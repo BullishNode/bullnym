@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
+        .route("/register", axum::routing::delete(registration::delete_registration))
         .route("/webhook/boltz", post(claimer::webhook))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())

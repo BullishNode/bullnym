@@ -65,6 +65,20 @@ pub async fn update_user_descriptor(
     .await
 }
 
+pub async fn deactivate_user(
+    pool: &PgPool,
+    npub: &str,
+) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "UPDATE users SET is_active = FALSE \
+         WHERE npub = $1 AND is_active = TRUE \
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active",
+    )
+    .bind(npub)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn update_dns_record_id(
     pool: &PgPool,
     nym: &str,

@@ -134,6 +134,35 @@ pub async fn update_registration(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct DeleteRequest {
+    pub npub: String,
+    pub signature: String,
+}
+
+/// DELETE /register — deactivate a Lightning Address registration
+pub async fn delete_registration(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<StatusCode, AppError> {
+    // Verify schnorr signature: SHA256("delete")
+    auth::verify_signature(&req.npub, b"delete", &req.signature)?;
+
+    let user = db::deactivate_user(&state.db, &req.npub)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
+
+    // Delete DNS record
+    if let (Some(dns), Some(record_id)) = (&state.dns, &user.dns_record_id) {
+        if let Err(e) = dns.delete_record(record_id).await {
+            tracing::error!("failed to delete DNS record for {}: {e}", user.nym);
+        }
+    }
+
+    tracing::info!("deactivated registration for {}", user.nym);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
