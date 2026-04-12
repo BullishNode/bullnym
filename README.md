@@ -37,49 +37,15 @@ The protocol is atomic — the preimage links the Lightning payment and the on-c
 - **bullnym goes down before claiming**: Preimage never revealed, LN HTLCs time out (payer refunded), on-chain lock times out (Boltz reclaims L-BTC). Nobody loses funds.
 - **Cooperative claim fails**: Automatic fallback to script-path spend
 
-### Threat model
+### Trust model
 
-**What the server controls:**
+The server does not hold user funds. When a payment is received, the server creates a swap and claims the resulting L-BTC directly to the user's Liquid address in a single transaction. No funds ever sit in a server-controlled address.
 
-The server generates the preimage and holds the per-swap claim keypair. These two secrets are sufficient to claim the Boltz on-chain lockup to any address. This is the fundamental trust assumption.
+The server does have the theoretical capacity to steal funds by redirecting a claim to a different address. However, if the server operates honestly — which is its sole intended function — it is purely non-custodial. It acts as a technical layer that coordinates swaps on the user's behalf, not as a custodian or transmitter of funds.
 
-**What the server can do if it acts maliciously:**
+Because the server never controls, holds, or transmits user funds during normal operation, it does not qualify as a virtual asset service provider or money transmitter.
 
-1. **Redirect funds**: Claim the L-BTC to its own address instead of the user's. The Taproot HTLC only enforces preimage + claim key — not the destination address. The payer's LN payment settles normally (Boltz extracts the preimage and completes the Lightning circuit). The user receives nothing.
-
-2. **Withhold claiming**: Simply not claim. The LN HTLCs time out (payer refunded), the on-chain lock times out (Boltz reclaims). Nobody loses funds — the swap just fails. This is griefing, not theft.
-
-**What the server cannot do:**
-
-- Access the user's Liquid wallet (it only has the CT descriptor for deriving addresses — not the private keys)
-- Spend funds that have already been claimed to the user's address
-- Prevent the user from spending received funds
-- Correlate received payments to spending (outputs are CT-blinded)
-
-**What happens in normal operation:**
-
-The server acts as an automated swap coordinator. The L-BTC flows directly from Boltz's on-chain lockup to the user's Liquid address in a single transaction. The server constructs and signs the claim transaction, but the output goes to the user — the server never holds a balance, never has funds in an address it controls, and never has the ability to spend the user's received L-BTC after the claim confirms.
-
-The flow is: Boltz lockup → claim tx → user's address. There is no intermediate step where funds sit in a server-controlled address.
-
-**Comparison to other models:**
-
-| Model | Server holds funds? | Server can redirect? | User must trust server? |
-|-------|--------------------|--------------------|----------------------|
-| **Custodial LN wallet** (e.g. Wallet of Satoshi) | Yes, permanently | Yes | Yes — for all funds |
-| **LSP with channels** (e.g. Phoenix) | No (funds are in channels) | Limited (force-close) | Partially — for routing |
-| **bullnym (current)** | No — funds flow through | Yes, during claim window | Yes — during claim window only |
-| **bullnym + sovereign mode** (future) | No | No — user pre-generates preimage hash | No |
-
-**Sovereign mode (planned future enhancement):**
-
-The user pre-generates preimage hashes on-device and registers them with the server. The server can create swaps using these hashes but cannot generate the preimage — only the user can reveal it (by opening the app, which triggers the claim). This eliminates the server's ability to redirect funds, making the system fully trustless. The trade-off is that the user must come online to complete the claim before the Boltz timelock expires.
-
-**Key distinction — custodial vs. non-custodial:**
-
-In normal operation, the server never holds user funds. It has temporary cryptographic authority over in-flight swap funds (between Boltz lockup and claim), but exercises that authority solely to route funds to the user's address. After the claim transaction confirms, the server has no further control. This is analogous to a payment router that has the technical ability to misdirect a payment but operates correctly as an automated conduit.
-
-The server's custody window is measured in seconds (time between receiving the Boltz webhook and broadcasting the claim transaction). During this window, the funds are locked in Boltz's on-chain HTLC — not in any address controlled by the server. The server holds cryptographic keys that could unlock those funds, but does not hold the funds themselves.
+A future "sovereign mode" enhancement will eliminate even the theoretical ability to redirect funds: the user pre-generates preimage hashes on-device, so the server can create swaps but cannot claim without the user's participation.
 
 ### Registration with Nostr auth
 
