@@ -1,0 +1,11 @@
+domain = "localhost:8080"
+listen = "0.0.0.0:8080"
+pool_size = 5
+
+[boltz]
+api_url = "https://api.boltz.exchange/v2"
+electrum_url = "blockstream.info:995"
+
+[limits]
+min_sendable_msat = 10000000
+max_sendable_msat = 25000000000
