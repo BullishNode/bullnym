@@ -19,7 +19,12 @@ use crate::error::AppError;
 use crate::AppState;
 
 #[derive(Deserialize)]
-pub struct BoltzWebhook {
+pub struct BoltzWebhookEnvelope {
+    pub data: BoltzWebhookData,
+}
+
+#[derive(Deserialize)]
+pub struct BoltzWebhookData {
     pub id: String,
     pub status: String,
 }
@@ -28,8 +33,17 @@ pub struct BoltzWebhook {
 /// On lockup events, triggers a cooperative MuSig2 claim.
 pub async fn webhook(
     State(state): State<AppState>,
-    Json(payload): Json<BoltzWebhook>,
+    body: String,
 ) -> Result<&'static str, AppError> {
+    tracing::info!("boltz webhook raw: {}", body);
+
+    let envelope: BoltzWebhookEnvelope = serde_json::from_str(&body)
+        .map_err(|e| {
+            tracing::error!("failed to parse webhook: {e}");
+            AppError::ClaimError(format!("invalid webhook payload: {e}"))
+        })?;
+    let payload = envelope.data;
+
     tracing::info!("boltz webhook: swap={} status={}", payload.id, payload.status);
 
     let swap = db::get_swap_by_boltz_id(&state.db, &payload.id)
