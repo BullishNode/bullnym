@@ -63,34 +63,35 @@ POST /register
 }
 ```
 
-The same Nostr keypair is used for all authenticated operations (update descriptor, delete registration). On registration, the mobile app also publishes a NIP-05 profile to Nostr relays with the `nip05` and `lud16` fields set, so the Lightning Address is discoverable via Nostr.
+The same Nostr keypair is used for all authenticated operations (update descriptor, delete registration).
 
-The server doubles as a NIP-05 identity provider:
+### Nostr integration
+
+On registration, the mobile app publishes a Nostr profile (kind 0) to relays with `nip05` and `lud16` fields set to `francis@bullpay.ca`. The server doubles as a NIP-05 identity provider:
 
 ```
 GET /.well-known/nostr.json?name=francis
 → { "names": { "francis": "<npub hex>" } }
 ```
 
-### LUD-22: Pay-to-pubkey
+This gives two immediate benefits:
 
-bullnym is designed around the idea that Lightning Addresses should be tied to Nostr identities. The nym `francis@bullpay.ca` is simultaneously:
+1. **Nostr zaps**: Any Nostr client (Damus, Primal, etc.) can zap the user via the `lud16` field. The zap goes through the LNURL flow and settles on Liquid.
+2. **NIP-05 verification**: The Nostr identity is domain-backed — `francis@bullpay.ca` resolves to the user's pubkey.
 
-- A Lightning Address (LUD-16) — receive Lightning payments settled to Liquid
-- A NIP-05 identifier — verifiable Nostr identity
-- A future LUD-22 endpoint — pay directly to a pubkey
+The Nostr keypair is derived from the user's BIP85 master seed, making it deterministic and portable. If the user migrates to a different LNURL provider, they derive the same keypair, update their Nostr profile with the new `lud16`, and all their Nostr contacts can still pay them. The identity lives on Nostr, not on bullpay.ca.
 
-This means any Nostr client that resolves `francis@bullpay.ca` via NIP-05 can also pay that user via Lightning, and vice versa.
+### Future: BIP 353 + Silent Payments
 
-### Future: BIP 353 DNS payment instructions
+Today, the Nostr profile points back to the server — if bullpay.ca is down, payments don't work regardless of what's on the relays. The "decentralized registry" becomes genuinely useful when Silent Payments (BIP 352) are supported.
 
-The plan includes BIP 353 support — DNSSEC-signed TXT records at `francis.user._bitcoin-payment.bullpay.ca` containing a `bitcoin:` URI. This gives wallets that support BIP 353 (Phoenix, Zeus, etc.) an alternative resolution path alongside LNURL:
+With Silent Payments, the user's Nostr profile and BIP 353 DNS record can contain a Silent Payment address that lets senders derive unique on-chain addresses without any server interaction. At that point, `francis@bullpay.ca` resolves to multiple independent payment paths:
 
-- DNS-first wallets resolve the TXT record and get a Liquid address or BOLT12 offer
-- LNURL wallets resolve via HTTPS as usual
-- Both paths work from the same `user@domain` identifier
+- **LNURL** → Boltz swap → Liquid (needs bullpay.ca online)
+- **Nostr profile** → Silent Payment address → on-chain Bitcoin (peer-to-peer, no server needed)
+- **BIP 353 DNS** → Silent Payment address → on-chain Bitcoin (needs DNS only)
 
-The DNS record is created at registration time and rotated when addresses are allocated during LNURL callbacks. DNSSEC validation is required by BIP 353, ensuring the payment instructions haven't been tampered with.
+The server becomes one of several resolution paths, not the only one. The architecture is positioned for this: the Nostr keypair is BIP85-derived (portable), the profile is replicated across relays, and adding a Silent Payment address is a one-field update when the time comes.
 
 ## Architecture
 
