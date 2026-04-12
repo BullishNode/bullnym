@@ -69,22 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dns,
     };
 
-    // Crash recovery: claim any swaps that were left in lockup_confirmed status
-    let recovery_pool = pool.clone();
-    let recovery_boltz = boltz.clone();
-    let recovery_config = config.clone();
-    tokio::spawn(async move {
-        if let Err(e) = claimer::recover_unclaimed_swaps(
-            &recovery_pool,
-            &recovery_boltz,
-            &recovery_config.boltz.electrum_url,
-            &recovery_config.boltz.api_url,
-        )
-        .await
-        {
-            tracing::error!("crash recovery failed: {e}");
-        }
-    });
+    // Background claimer: retries unclaimed swaps every 30s (replaces one-shot crash recovery)
+    claimer::spawn_background_claimer(pool.clone(), config.clone());
 
     let app = Router::new()
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))

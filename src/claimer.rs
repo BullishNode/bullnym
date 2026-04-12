@@ -1,5 +1,7 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::extract::State;
-use axum::Json;
 use serde::Deserialize;
 
 use boltz_client::network::electrum::ElectrumLiquidClient;
@@ -13,7 +15,7 @@ use boltz_client::util::fees::Fee;
 use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
-use crate::boltz::BoltzService;
+use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::AppState;
@@ -54,6 +56,15 @@ pub async fn webhook(
             AppError::ClaimError(format!("unknown swap: {}", payload.id))
         })?;
 
+    // Idempotency: skip swaps that have reached a terminal state
+    match swap.status.as_str() {
+        "claimed" | "expired" => {
+            tracing::debug!("ignoring webhook for {} swap {}", swap.status, payload.id);
+            return Ok("ok");
+        }
+        _ => {}
+    }
+
     match payload.status.as_str() {
         "transaction.mempool" | "transaction.confirmed" => {
             let new_status = if payload.status == "transaction.mempool" {
@@ -67,31 +78,7 @@ pub async fn webhook(
 
             // Attempt cooperative claim with retry — electrum may not have
             // the lockup tx yet when the webhook arrives
-            let mut claimed = false;
-            for attempt in 1..=3 {
-                if attempt > 1 {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                match claim_swap(
-                    &state.db,
-                    &swap,
-                    &state.config.boltz.electrum_url,
-                    &state.config.boltz.api_url,
-                )
-                .await
-                {
-                    Ok(()) => { claimed = true; break; }
-                    Err(e) => {
-                        tracing::warn!("claim attempt {attempt}/3 failed for swap {}: {e}", payload.id);
-                    }
-                }
-            }
-            if !claimed {
-                tracing::error!("all claim attempts failed for swap {}", payload.id);
-                db::update_swap_status(&state.db, swap.id, "claim_failed", None)
-                    .await
-                    .ok();
-            }
+            try_claim_with_retry(&state.db, &swap, &state.config.boltz.electrum_url, &state.config.boltz.api_url).await;
         }
         "invoice.settled" => {
             tracing::info!("invoice settled for swap {}", payload.id);
@@ -107,6 +94,33 @@ pub async fn webhook(
     }
 
     Ok("ok")
+}
+
+/// Try to claim a swap with up to 3 attempts and 2s delay between retries.
+async fn try_claim_with_retry(
+    pool: &sqlx::PgPool,
+    swap: &db::SwapRecord,
+    electrum_url: &str,
+    boltz_url: &str,
+) {
+    for attempt in 1..=3 {
+        if attempt > 1 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        match claim_swap(pool, swap, electrum_url, boltz_url).await {
+            Ok(()) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "claim attempt {attempt}/3 failed for swap {}: {e}",
+                    swap.boltz_swap_id
+                );
+            }
+        }
+    }
+    tracing::error!("all claim attempts failed for swap {}", swap.boltz_swap_id);
+    db::update_swap_status(pool, swap.id, "claim_failed", None)
+        .await
+        .ok();
 }
 
 /// Execute a cooperative MuSig2 claim for a single swap.
@@ -207,40 +221,45 @@ async fn claim_swap(
     Ok(())
 }
 
-/// Crash recovery: scan for swaps that were left in a claimable state and attempt to claim them.
-pub async fn recover_unclaimed_swaps(
-    pool: &sqlx::PgPool,
-    _boltz_service: &BoltzService,
-    electrum_url: &str,
-    boltz_url: &str,
-) -> Result<(), AppError> {
-    let unclaimed = db::get_unclaimed_swaps(pool)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
+/// Background task: periodically scans for unclaimed swaps and attempts to claim them.
+/// Runs every 30 seconds. Handles both crash recovery (on first run) and retrying
+/// swaps that failed during webhook-triggered claims.
+pub fn spawn_background_claimer(
+    pool: sqlx::PgPool,
+    config: Arc<Config>,
+) {
+    tokio::spawn(async move {
+        let mut first_run = true;
+        loop {
+            let unclaimed = match db::get_unclaimed_swaps(&pool).await {
+                Ok(swaps) => swaps,
+                Err(e) => {
+                    tracing::error!("background claimer: db query failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
 
-    if unclaimed.is_empty() {
-        tracing::info!("crash recovery: no unclaimed swaps found");
-        return Ok(());
-    }
-
-    tracing::info!(
-        "crash recovery: found {} unclaimed swaps, attempting claims",
-        unclaimed.len()
-    );
-
-    for swap in &unclaimed {
-        match claim_swap(pool, swap, electrum_url, boltz_url).await {
-            Ok(()) => {
-                tracing::info!("crash recovery: claimed swap {}", swap.boltz_swap_id);
+            if !unclaimed.is_empty() {
+                if first_run {
+                    tracing::info!("background claimer: found {} unclaimed swaps on startup", unclaimed.len());
+                }
+                for swap in &unclaimed {
+                    match claim_swap(&pool, swap, &config.boltz.electrum_url, &config.boltz.api_url).await {
+                        Ok(()) => {
+                            tracing::info!("background claimer: claimed swap {}", swap.boltz_swap_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("background claimer: swap {} not claimable yet: {e}", swap.boltz_swap_id);
+                        }
+                    }
+                }
+            } else if first_run {
+                tracing::info!("background claimer: no unclaimed swaps found");
             }
-            Err(e) => {
-                tracing::error!(
-                    "crash recovery: failed to claim swap {}: {e}",
-                    swap.boltz_swap_id
-                );
-            }
+
+            first_run = false;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
-    }
-
-    Ok(())
+    });
 }
