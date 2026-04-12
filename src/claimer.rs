@@ -56,7 +56,6 @@ pub async fn webhook(
 
     match payload.status.as_str() {
         "transaction.mempool" | "transaction.confirmed" => {
-            // Update status
             let new_status = if payload.status == "transaction.mempool" {
                 "lockup_mempool"
             } else {
@@ -159,7 +158,7 @@ async fn claim_swap(
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: swap.address.clone(),
-        fee: Fee::Relative(0.01), // 0.01 sat/vB with ELIP-200 CT discount
+        fee: Fee::Relative(0.1), // 0.1 sat/vB — Liquid default minrelaytxfee with ELIP-200 CT discount
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
