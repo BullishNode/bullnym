@@ -159,7 +159,7 @@ async fn claim_swap(
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: swap.address.clone(),
-        fee: Fee::Absolute(300), // Liquid fees are minimal
+        fee: Fee::Relative(0.01), // 0.01 sat/vB with ELIP-200 CT discount
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
