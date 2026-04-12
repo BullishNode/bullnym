@@ -48,7 +48,7 @@ impl IntoResponse for AppError {
             AppError::NymInvalid(r) => r.as_str(),
             AppError::InvalidDescriptor(_) => "Invalid wallet descriptor",
             AppError::InvalidAmount(r) => r.as_str(),
-            AppError::AuthError(_) => "Authentication failed",
+            AppError::AuthError(r) => r.as_str(),
             AppError::BoltzError(_) => "Payment service temporarily unavailable",
             AppError::ClaimError(_) => "Claim service temporarily unavailable",
             AppError::DbError(_) => "Internal server error",
