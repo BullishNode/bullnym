@@ -41,8 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
 
-    let boltz_service = boltz::BoltzService::new(&config.boltz.api_url, swap_master_key);
-    tracing::info!("boltz service initialized ({})", config.boltz.api_url);
+    let webhook_url = format!("https://{}/webhook/boltz", config.domain);
+    let boltz_service = boltz::BoltzService::new(&config.boltz.api_url, swap_master_key, Some(webhook_url.clone()));
+    tracing::info!("boltz service initialized ({}) webhook={}", config.boltz.api_url, webhook_url);
 
     let dns = if config.dns_enabled() {
         tracing::info!("DNS record management enabled for {}", config.dns.zone_domain);

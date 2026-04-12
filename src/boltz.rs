@@ -1,6 +1,6 @@
 use boltz_client::bitcoin::secp256k1::Keypair;
 use boltz_client::swaps::boltz::{
-    BoltzApiClientV2, CreateReverseRequest, CreateReverseResponse,
+    BoltzApiClientV2, CreateReverseRequest, CreateReverseResponse, RevSwapStates, Webhook,
 };
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::PublicKey;
@@ -19,13 +19,15 @@ pub struct SwapResult {
 pub struct BoltzService {
     api: BoltzApiClientV2,
     swap_master_key: SwapMasterKey,
+    webhook_url: Option<String>,
 }
 
 impl BoltzService {
-    pub fn new(boltz_url: &str, swap_master_key: SwapMasterKey) -> Self {
+    pub fn new(boltz_url: &str, swap_master_key: SwapMasterKey, webhook_url: Option<String>) -> Self {
         Self {
             api: BoltzApiClientV2::new(boltz_url.to_string(), None),
             swap_master_key,
+            webhook_url,
         }
     }
 
@@ -56,7 +58,17 @@ impl BoltzService {
             address: Some(address.to_string()),
             address_signature: None,
             referral_id: None,
-            webhook: None,
+            webhook: self.webhook_url.as_ref().map(|url| Webhook {
+                url: url.clone(),
+                hash_swap_id: None,
+                status: Some(vec![
+                    RevSwapStates::TransactionMempool,
+                    RevSwapStates::TransactionConfirmed,
+                    RevSwapStates::InvoiceSettled,
+                    RevSwapStates::SwapExpired,
+                    RevSwapStates::TransactionFailed,
+                ]),
+            }),
             claim_covenant: None,
         };
 

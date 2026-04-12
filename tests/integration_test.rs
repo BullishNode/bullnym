@@ -55,7 +55,7 @@ fn test_state(pool: PgPool) -> AppState {
     AppState {
         db: pool,
         config: Arc::new(test_config()),
-        boltz: Arc::new(BoltzService::new("http://127.0.0.1:1", swap_master_key)),
+        boltz: Arc::new(BoltzService::new("http://127.0.0.1:1", swap_master_key, None)),
         dns: None,
     }
 }
