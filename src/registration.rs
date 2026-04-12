@@ -47,7 +47,6 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
-    // Validate nym format
     if !NYM_REGEX.is_match(&req.nym) {
         return Err(AppError::NymInvalid(
             "must be 3-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
@@ -55,33 +54,23 @@ pub async fn register(
         ));
     }
 
-    // Validate descriptor
     descriptor::validate_descriptor(
         &req.ct_descriptor,
         state.config.limits.max_descriptor_len,
     )?;
 
-    // Verify schnorr signature: SHA256(nym + ct_descriptor)
     let message = format!("{}{}", req.nym, req.ct_descriptor);
+    tracing::info!(
+        "register: nym={} npub={}... sig={}... descriptor_len={} message_len={}",
+        req.nym,
+        &req.npub.get(..16).unwrap_or(&req.npub),
+        &req.signature.get(..16).unwrap_or(&req.signature),
+        req.ct_descriptor.len(),
+        message.len(),
+    );
     auth::verify_signature(&req.npub, message.as_bytes(), &req.signature)?;
 
-    // Insert user
     db::create_user(&state.db, &req.nym, &req.npub, &req.ct_descriptor).await?;
-
-    // Create BIP 353 DNS record (best-effort)
-    if let Some(dns) = &state.dns {
-        let address = descriptor::derive_address(&req.ct_descriptor, 0)?;
-        match dns.create_bip353_record(&req.nym, &address).await {
-            Ok(record_id) => {
-                if let Err(e) =
-                    db::update_dns_record_id(&state.db, &req.nym, &record_id).await
-                {
-                    tracing::error!("failed to store dns_record_id for {}: {e}", req.nym);
-                }
-            }
-            Err(e) => tracing::error!("failed to create DNS record for {}: {e}", req.nym),
-        }
-    }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
     let nip05 = lightning_address.clone();
@@ -101,30 +90,16 @@ pub async fn update_registration(
     State(state): State<AppState>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<UpdateResponse>, AppError> {
-    // Verify schnorr signature: SHA256(ct_descriptor)
     auth::verify_signature(&req.npub, req.ct_descriptor.as_bytes(), &req.signature)?;
 
-    // Validate descriptor
     descriptor::validate_descriptor(
         &req.ct_descriptor,
         state.config.limits.max_descriptor_len,
     )?;
 
-    // Update
     let user = db::update_user_descriptor(&state.db, &req.npub, &req.ct_descriptor)
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
-
-    // Update DNS record with new address at index 0
-    if let (Some(dns), Some(record_id)) = (&state.dns, &user.dns_record_id) {
-        let address = descriptor::derive_address(&req.ct_descriptor, 0)?;
-        if let Err(e) = dns
-            .update_bip353_record(record_id, &user.nym, &address)
-            .await
-        {
-            tracing::error!("failed to update DNS record for {}: {e}", user.nym);
-        }
-    }
 
     let lightning_address = format!("{}@{}", user.nym, state.config.domain);
 
@@ -145,19 +120,11 @@ pub async fn delete_registration(
     State(state): State<AppState>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<StatusCode, AppError> {
-    // Verify schnorr signature: SHA256("delete")
     auth::verify_signature(&req.npub, b"delete", &req.signature)?;
 
     let user = db::deactivate_user(&state.db, &req.npub)
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
-
-    // Delete DNS record
-    if let (Some(dns), Some(record_id)) = (&state.dns, &user.dns_record_id) {
-        if let Err(e) = dns.delete_record(record_id).await {
-            tracing::error!("failed to delete DNS record for {}: {e}", user.nym);
-        }
-    }
 
     tracing::info!("deactivated registration for {}", user.nym);
     Ok(StatusCode::NO_CONTENT)
