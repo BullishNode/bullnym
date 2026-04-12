@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use boltz_client::bitcoin::secp256k1::Keypair;
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateReverseRequest, CreateReverseResponse,
@@ -21,7 +19,6 @@ pub struct SwapResult {
 pub struct BoltzService {
     api: BoltzApiClientV2,
     swap_master_key: SwapMasterKey,
-    next_swap_index: Mutex<u64>,
 }
 
 impl BoltzService {
@@ -29,28 +26,20 @@ impl BoltzService {
         Self {
             api: BoltzApiClientV2::new(boltz_url.to_string(), None),
             swap_master_key,
-            next_swap_index: Mutex::new(0),
         }
-    }
-
-    fn next_keypair(&self) -> Result<(u64, Keypair), AppError> {
-        let mut index = self.next_swap_index.lock().unwrap();
-        let keypair = self
-            .swap_master_key
-            .derive_swapkey(*index)
-            .map_err(|e| AppError::BoltzError(format!("key derivation failed: {e}")))?;
-        let current = *index;
-        *index += 1;
-        Ok((current, keypair))
     }
 
     pub async fn create_reverse_swap(
         &self,
+        swap_key_index: u64,
         amount_sat: u64,
         address: &str,
         description_hash: &str,
     ) -> Result<SwapResult, AppError> {
-        let (_, keypair) = self.next_keypair()?;
+        let keypair = self
+            .swap_master_key
+            .derive_swapkey(swap_key_index)
+            .map_err(|e| AppError::BoltzError(format!("key derivation failed: {e}")))?;
         let preimage = Preimage::from_swap_key(&keypair);
 
         let claim_public_key = PublicKey::new(keypair.public_key());

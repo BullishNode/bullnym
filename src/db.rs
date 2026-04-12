@@ -78,6 +78,15 @@ pub async fn update_dns_record_id(
     Ok(())
 }
 
+/// Atomically allocates the next swap key index from a PostgreSQL sequence.
+/// Each call returns a unique, never-repeated value that survives restarts.
+pub async fn next_swap_key_index(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT nextval('swap_key_seq')")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0 as u64)
+}
+
 /// Atomically increments next_addr_idx and returns the index to use.
 /// Returns None if the nym does not exist or is inactive.
 pub async fn allocate_address_index(pool: &PgPool, nym: &str) -> Result<Option<i32>, sqlx::Error> {

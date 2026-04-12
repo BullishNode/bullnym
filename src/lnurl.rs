@@ -106,12 +106,16 @@ pub async fn callback(
 
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
+    let swap_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
+
     let metadata_str = build_metadata(&nym, &state.config.domain);
     let description_hash_hex = hex::encode(Sha256::digest(metadata_str.as_bytes()));
 
     let result = state
         .boltz
-        .create_reverse_swap(amount_sat, &address, &description_hash_hex)
+        .create_reverse_swap(swap_key_index, amount_sat, &address, &description_hash_hex)
         .await?;
 
     let preimage_hex = hex::encode(&result.preimage);

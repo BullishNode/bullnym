@@ -86,9 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let app = Router::new()
-        .route("/.well-known/lnurlp/{nym}", get(lnurl::metadata))
+        .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
-        .route("/lnurlp/callback/{nym}", get(lnurl::callback))
+        .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route("/webhook/boltz", post(claimer::webhook))
