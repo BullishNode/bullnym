@@ -65,16 +65,29 @@ pub async fn webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Attempt cooperative claim
-            if let Err(e) = claim_swap(
-                &state.db,
-                &swap,
-                &state.config.boltz.electrum_url,
-                &state.config.boltz.api_url,
-            )
-            .await
-            {
-                tracing::error!("claim failed for swap {}: {e}", payload.id);
+            // Attempt cooperative claim with retry — electrum may not have
+            // the lockup tx yet when the webhook arrives
+            let mut claimed = false;
+            for attempt in 1..=3 {
+                if attempt > 1 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                match claim_swap(
+                    &state.db,
+                    &swap,
+                    &state.config.boltz.electrum_url,
+                    &state.config.boltz.api_url,
+                )
+                .await
+                {
+                    Ok(()) => { claimed = true; break; }
+                    Err(e) => {
+                        tracing::warn!("claim attempt {attempt}/3 failed for swap {}: {e}", payload.id);
+                    }
+                }
+            }
+            if !claimed {
+                tracing::error!("all claim attempts failed for swap {}", payload.id);
                 db::update_swap_status(&state.db, swap.id, "claim_failed", None)
                     .await
                     .ok();
