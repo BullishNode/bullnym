@@ -8,6 +8,8 @@ use crate::descriptor;
 use crate::error::AppError;
 use crate::AppState;
 
+// --- Metadata response (LUD-06 + extensions) ---
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LnurlPayMetadata {
@@ -16,18 +18,59 @@ pub struct LnurlPayMetadata {
     pub min_sendable: u64,
     pub metadata: String,
     pub tag: String,
+    pub comment_allowed: u16,
+    pub currencies: Vec<Currency>,
 }
+
+#[derive(Serialize)]
+pub struct Currency {
+    pub code: String,
+    pub name: String,
+    pub network: String,
+    pub symbol: String,
+}
+
+// --- Callback params ---
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
     pub amount: u64,
+    pub comment: Option<String>,
+    pub network: Option<String>,
+}
+
+// --- Callback response variants ---
+
+#[derive(Serialize)]
+pub struct LightningResponse {
+    pub pr: String,
+    pub routes: Vec<()>,
+    pub disposable: bool,
+    #[serde(rename = "successAction")]
+    pub success_action: SuccessAction,
 }
 
 #[derive(Serialize)]
-pub struct CallbackResponse {
-    pub pr: String,
-    pub routes: Vec<()>,
+pub struct SuccessAction {
+    pub tag: String,
+    pub message: String,
 }
+
+#[derive(Serialize)]
+pub struct LiquidResponse {
+    pub onchain: OnchainPayment,
+    pub disposable: bool,
+}
+
+#[derive(Serialize)]
+pub struct OnchainPayment {
+    pub network: String,
+    pub address: String,
+    pub amount_sat: u64,
+    pub bip21: String,
+}
+
+// --- Metadata builder ---
 
 fn build_metadata(nym: &str, domain: &str) -> String {
     let identifier = format!("{nym}@{domain}");
@@ -38,6 +81,10 @@ fn build_metadata(nym: &str, domain: &str) -> String {
     ])
     .expect("metadata serialization cannot fail")
 }
+
+const LBTC_ASSET_ID: &str = "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
+
+// --- Handlers ---
 
 pub async fn metadata(
     State(state): State<AppState>,
@@ -52,14 +99,28 @@ pub async fn metadata(
     }
 
     let callback = format!("https://{}/lnurlp/callback/{}", state.config.domain, nym);
-    let metadata_str = build_metadata(&nym, &state.config.domain);
 
     Ok(Json(LnurlPayMetadata {
         callback,
         max_sendable: state.config.limits.max_sendable_msat,
         min_sendable: state.config.limits.min_sendable_msat,
-        metadata: metadata_str,
+        metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
+        comment_allowed: 144,
+        currencies: vec![
+            Currency {
+                code: "BTC".to_string(),
+                name: "Bitcoin".to_string(),
+                network: "bitcoin".to_string(),
+                symbol: "BTC".to_string(),
+            },
+            Currency {
+                code: "BTC".to_string(),
+                name: "Liquid Bitcoin".to_string(),
+                network: "liquid".to_string(),
+                symbol: "L-BTC".to_string(),
+            },
+        ],
     }))
 }
 
@@ -67,7 +128,7 @@ pub async fn callback(
     State(state): State<AppState>,
     Path(nym): Path<String>,
     Query(params): Query<CallbackParams>,
-) -> Result<Json<CallbackResponse>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     if params.amount < state.config.limits.min_sendable_msat {
         return Err(AppError::InvalidAmount(format!(
             "minimum is {} msat",
@@ -106,6 +167,25 @@ pub async fn callback(
 
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
+    // Liquid-direct: return address without Boltz swap
+    if params.network.as_deref() == Some("liquid") {
+        let bip21 = format!(
+            "liquidnetwork:{address}?amount={}&assetid={LBTC_ASSET_ID}",
+            format_btc_amount(amount_sat),
+        );
+        let resp = LiquidResponse {
+            onchain: OnchainPayment {
+                network: "liquid".to_string(),
+                address,
+                amount_sat,
+                bip21,
+            },
+            disposable: false,
+        };
+        return Ok(Json(resp).into_response());
+    }
+
+    // Lightning: create Boltz reverse swap
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
@@ -140,11 +220,24 @@ pub async fn callback(
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
 
-    Ok(Json(CallbackResponse {
+    let resp = LightningResponse {
         pr: result.invoice,
         routes: vec![],
-    }))
+        disposable: false,
+        success_action: SuccessAction {
+            tag: "message".to_string(),
+            message: format!("Payment received to {nym}@{}", state.config.domain),
+        },
+    };
+    Ok(Json(resp).into_response())
 }
+
+fn format_btc_amount(sats: u64) -> String {
+    let btc = sats as f64 / 100_000_000.0;
+    format!("{btc:.8}")
+}
+
+use axum::response::IntoResponse;
 
 #[cfg(test)]
 mod tests {
@@ -186,7 +279,7 @@ mod tests {
         let hash1 = hex::encode(Sha256::digest(meta.as_bytes()));
         let hash2 = hex::encode(Sha256::digest(build_metadata("francis", "bullpay.ca").as_bytes()));
         assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 64); // 32 bytes = 64 hex chars
+        assert_eq!(hash1.len(), 64);
     }
 
     #[test]
@@ -194,5 +287,12 @@ mod tests {
         let h1 = hex::encode(Sha256::digest(build_metadata("alice", "bullpay.ca").as_bytes()));
         let h2 = hex::encode(Sha256::digest(build_metadata("bob", "bullpay.ca").as_bytes()));
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn format_btc_amount_works() {
+        assert_eq!(format_btc_amount(307), "0.00000307");
+        assert_eq!(format_btc_amount(100_000_000), "1.00000000");
+        assert_eq!(format_btc_amount(1), "0.00000001");
     }
 }
