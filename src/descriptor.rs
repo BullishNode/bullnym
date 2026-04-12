@@ -26,40 +26,30 @@ pub fn validate_descriptor(ct_descriptor: &str, max_len: usize) -> Result<(), Ap
 mod tests {
     use super::*;
 
-    // Mainnet CT descriptor derived from "abandon...about" mnemonic via lwk
-    // Generated externally — this is a static test fixture
-    const TEST_CT_DESC: &str = "ct(slip77(0371e66dde8ab1a8f4d4c7c891c6a207a11e1bbd392147ae3a35a4ca85e92a40),elwpkh([be81a2a4/84'/1776'/0']xpub6DJJiSbjNa7GBDMBuFPxqh2uMy2pUMFNSGSCL3oJVHTc8HdJnw6AVGinMBDHb64svphEpJLc9YzRMCFMd5jP5KaDPZQMegxW2eLBigC7bgJV/0/*))";
+    // CT descriptor using h-notation (required by lwk 0.14). Derived from "abandon...about" mnemonic.
+    const TEST_CT_DESC: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
     #[test]
     fn derive_valid_address() {
-        let addr = derive_address(TEST_CT_DESC, 0);
-        // If the descriptor doesn't parse on this system, skip gracefully
-        if let Ok(addr) = addr {
-            assert!(!addr.is_empty());
-        }
+        let addr = derive_address(TEST_CT_DESC, 0).expect("descriptor must parse");
+        assert!(addr.starts_with("lq1qq"), "expected confidential address, got {addr}");
     }
 
     #[test]
     fn deterministic_derivation() {
-        if let (Ok(a1), Ok(a2)) = (
-            derive_address(TEST_CT_DESC, 5),
-            derive_address(TEST_CT_DESC, 5),
-        ) {
-            assert_eq!(a1, a2);
-        }
+        let a1 = derive_address(TEST_CT_DESC, 5).unwrap();
+        let a2 = derive_address(TEST_CT_DESC, 5).unwrap();
+        assert_eq!(a1, a2);
     }
 
     #[test]
     fn different_indices_different_addresses() {
-        if let (Ok(a0), Ok(a1), Ok(a2)) = (
-            derive_address(TEST_CT_DESC, 0),
-            derive_address(TEST_CT_DESC, 1),
-            derive_address(TEST_CT_DESC, 2),
-        ) {
-            assert_ne!(a0, a1);
-            assert_ne!(a1, a2);
-            assert_ne!(a0, a2);
-        }
+        let a0 = derive_address(TEST_CT_DESC, 0).unwrap();
+        let a1 = derive_address(TEST_CT_DESC, 1).unwrap();
+        let a2 = derive_address(TEST_CT_DESC, 2).unwrap();
+        assert_ne!(a0, a1);
+        assert_ne!(a1, a2);
+        assert_ne!(a0, a2);
     }
 
     #[test]

@@ -101,7 +101,7 @@ pub async fn callback(
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
 
     let addr_index_u32 = u32::try_from(addr_index).map_err(|_| {
-        AppError::InvalidAmount("address index overflow".to_string())
+        AppError::DbError("address index overflow".to_string())
     })?;
 
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
@@ -123,22 +123,22 @@ pub async fn callback(
     let boltz_response_json = serde_json::to_string(&result.boltz_response)
         .map_err(|e| AppError::BoltzError(format!("failed to serialize boltz response: {e}")))?;
 
-    if let Err(e) = db::record_swap(
+    db::record_swap(
         &state.db,
-        &nym,
-        &result.swap_id,
-        &address,
-        addr_index,
-        amount_sat,
-        &result.invoice,
-        &preimage_hex,
-        &claim_key_hex,
-        &boltz_response_json,
+        &db::NewSwapRecord {
+            nym: &nym,
+            boltz_swap_id: &result.swap_id,
+            address: &address,
+            address_index: addr_index,
+            amount_sat,
+            invoice: &result.invoice,
+            preimage_hex: &preimage_hex,
+            claim_key_hex: &claim_key_hex,
+            boltz_response_json: &boltz_response_json,
+        },
     )
     .await
-    {
-        tracing::error!("failed to record swap {}: {e}", result.swap_id);
-    }
+    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
 
     Ok(Json(CallbackResponse {
         pr: result.invoice,

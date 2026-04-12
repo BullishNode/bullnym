@@ -3,6 +3,7 @@ use axum::Router;
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
 use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -69,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dns,
     };
 
-    // Background claimer: retries unclaimed swaps every 30s (replaces one-shot crash recovery)
-    claimer::spawn_background_claimer(pool.clone(), config.clone());
+    let cancel = CancellationToken::new();
+    claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
 
     let app = Router::new()
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
@@ -90,7 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("listening on {listen_addr}");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("received shutdown signal");
+            cancel.cancel();
+        })
         .await?;
 
     tracing::info!("shutdown complete");
@@ -99,11 +104,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-    tracing::info!("received shutdown signal");
 }

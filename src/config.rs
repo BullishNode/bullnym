@@ -46,12 +46,18 @@ pub struct DnsConfig {
     pub zone_domain: String,
 }
 
+const DEFAULT_POOL_SIZE: u32 = 10;
+const DEFAULT_MIN_SENDABLE_MSAT: u64 = 100_000; // 100 sats
+const DEFAULT_MAX_SENDABLE_MSAT: u64 = 25_000_000_000; // 25M sats
+const DEFAULT_MAX_DESCRIPTOR_LEN: usize = 1000;
+const DEFAULT_EASYDNS_URL: &str = "https://rest.easydns.net";
+
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            min_sendable_msat: default_min_sendable(),
-            max_sendable_msat: default_max_sendable(),
-            max_descriptor_len: default_max_descriptor_len(),
+            min_sendable_msat: DEFAULT_MIN_SENDABLE_MSAT,
+            max_sendable_msat: DEFAULT_MAX_SENDABLE_MSAT,
+            max_descriptor_len: DEFAULT_MAX_DESCRIPTOR_LEN,
         }
     }
 }
@@ -59,17 +65,17 @@ impl Default for LimitsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            easydns_api_url: default_easydns_url(),
+            easydns_api_url: DEFAULT_EASYDNS_URL.to_string(),
             zone_domain: String::new(),
         }
     }
 }
 
-fn default_pool_size() -> u32 { 10 }
-fn default_min_sendable() -> u64 { 10_000_000 }
-fn default_max_sendable() -> u64 { 25_000_000_000 }
-fn default_max_descriptor_len() -> usize { 1000 }
-fn default_easydns_url() -> String { "https://rest.easydns.net".to_string() }
+fn default_pool_size() -> u32 { DEFAULT_POOL_SIZE }
+fn default_min_sendable() -> u64 { DEFAULT_MIN_SENDABLE_MSAT }
+fn default_max_sendable() -> u64 { DEFAULT_MAX_SENDABLE_MSAT }
+fn default_max_descriptor_len() -> usize { DEFAULT_MAX_DESCRIPTOR_LEN }
+fn default_easydns_url() -> String { DEFAULT_EASYDNS_URL.to_string() }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
