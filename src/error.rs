@@ -12,7 +12,6 @@ pub enum AppError {
     AuthError(String),
     BoltzError(String),
     ClaimError(String),
-    DnsError(String),
     DbError(String),
 }
 
@@ -27,7 +26,6 @@ impl std::fmt::Display for AppError {
             Self::AuthError(reason) => write!(f, "auth error: {reason}"),
             Self::BoltzError(msg) => write!(f, "swap service error: {msg}"),
             Self::ClaimError(msg) => write!(f, "claim error: {msg}"),
-            Self::DnsError(msg) => write!(f, "dns error: {msg}"),
             Self::DbError(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -40,7 +38,6 @@ impl IntoResponse for AppError {
             AppError::DbError(msg) => tracing::error!("database error: {msg}"),
             AppError::BoltzError(msg) => tracing::error!("boltz error: {msg}"),
             AppError::ClaimError(msg) => tracing::error!("claim error: {msg}"),
-            AppError::DnsError(msg) => tracing::error!("dns error: {msg}"),
             _ => tracing::warn!("{self}"),
         }
 
@@ -54,7 +51,6 @@ impl IntoResponse for AppError {
             AppError::AuthError(_) => "Authentication failed",
             AppError::BoltzError(_) => "Payment service temporarily unavailable",
             AppError::ClaimError(_) => "Claim service temporarily unavailable",
-            AppError::DnsError(_) => "DNS record creation failed",
             AppError::DbError(_) => "Internal server error",
         };
 

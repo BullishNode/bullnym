@@ -4,7 +4,6 @@ pub mod claimer;
 pub mod config;
 pub mod db;
 pub mod descriptor;
-pub mod dns;
 pub mod error;
 pub mod lnurl;
 pub mod nostr;
@@ -15,5 +14,4 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub config: std::sync::Arc<config::Config>,
     pub boltz: std::sync::Arc<boltz::BoltzService>,
-    pub dns: Option<dns::EasyDnsClient>,
 }

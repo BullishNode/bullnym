@@ -10,7 +10,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migr
 lwk_wollet = "0.14.0"
 boltz-client = { path = "../boltz/boltz-rust", features = ["electrum"] }
 secp256k1 = { version = "0.29", features = ["global-context"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

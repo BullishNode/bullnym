@@ -8,7 +8,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use pay_service::{boltz, claimer, config, dns, lnurl, nostr, registration, AppState};
+use pay_service::{boltz, claimer, config, lnurl, nostr, registration, AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,21 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
 
     let webhook_url = format!("https://{}/webhook/boltz", config.domain);
-    let boltz_service = boltz::BoltzService::new(&config.boltz.api_url, swap_master_key, Some(webhook_url.clone()));
+    let boltz_service = boltz::BoltzService::new(
+        &config.boltz.api_url,
+        swap_master_key,
+        Some(webhook_url.clone()),
+    );
     tracing::info!("boltz service initialized ({}) webhook={}", config.boltz.api_url, webhook_url);
-
-    let dns = if config.dns_enabled() {
-        tracing::info!("DNS record management enabled for {}", config.dns.zone_domain);
-        Some(dns::EasyDnsClient::new(
-            &config.dns.easydns_api_url,
-            &config.dns.zone_domain,
-            config.easydns_api_key.as_deref().unwrap(),
-            config.easydns_api_token.as_deref().unwrap(),
-        ))
-    } else {
-        tracing::info!("DNS record management disabled");
-        None
-    };
 
     let listen_addr = config.listen.clone();
     let config = std::sync::Arc::new(config);
@@ -67,7 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: pool.clone(),
         config: config.clone(),
         boltz: boltz.clone(),
-        dns,
     };
 
     let cancel = CancellationToken::new();

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
-use pay_service::config::{BoltzConfig, Config, DnsConfig, LimitsConfig};
+use pay_service::config::{BoltzConfig, Config, LimitsConfig};
 use pay_service::{claimer, lnurl, nostr, registration, AppState};
 
 use boltz_client::network::Network;
@@ -44,11 +44,8 @@ fn test_config() -> Config {
             electrum_url: "blockstream.info:995".to_string(),
         },
         limits: LimitsConfig::default(),
-        dns: DnsConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
-        easydns_api_key: None,
-        easydns_api_token: None,
     }
 }
 
@@ -63,7 +60,6 @@ fn test_state(pool: PgPool) -> AppState {
         db: pool,
         config: Arc::new(test_config()),
         boltz: Arc::new(BoltzService::new("http://127.0.0.1:1", swap_master_key, None)),
-        dns: None,
     }
 }
 

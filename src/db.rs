@@ -69,13 +69,12 @@ pub struct User {
     pub npub: String,
     pub ct_descriptor: String,
     pub next_addr_idx: i32,
-    pub dns_record_id: Option<String>,
     pub is_active: bool,
 }
 
 pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active \
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE nym = $1",
     )
     .bind(nym)
@@ -85,7 +84,7 @@ pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, s
 
 pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active \
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1",
     )
     .bind(npub)
@@ -101,7 +100,7 @@ pub async fn create_user(
 ) -> Result<User, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "INSERT INTO users (nym, npub, ct_descriptor) VALUES ($1, $2, $3) \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active",
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
     .bind(nym)
     .bind(npub)
@@ -118,7 +117,7 @@ pub async fn update_user_descriptor(
     sqlx::query_as::<_, User>(
         "UPDATE users SET ct_descriptor = $2, next_addr_idx = 0 \
          WHERE npub = $1 AND is_active = TRUE \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active",
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
     .bind(ct_descriptor)
@@ -130,24 +129,11 @@ pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, 
     sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE \
          WHERE npub = $1 AND is_active = TRUE \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, dns_record_id, is_active",
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
     .fetch_optional(pool)
     .await
-}
-
-pub async fn update_dns_record_id(
-    pool: &PgPool,
-    nym: &str,
-    dns_record_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET dns_record_id = $2 WHERE nym = $1")
-        .bind(nym)
-        .bind(dns_record_id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 // --- Address & swap key allocation ---
