@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use regex::Regex;
@@ -134,6 +134,33 @@ pub async fn delete_registration(
 
     tracing::info!("deactivated registration for {}", user.nym);
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Lookup ---
+
+#[derive(Deserialize)]
+pub struct LookupParams {
+    pub npub: String,
+}
+
+#[derive(Serialize)]
+pub struct LookupResponse {
+    pub nym: String,
+    pub active: bool,
+}
+
+/// GET /register/lookup?npub=<hex> — check if an npub has a registration
+pub async fn lookup_by_npub(
+    State(state): State<AppState>,
+    Query(params): Query<LookupParams>,
+) -> Result<Json<LookupResponse>, AppError> {
+    if let Some(user) = db::get_user_by_npub(&state.db, &params.npub).await? {
+        return Ok(Json(LookupResponse { nym: user.nym, active: true }));
+    }
+    if let Some(user) = db::get_inactive_user_by_npub(&state.db, &params.npub).await? {
+        return Ok(Json(LookupResponse { nym: user.nym, active: false }));
+    }
+    Err(AppError::NymNotFound("no registration for this key".to_string()))
 }
 
 #[cfg(test)]
