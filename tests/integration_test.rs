@@ -76,6 +76,11 @@ fn test_app(state: AppState) -> Router {
 }
 
 fn sign_registration(nym: &str, ct_descriptor: &str) -> (String, String) {
+    let (npub, sig, _) = sign_registration_with_keypair(nym, ct_descriptor);
+    (npub, sig)
+}
+
+fn sign_registration_with_keypair(nym: &str, ct_descriptor: &str) -> (String, String, Keypair) {
     let secp = Secp256k1::new();
     let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
     let (xonly, _) = keypair.x_only_public_key();
@@ -84,7 +89,14 @@ fn sign_registration(nym: &str, ct_descriptor: &str) -> (String, String) {
     let digest = Sha256::digest(message.as_bytes());
     let msg = Message::from_digest(*digest.as_ref());
     let sig = secp.sign_schnorr(&msg, &keypair);
-    (npub_hex, sig.to_string())
+    (npub_hex, sig.to_string(), keypair)
+}
+
+fn sign_with_keypair(keypair: &Keypair, message: &[u8]) -> String {
+    let secp = Secp256k1::new();
+    let digest = Sha256::digest(message);
+    let msg = Message::from_digest(*digest.as_ref());
+    secp.sign_schnorr(&msg, keypair).to_string()
 }
 
 // Valid CT descriptor (lwk 0.14, h-notation)
@@ -423,6 +435,145 @@ async fn delete_registration_deactivates_user() {
 
     // LNURL should no longer resolve
     let (_, body) = get_path(&app, "/.well-known/lnurlp/deluser").await;
+    assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+// --- Nym lifecycle tests ---
+
+#[tokio::test]
+async fn reregister_after_delete_succeeds() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("lifecycle1", TEST_DESCRIPTOR);
+
+    // Register
+    let (status, _) = post_json(&app, "/register", json!({
+        "nym": "lifecycle1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Delete
+    let del_sig = sign_with_keypair(&keypair, b"delete");
+    let resp = app.clone().oneshot(
+        Request::builder()
+            .method("DELETE").uri("/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"npub": npub, "signature": del_sig}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Re-register with new nym, same npub
+    let new_msg = format!("{}{}", "lifecycle2", TEST_DESCRIPTOR);
+    let new_sig = sign_with_keypair(&keypair, new_msg.as_bytes());
+    let (status, body) = post_json(&app, "/register", json!({
+        "nym": "lifecycle2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": new_sig,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["nym"], "lifecycle2");
+
+    // New nym resolves
+    let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle2").await;
+    assert_eq!(body["tag"], "payRequest");
+
+    // Old nym does not resolve
+    let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle1").await;
+    assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reregister_same_nym_after_delete() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("samename", TEST_DESCRIPTOR);
+
+    // Register
+    post_json(&app, "/register", json!({
+        "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+
+    // Delete
+    let del_sig = sign_with_keypair(&keypair, b"delete");
+    app.clone().oneshot(
+        Request::builder()
+            .method("DELETE").uri("/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"npub": npub, "signature": del_sig}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+
+    // Re-register same nym — should reactivate
+    let re_sig = sign_with_keypair(&keypair, format!("{}{}", "samename", TEST_DESCRIPTOR).as_bytes());
+    let (status, body) = post_json(&app, "/register", json!({
+        "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["nym"], "samename");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn register_while_active_rejected() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("active1", TEST_DESCRIPTOR);
+
+    // Register first nym
+    let (status, _) = post_json(&app, "/register", json!({
+        "nym": "active1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Try registering second nym with same npub while first is active
+    let msg2 = format!("{}{}", "active2", TEST_DESCRIPTOR);
+    let sig2 = sign_with_keypair(&keypair, msg2.as_bytes());
+    let (status, body) = post_json(&app, "/register", json!({
+        "nym": "active2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig2,
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn deleted_nym_reserved_from_others() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub1, sig1, keypair1) = sign_registration_with_keypair("reserved", TEST_DESCRIPTOR);
+
+    // User 1 registers and deletes
+    post_json(&app, "/register", json!({
+        "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1,
+    })).await;
+
+    let del_sig = sign_with_keypair(&keypair1, b"delete");
+    app.clone().oneshot(
+        Request::builder()
+            .method("DELETE").uri("/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"npub": npub1, "signature": del_sig}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+
+    // User 2 tries to claim the same nym — should fail
+    let (npub2, sig2) = sign_registration("reserved", TEST_DESCRIPTOR);
+    let (_, body) = post_json(&app, "/register", json!({
+        "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
+    })).await;
     assert_eq!(body["status"], "ERROR");
 
     cleanup_db(&pool).await;
