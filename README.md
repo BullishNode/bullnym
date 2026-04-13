@@ -164,6 +164,17 @@ cargo run
 # → curl http://localhost:8080/health → "ok"
 ```
 
+## Client implementation
+
+The reference client is a fork of the [Bull Bitcoin mobile wallet](https://github.com/BullishNode/bullbitcoin-mobile/tree/feature/lightning-address) (Flutter). It handles:
+
+- BIP85-derived receive wallet for Lightning Address payments
+- Nostr keypair derivation and profile publishing
+- Registration, deletion, and nym management
+- Auto-sweep from receive wallet to main wallet
+
+**Status: alpha.** The client is functional but not production-ready. Registration, wallet creation, and the settings UI work. Sweep and end-to-end payment flow are under testing.
+
 ## Dependencies
 
 - [boltz-client](https://github.com/SatoshiPortal/boltz-rust) — Boltz API V2, MuSig2 cooperative claims, Magic Routing Hints
