@@ -111,7 +111,7 @@ pub async fn reactivate_user(
 ) -> Result<User, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "UPDATE users SET nym = $2, ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
-         WHERE npub = $1 AND is_active = FALSE \
+         WHERE id = (SELECT id FROM users WHERE npub = $1 AND is_active = FALSE ORDER BY created_at DESC LIMIT 1) \
          RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
