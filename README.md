@@ -81,6 +81,37 @@ This gives two immediate benefits:
 
 The Nostr keypair is derived from the user's BIP85 master seed, making it deterministic and portable. If the user migrates to a different LNURL provider, they derive the same keypair, update their Nostr profile with the new `lud16`, and all their Nostr contacts can still pay them. The identity lives on Nostr, not on bullpay.ca.
 
+### LUD-22: Currency negotiation (bypassing Lightning)
+
+bullnym implements [LUD-22](https://github.com/BullishNode/luds/tree/lud-22-currency-negotiation) — a proposed extension to LNURL-pay that lets wallets choose which payment network to settle on.
+
+The LNURL metadata advertises supported networks:
+```json
+{
+  "currencies": [
+    { "code": "BTC", "name": "Bitcoin", "network": "bitcoin" },
+    { "code": "BTC", "name": "Liquid Bitcoin", "network": "liquid" }
+  ]
+}
+```
+
+When a wallet supports Liquid natively (like Bull Bitcoin), it can skip the Boltz swap entirely by requesting `&network=liquid` on the callback. Instead of returning a Lightning invoice, the server returns a Liquid address directly:
+
+```json
+{
+  "onchain": {
+    "network": "liquid",
+    "address": "lq1qq...",
+    "amount_sat": 50000,
+    "bip21": "liquidnetwork:lq1qq...?amount=0.00050000&assetid=6f02..."
+  }
+}
+```
+
+This is significant: the Lightning Address becomes a payment code that works across networks. A Liquid-capable wallet paying `francis@bullpay.ca` settles directly on Liquid with zero swap fees, zero routing fees, and no trust assumption — the server just derives the next address from the user's CT descriptor and hands it over. No preimage, no claim, no custody window.
+
+Wallets that don't support Liquid (or don't send `&network=`) get the standard Lightning flow via Boltz. LUD-22 is fully backwards compatible — the `currencies` field is ignored by wallets that don't understand it.
+
 ### Future: BIP 353 + Silent Payments
 
 Today, the Nostr profile points back to the server — if bullpay.ca is down, payments don't work regardless of what's on the relays. The "decentralized registry" becomes genuinely useful when Silent Payments (BIP 352) are supported.
