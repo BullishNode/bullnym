@@ -85,10 +85,39 @@ pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, s
 pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE npub = $1",
+         FROM users WHERE npub = $1 AND is_active = TRUE",
     )
     .bind(npub)
     .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_inactive_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+         FROM users WHERE npub = $1 AND is_active = FALSE \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(npub)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn reactivate_user(
+    pool: &PgPool,
+    npub: &str,
+    nym: &str,
+    ct_descriptor: &str,
+) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "UPDATE users SET nym = $2, ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
+         WHERE npub = $1 AND is_active = FALSE \
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+    )
+    .bind(npub)
+    .bind(nym)
+    .bind(ct_descriptor)
+    .fetch_one(pool)
     .await
 }
 

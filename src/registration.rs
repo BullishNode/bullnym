@@ -60,17 +60,23 @@ pub async fn register(
     )?;
 
     let message = format!("{}{}", req.nym, req.ct_descriptor);
-    tracing::info!(
-        "register: nym={} npub={}... sig={}... descriptor_len={} message_len={}",
-        req.nym,
-        &req.npub.get(..16).unwrap_or(&req.npub),
-        &req.signature.get(..16).unwrap_or(&req.signature),
-        req.ct_descriptor.len(),
-        message.len(),
-    );
     auth::verify_signature(&req.npub, message.as_bytes(), &req.signature)?;
 
-    db::create_user(&state.db, &req.nym, &req.npub, &req.ct_descriptor).await?;
+    // Check if npub already has an active registration
+    if let Some(active) = db::get_user_by_npub(&state.db, &req.npub).await? {
+        return Err(AppError::NymTaken(format!(
+            "this key already has an active address: {}@{}",
+            active.nym, state.config.domain
+        )));
+    }
+
+    // Check if npub has an inactive registration — reactivate with new nym
+    if let Some(_inactive) = db::get_inactive_user_by_npub(&state.db, &req.npub).await? {
+        db::reactivate_user(&state.db, &req.npub, &req.nym, &req.ct_descriptor).await?;
+    } else {
+        // Fresh registration
+        db::create_user(&state.db, &req.nym, &req.npub, &req.ct_descriptor).await?;
+    }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
     let nip05 = lightning_address.clone();
