@@ -1,3 +1,6 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+
 use axum::routing::{get, post, put};
 use axum::Router;
 use boltz_client::network::Network;
@@ -8,7 +11,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use pay_service::{boltz, claimer, config, lnurl, nostr, registration, AppState};
+use pay_service::{
+    boltz, claimer, config, ip_whitelist, lnurl, nostr, rate_limit, registration,
+    utxo::{self, UtxoBackend},
+    AppState,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,14 +57,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!("boltz service initialized ({}) webhook={}", config.boltz.api_url, webhook_url);
 
+    // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
+    let whitelist = ip_whitelist::IpWhitelist::parse(&config.rate_limit.ip_whitelist)
+        .map_err(|e| format!("ip_whitelist parse error: {e}"))?;
+    if !whitelist.is_empty() {
+        tracing::info!(
+            "ip_whitelist loaded ({} entries); whitelisted callers bypass proof + rate limits",
+            config.rate_limit.ip_whitelist.len(),
+        );
+    }
+
+    // Electrum backend for Liquid UTXO verification. Failing to connect at
+    // startup is logged but not fatal — the whitelist path still works.
+    let utxo_backend: Option<Arc<dyn UtxoBackend>> = match utxo::ElectrumClient::connect(
+        &config.electrum.liquid_url,
+        config.electrum.cache_ttl_secs,
+        config.electrum.cache_max_entries,
+    ) {
+        Ok(c) => {
+            tracing::info!("liquid electrum backend connected: {}", config.electrum.liquid_url);
+            Some(Arc::new(c))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "liquid electrum backend unavailable ({}): proof-of-funds callbacks will fail until reachable",
+                e
+            );
+            None
+        }
+    };
+
+    let rate_limiter = Arc::new(rate_limit::RateLimiter::new(
+        pool.clone(),
+        config.rate_limit.clone(),
+    ));
+
     let listen_addr = config.listen.clone();
-    let config = std::sync::Arc::new(config);
-    let boltz = std::sync::Arc::new(boltz_service);
+    let config = Arc::new(config);
+    let boltz = Arc::new(boltz_service);
+    let whitelist = Arc::new(whitelist);
 
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
         boltz: boltz.clone(),
+        ip_whitelist: whitelist.clone(),
+        rate_limiter: rate_limiter.clone(),
+        utxo_backend,
     };
 
     let cancel = CancellationToken::new();
@@ -71,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/register", put(registration::update_registration))
         .route("/register", axum::routing::delete(registration::delete_registration))
         .route("/register/lookup", get(registration::lookup_by_npub))
+        .route("/api/reservations/:nym", get(registration::list_reservations))
         .route("/webhook/boltz", post(claimer::webhook))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())
@@ -81,13 +128,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     tracing::info!("listening on {listen_addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("received shutdown signal");
-            cancel.cancel();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("received shutdown signal");
+        cancel.cancel();
+    })
+    .await?;
 
     tracing::info!("shutdown complete");
     Ok(())

@@ -109,7 +109,8 @@ pub async fn reactivate_user(
     nym: &str,
     ct_descriptor: &str,
 ) -> Result<User, sqlx::Error> {
-    sqlx::query_as::<_, User>(
+    let mut tx = pool.begin().await?;
+    let user = sqlx::query_as::<_, User>(
         "UPDATE users SET nym = $2, ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
          WHERE id = (SELECT id FROM users WHERE npub = $1 AND is_active = FALSE ORDER BY created_at DESC LIMIT 1) \
          RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
@@ -117,8 +118,16 @@ pub async fn reactivate_user(
     .bind(npub)
     .bind(nym)
     .bind(ct_descriptor)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    // Descriptor reset means any cached outpoint→addr_index mappings now
+    // point into the wrong keyspace. Drop them.
+    sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
+        .bind(&user.nym)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(user)
 }
 
 pub async fn create_user(
@@ -143,15 +152,24 @@ pub async fn update_user_descriptor(
     npub: &str,
     ct_descriptor: &str,
 ) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(
+    let mut tx = pool.begin().await?;
+    let user_opt = sqlx::query_as::<_, User>(
         "UPDATE users SET ct_descriptor = $2, next_addr_idx = 0 \
          WHERE npub = $1 AND is_active = TRUE \
          RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
     .bind(ct_descriptor)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(user) = &user_opt {
+        sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
+            .bind(&user.nym)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(user_opt)
 }
 
 pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
@@ -285,6 +303,157 @@ pub async fn get_unclaimed_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx:
     )
     .fetch_all(pool)
     .await
+}
+
+// --- Outpoint → address index reservations ---
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct OutpointAddress {
+    pub nym: String,
+    pub outpoint: String,
+    pub addr_index: i32,
+    pub pubkey: Option<String>,
+    pub fulfilled: bool,
+}
+
+pub async fn get_outpoint_address(
+    pool: &PgPool,
+    nym: &str,
+    outpoint: &str,
+) -> Result<Option<OutpointAddress>, sqlx::Error> {
+    sqlx::query_as::<_, OutpointAddress>(
+        "SELECT nym, outpoint, addr_index, pubkey, fulfilled \
+         FROM outpoint_addresses WHERE nym = $1 AND outpoint = $2",
+    )
+    .bind(nym)
+    .bind(outpoint)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_reservations_for_nym(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Vec<OutpointAddress>, sqlx::Error> {
+    sqlx::query_as::<_, OutpointAddress>(
+        "SELECT nym, outpoint, addr_index, pubkey, fulfilled \
+         FROM outpoint_addresses WHERE nym = $1 ORDER BY addr_index ASC",
+    )
+    .bind(nym)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_unfulfilled_reservations(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM outpoint_addresses \
+         WHERE nym = $1 AND fulfilled = FALSE",
+    )
+    .bind(nym)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Idempotent allocation: returns the cached addr_index if `(nym, outpoint)`
+/// was seen before; otherwise bumps `users.next_addr_idx` and inserts a new
+/// row. Runs inside a single transaction so concurrent callers can't race on
+/// the same nym.
+pub async fn allocate_outpoint_address(
+    pool: &PgPool,
+    nym: &str,
+    outpoint: &str,
+    pubkey_hex: &str,
+) -> Result<i32, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Cache hit?
+    let cached: Option<(i32,)> = sqlx::query_as(
+        "SELECT addr_index FROM outpoint_addresses \
+         WHERE nym = $1 AND outpoint = $2",
+    )
+    .bind(nym)
+    .bind(outpoint)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((idx,)) = cached {
+        tx.commit().await?;
+        return Ok(idx);
+    }
+
+    // Allocate next index on the nym's users row (SELECT FOR UPDATE via
+    // UPDATE ... RETURNING implicitly row-locks).
+    let (allocated_idx,): (i32,) = sqlx::query_as(
+        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
+         WHERE nym = $1 AND is_active = TRUE \
+         RETURNING next_addr_idx - 1",
+    )
+    .bind(nym)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO outpoint_addresses (nym, outpoint, addr_index, pubkey) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(nym)
+    .bind(outpoint)
+    .bind(allocated_idx)
+    .bind(pubkey_hex)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(allocated_idx)
+}
+
+pub async fn mark_reservation_fulfilled(
+    pool: &PgPool,
+    nym: &str,
+    outpoint: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE outpoint_addresses SET fulfilled = TRUE, fulfilled_at = NOW() \
+         WHERE nym = $1 AND outpoint = $2 AND fulfilled = FALSE",
+    )
+    .bind(nym)
+    .bind(outpoint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// --- Rate limit events ---
+
+pub async fn record_rate_limit_event(
+    pool: &PgPool,
+    bucket: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO rate_limit_events (bucket) VALUES ($1)")
+        .bind(bucket)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn count_rate_limit_events(
+    pool: &PgPool,
+    bucket: &str,
+    window_secs: u32,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM rate_limit_events \
+         WHERE bucket = $1 AND created_at > NOW() - ($2 || ' seconds')::interval",
+    )
+    .bind(bucket)
+    .bind(window_secs as i32)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 #[cfg(test)]

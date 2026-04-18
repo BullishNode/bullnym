@@ -4,15 +4,59 @@ use serde_json::json;
 
 #[derive(Debug)]
 pub enum AppError {
+    // --- Registration / identity ---
     NymNotFound(String),
     NymTaken(String),
     NymInvalid(String),
     InvalidDescriptor(String),
     InvalidAmount(String),
     AuthError(String),
+
+    // --- Proof of funds (Liquid callback) ---
+    ProofOfFundsRequired(u64),      // carries min_proof_value_sat for message template
+    ProofOfFundsInvalid(String),    // sig / format failure (reason is internal, user sees generic copy)
+    InsufficientFunds(u64),         // carries min_proof_value_sat
+    UtxoNotFound,
+    UtxoSpent,
+    ValueCommitmentInvalid,
+    PubkeyUtxoMismatch,
+
+    // --- Rate limiting ---
+    TooManyPendingReservations,
+    RateLimited,
+
+    // --- Backend failures ---
+    ElectrumError(String),
     BoltzError(String),
     ClaimError(String),
     DbError(String),
+}
+
+impl AppError {
+    /// Machine-readable code exposed to clients for error discrimination.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NymNotFound(_) => "NymNotFound",
+            Self::NymTaken(_) => "NymTaken",
+            Self::NymInvalid(_) => "NymInvalid",
+            Self::InvalidDescriptor(_) => "InvalidDescriptor",
+            Self::InvalidAmount(_) => "InvalidAmount",
+            Self::AuthError(_) => "AuthError",
+            Self::ProofOfFundsRequired(_) => "ProofOfFundsRequired",
+            Self::ProofOfFundsInvalid(_) => "ProofOfFundsInvalid",
+            Self::InsufficientFunds(_) => "InsufficientFunds",
+            Self::UtxoNotFound => "UtxoNotFound",
+            Self::UtxoSpent => "UtxoSpent",
+            Self::ValueCommitmentInvalid => "ValueCommitmentInvalid",
+            Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
+            Self::TooManyPendingReservations => "TooManyPendingReservations",
+            Self::RateLimited => "RateLimited",
+            Self::ElectrumError(_) => "ElectrumError",
+            Self::BoltzError(_) => "BoltzError",
+            Self::ClaimError(_) => "ClaimError",
+            Self::DbError(_) => "InternalError",
+        }
+    }
 }
 
 impl std::fmt::Display for AppError {
@@ -24,6 +68,16 @@ impl std::fmt::Display for AppError {
             Self::InvalidDescriptor(reason) => write!(f, "invalid descriptor: {reason}"),
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::AuthError(reason) => write!(f, "auth error: {reason}"),
+            Self::ProofOfFundsRequired(min) => write!(f, "proof of funds required (min {min} sat)"),
+            Self::ProofOfFundsInvalid(r) => write!(f, "proof of funds invalid: {r}"),
+            Self::InsufficientFunds(min) => write!(f, "insufficient funds (min {min} sat)"),
+            Self::UtxoNotFound => write!(f, "utxo not found"),
+            Self::UtxoSpent => write!(f, "utxo spent"),
+            Self::ValueCommitmentInvalid => write!(f, "value commitment invalid"),
+            Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
+            Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
+            Self::RateLimited => write!(f, "rate limited"),
+            Self::ElectrumError(msg) => write!(f, "electrum error: {msg}"),
             Self::BoltzError(msg) => write!(f, "swap service error: {msg}"),
             Self::ClaimError(msg) => write!(f, "claim error: {msg}"),
             Self::DbError(msg) => write!(f, "internal error: {msg}"),
@@ -33,29 +87,68 @@ impl std::fmt::Display for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        // Log full details server-side only
+        // Log full details server-side only.
         match &self {
             AppError::DbError(msg) => tracing::error!("database error: {msg}"),
             AppError::BoltzError(msg) => tracing::error!("boltz error: {msg}"),
             AppError::ClaimError(msg) => tracing::error!("claim error: {msg}"),
+            AppError::ElectrumError(msg) => tracing::error!("electrum error: {msg}"),
+            AppError::ProofOfFundsInvalid(msg) => tracing::warn!("proof invalid: {msg}"),
             _ => tracing::warn!("{self}"),
         }
 
-        // Sanitized user-facing message — no internal details
-        let reason = match &self {
-            AppError::NymNotFound(_) => "Lightning address not found",
-            AppError::NymTaken(_) => "This name is already taken",
-            AppError::NymInvalid(r) => r.as_str(),
-            AppError::InvalidDescriptor(_) => "Invalid wallet descriptor",
-            AppError::InvalidAmount(r) => r.as_str(),
-            AppError::AuthError(r) => r.as_str(),
-            AppError::BoltzError(_) => "Payment service temporarily unavailable",
-            AppError::ClaimError(_) => "Claim service temporarily unavailable",
-            AppError::DbError(_) => "Internal server error",
+        // User-facing copy. Must be safe to show to arbitrary payers.
+        let reason: String = match &self {
+            AppError::NymNotFound(_) => "Lightning address not found".into(),
+            AppError::NymTaken(_) => "This name is already taken".into(),
+            AppError::NymInvalid(r) => r.clone(),
+            AppError::InvalidDescriptor(_) => "Invalid wallet descriptor".into(),
+            AppError::InvalidAmount(r) => r.clone(),
+            AppError::AuthError(r) => r.clone(),
+            AppError::ProofOfFundsRequired(min) => format!(
+                "To request payment details from this Lightning Address, \
+                 you must have at least {min} sats in your wallet."
+            ),
+            AppError::InsufficientFunds(min) => format!(
+                "To pay this Lightning Address, you need at least {min} \
+                 sats in your wallet."
+            ),
+            AppError::ProofOfFundsInvalid(_) => {
+                "Your wallet could not prove it has enough funds. Please \
+                 restart your wallet and try again.".into()
+            }
+            AppError::UtxoNotFound => {
+                "The funds your wallet tried to use aren't yet visible on \
+                 the Liquid network. Please wait a moment for them to \
+                 confirm, then try again.".into()
+            }
+            AppError::UtxoSpent => {
+                "The funds your wallet tried to use have already been spent \
+                 in another transaction.".into()
+            }
+            AppError::ValueCommitmentInvalid => {
+                "Your wallet's balance information doesn't match the Liquid \
+                 blockchain. Please refresh your wallet and try again.".into()
+            }
+            AppError::PubkeyUtxoMismatch => {
+                "Your wallet provided funds that don't match its signature. \
+                 This is likely a wallet bug — please report it.".into()
+            }
+            AppError::TooManyPendingReservations => {
+                "This recipient has too many payments waiting. Please try \
+                 again in a few minutes.".into()
+            }
+            AppError::RateLimited => {
+                "You've made too many requests to this Lightning Address. \
+                 Please wait and try again.".into()
+            }
+            AppError::ElectrumError(_) => "Liquid network temporarily unavailable".into(),
+            AppError::BoltzError(_) => "Payment service temporarily unavailable".into(),
+            AppError::ClaimError(_) => "Claim service temporarily unavailable".into(),
+            AppError::DbError(_) => "Internal server error".into(),
         };
 
-        // Non-auth errors use LNURL format (HTTP 200 + status/reason).
-        // Auth errors use standard HTTP 401.
+        // Auth errors: standard HTTP 401. Everything else: HTTP 200 + LNURL body.
         let status = match &self {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
             _ => StatusCode::OK,
@@ -63,6 +156,7 @@ impl IntoResponse for AppError {
 
         let body = json!({
             "status": "ERROR",
+            "code": self.code(),
             "reason": reason,
         });
 
@@ -83,4 +177,3 @@ impl From<sqlx::Error> for AppError {
         AppError::DbError(e.to_string())
     }
 }
-

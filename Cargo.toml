@@ -22,6 +22,9 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 dotenvy = "0.15"
 tokio-util = "0.7"
+async-trait = "0.1"
+electrum-client = "0.21"
+ipnet = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"

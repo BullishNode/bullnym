@@ -1,15 +1,20 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth;
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::AppState;
+
+/// Accepted clock-skew window for the `reservations` auth timestamp. Wider
+/// than NIP-98 default (60s) because mobile clocks drift more than desktop.
+const RESERVATIONS_TS_WINDOW_SECS: u64 = 300;
 
 static NYM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\-]{1,30}[a-z0-9]$").unwrap());
@@ -161,6 +166,79 @@ pub async fn lookup_by_npub(
         return Ok(Json(LookupResponse { nym: user.nym, active: false }));
     }
     Err(AppError::NymNotFound("no registration for this key".to_string()))
+}
+
+// --- Reservation sync ---
+
+#[derive(Deserialize)]
+pub struct ReservationsAuthParams {
+    pub ts: u64,
+    pub sig: String,
+    pub npub: String,
+}
+
+#[derive(Serialize)]
+pub struct ReservationItem {
+    pub outpoint: String,
+    pub addr_index: i32,
+    pub fulfilled: bool,
+}
+
+#[derive(Serialize)]
+pub struct ReservationsResponse {
+    pub reservations: Vec<ReservationItem>,
+    pub next_addr_idx: i32,
+}
+
+/// GET /api/reservations/:nym
+///
+/// Auth via Schnorr signature over `sha256("reservations:" || nym || ":" || ts)`,
+/// where ts is a unix timestamp within ±RESERVATIONS_TS_WINDOW_SECS of server
+/// clock. The signing key must match the `npub` on record for this nym.
+pub async fn list_reservations(
+    State(state): State<AppState>,
+    Path(nym): Path<String>,
+    Query(params): Query<ReservationsAuthParams>,
+) -> Result<Json<ReservationsResponse>, AppError> {
+    // Clock skew check.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let skew = if now > params.ts { now - params.ts } else { params.ts - now };
+    if skew > RESERVATIONS_TS_WINDOW_SECS {
+        return Err(AppError::AuthError("timestamp outside allowed window".into()));
+    }
+
+    // Verify sig over "reservations:{nym}:{ts}".
+    let message = format!("reservations:{}:{}", nym, params.ts);
+    auth::verify_signature(&params.npub, message.as_bytes(), &params.sig)?;
+
+    // Bind to the nym owner on record.
+    let user = db::get_user_by_nym(&state.db, &nym)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+    if !user.is_active {
+        return Err(AppError::NymNotFound(nym));
+    }
+    if user.npub != params.npub {
+        return Err(AppError::AuthError("signer does not own this nym".into()));
+    }
+
+    let rows = db::list_reservations_for_nym(&state.db, &nym).await?;
+    let reservations = rows
+        .into_iter()
+        .map(|r| ReservationItem {
+            outpoint: r.outpoint,
+            addr_index: r.addr_index,
+            fulfilled: r.fulfilled,
+        })
+        .collect();
+
+    Ok(Json(ReservationsResponse {
+        reservations,
+        next_addr_idx: user.next_addr_idx,
+    }))
 }
 
 #[cfg(test)]

@@ -10,7 +10,11 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
-use pay_service::config::{BoltzConfig, Config, LimitsConfig};
+use pay_service::config::{
+    BoltzConfig, Config, ElectrumConfig, LimitsConfig, ProofConfig, RateLimitConfig,
+};
+use pay_service::ip_whitelist::IpWhitelist;
+use pay_service::rate_limit::RateLimiter;
 use pay_service::{claimer, lnurl, nostr, registration, AppState};
 
 use boltz_client::network::Network;
@@ -44,6 +48,9 @@ fn test_config() -> Config {
             electrum_url: "blockstream.info:995".to_string(),
         },
         limits: LimitsConfig::default(),
+        proof: ProofConfig::default(),
+        rate_limit: RateLimitConfig::default(),
+        electrum: ElectrumConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
     }
@@ -56,10 +63,15 @@ fn test_state(pool: PgPool) -> AppState {
         Network::Mainnet,
     ).unwrap();
 
+    let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), RateLimitConfig::default()));
+
     AppState {
         db: pool,
         config: Arc::new(test_config()),
         boltz: Arc::new(BoltzService::new("http://127.0.0.1:1", swap_master_key, None)),
+        ip_whitelist: Arc::new(IpWhitelist::default()),
+        rate_limiter,
+        utxo_backend: None,
     }
 }
 
@@ -577,4 +589,34 @@ async fn deleted_nym_reserved_from_others() {
     assert_eq!(body["status"], "ERROR");
 
     cleanup_db(&pool).await;
+}
+
+#[test]
+fn schnorr_sign_verify_roundtrip() {
+    // This tests the exact same flow the mobile app uses:
+    // 1. Generate a keypair
+    // 2. Sign SHA256(message) with schnorr
+    // 3. Verify with our auth::verify_signature
+    
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use sha2::{Digest, Sha256};
+    
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (xonly, _parity) = keypair.x_only_public_key();
+    let npub_hex = xonly.to_string();
+    
+    let message = b"tester1ct(slip77(...),elwpkh(...))";
+    let digest = Sha256::digest(message);
+    let msg = secp256k1::Message::from_digest(*digest.as_ref());
+    let sig = secp.sign_schnorr(&msg, &keypair);
+    let sig_hex = sig.to_string();
+    
+    println!("npub: {npub_hex}");
+    println!("sig:  {sig_hex}");
+    println!("sig len: {}", sig_hex.len());
+    
+    // Verify using our auth module
+    let result = pay_service::auth::verify_signature(&npub_hex, message, &sig_hex);
+    assert!(result.is_ok(), "Signature verification failed: {:?}", result);
 }

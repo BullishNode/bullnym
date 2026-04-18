@@ -1,11 +1,20 @@
-use axum::extract::{Path, Query, State};
+use std::net::SocketAddr;
+use std::str::FromStr;
+
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
+use lwk_wollet::elements;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
+use crate::ip_whitelist;
+use crate::utxo::{
+    script_matches_pubkey, verify_ownership_sig, verify_value_commitment, ParsedOutpoint,
+};
 use crate::AppState;
 
 // --- Metadata response (LUD-06 + extensions) ---
@@ -37,6 +46,37 @@ pub struct CallbackParams {
     pub amount: u64,
     pub comment: Option<String>,
     pub network: Option<String>,
+
+    // Proof-of-funds fields (required for `network=liquid` unless caller is
+    // on the IP whitelist).
+    pub outpoint: Option<String>,
+    pub pubkey: Option<String>,
+    pub sig: Option<String>,
+    pub value: Option<u64>,
+    pub value_bf: Option<String>,
+    pub asset_bf: Option<String>,
+}
+
+struct ProofFields {
+    outpoint: String,
+    pubkey: String,
+    sig: String,
+    value: u64,
+    value_bf: String,
+    asset_bf: String,
+}
+
+impl CallbackParams {
+    fn take_proof(&self) -> Option<ProofFields> {
+        Some(ProofFields {
+            outpoint: self.outpoint.clone()?,
+            pubkey: self.pubkey.clone()?,
+            sig: self.sig.clone()?,
+            value: self.value?,
+            value_bf: self.value_bf.clone()?,
+            asset_bf: self.asset_bf.clone()?,
+        })
+    }
 }
 
 // --- Callback response variants ---
@@ -127,8 +167,12 @@ pub async fn metadata(
 pub async fn callback(
     State(state): State<AppState>,
     Path(nym): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Result<axum::response::Response, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    // --- Amount validation (always) ---
     if params.amount < state.config.limits.min_sendable_msat {
         return Err(AppError::InvalidAmount(format!(
             "minimum is {} msat",
@@ -157,18 +201,129 @@ pub async fn callback(
         return Err(AppError::NymNotFound(nym.clone()));
     }
 
-    let addr_index = db::allocate_address_index(&state.db, &nym)
-        .await?
-        .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+    // --- Caller IP resolution + whitelist check ---
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let caller_ip = ip_whitelist::resolve_caller_ip(
+        peer.map(|p| p.ip()),
+        xff,
+        state.config.rate_limit.trust_forwarded_for,
+    );
+    let is_whitelisted = match caller_ip {
+        Some(ip) => state.ip_whitelist.contains(ip),
+        None => false,
+    };
 
-    let addr_index_u32 = u32::try_from(addr_index).map_err(|_| {
-        AppError::DbError("address index overflow".to_string())
-    })?;
+    // Per-IP limit applies to both Liquid and Lightning paths (cheap first
+    // gate, before any sig verify or Boltz call). Whitelisted callers skip.
+    if !is_whitelisted {
+        if let Some(ip) = caller_ip {
+            state.rate_limiter.check_per_ip(ip).await?;
+        }
+    }
 
-    let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
-
-    // Liquid-direct: return address without Boltz swap
+    // --- Liquid path ---
     if params.network.as_deref() == Some("liquid") {
+        let addr_index = if is_whitelisted {
+            // Trusted caller: bypass proof + all rate limits. Still allocate
+            // a fresh addr_index so they can receive.
+            let idx = db::allocate_address_index(&state.db, &nym)
+                .await?
+                .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+            idx
+        } else {
+            let proof = params
+                .take_proof()
+                .ok_or(AppError::ProofOfFundsRequired(state.config.proof.min_proof_value_sat))?;
+
+            // Sig verify.
+            let pubkey = verify_ownership_sig(
+                state.config.proof.message_tag.as_bytes(),
+                &nym,
+                &proof.outpoint,
+                &proof.pubkey,
+                &proof.sig,
+            )?;
+
+            // Per-pubkey limit.
+            state.rate_limiter.check_per_pubkey(&proof.pubkey).await?;
+
+            // Idempotent cache lookup.
+            if let Some(cached) = db::get_outpoint_address(&state.db, &nym, &proof.outpoint).await? {
+                cached.addr_index
+            } else {
+                // Per-nym pending reservation cap.
+                state.rate_limiter.check_pending_reservations(&nym).await?;
+
+                // Everything past this point requires on-chain verification.
+                let backend = state
+                    .utxo_backend
+                    .as_ref()
+                    .ok_or_else(|| AppError::ElectrumError("no blockchain backend configured".into()))?;
+
+                state.rate_limiter.check_electrum().await?;
+
+                let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
+                let raw_tx = backend.get_raw_tx(&parsed.txid_hex).await?;
+                let tx: elements::Transaction = elements::encode::deserialize(&raw_tx)
+                    .map_err(|e| AppError::ElectrumError(format!("tx decode: {e}")))?;
+
+                let txout = tx
+                    .output
+                    .get(parsed.vout as usize)
+                    .ok_or(AppError::UtxoNotFound)?;
+
+                if !script_matches_pubkey(&txout.script_pubkey, &pubkey) {
+                    return Err(AppError::PubkeyUtxoMismatch);
+                }
+
+                let onchain_commitment = match &txout.value {
+                    elements::confidential::Value::Confidential(c) => c,
+                    _ => return Err(AppError::ProofOfFundsInvalid(
+                        "expected confidential value on Liquid UTXO".into(),
+                    )),
+                };
+
+                let asset_id = elements::issuance::AssetId::from_str(LBTC_ASSET_ID)
+                    .expect("built-in L-BTC asset id parses");
+
+                let ok = verify_value_commitment(
+                    &asset_id,
+                    proof.value,
+                    &proof.value_bf,
+                    &proof.asset_bf,
+                    onchain_commitment,
+                )?;
+                if !ok {
+                    return Err(AppError::ValueCommitmentInvalid);
+                }
+
+                if proof.value < state.config.proof.min_proof_value_sat {
+                    return Err(AppError::InsufficientFunds(
+                        state.config.proof.min_proof_value_sat,
+                    ));
+                }
+
+                // Unspent check must be fresh.
+                let unspent = backend
+                    .is_unspent(&txout.script_pubkey, &parsed.txid_hex, parsed.vout)
+                    .await?;
+                if !unspent {
+                    return Err(AppError::UtxoSpent);
+                }
+
+                // Atomic allocation + cache insert.
+                db::allocate_outpoint_address(&state.db, &nym, &proof.outpoint, &proof.pubkey)
+                    .await?
+            }
+        };
+
+        let addr_index_u32 = u32::try_from(addr_index).map_err(|_| {
+            AppError::DbError("address index overflow".to_string())
+        })?;
+        let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
+
         let bip21 = format!(
             "liquidnetwork:{address}?amount={}&assetid={LBTC_ASSET_ID}",
             format_btc_amount(amount_sat),
@@ -184,6 +339,22 @@ pub async fn callback(
         };
         return Ok(Json(resp).into_response());
     }
+
+    // --- Lightning path ---
+
+    if !is_whitelisted {
+        state.rate_limiter.check_lightning_per_nym(&nym).await?;
+    }
+
+    let addr_index = db::allocate_address_index(&state.db, &nym)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+
+    let addr_index_u32 = u32::try_from(addr_index).map_err(|_| {
+        AppError::DbError("address index overflow".to_string())
+    })?;
+
+    let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
     // Lightning: create Boltz reverse swap
     let swap_key_index = db::next_swap_key_index(&state.db)
