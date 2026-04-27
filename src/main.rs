@@ -21,6 +21,14 @@ use pay_service::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
+    // rustls 0.23 panics if more than one CryptoProvider feature is linked
+    // and no process-level default is selected. Both aws-lc-rs and ring come
+    // in transitively (electrum-client + lwk + boltz-client), so install one
+    // explicitly before any TLS handshake.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "rustls CryptoProvider already installed")?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

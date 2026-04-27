@@ -25,6 +25,7 @@ tokio-util = "0.7"
 async-trait = "0.1"
 electrum-client = "0.21"
 ipnet = "2"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

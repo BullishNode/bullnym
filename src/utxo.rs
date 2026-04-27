@@ -399,28 +399,50 @@ impl UtxoBackend for ElectrumClient {
         txid_hex: &str,
         vout: u32,
     ) -> Result<bool, AppError> {
-        // script_list_unspent wants a bitcoin::Script; the electrum protocol
-        // hashes the raw bytes, so the script's wire encoding is what matters.
-        let script_bytes = script_pubkey.as_bytes().to_vec();
+        // The high-level `script_list_unspent` in electrum-client is hard-coded
+        // to deserialize `value` as u64 (Bitcoin shape). Liquid's electrs
+        // returns a confidential value commitment (a sequence) for the same
+        // field, which fails JSON deserialization with
+        //   "invalid type: sequence, expected u64".
+        // Use raw_call and iterate the JSON manually, ignoring `value` — we
+        // only care whether the (txid, vout) pair is in the unspent list.
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
         let txid = txid_hex.to_string();
 
         let state = self.state.clone();
         let urls = self.urls.clone();
-        let utxos = tokio::task::spawn_blocking(move || {
-            let btc_script = electrum_client::bitcoin::ScriptBuf::from_bytes(script_bytes);
-            run_op_blocking(&state, &urls, "script_list_unspent", |client| {
+        let result = tokio::task::spawn_blocking(move || {
+            run_op_blocking(&state, &urls, "scripthash.listunspent", |client| {
                 use electrum_client::ElectrumApi;
-                client.script_list_unspent(btc_script.as_script())
+                client.raw_call(
+                    "blockchain.scripthash.listunspent",
+                    vec![electrum_client::Param::String(scripthash_hex.clone())],
+                )
             })
         })
         .await
         .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
-        .map_err(|e| AppError::ElectrumError(format!("script_list_unspent: {e}")))?;
+        .map_err(|e| AppError::ElectrumError(format!("scripthash.listunspent: {e}")))?;
+
+        let utxos = result.as_array().ok_or_else(|| {
+            AppError::ElectrumError(
+                "scripthash.listunspent: expected JSON array response".into(),
+            )
+        })?;
 
         Ok(utxos.iter().any(|u| {
-            u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout
+            u.get("tx_hash").and_then(|v| v.as_str()) == Some(txid.as_str())
+                && u.get("tx_pos").and_then(|v| v.as_u64()) == Some(vout as u64)
         }))
     }
+}
+
+/// Electrum scripthash convention: sha256 of the scriptpubkey wire bytes,
+/// reversed to little-endian display order, and hex-encoded.
+fn electrum_scripthash_hex(script: &elements::Script) -> String {
+    let mut digest: [u8; 32] = Sha256::digest(script.as_bytes()).into();
+    digest.reverse();
+    hex::encode(digest)
 }
 
 #[cfg(test)]
