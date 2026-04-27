@@ -172,16 +172,24 @@ impl Default for ElectrumConfig {
 impl ElectrumConfig {
     /// Resolve the configured URLs into a single ordered list, accepting
     /// either the legacy single-string field or the new list field (or both).
+    /// URLs without an explicit `ssl://` or `tcp://` scheme are normalized to
+    /// `ssl://` — every public Liquid Electrum server we know of uses TLS, so
+    /// a bare `host:port` was the source of a long-standing PF outage where
+    /// `electrum-client` defaulted to plain TCP against a TLS port.
     pub fn urls(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if let Some(u) = &self.liquid_url {
             if !u.is_empty() {
-                out.push(u.clone());
+                out.push(normalize_electrum_url(u));
             }
         }
         for u in &self.liquid_urls {
-            if !u.is_empty() && !out.contains(u) {
-                out.push(u.clone());
+            if u.is_empty() {
+                continue;
+            }
+            let n = normalize_electrum_url(u);
+            if !out.contains(&n) {
+                out.push(n);
             }
         }
         if out.is_empty() {
@@ -191,7 +199,22 @@ impl ElectrumConfig {
     }
 }
 
-fn default_liquid_electrum_url() -> String { "blockstream.info:995".to_string() }
+/// Add a default `ssl://` prefix to URLs that lack a scheme. Logs a warning
+/// so operators can fix their configs.
+pub fn normalize_electrum_url(raw: &str) -> String {
+    if raw.starts_with("ssl://") || raw.starts_with("tcp://") {
+        raw.to_string()
+    } else {
+        tracing::warn!(
+            "electrum url '{}' has no ssl:// or tcp:// scheme; assuming ssl://. \
+             Add an explicit prefix in config to silence this warning.",
+            raw
+        );
+        format!("ssl://{}", raw)
+    }
+}
+
+fn default_liquid_electrum_url() -> String { "ssl://blockstream.info:995".to_string() }
 fn default_electrum_cache_ttl() -> u64 { 3600 }
 fn default_electrum_cache_max() -> usize { 10_000 }
 
@@ -240,7 +263,7 @@ mod tests {
             cache_ttl_secs: 0,
             cache_max_entries: 0,
         };
-        assert_eq!(cfg.urls(), vec!["a.example:50001".to_string()]);
+        assert_eq!(cfg.urls(), vec!["ssl://a.example:50001".to_string()]);
     }
 
     #[test]
@@ -251,7 +274,10 @@ mod tests {
             cache_ttl_secs: 0,
             cache_max_entries: 0,
         };
-        assert_eq!(cfg.urls(), vec!["a:1".to_string(), "b:2".to_string()]);
+        assert_eq!(
+            cfg.urls(),
+            vec!["ssl://a:1".to_string(), "ssl://b:2".to_string()]
+        );
     }
 
     #[test]
@@ -264,7 +290,7 @@ mod tests {
         };
         assert_eq!(
             cfg.urls(),
-            vec!["primary:1".to_string(), "secondary:2".to_string()]
+            vec!["ssl://primary:1".to_string(), "ssl://secondary:2".to_string()]
         );
     }
 
@@ -277,6 +303,7 @@ mod tests {
             cache_max_entries: 0,
         };
         assert_eq!(cfg.urls(), vec![default_liquid_electrum_url()]);
+        assert!(cfg.urls()[0].starts_with("ssl://"));
     }
 
     #[test]
@@ -287,6 +314,26 @@ mod tests {
             cache_ttl_secs: 0,
             cache_max_entries: 0,
         };
-        assert_eq!(cfg.urls(), vec!["a:1".to_string()]);
+        assert_eq!(cfg.urls(), vec!["ssl://a:1".to_string()]);
+    }
+
+    #[test]
+    fn electrum_urls_preserves_explicit_scheme() {
+        let cfg = ElectrumConfig {
+            liquid_url: None,
+            liquid_urls: vec![
+                "tcp://localhost:50001".to_string(),
+                "ssl://example:995".to_string(),
+            ],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(
+            cfg.urls(),
+            vec![
+                "tcp://localhost:50001".to_string(),
+                "ssl://example:995".to_string(),
+            ]
+        );
     }
 }
