@@ -183,6 +183,72 @@ pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, 
     .await
 }
 
+/// Outcome of a purge attempt.
+pub enum PurgeOutcome {
+    /// Purge applied. Returns the (now-deactivated) user row.
+    Purged(User),
+    /// No active user exists for this npub.
+    NotFound,
+    /// Refused because in-flight swaps still hold live claim secrets.
+    InFlightSwaps(usize),
+}
+
+/// Hard-delete every swap_record and outpoint_address tied to this npub's
+/// active nym, then deactivate the user row while keeping `nym` and `npub`
+/// so the address stays reserved and the original owner can re-register.
+///
+/// Refuses if any swap is non-terminal: those rows hold the only copy of
+/// `claim_key_hex` / `preimage_hex` needed to redeem a Boltz lockup.
+pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let user_opt = sqlx::query_as::<_, User>(
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+         FROM users WHERE npub = $1 AND is_active = TRUE FOR UPDATE",
+    )
+    .bind(npub)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(user) = user_opt else {
+        tx.rollback().await?;
+        return Ok(PurgeOutcome::NotFound);
+    };
+
+    let in_flight: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM swap_records \
+         WHERE nym = $1 AND status NOT IN ('claimed', 'expired')",
+    )
+    .bind(&user.nym)
+    .fetch_one(&mut *tx)
+    .await?;
+    if in_flight > 0 {
+        tx.rollback().await?;
+        return Ok(PurgeOutcome::InFlightSwaps(in_flight as usize));
+    }
+
+    sqlx::query("DELETE FROM swap_records WHERE nym = $1")
+        .bind(&user.nym)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
+        .bind(&user.nym)
+        .execute(&mut *tx)
+        .await?;
+
+    let purged = sqlx::query_as::<_, User>(
+        "UPDATE users SET is_active = FALSE, ct_descriptor = '', next_addr_idx = 0 \
+         WHERE id = $1 \
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(PurgeOutcome::Purged(purged))
+}
+
 // --- Address & swap key allocation ---
 
 pub async fn next_swap_key_index(pool: &PgPool) -> Result<u64, sqlx::Error> {

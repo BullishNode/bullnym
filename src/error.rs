@@ -11,6 +11,7 @@ pub enum AppError {
     InvalidDescriptor(String),
     InvalidAmount(String),
     AuthError(String),
+    PurgeBlocked(usize),
 
     // --- Proof of funds (Liquid callback) ---
     ProofOfFundsRequired(u64),      // carries min_proof_value_sat for message template
@@ -42,6 +43,7 @@ impl AppError {
             Self::InvalidDescriptor(_) => "InvalidDescriptor",
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::AuthError(_) => "AuthError",
+            Self::PurgeBlocked(_) => "PurgeBlocked",
             Self::ProofOfFundsRequired(_) => "ProofOfFundsRequired",
             Self::ProofOfFundsInvalid(_) => "ProofOfFundsInvalid",
             Self::InsufficientFunds(_) => "InsufficientFunds",
@@ -68,6 +70,7 @@ impl std::fmt::Display for AppError {
             Self::InvalidDescriptor(reason) => write!(f, "invalid descriptor: {reason}"),
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::AuthError(reason) => write!(f, "auth error: {reason}"),
+            Self::PurgeBlocked(n) => write!(f, "purge blocked: {n} in-flight swap(s)"),
             Self::ProofOfFundsRequired(min) => write!(f, "proof of funds required (min {min} sat)"),
             Self::ProofOfFundsInvalid(r) => write!(f, "proof of funds invalid: {r}"),
             Self::InsufficientFunds(min) => write!(f, "insufficient funds (min {min} sat)"),
@@ -105,6 +108,10 @@ impl IntoResponse for AppError {
             AppError::InvalidDescriptor(_) => "Invalid wallet descriptor".into(),
             AppError::InvalidAmount(r) => r.clone(),
             AppError::AuthError(r) => r.clone(),
+            AppError::PurgeBlocked(n) => format!(
+                "Cannot purge while {n} swap(s) are still in flight. \
+                 Wait for them to settle or expire, then try again."
+            ),
             AppError::ProofOfFundsRequired(min) => format!(
                 "To request payment details from this Lightning Address, \
                  you must have at least {min} sats in your wallet."

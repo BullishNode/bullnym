@@ -591,6 +591,205 @@ async fn deleted_nym_reserved_from_others() {
     cleanup_db(&pool).await;
 }
 
+// --- Purge (destructive delete with reservation) ---
+
+async fn delete_request(app: &Router, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn insert_swap(pool: &PgPool, nym: &str, status: &str, addr_idx: i32) {
+    sqlx::query(
+        "INSERT INTO swap_records \
+         (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
+          preimage_hex, claim_key_hex, boltz_response_json, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(nym)
+    .bind(format!("boltz-{nym}-{addr_idx}"))
+    .bind(format!("lq1addr{addr_idx}"))
+    .bind(addr_idx)
+    .bind(1000i64)
+    .bind("lnbc10n1...")
+    .bind("aa".repeat(32))
+    .bind("bb".repeat(32))
+    .bind("{}")
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn purge_with_no_swaps_scrubs_descriptor_and_keeps_nym_reserved() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("purger1", TEST_DESCRIPTOR);
+    post_json(&app, "/register", json!({
+        "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+
+    let purge_sig = sign_with_keypair(&keypair, b"purge");
+    let (status, _) = delete_request(&app, json!({
+        "npub": npub, "signature": purge_sig, "purge": true,
+    })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // LNURL no longer resolves
+    let (_, body) = get_path(&app, "/.well-known/lnurlp/purger1").await;
+    assert_eq!(body["status"], "ERROR");
+
+    // Row survives with scrubbed descriptor and is_active=false
+    let row: (bool, String) = sqlx::query_as(
+        "SELECT is_active, ct_descriptor FROM users WHERE nym = $1",
+    )
+    .bind("purger1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!row.0);
+    assert_eq!(row.1, "");
+
+    // Another npub cannot claim the reserved nym
+    let (npub2, sig2) = sign_registration("purger1", TEST_DESCRIPTOR);
+    let (_, body) = post_json(&app, "/register", json!({
+        "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
+    })).await;
+    assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn purge_blocked_when_pending_swap_exists() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("purger2", TEST_DESCRIPTOR);
+    post_json(&app, "/register", json!({
+        "nym": "purger2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+    insert_swap(&pool, "purger2", "pending", 0).await;
+    insert_swap(&pool, "purger2", "lockup_confirmed", 1).await;
+
+    let purge_sig = sign_with_keypair(&keypair, b"purge");
+    let (_, body) = delete_request(&app, json!({
+        "npub": npub, "signature": purge_sig, "purge": true,
+    })).await;
+    assert_eq!(body["code"], "PurgeBlocked");
+    assert!(body["reason"].as_str().unwrap().contains("2"));
+
+    // User still active, swaps untouched
+    let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE nym = 'purger2'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(active);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger2'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn purge_drops_only_terminal_swap_history() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("purger3", TEST_DESCRIPTOR);
+    post_json(&app, "/register", json!({
+        "nym": "purger3", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+    insert_swap(&pool, "purger3", "claimed", 0).await;
+    insert_swap(&pool, "purger3", "expired", 1).await;
+
+    let purge_sig = sign_with_keypair(&keypair, b"purge");
+    let (status, _) = delete_request(&app, json!({
+        "npub": npub, "signature": purge_sig, "purge": true,
+    })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger3'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn delete_signature_does_not_authorize_purge() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("purger4", TEST_DESCRIPTOR);
+    post_json(&app, "/register", json!({
+        "nym": "purger4", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+    insert_swap(&pool, "purger4", "claimed", 0).await;
+
+    // Sign the soft-delete challenge but try to use it for purge
+    let delete_sig = sign_with_keypair(&keypair, b"delete");
+    let (status, _) = delete_request(&app, json!({
+        "npub": npub, "signature": delete_sig, "purge": true,
+    })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // User still active, swap_records intact
+    let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE nym = 'purger4'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(active);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger4'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn purge_then_owner_reregisters_same_nym() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, keypair) = sign_registration_with_keypair("purger5", TEST_DESCRIPTOR);
+    post_json(&app, "/register", json!({
+        "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+    })).await;
+
+    let purge_sig = sign_with_keypair(&keypair, b"purge");
+    delete_request(&app, json!({
+        "npub": npub, "signature": purge_sig, "purge": true,
+    })).await;
+
+    // Same owner re-registers same nym
+    let re_sig = sign_with_keypair(&keypair, format!("{}{}", "purger5", TEST_DESCRIPTOR).as_bytes());
+    let (status, body) = post_json(&app, "/register", json!({
+        "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["nym"], "purger5");
+
+    cleanup_db(&pool).await;
+}
+
 #[test]
 fn schnorr_sign_verify_roundtrip() {
     // This tests the exact same flow the mobile app uses:

@@ -124,21 +124,44 @@ pub async fn update_registration(
 pub struct DeleteRequest {
     pub npub: String,
     pub signature: String,
+    /// When true, hard-delete all swap_records / outpoint_addresses for the
+    /// nym in addition to deactivating it. The nym row itself is kept so the
+    /// name stays reserved and the original npub can re-register it.
+    /// Requires the signature to be over `b"purge"` (not `b"delete"`).
+    #[serde(default)]
+    pub purge: bool,
 }
 
-/// DELETE /register — deactivate a Lightning Address registration
+/// DELETE /register — deactivate a Lightning Address registration.
+///
+/// `purge=false` (default): soft-delete only — preserves `swap_records`.
+/// `purge=true`: also drops swap history. Refuses if non-terminal swaps
+/// exist (their rows hold the only copy of the Boltz claim key).
 pub async fn delete_registration(
     State(state): State<AppState>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<StatusCode, AppError> {
-    auth::verify_signature(&req.npub, b"delete", &req.signature)?;
+    let challenge: &[u8] = if req.purge { b"purge" } else { b"delete" };
+    auth::verify_signature(&req.npub, challenge, &req.signature)?;
 
-    let user = db::deactivate_user(&state.db, &req.npub)
-        .await?
-        .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
-
-    tracing::info!("deactivated registration for {}", user.nym);
-    Ok(StatusCode::NO_CONTENT)
+    if req.purge {
+        match db::purge_user(&state.db, &req.npub).await? {
+            db::PurgeOutcome::Purged(user) => {
+                tracing::info!("purged registration for {}", user.nym);
+                Ok(StatusCode::NO_CONTENT)
+            }
+            db::PurgeOutcome::NotFound => Err(AppError::NymNotFound(
+                "no registration found for this key".to_string(),
+            )),
+            db::PurgeOutcome::InFlightSwaps(n) => Err(AppError::PurgeBlocked(n)),
+        }
+    } else {
+        let user = db::deactivate_user(&state.db, &req.npub).await?.ok_or_else(
+            || AppError::NymNotFound("no registration found for this key".to_string()),
+        )?;
+        tracing::info!("deactivated registration for {}", user.nym);
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // --- Lookup ---
