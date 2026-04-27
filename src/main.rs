@@ -67,22 +67,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Electrum backend for Liquid UTXO verification. Failing to connect at
-    // startup is logged but not fatal — the whitelist path still works.
+    // Electrum backend for Liquid UTXO verification. The client is resilient
+    // to stale TCP connections and rotates through `liquid_urls` on failure;
+    // even if no URL is reachable at startup it constructs successfully and
+    // reconnects lazily on the first PF request.
+    let electrum_urls = config.electrum.urls();
+    tracing::info!(
+        "liquid electrum backend configured with {} url(s): {}",
+        electrum_urls.len(),
+        electrum_urls.join(", ")
+    );
     let utxo_backend: Option<Arc<dyn UtxoBackend>> = match utxo::ElectrumClient::connect(
-        &config.electrum.liquid_url,
+        electrum_urls,
         config.electrum.cache_ttl_secs,
         config.electrum.cache_max_entries,
     ) {
-        Ok(c) => {
-            tracing::info!("liquid electrum backend connected: {}", config.electrum.liquid_url);
-            Some(Arc::new(c))
-        }
+        Ok(c) => Some(Arc::new(c)),
         Err(e) => {
-            tracing::warn!(
-                "liquid electrum backend unavailable ({}): proof-of-funds callbacks will fail until reachable",
-                e
-            );
+            tracing::error!("liquid electrum backend init failed: {e}");
             None
         }
     };

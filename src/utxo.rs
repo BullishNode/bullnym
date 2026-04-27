@@ -173,13 +173,27 @@ pub trait UtxoBackend: Send + Sync {
 }
 
 /// Cached raw-tx wrapper around a blocking electrum-client.
+///
+/// Resilient to two failure modes seen in production:
+/// 1. The underlying TCP/TLS connection goes stale after ~10s idle and every
+///    subsequent call returns a JSON-parse / EOF error. We detect any
+///    transport-class error and reconnect before the next call.
+/// 2. A single Electrum server may be down. Operators can configure a list
+///    of URLs; we round-robin through them on connection failure.
 pub struct ElectrumClient {
-    // The underlying sync client. Wrapped in a tokio mutex so async callers
-    // can serialize their blocking-thread hops through it.
-    inner: Arc<AsyncMutex<electrum_client::Client>>,
+    urls: Vec<String>,
+    state: Arc<AsyncMutex<ConnState>>,
     cache: Arc<AsyncMutex<TxCache>>,
     cache_ttl: Duration,
     cache_max: usize,
+}
+
+struct ConnState {
+    /// `None` after a transport error or a failed reconnect attempt; the next
+    /// caller will lazily reconnect.
+    client: Option<electrum_client::Client>,
+    /// Index into `urls` for the next reconnect attempt.
+    url_idx: usize,
 }
 
 struct TxCache {
@@ -220,16 +234,128 @@ impl TxCache {
 }
 
 impl ElectrumClient {
-    pub fn connect(url: &str, cache_ttl_secs: u64, cache_max: usize) -> Result<Self, AppError> {
-        let client = electrum_client::Client::new(url)
-            .map_err(|e| AppError::ElectrumError(format!("connect {url}: {e}")))?;
+    /// Construct a multi-URL Electrum client. Tries each URL in turn at
+    /// startup; if one connects, uses it. If none connect, still returns
+    /// `Ok(...)` so the service can come up — reconnect happens lazily on
+    /// the first call. The only `Err` case is an empty URL list.
+    pub fn connect(
+        urls: Vec<String>,
+        cache_ttl_secs: u64,
+        cache_max: usize,
+    ) -> Result<Self, AppError> {
+        if urls.is_empty() {
+            return Err(AppError::ElectrumError("liquid_urls is empty".into()));
+        }
+
+        let mut chosen: Option<(electrum_client::Client, usize)> = None;
+        for (i, url) in urls.iter().enumerate() {
+            match electrum_client::Client::new(url) {
+                Ok(c) => {
+                    tracing::info!("electrum eager-connected: {}", url);
+                    chosen = Some((c, i));
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("electrum eager-connect failed for {}: {}", url, e);
+                }
+            }
+        }
+        let (client, url_idx) = match chosen {
+            Some(p) => (Some(p.0), p.1),
+            None => {
+                tracing::warn!(
+                    "all {} electrum servers unreachable at startup; will retry lazily on first PF request",
+                    urls.len()
+                );
+                (None, 0)
+            }
+        };
+
         Ok(Self {
-            inner: Arc::new(AsyncMutex::new(client)),
+            urls,
+            state: Arc::new(AsyncMutex::new(ConnState { client, url_idx })),
             cache: Arc::new(AsyncMutex::new(TxCache::new())),
             cache_ttl: Duration::from_secs(cache_ttl_secs),
             cache_max,
         })
     }
+}
+
+/// Run an op against the current Electrum connection, reconnecting on
+/// transport-class errors and rotating through `urls` on failure.
+///
+/// Holds the connection-state lock for the duration of the retry sequence,
+/// so concurrent callers serialize through it (matches prior behavior — the
+/// underlying sync client was already serialized by a single mutex).
+///
+/// `Protocol` errors are returned without retry: those are server-side
+/// responses (e.g. "no such tx") that don't indicate a broken connection.
+fn run_op_blocking<T, F>(
+    state: &AsyncMutex<ConnState>,
+    urls: &[String],
+    op_name: &str,
+    op: F,
+) -> Result<T, electrum_client::Error>
+where
+    F: Fn(&electrum_client::Client) -> Result<T, electrum_client::Error>,
+{
+    let mut guard = state.blocking_lock();
+    // urls.len() attempts gives every server one shot; minimum 2 so a
+    // single-URL config still gets one reconnect retry on a stale TCP.
+    let max_attempts = urls.len().max(2);
+    let mut last_err: Option<electrum_client::Error> = None;
+
+    for attempt in 0..max_attempts {
+        if guard.client.is_none() {
+            // Try to connect, walking through the URL ring once.
+            for _ in 0..urls.len() {
+                let url = urls[guard.url_idx].clone();
+                match electrum_client::Client::new(&url) {
+                    Ok(c) => {
+                        tracing::info!("electrum reconnected: {}", url);
+                        guard.client = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("electrum reconnect to {} failed: {}", url, e);
+                        last_err = Some(e);
+                        guard.url_idx = (guard.url_idx + 1) % urls.len();
+                    }
+                }
+            }
+            if guard.client.is_none() {
+                return Err(last_err.unwrap_or_else(|| {
+                    electrum_client::Error::Message("no electrum urls reachable".into())
+                }));
+            }
+        }
+
+        let client = guard.client.as_ref().expect("client present after reconnect");
+        match op(client) {
+            Ok(v) => return Ok(v),
+            Err(electrum_client::Error::Protocol(p)) => {
+                // Server-side error (e.g. "no such mempool/blockchain tx").
+                // The connection is still healthy — keep it.
+                return Err(electrum_client::Error::Protocol(p));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "electrum {} attempt {}: transport error on {}: {}",
+                    op_name,
+                    attempt + 1,
+                    urls[guard.url_idx],
+                    e
+                );
+                guard.client = None;
+                guard.url_idx = (guard.url_idx + 1) % urls.len();
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        electrum_client::Error::Message("electrum retries exhausted".into())
+    }))
 }
 
 #[async_trait::async_trait]
@@ -245,11 +371,13 @@ impl UtxoBackend for ElectrumClient {
         let txid = electrum_client::bitcoin::Txid::from_str(txid_hex)
             .map_err(|e| AppError::ProofOfFundsInvalid(format!("txid parse: {e}")))?;
 
-        let client = self.inner.clone();
+        let state = self.state.clone();
+        let urls = self.urls.clone();
         let bytes = tokio::task::spawn_blocking(move || {
-            use electrum_client::ElectrumApi;
-            let guard = client.blocking_lock();
-            guard.transaction_get_raw(&txid)
+            run_op_blocking(&state, &urls, "transaction_get_raw", |client| {
+                use electrum_client::ElectrumApi;
+                client.transaction_get_raw(&txid)
+            })
         })
         .await
         .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
@@ -276,12 +404,14 @@ impl UtxoBackend for ElectrumClient {
         let script_bytes = script_pubkey.as_bytes().to_vec();
         let txid = txid_hex.to_string();
 
-        let client = self.inner.clone();
+        let state = self.state.clone();
+        let urls = self.urls.clone();
         let utxos = tokio::task::spawn_blocking(move || {
-            use electrum_client::ElectrumApi;
             let btc_script = electrum_client::bitcoin::ScriptBuf::from_bytes(script_bytes);
-            let guard = client.blocking_lock();
-            guard.script_list_unspent(btc_script.as_script())
+            run_op_blocking(&state, &urls, "script_list_unspent", |client| {
+                use electrum_client::ElectrumApi;
+                client.script_list_unspent(btc_script.as_script())
+            })
         })
         .await
         .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?

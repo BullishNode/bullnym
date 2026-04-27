@@ -256,6 +256,21 @@ pub async fn callback(
                 // Per-nym pending reservation cap.
                 state.rate_limiter.check_pending_reservations(&nym).await?;
 
+                // Local-only checks BEFORE touching the network. Saves Electrum
+                // capacity for valid requests and lets obviously-bad inputs
+                // fail fast even if the backend is unreachable.
+                //
+                // The claimed `value` must be at least min_proof_value_sat. If
+                // the claim doesn't actually match on-chain, value-commitment
+                // verification (below, after fetch) catches that — so a low
+                // claim can't unlock above-min behavior.
+                if proof.value < state.config.proof.min_proof_value_sat {
+                    return Err(AppError::InsufficientFunds(
+                        state.config.proof.min_proof_value_sat,
+                    ));
+                }
+                let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
+
                 // Everything past this point requires on-chain verification.
                 let backend = state
                     .utxo_backend
@@ -264,7 +279,6 @@ pub async fn callback(
 
                 state.rate_limiter.check_electrum().await?;
 
-                let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
                 let raw_tx = backend.get_raw_tx(&parsed.txid_hex).await?;
                 let tx: elements::Transaction = elements::encode::deserialize(&raw_tx)
                     .map_err(|e| AppError::ElectrumError(format!("tx decode: {e}")))?;
@@ -297,12 +311,6 @@ pub async fn callback(
                 )?;
                 if !ok {
                     return Err(AppError::ValueCommitmentInvalid);
-                }
-
-                if proof.value < state.config.proof.min_proof_value_sat {
-                    return Err(AppError::InsufficientFunds(
-                        state.config.proof.min_proof_value_sat,
-                    ));
                 }
 
                 // Unspent check must be fresh.

@@ -144,9 +144,14 @@ fn default_global_electrum_rate() -> u32 { 50 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ElectrumConfig {
-    /// Liquid Electrum server URL (e.g. "blockstream.info:995" over SSL).
-    #[serde(default = "default_liquid_electrum_url")]
-    pub liquid_url: String,
+    /// Single Liquid Electrum server URL (deprecated; use `liquid_urls`).
+    /// Kept for backwards-compat with existing deployed configs.
+    #[serde(default)]
+    pub liquid_url: Option<String>,
+    /// Ordered list of Liquid Electrum server URLs. Tried in order on every
+    /// reconnect; rotate on transport failure to survive single-server outages.
+    #[serde(default)]
+    pub liquid_urls: Vec<String>,
     #[serde(default = "default_electrum_cache_ttl")]
     pub cache_ttl_secs: u64,
     #[serde(default = "default_electrum_cache_max")]
@@ -156,10 +161,33 @@ pub struct ElectrumConfig {
 impl Default for ElectrumConfig {
     fn default() -> Self {
         Self {
-            liquid_url: default_liquid_electrum_url(),
+            liquid_url: None,
+            liquid_urls: vec![default_liquid_electrum_url()],
             cache_ttl_secs: default_electrum_cache_ttl(),
             cache_max_entries: default_electrum_cache_max(),
         }
+    }
+}
+
+impl ElectrumConfig {
+    /// Resolve the configured URLs into a single ordered list, accepting
+    /// either the legacy single-string field or the new list field (or both).
+    pub fn urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(u) = &self.liquid_url {
+            if !u.is_empty() {
+                out.push(u.clone());
+            }
+        }
+        for u in &self.liquid_urls {
+            if !u.is_empty() && !out.contains(u) {
+                out.push(u.clone());
+            }
+        }
+        if out.is_empty() {
+            out.push(default_liquid_electrum_url());
+        }
+        out
     }
 }
 
@@ -197,5 +225,68 @@ impl Config {
             return Err("proof.message_tag must be non-empty".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn electrum_urls_legacy_single_field_only() {
+        let cfg = ElectrumConfig {
+            liquid_url: Some("a.example:50001".to_string()),
+            liquid_urls: vec![],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(cfg.urls(), vec!["a.example:50001".to_string()]);
+    }
+
+    #[test]
+    fn electrum_urls_list_field_only() {
+        let cfg = ElectrumConfig {
+            liquid_url: None,
+            liquid_urls: vec!["a:1".to_string(), "b:2".to_string()],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(cfg.urls(), vec!["a:1".to_string(), "b:2".to_string()]);
+    }
+
+    #[test]
+    fn electrum_urls_both_fields_dedup_legacy_first() {
+        let cfg = ElectrumConfig {
+            liquid_url: Some("primary:1".to_string()),
+            liquid_urls: vec!["primary:1".to_string(), "secondary:2".to_string()],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(
+            cfg.urls(),
+            vec!["primary:1".to_string(), "secondary:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn electrum_urls_falls_back_to_default() {
+        let cfg = ElectrumConfig {
+            liquid_url: None,
+            liquid_urls: vec![],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(cfg.urls(), vec![default_liquid_electrum_url()]);
+    }
+
+    #[test]
+    fn electrum_urls_skips_empty_strings() {
+        let cfg = ElectrumConfig {
+            liquid_url: Some(String::new()),
+            liquid_urls: vec![String::new(), "a:1".to_string()],
+            cache_ttl_secs: 0,
+            cache_max_entries: 0,
+        };
+        assert_eq!(cfg.urls(), vec!["a:1".to_string()]);
     }
 }
