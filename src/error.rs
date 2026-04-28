@@ -16,10 +16,8 @@ pub enum AppError {
     // --- Proof of funds (Liquid callback) ---
     ProofOfFundsRequired(u64),      // carries min_proof_value_sat for message template
     ProofOfFundsInvalid(String),    // sig / format failure (reason is internal, user sees generic copy)
-    InsufficientFunds(u64),         // carries min_proof_value_sat
     UtxoNotFound,
     UtxoSpent,
-    ValueCommitmentInvalid,
     PubkeyUtxoMismatch,
 
     // --- Rate limiting ---
@@ -46,10 +44,8 @@ impl AppError {
             Self::PurgeBlocked(_) => "PurgeBlocked",
             Self::ProofOfFundsRequired(_) => "ProofOfFundsRequired",
             Self::ProofOfFundsInvalid(_) => "ProofOfFundsInvalid",
-            Self::InsufficientFunds(_) => "InsufficientFunds",
             Self::UtxoNotFound => "UtxoNotFound",
             Self::UtxoSpent => "UtxoSpent",
-            Self::ValueCommitmentInvalid => "ValueCommitmentInvalid",
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
             Self::TooManyPendingReservations => "TooManyPendingReservations",
             Self::RateLimited => "RateLimited",
@@ -73,10 +69,8 @@ impl std::fmt::Display for AppError {
             Self::PurgeBlocked(n) => write!(f, "purge blocked: {n} in-flight swap(s)"),
             Self::ProofOfFundsRequired(min) => write!(f, "proof of funds required (min {min} sat)"),
             Self::ProofOfFundsInvalid(r) => write!(f, "proof of funds invalid: {r}"),
-            Self::InsufficientFunds(min) => write!(f, "insufficient funds (min {min} sat)"),
             Self::UtxoNotFound => write!(f, "utxo not found"),
             Self::UtxoSpent => write!(f, "utxo spent"),
-            Self::ValueCommitmentInvalid => write!(f, "value commitment invalid"),
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
             Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
             Self::RateLimited => write!(f, "rate limited"),
@@ -116,10 +110,6 @@ impl IntoResponse for AppError {
                 "To request payment details from this Lightning Address, \
                  you must have at least {min} sats in your wallet."
             ),
-            AppError::InsufficientFunds(min) => format!(
-                "To pay this Lightning Address, you need at least {min} \
-                 sats in your wallet."
-            ),
             AppError::ProofOfFundsInvalid(_) => {
                 "Your wallet could not prove it has enough funds. Please \
                  restart your wallet and try again.".into()
@@ -132,10 +122,6 @@ impl IntoResponse for AppError {
             AppError::UtxoSpent => {
                 "The funds your wallet tried to use have already been spent \
                  in another transaction.".into()
-            }
-            AppError::ValueCommitmentInvalid => {
-                "Your wallet's balance information doesn't match the Liquid \
-                 blockchain. Please refresh your wallet and try again.".into()
             }
             AppError::PubkeyUtxoMismatch => {
                 "Your wallet provided funds that don't match its signature. \

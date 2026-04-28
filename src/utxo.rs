@@ -1,12 +1,10 @@
-//! UTXO ownership proof + commitment verification + Electrum backend.
+//! UTXO ownership proof + Electrum backend.
 //!
 //! The Liquid LNURL-pay callback requires the payer to prove ownership of
-//! a real, unspent UTXO worth at least `min_proof_value_sat`. This module
-//! implements:
+//! a real, unspent UTXO. This module implements:
 //!
 //! - `verify_ownership_sig` — ECDSA over `sha256(tag || nym || outpoint)`
 //! - `script_matches_pubkey` — P2WPKH match against the tx output scriptpubkey
-//! - `verify_value_commitment` — Pedersen commitment reconstruction
 //! - `ElectrumClient` — raw-tx fetch (cached) + unspent check (uncached)
 
 use std::collections::HashMap;
@@ -15,19 +13,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lwk_wollet::elements;
-use lwk_wollet::elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use lwk_wollet::elements::hashes::{hash160, Hash as ElementsHash};
-use lwk_wollet::elements::issuance::AssetId;
-use lwk_wollet::elements::secp256k1_zkp::{self as zkp};
 use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::AppError;
-
-// L-BTC asset id (display-reversed form, same as `lnurl.rs::LBTC_ASSET_ID`).
-pub const LBTC_ASSET_ID_HEX: &str =
-    "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
 
 // --- Ownership signature ---
 
@@ -82,50 +73,6 @@ pub fn script_matches_pubkey(script: &elements::Script, pubkey: &PublicKey) -> b
     script == &expected
 }
 
-// --- Pedersen value commitment ---
-
-/// Reconstruct the expected Pedersen commitment from the claimed
-/// (value, value_bf, asset_bf) triple and compare to the on-chain commitment.
-///
-/// Blinding factors come in from the payer as hex strings. They're passed to
-/// the elements crate in native byte-order (32 bytes each).
-pub fn verify_value_commitment(
-    asset_id: &AssetId,
-    value: u64,
-    value_bf_hex: &str,
-    asset_bf_hex: &str,
-    onchain: &zkp::PedersenCommitment,
-) -> Result<bool, AppError> {
-    let vbf_bytes = hex::decode(value_bf_hex)
-        .map_err(|e| AppError::ProofOfFundsInvalid(format!("value_bf hex: {e}")))?;
-    let abf_bytes = hex::decode(asset_bf_hex)
-        .map_err(|e| AppError::ProofOfFundsInvalid(format!("asset_bf hex: {e}")))?;
-    if vbf_bytes.len() != 32 || abf_bytes.len() != 32 {
-        return Err(AppError::ProofOfFundsInvalid(
-            "blinding factors must be 32 bytes".into(),
-        ));
-    }
-
-    let vbf = ValueBlindingFactor::from_slice(&vbf_bytes)
-        .map_err(|e| AppError::ProofOfFundsInvalid(format!("value_bf: {e}")))?;
-    let abf = AssetBlindingFactor::from_slice(&abf_bytes)
-        .map_err(|e| AppError::ProofOfFundsInvalid(format!("asset_bf: {e}")))?;
-
-    let secp = zkp::Secp256k1::new();
-    let expected = elements::confidential::Value::new_confidential_from_assetid(
-        &secp, value, *asset_id, vbf, abf,
-    );
-
-    match expected {
-        elements::confidential::Value::Confidential(expected_comm) => {
-            Ok(expected_comm.serialize() == onchain.serialize())
-        }
-        _ => Err(AppError::ProofOfFundsInvalid(
-            "commitment construction failed".into(),
-        )),
-    }
-}
-
 // --- Outpoint parsing ---
 
 pub struct ParsedOutpoint {
@@ -170,6 +117,11 @@ pub trait UtxoBackend: Send + Sync {
         txid_hex: &str,
         vout: u32,
     ) -> Result<bool, AppError>;
+
+    /// Check whether the given script has any history (mempool + confirmed)
+    /// on the Liquid network. Used by the chain_watcher to detect payments
+    /// landing at a nym's next-unused address. (added by chain_watcher)
+    async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
 }
 
 /// Cached raw-tx wrapper around a blocking electrum-client.
@@ -434,6 +386,37 @@ impl UtxoBackend for ElectrumClient {
             u.get("tx_hash").and_then(|v| v.as_str()) == Some(txid.as_str())
                 && u.get("tx_pos").and_then(|v| v.as_u64()) == Some(vout as u64)
         }))
+    }
+
+    async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError> {
+        // Use raw_call (parallel to is_unspent) so we avoid any Liquid-specific
+        // deserialization quirks in the high-level electrum-client wrapper.
+        // The history response shape is `[{tx_hash, height, [fee]}, ...]`; we
+        // only care whether the array is non-empty.
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
+
+        let state = self.state.clone();
+        let urls = self.urls.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            run_op_blocking(&state, &urls, "scripthash.get_history", |client| {
+                use electrum_client::ElectrumApi;
+                client.raw_call(
+                    "blockchain.scripthash.get_history",
+                    vec![electrum_client::Param::String(scripthash_hex.clone())],
+                )
+            })
+        })
+        .await
+        .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
+        .map_err(|e| AppError::ElectrumError(format!("scripthash.get_history: {e}")))?;
+
+        let history = result.as_array().ok_or_else(|| {
+            AppError::ElectrumError(
+                "scripthash.get_history: expected JSON array response".into(),
+            )
+        })?;
+
+        Ok(!history.is_empty())
     }
 }
 

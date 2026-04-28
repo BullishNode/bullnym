@@ -425,9 +425,11 @@ pub async fn count_unfulfilled_reservations(
 }
 
 /// Idempotent allocation: returns the cached addr_index if `(nym, outpoint)`
-/// was seen before; otherwise bumps `users.next_addr_idx` and inserts a new
-/// row. Runs inside a single transaction so concurrent callers can't race on
-/// the same nym.
+/// was seen before; otherwise reads the user's CURRENT `next_addr_idx`,
+/// inserts a new `outpoint_addresses` row using that value (informational),
+/// and returns it. Does NOT advance `users.next_addr_idx` — that's done
+/// asynchronously by the chain watcher when an address is observed paid.
+/// Runs inside a single transaction so concurrent callers see consistent state.
 pub async fn allocate_outpoint_address(
     pool: &PgPool,
     nym: &str,
@@ -451,12 +453,10 @@ pub async fn allocate_outpoint_address(
         return Ok(idx);
     }
 
-    // Allocate next index on the nym's users row (SELECT FOR UPDATE via
-    // UPDATE ... RETURNING implicitly row-locks).
-    let (allocated_idx,): (i32,) = sqlx::query_as(
-        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
-         WHERE nym = $1 AND is_active = TRUE \
-         RETURNING next_addr_idx - 1",
+    // Read current next_addr_idx (no increment — chain watcher advances it).
+    let (current_idx,): (i32,) = sqlx::query_as(
+        "SELECT next_addr_idx FROM users \
+         WHERE nym = $1 AND is_active = TRUE",
     )
     .bind(nym)
     .fetch_one(&mut *tx)
@@ -468,13 +468,13 @@ pub async fn allocate_outpoint_address(
     )
     .bind(nym)
     .bind(outpoint)
-    .bind(allocated_idx)
+    .bind(current_idx)
     .bind(pubkey_hex)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-    Ok(allocated_idx)
+    Ok(current_idx)
 }
 
 pub async fn mark_reservation_fulfilled(
@@ -520,6 +520,95 @@ pub async fn count_rate_limit_events(
     .fetch_one(pool)
     .await?;
     Ok(row.0)
+}
+
+// =====================================================================
+// Distinct-nym rate-limit helpers (added 2026-04-27)
+// =====================================================================
+
+/// Append a single (source_key, nym) row to `nym_access_events`. Source key is
+/// "ip:<addr>" or "outpoint:<txid>:<vout>". Caller is responsible for any
+/// canonicalization (lowercase hex etc.) before calling.
+pub async fn record_nym_access(
+    pool: &PgPool,
+    source_key: &str,
+    nym: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO nym_access_events (source_key, nym) VALUES ($1, $2)")
+        .bind(source_key)
+        .bind(nym)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Count DISTINCT nyms seen for `source_key` within the last `window_secs`.
+/// Used by the per-IP and per-outpoint distinct-nym rate limiters.
+pub async fn count_distinct_nyms(
+    pool: &PgPool,
+    source_key: &str,
+    window_secs: u32,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT nym) FROM nym_access_events \
+         WHERE source_key = $1 \
+         AND created_at > NOW() - ($2 || ' seconds')::interval",
+    )
+    .bind(source_key)
+    .bind(window_secs as i32)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+// =====================================================================
+// Chain watcher helpers (added 2026-04-27)
+// =====================================================================
+
+pub struct ActiveNymForWatcher {
+    pub nym: String,
+    pub ct_descriptor: String,
+    pub next_addr_idx: i32,
+}
+
+pub async fn list_active_nyms_for_watcher(
+    pool: &PgPool,
+) -> Result<Vec<ActiveNymForWatcher>, sqlx::Error> {
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT nym, ct_descriptor, next_addr_idx FROM users WHERE is_active = TRUE",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(nym, ct_descriptor, next_addr_idx)| ActiveNymForWatcher {
+            nym,
+            ct_descriptor,
+            next_addr_idx,
+        })
+        .collect())
+}
+
+/// Advance `users.next_addr_idx` past `observed_idx`, but only if it hasn't
+/// already advanced beyond it. Idempotent under concurrent observations:
+/// the `next_addr_idx <= observed_idx` guard ensures this update is a no-op
+/// when the row has already moved on (e.g. due to a request handler
+/// allocation racing with the watcher).
+pub async fn advance_next_addr_idx(
+    pool: &PgPool,
+    nym: &str,
+    observed_idx: u32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET next_addr_idx = $2 \
+         WHERE nym = $1 AND is_active = TRUE AND next_addr_idx <= $3",
+    )
+    .bind(nym)
+    .bind((observed_idx + 1) as i32)
+    .bind(observed_idx as i32)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

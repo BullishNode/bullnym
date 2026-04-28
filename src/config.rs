@@ -102,6 +102,18 @@ pub struct RateLimitConfig {
     #[serde(default = "default_per_pubkey_window_secs")]
     pub per_pubkey_window_secs: u32,
 
+    /// Max distinct nyms a single source IP may probe per
+    /// `distinct_nyms_window_secs`. 0 disables the check.
+    #[serde(default = "default_distinct_nyms_per_ip")]
+    pub distinct_nyms_per_ip_limit: u32,
+    /// Max distinct nyms a single proof-of-funds outpoint may be reused
+    /// against per `distinct_nyms_window_secs`. 0 disables the check.
+    #[serde(default = "default_distinct_nyms_per_outpoint")]
+    pub distinct_nyms_per_outpoint_limit: u32,
+    /// Window for the distinct-nyms-per-source counters (seconds).
+    #[serde(default = "default_distinct_nyms_window_secs")]
+    pub distinct_nyms_window_secs: u32,
+
     #[serde(default = "default_max_pending_per_nym")]
     pub max_pending_reservations_per_nym: u32,
     #[serde(default = "default_recycle_days")]
@@ -123,6 +135,9 @@ impl Default for RateLimitConfig {
             per_ip_window_secs: default_per_ip_window_secs(),
             per_pubkey_limit: default_per_pubkey_limit(),
             per_pubkey_window_secs: default_per_pubkey_window_secs(),
+            distinct_nyms_per_ip_limit: default_distinct_nyms_per_ip(),
+            distinct_nyms_per_outpoint_limit: default_distinct_nyms_per_outpoint(),
+            distinct_nyms_window_secs: default_distinct_nyms_window_secs(),
             max_pending_reservations_per_nym: default_max_pending_per_nym(),
             recycle_pending_older_than_days: default_recycle_days(),
             lightning_rate_per_minute: default_lightning_rate(),
@@ -133,8 +148,14 @@ impl Default for RateLimitConfig {
 
 fn default_per_ip_limit() -> u32 { 60 }
 fn default_per_ip_window_secs() -> u32 { 60 }
-fn default_per_pubkey_limit() -> u32 { 10 }
+/// Disabled by default (0). The per-pubkey sliding-window check is redundant
+/// with the per-outpoint distinct-nym check; field is kept for backwards
+/// compatibility with deployed configs that explicitly set a non-zero value.
+fn default_per_pubkey_limit() -> u32 { 0 }
 fn default_per_pubkey_window_secs() -> u32 { 3600 }
+fn default_distinct_nyms_per_ip() -> u32 { 10 }
+fn default_distinct_nyms_per_outpoint() -> u32 { 10 }
+fn default_distinct_nyms_window_secs() -> u32 { 3600 }
 fn default_max_pending_per_nym() -> u32 { 500 }
 fn default_recycle_days() -> u32 { 30 }
 fn default_lightning_rate() -> u32 { 10 }

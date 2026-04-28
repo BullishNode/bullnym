@@ -7,5 +7,21 @@ api_url = "https://api.boltz.exchange/v2"
 electrum_url = "blockstream.info:995"
 
 [limits]
-min_sendable_msat = 10000000
+# Match prod so simulator's amount=100000 msat works.
+min_sendable_msat = 100000
 max_sendable_msat = 25000000000
+
+[electrum]
+# Bull's own Liquid Electrum — has been more reliable than Blockstream's.
+liquid_url = "les.bullbitcoin.com:995"
+
+[rate_limit]
+# High limits so the simulator suite can run repeatedly without budget concerns.
+per_ip_limit = 1000
+per_ip_window_secs = 60
+per_pubkey_limit = 1000
+per_pubkey_window_secs = 3600
+max_pending_reservations_per_nym = 5000
+lightning_rate_per_minute = 1000
+global_electrum_rate_per_sec = 200
+trust_forwarded_for = false

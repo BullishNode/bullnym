@@ -12,7 +12,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, claimer, config, ip_whitelist, lnurl, nostr, rate_limit, registration,
+    boltz, chain_watcher, claimer, config, ip_whitelist, lnurl, nostr, rate_limit, registration,
     utxo::{self, UtxoBackend},
     AppState,
 };
@@ -118,6 +118,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cancel = CancellationToken::new();
     claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
+
+    if let Some(backend) = state.utxo_backend.clone() {
+        let pool = state.db.clone();
+        let rl = rate_limiter.clone();
+        let cancel_watcher = cancel.clone();
+        tokio::spawn(async move {
+            chain_watcher::run(
+                pool,
+                backend,
+                rl,
+                cancel_watcher,
+                chain_watcher::ChainWatcherConfig::default(),
+            )
+            .await;
+        });
+        tracing::info!("chain watcher started (poll every 30s, lookahead 10)");
+    } else {
+        tracing::warn!("chain watcher NOT started: utxo backend unavailable");
+    }
 
     let app = Router::new()
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))

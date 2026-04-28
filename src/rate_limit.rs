@@ -62,6 +62,38 @@ impl RateLimiter {
         .await
     }
 
+    // --- Distinct-nyms per IP (Liquid callback) ---
+    pub async fn check_distinct_nyms_per_ip(
+        &self,
+        ip: IpAddr,
+        nym: &str,
+    ) -> Result<(), AppError> {
+        let source_key = format!("ip:{ip}");
+        self.distinct_nyms_check(
+            &source_key,
+            nym,
+            self.cfg.distinct_nyms_per_ip_limit,
+            self.cfg.distinct_nyms_window_secs,
+        )
+        .await
+    }
+
+    // --- Distinct-nyms per outpoint (Liquid callback) ---
+    pub async fn check_distinct_nyms_per_outpoint(
+        &self,
+        outpoint: &str,
+        nym: &str,
+    ) -> Result<(), AppError> {
+        let source_key = format!("outpoint:{outpoint}");
+        self.distinct_nyms_check(
+            &source_key,
+            nym,
+            self.cfg.distinct_nyms_per_outpoint_limit,
+            self.cfg.distinct_nyms_window_secs,
+        )
+        .await
+    }
+
     // --- Per-nym lightning-path rate limit ---
     pub async fn check_lightning_per_nym(&self, nym: &str) -> Result<(), AppError> {
         let bucket = format!("nym:{nym}");
@@ -110,6 +142,28 @@ impl RateLimiter {
         }
         db::record_rate_limit_event(&self.pool, bucket).await?;
         let count = db::count_rate_limit_events(&self.pool, bucket, window_secs).await?;
+        if count as u32 > limit {
+            return Err(AppError::RateLimited);
+        }
+        Ok(())
+    }
+
+    /// Record a (source_key, nym) pair, then reject if the count of DISTINCT
+    /// nyms seen for this source within `window_secs` exceeds `limit`.
+    ///
+    /// Invariants: `limit == 0` disables the check (always allow).
+    async fn distinct_nyms_check(
+        &self,
+        source_key: &str,
+        nym: &str,
+        limit: u32,
+        window_secs: u32,
+    ) -> Result<(), AppError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        db::record_nym_access(&self.pool, source_key, nym).await?;
+        let count = db::count_distinct_nyms(&self.pool, source_key, window_secs).await?;
         if count as u32 > limit {
             return Err(AppError::RateLimited);
         }

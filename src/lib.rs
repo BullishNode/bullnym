@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod boltz;
+pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
 pub mod db;

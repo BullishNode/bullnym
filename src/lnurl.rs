@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::str::FromStr;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::HeaderMap;
@@ -12,9 +11,7 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
-use crate::utxo::{
-    script_matches_pubkey, verify_ownership_sig, verify_value_commitment, ParsedOutpoint,
-};
+use crate::utxo::{script_matches_pubkey, verify_ownership_sig, ParsedOutpoint};
 use crate::AppState;
 
 // --- Metadata response (LUD-06 + extensions) ---
@@ -52,8 +49,14 @@ pub struct CallbackParams {
     pub outpoint: Option<String>,
     pub pubkey: Option<String>,
     pub sig: Option<String>,
+    // Forward-compat: mobile clients still send these, but the server no
+    // longer uses them. Kept in the deserialization shape so older clients
+    // don't fail with "unknown field" if they were ever to be rejected.
+    #[allow(dead_code)]
     pub value: Option<u64>,
+    #[allow(dead_code)]
     pub value_bf: Option<String>,
+    #[allow(dead_code)]
     pub asset_bf: Option<String>,
 }
 
@@ -61,9 +64,6 @@ struct ProofFields {
     outpoint: String,
     pubkey: String,
     sig: String,
-    value: u64,
-    value_bf: String,
-    asset_bf: String,
 }
 
 impl CallbackParams {
@@ -72,9 +72,6 @@ impl CallbackParams {
             outpoint: self.outpoint.clone()?,
             pubkey: self.pubkey.clone()?,
             sig: self.sig.clone()?,
-            value: self.value?,
-            value_bf: self.value_bf.clone()?,
-            asset_bf: self.asset_bf.clone()?,
         })
     }
 }
@@ -225,14 +222,7 @@ pub async fn callback(
 
     // --- Liquid path ---
     if params.network.as_deref() == Some("liquid") {
-        let addr_index = if is_whitelisted {
-            // Trusted caller: bypass proof + all rate limits. Still allocate
-            // a fresh addr_index so they can receive.
-            let idx = db::allocate_address_index(&state.db, &nym)
-                .await?
-                .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
-            idx
-        } else {
+        if !is_whitelisted {
             let proof = params
                 .take_proof()
                 .ok_or(AppError::ProofOfFundsRequired(state.config.proof.min_proof_value_sat))?;
@@ -249,26 +239,24 @@ pub async fn callback(
             // Per-pubkey limit.
             state.rate_limiter.check_per_pubkey(&proof.pubkey).await?;
 
-            // Idempotent cache lookup.
-            if let Some(cached) = db::get_outpoint_address(&state.db, &nym, &proof.outpoint).await? {
-                cached.addr_index
-            } else {
+            // Idempotent cache lookup. The address returned to the payer is
+            // always derived from `user.next_addr_idx` (last-unused mode) —
+            // the cache row exists only as an idempotency / accounting marker.
+            if db::get_outpoint_address(&state.db, &nym, &proof.outpoint).await?.is_none() {
+                // Distinct-nym fan-out limits (catch one IP / one outpoint
+                // cycling across many nyms). Only on cache miss — idempotent
+                // retries are free.
+                if let Some(ip) = caller_ip {
+                    state.rate_limiter.check_distinct_nyms_per_ip(ip, &nym).await?;
+                }
+                state
+                    .rate_limiter
+                    .check_distinct_nyms_per_outpoint(&proof.outpoint, &nym)
+                    .await?;
+
                 // Per-nym pending reservation cap.
                 state.rate_limiter.check_pending_reservations(&nym).await?;
 
-                // Local-only checks BEFORE touching the network. Saves Electrum
-                // capacity for valid requests and lets obviously-bad inputs
-                // fail fast even if the backend is unreachable.
-                //
-                // The claimed `value` must be at least min_proof_value_sat. If
-                // the claim doesn't actually match on-chain, value-commitment
-                // verification (below, after fetch) catches that — so a low
-                // claim can't unlock above-min behavior.
-                if proof.value < state.config.proof.min_proof_value_sat {
-                    return Err(AppError::InsufficientFunds(
-                        state.config.proof.min_proof_value_sat,
-                    ));
-                }
                 let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
 
                 // Everything past this point requires on-chain verification.
@@ -292,27 +280,6 @@ pub async fn callback(
                     return Err(AppError::PubkeyUtxoMismatch);
                 }
 
-                let onchain_commitment = match &txout.value {
-                    elements::confidential::Value::Confidential(c) => c,
-                    _ => return Err(AppError::ProofOfFundsInvalid(
-                        "expected confidential value on Liquid UTXO".into(),
-                    )),
-                };
-
-                let asset_id = elements::issuance::AssetId::from_str(LBTC_ASSET_ID)
-                    .expect("built-in L-BTC asset id parses");
-
-                let ok = verify_value_commitment(
-                    &asset_id,
-                    proof.value,
-                    &proof.value_bf,
-                    &proof.asset_bf,
-                    onchain_commitment,
-                )?;
-                if !ok {
-                    return Err(AppError::ValueCommitmentInvalid);
-                }
-
                 // Unspent check must be fresh.
                 let unspent = backend
                     .is_unspent(&txout.script_pubkey, &parsed.txid_hex, parsed.vout)
@@ -321,13 +288,17 @@ pub async fn callback(
                     return Err(AppError::UtxoSpent);
                 }
 
-                // Atomic allocation + cache insert.
+                // Insert the idempotency marker. Does NOT advance
+                // `users.next_addr_idx` — the chain watcher does that
+                // asynchronously when an address is observed paid.
                 db::allocate_outpoint_address(&state.db, &nym, &proof.outpoint, &proof.pubkey)
-                    .await?
+                    .await?;
             }
-        };
+        }
 
-        let addr_index_u32 = u32::try_from(addr_index).map_err(|_| {
+        // Last-unused address: always derive from the user's current
+        // `next_addr_idx`, whether cached or freshly inserted.
+        let addr_index_u32 = u32::try_from(user.next_addr_idx).map_err(|_| {
             AppError::DbError("address index overflow".to_string())
         })?;
         let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
