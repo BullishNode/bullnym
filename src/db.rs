@@ -611,6 +611,28 @@ pub async fn advance_next_addr_idx(
     Ok(())
 }
 
+/// Mark every still-pending reservation that targets `addr_index` for `nym`
+/// as fulfilled. Called by the chain watcher when a payment is observed at
+/// `derive(descriptor, addr_index)` — under last-unused mode many concurrent
+/// senders may share a single addr_index, so a single observed payment can
+/// flip multiple rows. Returns the number of rows updated for diagnostics.
+pub async fn mark_reservations_fulfilled_at_idx(
+    pool: &PgPool,
+    nym: &str,
+    addr_index: u32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE outpoint_addresses \
+            SET fulfilled = TRUE, fulfilled_at = NOW() \
+          WHERE nym = $1 AND addr_index = $2 AND fulfilled = FALSE",
+    )
+    .bind(nym)
+    .bind(addr_index as i32)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

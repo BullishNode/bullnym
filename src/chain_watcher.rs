@@ -127,12 +127,23 @@ async fn poll_once(
 
             match backend.has_history(&script).await {
                 Ok(true) => {
-                    tracing::info!(
-                        "chain_watcher: observed payment at nym={} idx={} (advancing next_addr_idx)",
-                        n.nym,
-                        idx
-                    );
                     db::advance_next_addr_idx(pool, &n.nym, idx).await?;
+                    // Flip every still-pending reservation that pointed at
+                    // this idx. In last-unused mode multiple concurrent
+                    // senders share an addr_index, so one observed payment
+                    // may fulfill many rows. Without this, the
+                    // `count_unfulfilled_reservations` view stays artificially
+                    // inflated and the per-nym pending cap could fire on a
+                    // legitimate busy nym.
+                    let fulfilled =
+                        db::mark_reservations_fulfilled_at_idx(pool, &n.nym, idx).await?;
+                    tracing::info!(
+                        "chain_watcher: observed payment at nym={} idx={} \
+                         (advanced next_addr_idx, fulfilled {} reservation row(s))",
+                        n.nym,
+                        idx,
+                        fulfilled,
+                    );
                     // Re-poll from the new next_addr_idx on the next cycle.
                     break;
                 }
