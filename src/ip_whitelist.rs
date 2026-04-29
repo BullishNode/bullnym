@@ -50,9 +50,15 @@ impl IpWhitelist {
 
 /// Resolve the effective caller IP from a socket peer and headers.
 ///
-/// When `trust_forwarded_for` is true, the first entry in `X-Forwarded-For`
-/// takes precedence. Only enable behind a trusted reverse proxy — otherwise
-/// clients can trivially spoof the whitelist.
+/// When `trust_forwarded_for` is true, we read the **rightmost** entry in
+/// X-Forwarded-For — the one our reverse proxy (nginx with
+/// `proxy_add_x_forwarded_for`) appends itself, which is the only entry
+/// the client can't forge. Anything to the left of that was supplied by
+/// the client; trusting the leftmost would let any caller pretend to be
+/// any IP by injecting `X-Forwarded-For: <fake-ip>` on their request.
+///
+/// Only enable `trust_forwarded_for` when actually behind a reverse proxy
+/// that appends the real client IP to XFF.
 pub fn resolve_caller_ip(
     peer: Option<IpAddr>,
     forwarded_for: Option<&str>,
@@ -60,9 +66,9 @@ pub fn resolve_caller_ip(
 ) -> Option<IpAddr> {
     if trust_forwarded_for {
         if let Some(xff) = forwarded_for {
-            // Pick the left-most entry (original client, per XFF convention).
-            let first = xff.split(',').next()?.trim();
-            if let Ok(ip) = IpAddr::from_str(first) {
+            // Right-most entry: prepended by our reverse proxy, not the client.
+            let last = xff.split(',').next_back()?.trim();
+            if let Ok(ip) = IpAddr::from_str(last) {
                 return Some(ip);
             }
         }
@@ -116,10 +122,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_xff_when_trusted() {
+    fn resolve_uses_rightmost_xff_when_trusted() {
+        // nginx appends $remote_addr — rightmost entry is the trusted one.
         let peer: IpAddr = "1.2.3.4".parse().unwrap();
         let got = resolve_caller_ip(Some(peer), Some("9.9.9.9, 8.8.8.8"), true);
-        assert_eq!(got, Some("9.9.9.9".parse().unwrap()));
+        assert_eq!(got, Some("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_cannot_spoof_via_leftmost_xff() {
+        // Attacker injects "X-Forwarded-For: 198.51.100.1" hoping the
+        // server treats it as the caller IP. nginx appends the real
+        // peer IP after a comma, producing "198.51.100.1, <real>".
+        // Server must use the rightmost entry, not the attacker's.
+        let peer: IpAddr = "1.2.3.4".parse().unwrap();
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let xff = "198.51.100.1, 203.0.113.7";
+        let got = resolve_caller_ip(Some(peer), Some(xff), true);
+        assert_eq!(got, Some(real));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_peer_on_malformed_xff() {
+        let peer: IpAddr = "1.2.3.4".parse().unwrap();
+        let got = resolve_caller_ip(Some(peer), Some("not-an-ip"), true);
+        assert_eq!(got, Some(peer));
     }
 
     #[test]
