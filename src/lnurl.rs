@@ -25,7 +25,7 @@ pub struct LnurlPayMetadata {
     pub metadata: String,
     pub tag: String,
     pub comment_allowed: u16,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "payment_methods", skip_serializing_if = "Vec::is_empty")]
     pub payment_methods: Vec<&'static str>,
 }
 
