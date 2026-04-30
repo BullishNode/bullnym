@@ -14,6 +14,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -26,6 +28,7 @@ async-trait = "0.1"
 electrum-client = "0.21"
 ipnet = "2"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+dashmap = "6"
 
 [dev-dependencies]
 http-body-util = "0.1"

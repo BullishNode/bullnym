@@ -22,27 +22,52 @@ use crate::rate_limit::RateLimiter;
 use crate::utxo::UtxoBackend;
 
 pub struct ChainWatcherConfig {
-    pub poll_interval_secs: u64,
+    /// How often to scan the "active" set (users with a recent callback).
+    pub active_tick_secs: u64,
+    /// How often to scan the "idle" set (everyone else). Idle ticks also
+    /// re-scan the active set, so the active loop never stalls during an
+    /// idle pass.
+    pub idle_tick_secs: u64,
+    /// A user is "active" if `last_callback_at` is within this many
+    /// seconds. NULL last_callback_at always falls in the idle set.
+    pub active_window_secs: u32,
     pub lookahead: u32,
 }
 
 impl Default for ChainWatcherConfig {
     fn default() -> Self {
         Self {
-            poll_interval_secs: 30,
+            active_tick_secs: 30,
+            idle_tick_secs: 600,
+            active_window_secs: 86_400,
             lookahead: 10,
         }
     }
 }
 
-/// Run the chain watcher loop. Intended to be `tokio::spawn`-ed and run for
-/// the lifetime of the server. Errors during a single poll are logged but do
-/// not terminate the loop. Exits cleanly on `cancel.cancelled()`.
+impl ChainWatcherConfig {
+    /// Build from `RateLimitConfig` so the watcher cadences come from one
+    /// place (the deployed config) without each call site recomputing.
+    pub fn from_rate_limit_config(rl: &crate::config::RateLimitConfig) -> Self {
+        Self {
+            active_tick_secs: rl.chain_watcher_active_user_tick_secs as u64,
+            idle_tick_secs: rl.chain_watcher_idle_user_tick_secs as u64,
+            active_window_secs: rl.chain_watcher_active_window_secs,
+            lookahead: 10,
+        }
+    }
+}
+
+/// Run the chain watcher loop. Spawned for the lifetime of the server.
+/// Two cadences (P4):
+///   - `active_tick_secs`: scans only users with a recent callback.
+///     Bounded by real traffic, not by the size of the `users` table.
+///   - `idle_tick_secs`: scans every active user (active + idle). Catches
+///     payments to users who haven't had a recent callback.
 ///
-/// `rate_limiter` is shared with the request handlers so that this watcher's
-/// Electrum traffic is metered by the same global token bucket — without it,
-/// a 30s tick over many active nyms would burst-saturate the bucket and
-/// starve real callbacks.
+/// `rate_limiter` exposes a dedicated watcher-only Electrum bucket
+/// (`check_electrum_watcher`) so a callback storm cannot starve the
+/// watcher and vice-versa.
 pub async fn run(
     pool: PgPool,
     backend: Arc<dyn UtxoBackend + Send + Sync>,
@@ -50,32 +75,71 @@ pub async fn run(
     cancel: CancellationToken,
     cfg: ChainWatcherConfig,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));
-    // Skip the immediate-first-tick so we don't slam the DB/Electrum at boot
-    // before the rest of the server has finished warming up.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut active_tick = tokio::time::interval(Duration::from_secs(cfg.active_tick_secs));
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(cfg.idle_tick_secs));
+    active_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Skip the immediate-first-tick so we don't slam the DB/Electrum at
+    // boot before the rest of the server has finished warming up.
+    active_tick.tick().await;
+    idle_tick.tick().await;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("chain_watcher: shutdown signal received, exiting");
                 break;
             }
-            _ = interval.tick() => {}
-        }
-        if let Err(e) = poll_once(&pool, backend.as_ref(), rate_limiter.as_ref(), cfg.lookahead, &cancel).await {
-            tracing::warn!("chain_watcher poll failed: {e:?}");
+            _ = active_tick.tick() => {
+                let nyms = match db::list_recently_active_nyms_for_watcher(
+                    &pool, cfg.active_window_secs,
+                ).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("chain_watcher: list active failed: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = poll_nyms(
+                    &pool, backend.as_ref(), rate_limiter.as_ref(),
+                    cfg.lookahead, nyms, &cancel, "active",
+                ).await {
+                    tracing::warn!("chain_watcher active poll failed: {e:?}");
+                }
+            }
+            _ = idle_tick.tick() => {
+                // Idle tick scans all active users (active + idle subsets).
+                // Slower cadence so this never blocks the active loop.
+                let nyms = match db::list_active_nyms_for_watcher(&pool).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("chain_watcher: list-all failed: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = poll_nyms(
+                    &pool, backend.as_ref(), rate_limiter.as_ref(),
+                    cfg.lookahead, nyms, &cancel, "idle",
+                ).await {
+                    tracing::warn!("chain_watcher idle poll failed: {e:?}");
+                }
+            }
         }
     }
 }
 
-async fn poll_once(
+async fn poll_nyms(
     pool: &PgPool,
     backend: &(dyn UtxoBackend + Send + Sync),
     rate_limiter: &RateLimiter,
     lookahead: u32,
+    nyms: Vec<db::ActiveNymForWatcher>,
     cancel: &CancellationToken,
+    tier: &'static str,
 ) -> Result<(), AppError> {
-    let nyms = db::list_active_nyms_for_watcher(pool).await?;
+    let n_total = nyms.len();
+    let started = std::time::Instant::now();
     for n in nyms {
         if cancel.is_cancelled() {
             return Ok(());
@@ -112,13 +176,13 @@ async fn poll_once(
                 }
             };
 
-            // Honour the same global Electrum token bucket as the request
-            // handlers. If we'd starve the bucket, drop this address (and
-            // implicitly the rest of this nym's lookahead) and try again
-            // next tick. Real user callbacks have priority.
-            if rate_limiter.check_electrum().await.is_err() {
+            // Use the watcher-dedicated Electrum bucket (P4) so a user-
+            // callback storm cannot starve the watcher. If our bucket
+            // exhausts, drop the rest of this nym's lookahead and try
+            // again on the next tick.
+            if rate_limiter.check_electrum_watcher().await.is_err() {
                 tracing::debug!(
-                    "chain_watcher: electrum bucket exhausted, deferring nym={} idx={}",
+                    "chain_watcher: watcher Electrum bucket exhausted, deferring nym={} idx={}",
                     n.nym,
                     idx
                 );
@@ -161,6 +225,11 @@ async fn poll_once(
             }
         }
     }
+    let elapsed_ms = started.elapsed().as_millis();
+    tracing::debug!(
+        "chain_watcher: {} tick scanned {} nyms in {}ms",
+        tier, n_total, elapsed_ms
+    );
     Ok(())
 }
 

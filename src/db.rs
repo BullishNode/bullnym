@@ -493,62 +493,104 @@ pub async fn mark_reservation_fulfilled(
     Ok(())
 }
 
-// --- Rate limit events ---
+// --- D2 webhook idempotency ---
 
-pub async fn record_rate_limit_event(
+/// Try to record that a webhook event was processed. Returns `true` if
+/// this is the first time we've seen `event_id` (caller should do the
+/// work) or `false` if it was already processed (caller short-circuits
+/// to 200 OK without acting).
+pub async fn try_record_webhook_event(
     pool: &PgPool,
-    bucket: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO rate_limit_events (bucket) VALUES ($1)")
-        .bind(bucket)
-        .execute(pool)
-        .await?;
-    Ok(())
+    event_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO processed_webhook_events (event_id) VALUES ($1) \
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(event_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
-pub async fn count_rate_limit_events(
+// --- Active-user ceiling (P1 max_active_users gate) ---
+
+/// Count rows with `is_active = TRUE` for the registration ceiling check.
+/// Single-shot atomic query; used on the cheap path before signature verify.
+pub async fn count_active_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
+// --- Rate limit events ---
+
+// NOTE: the non-atomic write-then-count pair (`record_rate_limit_event` +
+// `count_rate_limit_events`) was removed in P3. All sliding-window axes now
+// go through either `record_and_count_rate_limit_atomic` (Postgres path
+// with advisory lock) or the in-memory limiter in `rate_limit::InMemorySliding`.
+
+/// Atomic INSERT-then-COUNT for sliding-window rate limits, serialized on
+/// the bucket key via `pg_advisory_xact_lock`. Only one transaction with
+/// the same bucket can be inside this critical section at a time, so two
+/// concurrent callers can't both pass under the limit and then both
+/// commit past it. Returns the post-insert count.
+pub async fn record_and_count_rate_limit_atomic(
     pool: &PgPool,
     bucket: &str,
     window_secs: u32,
 ) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(bucket)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO rate_limit_events (bucket) VALUES ($1)")
+        .bind(bucket)
+        .execute(&mut *tx)
+        .await?;
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM rate_limit_events \
          WHERE bucket = $1 AND created_at > NOW() - ($2 || ' seconds')::interval",
     )
     .bind(bucket)
     .bind(window_secs as i32)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.0)
 }
 
 // =====================================================================
-// Distinct-nym rate-limit helpers (added 2026-04-27)
+// Distinct-nym rate-limit helpers
 // =====================================================================
+//
+// NOTE: the non-atomic write-then-count pair was removed in P3. All
+// distinct-nyms axes now go through the atomic helper below.
 
-/// Append a single (source_key, nym) row to `nym_access_events`. Source key is
-/// "ip:<addr>" or "outpoint:<txid>:<vout>". Caller is responsible for any
-/// canonicalization (lowercase hex etc.) before calling.
-pub async fn record_nym_access(
+/// Atomic INSERT-then-COUNT-DISTINCT for the distinct-nyms axes,
+/// serialized on `source_key` via `pg_advisory_xact_lock`. Same atomicity
+/// story as `record_and_count_rate_limit_atomic` — kills the race where
+/// two concurrent callers both INSERT and then both COUNT under the limit
+/// before either commit lands. Returns the post-insert distinct count.
+pub async fn record_and_count_distinct_nyms_atomic(
     pool: &PgPool,
     source_key: &str,
     nym: &str,
-) -> Result<(), sqlx::Error> {
+    window_secs: u32,
+) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(source_key)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("INSERT INTO nym_access_events (source_key, nym) VALUES ($1, $2)")
         .bind(source_key)
         .bind(nym)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
-}
-
-/// Count DISTINCT nyms seen for `source_key` within the last `window_secs`.
-/// Used by the per-IP and per-outpoint distinct-nym rate limiters.
-pub async fn count_distinct_nyms(
-    pool: &PgPool,
-    source_key: &str,
-    window_secs: u32,
-) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(DISTINCT nym) FROM nym_access_events \
          WHERE source_key = $1 \
@@ -556,8 +598,9 @@ pub async fn count_distinct_nyms(
     )
     .bind(source_key)
     .bind(window_secs as i32)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.0)
 }
 
@@ -587,6 +630,49 @@ pub async fn list_active_nyms_for_watcher(
             next_addr_idx,
         })
         .collect())
+}
+
+/// Watcher's "active" set: users whose `last_callback_at` is within the
+/// last `active_window_secs`. This is the hot list scanned every fast
+/// tick. Bounded in size by real callback traffic, not by the size of
+/// the `users` table.
+pub async fn list_recently_active_nyms_for_watcher(
+    pool: &PgPool,
+    active_window_secs: u32,
+) -> Result<Vec<ActiveNymForWatcher>, sqlx::Error> {
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT nym, ct_descriptor, next_addr_idx \
+         FROM users \
+         WHERE is_active = TRUE \
+           AND last_callback_at > NOW() - ($1 || ' seconds')::interval",
+    )
+    .bind(active_window_secs as i32)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(nym, ct_descriptor, next_addr_idx)| ActiveNymForWatcher {
+            nym,
+            ct_descriptor,
+            next_addr_idx,
+        })
+        .collect())
+}
+
+/// Mark that a user was just hit by `/lnurlp/callback`. Drives the
+/// watcher's activity prioritization (P4). Best-effort: an error here is
+/// logged but not propagated — failing to update activity should never
+/// fail a successful payment-address lookup.
+pub async fn touch_user_callback(pool: &PgPool, nym: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE users SET last_callback_at = NOW() WHERE nym = $1 AND is_active = TRUE",
+    )
+    .bind(nym)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!("touch_user_callback: nym={nym} failed: {e}");
+    }
 }
 
 /// Advance `users.next_addr_idx` past `observed_idx`, but only if it hasn't

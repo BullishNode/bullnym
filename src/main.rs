@@ -12,7 +12,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, chain_watcher, claimer, config, ip_whitelist, lnurl, nostr, rate_limit, registration,
+    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, registration,
     utxo::{self, UtxoBackend},
     AppState,
 };
@@ -119,21 +119,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = CancellationToken::new();
     claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
 
+    // Periodic GC of rate-limit tables. Without this, sliding-window
+    // queries get progressively slower as inactive rows accumulate.
+    {
+        let pool = pool.clone();
+        let cancel_gc = cancel.clone();
+        tokio::spawn(async move {
+            gc::run(pool, cancel_gc, gc::GcConfig::default()).await;
+        });
+        tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
+    }
+
+    // Periodic in-memory sweep for the per-IP / register / metadata
+    // sliding-window counters. Without this, one-shot bursts of unique
+    // IPs would leave entries behind forever.
+    {
+        let rl = rate_limiter.clone();
+        let cancel_sweep = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel_sweep.cancelled() => return,
+                    _ = tick.tick() => {
+                        let evicted = rl.sweep_inmemory(std::time::Duration::from_secs(7200));
+                        if evicted > 0 {
+                            tracing::info!("rate-limit in-mem sweep: evicted {} idle entries", evicted);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     if let Some(backend) = state.utxo_backend.clone() {
         let pool = state.db.clone();
         let rl = rate_limiter.clone();
         let cancel_watcher = cancel.clone();
+        let watcher_cfg =
+            chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
+        let active = watcher_cfg.active_tick_secs;
+        let idle = watcher_cfg.idle_tick_secs;
         tokio::spawn(async move {
-            chain_watcher::run(
-                pool,
-                backend,
-                rl,
-                cancel_watcher,
-                chain_watcher::ChainWatcherConfig::default(),
-            )
-            .await;
+            chain_watcher::run(pool, backend, rl, cancel_watcher, watcher_cfg).await;
         });
-        tracing::info!("chain watcher started (poll every 30s, lookahead 10)");
+        tracing::info!(
+            "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
+            active, idle,
+        );
     } else {
         tracing::warn!("chain watcher NOT started: utxo backend unavailable");
     }

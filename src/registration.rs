@@ -1,8 +1,9 @@
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +11,40 @@ use crate::auth;
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
+use crate::ip_whitelist;
 use crate::AppState;
+
+/// Resolve the caller IP using the same logic as `/lnurlp/callback`:
+/// rightmost X-Forwarded-For when `trust_forwarded_for`, otherwise the TCP
+/// peer. Returns `None` if neither source is available.
+fn caller_ip(
+    state: &AppState,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Option<IpAddr> {
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    ip_whitelist::resolve_caller_ip(
+        peer.map(|p| p.ip()),
+        xff,
+        state.config.rate_limit.trust_forwarded_for,
+    )
+}
+
+/// Apply the per-IP register rate limit. Whitelisted callers bypass.
+/// Called at the top of every `/register*` handler before any sig work.
+async fn gate_register_per_ip(
+    state: &AppState,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Result<Option<IpAddr>, AppError> {
+    let ip = caller_ip(state, peer, headers);
+    if let Some(ip) = ip {
+        if !state.ip_whitelist.contains(ip) {
+            state.rate_limiter.check_register_per_ip(ip).await?;
+        }
+    }
+    Ok(ip)
+}
 
 /// Accepted clock-skew window for the `reservations` auth timestamp. Wider
 /// than NIP-98 default (60s) because mobile clocks drift more than desktop.
@@ -50,8 +84,22 @@ pub struct UpdateResponse {
 /// POST /register — create a new Lightning Address with nostr auth
 pub async fn register(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+
+    // P1: gate before any CPU-expensive work (sig verify, descriptor parse).
+    let ip = gate_register_per_ip(&state, peer, &headers).await?;
+    let is_whitelisted = ip.map(|ip| state.ip_whitelist.contains(ip)).unwrap_or(false);
+
+    // P1: hard ceiling on active users. New registrations are blocked once
+    // the cap is reached; updates / lookups / deletes still work.
+    if !is_whitelisted {
+        state.rate_limiter.check_max_active_users().await?;
+    }
+
     if !NYM_REGEX.is_match(&req.nym) {
         return Err(AppError::NymInvalid(
             "must be 3-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
@@ -63,6 +111,20 @@ pub async fn register(
         &req.ct_descriptor,
         state.config.limits.max_descriptor_len,
     )?;
+
+    // P1: distinct-npubs-per-IP cap, applied after the cheap input
+    // validation but BEFORE the Schnorr verify. Recording the npub here
+    // (without it being verified) is fine because the limiter only counts
+    // distinct values — adversarial garbage just consumes the attacker's
+    // own bucket faster.
+    if !is_whitelisted {
+        if let Some(ip) = ip {
+            state
+                .rate_limiter
+                .check_register_distinct_npubs_per_ip(ip, &req.npub)
+                .await?;
+        }
+    }
 
     let message = format!("{}{}", req.nym, req.ct_descriptor);
     auth::verify_signature(&req.npub, message.as_bytes(), &req.signature)?;
@@ -99,8 +161,13 @@ pub async fn register(
 /// PUT /register — update descriptor for an existing registration
 pub async fn update_registration(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<UpdateResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let _ = gate_register_per_ip(&state, peer, &headers).await?;
+
     auth::verify_signature(&req.npub, req.ct_descriptor.as_bytes(), &req.signature)?;
 
     descriptor::validate_descriptor(
@@ -139,8 +206,13 @@ pub struct DeleteRequest {
 /// exist (their rows hold the only copy of the Boltz claim key).
 pub async fn delete_registration(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<DeleteRequest>,
 ) -> Result<StatusCode, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let _ = gate_register_per_ip(&state, peer, &headers).await?;
+
     let challenge: &[u8] = if req.purge { b"purge" } else { b"delete" };
     auth::verify_signature(&req.npub, challenge, &req.signature)?;
 
@@ -180,8 +252,25 @@ pub struct LookupResponse {
 /// GET /register/lookup?npub=<hex> — check if an npub has a registration
 pub async fn lookup_by_npub(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(params): Query<LookupParams>,
 ) -> Result<Json<LookupResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = gate_register_per_ip(&state, peer, &headers).await?;
+
+    // P2: bound how many distinct npubs one IP can probe. The per-IP
+    // register rate (P1) caps query speed; this caps total enumeration
+    // breadth even for a slow attacker.
+    if let Some(ip) = ip {
+        if !state.ip_whitelist.contains(ip) {
+            state
+                .rate_limiter
+                .check_lookup_distinct_npubs_per_ip(ip, &params.npub)
+                .await?;
+        }
+    }
+
     if let Some(user) = db::get_user_by_npub(&state.db, &params.npub).await? {
         return Ok(Json(LookupResponse { nym: user.nym, active: true }));
     }

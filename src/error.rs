@@ -23,6 +23,10 @@ pub enum AppError {
     // --- Rate limiting ---
     TooManyPendingReservations,
     RateLimited,
+    /// Hard ceiling on a resource has been reached (e.g., `max_active_users`).
+    /// Distinguished from `RateLimited` because the cap is durable, not a
+    /// transient burst — clients should not retry-with-backoff.
+    ServiceUnavailable(String),
 
     // --- Backend failures ---
     ElectrumError(String),
@@ -49,6 +53,7 @@ impl AppError {
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
             Self::TooManyPendingReservations => "TooManyPendingReservations",
             Self::RateLimited => "RateLimited",
+            Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::ElectrumError(_) => "ElectrumError",
             Self::BoltzError(_) => "BoltzError",
             Self::ClaimError(_) => "ClaimError",
@@ -74,6 +79,7 @@ impl std::fmt::Display for AppError {
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
             Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
             Self::RateLimited => write!(f, "rate limited"),
+            Self::ServiceUnavailable(reason) => write!(f, "service unavailable: {reason}"),
             Self::ElectrumError(msg) => write!(f, "electrum error: {msg}"),
             Self::BoltzError(msg) => write!(f, "swap service error: {msg}"),
             Self::ClaimError(msg) => write!(f, "claim error: {msg}"),
@@ -91,6 +97,7 @@ impl IntoResponse for AppError {
             AppError::ClaimError(msg) => tracing::error!("claim error: {msg}"),
             AppError::ElectrumError(msg) => tracing::error!("electrum error: {msg}"),
             AppError::ProofOfFundsInvalid(msg) => tracing::warn!("proof invalid: {msg}"),
+            AppError::ServiceUnavailable(msg) => tracing::error!("service unavailable: {msg}"),
             _ => tracing::warn!("{self}"),
         }
 
@@ -135,15 +142,21 @@ impl IntoResponse for AppError {
                 "You've made too many requests to this Lightning Address. \
                  Please wait and try again.".into()
             }
+            AppError::ServiceUnavailable(_) => {
+                "This service is temporarily not accepting new registrations. \
+                 Please try again later.".into()
+            }
             AppError::ElectrumError(_) => "Liquid network temporarily unavailable".into(),
             AppError::BoltzError(_) => "Payment service temporarily unavailable".into(),
             AppError::ClaimError(_) => "Claim service temporarily unavailable".into(),
             AppError::DbError(_) => "Internal server error".into(),
         };
 
-        // Auth errors: standard HTTP 401. Everything else: HTTP 200 + LNURL body.
+        // Auth errors: 401. ServiceUnavailable: 503. Everything else: HTTP 200
+        // + LNURL body (LUD-06 spec: errors travel in the JSON envelope).
         let status = match &self {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
+            AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::OK,
         };
 

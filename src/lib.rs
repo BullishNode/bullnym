@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod descriptor;
 pub mod error;
+pub mod gc;
 pub mod ip_whitelist;
 pub mod lnurl;
 pub mod nostr;

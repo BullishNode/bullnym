@@ -25,3 +25,37 @@ max_pending_reservations_per_nym = 5000
 lightning_rate_per_minute = 1000
 global_electrum_rate_per_sec = 200
 trust_forwarded_for = false
+
+# --- Registration gates (P1) ---
+# These close R8 (registration flood). Aggressive on purpose; legitimate users
+# register once per identity so 5/min/IP is generous. Per-IP-distinct-npubs
+# blocks slow-drip multi-identity creation. The ceiling is the operational
+# guardrail; raise once we see real signup traffic approach it.
+register_rate_limit                           = 5
+register_rate_window_secs                     = 60
+register_distinct_npubs_per_ip_limit          = 10
+register_distinct_npubs_per_ip_window_secs    = 3600
+max_active_users                              = 100000
+
+# --- Metadata + lookup gates (P2) ---
+# Closes R-enum (full nym-list discovery via /.well-known endpoints).
+# 30/min/IP is plenty for legitimate paying clients (which fetch metadata
+# once per payment, plus an occasional NIP-05 verification). The distinct-
+# nyms cap throttles slow-drip enumeration.
+metadata_rate_limit                           = 30
+metadata_rate_window_secs                     = 60
+metadata_distinct_nyms_per_ip_limit           = 20
+metadata_distinct_nyms_per_ip_window_secs     = 3600
+lookup_distinct_npubs_per_ip_limit            = 20
+lookup_distinct_npubs_per_ip_window_secs      = 3600
+
+# --- Chain watcher (P4) ---
+# Dedicated Electrum bucket so a callback storm can't starve the watcher
+# (and vice-versa). Active users (recent /lnurlp/callback) get the fast
+# tick; idle users get scanned every 10 min. With 100k+ registered
+# users this keeps per-tick Electrum cost bounded by real traffic, not
+# by table size.
+chain_watcher_electrum_rate_per_sec           = 50
+chain_watcher_active_user_tick_secs           = 30
+chain_watcher_idle_user_tick_secs             = 600
+chain_watcher_active_window_secs              = 86400

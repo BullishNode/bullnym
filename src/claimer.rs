@@ -1,8 +1,13 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use boltz_client::network::electrum::ElectrumLiquidClient;
@@ -18,7 +23,13 @@ use boltz_client::Keypair;
 use crate::config::Config;
 use crate::db::{self, SwapStatus};
 use crate::error::AppError;
+use crate::ip_whitelist;
 use crate::AppState;
+
+/// HTTP header Boltz uses to authenticate its webhook deliveries.
+/// Confirm at impl time against Boltz's current docs — header name has
+/// historically varied (`Boltz-Hmac-Signature` / `X-Boltz-Hmac` etc.).
+const BOLTZ_HMAC_HEADER: &str = "boltz-hmac-signature";
 
 #[derive(Deserialize)]
 struct WebhookEnvelope {
@@ -33,8 +44,52 @@ struct WebhookData {
 
 pub async fn webhook(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     body: String,
 ) -> Result<&'static str, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+
+    // D2 #1 — per-source rate-limit gate. Independent of HMAC; bounds
+    // webhook-bomb cost even if the secret leaks.
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let caller_ip = ip_whitelist::resolve_caller_ip(
+        peer.map(|p| p.ip()),
+        xff,
+        state.config.rate_limit.trust_forwarded_for,
+    );
+    if let Some(ip) = caller_ip {
+        if !state.ip_whitelist.contains(ip) {
+            state.rate_limiter.check_webhook_per_ip(ip).await?;
+        }
+    }
+
+    // D2 #2 — HMAC verify. When the secret is empty we log loudly and
+    // skip the check (legacy/dev mode). Production MUST set
+    // `BOLTZ_WEBHOOK_SECRET` in `.env`.
+    if state.config.boltz_webhook_secret.is_empty() {
+        tracing::warn!(
+            "boltz webhook: BOLTZ_WEBHOOK_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
+        );
+    } else {
+        let provided_sig = headers
+            .get(BOLTZ_HMAC_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                tracing::warn!(
+                    "boltz webhook: missing {} header from {:?}",
+                    BOLTZ_HMAC_HEADER,
+                    caller_ip
+                );
+                AppError::AuthError("missing webhook signature".into())
+            })?;
+        verify_hmac(&state.config.boltz_webhook_secret, body.as_bytes(), provided_sig)
+            .map_err(|e| {
+                tracing::warn!("boltz webhook: HMAC verify failed from {:?}: {e}", caller_ip);
+                AppError::AuthError("invalid webhook signature".into())
+            })?;
+    }
+
     tracing::debug!("boltz webhook raw: {}", body);
 
     let envelope: WebhookEnvelope = serde_json::from_str(&body).map_err(|e| {
@@ -42,6 +97,18 @@ pub async fn webhook(
         AppError::ClaimError(format!("invalid webhook payload: {e}"))
     })?;
     let data = envelope.data;
+
+    // D2 #3 — idempotency. Boltz can re-deliver the same event.
+    // event_id = "{swap_id}:{status}" is deterministic; first INSERT
+    // wins, duplicates short-circuit to 200 with no work done.
+    let event_id = format!("{}:{}", data.id, data.status);
+    let is_first = db::try_record_webhook_event(&state.db, &event_id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    if !is_first {
+        tracing::debug!("boltz webhook: duplicate event {event_id} — short-circuiting");
+        return Ok("ok");
+    }
 
     tracing::info!("boltz webhook: swap={} status={}", data.id, data.status);
 
@@ -205,6 +272,68 @@ async fn claim_swap(
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     Ok(())
+}
+
+/// HMAC-SHA256 of `body` with `secret`, compared in constant time
+/// against a hex-encoded `provided`. Returns `Err` on length mismatch,
+/// hex decode failure, or signature mismatch — all indistinguishable
+/// from each other to the caller (no oracle).
+fn verify_hmac(secret: &str, body: &[u8], provided_hex: &str) -> Result<(), String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("hmac init: {e}"))?;
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+    let provided = hex::decode(provided_hex).map_err(|_| "bad hex".to_string())?;
+    if expected.len() != provided.len() {
+        return Err("length mismatch".into());
+    }
+    if expected.ct_eq(&provided).into() {
+        Ok(())
+    } else {
+        Err("signature mismatch".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_hmac_accepts_correct_signature() {
+        let secret = "supersecret";
+        let body = b"{\"id\":\"abc\",\"status\":\"transaction.confirmed\"}";
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = hex::encode(mac.finalize().into_bytes());
+        assert!(verify_hmac(secret, body, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_hmac_rejects_wrong_secret() {
+        let body = b"hello";
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"right").unwrap();
+        mac.update(body);
+        let sig = hex::encode(mac.finalize().into_bytes());
+        assert!(verify_hmac("wrong", body, &sig).is_err());
+    }
+
+    #[test]
+    fn verify_hmac_rejects_tampered_body() {
+        let secret = "supersecret";
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(b"original");
+        let sig = hex::encode(mac.finalize().into_bytes());
+        assert!(verify_hmac(secret, b"tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn verify_hmac_rejects_garbage_hex() {
+        assert!(verify_hmac("k", b"body", "not-hex").is_err());
+    }
 }
 
 pub fn spawn_background_claimer(

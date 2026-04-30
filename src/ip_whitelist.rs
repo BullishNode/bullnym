@@ -48,6 +48,36 @@ impl IpWhitelist {
     }
 }
 
+/// Compute the rate-limit "source key" string for a caller IP.
+///
+/// IPv4 hosts get a unique key per address (`/32`).
+///
+/// IPv6 addresses are aggregated to `/56` so that an attacker with a
+/// routed `/64` (the standard ISP allocation, also what cloud VMs hand
+/// out) cannot rotate through 2⁶⁴ source addresses to bypass per-source
+/// caps. A `/56` covers a single ISP customer allocation — finer-grained
+/// would let one VM act as a 2⁶⁴-wide source, coarser would collide many
+/// real residential customers under one key.
+pub fn source_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("v4:/32:{v4}"),
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            // /56 = first 7 octets verbatim, 8th masked to 0.
+            format!(
+                "v6:/56:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}00::",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                octets[4],
+                octets[5],
+                octets[6]
+            )
+        }
+    }
+}
+
 /// Resolve the effective caller IP from a socket peer and headers.
 ///
 /// When `trust_forwarded_for` is true, we read the **rightmost** entry in
@@ -159,5 +189,30 @@ mod tests {
     #[test]
     fn resolve_none_when_no_source() {
         assert_eq!(resolve_caller_ip(None, None, false), None);
+    }
+
+    #[test]
+    fn source_key_ipv4_uses_full_address() {
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "203.0.113.8".parse().unwrap();
+        assert_ne!(source_key(a), source_key(b));
+        assert_eq!(source_key(a), "v4:/32:203.0.113.7");
+    }
+
+    #[test]
+    fn source_key_ipv6_aggregates_to_56() {
+        // Two addresses inside the same /56 must produce the same key.
+        let a: IpAddr = "2001:db8:abcd:0100::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:abcd:01ff:beef:cafe:dead:0001".parse().unwrap();
+        assert_eq!(source_key(a), source_key(b));
+        // A /56 over the boundary must NOT collide.
+        let c: IpAddr = "2001:db8:abcd:0200::1".parse().unwrap();
+        assert_ne!(source_key(a), source_key(c));
+    }
+
+    #[test]
+    fn source_key_ipv6_format_is_stable() {
+        let ip: IpAddr = "2001:db8:abcd:01ff:beef:cafe:dead:0001".parse().unwrap();
+        assert_eq!(source_key(ip), "v6:/56:2001:0db8:abcd:0100::");
     }
 }
