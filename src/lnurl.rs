@@ -25,15 +25,8 @@ pub struct LnurlPayMetadata {
     pub metadata: String,
     pub tag: String,
     pub comment_allowed: u16,
-    pub currencies: Vec<Currency>,
-}
-
-#[derive(Serialize)]
-pub struct Currency {
-    pub code: String,
-    pub name: String,
-    pub network: String,
-    pub symbol: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub payment_methods: Vec<&'static str>,
 }
 
 // --- Callback params ---
@@ -42,10 +35,7 @@ pub struct Currency {
 pub struct CallbackParams {
     pub amount: u64,
     pub comment: Option<String>,
-    pub network: Option<String>,
-
-    // Proof-of-funds fields (required for `network=liquid` unless caller is
-    // on the IP whitelist).
+    pub payment_method: Option<String>,
     pub outpoint: Option<String>,
     pub pubkey: Option<String>,
     pub sig: Option<String>,
@@ -93,20 +83,6 @@ pub struct SuccessAction {
     pub message: String,
 }
 
-#[derive(Serialize)]
-pub struct LiquidResponse {
-    pub onchain: OnchainPayment,
-    pub disposable: bool,
-}
-
-#[derive(Serialize)]
-pub struct OnchainPayment {
-    pub network: String,
-    pub address: String,
-    pub amount_sat: u64,
-    pub bip21: String,
-}
-
 // --- Metadata builder ---
 
 fn build_metadata(nym: &str, domain: &str) -> String {
@@ -119,9 +95,13 @@ fn build_metadata(nym: &str, domain: &str) -> String {
     .expect("metadata serialization cannot fail")
 }
 
-const LBTC_ASSET_ID: &str = "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
-
 // --- Helpers ---
+
+fn requests_method(payment_method: Option<&str>, target: &str) -> bool {
+    payment_method
+        .map(|s| s.split(',').any(|m| m.trim() == target))
+        .unwrap_or(false)
+}
 
 /// Resolve caller IP and apply the per-IP metadata rate-limit + (when a nym
 /// is being queried) the distinct-nyms-per-IP cap. Whitelisted callers
@@ -181,20 +161,7 @@ pub async fn metadata(
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
         comment_allowed: 144,
-        currencies: vec![
-            Currency {
-                code: "BTC".to_string(),
-                name: "Bitcoin".to_string(),
-                network: "bitcoin".to_string(),
-                symbol: "BTC".to_string(),
-            },
-            Currency {
-                code: "BTC".to_string(),
-                name: "Liquid Bitcoin".to_string(),
-                network: "liquid".to_string(),
-                symbol: "L-BTC".to_string(),
-            },
-        ],
+        payment_methods: vec!["L-BTC"],
     }))
 }
 
@@ -244,7 +211,7 @@ async fn serve_liquid(
     state: &AppState,
     nym: &str,
     user: &db::User,
-    amount_sat: u64,
+    _amount_sat: u64,
     params: &CallbackParams,
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
@@ -316,24 +283,11 @@ async fn serve_liquid(
         }
     }
 
-    // Last-unused address.
     let addr_index_u32 = u32::try_from(user.next_addr_idx)
         .map_err(|_| AppError::DbError("address index overflow".to_string()))?;
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
-    let bip21 = format!(
-        "liquidnetwork:{address}?amount={}&assetid={LBTC_ASSET_ID}",
-        format_btc_amount(amount_sat),
-    );
-    let resp = LiquidResponse {
-        onchain: OnchainPayment {
-            network: "liquid".to_string(),
-            address,
-            amount_sat,
-            bip21,
-        },
-        disposable: false,
-    };
+    let resp = serde_json::json!({ "L-BTC": { "address": address } });
     db::touch_user_callback(&state.db, nym).await;
     Ok(Json(resp).into_response())
 }
@@ -465,15 +419,7 @@ pub async fn callback(
         }
     }
 
-    // --- Liquid path is opt-in via `network=liquid` ---
-    // PR C: on a Liquid-side rate-limit, transparently fall back to
-    // Lightning (the default rail). Lightning doesn't leak Liquid
-    // addresses, so the surveillance argument that justifies the tight
-    // Liquid caps doesn't apply — serving an invoice instead of a 429
-    // gives legitimate payers a working path AND raises attacker cost
-    // (each fallback creates a real Boltz reverse swap, which is useless
-    // for chain-analysis surveillance and costs Boltz API quota).
-    if params.network.as_deref() == Some("liquid") {
+    if requests_method(params.payment_method.as_deref(), "L-BTC") {
         match serve_liquid(&state, &nym, &user, amount_sat, &params, caller_ip, is_whitelisted)
             .await
         {
@@ -493,11 +439,6 @@ pub async fn callback(
 
     // Lightning path — default rail AND fallback destination.
     serve_lightning(&state, &nym, &user, amount_sat, caller_ip, is_whitelisted).await
-}
-
-fn format_btc_amount(sats: u64) -> String {
-    let btc = sats as f64 / 100_000_000.0;
-    format!("{btc:.8}")
 }
 
 use axum::response::IntoResponse;
@@ -581,6 +522,34 @@ mod tests {
         assert_eq!(rl_gate(r).ok(), Some(42));
     }
 
+    // --- LUD-22 dispatch helper ---
+
+    #[test]
+    fn requests_method_single() {
+        assert!(requests_method(Some("L-BTC"), "L-BTC"));
+        assert!(!requests_method(Some("L-BTC"), "BTC-SP"));
+        assert!(!requests_method(None, "L-BTC"));
+    }
+
+    #[test]
+    fn requests_method_comma_list() {
+        assert!(requests_method(Some("L-BTC,BTC-SP"), "L-BTC"));
+        assert!(requests_method(Some("L-BTC,BTC-SP"), "BTC-SP"));
+        assert!(!requests_method(Some("L-BTC,BTC-SP"), "BTC"));
+    }
+
+    #[test]
+    fn requests_method_trims_whitespace() {
+        assert!(requests_method(Some("L-BTC, BTC-SP"), "BTC-SP"));
+        assert!(requests_method(Some(" L-BTC "), "L-BTC"));
+    }
+
+    #[test]
+    fn requests_method_case_sensitive() {
+        // Codes are canonical-case; "l-btc" is not a match.
+        assert!(!requests_method(Some("l-btc"), "L-BTC"));
+    }
+
     #[test]
     fn metadata_has_two_entries() {
         let meta = build_metadata("test", "example.com");
@@ -606,10 +575,4 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    #[test]
-    fn format_btc_amount_works() {
-        assert_eq!(format_btc_amount(307), "0.00000307");
-        assert_eq!(format_btc_amount(100_000_000), "1.00000000");
-        assert_eq!(format_btc_amount(1), "0.00000001");
-    }
 }
