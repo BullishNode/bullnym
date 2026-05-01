@@ -69,6 +69,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.per_ip_limit,
             self.cfg.per_ip_window_secs,
+            AppError::RateLimitedSender,
         )
     }
 
@@ -81,6 +82,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.per_pubkey_limit,
             self.cfg.per_pubkey_window_secs,
+            AppError::RateLimitedSender,
         )
         .await
     }
@@ -107,6 +109,7 @@ impl RateLimiter {
             nym,
             limit,
             self.cfg.distinct_nyms_window_secs,
+            AppError::RateLimitedNetwork,
         )
         .await
     }
@@ -123,6 +126,7 @@ impl RateLimiter {
             nym,
             self.cfg.distinct_nyms_per_outpoint_limit,
             self.cfg.distinct_nyms_window_secs,
+            AppError::RateLimitedNetwork,
         )
         .await
     }
@@ -137,6 +141,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.lightning_rate_per_minute,
             60,
+            AppError::RateLimitedRecipient,
         )
         .await
     }
@@ -152,6 +157,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.register_rate_limit,
             self.cfg.register_rate_window_secs,
+            AppError::RateLimitedSender,
         )
     }
 
@@ -173,6 +179,7 @@ impl RateLimiter {
             npub_hex,
             self.cfg.register_distinct_npubs_per_ip_limit,
             self.cfg.register_distinct_npubs_per_ip_window_secs,
+            AppError::RateLimitedNetwork,
         )
         .await
     }
@@ -205,6 +212,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.metadata_rate_limit,
             self.cfg.metadata_rate_window_secs,
+            AppError::RateLimitedSender,
         )
     }
 
@@ -224,6 +232,7 @@ impl RateLimiter {
             nym,
             self.cfg.metadata_distinct_nyms_per_ip_limit,
             self.cfg.metadata_distinct_nyms_per_ip_window_secs,
+            AppError::RateLimitedNetwork,
         )
         .await
     }
@@ -236,10 +245,13 @@ impl RateLimiter {
     /// Boltz traffic is well under 10/min/IP for a healthy swap.
     pub async fn check_webhook_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("webhook:{}", source_key(ip));
+        // Webhook errors go back to Boltz, not a wallet — copy is irrelevant
+        // beyond the HTTP status. Use Sender for log-grouping consistency.
         self.inmem_sliding_check(
             &bucket,
             self.cfg.webhook_rate_limit,
             self.cfg.webhook_rate_window_secs,
+            AppError::RateLimitedSender,
         )
     }
 
@@ -254,6 +266,7 @@ impl RateLimiter {
             &bucket,
             self.cfg.lightning_per_source_limit,
             self.cfg.lightning_per_source_window_secs,
+            AppError::RateLimitedSender,
         )
     }
 
@@ -268,6 +281,7 @@ impl RateLimiter {
             npub_hex,
             self.cfg.lookup_distinct_npubs_per_ip_limit,
             self.cfg.lookup_distinct_npubs_per_ip_window_secs,
+            AppError::RateLimitedNetwork,
         )
         .await
     }
@@ -300,7 +314,7 @@ impl RateLimiter {
                 axis = "electrum_bucket",
                 "global Electrum token bucket exhausted"
             );
-            Err(AppError::RateLimited)
+            Err(AppError::BackendThrottled)
         }
     }
 
@@ -319,7 +333,7 @@ impl RateLimiter {
                 axis = "electrum_bucket_watcher",
                 "watcher Electrum bucket exhausted"
             );
-            Err(AppError::RateLimited)
+            Err(AppError::BackendThrottled)
         }
     }
 
@@ -335,6 +349,7 @@ impl RateLimiter {
         bucket: &str,
         limit: u32,
         window_secs: u32,
+        on_limit: AppError,
     ) -> Result<(), AppError> {
         if limit == 0 {
             return Ok(());
@@ -352,7 +367,7 @@ impl RateLimiter {
                     window_secs = window_secs,
                     "in-memory sliding-window limit exceeded"
                 );
-                Err(AppError::RateLimited)
+                Err(on_limit)
             }
         }
     }
@@ -368,6 +383,7 @@ impl RateLimiter {
         bucket: &str,
         limit: u32,
         window_secs: u32,
+        on_limit: AppError,
     ) -> Result<(), AppError> {
         if limit == 0 {
             return Ok(());
@@ -387,7 +403,7 @@ impl RateLimiter {
                 window_secs = window_secs,
                 "atomic sliding-window limit exceeded"
             );
-            return Err(AppError::RateLimited);
+            return Err(on_limit);
         }
         Ok(())
     }
@@ -401,6 +417,7 @@ impl RateLimiter {
         nym: &str,
         limit: u32,
         window_secs: u32,
+        on_limit: AppError,
     ) -> Result<(), AppError> {
         if limit == 0 {
             return Ok(());
@@ -422,7 +439,7 @@ impl RateLimiter {
                 window_secs = window_secs,
                 "distinct-nyms limit exceeded"
             );
-            return Err(AppError::RateLimited);
+            return Err(on_limit);
         }
         Ok(())
     }

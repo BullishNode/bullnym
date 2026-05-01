@@ -81,11 +81,39 @@ pub struct RegisterRequest {
     pub timestamp: Option<u64>,
 }
 
+/// Wire-shape view of a per-npub lifetime nym quota. Lives on every
+/// register/lookup/delete response and inside `NymQuotaExceeded.details`
+/// so the mobile decodes it from one shape regardless of which endpoint
+/// produced it. `remaining` is `(cap - used).max(0)` — included so clients
+/// don't have to recompute.
+#[derive(Serialize, Clone, Copy)]
+pub struct QuotaView {
+    pub used: i64,
+    pub cap: i64,
+    pub remaining: i64,
+}
+
+impl QuotaView {
+    fn new(used: i64, cap: i64) -> Self {
+        Self { used, cap, remaining: (cap - used).max(0) }
+    }
+}
+
 #[derive(Serialize)]
 pub struct RegisterResponse {
     pub nym: String,
     pub lightning_address: String,
     pub nip05: String,
+    /// Lifetime nym quota AFTER this register. Mobile reads this so it
+    /// doesn't need a follow-up `/register/lookup` round trip.
+    pub quota: QuotaView,
+}
+
+/// Response body for `DELETE /register`. Returns the quota AFTER the
+/// deactivation (which is unchanged — deactivate doesn't free a slot).
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub quota: QuotaView,
 }
 
 #[derive(Deserialize)]
@@ -158,24 +186,35 @@ pub async fn register(
         v0_challenge.as_bytes(),
     )?;
 
-    // Check if npub already has an active registration
-    if let Some(active) = db::get_user_by_npub(&state.db, &req.npub).await? {
-        return Err(AppError::NymTaken(format!(
-            "this key already has an active address: {}@{}",
-            active.nym, state.config.domain
-        )));
-    }
-
-    // Check if npub has an inactive registration — reactivate with new nym
-    if let Some(_inactive) = db::get_inactive_user_by_npub(&state.db, &req.npub).await? {
-        db::reactivate_user(&state.db, &req.npub, &req.nym, &req.ct_descriptor).await?;
-    } else {
-        // Fresh registration
-        db::create_user(&state.db, &req.nym, &req.npub, &req.ct_descriptor).await?;
+    // Atomic register flow under an advisory lock keyed on `npub`.
+    // Past nyms stay reserved forever (the inactive row keeps its name);
+    // re-registering the original nym reactivates the same row so swap
+    // history follows the FK; a different nym becomes a fresh row.
+    let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    match db::register_user_atomic(
+        &state.db,
+        &req.npub,
+        &req.nym,
+        &req.ct_descriptor,
+        cap,
+    )
+    .await?
+    {
+        db::RegisterOutcome::Created(_) | db::RegisterOutcome::Reactivated(_) => {}
+        db::RegisterOutcome::KeyAlreadyRegistered { nym } => {
+            return Err(AppError::KeyAlreadyRegistered {
+                nym,
+                domain: state.config.domain.clone(),
+            });
+        }
+        db::RegisterOutcome::QuotaExceeded { used, cap } => {
+            return Err(AppError::NymQuotaExceeded { used, cap });
+        }
     }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
     let nip05 = lightning_address.clone();
+    let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -183,6 +222,7 @@ pub async fn register(
             nym: req.nym,
             lightning_address,
             nip05,
+            quota: QuotaView::new(used, cap),
         }),
     ))
 }
@@ -247,7 +287,7 @@ pub async fn delete_registration(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<DeleteRequest>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<DeleteResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let _ = gate_register_per_ip(&state, peer, &headers).await?;
 
@@ -266,20 +306,24 @@ pub async fn delete_registration(
         match db::purge_user(&state.db, &req.npub).await? {
             db::PurgeOutcome::Purged(user) => {
                 tracing::info!("purged registration for {}", user.nym);
-                Ok(StatusCode::NO_CONTENT)
             }
-            db::PurgeOutcome::NotFound => Err(AppError::NymNotFound(
-                "no registration found for this key".to_string(),
-            )),
-            db::PurgeOutcome::InFlightSwaps(n) => Err(AppError::PurgeBlocked(n)),
+            db::PurgeOutcome::NotFound => {
+                return Err(AppError::NymNotFound(
+                    "no registration found for this key".to_string(),
+                ));
+            }
+            db::PurgeOutcome::InFlightSwaps(n) => return Err(AppError::PurgeBlocked(n)),
         }
     } else {
         let user = db::deactivate_user(&state.db, &req.npub).await?.ok_or_else(
             || AppError::NymNotFound("no registration found for this key".to_string()),
         )?;
         tracing::info!("deactivated registration for {}", user.nym);
-        Ok(StatusCode::NO_CONTENT)
     }
+
+    let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
+    Ok(Json(DeleteResponse { quota: QuotaView::new(used, cap) }))
 }
 
 // --- Lookup ---
@@ -293,6 +337,17 @@ pub struct LookupParams {
 pub struct LookupResponse {
     pub nym: String,
     pub active: bool,
+    /// Canonical quota wire shape. Mobile decoders read this. Mirrors the
+    /// shape on `RegisterResponse`, `DeleteResponse`, and inside
+    /// `NymQuotaExceeded.details`.
+    pub quota: QuotaView,
+    /// Legacy field — kept until the next mobile build hits 95% adoption,
+    /// then removed by `pay-service:remove-legacy-quota-keys`. New clients
+    /// MUST read `quota.used`.
+    pub lifetime_nyms_used: i64,
+    /// Legacy field — see `lifetime_nyms_used`. New clients MUST read
+    /// `quota.cap`.
+    pub lifetime_nyms_cap: i64,
 }
 
 /// GET /register/lookup?npub=<hex> — check if an npub has a registration
@@ -317,11 +372,28 @@ pub async fn lookup_by_npub(
         }
     }
 
-    if let Some(user) = db::get_user_by_npub(&state.db, &params.npub).await? {
-        return Ok(Json(LookupResponse { nym: user.nym, active: true }));
+    // One round trip — see `db::lookup_status_by_npub`.
+    let (active_nym, inactive_nym, used) =
+        db::lookup_status_by_npub(&state.db, &params.npub).await?;
+    let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    let quota = QuotaView::new(used, cap);
+    if let Some(nym) = active_nym {
+        return Ok(Json(LookupResponse {
+            nym,
+            active: true,
+            quota,
+            lifetime_nyms_used: used,
+            lifetime_nyms_cap: cap,
+        }));
     }
-    if let Some(user) = db::get_inactive_user_by_npub(&state.db, &params.npub).await? {
-        return Ok(Json(LookupResponse { nym: user.nym, active: false }));
+    if let Some(nym) = inactive_nym {
+        return Ok(Json(LookupResponse {
+            nym,
+            active: false,
+            quota,
+            lifetime_nyms_used: used,
+            lifetime_nyms_cap: cap,
+        }));
     }
     Err(AppError::NymNotFound("no registration for this key".to_string()))
 }

@@ -46,7 +46,16 @@ pub struct LimitsConfig {
     pub max_sendable_msat: u64,
     #[serde(default = "default_max_descriptor_len")]
     pub max_descriptor_len: usize,
+    /// Hard cap on the number of distinct nyms a single npub can ever
+    /// register. Inactive (deregistered) nyms still count — the row keeps
+    /// its name reserved. Without this cap one key can squat the namespace
+    /// by churning through dereg/rereg cycles.
+    #[serde(default = "default_max_lifetime_nyms_per_npub")]
+    pub max_lifetime_nyms_per_npub: i64,
 }
+
+const DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB: i64 = 3;
+fn default_max_lifetime_nyms_per_npub() -> i64 { DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -54,6 +63,7 @@ impl Default for LimitsConfig {
             min_sendable_msat: DEFAULT_MIN_SENDABLE_MSAT,
             max_sendable_msat: DEFAULT_MAX_SENDABLE_MSAT,
             max_descriptor_len: DEFAULT_MAX_DESCRIPTOR_LEN,
+            max_lifetime_nyms_per_npub: DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB,
         }
     }
 }

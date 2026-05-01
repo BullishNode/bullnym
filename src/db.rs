@@ -103,31 +103,168 @@ pub async fn get_inactive_user_by_npub(pool: &PgPool, npub: &str) -> Result<Opti
     .await
 }
 
-pub async fn reactivate_user(
+/// Mark a user row as having seen real activity (a Lightning swap or a
+/// Liquid LUD-22 reservation). Idempotent: the `WHERE has_been_used = FALSE`
+/// guard makes re-marking a no-op. Caller passes the executor (a tx
+/// borrow when this update belongs to a larger atomic flow, or the pool
+/// directly otherwise).
+pub async fn mark_user_used<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    nym: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET has_been_used = TRUE WHERE nym = $1 AND has_been_used = FALSE")
+        .bind(nym)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Total nyms ever registered under this npub (active + inactive). Used
+/// to enforce `max_lifetime_nyms_per_npub` so one key can't squat the
+/// namespace via dereg/rereg cycles.
+pub async fn count_lifetime_nyms_by_npub(
+    pool: &PgPool,
+    npub: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
+        .bind(npub)
+        .fetch_one(pool)
+        .await
+}
+
+/// Combined lookup-by-npub: in one round trip, returns
+/// `(active_nym, inactive_nym, used_count)`. Used by `GET /register/lookup`
+/// so the wallet-open path is one DB call instead of three.
+///
+/// `active_nym`: the nym of the active row (if any).
+/// `inactive_nym`: the nym of the most-recently-deactivated row (if any).
+/// `used`: total lifetime rows under this npub.
+pub async fn lookup_status_by_npub(
+    pool: &PgPool,
+    npub: &str,
+) -> Result<(Option<String>, Option<String>, i64), sqlx::Error> {
+    let row: (Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT \
+            (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE LIMIT 1) AS active_nym, \
+            (SELECT nym FROM users WHERE npub = $1 AND is_active = FALSE \
+                ORDER BY created_at DESC LIMIT 1) AS inactive_nym, \
+            (SELECT COUNT(*) FROM users WHERE npub = $1) AS used",
+    )
+    .bind(npub)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.0, row.1, row.2.unwrap_or(0)))
+}
+
+/// Outcome of `register_user_atomic`. Mirrors the three branches of the
+/// register handler so the caller can map each to the right `AppError`.
+pub enum RegisterOutcome {
+    /// New user row inserted.
+    Created(User),
+    /// Existing inactive row reactivated (caller asked for the same nym they
+    /// previously held).
+    Reactivated(User),
+    /// This npub already has an active row under `nym`. Caller maps to
+    /// `AppError::KeyAlreadyRegistered`.
+    KeyAlreadyRegistered { nym: String },
+    /// Inserting would push past the lifetime cap. Caller maps to
+    /// `AppError::NymQuotaExceeded`. Carries `used` so the error envelope
+    /// can ship the same `quota` object the mobile sees on lookup.
+    QuotaExceeded { used: i64, cap: i64 },
+}
+
+/// Atomic register flow. Serializes concurrent registers from the same npub
+/// via `pg_advisory_xact_lock(hashtext(npub))` so the cap check, the
+/// active-row check, and the INSERT/UPDATE all observe a consistent view.
+///
+/// Advisory-lock keyspace audit (Kumulynja PLAN-3): the rate-limit code in
+/// `record_and_count_rate_limit_atomic` and `record_and_count_distinct_nyms_atomic`
+/// also uses `pg_advisory_xact_lock`, but keys on `hashtext(<bucket-string>)`
+/// where the bucket is `register:ip:...`, `meta:ip:...`, etc. — never `npub`
+/// raw. Bucket strings and raw npub hex live in disjoint string spaces, so
+/// hashtext collisions are vanishingly improbable, and no single tx ever
+/// holds both a registration lock and a rate-limit lock (the rate-limit gates
+/// run before this function is called).
+pub async fn register_user_atomic(
     pool: &PgPool,
     npub: &str,
     nym: &str,
     ct_descriptor: &str,
-) -> Result<User, sqlx::Error> {
+    cap: i64,
+) -> Result<RegisterOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let user = sqlx::query_as::<_, User>(
-        "UPDATE users SET nym = $2, ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
-         WHERE id = (SELECT id FROM users WHERE npub = $1 AND is_active = FALSE ORDER BY created_at DESC LIMIT 1) \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(npub)
+        .execute(&mut *tx)
+        .await?;
+
+    // Re-check inside the lock — another tx may have inserted the active row
+    // while we were waiting.
+    let active = sqlx::query_as::<_, User>(
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+         FROM users WHERE npub = $1 AND is_active = TRUE",
     )
     .bind(npub)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(active) = active {
+        tx.rollback().await?;
+        return Ok(RegisterOutcome::KeyAlreadyRegistered { nym: active.nym });
+    }
+
+    let prior_inactive = sqlx::query_as::<_, User>(
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+         FROM users WHERE npub = $1 AND is_active = FALSE \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(npub)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(prior) = prior_inactive.as_ref().filter(|u| u.nym == nym) {
+        // Reactivate same nym — no rename, FK from swap_records still aligned.
+        let user = sqlx::query_as::<_, User>(
+            "UPDATE users SET ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
+             WHERE npub = $1 AND nym = $2 AND is_active = FALSE \
+             RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+        )
+        .bind(npub)
+        .bind(&prior.nym)
+        .bind(ct_descriptor)
+        .fetch_one(&mut *tx)
+        .await?;
+        // Descriptor reset means any cached outpoint→addr_index mappings now
+        // point into the wrong keyspace. Drop them.
+        sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
+            .bind(&user.nym)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(RegisterOutcome::Reactivated(user));
+    }
+
+    // Cap check inside the lock.
+    let used: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
+        .bind(npub)
+        .fetch_one(&mut *tx)
+        .await?;
+    if used >= cap {
+        tx.rollback().await?;
+        return Ok(RegisterOutcome::QuotaExceeded { used, cap });
+    }
+
+    let user = sqlx::query_as::<_, User>(
+        "INSERT INTO users (nym, npub, ct_descriptor) VALUES ($1, $2, $3) \
+         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+    )
     .bind(nym)
+    .bind(npub)
     .bind(ct_descriptor)
     .fetch_one(&mut *tx)
     .await?;
-    // Descriptor reset means any cached outpoint→addr_index mappings now
-    // point into the wrong keyspace. Drop them.
-    sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
-        .bind(&user.nym)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
-    Ok(user)
+    Ok(RegisterOutcome::Created(user))
 }
 
 pub async fn create_user(
@@ -285,6 +422,7 @@ pub struct NewSwapRecord<'a> {
 }
 
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
@@ -300,8 +438,10 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     .bind(swap.preimage_hex)
     .bind(swap.claim_key_hex)
     .bind(swap.boltz_response_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    mark_user_used(&mut *tx, swap.nym).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -473,6 +613,8 @@ pub async fn allocate_outpoint_address(
     .execute(&mut *tx)
     .await?;
 
+    mark_user_used(&mut *tx, nym).await?;
+
     tx.commit().await?;
     Ok(current_idx)
 }
@@ -537,6 +679,13 @@ pub async fn count_active_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// the same bucket can be inside this critical section at a time, so two
 /// concurrent callers can't both pass under the limit and then both
 /// commit past it. Returns the post-insert count.
+///
+/// Advisory-lock keyspace: keys are `hashtext(<bucket>)` where bucket is
+/// `register:ip:...`, `meta:ip:...`, `nym:...`, etc. The registration flow
+/// (`register_user_atomic`) keys on `hashtext(<npub-hex>)`. Bucket strings
+/// and raw npub hex live in disjoint string spaces, and rate-limit gates
+/// run before `register_user_atomic` is called (never inside its tx), so
+/// no AB/BA deadlock is possible.
 pub async fn record_and_count_rate_limit_atomic(
     pool: &PgPool,
     bucket: &str,

@@ -192,15 +192,15 @@ impl From<sqlx::Error> for LiquidOutcome {
     }
 }
 
-/// Map a rate-limit gate result so `RateLimited` /
-/// `TooManyPendingReservations` become the soft-fallback signal; every
-/// other error stays Hard.
+/// Map a rate-limit gate result so any rate-limit-class error becomes the
+/// soft-fallback signal; every other error stays Hard. The rate-limit
+/// classification is owned by `AppError::is_rate_limit` so adding a new
+/// rate-limit code in `error.rs` automatically routes through the soft
+/// path here.
 fn rl_gate<T>(result: Result<T, AppError>) -> Result<T, LiquidOutcome> {
     match result {
         Ok(v) => Ok(v),
-        Err(AppError::RateLimited) | Err(AppError::TooManyPendingReservations) => {
-            Err(LiquidOutcome::SoftRateLimited)
-        }
+        Err(e) if e.is_rate_limit() => Err(LiquidOutcome::SoftRateLimited),
         Err(other) => Err(LiquidOutcome::Hard(other)),
     }
 }
@@ -219,7 +219,9 @@ async fn serve_liquid(
     if !is_whitelisted {
         let proof = params
             .take_proof()
-            .ok_or(AppError::ProofOfFundsRequired(state.config.proof.min_proof_value_sat))?;
+            .ok_or(AppError::ProofOfFundsRequired {
+                min_sat: state.config.proof.min_proof_value_sat,
+            })?;
 
         // Sig verify (Hard — proof error if fails).
         let pubkey = verify_ownership_sig(
@@ -476,10 +478,17 @@ mod tests {
 
     #[test]
     fn rl_gate_rate_limited_becomes_soft() {
-        let r: Result<(), AppError> = Err(AppError::RateLimited);
-        match rl_gate(r) {
-            Err(LiquidOutcome::SoftRateLimited) => (),
-            _ => panic!("RateLimited should map to SoftRateLimited"),
+        for variant in [
+            AppError::RateLimitedSender,
+            AppError::RateLimitedRecipient,
+            AppError::RateLimitedNetwork,
+            AppError::BackendThrottled,
+        ] {
+            let r: Result<(), AppError> = Err(variant);
+            match rl_gate(r) {
+                Err(LiquidOutcome::SoftRateLimited) => (),
+                _ => panic!("rate-limit variant should map to SoftRateLimited"),
+            }
         }
     }
 

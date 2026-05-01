@@ -819,3 +819,80 @@ fn schnorr_sign_verify_roundtrip() {
     let result = pay_service::auth::verify_signature(&npub_hex, message, &sig_hex);
     assert!(result.is_ok(), "Signature verification failed: {:?}", result);
 }
+
+/// Two concurrent registers from the same npub, when only one slot remains
+/// under the lifetime cap, must result in exactly one Created and one
+/// NymQuotaExceeded — never two Createds (which would overshoot the cap)
+/// and never InternalError (the bug pre-advisory-lock).
+#[tokio::test]
+async fn register_concurrent_does_not_exceed_cap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    // One keypair → one npub for all calls.
+    let (npub_hex, _, kp) = sign_registration_with_keypair("filler-0", TEST_DESCRIPTOR);
+
+    // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
+    // creating + deactivating filler rows. Goes through the atomic flow
+    // sequentially so the partial unique on active-npub isn't violated.
+    pay_service::db::register_user_atomic(
+        &pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, 3,
+    ).await.unwrap();
+    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
+        .execute(&pool).await.unwrap();
+    pay_service::db::register_user_atomic(
+        &pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, 3,
+    ).await.unwrap();
+    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
+        .execute(&pool).await.unwrap();
+
+    // Two concurrent register calls — only one slot remains. Without the
+    // advisory lock, both would pass `used < cap` (read=2) and both would
+    // INSERT, leaving 4 lifetime rows. With the lock, the loser sees
+    // `used >= cap` and returns NymQuotaExceeded.
+    let sig_a = sign_with_keypair(&kp, format!("conc-a{}", TEST_DESCRIPTOR).as_bytes());
+    let sig_b = sign_with_keypair(&kp, format!("conc-b{}", TEST_DESCRIPTOR).as_bytes());
+
+    let req_a = post_json(&app, "/register", json!({
+        "nym": "conc-a",
+        "ct_descriptor": TEST_DESCRIPTOR,
+        "npub": npub_hex,
+        "signature": sig_a,
+    }));
+    let req_b = post_json(&app, "/register", json!({
+        "nym": "conc-b",
+        "ct_descriptor": TEST_DESCRIPTOR,
+        "npub": npub_hex,
+        "signature": sig_b,
+    }));
+    let ((status_a, body_a), (status_b, body_b)) = tokio::join!(req_a, req_b);
+
+    let success_count = (status_a == StatusCode::CREATED) as u32
+        + (status_b == StatusCode::CREATED) as u32;
+    let quota_count = (body_a["code"] == "NymQuotaExceeded") as u32
+        + (body_b["code"] == "NymQuotaExceeded") as u32;
+
+    assert_eq!(
+        success_count, 1,
+        "exactly one register should succeed; got a=({status_a:?},{body_a}) b=({status_b:?},{body_b})"
+    );
+    assert_eq!(
+        quota_count, 1,
+        "the other should be NymQuotaExceeded; got a={body_a} b={body_b}"
+    );
+    // The bug we're guarding against: race-loser returning a generic
+    // InternalError because the cap check happened outside the atomic tx.
+    let codes = [body_a["code"].as_str(), body_b["code"].as_str()];
+    assert!(
+        !codes.contains(&Some("InternalError")),
+        "must not return InternalError under contention; got {codes:?}"
+    );
+
+    // DB invariant: exactly cap rows under this npub.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
+        .bind(&npub_hex).fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 3, "lifetime cap must hold under contention");
+
+    cleanup_db(&pool).await;
+}
