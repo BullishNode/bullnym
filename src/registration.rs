@@ -5,7 +5,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth;
 use crate::db;
@@ -46,12 +45,31 @@ async fn gate_register_per_ip(
     Ok(ip)
 }
 
-/// Accepted clock-skew window for the `reservations` auth timestamp. Wider
-/// than NIP-98 default (60s) because mobile clocks drift more than desktop.
-const RESERVATIONS_TS_WINDOW_SECS: u64 = 300;
-
 static NYM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\-]{1,30}[a-z0-9]$").unwrap());
+
+// Dispatches v1 (timestamped, domain-tagged) when `timestamp` is supplied,
+// otherwise falls back to legacy v0 with a deprecation warn. v0 path will
+// be removed once the deprecation log volume drops.
+fn verify_la_action_sig(
+    npub: &str,
+    action: &str,
+    v1_payload: &[&str],
+    timestamp: Option<u64>,
+    signature: &str,
+    v0_challenge: &[u8],
+) -> Result<(), AppError> {
+    if let Some(ts) = timestamp {
+        auth::verify_la_v1(action, npub, v1_payload, ts, signature)
+    } else {
+        tracing::warn!(
+            npub = %npub,
+            action = %action,
+            "deprecated v0 sig accepted; will be rejected after overlap window"
+        );
+        auth::verify_signature(npub, v0_challenge, signature)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -59,6 +77,8 @@ pub struct RegisterRequest {
     pub ct_descriptor: String,
     pub npub: String,
     pub signature: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -73,6 +93,8 @@ pub struct UpdateRequest {
     pub npub: String,
     pub ct_descriptor: String,
     pub signature: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -126,8 +148,15 @@ pub async fn register(
         }
     }
 
-    let message = format!("{}{}", req.nym, req.ct_descriptor);
-    auth::verify_signature(&req.npub, message.as_bytes(), &req.signature)?;
+    let v0_challenge = format!("{}{}", req.nym, req.ct_descriptor);
+    verify_la_action_sig(
+        &req.npub,
+        "register",
+        &[&req.nym, &req.ct_descriptor],
+        req.timestamp,
+        &req.signature,
+        v0_challenge.as_bytes(),
+    )?;
 
     // Check if npub already has an active registration
     if let Some(active) = db::get_user_by_npub(&state.db, &req.npub).await? {
@@ -168,7 +197,14 @@ pub async fn update_registration(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let _ = gate_register_per_ip(&state, peer, &headers).await?;
 
-    auth::verify_signature(&req.npub, req.ct_descriptor.as_bytes(), &req.signature)?;
+    verify_la_action_sig(
+        &req.npub,
+        "update",
+        &[&req.ct_descriptor],
+        req.timestamp,
+        &req.signature,
+        req.ct_descriptor.as_bytes(),
+    )?;
 
     descriptor::validate_descriptor(
         &req.ct_descriptor,
@@ -193,10 +229,12 @@ pub struct DeleteRequest {
     pub signature: String,
     /// When true, hard-delete all swap_records / outpoint_addresses for the
     /// nym in addition to deactivating it. The nym row itself is kept so the
-    /// name stays reserved and the original npub can re-register it.
-    /// Requires the signature to be over `b"purge"` (not `b"delete"`).
+    /// name stays reserved and the original npub can re-register it. Requires
+    /// the signature to be over `b"purge"` (not `b"delete"`).
     #[serde(default)]
     pub purge: bool,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 /// DELETE /register — deactivate a Lightning Address registration.
@@ -213,8 +251,16 @@ pub async fn delete_registration(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let _ = gate_register_per_ip(&state, peer, &headers).await?;
 
-    let challenge: &[u8] = if req.purge { b"purge" } else { b"delete" };
-    auth::verify_signature(&req.npub, challenge, &req.signature)?;
+    let action = if req.purge { "purge" } else { "delete" };
+    let v0_challenge: &[u8] = if req.purge { b"purge" } else { b"delete" };
+    verify_la_action_sig(
+        &req.npub,
+        action,
+        &[],
+        req.timestamp,
+        &req.signature,
+        v0_challenge,
+    )?;
 
     if req.purge {
         match db::purge_user(&state.db, &req.npub).await? {
@@ -313,14 +359,7 @@ pub async fn list_reservations(
     Query(params): Query<ReservationsAuthParams>,
 ) -> Result<Json<ReservationsResponse>, AppError> {
     // Clock skew check.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let skew = if now > params.ts { now - params.ts } else { params.ts - now };
-    if skew > RESERVATIONS_TS_WINDOW_SECS {
-        return Err(AppError::AuthError("timestamp outside allowed window".into()));
-    }
+    auth::check_ts_freshness(params.ts)?;
 
     // Verify sig over "reservations:{nym}:{ts}".
     let message = format!("reservations:{}:{}", nym, params.ts);
