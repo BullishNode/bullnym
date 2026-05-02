@@ -132,28 +132,32 @@ pub async fn count_lifetime_nyms_by_npub(
         .await
 }
 
-/// Combined lookup-by-npub: in one round trip, returns
-/// `(active_nym, inactive_nym, used_count)`. Used by `GET /register/lookup`
-/// so the wallet-open path is one DB call instead of three.
-///
-/// `active_nym`: the nym of the active row (if any).
-/// `inactive_nym`: the nym of the most-recently-deactivated row (if any).
-/// `used`: total lifetime rows under this npub.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreviousNym {
+    pub nym: String,
+    pub created_at: String,
+}
+
+/// One round trip: `(active_nym, previous_nyms_most_recent_first, used_count)`.
 pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
-) -> Result<(Option<String>, Option<String>, i64), sqlx::Error> {
-    let row: (Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
-        "SELECT \
-            (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE LIMIT 1) AS active_nym, \
-            (SELECT nym FROM users WHERE npub = $1 AND is_active = FALSE \
-                ORDER BY created_at DESC LIMIT 1) AS inactive_nym, \
-            (SELECT COUNT(*) FROM users WHERE npub = $1) AS used",
-    )
-    .bind(npub)
-    .fetch_one(pool)
-    .await?;
-    Ok((row.0, row.1, row.2.unwrap_or(0)))
+) -> Result<(Option<String>, Vec<PreviousNym>, i64), sqlx::Error> {
+    let row: (Option<String>, Option<sqlx::types::Json<Vec<PreviousNym>>>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT \
+                (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE LIMIT 1) \
+                    AS active_nym, \
+                (SELECT json_agg(json_build_object('nym', nym, 'created_at', created_at) \
+                                 ORDER BY created_at DESC) \
+                   FROM users WHERE npub = $1 AND is_active = FALSE) \
+                    AS previous_nyms, \
+                (SELECT COUNT(*) FROM users WHERE npub = $1) AS used",
+        )
+        .bind(npub)
+        .fetch_one(pool)
+        .await?;
+    Ok((row.0, row.1.map(|j| j.0).unwrap_or_default(), row.2.unwrap_or(0)))
 }
 
 /// Outcome of `register_user_atomic`. Mirrors the three branches of the

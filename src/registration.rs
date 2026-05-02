@@ -335,12 +335,14 @@ pub struct LookupParams {
 
 #[derive(Serialize)]
 pub struct LookupResponse {
+    /// Active nym, or the most-recent inactive nym when `active == false`
+    /// (i.e. `previous_nyms[0].nym`). Kept for older clients that don't
+    /// read `previous_nyms`.
     pub nym: String,
     pub active: bool,
-    /// Canonical quota wire shape. Mobile decoders read this. Mirrors the
-    /// shape on `RegisterResponse`, `DeleteResponse`, and inside
-    /// `NymQuotaExceeded.details`.
     pub quota: QuotaView,
+    /// All inactive nyms for this npub, most-recent first.
+    pub previous_nyms: Vec<db::PreviousNym>,
     /// Legacy field — kept until the next mobile build hits 95% adoption,
     /// then removed by `pay-service:remove-legacy-quota-keys`. New clients
     /// MUST read `quota.used`.
@@ -372,8 +374,7 @@ pub async fn lookup_by_npub(
         }
     }
 
-    // One round trip — see `db::lookup_status_by_npub`.
-    let (active_nym, inactive_nym, used) =
+    let (active_nym, previous_nyms, used) =
         db::lookup_status_by_npub(&state.db, &params.npub).await?;
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
     let quota = QuotaView::new(used, cap);
@@ -382,15 +383,18 @@ pub async fn lookup_by_npub(
             nym,
             active: true,
             quota,
+            previous_nyms,
             lifetime_nyms_used: used,
             lifetime_nyms_cap: cap,
         }));
     }
-    if let Some(nym) = inactive_nym {
+    if let Some(head) = previous_nyms.first() {
+        let nym = head.nym.clone();
         return Ok(Json(LookupResponse {
             nym,
             active: false,
             quota,
+            previous_nyms,
             lifetime_nyms_used: used,
             lifetime_nyms_cap: cap,
         }));

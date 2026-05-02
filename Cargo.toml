@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full", "signal"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migrate", "json"] }
 lwk_wollet = "0.14.0"
 boltz-client = { path = "../boltz/boltz-rust", features = ["electrum"] }
 secp256k1 = { version = "0.29", features = ["global-context"] }
