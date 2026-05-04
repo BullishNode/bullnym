@@ -35,7 +35,6 @@ impl BoltzService {
         &self,
         swap_key_index: u64,
         amount_sat: u64,
-        address: &str,
         description_hash: &str,
     ) -> Result<SwapResult, AppError> {
         let keypair = self
@@ -46,6 +45,9 @@ impl BoltzService {
 
         let claim_public_key = PublicKey::new(keypair.public_key());
 
+        // No `address` / `address_signature`: bullnym deprecates Magic Routing
+        // Hint to keep descriptor allocation off the unauthenticated callback
+        // path. See docs/lud-22-vs-mrh-research.md.
         let request = CreateReverseRequest {
             from: "BTC".to_string(),
             to: "L-BTC".to_string(),
@@ -55,7 +57,7 @@ impl BoltzService {
             preimage_hash: Some(preimage.sha256),
             description: None,
             description_hash: Some(description_hash.to_string()),
-            address: Some(address.to_string()),
+            address: None,
             address_signature: None,
             referral_id: None,
             webhook: self.webhook_url.as_ref().map(|url| Webhook {

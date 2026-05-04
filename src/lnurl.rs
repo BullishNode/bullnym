@@ -299,7 +299,6 @@ async fn serve_liquid(
 async fn serve_lightning(
     state: &AppState,
     nym: &str,
-    user: &db::User,
     amount_sat: u64,
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
@@ -310,15 +309,6 @@ async fn serve_lightning(
         }
     }
 
-    let addr_index = db::allocate_address_index(&state.db, nym)
-        .await?
-        .ok_or_else(|| AppError::NymNotFound(nym.to_string()))?;
-
-    let addr_index_u32 = u32::try_from(addr_index)
-        .map_err(|_| AppError::DbError("address index overflow".to_string()))?;
-
-    let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
-
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
@@ -326,9 +316,11 @@ async fn serve_lightning(
     let metadata_str = build_metadata(nym, &state.config.domain);
     let description_hash_hex = hex::encode(Sha256::digest(metadata_str.as_bytes()));
 
+    // No address pre-allocated: the cooperative MuSig2 claim path allocates
+    // the descriptor index at claim time. See docs/lud-22-vs-mrh-research.md.
     let result = state
         .boltz
-        .create_reverse_swap(swap_key_index, amount_sat, &address, &description_hash_hex)
+        .create_reverse_swap(swap_key_index, amount_sat, &description_hash_hex)
         .await?;
 
     let preimage_hex = hex::encode(&result.preimage);
@@ -341,8 +333,8 @@ async fn serve_lightning(
         &db::NewSwapRecord {
             nym,
             boltz_swap_id: &result.swap_id,
-            address: &address,
-            address_index: addr_index,
+            address: None,
+            address_index: None,
             amount_sat,
             invoice: &result.invoice,
             preimage_hex: &preimage_hex,
@@ -440,7 +432,7 @@ pub async fn callback(
     }
 
     // Lightning path — default rail AND fallback destination.
-    serve_lightning(&state, &nym, &user, amount_sat, caller_ip, is_whitelisted).await
+    serve_lightning(&state, &nym, amount_sat, caller_ip, is_whitelisted).await
 }
 
 use axum::response::IntoResponse;

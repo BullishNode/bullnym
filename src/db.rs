@@ -416,8 +416,8 @@ pub async fn allocate_address_index(pool: &PgPool, nym: &str) -> Result<Option<i
 pub struct NewSwapRecord<'a> {
     pub nym: &'a str,
     pub boltz_swap_id: &'a str,
-    pub address: &'a str,
-    pub address_index: i32,
+    pub address: Option<&'a str>,
+    pub address_index: Option<i32>,
     pub amount_sat: u64,
     pub invoice: &'a str,
     pub preimage_hex: &'a str,
@@ -449,13 +449,35 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     Ok(())
 }
 
+/// Fill in the claim destination on a swap_records row whose `address` was
+/// not pre-allocated at swap creation (the post-MRH-deprecation flow). The
+/// `WHERE address IS NULL` guard makes this idempotent: a retry that races
+/// a successful first call no-ops.
+pub async fn set_swap_address(
+    pool: &PgPool,
+    swap_id: Uuid,
+    address: &str,
+    address_index: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE swap_records SET address = $2, address_index = $3 \
+         WHERE id = $1 AND address IS NULL",
+    )
+    .bind(swap_id)
+    .bind(address)
+    .bind(address_index)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct SwapRecord {
     pub id: Uuid,
     pub nym: String,
     pub boltz_swap_id: String,
-    pub address: String,
-    pub address_index: i32,
+    pub address: Option<String>,
+    pub address_index: Option<i32>,
     pub amount_sat: i64,
     pub invoice: String,
     pub preimage_hex: Option<String>,

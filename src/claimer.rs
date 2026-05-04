@@ -22,6 +22,7 @@ use boltz_client::Keypair;
 
 use crate::config::Config;
 use crate::db::{self, SwapStatus};
+use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
 use crate::AppState;
@@ -167,11 +168,30 @@ async fn try_claim_with_retry(
     electrum_url: &str,
     boltz_url: &str,
 ) {
+    // Resolve the claim destination once. Swaps created post-MRH-deprecation
+    // arrive with `address: None` and need a descriptor index allocated here;
+    // legacy swaps already have it set from swap-creation time. The helper is
+    // serialized on the swap row (FOR UPDATE) so concurrent webhook deliveries
+    // do not double-allocate.
+    let output_address = match resolve_claim_address(pool, swap).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::error!(
+                "failed to resolve claim address for swap {}: {e}",
+                swap.boltz_swap_id
+            );
+            db::update_swap_status(pool, swap.id, SwapStatus::ClaimFailed, None)
+                .await
+                .ok();
+            return;
+        }
+    };
+
     for attempt in 1..=3 {
         if attempt > 1 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        match claim_swap(pool, swap, electrum_url, boltz_url).await {
+        match claim_swap(pool, swap, &output_address, electrum_url, boltz_url).await {
             Ok(()) => return,
             Err(e) => {
                 tracing::warn!(
@@ -190,9 +210,87 @@ async fn try_claim_with_retry(
         .ok();
 }
 
+/// Returns the claim destination for this swap, allocating one from the
+/// receiver's CT descriptor if it has not been set yet. Serialized on the
+/// `swap_records` row via `SELECT ... FOR UPDATE`, so concurrent webhook
+/// deliveries (e.g. transaction.mempool followed by transaction.confirmed)
+/// cannot double-allocate.
+async fn resolve_claim_address(
+    pool: &sqlx::PgPool,
+    swap: &db::SwapRecord,
+) -> Result<String, AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    let row: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT address, address_index FROM swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(swap.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    if let Some((Some(addr), Some(_))) = &row {
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        return Ok(addr.clone());
+    }
+
+    let user = db::get_user_by_nym(pool, &swap.nym)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("user not found: {}", swap.nym)))?;
+
+    let addr_index_row: Option<(i32,)> = sqlx::query_as(
+        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
+         WHERE nym = $1 AND is_active = TRUE \
+         RETURNING next_addr_idx - 1",
+    )
+    .bind(&swap.nym)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    let addr_index = addr_index_row
+        .map(|(idx,)| idx)
+        .ok_or_else(|| AppError::ClaimError(format!("address allocation failed: {}", swap.nym)))?;
+
+    let addr_index_u32 = u32::try_from(addr_index)
+        .map_err(|_| AppError::ClaimError("address index overflow".to_string()))?;
+    let derived = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
+
+    sqlx::query(
+        "UPDATE swap_records SET address = $2, address_index = $3 WHERE id = $1",
+    )
+    .bind(swap.id)
+    .bind(&derived)
+    .bind(addr_index)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    tracing::info!(
+        event = "lightning_swap_address_allocated_at_claim",
+        nym = %swap.nym,
+        swap_id = %swap.id,
+        address_index = addr_index,
+        "claim-time descriptor allocation"
+    );
+
+    Ok(derived)
+}
+
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
+    output_address: &str,
     electrum_url: &str,
     boltz_url: &str,
 ) -> Result<(), AppError> {
@@ -243,7 +341,7 @@ async fn claim_swap(
 
     let params = SwapTransactionParams {
         keys: keypair,
-        output_address: swap.address.clone(),
+        output_address: output_address.to_string(),
         fee: Fee::Relative(0.1),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
@@ -363,9 +461,20 @@ pub fn spawn_background_claimer(
                     );
                 }
                 for swap in &unclaimed {
+                    let output_address = match resolve_claim_address(&pool, swap).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(
+                                "background claimer: address resolution failed for swap {}: {e}",
+                                swap.boltz_swap_id
+                            );
+                            continue;
+                        }
+                    };
                     match claim_swap(
                         &pool,
                         swap,
+                        &output_address,
                         &config.boltz.electrum_url,
                         &config.boltz.api_url,
                     )

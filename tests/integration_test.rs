@@ -346,8 +346,8 @@ async fn webhook_skips_terminal_swaps() {
     pay_service::db::record_swap(&pool, &pay_service::db::NewSwapRecord {
         nym: "webhookuser",
         boltz_swap_id: "FAKE_CLAIMED",
-        address: "lq1qqtest",
-        address_index: 0,
+        address: Some("lq1qqtest"),
+        address_index: Some(0),
         amount_sat: 1000,
         invoice: "lnbc...",
         preimage_hex: "aa".repeat(32).as_str(),
