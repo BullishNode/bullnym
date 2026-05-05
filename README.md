@@ -1,183 +1,98 @@
 # bullnym
 
-Lightning Address pay service for Bull Bitcoin. Lets users register a nym (e.g. `francis@bullpay.ca`) and receive Lightning payments that settle on Liquid via Boltz reverse submarine swaps.
+The problem that Bullnym attempts to solve is that because the BULL wallet relies on an atomic-swap server (boltz) to allow users to receive Lightning Network payments, the BULL wallet cannot offer Lightning Address (LNURL-PAY) to its users.
 
-## How it works
+This is a significant UX downside of the BULL wallet compared to other custodial Lightning wallets, and other graduated wallets such as Spark-enabled wallets.
 
-### LNURL-pay flow
+The solution is a server compatible with LNURL which has 3 main functions:
 
-When someone pays `francis@bullpay.ca`, their wallet resolves it via [LUD-16](https://github.com/lnurl/luds/blob/luds/16.md):
+1. It receives and stores Liquid confidential descriptors for the user (recipient)
+2. It generates and assigns a Lightning Network address associated to that descriptor
+3. It creates a reverse submarine swap on behalf of the user (recipient) when a sender calls the LNURL endpoints and requests a bolt11 for that address.
 
-1. Wallet queries `GET https://bullpay.ca/.well-known/lnurlp/francis`
-2. bullnym returns LNURL-pay metadata (min/max amounts, description)
-3. Wallet calls `GET /lnurlp/callback/francis?amount=<msats>`
-4. bullnym creates a Boltz reverse swap (LN → L-BTC) and returns the BOLT11 invoice
-5. Payer pays the invoice on Lightning
+The Lightning Address is called a "nym".
 
-### Boltz reverse swap + cooperative claim
+## Risks and tradeoffs. Is it custodial?
 
-When the Lightning payment arrives:
+There are typically 2 risks associated with a custodial Lightning address server:
 
-1. Boltz holds the incoming LN HTLCs (can't settle — doesn't have the preimage)
-2. Boltz locks L-BTC on-chain in a Taproot HTLC
-3. Boltz sends a webhook to bullnym (`transaction.mempool`)
-4. bullnym performs a **cooperative MuSig2 claim** with Boltz — a Taproot keypath spend that produces a CT-blinded output directly to the user's Liquid address
-5. Boltz extracts the preimage from the cooperative claim and settles the Lightning HTLCs
+- **Risk to the user:** the server can steal funds and censor payments
+- **Risk to the operator:** illegally operating a money transmission service without a license
 
-The cooperative claim is indistinguishable from a normal Taproot transaction on-chain. The output is Confidential Transaction-blinded, preserving the user's privacy. If Boltz is unresponsive, bullnym falls back to a script-path spend using the preimage and claim key directly.
+The Bullnym system is interesting in that it is technically non-custodial: at no point in time does it actually handle user funds or facilitate a payment. All it does is calling the Boltz API and providing a Liquid network address. This eliminates the legal risk to the operator.
 
-We do **not** use Boltz claim covenants. Boltz [explicitly warns](https://docs.boltz.exchange/v/api/claim-covenants) that covenants are not safe for LNURL flows where the receiving client is offline. The trust model is identical either way (service is custodial during the claim window), but cooperative claims give us CT privacy and a clean on-chain footprint.
+However, because the swap is constructed by the server and not the user, the server could maliciously create a swap with another Liquid address that doesn't actually belong to the recipient. In effect, the server could steal funds from the user. The end result is that the end user still has to trust that the server operates honestly, but as long as the server operates honestly, the swap remains non-custodial. So it's an interesting situation of non-custodial but still trusted.
 
-### Failure modes
+## Privacy: special purpose wallet and autosweep
 
-The protocol is atomic — the preimage links the Lightning payment and the on-chain lock. Most failures unwind cleanly:
+The other major risk to the user is that the user has to send his Liquid wallet descriptor to the server, so that the server derives a new Liquid address for every payment. The alternative is to have a single Liquid address. Having a single liquid address allows any blockchain observer to track a user's payment. Confidential transactions on the Liquid network hide amounts from on-chain observers, but address reuse is still a major privacy downside. Providing a descriptor to the server, to avoid address reuse, provides a considerable privacy improvement at the chainanalysis level but allows the server to effectively see all the transactions done to and from that wallet. The server does have the blinding key. It's part of the CT descriptor and is needed to derive confidential addresses. So it can see the amounts of every transaction received via the Lightning Address, but not other transactions on the user's main wallet.
 
-- **Payer never pays**: Invoice expires, nothing happens
-- **Boltz never locks L-BTC**: Lightning HTLCs time out, payer is refunded
-- **bullnym goes down before claiming**: Preimage never revealed, LN HTLCs time out (payer refunded), on-chain lock times out (Boltz reclaims L-BTC). Nobody loses funds.
-- **Cooperative claim fails**: Automatic fallback to script-path spend
+The solution to this problem chosen by the client is to generate a single purpose Liquid wallet in the BULL application which is only used to receive payments via the Bullnym server. The "main" or "default" Liquid network wallet is therefore not compromised.
 
-### Trust model
+In order to provide a simple user experience, this "single purpose" liquid network wallet is derived deterministically via BIP85 so that it can be recovered from the same mnemonic backup as the default wallets. We call this the Lightning Address wallet. In addition, an auto-sweep function is added so that any payment received in the Lightning Address wallet is automatically sent to the default Liquid wallet (the Instant Payments wallet). The default user experience completely hides the existence of the Lightning Address wallet, not visible on the home page, so that the user never needs to interact with it at all. The drawback to autosweep is that it adds ~19 sats to every payment received, because of the extra Liquid network transaction. At current Bitcoin price (~80,000 USD) this is ~$0.015 and is an acceptable tradeoff.
 
-**This system is not trustless.** Unlike standard Boltz swaps that are generated by the users themselves, these swaps are generated by a service that has the capacity to steal user funds by changing the output address to one of its own, instead of using an output address from the user's supplied descriptor.
+## Nostr-based authentication
 
-That said, the server does not hold user funds. When a payment is received, the server creates a swap and claims the resulting L-BTC directly to the user's Liquid address in a single transaction. No funds ever sit in a server-controlled address.
+When registering a nym with the Bullnym server, the BULL app derives a nostr keypair using BIP85 and uses it to sign a registration message with the Bullnym server. This allows the user to authenticate itself with the Bullnym server to manage his nym. The main actions a user can perform are:
 
-The server does have the theoretical capacity to steal funds by redirecting a claim to a different address. However, if the server operates honestly — which is its sole intended function — it is purely non-custodial. It acts as a technical layer that coordinates swaps on the user's behalf, not as a custodian or transmitter of funds.
+- **Deactivating a nym:** this prevents senders from sending payments to the Lightning address (enforced by the server).
+- **Changing a descriptor associated to a nym:** in case the user migrates wallets but wants to keep the same nym.
+- **Creating a new nym:** this allows the user to create a new nym for a previously registered descriptor.
 
-Because the server never controls, holds, or transmits user funds during normal operation, it does not qualify as a virtual asset service provider or money transmitter.
+Why nostr? Nostr is not required for this authentication protocol, various other protocols built on BIP85 could have been used. However, there are other features that nostr enables such as sending and receiving messages and publishing the nym on the nostr relay network for discoverability. The better question is therefore "why not nostr?" and there doesn't seem to be any downside to using nostr for authentication.
 
-A future "sovereign mode" enhancement will eliminate even the theoretical ability to redirect funds: the user pre-generates preimage hashes on-device, so the server can create swaps but cannot claim without the user's participation.
+## LUD-22 and compatibility
 
-### Registration with Nostr auth
+The Bullnym server is compatible with any LNURL-enabled sender wallet. During development, we noticed: a BULL wallet user sending a Lightning network payment to a recipient that is using Bullnym for its Lightning address, there is a massive inefficiency: the sender will be creating a submarine swap from Liquid to Lightning, and paying the receiver's reverse submarine swap from Lightning to Liquid. Not only do both the sender and the receiver end up paying Boltz's swap fees, but these 2 swaps generate 4 Liquid network transactions and pay those network fees!
 
-Users register by choosing a nym and signing with a Nostr keypair derived from their wallet's master seed via BIP85 (application 86, per NIP-06). The server verifies the schnorr signature and stores the user's npub alongside their nym and CT descriptor.
+This is a known problem for any sender that sends funds over lightning network to a recipient where both are using the Boltz api integration. To solve this problem, Boltz created an innovative mechanism called the "magic routing hint" (MRH) where Boltz will embed the recipient's Liquid address in the bolt11 routing hint, so that a sender whose wallet is MRH-aware, when decoding the bolt11, will know to "skip" paying the bolt11 and simply extract the Liquid address from the routing hint and pay that directly. Exactly what we want to achieve. There are 4 major issues with this:
 
-```
-POST /register
-{
-  "nym": "francis",
-  "ct_descriptor": "ct(slip77(...),elwpkh(...))",
-  "npub": "<x-only pubkey hex>",
-  "signature": "<schnorr sig over SHA256(nym + ct_descriptor)>"
-}
-```
+1. The magic routing hint is added by the Boltz server, at their leisure. If Boltz decides to remove this feature, there is nothing that the Bullnym server operator can do.
+2. The Bullnym server can be extended to support various other forms of payment, such as Silent Payment addresses, Ark addresses, Spark addresses, etc. While there is nothing preventing Boltz from extending MRH to support these alternative methods, this is outside of the Bullnym server's control.
+3. The main threat here is enumeration attacks, where any sender can repeatedly call the LNURL endpoint. More on this in the rate limiting section. The Bullnym server operator may want to implement his own rate limiting that is stricter than Boltz's.
+4. MRH only works with wallets that implement the Boltz software libraries.
 
-The same Nostr keypair is used for all authenticated operations (update descriptor, delete registration).
+Bullnym introduces LUD-22, which allows the sender to specify to a LNURL server that he is able and willing to send funds over the Liquid network (or any other network). LNURL servers which implement the Bullnym model will then return a Liquid address instead of the bolt11 reverse submarine swap. This can be extended to Silent Payments, Ark addresses, Spark addresses, etc.
 
-### Nostr integration
+The result of LUD-22 is that it creates a single "nym" service which is compatible with existing LNURL-enabled wallets, but which also allows wallets to register other available payment methods that bypass the classic bolt11 response if the sender and recipient are both on a compatible alternative payment protocol. This achieves something similar to Samourai Wallet's "paynym server" system, but it is compatible with LNURL, supports Silent Payments, supports the Liquid Network, and can be extended to support practically any Bitcoin payment protocol.
 
-On registration, the mobile app publishes a Nostr profile (kind 0) to relays with `nip05` and `lud16` fields set to `francis@bullpay.ca`. The server doubles as a NIP-05 identity provider:
+## Why LUD-22, not MRH
 
-```
-GET /.well-known/nostr.json?name=francis
-→ { "names": { "francis": "<npub hex>" } }
-```
+We considered keeping MRH (Magic Routing Hint) alongside LUD-22 as an alternative on-chain shortcut and decided against it. The deciding factor is enumeration-attack resistance.
 
-This gives two immediate benefits:
+MRH has no commitment from the sender. Anyone can hit the LNURL callback over HTTP, get an address allocated and embedded in the bolt11 routing hint, and never pay. The address counter on the recipient's CT descriptor advances anyway. With enough sustained traffic, the counter ratchets past the recipient wallet's gap limit, and gap-limit-bounded scanners (BDK, LWK by default) silently stop picking up new payments until the user does a manual full rescan. Funds aren't lost, but the receive UX breaks. The only available defense for MRH is per-source-IP throttling, which is bounded by what legitimate senders tolerate rather than by what attackers tolerate. The TTL-recycle trick we use elsewhere doesn't apply, because the address stays a valid Liquid receive address indefinitely after the bolt11 expires.
 
-1. **Nostr zaps**: Any Nostr client (Damus, Primal, etc.) can zap the user via the `lud16` field. The zap goes through the LNURL flow and settles on Liquid.
-2. **NIP-05 verification**: The Nostr identity is domain-backed — `francis@bullpay.ca` resolves to the user's pubkey.
+LUD-22 fixes this at the protocol layer by requiring the sender to sign ownership of a Liquid UTXO worth at least 100 sats before the server hands out an address. The commitment is small but it changes everything about the attack economics. On every dimension that matters, the contrast is sharp:
 
-The Nostr keypair is derived from the user's BIP85 master seed, making it deterministic and portable. If the user migrates to a different LNURL provider, they derive the same keypair, update their Nostr profile with the new `lud16`, and all their Nostr contacts can still pay them. The identity lives on Nostr, not on bullpay.ca.
+| Property | MRH | LUD-22 |
+|---|---|---|
+| Cost per request to attacker | Zero (HTTP GET) | ≥ 100 sats committed on-chain |
+| Idempotency on repeat | None — counter advances every time | Cache hit (same outpoint and nym → same address) |
+| Recovery after attack | None — damage is cumulative | Automatic via TTL recycling |
+| Bound on damage | Unbounded over time | 3 nyms per UTXO per hour |
 
-### LUD-22: Currency negotiation (bypassing Lightning)
+The cost of deprecating MRH is borne by senders that supported MRH but not LUD-22 (mainly Aqua and other Boltz-library wallets). For those senders, payments now route through the standard reverse-swap path: roughly 580 extra sats of Boltz fees on a 100,000-sat payment, plus a few extra Liquid network transactions. The remediation is for those wallets to adopt LUD-22, at which point the on-chain shortcut is restored — with stronger privacy properties and a structurally cost-bounded defense profile.
 
-bullnym implements [LUD-22](https://github.com/BullishNode/luds/tree/lud-22-currency-negotiation) — a proposed extension to LNURL-pay that lets wallets choose which payment network to settle on.
+## LUD-22 rate limiting
 
-The LNURL metadata advertises supported networks:
-```json
-{
-  "currencies": [
-    { "code": "BTC", "name": "Bitcoin", "network": "bitcoin" },
-    { "code": "BTC", "name": "Liquid Bitcoin", "network": "liquid" }
-  ]
-}
-```
+The threat we are mitigating is descriptor-index exhaustion. Every address handed out via LUD-22 advances the recipient's CT descriptor counter. If an attacker can advance it freely, gap-limit-bounded wallets eventually stop seeing new payments. The 100-sat UTXO ownership proof required by LUD-22 is what makes a real defense possible, because every request now costs the attacker something on-chain. That single commitment gates four cascading mechanisms:
 
-When a wallet supports Liquid natively (like Bull Bitcoin), it can skip the Boltz swap entirely by requesting `&network=liquid` on the callback. Instead of returning a Lightning invoice, the server returns a Liquid address directly:
+1. **Idempotent mapping.** Each `(nym, outpoint)` pair always resolves to the same address. A repeated request with the same UTXO targeting the same nym hits cache; the descriptor counter does not advance. An attacker who simply repeats requests makes no progress.
+2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour. To probe more, the attacker has to rotate UTXOs, which means real on-chain Liquid spends with real network fees and confirmation delays.
+3. **Per-pubkey volume cap.** The signing key on the proof is rate-limited to 10 requests per hour. Spreading volume across many keys forces spreading across many UTXOs, which compounds the on-chain cost.
+4. **TTL recycling.** Pending reservations release after one hour. An attacker who never pays cannot hold address allocations indefinitely; the descriptor counter is bounded by the steady-state hostage size, not by total request count over time.
 
-```json
-{
-  "onchain": {
-    "network": "liquid",
-    "address": "lq1qq...",
-    "amount_sat": 50000,
-    "bip21": "liquidnetwork:lq1qq...?amount=0.00050000&assetid=6f02..."
-  }
-}
-```
+Standard per-IP rate limiting applies on top of all four.
 
-This is significant: the Lightning Address becomes a payment code that works across networks. A Liquid-capable wallet paying `francis@bullpay.ca` settles directly on Liquid with zero swap fees, zero routing fees, and no trust assumption — the server just derives the next address from the user's CT descriptor and hands it over. No preimage, no claim, no custody window.
+The combined effect is that the cost of a sustained enumeration attack scales with the on-chain Liquid UTXO supply the attacker controls, not with their willingness to send HTTP requests. Probing 1,000 nyms in an hour requires at least 334 distinct UTXOs of at least 100 sats each, all funded on-chain — a cost that has no analogue under MRH.
 
-Wallets that don't support Liquid (or don't send `&network=`) get the standard Lightning flow via Boltz. LUD-22 is fully backwards compatible — the `currencies` field is ignored by wallets that don't understand it.
+## Nostr nym registration with NIP05
 
-### Future: BIP 353 + Silent Payments
+The Bullnym server supports NIP05 registration. This allows users to optionally register their nym and Lightning address on the nostr relay network. This allows for discoverability (find contacts via the Nostr network) and opens up interesting possibilities such as NIP57 (zaps). Honestly, I am not sure that this adds any value because the nostr keypair generated is not associated to the user's identity and therefore doesn't let nostr users find the payment details of their contacts. It may also have downsides (discoverability introduces ddos vectors). And it does not provide redundancy because if the Bullnym server goes offline, users will not be able to obtain payment details from recipients via nostr because the NIP05 info just points to the Bullnym server. However, given that BULL plans to eventually publish Silent Payment addresses on nostr, this is a neat proof of concept and a useful place to surface issues like how to deactivate payment instructions.
 
-Today, the Nostr profile points back to the server — if bullpay.ca is down, payments don't work regardless of what's on the relays. The "decentralized registry" becomes genuinely useful when Silent Payments (BIP 352) are supported.
+## Some other considerations: nym reservations
 
-With Silent Payments, the user's Nostr profile and BIP 353 DNS record can contain a Silent Payment address that lets senders derive unique on-chain addresses without any server interaction. At that point, `francis@bullpay.ca` resolves to multiple independent payment paths:
-
-- **LNURL** → Boltz swap → Liquid (needs bullpay.ca online)
-- **Nostr profile** → Silent Payment address → on-chain Bitcoin (peer-to-peer, no server needed)
-- **BIP 353 DNS** → Silent Payment address → on-chain Bitcoin (needs DNS only)
-
-The server becomes one of several resolution paths, not the only one. The architecture is positioned for this: the Nostr keypair is BIP85-derived (portable), the profile is replicated across relays, and adding a Silent Payment address is a one-field update when the time comes.
-
-## Architecture
-
-```
-bullnym (Rust/Axum)
-├── LNURL endpoints (LUD-06/LUD-16)
-├── Registration with Nostr schnorr auth
-├── Boltz reverse swap creation
-├── Cooperative MuSig2 claiming (webhook-driven)
-├── Crash recovery (startup scan for unclaimed swaps)
-├── NIP-05 identity provider
-├── CT descriptor → Liquid address derivation (lwk_wollet)
-└── PostgreSQL (users, swap records, swap state)
-
-Mobile (bullbitcoin-mobile)
-├── BIP85-derived receive wallet (index 75)
-├── Nostr keypair derivation (BIP85 application 86)
-├── Pay service registration + deletion
-├── Auto-sweep from receive wallet to main wallet
-└── Nostr profile publishing (NIP-05, LUD-16)
-```
-
-## Running locally
-
-```bash
-# Create database
-sudo -u postgres psql -c "CREATE USER pay_service WITH PASSWORD 'devpass';"
-sudo -u postgres psql -c "CREATE DATABASE pay_service OWNER pay_service;"
-
-# Configure
-cat > .env << 'EOF'
-DATABASE_URL=postgres://pay_service:devpass@localhost/pay_service
-SWAP_MNEMONIC=<your 12-word BIP39 mnemonic>
-EOF
-
-# Run migrations and start
-cargo run
-# → listening on 0.0.0.0:8080
-# → curl http://localhost:8080/health → "ok"
-```
-
-## Client implementation
-
-The reference client is a fork of the [Bull Bitcoin mobile wallet](https://github.com/BullishNode/bullbitcoin-mobile/tree/feature/lightning-address) (Flutter). It handles:
-
-- BIP85-derived receive wallet for Lightning Address payments
-- Nostr keypair derivation and profile publishing
-- Registration, deletion, and nym management
-- Auto-sweep from receive wallet to main wallet
-
-**Status: alpha.** The client is functional but not production-ready. Registration, wallet creation, and the settings UI work. Sweep and end-to-end payment flow are under testing.
-
-## Dependencies
-
-- [boltz-client](https://github.com/SatoshiPortal/boltz-rust) — Boltz API V2, MuSig2 cooperative claims, Magic Routing Hints
-- [lwk_wollet](https://github.com/Blockstream/lwk) — Liquid CT descriptor parsing and address derivation
-- [axum](https://github.com/tokio-rs/axum) — HTTP server
-- [sqlx](https://github.com/launchbadge/sqlx) — PostgreSQL with compile-time checked queries
+- Users can only register up to 3 nyms per nostr identity, to prevent griefing nyms. In addition to standard rate limiting to prevent griefing. When a user deactivates his 2nd nym, he will see a message telling him that he only has 1 nym left.
+- Deactivated nyms can never be taken by someone else, to prevent impersonation. They are "reserved forever" by the npub that first registered them.
+- Only 1 nym available per wallet at a time. This restriction is for system and ui/ux simplicity and could be lifted later.
+- Nyms that have never been used could be made to expire after a long period of time (to prevent griefing, but this is risky).
