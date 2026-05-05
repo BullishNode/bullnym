@@ -96,3 +96,207 @@ The Bullnym server supports NIP05 registration. This allows users to optionally 
 - Deactivated nyms can never be taken by someone else, to prevent impersonation. They are "reserved forever" by the npub that first registered them.
 - Only 1 nym available per wallet at a time. This restriction is for system and ui/ux simplicity and could be lifted later.
 - Nyms that have never been used could be made to expire after a long period of time (to prevent griefing, but this is risky).
+
+---
+
+# Technical reference
+
+## Architecture
+
+bullnym is a Rust/Axum HTTP server with a Postgres backend, four background workers, and stateful integrations with a Liquid Electrum server and the Boltz API.
+
+```
+HTTP layer (Axum)
+├── /.well-known/lnurlp/:nym         LUD-06 metadata
+├── /.well-known/nostr.json          NIP-05 identity provider
+├── /lnurlp/callback/:nym            LNURL-pay callback (Lightning + LUD-22 L-BTC)
+├── /register {POST,PUT,DELETE}      Nym lifecycle, BIP-340 Schnorr-authenticated
+├── /register/lookup                 Recover registration state by npub
+├── /api/reservations/:nym           List the nym's pending LUD-22 reservations
+├── /webhook/boltz                   Boltz reverse-swap status (HMAC-SHA256)
+└── /health                          Liveness probe
+
+Background tasks (spawned in main, joined on SIGINT)
+├── claimer                          Webhook drain + MuSig2 cooperative claims
+├── chain_watcher                    Liquid Electrum polling, deposit detection, TTL recycle
+├── rate-limit GC                    Prunes sliding-window counter rows in Postgres
+└── in-memory rate-limit sweep       Evicts idle per-IP buckets from process memory
+
+Stateful dependencies
+├── PostgreSQL                       Users, swap records, rate-limit counters
+├── Boltz API v2                     Reverse-swap creation, MuSig2 cooperative claim
+└── Liquid Electrum                  UTXO ownership verification, deposit polling
+```
+
+The server is stateless across processes — all durable state lives in Postgres. Restart-safety is provided by the claimer's startup scan (it re-checks every unclaimed swap on boot) and by exclusion constraints / unique indexes that make every claim and every address allocation idempotent.
+
+## HTTP API
+
+### Public LNURL endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/.well-known/lnurlp/:nym` | LUD-06 metadata (callback URL, min/max sendable, `payment_methods`) |
+| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 identity provider, returns the registered npub |
+| `GET` | `/lnurlp/callback/:nym` | LNURL-pay callback. Returns a BOLT11 invoice (default Lightning rail) or a Liquid address (LUD-22 with `payment_method=L-BTC` plus a UTXO ownership proof) |
+
+Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `pubkey`, and `sig` query params. The server verifies the Schnorr signature, checks the UTXO is unspent on Liquid Electrum, confirms its value is at least `proof.min_proof_value_sat` (default 1000), and returns either the cached `(nym, outpoint)` address or a freshly allocated one from the user's CT descriptor.
+
+### Authenticated nym lifecycle
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/register` | Create a new nym |
+| `PUT` | `/register` | Update CT descriptor on an existing nym |
+| `DELETE` | `/register` | Deactivate a nym |
+| `GET` | `/register/lookup?npub=...` | List nyms registered to an npub (rate-limited per IP, distinct-npubs cap) |
+| `GET` | `/api/reservations/:nym?...` | List the nym's pending LUD-22 reservations |
+
+All write operations require a BIP-340 Schnorr signature over a domain-tagged payload (see Authentication).
+
+### Webhook
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/webhook/boltz` | Boltz reverse-swap status notifications, used by the claimer to drive MuSig2 cooperative claims |
+
+Authenticated by `Boltz-HMAC-Signature: <hex(HMAC-SHA256(secret, body))>`, compared in constant time. Independent of HMAC, the route is rate-limited per source so a leaked secret does not turn into a webhook bomb.
+
+## Authentication
+
+### Lightning Address v1 signing
+
+Mobile clients sign a domain-tagged byte string with the BIP-340 Schnorr key derived from BIP85 (the same Nostr keypair used for registration):
+
+```
+bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
+```
+
+| Action | Payload fields |
+|---|---|
+| `register` | `nym`, `ct_descriptor` |
+| `update` | `ct_descriptor` |
+| `delete` | (none) |
+
+The server verifies the Schnorr signature against `SHA-256(message)` and rejects timestamps outside `±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged, untimestamped) is still accepted with a deprecation warning to support older mobile builds; it will be removed once warning volume drops.
+
+### IP whitelist
+
+`rate_limit.ip_whitelist` accepts CIDR ranges. Whitelisted callers bypass all rate limits and the LUD-22 proof-of-funds check. Used for known partners and the simulator suite. Parsing is fail-closed: a typo in a CIDR aborts startup loudly.
+
+## Configuration
+
+`config.toml` has the operational knobs; secrets and connection strings come from the environment.
+
+```toml
+domain    = "bullpay.ca"        # Public hostname; used in LUD-06 metadata + identifiers
+listen    = "127.0.0.1:8080"    # Bind address (loopback when behind nginx)
+pool_size = 10                  # Postgres connection pool
+
+[boltz]
+api_url      = "https://api.boltz.exchange/v2"
+electrum_url = "blockstream.info:995"  # Boltz client's transitive Electrum dep
+
+[limits]
+min_sendable_msat          = 100_000          # 100 sats
+max_sendable_msat          = 25_000_000_000   # 25 M sats
+max_descriptor_len         = 1000
+max_lifetime_nyms_per_npub = 3                # Hard cap per npub (incl. inactive)
+
+[proof]
+min_proof_value_sat = 1000                    # LUD-22 UTXO ownership floor
+message_tag         = "bullpay-lnurlp-v1"
+
+[electrum]
+liquid_urls       = ["les.bullbitcoin.com:995"]  # First reachable wins; rotates on transport failure
+cache_ttl_secs    = 3600
+cache_max_entries = 10_000
+
+[rate_limit]
+trust_forwarded_for = true                    # Set true behind a known reverse proxy
+ip_whitelist        = []                      # CIDRs that bypass all gates
+# ...numerous tunables, organized by feature group with comments in src/config.rs...
+```
+
+The `[rate_limit]` table has many tunables, organized by feature group with comments explaining the threat each one closes (registration flood, nym-list discovery, chain-watcher starvation, webhook bomb, etc.). Defaults are conservative; production overrides live in the deployed `config.toml`.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | Postgres DSN, e.g. `postgres://payservice:...@localhost/payservice` |
+| `SWAP_MNEMONIC` | yes | 12-word BIP39 mnemonic for the Boltz `SwapMasterKey` (preimage and claim-key derivation) |
+| `BOLTZ_WEBHOOK_SECRET` | recommended | Shared HMAC secret for `/webhook/boltz`. Empty disables auth (dev only); production must set it. |
+
+`.env` at the project root is read at startup via `dotenvy`.
+
+## Database
+
+Postgres is the single source of truth. All migrations are plain SQL under `migrations/`, applied **manually** via `psql`; the binary does not run `sqlx::migrate!()` in-process to avoid surprise schema changes on restart.
+
+Major tables:
+
+- **`users`** — one row per nym. Holds `npub`, `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
+- **`swap_records`** — one row per Boltz reverse swap. References `users(nym)`. Includes `boltz_swap_id`, `address`, `address_index`, `amount_sat`, `invoice`, MuSig2 claim state. `address` is nullable on the Lightning path: addresses are now allocated at claim time (since the MRH deprecation), not at swap creation.
+- **`outpoint_addresses`** — LUD-22 `(nym, outpoint) → address_index` cache. UNIQUE constraint enforces the idempotent-mapping defense.
+- **`nym_access_events`** — sliding-window counters for the distinct-nyms-per-IP and distinct-nyms-per-outpoint caps.
+- **`processed_webhook_events`** — webhook idempotency guard.
+- **Rate-limit counter tables** — per-IP, per-pubkey, register and metadata sliding windows. Pruned every 10 min by the GC task.
+
+## Background tasks
+
+All four are spawned in `main` and shut down via a single `CancellationToken` on `SIGINT`.
+
+- **`claimer::spawn_background_claimer`** — drains the webhook queue and Boltz events. On `transaction.mempool` it allocates a fresh address index and performs a MuSig2 cooperative claim (Taproot key-path) to the user's CT descriptor. Falls back to the script-path spend with the preimage if Boltz is unresponsive.
+- **`chain_watcher::run`** — polls Liquid Electrum on a per-user tick. Active users (callback within 24 h) tick every 30 s; idle users every 10 min. Uses a dedicated Electrum token bucket so a callback storm cannot starve the watcher (and vice versa). Releases unfunded LUD-22 reservations after their TTL and detects deposits to addresses already handed out.
+- **`gc::run`** — every 10 min, prunes rate-limit and access-event rows older than 24 h. Without this, sliding-window queries grow O(N).
+- **In-memory rate-limit sweep** — every 5 min, evicts in-process counter buckets idle for more than 2 h. Bounds RSS under unique-IP bursts.
+
+## Building and running locally
+
+```bash
+# Postgres
+sudo -u postgres psql -c "CREATE USER payservice WITH PASSWORD 'devpass';"
+sudo -u postgres psql -c "CREATE DATABASE payservice OWNER payservice;"
+for m in migrations/*.sql; do
+    sudo -u postgres psql -d payservice -f "$m"
+done
+
+# Env
+cat > .env <<'EOF'
+DATABASE_URL=postgres://payservice:devpass@localhost/payservice
+SWAP_MNEMONIC=<12-word BIP39 mnemonic>
+BOLTZ_WEBHOOK_SECRET=<32-byte hex>
+EOF
+
+# Build + run
+cargo run --release
+# → listening on 0.0.0.0:8080
+curl -fsS http://localhost:8080/health   # → "ok"
+```
+
+`Cargo.toml` references `boltz-client` via a path dependency to a sibling checkout of `SatoshiPortal/boltz-rust`. Clone it as `../boltz/boltz-rust` relative to this repo, or adjust the path.
+
+## Deployment notes
+
+Production runs on a hardened Linux VM under systemd as user `payservice`, behind nginx with TLS via Let's Encrypt at `bullpay.ca`. The binary is built locally (`cargo build --release`) and `scp`'d to the VM — no Rust toolchain is installed on prod. Both hosts run the same glibc and arch.
+
+- **Reverse proxy.** nginx terminates TLS and forwards to `127.0.0.1:8080`. `X-Forwarded-For` is set, so `[rate_limit] trust_forwarded_for = true` is required for per-IP gating to work.
+- **Migrations.** Applied manually via `psql` against the production DB. The service does not run `sqlx::migrate!()` in-process. `_sqlx_migrations` is not present.
+- **Rollback.** VM snapshots are taken before every deploy, and the prior binary is kept at `/opt/payservice/bin/pay-service.bak` for fast rollback without a snapshot restore.
+- **Electrum URL scheme.** `[electrum]` URLs should be prefixed `ssl://`. The server warns and assumes `ssl://` for bare `host:port`, but explicit prefixes silence the warning and avoid a long-standing source of plain-TCP-against-TLS-port outages.
+
+## Dependencies
+
+| Crate | Purpose |
+|---|---|
+| [axum](https://github.com/tokio-rs/axum) 0.7 | HTTP server |
+| [tokio](https://github.com/tokio-rs/tokio) 1 | Async runtime, signal handling |
+| [sqlx](https://github.com/launchbadge/sqlx) 0.8 | Postgres with compile-time-checked queries |
+| [lwk_wollet](https://github.com/Blockstream/lwk) 0.14 | Liquid CT descriptor parsing, address derivation |
+| [boltz-client](https://github.com/SatoshiPortal/boltz-rust) | Boltz API v2, MuSig2 cooperative claims |
+| [secp256k1](https://github.com/rust-bitcoin/rust-secp256k1) 0.29 | BIP-340 Schnorr verification |
+| [electrum-client](https://github.com/bitcoindevkit/rust-electrum-client) 0.21 | Liquid Electrum (UTXO verification, mempool / chain polling) |
+| [tower-http](https://github.com/tower-rs/tower-http) | TraceLayer, CORS, body-size limit |
+| [rustls](https://github.com/rustls/rustls) 0.23 | TLS via `aws-lc-rs` |
+| [dashmap](https://github.com/xacrimon/dashmap) 6 | Lock-free in-memory rate-limit buckets |
