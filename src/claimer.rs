@@ -218,6 +218,7 @@ async fn dispatch_webhook(
                 &swap,
                 &state.config.boltz.electrum_url,
                 &state.config.boltz.api_url,
+                state.config.claim.max_claim_attempts,
             )
             .await;
         }
@@ -322,44 +323,39 @@ pub enum ClaimOutcome {
     AlreadyTerminal,
 }
 
-/// Webhook-path retry: spawns up to 3 attempts in quick succession.
-/// PR #5 (bounded retry + backoff) replaces this loop with the
-/// background sweep's exponential-backoff schedule. Until then we
-/// preserve the existing 3×2s behaviour so the diff stays focused on
-/// the keystone idempotency fix.
+/// Webhook-path single-shot claim attempt. Errors are recorded by
+/// `claim_swap` itself (which calls `db::record_claim_failure` to
+/// schedule the next retry on the documented backoff). The background
+/// sweep is the retry mechanism — the webhook handler does not loop.
+///
+/// The previous implementation looped 3 times with 2s delays inside the
+/// webhook handler. That blocked the response to Boltz for up to ~10
+/// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
+/// the background sweep's 30s tick — every webhook produced 4 claim
+/// attempts before the sweep even started.
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
     electrum_url: &str,
     boltz_url: &str,
+    max_claim_attempts: i32,
 ) {
-    for attempt in 1..=3 {
-        if attempt > 1 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+    match claim_swap(pool, swap.id, electrum_url, boltz_url, max_claim_attempts).await {
+        Ok(ClaimOutcome::Broadcast) => {}
+        Ok(ClaimOutcome::AlreadyTerminal) => {}
+        Ok(ClaimOutcome::SkippedLockHeld) => {
+            tracing::debug!(
+                "webhook claim skipped (lock held) for swap {}",
+                swap.boltz_swap_id
+            );
         }
-        match claim_swap(pool, swap.id, electrum_url, boltz_url).await {
-            Ok(ClaimOutcome::Broadcast) => return,
-            Ok(ClaimOutcome::AlreadyTerminal) => return,
-            Ok(ClaimOutcome::SkippedLockHeld) => {
-                // Another path is mid-claim. Step out and let it finish;
-                // re-running here would just block on the lock.
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "claim attempt {attempt}/3 failed for swap {}: {e}",
-                    swap.boltz_swap_id
-                );
-            }
+        Err(e) => {
+            tracing::warn!(
+                "webhook claim attempt failed for swap {}: {e}",
+                swap.boltz_swap_id
+            );
         }
     }
-    tracing::error!(
-        "all claim attempts failed for swap {}",
-        swap.boltz_swap_id
-    );
-    db::update_swap_status(pool, swap.id, SwapStatus::ClaimFailed, None)
-        .await
-        .ok();
 }
 
 /// Returns the claim destination for this swap, allocating one from the
@@ -489,6 +485,55 @@ async fn claim_swap(
     swap_id: Uuid,
     electrum_url: &str,
     boltz_url: &str,
+    max_claim_attempts: i32,
+) -> Result<ClaimOutcome, AppError> {
+    // Outer wrapper: records every Err uniformly via
+    // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
+    // are Ok variants and do NOT count as failures (no attempt was
+    // really made).
+    let result = claim_swap_inner(pool, swap_id, electrum_url, boltz_url).await;
+    if let Err(ref e) = result {
+        let err_str = e.to_string();
+        match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
+            Ok(db::ClaimFailureOutcome::Stuck) => {
+                tracing::error!(
+                    event = "swap_claim_stuck",
+                    swap_id = %swap_id,
+                    attempts = max_claim_attempts,
+                    last_error = %err_str,
+                    "swap reached max_claim_attempts; transitioned to claim_stuck"
+                );
+            }
+            Ok(db::ClaimFailureOutcome::Scheduled) => {
+                tracing::warn!(
+                    event = "swap_claim_failure_scheduled",
+                    swap_id = %swap_id,
+                    last_error = %err_str,
+                    "claim failed; scheduled for retry"
+                );
+            }
+            Ok(db::ClaimFailureOutcome::NoOp) => {
+                tracing::debug!(
+                    "claim failure for {} arrived after row reached terminal state",
+                    swap_id
+                );
+            }
+            Err(db_err) => {
+                tracing::error!(
+                    "failed to record claim failure for swap {}: {db_err}",
+                    swap_id
+                );
+            }
+        }
+    }
+    result
+}
+
+async fn claim_swap_inner(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    electrum_url: &str,
+    boltz_url: &str,
 ) -> Result<ClaimOutcome, AppError> {
     // ----- Phase 1: acquire single-flight, prepare the claim tx.
     let mut tx = pool
@@ -600,10 +645,15 @@ async fn claim_swap(
     let txid = btc_like_txid(&claim_tx);
     tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid);
 
-    // ----- Phase 3: mark Claimed.
+    // ----- Phase 3: mark Claimed + clear retry bookkeeping.
     db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    if let Err(e) = db::clear_claim_failure_state(pool, swap.id).await {
+        // Non-fatal: row is Claimed; stale last-error fields are an
+        // observability nuisance only.
+        tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
+    }
 
     Ok(ClaimOutcome::Broadcast)
 }
@@ -776,6 +826,7 @@ pub fn spawn_background_claimer(
                         swap.id,
                         &config.boltz.electrum_url,
                         &config.boltz.api_url,
+                        config.claim.max_claim_attempts,
                     )
                     .await
                     {

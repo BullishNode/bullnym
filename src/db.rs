@@ -637,6 +637,126 @@ pub async fn mark_cooperative_refused(
     Ok(())
 }
 
+/// Outcome of `record_claim_failure`. Drives the caller's logging and
+/// (eventually, via PR #11) metrics counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimFailureOutcome {
+    /// Attempt counter incremented, next_claim_attempt_at set per the
+    /// backoff schedule. The background sweep will retry later.
+    Scheduled,
+    /// Attempts ≥ `max_attempts`. Status transitioned to `claim_stuck`;
+    /// row no longer picked up by the sweep. Operator action required.
+    Stuck,
+    /// The row was already in a terminal state (or didn't exist). The
+    /// failure record was a no-op.
+    NoOp,
+}
+
+/// Record a failed claim attempt and schedule the next retry.
+///
+/// Called from `claim_swap` when the broadcast fails (or, in PR #6,
+/// when `construct_claim_tx` exhausts its options). Increments
+/// `claim_attempts`, stamps `last_claim_error`, and computes
+/// `next_claim_attempt_at` from the documented backoff schedule:
+///
+/// ```text
+/// claim_attempts (post-increment): 1, 2, 3,  4,   5,    6,    7+
+/// delay (seconds):                30, 60, 120, 300, 600, 1800, 3600 (cap)
+/// ```
+///
+/// ±20% jitter is applied via Postgres `random()` so a backlog draining
+/// at the same tick doesn't synchronise into a thundering herd. Jitter
+/// is server-side so we don't pull a `rand` dependency.
+///
+/// When `claim_attempts` reaches `max_attempts`, the row transitions to
+/// `claim_stuck` (terminal). Subsequent calls become `NoOp` because the
+/// terminal-state guard rejects further updates.
+///
+/// Forward-only: never writes through a row already in a terminal state
+/// (claimed / expired / claim_stuck / lockup_refunded).
+pub async fn record_claim_failure(
+    pool: &PgPool,
+    id: Uuid,
+    error_msg: &str,
+    max_attempts: i32,
+) -> Result<ClaimFailureOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let bumped: Option<(i32,)> = sqlx::query_as(
+        "UPDATE swap_records \
+         SET claim_attempts = claim_attempts + 1, \
+             last_claim_error = $2, \
+             last_claim_error_at = NOW(), \
+             updated_at = NOW(), \
+             next_claim_attempt_at = NOW() + ( \
+                 CASE \
+                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '30 seconds' \
+                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '60 seconds' \
+                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '120 seconds' \
+                     WHEN claim_attempts + 1 = 4 THEN INTERVAL '300 seconds' \
+                     WHEN claim_attempts + 1 = 5 THEN INTERVAL '600 seconds' \
+                     WHEN claim_attempts + 1 = 6 THEN INTERVAL '1800 seconds' \
+                     ELSE INTERVAL '3600 seconds' \
+                 END \
+             ) * (0.8 + 0.4 * random()) \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded') \
+         RETURNING claim_attempts",
+    )
+    .bind(id)
+    .bind(error_msg)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match bumped {
+        None => ClaimFailureOutcome::NoOp,
+        Some((attempts,)) if attempts >= max_attempts => {
+            // Terminal-state guard inside this UPDATE is technically
+            // redundant — we only reach this branch via the prior UPDATE
+            // succeeding under the same guard within the same tx — but
+            // it documents the invariant and fails closed if the UPDATE
+            // chain ever changes shape.
+            sqlx::query(
+                "UPDATE swap_records \
+                 SET status = 'claim_stuck', updated_at = NOW() \
+                 WHERE id = $1 \
+                   AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            ClaimFailureOutcome::Stuck
+        }
+        Some(_) => ClaimFailureOutcome::Scheduled,
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Reset retry bookkeeping after a successful claim attempt. Called
+/// from `claim_swap` once `try_broadcast_tx` returns Ok — clears the
+/// last-error fields so operators see "no errors" on a healthy row,
+/// and zeros out `next_claim_attempt_at` so a hypothetical future
+/// retry (after a reconciler-induced state change) doesn't wait on a
+/// stale schedule.
+pub async fn clear_claim_failure_state(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE swap_records \
+         SET last_claim_error = NULL, \
+             last_claim_error_at = NULL, \
+             next_claim_attempt_at = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Background-sweep query: rows that are claimable AND ready to retry.
 /// `next_claim_attempt_at IS NULL` means "never tried" (or freshly reset
 /// by the rescue runbook); `<= NOW()` means the backoff window has

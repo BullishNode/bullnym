@@ -15,6 +15,8 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub electrum: ElectrumConfig,
+    #[serde(default)]
+    pub claim: ClaimConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
@@ -47,6 +49,133 @@ pub struct BoltzConfig {
     pub api_url: String,
     pub electrum_url: String,
 }
+
+// --- Claim retry policy ---
+
+const DEFAULT_MAX_CLAIM_ATTEMPTS: i32 = 30;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaimConfig {
+    /// After this many failed claim attempts, the row transitions to
+    /// `claim_stuck` and is excluded from the background sweep until an
+    /// operator runs the rescue runbook
+    /// (`pay-service/docs/runbook-stuck-swap.md`, added in PR #11).
+    ///
+    /// Default 30 ≈ 24h of trying with the documented backoff
+    /// (30s, 60s, 120s, 300s, 600s, 1800s, 3600s cap). Plenty for any
+    /// transient outage; well past Boltz's `timeoutBlockHeight` for any
+    /// realistic swap.
+    #[serde(default = "default_max_claim_attempts")]
+    pub max_claim_attempts: i32,
+}
+
+impl Default for ClaimConfig {
+    fn default() -> Self {
+        Self {
+            max_claim_attempts: DEFAULT_MAX_CLAIM_ATTEMPTS,
+        }
+    }
+}
+
+fn default_max_claim_attempts() -> i32 {
+    DEFAULT_MAX_CLAIM_ATTEMPTS
+}
+
+// --- Pricer config ---
+
+const DEFAULT_PRICER_URL: &str = "https://api.bullbitcoin.com/public/price";
+const DEFAULT_PRICER_CACHE_TTL_SECS: u64 = 60;
+const DEFAULT_PRICER_REQUEST_TIMEOUT_MS: u64 = 2000;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricerConfig {
+    /// JSON-RPC endpoint for the bullbitcoin API-Pricer. Donation pages
+    /// fetch `getRate` per `display_currency` to embed a fiat conversion
+    /// rate at HTML render time.
+    #[serde(default = "default_pricer_url")]
+    pub url: String,
+    /// In-memory TTL (seconds) for cached rates. A thundering herd of
+    /// donation-page views all share one upstream call within the TTL.
+    #[serde(default = "default_pricer_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// HTTP request timeout (milliseconds) for the upstream call. On
+    /// timeout / error, the donation render falls back to the last-good
+    /// cached rate (if any).
+    #[serde(default = "default_pricer_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+impl Default for PricerConfig {
+    fn default() -> Self {
+        Self {
+            url: DEFAULT_PRICER_URL.to_string(),
+            cache_ttl_secs: DEFAULT_PRICER_CACHE_TTL_SECS,
+            request_timeout_ms: DEFAULT_PRICER_REQUEST_TIMEOUT_MS,
+        }
+    }
+}
+
+fn default_pricer_url() -> String { DEFAULT_PRICER_URL.to_string() }
+fn default_pricer_cache_ttl_secs() -> u64 { DEFAULT_PRICER_CACHE_TTL_SECS }
+fn default_pricer_request_timeout_ms() -> u64 { DEFAULT_PRICER_REQUEST_TIMEOUT_MS }
+
+// --- Donation page (Phase 3 image pipeline) ---
+
+const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
+const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 10_000;
+const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
+const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
+const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DonationConfig {
+    /// Filesystem root for image storage. The handler writes to
+    /// `<image_root_path>/<nym>/<kind>.webp`. nginx serves this directly
+    /// at `location ^~ /img/`. The directory must be writable by the
+    /// pay-service user and readable by nginx.
+    #[serde(default = "default_donation_image_root")]
+    pub image_root_path: String,
+    /// Hard cap on incoming image bytes. Enforced via per-route
+    /// `DefaultBodyLimit` BEFORE the multipart parser runs — bytes never
+    /// enter memory beyond this.
+    #[serde(default = "default_donation_image_max_bytes")]
+    pub image_max_bytes: usize,
+    /// Reject images whose decoded dimensions exceed this in either
+    /// axis. Image-bomb defense: read the header dimensions first
+    /// (cheap), reject before allocating the full pixel buffer.
+    #[serde(default = "default_donation_image_max_dimension")]
+    pub image_max_dimension: u32,
+    /// Output size for resized avatar (square).
+    #[serde(default = "default_donation_avatar_size")]
+    pub avatar_size: u32,
+    /// Output size for resized OG image (1200×630 is the Twitter/Facebook
+    /// summary_large_image standard).
+    #[serde(default = "default_donation_og_width")]
+    pub og_width: u32,
+    #[serde(default = "default_donation_og_height")]
+    pub og_height: u32,
+}
+
+impl Default for DonationConfig {
+    fn default() -> Self {
+        Self {
+            image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
+            image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
+            image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
+            avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
+            og_width: DEFAULT_DONATION_OG_WIDTH,
+            og_height: DEFAULT_DONATION_OG_HEIGHT,
+        }
+    }
+}
+
+fn default_donation_image_root() -> String { DEFAULT_DONATION_IMAGE_ROOT.to_string() }
+fn default_donation_image_max_bytes() -> usize { DEFAULT_DONATION_IMAGE_MAX_BYTES }
+fn default_donation_image_max_dimension() -> u32 { DEFAULT_DONATION_IMAGE_MAX_DIMENSION }
+fn default_donation_avatar_size() -> u32 { DEFAULT_DONATION_AVATAR_SIZE }
+fn default_donation_og_width() -> u32 { DEFAULT_DONATION_OG_WIDTH }
+fn default_donation_og_height() -> u32 { DEFAULT_DONATION_OG_HEIGHT }
 
 const DEFAULT_POOL_SIZE: u32 = 10;
 const DEFAULT_MIN_SENDABLE_MSAT: u64 = 100_000;
