@@ -584,15 +584,49 @@ async fn claim_swap_inner(
             AppError::ClaimError(format!("decode persisted claim_tx: {e}"))
         })?
     } else {
-        let constructed =
-            construct_claim_tx(&swap, &output_address, electrum_url, boltz_url).await?;
+        // Choose the claim path. `cooperative_refused` is set by either:
+        //   - the webhook handler on `swap.expired` (PR #4), OR
+        //   - this function on a previous attempt where Boltz returned
+        //     a known cooperative-refusal error (below).
+        // Once it flips, the row stays on script-path forever — no
+        // ping-pong. `cooperative_refused` is a one-way flag.
+        let use_cooperative = !swap.cooperative_refused;
+        let constructed = match construct_claim_tx(
+            &swap,
+            &output_address,
+            electrum_url,
+            boltz_url,
+            use_cooperative,
+        )
+        .await
+        {
+            Ok(tx) => tx,
+            Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
+                // Boltz refused cooperative MuSig2 (status mismatch,
+                // bad preimage, or operator-disabled). Flip the flag
+                // so the next sweep tick takes the script path; this
+                // attempt aborts (we'll already have committed nothing
+                // since we're inside the construction tx).
+                tracing::warn!(
+                    event = "swap_cooperative_refused_runtime",
+                    swap_id = %swap.boltz_swap_id,
+                    error = %e,
+                    "boltz refused cooperative claim; flipping cooperative_refused for next attempt"
+                );
+                // mark_cooperative_refused opens its own short tx and is
+                // idempotent — safe to call from inside our locked tx
+                // (different connection; advisory lock doesn't conflict).
+                let _ = db::mark_cooperative_refused(pool, swap.id).await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let hex = serialize_claim_tx_hex(&constructed)?;
         let txid = btc_like_txid(&constructed);
+        let claim_path = if use_cooperative { "cooperative" } else { "script" };
         // `WHERE claim_tx_hex IS NULL` makes this a no-op if a concurrent
         // attempt persisted first (defensive — the advisory lock should
         // have prevented this; the guard is there to fail closed).
-        // PR #6 (cooperative→script fallback) sets `claim_path` based on
-        // the actually-taken path. For now everything is cooperative.
         sqlx::query(
             "UPDATE swap_records \
              SET claim_tx_hex = $2, claim_txid = $3, claim_path = $4 \
@@ -601,7 +635,7 @@ async fn claim_swap_inner(
         .bind(swap.id)
         .bind(&hex)
         .bind(&txid)
-        .bind("cooperative")
+        .bind(claim_path)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -658,15 +692,27 @@ async fn claim_swap_inner(
     Ok(ClaimOutcome::Broadcast)
 }
 
-/// Build the cooperative claim tx for a freshly-funded reverse swap.
-/// Pure I/O — gets called under the per-swap advisory lock so it runs
-/// at most once per swap at a time. PR #6 adds the script-path fallback
-/// branch when `swap.cooperative_refused` is set.
+/// Build a claim tx for a freshly-funded reverse swap.
+///
+/// `cooperative` selects the spending path:
+///
+///   - `true`: MuSig2 keypath — fastest, smallest tx (~107 vB on Liquid),
+///     requires Boltz to cosign via `POST /swap/reverse/{id}/claim`.
+///     Default for swaps in good standing.
+///   - `false`: script-path with preimage reveal — ~85 vB larger
+///     (~9 sats more on Liquid), works without Boltz, and is the only
+///     option once `swap.expired` has fired (Boltz refuses cooperative
+///     post-expiry per `MusigSigner.ts`).
+///
+/// Pure I/O — called under the per-swap advisory lock so at most one
+/// `construct_claim` runs per swap at a time, regardless of webhook /
+/// sweep / reconciler concurrency.
 async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
     electrum_url: &str,
     boltz_url: &str,
+    cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_hex = swap
         .preimage_hex
@@ -717,13 +763,40 @@ async fn construct_claim_tx(
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
-        options: Some(TransactionOptions::default()),
+        options: Some(TransactionOptions::default().with_cooperative(cooperative)),
     };
 
     swap_script
         .construct_claim(&preimage, params)
         .await
         .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))
+}
+
+/// Heuristic classifier for cooperative-claim refusals from Boltz.
+///
+/// `boltz-rust`'s `get_reverse_partial_sig` surfaces an HTTP 4xx as
+/// `Error::Serde` (the response body isn't a `PartialSig`, so JSON
+/// parse fails). The status code is not preserved on the wire — we
+/// have to inspect the message body for known refusal phrases.
+///
+/// Per the plan's risk register: misclassification toward "transient"
+/// is safer than toward "refused". Premature cooperative abandonment
+/// costs an extra ~9 sats of fee on a recoverable swap; the reverse
+/// silently disables the optimal claim path. Only the substrings below
+/// are treated as definite refusal; everything else falls through to
+/// the wrapper's normal retry-with-backoff handling.
+fn is_cooperative_refusal(err: &AppError) -> bool {
+    let s = err.to_string().to_lowercase();
+    // Phrasing taken from `boltz-backend` `lib/service/cooperative/MusigSigner.ts`
+    // and the public Boltz API errors documented at
+    // https://api.docs.boltz.exchange/. Update this list if Boltz's
+    // error wording shifts — symptom would be cooperative attempts
+    // looping at backoff cap until ClaimStuck.
+    s.contains("swap expired")
+        || s.contains("invalid preimage")
+        || s.contains("cooperative claim disabled")
+        || s.contains("cooperative signing disabled")
+        || s.contains("not eligible for cooperative")
 }
 
 /// Hex-encode a fully-signed claim tx for storage in
@@ -790,6 +863,42 @@ mod tests {
     fn url_secret_rejects_length_mismatch() {
         assert!(!url_secret_matches_pair("0123456789abcde", "0123456789abcdef", ""));
         assert!(!url_secret_matches_pair("0123456789abcdef0", "0123456789abcdef", ""));
+    }
+
+    #[test]
+    fn cooperative_refusal_recognises_known_phrases() {
+        for phrase in [
+            "construct_claim failed: serde error: swap expired at line 1",
+            "construct_claim failed: invalid preimage",
+            "construct_claim failed: cooperative claim disabled",
+            "construct_claim failed: cooperative signing disabled",
+            "construct_claim failed: not eligible for cooperative",
+            // case-insensitive
+            "construct_claim failed: SWAP EXPIRED",
+        ] {
+            let e = AppError::ClaimError(phrase.to_string());
+            assert!(
+                is_cooperative_refusal(&e),
+                "expected refusal classification for: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn cooperative_refusal_rejects_unrelated_errors() {
+        for phrase in [
+            "broadcast failed: connection reset",
+            "construct_claim failed: timeout",
+            "construct_claim failed: 502 bad gateway",
+            "swap script build failed: ...",
+            "electrum connection failed: ...",
+        ] {
+            let e = AppError::ClaimError(phrase.to_string());
+            assert!(
+                !is_cooperative_refusal(&e),
+                "did not expect refusal classification for: {phrase}"
+            );
+        }
     }
 }
 
