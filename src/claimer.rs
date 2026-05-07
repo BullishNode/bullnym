@@ -222,20 +222,84 @@ async fn dispatch_webhook(
             .await;
         }
         "invoice.settled" => {
+            // Preimage was disclosed and Boltz settled the LN HTLC. This
+            // arrives downstream of our successful cooperative claim. We
+            // don't transition status here — the claim path itself sets
+            // `Claimed` with the on-chain txid.
             tracing::info!("invoice settled for swap {}", data.id);
         }
-        "swap.expired" | "transaction.failed" => {
-            // NOTE: PR #4 (state machine hardening) revisits this branch.
-            // `swap.expired` should NOT terminal-state — the on-chain HTLC
-            // may still be claimable until `timeoutBlockHeight`, and after
-            // `swap.expired` only the script-path can recover it. For now
-            // (PR #2: webhook auth only) preserve existing behavior to
-            // keep the diff focused.
+        "swap.expired" => {
+            // `swap.expired` is the wall-clock hold-invoice timer (~50% of
+            // swap timeout per Boltz docs). It does NOT mean the on-chain
+            // HTLC is dead — the lockup output stays claimable until
+            // `timeoutBlockHeight`. After this status, however, the
+            // cooperative claim endpoint refuses (per `MusigSigner.ts`),
+            // so the only path is script-path with the preimage.
+            //
+            // Action: set `cooperative_refused = TRUE` so the next sweep
+            // tick takes the script path (PR #6 implements that branch).
+            // Do NOT transition to a terminal state — that would abandon
+            // potentially-claimable funds.
+            tracing::warn!(
+                event = "swap_expired_webhook",
+                swap_id = %data.id,
+                "swap.expired received; flipping cooperative_refused for script-path retry"
+            );
+            db::mark_cooperative_refused(&state.db, swap.id)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+        }
+        "transaction.failed" => {
+            // Boltz tried to lock up on-chain but failed (e.g. their fee
+            // estimation was rejected). The user's LN HTLC auto-cancels
+            // — they don't pay, we have nothing to claim. Terminal.
+            tracing::info!(
+                event = "swap_transaction_failed",
+                swap_id = %data.id,
+                "boltz lockup failed; LN HTLC will cancel back to sender"
+            );
             db::update_swap_status(&state.db, swap.id, SwapStatus::Expired, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
         }
+        "invoice.expired" => {
+            // The user never paid the LN invoice within its TTL. Boltz
+            // never funded a lockup. Terminal Expired (same shape as
+            // `transaction.failed`).
+            tracing::info!(
+                event = "swap_invoice_expired",
+                swap_id = %data.id,
+                "invoice expired before payment"
+            );
+            db::update_swap_status(&state.db, swap.id, SwapStatus::Expired, None)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+        }
+        "transaction.refunded" => {
+            // Boltz refunded its own lockup before we claimed it. The
+            // user paid the LN invoice and is not made whole — this is
+            // the fund-loss terminal state. P0 alert.
+            //
+            // Currently this status is not in our webhook subscription
+            // filter (boltz.rs around line 65), so it arrives only via
+            // the reconciler in PR #7. The handler is wired here so the
+            // moment PR #10 adds the filter, the path works.
+            tracing::error!(
+                event = "swap_lockup_refunded",
+                swap_id = %data.id,
+                nym = %swap.nym,
+                amount_sat = swap.amount_sat,
+                "FUND LOSS: boltz refunded lockup; user paid LN side, no on-chain claim"
+            );
+            db::update_swap_status(&state.db, swap.id, SwapStatus::LockupRefunded, None)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+        }
         _ => {
+            // Other Boltz statuses (`swap.created`, `minerfee.paid`, etc.)
+            // are informational; we don't act on them. Logged at debug
+            // so a new status appearing in the wild is visible in -v
+            // logs without spamming production at info level.
             tracing::debug!("ignoring webhook status: {}", data.status);
         }
     }

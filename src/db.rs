@@ -579,19 +579,59 @@ pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Forward-only status update. Refuses to write through a row whose
+/// status is already in a terminal state (claimed, expired, claim_stuck,
+/// lockup_refunded). Closes the race where, e.g., a `transaction.failed`
+/// webhook arrives during a successful claim and would otherwise
+/// overwrite `Claimed → Expired`.
+///
+/// Returns the number of rows updated. A 0 return is normal when the
+/// row had already reached a terminal state — the caller should not
+/// treat it as an error.
+///
+/// NOTE: this guard does not enforce ordinal monotonicity between
+/// non-terminal states (e.g. lockup_confirmed → lockup_mempool, which a
+/// late webhook could provoke). Both are claimable and the consequence
+/// is purely observability noise. PR #4 keeps the simpler invariant.
 pub async fn update_swap_status(
     pool: &PgPool,
     id: Uuid,
     status: SwapStatus,
     claim_txid: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE swap_records SET status = $2, claim_txid = COALESCE($3, claim_txid), \
-         updated_at = NOW() WHERE id = $1",
+         updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(id)
     .bind(status.to_string())
     .bind(claim_txid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Set `cooperative_refused = TRUE` so the next claim attempt takes the
+/// script path (PR #6 reads this flag in `construct_claim_tx`). Used by
+/// the webhook handler when Boltz emits `swap.expired` — the cooperative
+/// endpoint refuses post-expiry per `MusigSigner.ts`, but the on-chain
+/// HTLC is still claimable until `timeoutBlockHeight` via the script
+/// path.
+///
+/// Idempotent. Status is not touched here — the row stays claimable.
+pub async fn mark_cooperative_refused(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE swap_records \
+         SET cooperative_refused = TRUE, updated_at = NOW() \
+         WHERE id = $1 AND cooperative_refused = FALSE \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+    )
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(())
