@@ -15,11 +15,23 @@ pub enum SwapStatus {
     Claimed,
     ClaimFailed,
     Expired,
+    /// Auto-retry budget exhausted. Excluded from the background sweep;
+    /// requires manual intervention via the runbook (rescue: reset
+    /// claim_attempts, clear claim_tx_hex, flip cooperative_refused,
+    /// status back to lockup_confirmed).
+    ClaimStuck,
+    /// Boltz auto-refunded its lockup before we claimed. The user paid
+    /// the LN invoice and got nothing back — fund-loss terminal state.
+    /// Reconciler is the only path that writes this; emits a P0 alert.
+    LockupRefunded,
 }
 
 impl SwapStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Claimed | Self::Expired)
+        matches!(
+            self,
+            Self::Claimed | Self::Expired | Self::ClaimStuck | Self::LockupRefunded
+        )
     }
 
     pub fn is_claimable(self) -> bool {
@@ -40,6 +52,8 @@ impl fmt::Display for SwapStatus {
             Self::Claimed => "claimed",
             Self::ClaimFailed => "claim_failed",
             Self::Expired => "expired",
+            Self::ClaimStuck => "claim_stuck",
+            Self::LockupRefunded => "lockup_refunded",
         })
     }
 }
@@ -55,6 +69,8 @@ impl FromStr for SwapStatus {
             "claimed" => Ok(Self::Claimed),
             "claim_failed" => Ok(Self::ClaimFailed),
             "expired" => Ok(Self::Expired),
+            "claim_stuck" => Ok(Self::ClaimStuck),
+            "lockup_refunded" => Ok(Self::LockupRefunded),
             other => Err(format!("unknown swap status: {other}")),
         }
     }
@@ -485,6 +501,38 @@ pub struct SwapRecord {
     pub boltz_response_json: Option<String>,
     pub status: String,
     pub claim_txid: Option<String>,
+    /// Hex-encoded fully-signed claim transaction. Populated immediately
+    /// before the first broadcast attempt so subsequent retries
+    /// re-broadcast the SAME tx instead of constructing a new one
+    /// (`construct_claim` is non-deterministic on Liquid: random MuSig2
+    /// nonces + asset/value blinding factors). Cleared by the bump-fee
+    /// retry path.
+    pub claim_tx_hex: Option<String>,
+    /// 'cooperative' (MuSig2 keypath, requires Boltz cosign) or 'script'
+    /// (preimage-revealing script-path). The script path is the only
+    /// recovery once Boltz status reaches `swap.expired`.
+    pub claim_path: Option<String>,
+    /// Total claim attempts (across construct+broadcast). The background
+    /// sweep gives up at `config.max_claim_attempts` and transitions the
+    /// row to `ClaimStuck`.
+    pub claim_attempts: i32,
+    /// Currently-budgeted fee rate in sat/vByte. Set on first attempt;
+    /// bumped on relay-fee rejection up to `claim_fee_sat_per_vb_cap`.
+    pub current_fee_rate: Option<f64>,
+    /// Last claim error message — operator-facing surface for stuck swaps.
+    pub last_claim_error: Option<String>,
+    /// Set when Boltz refused the cooperative MuSig2 endpoint (HTTP 4xx
+    /// or known refusal substrings). Future attempts skip cooperative and
+    /// take the script path.
+    pub cooperative_refused: bool,
+    // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
+    // columns in the schema but intentionally NOT read into this struct.
+    // Reading TIMESTAMPTZ requires the `time` or `chrono` sqlx feature
+    // flag, which the workspace deliberately avoids (see DonationPage
+    // comment at db.rs around line 935). All timestamp comparisons
+    // happen server-side in SQL (e.g. `WHERE next_claim_attempt_at IS
+    // NULL OR next_claim_attempt_at <= NOW()`), and the values are only
+    // surfaced to operators via direct DB queries (the runbook).
 }
 
 impl SwapRecord {
@@ -493,15 +541,24 @@ impl SwapRecord {
     }
 }
 
+/// SQL projection of every `SwapRecord` field above. Centralized so each
+/// new column added to the struct is reflected in exactly one place; the
+/// FromRow derive matches by name so column order is cosmetic. The two
+/// timestamp columns (`next_claim_attempt_at`, `last_claim_error_at`)
+/// are intentionally excluded — see the struct comment.
+const SWAP_RECORD_COLUMNS: &str =
+    "id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
+     preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid, \
+     claim_tx_hex, claim_path, claim_attempts, current_fee_rate, \
+     last_claim_error, cooperative_refused";
+
 pub async fn get_swap_by_boltz_id(
     pool: &PgPool,
     boltz_swap_id: &str,
 ) -> Result<Option<SwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, SwapRecord>(
-        "SELECT id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
-         preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid \
-         FROM swap_records WHERE boltz_swap_id = $1",
-    )
+    sqlx::query_as::<_, SwapRecord>(&format!(
+        "SELECT {SWAP_RECORD_COLUMNS} FROM swap_records WHERE boltz_swap_id = $1"
+    ))
     .bind(boltz_swap_id)
     .fetch_optional(pool)
     .await
@@ -525,16 +582,30 @@ pub async fn update_swap_status(
     Ok(())
 }
 
-pub async fn get_unclaimed_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, SwapRecord>(
-        "SELECT id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
-         preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid \
+/// Background-sweep query: rows that are claimable AND ready to retry.
+/// `next_claim_attempt_at IS NULL` means "never tried" (or freshly reset
+/// by the rescue runbook); `<= NOW()` means the backoff window has
+/// elapsed. Both `claim_stuck` and `lockup_refunded` are excluded
+/// implicitly via the IN-list — both are terminal.
+pub async fn get_ready_to_claim_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, SwapRecord>(&format!(
+        "SELECT {SWAP_RECORD_COLUMNS} \
          FROM swap_records \
          WHERE status IN ('lockup_mempool', 'lockup_confirmed', 'claiming', 'claim_failed') \
-         AND claim_txid IS NULL",
-    )
+           AND claim_txid IS NULL \
+           AND (next_claim_attempt_at IS NULL OR next_claim_attempt_at <= NOW()) \
+         ORDER BY next_claim_attempt_at NULLS FIRST"
+    ))
     .fetch_all(pool)
     .await
+}
+
+/// Backwards-compat alias. Kept because the existing claimer module
+/// imports the old name; subsequent PRs in this rollout will switch
+/// callers over to `get_ready_to_claim_swaps`.
+#[deprecated(note = "use get_ready_to_claim_swaps")]
+pub async fn get_unclaimed_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx::Error> {
+    get_ready_to_claim_swaps(pool).await
 }
 
 // --- Outpoint → address index reservations ---
@@ -898,20 +969,27 @@ pub async fn mark_reservations_fulfilled_at_idx(
 mod tests {
     use super::*;
 
+    /// Single source of truth for the enum's variant set. Every test in
+    /// this module iterates over this so adding a new variant fails
+    /// loudly here instead of silently skipping coverage.
+    const ALL_STATUSES: &[SwapStatus] = &[
+        SwapStatus::Pending,
+        SwapStatus::LockupMempool,
+        SwapStatus::LockupConfirmed,
+        SwapStatus::Claiming,
+        SwapStatus::Claimed,
+        SwapStatus::ClaimFailed,
+        SwapStatus::Expired,
+        SwapStatus::ClaimStuck,
+        SwapStatus::LockupRefunded,
+    ];
+
     #[test]
     fn swap_status_round_trip() {
-        for status in [
-            SwapStatus::Pending,
-            SwapStatus::LockupMempool,
-            SwapStatus::LockupConfirmed,
-            SwapStatus::Claiming,
-            SwapStatus::Claimed,
-            SwapStatus::ClaimFailed,
-            SwapStatus::Expired,
-        ] {
+        for status in ALL_STATUSES {
             let s = status.to_string();
             let parsed: SwapStatus = s.parse().unwrap();
-            assert_eq!(parsed, status);
+            assert_eq!(parsed, *status);
         }
     }
 
@@ -919,7 +997,12 @@ mod tests {
     fn swap_status_terminal() {
         assert!(SwapStatus::Claimed.is_terminal());
         assert!(SwapStatus::Expired.is_terminal());
+        assert!(SwapStatus::ClaimStuck.is_terminal());
+        assert!(SwapStatus::LockupRefunded.is_terminal());
         assert!(!SwapStatus::Pending.is_terminal());
+        assert!(!SwapStatus::LockupMempool.is_terminal());
+        assert!(!SwapStatus::LockupConfirmed.is_terminal());
+        assert!(!SwapStatus::Claiming.is_terminal());
         assert!(!SwapStatus::ClaimFailed.is_terminal());
     }
 
@@ -932,6 +1015,19 @@ mod tests {
         assert!(!SwapStatus::Pending.is_claimable());
         assert!(!SwapStatus::Claimed.is_claimable());
         assert!(!SwapStatus::Expired.is_claimable());
+        assert!(!SwapStatus::ClaimStuck.is_claimable());
+        assert!(!SwapStatus::LockupRefunded.is_claimable());
+    }
+
+    /// Cross-check: terminal and claimable are disjoint.
+    #[test]
+    fn swap_status_terminal_disjoint_from_claimable() {
+        for status in ALL_STATUSES {
+            assert!(
+                !(status.is_terminal() && status.is_claimable()),
+                "status {status} is both terminal and claimable"
+            );
+        }
     }
 
     #[test]
