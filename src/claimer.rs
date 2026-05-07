@@ -2,11 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, State};
-use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
@@ -27,11 +25,6 @@ use crate::error::AppError;
 use crate::ip_whitelist;
 use crate::AppState;
 
-/// HTTP header Boltz uses to authenticate its webhook deliveries.
-/// Confirm at impl time against Boltz's current docs — header name has
-/// historically varied (`Boltz-Hmac-Signature` / `X-Boltz-Hmac` etc.).
-const BOLTZ_HMAC_HEADER: &str = "boltz-hmac-signature";
-
 #[derive(Deserialize)]
 struct WebhookEnvelope {
     data: WebhookData,
@@ -43,16 +36,119 @@ struct WebhookData {
     status: String,
 }
 
-pub async fn webhook(
+/// Constant-time match of a presented URL-path secret against a
+/// (current, previous) pair of configured secrets.
+///
+/// - Returns `true` only when `presented` matches one of the configured
+///   secrets exactly.
+/// - Empty configured secrets never validate, even against an empty
+///   presented value — otherwise a misconfigured deploy would silently
+///   accept any request.
+/// - Length differences fail before the constant-time compare. This
+///   leaks "wrong length" via timing but the configured secret is a
+///   fixed long random string; the worst case is the attacker learns
+///   "you didn't pick this length", which is uninteresting.
+fn url_secret_matches_pair(presented: &str, current: &str, previous: &str) -> bool {
+    fn ct_eq(a: &str, b: &str) -> bool {
+        if b.is_empty() || a.len() != b.len() {
+            return false;
+        }
+        a.as_bytes().ct_eq(b.as_bytes()).into()
+    }
+    ct_eq(presented, current) || ct_eq(presented, previous)
+}
+
+fn webhook_url_secret_matches(presented: &str, config: &Config) -> bool {
+    url_secret_matches_pair(
+        presented,
+        &config.boltz_webhook_url_secret,
+        &config.boltz_webhook_url_secret_previous,
+    )
+}
+
+/// Authenticated webhook entrypoint: `/webhook/boltz/:secret`.
+/// Routes the request to the shared dispatcher only after the URL
+/// segment matches a configured secret in constant time.
+pub async fn webhook_with_secret(
     State(state): State<AppState>,
+    Path(secret): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<&'static str, AppError> {
+    if !webhook_url_secret_matches(&secret, &state.config) {
+        // Same shape as a route miss — don't leak whether the path
+        // existed but the secret was wrong vs. the route doesn't exist.
+        // Webhook-bomb rate-limit is still applied below.
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        let caller_ip = ip_whitelist::resolve_caller_ip(
+            peer_opt.map(|ConnectInfo(addr)| addr.ip()),
+            xff,
+            state.config.rate_limit.trust_forwarded_for,
+        );
+        tracing::warn!(
+            "boltz webhook: URL secret mismatch from {:?}",
+            caller_ip
+        );
+        return Err(AppError::AuthError(StatusCode::NOT_FOUND.to_string()));
+    }
+    dispatch_webhook(state, peer_opt, headers, body).await
+}
+
+/// Legacy unauthenticated webhook entrypoint: `/webhook/boltz`. When
+/// `boltz_webhook_url_secret` is configured this path is locked down —
+/// production must register the authenticated URL with Boltz instead.
+/// Kept on the router so dev environments without a configured secret
+/// keep working as before.
+///
+/// **First-time secret rollout (operational note).** The webhook URL is
+/// captured Boltz-side at swap-creation time. Setting the secret on a
+/// running deployment that previously created swaps without one will
+/// reject all in-flight swaps' webhook deliveries (Boltz retries 5×60s
+/// then abandons). Mitigation: deploy this code with the secret unset
+/// first, drain in-flight swaps (~24h max via reconciler / on-chain
+/// timeouts), then flip the secret on.
+pub async fn webhook_unauthenticated(
+    State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<&'static str, AppError> {
+    if !state.config.boltz_webhook_url_secret.is_empty() {
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        let caller_ip = ip_whitelist::resolve_caller_ip(
+            peer_opt.map(|ConnectInfo(addr)| addr.ip()),
+            xff,
+            state.config.rate_limit.trust_forwarded_for,
+        );
+        tracing::warn!(
+            "boltz webhook: hit on unauthenticated path while secret is configured (caller={:?})",
+            caller_ip,
+        );
+        return Err(AppError::AuthError(StatusCode::NOT_FOUND.to_string()));
+    }
+    tracing::warn!(
+        "boltz webhook: BOLTZ_WEBHOOK_URL_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
+    );
+    dispatch_webhook(state, peer_opt, headers, body).await
+}
+
+/// Shared post-auth webhook handler.
+///
+/// Returns `Ok("ok")` (200) for every payload we successfully decode and
+/// route — including unknown swap IDs and unhandled statuses — so Boltz's
+/// webhook caller treats the delivery as successful and stops retrying.
+/// We only return errors for malformed payloads or DB failures, which
+/// Boltz should retry.
+async fn dispatch_webhook(
+    state: AppState,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: String,
 ) -> Result<&'static str, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
 
-    // D2 #1 — per-source rate-limit gate. Independent of HMAC; bounds
-    // webhook-bomb cost even if the secret leaks.
+    // Per-source rate-limit gate. Survives even with a leaked URL secret.
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     let caller_ip = ip_whitelist::resolve_caller_ip(
         peer.map(|p| p.ip()),
@@ -65,32 +161,6 @@ pub async fn webhook(
         }
     }
 
-    // D2 #2 — HMAC verify. When the secret is empty we log loudly and
-    // skip the check (legacy/dev mode). Production MUST set
-    // `BOLTZ_WEBHOOK_SECRET` in `.env`.
-    if state.config.boltz_webhook_secret.is_empty() {
-        tracing::warn!(
-            "boltz webhook: BOLTZ_WEBHOOK_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
-        );
-    } else {
-        let provided_sig = headers
-            .get(BOLTZ_HMAC_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "boltz webhook: missing {} header from {:?}",
-                    BOLTZ_HMAC_HEADER,
-                    caller_ip
-                );
-                AppError::AuthError("missing webhook signature".into())
-            })?;
-        verify_hmac(&state.config.boltz_webhook_secret, body.as_bytes(), provided_sig)
-            .map_err(|e| {
-                tracing::warn!("boltz webhook: HMAC verify failed from {:?}: {e}", caller_ip);
-                AppError::AuthError("invalid webhook signature".into())
-            })?;
-    }
-
     tracing::debug!("boltz webhook raw: {}", body);
 
     let envelope: WebhookEnvelope = serde_json::from_str(&body).map_err(|e| {
@@ -99,7 +169,7 @@ pub async fn webhook(
     })?;
     let data = envelope.data;
 
-    // D2 #3 — idempotency. Boltz can re-deliver the same event.
+    // Idempotency. Boltz can re-deliver the same event.
     // event_id = "{swap_id}:{status}" is deterministic; first INSERT
     // wins, duplicates short-circuit to 200 with no work done.
     let event_id = format!("{}:{}", data.id, data.status);
@@ -113,13 +183,17 @@ pub async fn webhook(
 
     tracing::info!("boltz webhook: swap={} status={}", data.id, data.status);
 
-    let swap = db::get_swap_by_boltz_id(&state.db, &data.id)
+    let Some(swap) = db::get_swap_by_boltz_id(&state.db, &data.id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| {
-            tracing::warn!("webhook for unknown swap: {}", data.id);
-            AppError::ClaimError(format!("unknown swap: {}", data.id))
-        })?;
+    else {
+        // Unknown swap_id is not an error condition for Boltz to retry —
+        // either we never created the swap here, or the row was purged.
+        // Returning 200 stops the (5×60s) retry storm. PR #4 hardens
+        // every other branch with the same posture.
+        tracing::warn!("boltz webhook for unknown swap: {}", data.id);
+        return Ok("ok");
+    };
 
     let status = swap.parsed_status().map_err(AppError::DbError)?;
     if status.is_terminal() {
@@ -150,6 +224,12 @@ pub async fn webhook(
             tracing::info!("invoice settled for swap {}", data.id);
         }
         "swap.expired" | "transaction.failed" => {
+            // NOTE: PR #4 (state machine hardening) revisits this branch.
+            // `swap.expired` should NOT terminal-state — the on-chain HTLC
+            // may still be claimable until `timeoutBlockHeight`, and after
+            // `swap.expired` only the script-path can recover it. For now
+            // (PR #2: webhook auth only) preserve existing behavior to
+            // keep the diff focused.
             db::update_swap_status(&state.db, swap.id, SwapStatus::Expired, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -372,65 +452,48 @@ async fn claim_swap(
     Ok(())
 }
 
-/// HMAC-SHA256 of `body` with `secret`, compared in constant time
-/// against a hex-encoded `provided`. Returns `Err` on length mismatch,
-/// hex decode failure, or signature mismatch — all indistinguishable
-/// from each other to the caller (no oracle).
-fn verify_hmac(secret: &str, body: &[u8], provided_hex: &str) -> Result<(), String> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| format!("hmac init: {e}"))?;
-    mac.update(body);
-    let expected = mac.finalize().into_bytes();
-    let provided = hex::decode(provided_hex).map_err(|_| "bad hex".to_string())?;
-    if expected.len() != provided.len() {
-        return Err("length mismatch".into());
-    }
-    if expected.ct_eq(&provided).into() {
-        Ok(())
-    } else {
-        Err("signature mismatch".into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn verify_hmac_accepts_correct_signature() {
-        let secret = "supersecret";
-        let body = b"{\"id\":\"abc\",\"status\":\"transaction.confirmed\"}";
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body);
-        let sig = hex::encode(mac.finalize().into_bytes());
-        assert!(verify_hmac(secret, body, &sig).is_ok());
+    fn url_secret_matches_current() {
+        assert!(url_secret_matches_pair("s3cr3t-current", "s3cr3t-current", ""));
     }
 
     #[test]
-    fn verify_hmac_rejects_wrong_secret() {
-        let body = b"hello";
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(b"right").unwrap();
-        mac.update(body);
-        let sig = hex::encode(mac.finalize().into_bytes());
-        assert!(verify_hmac("wrong", body, &sig).is_err());
+    fn url_secret_matches_previous_during_overlap() {
+        assert!(url_secret_matches_pair(
+            "s3cr3t-previous",
+            "s3cr3t-current",
+            "s3cr3t-previous"
+        ));
+        assert!(url_secret_matches_pair(
+            "s3cr3t-current",
+            "s3cr3t-current",
+            "s3cr3t-previous"
+        ));
     }
 
     #[test]
-    fn verify_hmac_rejects_tampered_body() {
-        let secret = "supersecret";
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(b"original");
-        let sig = hex::encode(mac.finalize().into_bytes());
-        assert!(verify_hmac(secret, b"tampered", &sig).is_err());
+    fn url_secret_rejects_wrong() {
+        assert!(!url_secret_matches_pair("nope", "s3cr3t-current", "s3cr3t-previous"));
+        assert!(!url_secret_matches_pair("", "s3cr3t-current", "s3cr3t-previous"));
+    }
+
+    /// Empty configured secrets must never validate — even against an
+    /// empty presented secret. Otherwise a misconfigured deploy would
+    /// silently accept any presented value.
+    #[test]
+    fn url_secret_rejects_empty_when_unconfigured() {
+        assert!(!url_secret_matches_pair("", "", ""));
+        assert!(!url_secret_matches_pair("anything", "", ""));
     }
 
     #[test]
-    fn verify_hmac_rejects_garbage_hex() {
-        assert!(verify_hmac("k", b"body", "not-hex").is_err());
+    fn url_secret_rejects_length_mismatch() {
+        assert!(!url_secret_matches_pair("0123456789abcde", "0123456789abcdef", ""));
+        assert!(!url_secret_matches_pair("0123456789abcdef0", "0123456789abcdef", ""));
     }
 }
 

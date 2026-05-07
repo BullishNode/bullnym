@@ -19,12 +19,27 @@ pub struct Config {
     pub database_url: String,
     #[serde(skip)]
     pub swap_mnemonic: String,
-    /// HMAC-SHA256 shared secret for Boltz webhook authentication.
-    /// Sourced from `BOLTZ_WEBHOOK_SECRET` env var. When empty, webhook
-    /// HMAC verification is disabled — for legacy compat, but production
-    /// MUST set this.
+    /// URL-path secret for Boltz webhook authentication. Boltz's backend
+    /// (verified at `boltzr/src/webhook/caller.rs`) does NOT sign webhook
+    /// deliveries — there is no HMAC header. The shared secret therefore
+    /// has to live somewhere Boltz already echoes back, and the only
+    /// such place is the webhook URL itself. We register
+    /// `https://{domain}/webhook/boltz/{webhook_url_secret}` with Boltz
+    /// at swap creation time; the handler matches the path segment in
+    /// constant time.
+    ///
+    /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. When empty,
+    /// authentication is disabled (legacy/dev mode) — production MUST
+    /// set this. Rotation: see the runbook; existing in-flight swaps'
+    /// webhook URLs persist Boltz-side and 404 against a rotated secret.
     #[serde(skip)]
-    pub boltz_webhook_secret: String,
+    pub boltz_webhook_url_secret: String,
+    /// Optional previous URL secret. Accepted in addition to
+    /// `boltz_webhook_url_secret` for the duration of a rotation overlap
+    /// window (so existing swaps' webhooks keep delivering while new
+    /// swaps register the new URL). Empty = no overlap.
+    #[serde(skip)]
+    pub boltz_webhook_url_secret_previous: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -448,9 +463,15 @@ impl Config {
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
         // Optional in dev / required in prod. When empty, the webhook
         // handler logs a warning on every request and falls back to
-        // unauthenticated mode (legacy behaviour).
-        config.boltz_webhook_secret =
-            std::env::var("BOLTZ_WEBHOOK_SECRET").unwrap_or_default();
+        // unauthenticated mode (legacy behaviour). `BOLTZ_WEBHOOK_SECRET`
+        // is read for backwards-compat — the previous code expected an
+        // HMAC header that Boltz never sends; the value is now reused
+        // as the URL-path secret instead.
+        config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
+            .or_else(|_| std::env::var("BOLTZ_WEBHOOK_SECRET"))
+            .unwrap_or_default();
+        config.boltz_webhook_url_secret_previous =
+            std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
 
         config.validate()?;
         Ok(config)
