@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::{Chain, LiquidChain};
@@ -242,37 +243,44 @@ async fn dispatch_webhook(
     Ok("ok")
 }
 
+/// Outcome of a single `claim_swap` invocation.
+#[derive(Debug, Clone, Copy)]
+pub enum ClaimOutcome {
+    /// Constructed (or re-broadcast) a claim tx and Electrum accepted it
+    /// (or reported it was already in the utxo set — same outcome from
+    /// our perspective).
+    Broadcast,
+    /// Another process holds the per-swap advisory lock; the next sweep
+    /// tick (or webhook delivery) will try again.
+    SkippedLockHeld,
+    /// Row reached a terminal state (`Claimed`, `Expired`, `ClaimStuck`,
+    /// `LockupRefunded`) — nothing to do.
+    AlreadyTerminal,
+}
+
+/// Webhook-path retry: spawns up to 3 attempts in quick succession.
+/// PR #5 (bounded retry + backoff) replaces this loop with the
+/// background sweep's exponential-backoff schedule. Until then we
+/// preserve the existing 3×2s behaviour so the diff stays focused on
+/// the keystone idempotency fix.
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
     electrum_url: &str,
     boltz_url: &str,
 ) {
-    // Resolve the claim destination once. Swaps created post-MRH-deprecation
-    // arrive with `address: None` and need a descriptor index allocated here;
-    // legacy swaps already have it set from swap-creation time. The helper is
-    // serialized on the swap row (FOR UPDATE) so concurrent webhook deliveries
-    // do not double-allocate.
-    let output_address = match resolve_claim_address(pool, swap).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::error!(
-                "failed to resolve claim address for swap {}: {e}",
-                swap.boltz_swap_id
-            );
-            db::update_swap_status(pool, swap.id, SwapStatus::ClaimFailed, None)
-                .await
-                .ok();
-            return;
-        }
-    };
-
     for attempt in 1..=3 {
         if attempt > 1 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        match claim_swap(pool, swap, &output_address, electrum_url, boltz_url).await {
-            Ok(()) => return,
+        match claim_swap(pool, swap.id, electrum_url, boltz_url).await {
+            Ok(ClaimOutcome::Broadcast) => return,
+            Ok(ClaimOutcome::AlreadyTerminal) => return,
+            Ok(ClaimOutcome::SkippedLockHeld) => {
+                // Another path is mid-claim. Step out and let it finish;
+                // re-running here would just block on the lock.
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     "claim attempt {attempt}/3 failed for swap {}: {e}",
@@ -324,9 +332,18 @@ async fn resolve_claim_address(
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("user not found: {}", swap.nym)))?;
 
+    // The `is_active = TRUE` filter from the original implementation is
+    // intentionally dropped here. Funds locked up against a swap we
+    // created belong to the receiver regardless of their current
+    // activation status — a user who deactivated between swap creation
+    // and HTLC funding still gets their claim. `purge_user` already
+    // refuses to run while in-flight swaps exist (see db.rs:359), and
+    // it sets `ct_descriptor = ''` which would surface as a derive
+    // failure here, so a purged-row corner case fails loudly rather
+    // than silently strands.
     let addr_index_row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
-         WHERE nym = $1 AND is_active = TRUE \
+         WHERE nym = $1 \
          RETURNING next_addr_idx - 1",
     )
     .bind(&swap.nym)
@@ -367,13 +384,176 @@ async fn resolve_claim_address(
     Ok(derived)
 }
 
+/// Single-flight, idempotent claim.
+///
+/// `construct_claim` is non-deterministic on Liquid — random MuSig2
+/// session nonces (`liquid.rs:703-714`) plus random asset/value
+/// blinding factors (`liquid.rs:833`) yield a different valid-but-
+/// conflicting tx every call. The previous implementation called
+/// `construct_claim` from scratch on every retry; if a previous
+/// broadcast had landed but our response was lost, the next attempt
+/// produced a different tx that Electrum rejected as a double-spend
+/// and we marked the row `claim_failed` even though the swap had
+/// actually succeeded.
+///
+/// This version persists the constructed tx hex into `swap_records`
+/// BEFORE the first broadcast, so subsequent attempts re-broadcast
+/// the SAME tx instead of constructing a new one. Re-broadcasting
+/// is idempotent at the Electrum boundary: `try_broadcast_tx`
+/// (boltz-rust `wrappers.rs:199-212`) treats `"already in block
+/// chain"` and `"already in utxo set"` as success.
+///
+/// The shape:
+///
+///   1. Open a transaction; try to acquire `pg_try_advisory_xact_lock`
+///      keyed on `claim:<swap_id>`. Concurrent attempts return
+///      `SkippedLockHeld` and try on the next tick.
+///   2. Reload the row inside the lock. If terminal, return
+///      `AlreadyTerminal`.
+///   3. Resolve the claim destination address (allocates a fresh
+///      descriptor index if none was set at swap creation).
+///   4. If `claim_tx_hex` is set, deserialize it. Otherwise
+///      `construct_claim` and persist `(claim_tx_hex, claim_txid,
+///      claim_path)` in the same transaction. Mark status `claiming`.
+///   5. Commit (releases the advisory lock).
+///   6. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
+///      I/O-bound step and we don't want to hold a DB connection.
+///      Idempotent on Electrum.
+///   7. Mark status `claimed` with the on-chain txid.
 async fn claim_swap(
     pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    electrum_url: &str,
+    boltz_url: &str,
+) -> Result<ClaimOutcome, AppError> {
+    // ----- Phase 1: acquire single-flight, prepare the claim tx.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    // Advisory locks live on `pg_try_advisory_xact_lock` for the duration
+    // of the transaction. `claim:<uuid>` lives in a disjoint string space
+    // from the existing `register:` / `donation:` / raw-npub-hex usages
+    // (db.rs:201, 1088), so no AB/BA deadlock is possible with those.
+    let lock_key = format!("claim:{swap_id}");
+    let got_lock: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)",
+    )
+    .bind(&lock_key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+    if !got_lock {
+        tracing::debug!("claim_swap: lock held for {swap_id}, skipping");
+        return Ok(ClaimOutcome::SkippedLockHeld);
+    }
+
+    let swap = db::get_swap_by_id(&mut *tx, swap_id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("swap not found: {swap_id}")))?;
+
+    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    if status.is_terminal() {
+        tracing::debug!("claim_swap: {} already terminal ({})", swap_id, swap.status);
+        return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+
+    // resolve_claim_address opens its own short-lived tx with a row-level
+    // FOR UPDATE on the swap row. That's fine: we hold an advisory lock
+    // (in-memory, no row-level conflict) so its tx goes through cleanly.
+    // PR #4 (state-machine hardening) will inline this into the outer tx.
+    let output_address = resolve_claim_address(pool, &swap).await?;
+
+    let chain = Chain::Liquid(LiquidChain::Liquid);
+    let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
+        // Idempotent path: a previous attempt persisted the constructed
+        // tx but failed somewhere between persistence and "Claimed"
+        // status. Re-broadcast THAT tx, not a fresh one.
+        BtcLikeTransaction::from_hex(chain, hex).map_err(|e| {
+            AppError::ClaimError(format!("decode persisted claim_tx: {e}"))
+        })?
+    } else {
+        let constructed =
+            construct_claim_tx(&swap, &output_address, electrum_url, boltz_url).await?;
+        let hex = serialize_claim_tx_hex(&constructed)?;
+        let txid = btc_like_txid(&constructed);
+        // `WHERE claim_tx_hex IS NULL` makes this a no-op if a concurrent
+        // attempt persisted first (defensive — the advisory lock should
+        // have prevented this; the guard is there to fail closed).
+        // PR #6 (cooperative→script fallback) sets `claim_path` based on
+        // the actually-taken path. For now everything is cooperative.
+        sqlx::query(
+            "UPDATE swap_records \
+             SET claim_tx_hex = $2, claim_txid = $3, claim_path = $4 \
+             WHERE id = $1 AND claim_tx_hex IS NULL",
+        )
+        .bind(swap.id)
+        .bind(&hex)
+        .bind(&txid)
+        .bind("cooperative")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+        constructed
+    };
+
+    // Status → Claiming. Forward-only guard prevents regression from
+    // any terminal state. PR #4 generalizes this to a CAS helper.
+    sqlx::query(
+        "UPDATE swap_records \
+         SET status = 'claiming', updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+    )
+    .bind(swap.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    // ----- Phase 2: broadcast outside the lock.
+    //
+    // Broadcast is pure I/O against Electrum and may take seconds. We
+    // hold no DB connection or lock during the call. If the process
+    // dies between here and Phase 3, the next sweep tick re-acquires
+    // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
+    // THIS exact tx (idempotent).
+    let liquid_client =
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
+
+    chain_client
+        .try_broadcast_tx(&claim_tx)
+        .await
+        .map_err(|e| AppError::ClaimError(format!("broadcast failed: {e}")))?;
+
+    let txid = btc_like_txid(&claim_tx);
+    tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid);
+
+    // ----- Phase 3: mark Claimed.
+    db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    Ok(ClaimOutcome::Broadcast)
+}
+
+/// Build the cooperative claim tx for a freshly-funded reverse swap.
+/// Pure I/O — gets called under the per-swap advisory lock so it runs
+/// at most once per swap at a time. PR #6 adds the script-path fallback
+/// branch when `swap.cooperative_refused` is set.
+async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
     electrum_url: &str,
     boltz_url: &str,
-) -> Result<(), AppError> {
+) -> Result<BtcLikeTransaction, AppError> {
     let preimage_hex = swap
         .preimage_hex
         .as_deref()
@@ -407,17 +587,14 @@ async fn claim_swap(
     let swap_script = SwapScript::reverse_from_swap_resp(chain, &boltz_response, claim_public_key)
         .map_err(|e| AppError::ClaimError(format!("swap script build failed: {e}")))?;
 
-    // New connection per claim — ElectrumLiquidClient wraps a TCP socket
-    // and isn't Send+Sync, so it can't be shared across tasks.
+    // New connection per construct call — ElectrumLiquidClient wraps a
+    // TCP socket and isn't Send+Sync, so it can't be shared across tasks.
+    // PR #8 swaps this for the resilient multi-URL utxo::ElectrumClient.
     let liquid_client =
         ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
-
-    db::update_swap_status(pool, swap.id, SwapStatus::Claiming, None)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let params = SwapTransactionParams {
         keys: keypair,
@@ -429,27 +606,32 @@ async fn claim_swap(
         options: Some(TransactionOptions::default()),
     };
 
-    let claim_tx = swap_script
+    swap_script
         .construct_claim(&preimage, params)
         .await
-        .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))?;
+        .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))
+}
 
-    chain_client
-        .try_broadcast_tx(&claim_tx)
-        .await
-        .map_err(|e| AppError::ClaimError(format!("broadcast failed: {e}")))?;
+/// Hex-encode a fully-signed claim tx for storage in
+/// `swap_records.claim_tx_hex`. Mirrors the deserialize path in
+/// `BtcLikeTransaction::from_hex` so a round-trip is well-defined for
+/// both Liquid (elements consensus) and Bitcoin (consensus crate).
+fn serialize_claim_tx_hex(tx: &BtcLikeTransaction) -> Result<String, AppError> {
+    Ok(match tx {
+        BtcLikeTransaction::Liquid(t) => {
+            hex::encode(boltz_client::elements::encode::serialize(t))
+        }
+        BtcLikeTransaction::Bitcoin(t) => {
+            hex::encode(boltz_client::bitcoin::consensus::serialize(t))
+        }
+    })
+}
 
-    let txid_str = match &claim_tx {
-        BtcLikeTransaction::Liquid(tx) => tx.txid().to_string(),
-        BtcLikeTransaction::Bitcoin(tx) => tx.compute_txid().to_string(),
-    };
-    tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid_str);
-
-    db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid_str))
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-
-    Ok(())
+fn btc_like_txid(tx: &BtcLikeTransaction) -> String {
+    match tx {
+        BtcLikeTransaction::Liquid(t) => t.txid().to_string(),
+        BtcLikeTransaction::Bitcoin(t) => t.compute_txid().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +687,8 @@ pub fn spawn_background_claimer(
     tokio::spawn(async move {
         let mut first_run = true;
         loop {
-            let unclaimed = match db::get_unclaimed_swaps(&pool).await {
+            #[allow(deprecated)]
+            let ready = match db::get_unclaimed_swaps(&pool).await {
                 Ok(swaps) => swaps,
                 Err(e) => {
                     tracing::error!("background claimer: db query failed: {e}");
@@ -516,36 +699,37 @@ pub fn spawn_background_claimer(
                 }
             };
 
-            if !unclaimed.is_empty() {
+            if !ready.is_empty() {
                 if first_run {
                     tracing::info!(
                         "background claimer: found {} unclaimed swaps on startup",
-                        unclaimed.len()
+                        ready.len()
                     );
                 }
-                for swap in &unclaimed {
-                    let output_address = match resolve_claim_address(&pool, swap).await {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::warn!(
-                                "background claimer: address resolution failed for swap {}: {e}",
-                                swap.boltz_swap_id
-                            );
-                            continue;
-                        }
-                    };
+                for swap in &ready {
                     match claim_swap(
                         &pool,
-                        swap,
-                        &output_address,
+                        swap.id,
                         &config.boltz.electrum_url,
                         &config.boltz.api_url,
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(ClaimOutcome::Broadcast) => {
                             tracing::info!(
                                 "background claimer: claimed swap {}",
+                                swap.boltz_swap_id
+                            );
+                        }
+                        Ok(ClaimOutcome::SkippedLockHeld) => {
+                            tracing::debug!(
+                                "background claimer: skipped {} (lock held)",
+                                swap.boltz_swap_id
+                            );
+                        }
+                        Ok(ClaimOutcome::AlreadyTerminal) => {
+                            tracing::debug!(
+                                "background claimer: skipped {} (already terminal)",
                                 swap.boltz_swap_id
                             );
                         }

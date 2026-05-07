@@ -564,6 +564,21 @@ pub async fn get_swap_by_boltz_id(
     .await
 }
 
+/// Load a swap row by primary key. Generic over any sqlx executor so the
+/// claimer can call this inside its locked transaction (passing
+/// `&mut *tx`) instead of going back to the pool for a fresh connection.
+pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<SwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, SwapRecord>(&format!(
+        "SELECT {SWAP_RECORD_COLUMNS} FROM swap_records WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+}
+
 pub async fn update_swap_status(
     pool: &PgPool,
     id: Uuid,
