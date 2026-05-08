@@ -24,6 +24,7 @@ use tower_cookies::{Cookie, Cookies};
 use uuid::Uuid;
 
 use crate::db;
+use crate::donation_page::SUPPORTED_CURRENCIES;
 use crate::ip_whitelist;
 use crate::reserved_nyms;
 use crate::AppState;
@@ -60,6 +61,10 @@ struct DonationPageTpl<'a> {
     minor_per_btc: i64,
     precision: u8,
     last_known_rate: bool,
+    /// All currencies the server supports for fiat-denominated invoices.
+    /// Rendered as `<option>` entries on the unit dropdown so the sender
+    /// is not constrained to the merchant's display preference.
+    supported_currencies: &'static [&'static str],
 }
 
 #[derive(Template)]
@@ -222,6 +227,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
         minor_per_btc,
         precision,
         last_known_rate,
+        supported_currencies: SUPPORTED_CURRENCIES,
     }
     .render()
     .unwrap_or_else(|e| format!("template render failed: {e}"));
@@ -244,6 +250,11 @@ pub async fn render_or_404(
     // Strip leading slash and reject anything with another slash, dot, or
     // backslash. The fallback only handles single-segment slugs.
     let nym = raw_path.strip_prefix('/').unwrap_or(raw_path);
+    // Tolerate a single trailing slash (`/<nym>/`) — browsers and link-
+    // sharers commonly auto-append. Strip exactly one and re-validate;
+    // anything fancier (multiple slashes, intermediate slashes) still
+    // fails `is_valid_slug` below.
+    let nym = nym.strip_suffix('/').unwrap_or(nym);
     if !is_valid_slug(nym) {
         return render_404(&state, nym);
     }

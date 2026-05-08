@@ -129,8 +129,16 @@
             <div class="row">
                 <input id="amt" class="amount-input" type="number" step="any" min="0" inputmode="decimal" placeholder="0">
                 <select id="unit" class="currency-select">
-                    <option value="fiat">{{ display_currency }}</option>
+                    {# Crypto units. BTC and sat both produce sat-denominated invoices —
+                       JS converts BTC ×10^8 = sat. #}
                     <option value="sat">sat</option>
+                    <option value="btc">BTC</option>
+                    {# All fiat currencies the server supports. The merchant's
+                       display_currency is the default-selected option. Sender
+                       can override per-payment. #}
+                    {% for c in supported_currencies %}
+                        <option value="fiat:{{ c }}">{{ c }}</option>
+                    {% endfor %}
                 </select>
             </div>
             <button id="continue-btn" class="primary" type="button" disabled>Continue</button>
@@ -139,7 +147,7 @@
                 {% if minor_per_btc > 0 %}
                     1 BTC = {{ minor_per_btc }} {{ display_currency }} (minor){% if last_known_rate %} <span class="stale">(rate may be stale)</span>{% endif %}
                 {% else %}
-                    <span class="stale">rate unavailable — use sat denomination</span>
+                    <span class="stale">rate unavailable for {{ display_currency }} — sat or BTC still works</span>
                 {% endif %}
             </p>
         </div>
@@ -152,15 +160,29 @@
         // client-side throttling beyond the disabled-button guard.
         (function () {
             const NYM = "{{ nym }}";
-            const CURRENCY = "{{ display_currency }}";
-            const MINOR_PER_BTC = {{ minor_per_btc }};
-            const PRECISION = {{ precision }};
+            const DEFAULT_CURRENCY = "{{ display_currency }}";
             const SAT_PER_BTC = 100000000;
+            // Per-currency precision (minor units per major). Mirrors what
+            // the pricer reports for each supported currency.
+            const PRECISIONS = {
+                "USD": 2, "CAD": 2, "EUR": 2, "CRC": 2,
+                "MXN": 2, "ARS": 2, "COP": 0, "INR": 2
+            };
 
             const amt = document.getElementById('amt');
             const unit = document.getElementById('unit');
             const btn = document.getElementById('continue-btn');
             const err = document.getElementById('err');
+
+            // Default-select the merchant's display currency. If it's not
+            // in the dropdown for any reason, leave the first option (sat)
+            // as the default.
+            if (DEFAULT_CURRENCY) {
+                const target = `fiat:${DEFAULT_CURRENCY}`;
+                if ([...unit.options].some(o => o.value === target)) {
+                    unit.value = target;
+                }
+            }
 
             function valid() {
                 const v = parseFloat(amt.value);
@@ -178,17 +200,25 @@
                 btn.disabled = true;
                 err.textContent = '';
                 let body;
-                if (unit.value === 'sat') {
-                    body = { amount_sat: Math.round(parseFloat(amt.value)) };
-                } else {
-                    // Fiat path: convert to minor units (e.g. dollars -> cents).
-                    const minor = Math.round(
-                        parseFloat(amt.value) * Math.pow(10, PRECISION)
-                    );
+                const v = parseFloat(amt.value);
+                const u = unit.value;
+                if (u === 'sat') {
+                    body = { amount_sat: Math.round(v) };
+                } else if (u === 'btc') {
+                    // BTC → sat. Round to whole sat (no fractional sat).
+                    body = { amount_sat: Math.round(v * SAT_PER_BTC) };
+                } else if (u.startsWith('fiat:')) {
+                    const currency = u.slice(5);
+                    const precision = PRECISIONS[currency] ?? 2;
+                    const minor = Math.round(v * Math.pow(10, precision));
                     body = {
                         fiat_amount_minor: minor,
-                        fiat_currency: CURRENCY,
+                        fiat_currency: currency,
                     };
+                } else {
+                    err.textContent = 'unknown unit';
+                    btn.disabled = false;
+                    return;
                 }
                 try {
                     const res = await fetch(`/${NYM}/invoice`, {

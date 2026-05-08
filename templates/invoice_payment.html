@@ -161,11 +161,9 @@
                     Waiting for payment…
                 </div>
                 <div class="amount" id="amount-display">{{ amount_sat }} sat</div>
-                {% match fiat_currency %}
-                    {% when Some with (cur) %}
-                        <div class="meta">
-                            ≈ {{ fiat_amount_minor.unwrap_or(0) }} {{ cur }} (minor units, locked at create)
-                        </div>
+                {% match fiat_display %}
+                    {% when Some with (s) %}
+                        <div class="meta">≈ {{ s }} (locked at create)</div>
                     {% when None %}
                 {% endmatch %}
 
@@ -247,6 +245,9 @@
                 // Already terminal — no polling needed.
                 return;
             }
+            // is_fiat: true ⇒ rate refresh window applies; false (sat-denom)
+            // ⇒ never refreshes, only the outer expires_at countdown.
+            const IS_FIAT = {{ is_fiat }};
 
             const statusLine = document.getElementById('status-line');
             const amountDisplay = document.getElementById('amount-display');
@@ -372,7 +373,10 @@
                 if (TERMINAL_STATUSES.has(root.dataset.status)) return;
                 if (currentRateStale) {
                     countdown.innerHTML = '<span class="stale">rate may be stale</span>';
-                } else if (currentRateLocksUntilUnix > 0) {
+                } else if (IS_FIAT && currentRateLocksUntilUnix > 0) {
+                    // Fiat-denominated only: show rate-refresh countdown.
+                    // Sat-denominated invoices don't have a rate to refresh,
+                    // so we fall through to the outer expires countdown.
                     countdown.textContent = formatCountdown(
                         currentRateLocksUntilUnix,
                         'rate refreshes'

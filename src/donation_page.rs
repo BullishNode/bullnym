@@ -43,7 +43,7 @@ const MAX_DESCRIPTION_LEN: usize = 280;
 const MAX_SOCIAL_LINK_LEN: usize = 200;
 const MAX_SOCIAL_HANDLE_LEN: usize = 50;
 
-const SUPPORTED_CURRENCIES: &[&str] =
+pub const SUPPORTED_CURRENCIES: &[&str] =
     &["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"];
 
 static TWITTER_HANDLE_REGEX: LazyLock<Regex> =

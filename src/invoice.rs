@@ -411,8 +411,37 @@ struct InvoicePaymentTpl<'a> {
     domain: &'a str,
     status: &'a str,
     amount_sat: i64,
-    fiat_amount_minor: Option<i32>,
-    fiat_currency: Option<&'a str>,
+    /// Pre-formatted "<major-amount> <currency>" string for the meta
+    /// line, so the template doesn't have to do per-currency precision
+    /// arithmetic. None for sat-denominated invoices.
+    fiat_display: Option<String>,
+    /// True if the invoice is fiat-denominated (rate_minor_per_btc set).
+    /// Used by the JS countdown to decide whether to show "rate refreshes
+    /// in X" (fiat) or only "expires in X" (sat — never refreshes).
+    is_fiat: bool,
+}
+
+/// Per-currency precision (minor units per major). Mirrors what the
+/// pricer reports for each supported currency. Centralized here so
+/// every fiat-rendering callsite uses the same conversion.
+fn currency_precision(currency: &str) -> u8 {
+    match currency {
+        "COP" => 0,
+        // USD/CAD/EUR/CRC/MXN/ARS/INR all 2-decimal.
+        _ => 2,
+    }
+}
+
+fn format_fiat_major(minor: i32, currency: &str) -> String {
+    let p = currency_precision(currency);
+    if p == 0 {
+        format!("{minor} {currency}")
+    } else {
+        let divisor = 10i64.pow(p as u32);
+        let major = minor as i64 / divisor;
+        let frac = (minor as i64 % divisor).unsigned_abs();
+        format!("{major}.{frac:0>width$} {currency}", width = p as usize)
+    }
 }
 
 pub async fn render_payment(
@@ -429,14 +458,19 @@ pub async fn render_payment(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
+    let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
+        (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
+        _ => None,
+    };
+    let is_fiat = inv.rate_minor_per_btc.is_some();
     let tpl = InvoicePaymentTpl {
         nym: &inv.nym,
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
         amount_sat: inv.amount_sat,
-        fiat_amount_minor: inv.fiat_amount_minor,
-        fiat_currency: inv.fiat_currency.as_deref(),
+        fiat_display,
+        is_fiat,
     };
     let html = tpl
         .render()
