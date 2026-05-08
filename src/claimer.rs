@@ -973,7 +973,14 @@ pub fn spawn_background_claimer(
 ) {
     tokio::spawn(async move {
         let mut first_run = true;
+        // Heartbeat counter. Log liveness every N ticks so "is the
+        // background claimer running?" is a grep-able question, not a
+        // process-tree archaeology one. At 30s/tick × 10 ticks, that's
+        // every 5 minutes — same cadence as the rate-limit GC.
+        const HEARTBEAT_EVERY_N_TICKS: u32 = 10;
+        let mut tick_count: u32 = 0;
         loop {
+            tick_count = tick_count.wrapping_add(1);
             #[allow(deprecated)]
             let ready = match db::get_unclaimed_swaps(&pool).await {
                 Ok(swaps) => swaps,
@@ -1032,6 +1039,16 @@ pub fn spawn_background_claimer(
                 }
             } else if first_run {
                 tracing::info!("background claimer: no unclaimed swaps found");
+            }
+
+            if tick_count % HEARTBEAT_EVERY_N_TICKS == 0 {
+                tracing::info!(
+                    target: "claimer",
+                    event = "claimer_heartbeat",
+                    tick = tick_count,
+                    ready_count = ready.len(),
+                    "background claimer heartbeat"
+                );
             }
 
             first_run = false;
