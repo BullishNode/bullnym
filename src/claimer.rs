@@ -981,8 +981,7 @@ pub fn spawn_background_claimer(
         let mut tick_count: u32 = 0;
         loop {
             tick_count = tick_count.wrapping_add(1);
-            #[allow(deprecated)]
-            let ready = match db::get_unclaimed_swaps(&pool).await {
+            let ready = match db::get_ready_to_claim_swaps(&pool).await {
                 Ok(swaps) => swaps,
                 Err(e) => {
                     tracing::error!("background claimer: db query failed: {e}");

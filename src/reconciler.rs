@@ -51,7 +51,7 @@ pub fn spawn(
                     return;
                 }
                 _ = tick.tick() => {
-                    if let Err(e) = run_one_tick(&pool, &client, &config).await {
+                    if let Err(e) = run_one_tick(&pool, &client, &config, &cancel).await {
                         tracing::error!("reconciler tick failed: {e}");
                     }
                 }
@@ -64,6 +64,7 @@ async fn run_one_tick(
     pool: &PgPool,
     client: &BoltzApiClientV2,
     config: &ReconcilerConfig,
+    cancel: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
     let stale = db::list_non_terminal_swaps_oldest_first(
         pool,
@@ -80,6 +81,13 @@ async fn run_one_tick(
     tracing::info!("reconciler: scanning {} stale swap(s)", stale.len());
 
     for swap in &stale {
+        // Cooperative cancellation: at default config a single tick can
+        // take ~50s (200 swaps × 250ms each); without this, SIGTERM has
+        // to wait for the tick to complete. Bail mid-loop on cancel.
+        if cancel.is_cancelled() {
+            tracing::info!("reconciler: cancellation requested mid-tick; exiting early");
+            break;
+        }
         // Defensive throttle. With max_per_tick=200 and 50ms delay,
         // peak Boltz API RPM is ~133 — well below any reasonable rate
         // limit. Yields between calls to keep the runtime responsive.
