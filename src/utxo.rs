@@ -122,6 +122,28 @@ pub trait UtxoBackend: Send + Sync {
     /// on the Liquid network. Used by the chain_watcher to detect payments
     /// landing at a nym's next-unused address. (added by chain_watcher)
     async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
+
+    /// Does a transaction with this txid exist on the Liquid network
+    /// (in mempool or confirmed)?
+    ///
+    /// Used by the claim path's post-broadcast probe: when
+    /// `try_broadcast_tx` returns an error that isn't "already in utxo
+    /// set" (e.g. a timeout or `txn-already-known` worded slightly
+    /// differently), we probe Electrum to see if our tx is actually
+    /// on the network. If it is, the broadcast was effectively
+    /// successful and we mark `Claimed` instead of recording a
+    /// failure.
+    ///
+    /// Default impl: try `get_raw_tx`, treat `UtxoNotFound` as "doesn't
+    /// exist". Other errors propagate so a transient Electrum hiccup
+    /// doesn't cause us to incorrectly conclude the tx isn't there.
+    async fn tx_exists(&self, txid_hex: &str) -> Result<bool, AppError> {
+        match self.get_raw_tx(txid_hex).await {
+            Ok(_) => Ok(true),
+            Err(AppError::UtxoNotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Cached raw-tx wrapper around a blocking electrum-client.

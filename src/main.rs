@@ -139,7 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
-    claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
+    claimer::spawn_background_claimer(
+        pool.clone(),
+        config.clone(),
+        state.utxo_backend.clone(),
+        cancel.clone(),
+    );
 
     // Reconciler: polls boltz_api.get_swap for every non-terminal swap
     // older than `min_age_secs` and patches our DB to match Boltz's

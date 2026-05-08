@@ -24,6 +24,7 @@ use crate::db::{self, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::utxo::UtxoBackend;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -219,6 +220,7 @@ async fn dispatch_webhook(
                 &state.config.boltz.electrum_url,
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
+                state.utxo_backend.as_ref(),
             )
             .await;
         }
@@ -339,8 +341,18 @@ async fn try_claim_with_retry(
     electrum_url: &str,
     boltz_url: &str,
     max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
 ) {
-    match claim_swap(pool, swap.id, electrum_url, boltz_url, max_claim_attempts).await {
+    match claim_swap(
+        pool,
+        swap.id,
+        electrum_url,
+        boltz_url,
+        max_claim_attempts,
+        utxo_backend,
+    )
+    .await
+    {
         Ok(ClaimOutcome::Broadcast) => {}
         Ok(ClaimOutcome::AlreadyTerminal) => {}
         Ok(ClaimOutcome::SkippedLockHeld) => {
@@ -486,12 +498,13 @@ async fn claim_swap(
     electrum_url: &str,
     boltz_url: &str,
     max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
 ) -> Result<ClaimOutcome, AppError> {
     // Outer wrapper: records every Err uniformly via
     // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
     // are Ok variants and do NOT count as failures (no attempt was
     // really made).
-    let result = claim_swap_inner(pool, swap_id, electrum_url, boltz_url).await;
+    let result = claim_swap_inner(pool, swap_id, electrum_url, boltz_url, utxo_backend).await;
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
@@ -534,6 +547,7 @@ async fn claim_swap_inner(
     swap_id: Uuid,
     electrum_url: &str,
     boltz_url: &str,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
 ) -> Result<ClaimOutcome, AppError> {
     // ----- Phase 1: acquire single-flight, prepare the claim tx.
     let mut tx = pool
@@ -671,12 +685,61 @@ async fn claim_swap_inner(
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
-    chain_client
-        .try_broadcast_tx(&claim_tx)
-        .await
-        .map_err(|e| AppError::ClaimError(format!("broadcast failed: {e}")))?;
-
     let txid = btc_like_txid(&claim_tx);
+
+    if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
+        // `try_broadcast_tx` only swallows `"already in block chain"` /
+        // `"already in utxo set"` (boltz-rust wrappers.rs:199-212). Other
+        // mempool-acceptance phrasings vary by node implementation
+        // (`"txn-already-known"`, `"transaction already in block chain"`,
+        // timeouts after a successful write, etc.) and bubble as Err.
+        //
+        // Probe the multi-URL utxo backend for the txid before we
+        // declare failure — if the tx is on the network, the broadcast
+        // was effectively successful and we should mark Claimed instead
+        // of feeding the failure to the backoff schedule.
+        if let Some(backend) = utxo_backend {
+            match backend.tx_exists(&txid).await {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "claim_broadcast_probe_recovered",
+                        swap_id = %swap.boltz_swap_id,
+                        txid = %txid,
+                        broadcast_error = %broadcast_err,
+                        "broadcast errored but tx is on chain; treating as success"
+                    );
+                    // fall through to Phase 3
+                }
+                Ok(false) => {
+                    return Err(AppError::ClaimError(format!(
+                        "broadcast failed: {broadcast_err}"
+                    )));
+                }
+                Err(probe_err) => {
+                    // Probe itself failed (Electrum hiccup). Conservatively
+                    // assume the tx isn't on chain and propagate the
+                    // original broadcast error so the wrapper records a
+                    // failure and we retry on backoff. Log the probe error
+                    // for diagnosis.
+                    tracing::warn!(
+                        "tx_exists probe failed for {}: {probe_err}; \
+                         treating broadcast as failed",
+                        swap.boltz_swap_id
+                    );
+                    return Err(AppError::ClaimError(format!(
+                        "broadcast failed: {broadcast_err}"
+                    )));
+                }
+            }
+        } else {
+            // No utxo backend configured (dev/test). Honor the broadcast
+            // error verbatim.
+            return Err(AppError::ClaimError(format!(
+                "broadcast failed: {broadcast_err}"
+            )));
+        }
+    }
+
     tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid);
 
     // ----- Phase 3: mark Claimed + clear retry bookkeeping.
@@ -905,6 +968,7 @@ mod tests {
 pub fn spawn_background_claimer(
     pool: sqlx::PgPool,
     config: Arc<Config>,
+    utxo_backend: Option<Arc<dyn UtxoBackend>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -936,6 +1000,7 @@ pub fn spawn_background_claimer(
                         &config.boltz.electrum_url,
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
+                        utxo_backend.as_ref(),
                     )
                     .await
                     {
