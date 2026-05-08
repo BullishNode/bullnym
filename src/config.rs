@@ -8,6 +8,10 @@ pub struct Config {
     pub pool_size: u32,
     pub boltz: BoltzConfig,
     #[serde(default)]
+    pub pricer: PricerConfig,
+    #[serde(default)]
+    pub donation: DonationConfig,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub proof: ProofConfig,
@@ -432,6 +436,65 @@ pub struct RateLimitConfig {
     pub lightning_per_source_limit: u32,
     #[serde(default = "default_lightning_per_source_window_secs")]
     pub lightning_per_source_window_secs: u32,
+
+    // --- Donation page (Phase 2) ---
+    /// Per-source rate-limit on `GET /<nym>` donation-page HTML renders.
+    /// Public, browser-facing, no auth — bounds volumetric scraping. 0
+    /// disables the check.
+    #[serde(default = "default_donation_html_rate_limit")]
+    pub donation_html_rate_limit: u32,
+    #[serde(default = "default_donation_html_rate_window_secs")]
+    pub donation_html_rate_window_secs: u32,
+
+    // --- Donation page image upload (Phase 3) ---
+    /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
+    /// because a real user uploads avatar + OG once per session, not
+    /// many times per hour.
+    #[serde(default = "default_donation_image_uploads_per_npub_per_hour")]
+    pub donation_image_uploads_per_npub_per_hour: u32,
+    /// Per-source upload rate-limit. Defense-in-depth against IP-rotated
+    /// abuse — stops one IP from uploading to many npubs in quick
+    /// succession.
+    #[serde(default = "default_donation_image_uploads_per_source_per_min")]
+    pub donation_image_uploads_per_source_per_min: u32,
+
+    // --- Donation page callback (Phase 4) ---
+    /// Per-source rate-limit on `GET /lnurlp/donate-callback/<nym>`.
+    /// Loose — covers refresh-driven retries and accidental double-clicks.
+    #[serde(default = "default_donation_callback_per_source_per_min")]
+    pub donation_callback_per_source_per_min: u32,
+    /// Per-source cap on FRESH Liquid address allocations (the MISS path
+    /// of `lookup_or_allocate_donation_address`). Cookie HITs don't count
+    /// — same browser refreshing the page doesn't burn slots.
+    #[serde(default = "default_distinct_donation_addresses_per_source_per_hour")]
+    pub distinct_donation_addresses_per_source_per_hour: u32,
+    /// Per-source rate-limit on the donation-status poll endpoint. The
+    /// page polls every ~3s, so 60/min comfortably covers a normal
+    /// session while bounding scrape-style abuse.
+    #[serde(default = "default_donation_status_per_source_per_min")]
+    pub donation_status_per_source_per_min: u32,
+    /// TTL for `donation_allocations` rows. Bindings older than this are
+    /// pruned by `gc::prune_donation_allocations`. The `lookup_or_allocate`
+    /// hit-path also requires `last_used_at > NOW() - ttl`, so an
+    /// allocation that hasn't been touched within the window is treated
+    /// as a miss (regardless of whether the GC has run yet).
+    #[serde(default = "default_donation_allocation_ttl_days")]
+    pub donation_allocation_ttl_days: u32,
+
+    // --- Invoices (Phase B step 8) ---
+    /// Per-source rate-limit on anonymous `POST /<nym>/invoice`. Tighter
+    /// than `donation_callback_per_source_per_min` (30/min) because each
+    /// invoice creation is a real DB write + an eager Boltz reverse-swap
+    /// allocation; refresh-driven retries should land on the existing
+    /// invoice URL, not create new invoices. 0 disables the check.
+    #[serde(default = "default_invoice_create_per_source_per_min")]
+    pub invoice_create_per_source_per_min: u32,
+    /// Per-npub rate-limit on signed `POST /api/v1/<nym>/invoices`.
+    /// Bounds runaway wallet-origin invoice creation (e.g., a stolen
+    /// mobile credential). 100/h matches a heavy daily merchant
+    /// without blocking a legitimate burst. 0 disables the check.
+    #[serde(default = "default_invoice_create_per_npub_per_hour")]
+    pub invoice_create_per_npub_per_hour: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -480,6 +543,23 @@ impl Default for RateLimitConfig {
             lightning_per_source_limit: default_lightning_per_source_limit(),
             lightning_per_source_window_secs:
                 default_lightning_per_source_window_secs(),
+            donation_html_rate_limit: default_donation_html_rate_limit(),
+            donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
+            donation_image_uploads_per_npub_per_hour:
+                default_donation_image_uploads_per_npub_per_hour(),
+            donation_image_uploads_per_source_per_min:
+                default_donation_image_uploads_per_source_per_min(),
+            donation_callback_per_source_per_min:
+                default_donation_callback_per_source_per_min(),
+            distinct_donation_addresses_per_source_per_hour:
+                default_distinct_donation_addresses_per_source_per_hour(),
+            donation_status_per_source_per_min:
+                default_donation_status_per_source_per_min(),
+            donation_allocation_ttl_days: default_donation_allocation_ttl_days(),
+            invoice_create_per_source_per_min:
+                default_invoice_create_per_source_per_min(),
+            invoice_create_per_npub_per_hour:
+                default_invoice_create_per_npub_per_hour(),
         }
     }
 }
@@ -550,6 +630,38 @@ fn default_webhook_rate_window_secs() -> u32 { 60 }
 /// backwards-compat with deployed configs.)
 fn default_lightning_per_source_limit() -> u32 { 30 }
 fn default_lightning_per_source_window_secs() -> u32 { 3600 }
+/// 60/min: comfortable for a viral page being reloaded by many donators
+/// on the same NAT, while still bounding volumetric scraping. Per-source
+/// keying uses `source_key()` (IPv6 /56 aggregation).
+fn default_donation_html_rate_limit() -> u32 { 60 }
+fn default_donation_html_rate_window_secs() -> u32 { 60 }
+/// 6/h per npub: a real user uploads avatar + OG once per setup; six is
+/// generous headroom for retries and accidental re-uploads.
+fn default_donation_image_uploads_per_npub_per_hour() -> u32 { 6 }
+/// 3/min per source: defense-in-depth against IP-rotated abuse.
+fn default_donation_image_uploads_per_source_per_min() -> u32 { 3 }
+/// 30/min: loose enough that refresh-driven retries don't trip; tight
+/// enough that breadth scanning across nyms hits the per-source-distinct
+/// gate first.
+fn default_donation_callback_per_source_per_min() -> u32 { 30 }
+/// 3 fresh Liquid donation addresses per source per hour. Same shape as
+/// the LUD-22 `distinct_nyms_per_outpoint` cap.
+fn default_distinct_donation_addresses_per_source_per_hour() -> u32 { 3 }
+/// 60/min: page polls every ~3s during a session; comfortably covers
+/// normal use while bounding scrape-style abuse.
+fn default_donation_status_per_source_per_min() -> u32 { 60 }
+/// 30 days: matches the `bullpay_did` cookie expiry. After this, the
+/// cookie may still exist client-side but the binding is gone — donator
+/// gets a fresh address.
+fn default_donation_allocation_ttl_days() -> u32 { 30 }
+/// 5/min per source: anonymous invoice creation is a write+swap-alloc.
+/// Refresh hits the same invoice URL; new amounts mean new invoices,
+/// which 5 per minute comfortably covers an indecisive sender.
+fn default_invoice_create_per_source_per_min() -> u32 { 5 }
+/// 100/h per npub: signed wallet-origin invoice creation. Real-world
+/// merchant volume is well under this; the cap bounds abuse via a
+/// stolen mobile credential without throttling legitimate use.
+fn default_invoice_create_per_npub_per_hour() -> u32 { 100 }
 
 // --- Electrum / tx cache config ---
 

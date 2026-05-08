@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+{# Phase B step 9: invoice payment view. Renders the initial state from
+   the server-side `Invoice` row and lets the client JS poll
+   `/api/v1/invoices/<id>/status` to drive transitions. All six statuses
+   are handled (unpaid / paid / underpaid / overpaid / expired / cancelled).
+   Askama auto-escapes every `{{ }}` interpolation; `|safe` is forbidden
+   on user-controlled fields. #}
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice · {{ domain }}</title>
+
+    {# CSP: same-origin only, plus liquid.network WSS for 0-conf push.
+       No external scripts/fonts/images. #}
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; img-src 'self' data:;
+                   style-src 'self' 'unsafe-inline';
+                   script-src 'self' 'unsafe-inline';
+                   connect-src 'self' wss://liquid.network">
+
+    <style>
+        :root {
+            --bg: #0E0E0E;
+            --fg: #F5F5F5;
+            --accent: #F7931A;
+            --muted: #888;
+            --card: #1A1A1A;
+            --border: #2A2A2A;
+            --success: #4caf50;
+            --warn: #c97;
+            --error: #e57373;
+        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            line-height: 1.5;
+        }
+        main { max-width: 480px; margin: 0 auto; padding: 16px; }
+        h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
+        .nym { color: var(--muted); font-size: 13px; }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 12px;
+        }
+        .status-line {
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        .status-unpaid { color: var(--accent); }
+        .status-paid { color: var(--success); }
+        .status-warn { color: var(--warn); }
+        .status-err { color: var(--error); }
+        .amount {
+            font-size: 24px;
+            font-weight: 600;
+            text-align: center;
+            margin: 12px 0;
+        }
+        .qr-wrap {
+            text-align: center;
+            margin: 16px 0;
+            padding: 12px;
+            background: #fff;
+            border-radius: 8px;
+        }
+        .qr-wrap img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+        .qr-placeholder {
+            min-height: 240px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--muted);
+            font-size: 13px;
+        }
+        .rail-toggle {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .rail-toggle button {
+            flex: 1;
+            padding: 10px;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--fg);
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        .rail-toggle button.active {
+            background: var(--accent);
+            color: #000;
+            border-color: var(--accent);
+        }
+        .copy-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .copy-row code {
+            flex: 1;
+            background: #0A0A0A;
+            border: 1px solid var(--border);
+            padding: 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            word-break: break-all;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+        }
+        .copy-row button {
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--fg);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .countdown {
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+            margin-top: 8px;
+        }
+        .stale { color: var(--warn); }
+        .terminal-block {
+            text-align: center;
+            padding: 20px 0;
+        }
+        .terminal-icon {
+            font-size: 36px;
+            margin-bottom: 12px;
+        }
+        .meta {
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 12px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>Pay <span class="nym">{{ nym }}</span></h1>
+
+        <div class="card" id="root" data-status="{{ status }}">
+            {# Initial server-render branches. JS replaces this on status
+               transitions; for the unpaid case the JS also drives QR/rail
+               toggle. For terminal cases, JS polling continues briefly to
+               capture late settlements but mostly just confirms state. #}
+            {% if status == "unpaid" %}
+                <div class="status-line status-unpaid" id="status-line">
+                    Waiting for payment…
+                </div>
+                <div class="amount" id="amount-display">{{ amount_sat }} sat</div>
+                {% match fiat_currency %}
+                    {% when Some with (cur) %}
+                        <div class="meta">
+                            ≈ {{ fiat_amount_minor.unwrap_or(0) }} {{ cur }} (minor units, locked at create)
+                        </div>
+                    {% when None %}
+                {% endmatch %}
+
+                <div class="rail-toggle">
+                    <button id="rail-lightning" class="active" type="button">Lightning</button>
+                    <button id="rail-liquid" type="button">Liquid</button>
+                </div>
+
+                <div class="qr-wrap" id="qr-wrap">
+                    <div class="qr-placeholder">Loading offer…</div>
+                </div>
+
+                <div class="copy-row">
+                    <code id="payload-text">—</code>
+                    <button id="copy-btn" type="button">Copy</button>
+                </div>
+
+                <div class="countdown" id="countdown">…</div>
+            {% else if status == "paid" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-paid">✓</div>
+                    <div class="status-line status-paid">Paid</div>
+                    <div class="amount">{{ amount_sat }} sat</div>
+                </div>
+            {% else if status == "underpaid" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Underpaid</div>
+                    <div class="amount">
+                        Expected {{ amount_sat }} sat
+                    </div>
+                </div>
+            {% else if status == "overpaid" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Overpaid</div>
+                    <div class="amount">
+                        Expected {{ amount_sat }} sat
+                    </div>
+                </div>
+            {% else if status == "expired" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-err">×</div>
+                    <div class="status-line status-err">Expired</div>
+                    <div class="meta">This invoice expired without payment.</div>
+                </div>
+            {% else if status == "cancelled" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-err">×</div>
+                    <div class="status-line status-err">Cancelled</div>
+                    <div class="meta">The recipient cancelled this invoice.</div>
+                </div>
+            {% else %}
+                <div class="status-line">{{ status }}</div>
+            {% endif %}
+        </div>
+    </main>
+
+    <script>
+        // Phase B step 9: invoice payment view JS.
+        //
+        // Single state machine driven by polling /api/v1/invoices/<id>/status
+        // every 3s. The page re-renders on status changes, fetches the
+        // appropriate offer (Lightning eagerly via the /lightning endpoint,
+        // Liquid lazily on rail toggle via /liquid), and stops polling when
+        // the invoice reaches a terminal status.
+        (function () {
+            const INVOICE_ID = "{{ invoice_id }}";
+            const NYM = "{{ nym }}";
+            const SAT_PER_BTC = 100_000_000;
+            const POLL_INTERVAL_MS = 3000;
+            const TERMINAL_STATUSES = new Set([
+                "paid", "underpaid", "overpaid", "expired", "cancelled"
+            ]);
+
+            const root = document.getElementById('root');
+            const initialStatus = root.dataset.status;
+            if (TERMINAL_STATUSES.has(initialStatus)) {
+                // Already terminal — no polling needed.
+                return;
+            }
+
+            const statusLine = document.getElementById('status-line');
+            const amountDisplay = document.getElementById('amount-display');
+            const railLightning = document.getElementById('rail-lightning');
+            const railLiquid = document.getElementById('rail-liquid');
+            const qrWrap = document.getElementById('qr-wrap');
+            const payloadText = document.getElementById('payload-text');
+            const copyBtn = document.getElementById('copy-btn');
+            const countdown = document.getElementById('countdown');
+
+            let currentRail = 'lightning';
+            let currentLightningPr = null;
+            let currentLiquidAddress = null;
+            let currentAmountSat = {{ amount_sat }};
+            let currentRateLocksUntilUnix = 0;
+            let currentExpiresAtUnix = 0;
+            let currentRateStale = false;
+
+            function bip21Uri(address, amountSat) {
+                const btc = (amountSat / SAT_PER_BTC).toFixed(8);
+                return `liquidnetwork:${address}?amount=${btc}`;
+            }
+
+            function setQrPayload(text) {
+                payloadText.textContent = text;
+                qrWrap.innerHTML = '';
+                const img = document.createElement('img');
+                img.src = `/qr.svg?data=${encodeURIComponent(text)}`;
+                img.alt = 'payment QR';
+                qrWrap.appendChild(img);
+            }
+
+            function clearQr(message) {
+                payloadText.textContent = '—';
+                qrWrap.innerHTML = `<div class="qr-placeholder">${message}</div>`;
+            }
+
+            function setRail(rail) {
+                currentRail = rail;
+                if (rail === 'lightning') {
+                    railLightning.classList.add('active');
+                    railLiquid.classList.remove('active');
+                    if (currentLightningPr) {
+                        setQrPayload(currentLightningPr);
+                    } else {
+                        clearQr('Loading Lightning offer…');
+                        fetchLightning();
+                    }
+                } else {
+                    railLightning.classList.remove('active');
+                    railLiquid.classList.add('active');
+                    if (currentLiquidAddress) {
+                        setQrPayload(bip21Uri(currentLiquidAddress, currentAmountSat));
+                    } else {
+                        clearQr('Loading Liquid address…');
+                        fetchLiquid();
+                    }
+                }
+            }
+
+            async function fetchLightning() {
+                try {
+                    const res = await fetch(
+                        `/api/v1/invoices/${INVOICE_ID}/lightning`,
+                        { method: 'POST' }
+                    );
+                    const data = await res.json();
+                    if (data.pr) {
+                        currentLightningPr = data.pr;
+                        if (currentRail === 'lightning') {
+                            setQrPayload(currentLightningPr);
+                        }
+                    } else {
+                        clearQr('Lightning offer unavailable');
+                    }
+                } catch (e) {
+                    clearQr('Lightning offer unavailable');
+                }
+            }
+
+            async function fetchLiquid() {
+                try {
+                    const res = await fetch(
+                        `/api/v1/invoices/${INVOICE_ID}/liquid`,
+                        { method: 'POST' }
+                    );
+                    const data = await res.json();
+                    if (data.address) {
+                        currentLiquidAddress = data.address;
+                        if (currentRail === 'liquid') {
+                            setQrPayload(bip21Uri(data.address, currentAmountSat));
+                        }
+                    } else {
+                        clearQr('Liquid offer unavailable');
+                    }
+                } catch (e) {
+                    clearQr('Liquid offer unavailable');
+                }
+            }
+
+            railLightning.addEventListener('click', () => setRail('lightning'));
+            railLiquid.addEventListener('click', () => setRail('liquid'));
+            copyBtn.addEventListener('click', async () => {
+                const text = payloadText.textContent;
+                if (!text || text === '—') return;
+                try {
+                    await navigator.clipboard.writeText(text);
+                    copyBtn.textContent = 'Copied';
+                    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+                } catch (_) {}
+            });
+
+            function formatCountdown(targetUnix, label) {
+                const now = Math.floor(Date.now() / 1000);
+                const remaining = targetUnix - now;
+                if (remaining <= 0) return `${label} elapsed`;
+                const m = Math.floor(remaining / 60);
+                const s = remaining % 60;
+                return `${label} in ${m}:${String(s).padStart(2, '0')}`;
+            }
+
+            function refreshCountdown() {
+                if (TERMINAL_STATUSES.has(root.dataset.status)) return;
+                if (currentRateStale) {
+                    countdown.innerHTML = '<span class="stale">rate may be stale</span>';
+                } else if (currentRateLocksUntilUnix > 0) {
+                    countdown.textContent = formatCountdown(
+                        currentRateLocksUntilUnix,
+                        'rate refreshes'
+                    );
+                } else if (currentExpiresAtUnix > 0) {
+                    countdown.textContent = formatCountdown(
+                        currentExpiresAtUnix,
+                        'expires'
+                    );
+                }
+            }
+
+            function renderTerminalView(status, paidAmountSat, paidVia) {
+                root.dataset.status = status;
+                let icon = '';
+                let cls = '';
+                let title = '';
+                let detail = '';
+                if (status === 'paid') {
+                    icon = '✓'; cls = 'status-paid';
+                    title = 'Paid';
+                    detail = `${paidAmountSat || currentAmountSat} sat${paidVia ? ' via ' + paidVia : ''}`;
+                } else if (status === 'underpaid') {
+                    icon = '!'; cls = 'status-warn';
+                    title = 'Underpaid';
+                    detail = `Expected ${currentAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
+                } else if (status === 'overpaid') {
+                    icon = '!'; cls = 'status-warn';
+                    title = 'Overpaid';
+                    detail = `Expected ${currentAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
+                } else if (status === 'expired') {
+                    icon = '×'; cls = 'status-err';
+                    title = 'Expired';
+                    detail = 'This invoice expired without payment.';
+                } else if (status === 'cancelled') {
+                    icon = '×'; cls = 'status-err';
+                    title = 'Cancelled';
+                    detail = 'The recipient cancelled this invoice.';
+                }
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon ${cls}">${icon}</div>
+                        <div class="status-line ${cls}">${title}</div>
+                        <div class="meta">${detail}</div>
+                    </div>
+                `;
+            }
+
+            async function pollStatus() {
+                try {
+                    const res = await fetch(
+                        `/api/v1/invoices/${INVOICE_ID}/status`
+                    );
+                    const data = await res.json();
+                    if (data.status === 'ERROR') return;
+
+                    currentAmountSat = data.amount_sat;
+                    currentRateLocksUntilUnix = data.rate_locks_until_unix || 0;
+                    currentExpiresAtUnix = data.expires_at_unix || 0;
+                    currentRateStale = !!data.rate_stale;
+                    if (data.lightning_pr && data.lightning_pr !== currentLightningPr) {
+                        currentLightningPr = data.lightning_pr;
+                        if (currentRail === 'lightning') {
+                            setQrPayload(currentLightningPr);
+                        }
+                    }
+                    if (data.liquid_address && data.liquid_address !== currentLiquidAddress) {
+                        currentLiquidAddress = data.liquid_address;
+                        if (currentRail === 'liquid') {
+                            setQrPayload(bip21Uri(data.liquid_address, currentAmountSat));
+                        }
+                    }
+                    if (amountDisplay) {
+                        amountDisplay.textContent = `${currentAmountSat} sat`;
+                    }
+
+                    if (TERMINAL_STATUSES.has(data.status)) {
+                        renderTerminalView(
+                            data.status,
+                            data.paid_amount_sat,
+                            data.paid_via
+                        );
+                    }
+                } catch (e) {
+                    // Network blip — keep polling.
+                }
+            }
+
+            // Initial Lightning fetch (eager) on first paint.
+            fetchLightning();
+            // Polling cadence: every 3s while the invoice is non-terminal.
+            const pollTimer = setInterval(() => {
+                if (TERMINAL_STATUSES.has(root.dataset.status)) {
+                    clearInterval(pollTimer);
+                    return;
+                }
+                pollStatus();
+                refreshCountdown();
+            }, POLL_INTERVAL_MS);
+            refreshCountdown();
+        })();
+    </script>
+</body>
+</html>

@@ -309,6 +309,25 @@ async fn serve_lightning(
         }
     }
 
+    let (resp, _swap_id) = create_lightning_swap(state, nym, amount_sat).await?;
+    Ok(Json(resp).into_response())
+}
+
+/// Reusable Lightning-swap creation. Allocates a swap key, asks Boltz for
+/// a reverse swap, records the swap, returns the LNURL-pay response shape
+/// (with the BOLT11) plus the boltz swap id. Caller decides what to do
+/// with both — `serve_lightning` here just renders JSON; the donation
+/// callback in `donation_callback.rs` includes the swap_id so the page
+/// can poll `/lnurlp/donate-status` for the swap state.
+///
+/// Rate-limit is the caller's responsibility — different callers gate on
+/// different buckets (LNURL: `lightning_per_source`; donation callback:
+/// `donation_callback_per_source` + `lightning_per_source`).
+pub(crate) async fn create_lightning_swap(
+    state: &AppState,
+    nym: &str,
+    amount_sat: u64,
+) -> Result<(LightningResponse, String), AppError> {
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
@@ -340,6 +359,8 @@ async fn serve_lightning(
             preimage_hex: &preimage_hex,
             claim_key_hex: &claim_key_hex,
             boltz_response_json: &boltz_response_json,
+            // LNURL Lightning Address path is invoice-less by design.
+            invoice_id: None,
         },
     )
     .await
@@ -355,7 +376,7 @@ async fn serve_lightning(
         },
     };
     db::touch_user_callback(&state.db, nym).await;
-    Ok(Json(resp).into_response())
+    Ok((resp, result.swap_id))
 }
 
 pub async fn callback(

@@ -11,6 +11,30 @@ pub enum AppError {
     /// The submitted nym fails the format rules (`internal_reason` is for
     /// logging; the wire copy is fixed).
     NymInvalid(String),
+    /// Submitted nym matches a reserved server slug (e.g. "register",
+    /// "health"). Blocked at create time so `/<nym>` fallback can't shadow
+    /// explicit routes.
+    NymReserved,
+    /// Donation-page payload failed validation (length, range, format).
+    /// Inner string is operator-facing only; wire copy is a fixed message.
+    DonationPageInvalid(String),
+    /// No donation page exists for this nym (or it was archived and the
+    /// caller queried via a path that treats archived as gone).
+    DonationPageNotFound(String),
+    /// Invoice ID does not resolve, or the path's nym does not match the
+    /// invoice's owning nym. Same wire copy in both cases — never reveal
+    /// existence cross-nym.
+    InvoiceNotFound(String),
+    /// Image upload rejected (magic-byte sniff fail, decode error, etc.).
+    /// Inner string is operator-facing.
+    ImageInvalid(String),
+    /// Multipart form was malformed: missing required field, oversize text
+    /// field, etc. Distinct from `ImageInvalid` so the wire copy doesn't
+    /// blame the user's image when the form was actually wrong.
+    MultipartInvalid(String),
+    /// Decoded image dimensions exceeded `image_max_dimension`. Image-
+    /// bomb defense — the full pixel buffer was never allocated.
+    ImageDimensionsTooLarge { max: u32 },
     /// The caller's wallet already has an active address.
     KeyAlreadyRegistered { nym: String, domain: String },
     /// Wallet has registered the cap of lifetime nyms. Carries both `used`
@@ -95,6 +119,13 @@ impl AppError {
             Self::NymNotFound(_)
             | Self::NymTaken
             | Self::NymInvalid(_)
+            | Self::NymReserved
+            | Self::DonationPageInvalid(_)
+            | Self::DonationPageNotFound(_)
+            | Self::InvoiceNotFound(_)
+            | Self::ImageInvalid(_)
+            | Self::ImageDimensionsTooLarge { .. }
+            | Self::MultipartInvalid(_)
             | Self::KeyAlreadyRegistered { .. }
             | Self::NymQuotaExceeded { .. }
             | Self::InvalidDescriptor(_)
@@ -127,6 +158,13 @@ impl AppError {
             Self::NymNotFound(_) => "NymNotFound",
             Self::NymTaken => "NymTaken",
             Self::NymInvalid(_) => "NymInvalid",
+            Self::NymReserved => "NymReserved",
+            Self::DonationPageInvalid(_) => "DonationPageInvalid",
+            Self::DonationPageNotFound(_) => "DonationPageNotFound",
+            Self::InvoiceNotFound(_) => "InvoiceNotFound",
+            Self::ImageInvalid(_) => "ImageInvalid",
+            Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
+            Self::MultipartInvalid(_) => "MultipartInvalid",
             Self::KeyAlreadyRegistered { .. } => "KeyAlreadyRegistered",
             Self::NymQuotaExceeded { .. } => "NymQuotaExceeded",
             Self::InvalidDescriptor(_) => "InvalidDescriptor",
@@ -170,6 +208,15 @@ impl std::fmt::Display for AppError {
             Self::NymNotFound(nym) => write!(f, "nym not found: {nym}"),
             Self::NymTaken => write!(f, "nym already taken"),
             Self::NymInvalid(reason) => write!(f, "invalid nym: {reason}"),
+            Self::NymReserved => write!(f, "nym is reserved"),
+            Self::DonationPageInvalid(reason) => write!(f, "donation page invalid: {reason}"),
+            Self::DonationPageNotFound(nym) => write!(f, "no donation page for {nym}"),
+            Self::InvoiceNotFound(id) => write!(f, "invoice not found: {id}"),
+            Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
+            Self::ImageDimensionsTooLarge { max } => {
+                write!(f, "image dimensions exceed {max}px cap")
+            }
+            Self::MultipartInvalid(reason) => write!(f, "multipart invalid: {reason}"),
             Self::KeyAlreadyRegistered { nym, domain } => {
                 write!(f, "key already has active address: {nym}@{domain}")
             }
@@ -225,6 +272,15 @@ impl IntoResponse for AppError {
             AppError::NymNotFound(_) => "No Lightning Address is registered with this name.".into(),
             AppError::NymTaken => "This name is already registered.".into(),
             AppError::NymInvalid(_) => "This name contains characters that are not allowed. Names must be 3–32 characters: lowercase letters, numbers, and hyphens, with no leading or trailing hyphen.".into(),
+            AppError::NymReserved => "This name is reserved by the server. Choose a different name.".into(),
+            AppError::DonationPageInvalid(reason) => format!("Donation page rejected: {reason}."),
+            AppError::DonationPageNotFound(_) => "No donation page exists for this name.".into(),
+            AppError::InvoiceNotFound(_) => "Invoice not found.".into(),
+            AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
+            AppError::ImageDimensionsTooLarge { max } => format!(
+                "Image dimensions are too large. Maximum {max}×{max} pixels."
+            ),
+            AppError::MultipartInvalid(_) => "Upload form was malformed. Retry from the app.".into(),
             AppError::KeyAlreadyRegistered { nym, domain } => format!(
                 "This wallet already has an active Lightning Address: {nym}@{domain}. \
                  Deactivate it before registering a different name."

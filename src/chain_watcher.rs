@@ -144,6 +144,88 @@ async fn poll_nyms(
         if cancel.is_cancelled() {
             return Ok(());
         }
+
+        // Phase B replacement of the Phase 4 donation_allocations scan.
+        // Scan UNPAID invoice Liquid addresses first. The address-allocation
+        // race the donation_allocations scan was solving is identical
+        // for invoices: `allocate_invoice_liquid_address` bumps
+        // `users.next_addr_idx` past the just-allocated index, so the
+        // lookahead loop below would skip invoice addresses forever.
+        // We compensate by scanning invoices directly. Each row carries
+        // its own `liquid_address` (no re-derivation needed) and
+        // `amount_sat` (so `mark_invoice_paid` lands the right state
+        // without a second round-trip).
+        //
+        // Lenient policy: the chain watcher reports `paid_amount_sat ==
+        // amount_sat` (i.e. always 'paid', never 'underpaid'/'overpaid'
+        // via this path). Proper amount inspection (Liquid txout sum)
+        // arrives later; for v1 a single-conf tx at the address is
+        // treated as exact-amount payment. Lightning settlement (via
+        // claimer) carries the actual sat amount and DOES surface
+        // under/overpaid correctly.
+        let unpaid_invoices = match db::list_unpaid_invoice_liquid_addresses(pool, &n.nym).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "chain_watcher: list unpaid invoice liquid addrs for nym={} failed: {e}",
+                    n.nym
+                );
+                Vec::new()
+            }
+        };
+        for (invoice_id, addr_index, _address, amount_sat) in &unpaid_invoices {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if rate_limiter.check_electrum_watcher().await.is_err() {
+                break;
+            }
+            let idx = match u32::try_from(*addr_index) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let script = match derive_script_pubkey(&n.ct_descriptor, idx) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "chain_watcher: invoice derive failed for nym={} idx={}: {e}",
+                        n.nym,
+                        idx
+                    );
+                    continue;
+                }
+            };
+            match backend.has_history(&script).await {
+                Ok(true) => {
+                    let marked = db::mark_invoice_paid(
+                        pool,
+                        *invoice_id,
+                        *amount_sat,
+                        "liquid",
+                    )
+                    .await?;
+                    if marked > 0 {
+                        tracing::info!(
+                            event = "invoice_paid_observed",
+                            nym = %n.nym,
+                            invoice_id = %invoice_id,
+                            addr_index = idx,
+                            amount_sat = amount_sat,
+                            "chain_watcher: invoice Liquid address observed paid"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "chain_watcher: invoice has_history failed for nym={} idx={}: {e}",
+                        n.nym,
+                        idx
+                    );
+                }
+            }
+        }
+
         // Skip rows with negative or implausible indices defensively — DB
         // schema uses i32, but next_addr_idx is conceptually u32.
         let base_idx: u32 = match u32::try_from(n.next_addr_idx) {
@@ -201,6 +283,11 @@ async fn poll_nyms(
                     // legitimate busy nym.
                     let fulfilled =
                         db::mark_reservations_fulfilled_at_idx(pool, &n.nym, idx).await?;
+                    // Note: invoice Liquid addresses are caught earlier
+                    // by the dedicated unpaid-invoice scan above (their
+                    // index sits BEHIND `next_addr_idx` after allocation,
+                    // so this lookahead loop never sees them). No
+                    // invoice flip needed here.
                     tracing::info!(
                         "chain_watcher: observed payment at nym={} idx={} \
                          (advanced next_addr_idx, fulfilled {} reservation row(s))",

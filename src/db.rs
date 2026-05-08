@@ -393,6 +393,28 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
         .execute(&mut *tx)
         .await?;
 
+    // Auto-archive any donation page tied to this nym so the public URL
+    // stops accepting donations after the user purges. The page row stays
+    // (so old social-media links resolve cleanly to a "this donation
+    // page has been deleted" template) — same shape as user-initiated
+    // archive via DELETE /donation-page.
+    sqlx::query(
+        "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
+         WHERE nym = $1 AND archived_at IS NULL",
+    )
+    .bind(&user.nym)
+    .execute(&mut *tx)
+    .await?;
+
+    // Phase B: cookie-pinned donation_allocations is gone (migration 019).
+    // Invoice rows survive purge with `liquid_address` set, but they
+    // cascade-delete via `users(nym) ON DELETE CASCADE` — except purge
+    // doesn't DELETE the user row, just deactivates it. Invoices remain
+    // queryable by id, but their addresses are no longer derivable
+    // (descriptor wiped below). Acceptable: any in-flight invoice for a
+    // purged user becomes a graveyard row that the GC will eventually
+    // expire to 'expired' status.
+
     let purged = sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE, ct_descriptor = '', next_addr_idx = 0 \
          WHERE id = $1 \
@@ -439,6 +461,11 @@ pub struct NewSwapRecord<'a> {
     pub preimage_hex: &'a str,
     pub claim_key_hex: &'a str,
     pub boltz_response_json: &'a str,
+    /// Set when this swap is the Lightning offer for a specific invoice
+    /// (Phase B). The chain of rate refreshes inserts multiple swaps per
+    /// invoice; the claimer's invoice-flip hook (Phase B step 7) reads
+    /// this column to know which invoice to flip on settlement.
+    pub invoice_id: Option<Uuid>,
 }
 
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
@@ -446,8 +473,8 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
-          preimage_hex, claim_key_hex, boltz_response_json, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')",
+          preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10)",
     )
     .bind(swap.nym)
     .bind(swap.boltz_swap_id)
@@ -458,6 +485,7 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     .bind(swap.preimage_hex)
     .bind(swap.claim_key_hex)
     .bind(swap.boltz_response_json)
+    .bind(swap.invoice_id)
     .execute(&mut *tx)
     .await?;
     mark_user_used(&mut *tx, swap.nym).await?;
@@ -525,6 +553,11 @@ pub struct SwapRecord {
     /// or known refusal substrings). Future attempts skip cooperative and
     /// take the script path.
     pub cooperative_refused: bool,
+    /// Phase B: when this swap is the Lightning offer for an invoice, the
+    /// claimer's settlement hook reads this to flip the corresponding
+    /// invoice via `mark_invoice_paid`. NULL for LNURL Lightning Address
+    /// swaps and for legacy donation-page rows.
+    pub invoice_id: Option<Uuid>,
     // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
     // columns in the schema but intentionally NOT read into this struct.
     // Reading TIMESTAMPTZ requires the `time` or `chrono` sqlx feature
@@ -550,7 +583,7 @@ const SWAP_RECORD_COLUMNS: &str =
     "id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
      preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid, \
      claim_tx_hex, claim_path, claim_attempts, current_fee_rate, \
-     last_claim_error, cooperative_refused";
+     last_claim_error, cooperative_refused, invoice_id";
 
 pub async fn get_swap_by_boltz_id(
     pool: &PgPool,
@@ -748,6 +781,10 @@ pub struct ReconcilerSwap {
     pub claim_txid: Option<String>,
     pub nym: String,
     pub amount_sat: i64,
+    /// Phase B: when this swap is the Lightning offer for an invoice,
+    /// the reconciler's settlement hook flips the invoice via
+    /// `mark_invoice_paid` after a paid-equivalent CAS succeeds.
+    pub invoice_id: Option<Uuid>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
@@ -761,6 +798,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
             claim_txid: row.try_get("claim_txid")?,
             nym: row.try_get("nym")?,
             amount_sat: row.try_get("amount_sat")?,
+            invoice_id: row.try_get("invoice_id")?,
         })
     }
 }
@@ -778,7 +816,7 @@ pub async fn list_non_terminal_swaps_oldest_first(
 ) -> Result<Vec<ReconcilerSwap>, sqlx::Error> {
     sqlx::query_as::<_, ReconcilerSwap>(
         "SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-                nym, amount_sat \
+                nym, amount_sat, invoice_id \
          FROM swap_records \
          WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
            AND updated_at < NOW() - ($1 || ' seconds')::interval \
@@ -1239,6 +1277,830 @@ pub async fn mark_reservations_fulfilled_at_idx(
     Ok(result.rows_affected())
 }
 
+// =====================================================================
+// Donation pages (migration 016)
+// =====================================================================
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct DonationPage {
+    pub nym: String,
+    pub header: String,
+    pub description: String,
+    pub avatar_sha256: Option<String>,
+    pub og_sha256: Option<String>,
+    pub display_currency: String,
+    pub website: Option<String>,
+    pub twitter: Option<String>,
+    pub instagram: Option<String>,
+    pub enabled: bool,
+    /// Derived from `archived_at IS NOT NULL`. The full timestamp lives in
+    /// the column for audit but isn't read into Rust (would require the
+    /// chrono/time sqlx feature flag).
+    pub is_archived: bool,
+}
+
+pub struct UpsertDonationPage<'a> {
+    pub nym: &'a str,
+    pub header: &'a str,
+    pub description: &'a str,
+    pub display_currency: &'a str,
+    pub website: Option<&'a str>,
+    pub twitter: Option<&'a str>,
+    pub instagram: Option<&'a str>,
+    pub enabled: bool,
+}
+
+/// Insert-or-update a donation page row. Mobile sends the full v1 config on
+/// every save (PUT semantics). Update path clears `archived_at` so a re-save
+/// after archive un-archives — the row is already authenticated by Schnorr
+/// sig at the handler. Image hashes (`avatar_sha256`, `og_sha256`) are NOT
+/// touched here; they're owned by `POST /donation-page/image`.
+pub async fn upsert_donation_page(
+    pool: &PgPool,
+    page: &UpsertDonationPage<'_>,
+) -> Result<DonationPage, sqlx::Error> {
+    sqlx::query_as::<_, DonationPage>(
+        "INSERT INTO donation_pages \
+            (nym, header, description, display_currency, \
+             website, twitter, instagram, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (nym) DO UPDATE SET \
+             header = EXCLUDED.header, \
+             description = EXCLUDED.description, \
+             display_currency = EXCLUDED.display_currency, \
+             website = EXCLUDED.website, \
+             twitter = EXCLUDED.twitter, \
+             instagram = EXCLUDED.instagram, \
+             enabled = EXCLUDED.enabled, \
+             archived_at = NULL, \
+             updated_at = now() \
+         RETURNING nym, header, description, avatar_sha256, og_sha256, \
+                   display_currency, website, twitter, \
+                   instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
+    )
+    .bind(page.nym)
+    .bind(page.header)
+    .bind(page.description)
+    .bind(page.display_currency)
+    .bind(page.website)
+    .bind(page.twitter)
+    .bind(page.instagram)
+    .bind(page.enabled)
+    .fetch_one(pool)
+    .await
+}
+
+/// Soft-delete: mark `archived_at = now()`. The row is preserved so the
+/// public URL keeps resolving to the "archived" template instead of 404.
+/// Returns the post-archive row (or None if no donation page exists).
+pub async fn archive_donation_page(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Option<DonationPage>, sqlx::Error> {
+    sqlx::query_as::<_, DonationPage>(
+        "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
+         WHERE nym = $1 AND archived_at IS NULL \
+         RETURNING nym, header, description, avatar_sha256, og_sha256, \
+                   display_currency, website, twitter, \
+                   instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
+    )
+    .bind(nym)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Update the avatar or og image hash for a nym's donation page. Used by
+/// `POST /donation-page/image` after the resized WebP has been atomically
+/// written to disk. `kind_column` is one of `"avatar_sha256"` or
+/// `"og_sha256"` — caller validates via the `ImageKind` enum so the
+/// column name is hard-coded by an enum match, not user input.
+pub async fn update_donation_page_image_hash(
+    pool: &PgPool,
+    nym: &str,
+    kind_column: &str,
+    new_sha256: &str,
+) -> Result<Option<DonationPage>, sqlx::Error> {
+    // Hard-coded column allowlist defends against any caller that
+    // sneaks an arbitrary string in. The column name is validated here
+    // (not just upstream) because SQL injection via column names is
+    // un-parameterizable.
+    let sql = match kind_column {
+        "avatar_sha256" => {
+            "UPDATE donation_pages SET avatar_sha256 = $2, updated_at = now() \
+             WHERE nym = $1 \
+             RETURNING nym, header, description, avatar_sha256, og_sha256, \
+                       display_currency, preset_amounts, website, twitter, \
+                       instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
+        }
+        "og_sha256" => {
+            "UPDATE donation_pages SET og_sha256 = $2, updated_at = now() \
+             WHERE nym = $1 \
+             RETURNING nym, header, description, avatar_sha256, og_sha256, \
+                       display_currency, preset_amounts, website, twitter, \
+                       instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
+        }
+        _ => return Err(sqlx::Error::Protocol(format!(
+            "invalid image kind column: {kind_column}"
+        ))),
+    };
+    sqlx::query_as::<_, DonationPage>(sql)
+        .bind(nym)
+        .bind(new_sha256)
+        .fetch_optional(pool)
+        .await
+}
+
+// =====================================================================
+// Donation-page Liquid allocation (Phase 4)
+// =====================================================================
+
+#[derive(Debug)]
+pub struct DonationAllocation {
+    pub address: String,
+    pub address_index: i32,
+    pub was_existing: bool,
+}
+
+/// Cookie-pinned donation address allocator. Returns the existing binding
+/// if `(nym, source_key, device_id)` already has one within the TTL,
+/// otherwise allocates a fresh address from the user's ct_descriptor at
+/// `users.next_addr_idx` and bumps the index.
+///
+/// `derive_address` is a closure: the caller knows how to derive a CT
+/// address from a descriptor + index, so this fn doesn't depend on the
+/// `descriptor` module directly. Keeps `db.rs` test-friendly and
+/// pure-data.
+///
+/// Concurrency: runs the entire flow inside a tx under
+/// `pg_advisory_xact_lock(hashtext('donation:'||nym))`. Same atomicity
+/// pattern as `register_user_atomic` and the LUD-22 allocator. The lock
+/// keyspace prefix `donation:` is disjoint from `<bare-npub-hex>` and
+/// `<bucket-string>` so no AB/BA deadlock with rate-limit gates.
+pub async fn lookup_or_allocate_donation_address<F>(
+    pool: &PgPool,
+    nym: &str,
+    source_key: &str,
+    device_id: uuid::Uuid,
+    ttl_days: u32,
+    derive_address: F,
+) -> Result<DonationAllocation, sqlx::Error>
+where
+    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
+{
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation:{nym}"))
+        .execute(&mut *tx)
+        .await?;
+
+    // Hit path: existing binding within TTL **and not yet paid**.
+    // Once a donator has paid an address, a fresh Donate click should
+    // generate a NEW address — otherwise the page perpetually shows
+    // the same paid address with the "Paid" status, which is confusing
+    // and prevents subsequent donations.
+    let cached: Option<(String, i32)> = sqlx::query_as(
+        "SELECT address, address_index \
+         FROM donation_allocations \
+         WHERE nym = $1 AND source_key = $2 AND device_id = $3 \
+           AND last_used_at > NOW() - ($4 || ' days')::interval \
+           AND last_paid_at IS NULL",
+    )
+    .bind(nym)
+    .bind(source_key)
+    .bind(device_id)
+    .bind(ttl_days as i32)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((address, address_index)) = cached {
+        sqlx::query(
+            "UPDATE donation_allocations SET last_used_at = NOW() \
+             WHERE nym = $1 AND source_key = $2 AND device_id = $3",
+        )
+        .bind(nym)
+        .bind(source_key)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(DonationAllocation {
+            address,
+            address_index,
+            was_existing: true,
+        });
+    }
+
+    // Miss path: bump users.next_addr_idx atomically, derive address,
+    // insert binding. Bumping (vs static-from-current) ensures each
+    // donator gets a unique address — clean status-feedback semantics.
+    let row: (String, i32) = sqlx::query_as(
+        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
+         WHERE nym = $1 AND is_active = TRUE \
+         RETURNING ct_descriptor, next_addr_idx - 1",
+    )
+    .bind(nym)
+    .fetch_one(&mut *tx)
+    .await?;
+    let (ct_descriptor, address_index) = row;
+    let idx_u32 = u32::try_from(address_index).map_err(|_| {
+        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+    })?;
+    let address = derive_address(&ct_descriptor, idx_u32)?;
+
+    // ON CONFLICT here means there's an existing row for this
+    // (nym, source_key, device_id) that the cached SELECT skipped —
+    // either because it's been paid (we want to issue a fresh address)
+    // or because it expired (TTL elapsed). Overwrite all fields so
+    // the row reflects the new allocation, including clearing
+    // last_paid_at so status feedback resets cleanly.
+    let inserted: (String, i32) = sqlx::query_as(
+        "INSERT INTO donation_allocations \
+            (nym, source_key, device_id, address_index, address) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (nym, source_key, device_id) DO UPDATE \
+            SET address_index = EXCLUDED.address_index, \
+                address = EXCLUDED.address, \
+                allocated_at = NOW(), \
+                last_used_at = NOW(), \
+                last_paid_at = NULL \
+         RETURNING address, address_index",
+    )
+    .bind(nym)
+    .bind(source_key)
+    .bind(device_id)
+    .bind(address_index)
+    .bind(&address)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(DonationAllocation {
+        address: inserted.0,
+        address_index: inserted.1,
+        was_existing: false,
+    })
+}
+
+/// Cheap probe: does `(nym, source_key, device_id)` already have a live
+/// donation binding (within TTL)? Used by `callback_liquid` to skip the
+/// per-source rate-limit gate on cookie HITs — refreshes shouldn't burn
+/// the FRESH-allocation budget. This is advisory only; the source of
+/// truth is the atomic flow in `lookup_or_allocate_donation_address`.
+pub async fn peek_donation_binding(
+    pool: &PgPool,
+    nym: &str,
+    source_key: &str,
+    device_id: uuid::Uuid,
+    ttl_days: u32,
+) -> Result<bool, sqlx::Error> {
+    // Mirror the HIT condition in lookup_or_allocate_donation_address:
+    // a paid binding is treated as a MISS (page should issue a fresh
+    // address on the next Donate click) so the rate-limit gate fires.
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM donation_allocations \
+         WHERE nym = $1 AND source_key = $2 AND device_id = $3 \
+           AND last_used_at > NOW() - ($4 || ' days')::interval \
+           AND last_paid_at IS NULL",
+    )
+    .bind(nym)
+    .bind(source_key)
+    .bind(device_id)
+    .bind(ttl_days as i32)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Count distinct fresh donation addresses allocated under a source_key
+/// in the last `window_secs`. Used by the per-source rate-limit gate
+/// applied on the MISS path of `lookup_or_allocate_donation_address`.
+pub async fn count_recent_donation_allocations_per_source(
+    pool: &PgPool,
+    source_key: &str,
+    window_secs: u32,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM donation_allocations \
+         WHERE source_key = $1 \
+           AND allocated_at > NOW() - ($2 || ' seconds')::interval",
+    )
+    .bind(source_key)
+    .bind(window_secs as i32)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// List unpaid donation_allocations for a nym. Used by the chain
+/// watcher to re-scan donation addresses on each tick — the lookahead
+/// loop alone misses them because the MISS path of
+/// `lookup_or_allocate_donation_address` bumps `next_addr_idx` past the
+/// just-allocated index, leaving the index outside the watcher's
+/// `[next_addr_idx, +lookahead]` scan range.
+pub async fn list_unpaid_donation_allocations(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Vec<(i32, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (i32, String)>(
+        "SELECT address_index, address \
+         FROM donation_allocations \
+         WHERE nym = $1 AND last_paid_at IS NULL \
+         ORDER BY address_index ASC",
+    )
+    .bind(nym)
+    .fetch_all(pool)
+    .await
+}
+
+/// Mark every still-unpaid donation_allocation that targets `addr_index`
+/// for `nym` as paid. Called by the chain watcher when a payment is
+/// observed at `derive(descriptor, addr_index)`. Each donation_allocation
+/// row has a unique address_index (the MISS path bumps), so this updates
+/// at most one row per call — but we use the same set-based UPDATE shape
+/// as the LUD-22 reservation flow for consistency. Returns rows affected.
+pub async fn mark_donation_paid_at_idx(
+    pool: &PgPool,
+    nym: &str,
+    addr_index: u32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE donation_allocations \
+            SET last_paid_at = NOW() \
+          WHERE nym = $1 AND address_index = $2 AND last_paid_at IS NULL",
+    )
+    .bind(nym)
+    .bind(addr_index as i32)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Read donation-status payload for a Liquid donation: returns the
+/// allocation's `last_paid_at` (None = not paid yet). Used by the
+/// `/lnurlp/donate-status` poll endpoint.
+pub async fn get_donation_allocation_paid_status(
+    pool: &PgPool,
+    nym: &str,
+    address: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    // Use COALESCE so the boolean reads back unambiguously: TRUE = paid,
+    // FALSE = waiting, None = address doesn't belong to this nym.
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT (last_paid_at IS NOT NULL) AS paid \
+         FROM donation_allocations \
+         WHERE nym = $1 AND address = $2",
+    )
+    .bind(nym)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(paid,)| paid))
+}
+
+/// Recycler: drop donation_allocations rows older than `ttl_days`. Run
+/// periodically from `gc.rs` so abandoned cookies don't keep allocations
+/// alive forever.
+pub async fn prune_donation_allocations(
+    pool: &PgPool,
+    ttl_days: u32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM donation_allocations \
+         WHERE last_used_at < NOW() - ($1 || ' days')::interval",
+    )
+    .bind(ttl_days as i32)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn get_donation_page_by_nym(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Option<DonationPage>, sqlx::Error> {
+    sqlx::query_as::<_, DonationPage>(
+        "SELECT nym, header, description, avatar_sha256, og_sha256, \
+                display_currency, website, twitter, \
+                instagram, enabled, (archived_at IS NOT NULL) AS is_archived \
+         FROM donation_pages WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_optional(pool)
+    .await
+}
+
+// =====================================================================
+// Invoices (Phase B)
+//
+// Unified payment-intent abstraction. `origin` discriminates two creation
+// flows: 'checkout' (anonymous browser, server-rate-limited per source) and
+// 'wallet' (recipient's mobile, Schnorr-signed). Lightning offers attach
+// 1:N via `swap_records.invoice_id`; Liquid offer is 1:1, lazy-allocated
+// on first rail toggle.
+//
+// Timestamp columns are NOT read into Rust structs as DateTime values —
+// the workspace deliberately avoids the chrono/time sqlx feature flag.
+// Instead, projections expose timestamps as `BIGINT` Unix epoch seconds
+// via `EXTRACT(EPOCH FROM col)::BIGINT AS col_unix`. SQL boolean
+// expressions (`expires_at < NOW()` etc.) handle every comparison
+// server-side.
+// =====================================================================
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct Invoice {
+    pub id: Uuid,
+    pub nym: String,
+    pub origin: String,
+    pub fiat_amount_minor: Option<i32>,
+    pub fiat_currency: Option<String>,
+    pub amount_sat: i64,
+    pub rate_minor_per_btc: Option<i64>,
+    pub memo: Option<String>,
+    pub recipient_label: Option<String>,
+    pub liquid_address: Option<String>,
+    pub liquid_address_index: Option<i32>,
+    pub status: String,
+    pub paid_via: Option<String>,
+    pub paid_amount_sat: Option<i64>,
+    /// Unix epoch seconds. See section comment above for the timestamp
+    /// projection convention.
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub rate_locked_at_unix: i64,
+    pub rate_locks_until_unix: i64,
+    pub paid_at_unix: Option<i64>,
+    pub cancelled_at_unix: Option<i64>,
+}
+
+/// Single source of truth for the `Invoice` SQL projection. Centralized
+/// so a new column added to the struct is reflected in exactly one place
+/// (mirrors the SwapRecord pattern). FromRow matches by alias name, so
+/// the order is cosmetic.
+const INVOICE_COLUMNS: &str =
+    "id, nym, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+     rate_minor_per_btc, memo, recipient_label, liquid_address, \
+     liquid_address_index, status, paid_via, paid_amount_sat, \
+     EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
+     EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
+     EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
+     EXTRACT(EPOCH FROM rate_locks_until)::BIGINT AS rate_locks_until_unix, \
+     EXTRACT(EPOCH FROM paid_at)::BIGINT          AS paid_at_unix, \
+     EXTRACT(EPOCH FROM cancelled_at)::BIGINT     AS cancelled_at_unix";
+
+pub struct NewInvoice<'a> {
+    pub nym: &'a str,
+    /// 'checkout' or 'wallet'. Caller validates against the enum upstream.
+    pub origin: &'a str,
+    pub fiat_amount_minor: Option<i32>,
+    pub fiat_currency: Option<&'a str>,
+    pub amount_sat: i64,
+    pub rate_minor_per_btc: Option<i64>,
+    /// Wall-clock seconds the rate stays locked from `now()`. For
+    /// sat-denominated invoices, pass `expires_in_secs` so
+    /// `rate_locks_until == expires_at` and the on-demand refresh path
+    /// naturally never fires.
+    pub rate_lock_secs: i64,
+    pub memo: Option<&'a str>,
+    pub recipient_label: Option<&'a str>,
+    /// Wall-clock seconds the invoice stays valid from `now()`.
+    pub expires_in_secs: i64,
+}
+
+/// Insert a new invoice row. The Liquid address is NOT allocated here —
+/// `allocate_invoice_liquid_address` handles lazy allocation on first
+/// rail toggle. Lightning offers attach via a separate `record_swap` call
+/// that sets `swap_records.invoice_id`.
+pub async fn insert_invoice(
+    pool: &PgPool,
+    invoice: &NewInvoice<'_>,
+) -> Result<Invoice, sqlx::Error> {
+    sqlx::query_as::<_, Invoice>(&format!(
+        "INSERT INTO invoices \
+            (nym, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+             rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
+             expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, \
+                 NOW() + ($7 || ' seconds')::interval, $8, $9, \
+                 NOW() + ($10 || ' seconds')::interval) \
+         RETURNING {INVOICE_COLUMNS}"
+    ))
+    .bind(invoice.nym)
+    .bind(invoice.origin)
+    .bind(invoice.fiat_amount_minor)
+    .bind(invoice.fiat_currency)
+    .bind(invoice.amount_sat)
+    .bind(invoice.rate_minor_per_btc)
+    .bind(invoice.rate_lock_secs)
+    .bind(invoice.memo)
+    .bind(invoice.recipient_label)
+    .bind(invoice.expires_in_secs)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_invoice_by_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<Invoice>, sqlx::Error> {
+    sqlx::query_as::<_, Invoice>(&format!(
+        "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// List invoices for a nym, newest-first, with optional filters.
+///
+/// `origin`: `Some("checkout")` or `Some("wallet")` filters by origin;
+/// `None` returns both. `since_unix`: only rows with `created_at >=` that
+/// epoch-second value; `None` skips the time filter. `limit` caps the
+/// result set (caller enforces upper bound; we don't second-guess here).
+///
+/// Predicate uses `($p::TYPE IS NULL OR ...)` so the planner can skip the
+/// filter entirely when not provided. The composite index
+/// `invoices_nym_created_idx` services the ORDER BY.
+pub async fn list_invoices(
+    pool: &PgPool,
+    nym: &str,
+    origin: Option<&str>,
+    since_unix: Option<i64>,
+    limit: i64,
+) -> Result<Vec<Invoice>, sqlx::Error> {
+    sqlx::query_as::<_, Invoice>(&format!(
+        "SELECT {INVOICE_COLUMNS} FROM invoices \
+         WHERE nym = $1 \
+           AND ($2::TEXT IS NULL OR origin = $2) \
+           AND ($3::BIGINT IS NULL OR created_at >= TO_TIMESTAMP($3)) \
+         ORDER BY created_at DESC \
+         LIMIT $4"
+    ))
+    .bind(nym)
+    .bind(origin)
+    .bind(since_unix)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// List unpaid invoices' Liquid addresses for a nym, ordered by
+/// address_index. Returned shape `(invoice_id, address_index, address,
+/// amount_sat)` gives the chain watcher everything it needs to call
+/// `mark_invoice_paid` on a hit without a second round-trip per row.
+///
+/// Service path: chain_watcher.rs scans this list on each tick and flips
+/// the matching invoice via `mark_invoice_paid` when a Liquid tx lands.
+/// Compensates for the address-allocation race that the
+/// donation_allocations scan handled: the watcher's lookahead loop
+/// alone misses addresses past `next_addr_idx` because the allocator
+/// bumps the index past the just-allocated value.
+pub async fn list_unpaid_invoice_liquid_addresses(
+    pool: &PgPool,
+    nym: &str,
+) -> Result<Vec<(Uuid, i32, String, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, i32, String, i64)>(
+        "SELECT id, liquid_address_index, liquid_address, amount_sat \
+         FROM invoices \
+         WHERE nym = $1 \
+           AND status = 'unpaid' \
+           AND liquid_address IS NOT NULL \
+           AND liquid_address_index IS NOT NULL \
+         ORDER BY liquid_address_index ASC",
+    )
+    .bind(nym)
+    .fetch_all(pool)
+    .await
+}
+
+/// Idempotent invoice-paid flip. The `WHERE status = 'unpaid'` guard
+/// makes a re-call on the same id a no-op (returns 0 rows affected). The
+/// status is determined server-side from `paid_amount_sat` vs
+/// `amount_sat` so there's no SELECT-then-UPDATE race; whatever
+/// `amount_sat` is at flip-time decides under/over/exact.
+///
+/// `paid_via`: 'lightning' or 'liquid' (validated against the column-level
+/// CHECK in migration 019).
+///
+/// Returns rows_affected: 1 = flip happened; 0 = invoice was already in
+/// a terminal status (paid/under/over/expired/cancelled). 0 is NOT an
+/// error — the caller (webhook/chain-watcher) should treat it as success.
+pub async fn mark_invoice_paid(
+    pool: &PgPool,
+    id: Uuid,
+    paid_amount_sat: i64,
+    paid_via: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices SET \
+            status = (CASE \
+                WHEN $2 = amount_sat THEN 'paid' \
+                WHEN $2 <  amount_sat THEN 'underpaid' \
+                ELSE                       'overpaid' \
+            END), \
+            paid_via = $3, \
+            paid_amount_sat = $2, \
+            paid_at = NOW() \
+         WHERE id = $1 AND status = 'unpaid'",
+    )
+    .bind(id)
+    .bind(paid_amount_sat)
+    .bind(paid_via)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Cancel an unpaid invoice (recipient-initiated via signed
+/// `invoice-cancel`). Idempotent: re-call on a row that's already
+/// non-unpaid returns 0 rows affected. Caller verifies the Schnorr
+/// signature AND that the invoice's nym maps to the verifying npub
+/// upstream — this fn does not re-check ownership.
+pub async fn cancel_invoice(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices SET status = 'cancelled', cancelled_at = NOW() \
+         WHERE id = $1 AND status = 'unpaid'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Background sweep: flip every unpaid invoice past its outer deadline
+/// to 'expired'. Idempotent (set-based UPDATE; predicate excludes already-
+/// terminal rows). Run from `gc.rs` on the periodic GC cycle.
+pub async fn expire_invoices_past_deadline(
+    pool: &PgPool,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices SET status = 'expired' \
+         WHERE status = 'unpaid' AND expires_at < NOW()",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Update an invoice's sat amount + rate after a fiat-denominated rate
+/// refresh. Caller orchestrates: pricer.get_rate → boltz.create_reverse_swap
+/// → record_swap (with invoice_id set) → refresh_invoice_rate. The
+/// `WHERE status = 'unpaid'` guard makes this idempotent under the
+/// concurrent-poll race (two viewers triggering refresh at the same
+/// time). Both swaps land in `swap_records` pointing at this invoice;
+/// either BOLT11 settlement still flips the invoice (lenient policy).
+///
+/// Returns rows_affected: 1 = updated; 0 = invoice no longer unpaid
+/// (paid/cancelled/expired in the meantime).
+pub async fn refresh_invoice_rate(
+    pool: &PgPool,
+    id: Uuid,
+    new_amount_sat: i64,
+    new_rate_minor_per_btc: i64,
+    new_rate_lock_secs: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices SET \
+            amount_sat = $2, \
+            rate_minor_per_btc = $3, \
+            rate_locked_at = NOW(), \
+            rate_locks_until = NOW() + ($4 || ' seconds')::interval \
+         WHERE id = $1 AND status = 'unpaid'",
+    )
+    .bind(id)
+    .bind(new_amount_sat)
+    .bind(new_rate_minor_per_btc)
+    .bind(new_rate_lock_secs)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Lazy-allocate the Liquid address for an invoice. Mirrors
+/// `lookup_or_allocate_donation_address`'s atomicity pattern: one
+/// transaction guarded by `pg_advisory_xact_lock(hashtext('donation:'||nym))`
+/// — same lock keyspace as the legacy donation flow so the chain
+/// watcher's existing single-flight assumptions still hold.
+///
+/// Returns:
+/// - `Ok(Some((address, index)))` on first allocation (or on idempotent
+///   re-read if the address was already set).
+/// - `Ok(None)` if the invoice doesn't exist or its nym has no active
+///   user (caller decides the user-facing error).
+///
+/// `derive_address` is a closure: the caller knows how to derive a CT
+/// address from a descriptor + index, so this fn doesn't depend on the
+/// `descriptor` module directly.
+pub async fn allocate_invoice_liquid_address<F>(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    derive_address: F,
+) -> Result<Option<(String, i32)>, sqlx::Error>
+where
+    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
+{
+    let mut tx = pool.begin().await?;
+
+    // Need the nym to scope the advisory lock and bump next_addr_idx.
+    let nym: Option<(String,)> = sqlx::query_as(
+        "SELECT nym FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invoice_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((nym,)) = nym else {
+        return Ok(None);
+    };
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation:{nym}"))
+        .execute(&mut *tx)
+        .await?;
+
+    // Idempotent re-read: if a concurrent caller already allocated, just
+    // return the existing address.
+    let existing: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT liquid_address, liquid_address_index \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((Some(addr), Some(idx))) = existing {
+        tx.commit().await?;
+        return Ok(Some((addr, idx)));
+    }
+
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
+         WHERE nym = $1 AND is_active = TRUE \
+         RETURNING ct_descriptor, next_addr_idx - 1",
+    )
+    .bind(&nym)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((ct_descriptor, address_index)) = row else {
+        return Ok(None);
+    };
+    let idx_u32 = u32::try_from(address_index).map_err(|_| {
+        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+    })?;
+    let address = derive_address(&ct_descriptor, idx_u32)?;
+
+    sqlx::query(
+        "UPDATE invoices SET liquid_address = $2, liquid_address_index = $3 \
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .bind(&address)
+    .bind(address_index)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some((address, address_index)))
+}
+
+/// Read the most recent BOLT11 for an invoice (latest swap_records row
+/// whose `invoice_id = $1`). Returns the invoice/BOLT11 string, or None
+/// if no Lightning offer has been created yet for this invoice.
+///
+/// Service path: the status endpoint surfaces this so the page can render
+/// a fresh QR after a rate refresh creates a new swap.
+pub async fn latest_lightning_pr_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT invoice FROM swap_records \
+         WHERE invoice_id = $1 \
+         ORDER BY created_at DESC \
+         LIMIT 1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(s,)| s))
+}
+
+/// Pure helper: which invoice status should an unpaid invoice flip to,
+/// given the amount actually received? Mirrors the SQL CASE WHEN in
+/// `mark_invoice_paid` exactly. Exposed for handlers/tracing that need
+/// to predict the post-flip status without round-tripping to the DB.
+///
+/// Invariant (tested below): this and the SQL CASE WHEN must stay aligned.
+pub fn invoice_status_after_payment(paid_amount_sat: i64, amount_sat: i64) -> &'static str {
+    if paid_amount_sat == amount_sat {
+        "paid"
+    } else if paid_amount_sat < amount_sat {
+        "underpaid"
+    } else {
+        "overpaid"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +2169,38 @@ mod tests {
     #[test]
     fn swap_status_unknown_rejected() {
         assert!("garbage".parse::<SwapStatus>().is_err());
+    }
+
+    // --- Invoice helpers (Phase B) ---
+
+    #[test]
+    fn invoice_status_paid_exact() {
+        assert_eq!(invoice_status_after_payment(5000, 5000), "paid");
+        assert_eq!(invoice_status_after_payment(1, 1), "paid");
+    }
+
+    #[test]
+    fn invoice_status_underpaid() {
+        assert_eq!(invoice_status_after_payment(4999, 5000), "underpaid");
+        assert_eq!(invoice_status_after_payment(0, 5000), "underpaid");
+    }
+
+    #[test]
+    fn invoice_status_overpaid() {
+        assert_eq!(invoice_status_after_payment(5001, 5000), "overpaid");
+        assert_eq!(invoice_status_after_payment(i64::MAX, 5000), "overpaid");
+    }
+
+    /// The Rust helper and the SQL CASE WHEN in `mark_invoice_paid` must
+    /// agree on every boundary. If you change one, change the other.
+    /// This test documents the boundaries; the SQL itself is verified at
+    /// query-execution time and via integration tests.
+    #[test]
+    fn invoice_status_boundaries() {
+        // Boundary at amount_sat: equal → paid; below → underpaid;
+        // above → overpaid. Cross at exactly amount_sat == paid.
+        assert_eq!(invoice_status_after_payment(99, 100), "underpaid");
+        assert_eq!(invoice_status_after_payment(100, 100), "paid");
+        assert_eq!(invoice_status_after_payment(101, 100), "overpaid");
     }
 }

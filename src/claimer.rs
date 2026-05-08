@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::db::{self, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
+use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
 use crate::AppState;
@@ -214,6 +215,18 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
+            // Phase B step 7: paid-equivalent status — donator's HTLC
+            // settled. Mirror into invoice state if this swap belongs to
+            // an invoice. Errors are swallowed (logged) per the helper's
+            // contract; the swap CAS has already committed.
+            invoice::flip_invoice_on_lightning_settlement(
+                &state.db,
+                swap.invoice_id,
+                swap.amount_sat,
+                &swap.boltz_swap_id,
+            )
+            .await;
+
             try_claim_with_retry(
                 &state.db,
                 &swap,
@@ -297,6 +310,17 @@ async fn dispatch_webhook(
             db::update_swap_status(&state.db, swap.id, SwapStatus::LockupRefunded, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
+
+            // Phase B step 7: paid-equivalent — donator paid the LN
+            // side. The merchant fund-loss is tracked by the
+            // `swap_lockup_refunded` P0 alert (above), NOT invoice state.
+            invoice::flip_invoice_on_lightning_settlement(
+                &state.db,
+                swap.invoice_id,
+                swap.amount_sat,
+                &swap.boltz_swap_id,
+            )
+            .await;
         }
         _ => {
             // Other Boltz statuses (`swap.created`, `minerfee.paid`, etc.)
@@ -516,6 +540,20 @@ async fn claim_swap(
                     last_error = %err_str,
                     "swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
+                // Phase B step 7: paid-equivalent — donator paid the LN
+                // side; merchant-side claim is stuck. Surface to the
+                // donator's invoice view as 'paid'. Operator-facing
+                // tracking lives on the swap_claim_stuck alert above,
+                // not in invoice state.
+                if let Ok(Some(swap)) = db::get_swap_by_id(pool, swap_id).await {
+                    invoice::flip_invoice_on_lightning_settlement(
+                        pool,
+                        swap.invoice_id,
+                        swap.amount_sat,
+                        &swap.boltz_swap_id,
+                    )
+                    .await;
+                }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
                 tracing::warn!(
@@ -751,6 +789,18 @@ async fn claim_swap_inner(
         // observability nuisance only.
         tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
     }
+
+    // Phase B step 7: paid-equivalent (terminal happy path). Mirror into
+    // invoice state. The chain_watcher's Liquid-side flip and this
+    // Lightning-side flip are mutually idempotent at the invoice level
+    // (mark_invoice_paid's `WHERE status = 'unpaid'` predicate).
+    invoice::flip_invoice_on_lightning_settlement(
+        pool,
+        swap.invoice_id,
+        swap.amount_sat,
+        &swap.boltz_swap_id,
+    )
+    .await;
 
     Ok(ClaimOutcome::Broadcast)
 }

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::Router;
 use boltz_client::network::Network;
@@ -12,8 +13,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, reconciler,
-    registration,
+    boltz, chain_watcher, claimer, config, donation_page, donation_render, gc,
+    invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler, registration,
     utxo::{self, UtxoBackend},
     AppState,
 };
@@ -124,6 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rate_limit.clone(),
     ));
 
+    let pricer_client = Arc::new(
+        pricer::PricerClient::new(config.pricer.clone())
+            .map_err(|e| format!("pricer client init: {e}"))?,
+    );
+    tracing::info!(
+        "pricer client configured (url={}, ttl={}s, timeout={}ms)",
+        config.pricer.url,
+        config.pricer.cache_ttl_secs,
+        config.pricer.request_timeout_ms,
+    );
+
     let listen_addr = config.listen.clone();
     let config = Arc::new(config);
     let boltz = Arc::new(boltz_service);
@@ -136,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ip_whitelist: whitelist.clone(),
         rate_limiter: rate_limiter.clone(),
         utxo_backend,
+        pricer: pricer_client,
     };
 
     let cancel = CancellationToken::new();
@@ -216,6 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("chain watcher NOT started: utxo backend unavailable");
     }
 
+    // Donation-page image upload needs a 2 MiB body cap, well above the
+    // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
+    // image route in its own sub-router with its own RequestBodyLimitLayer
+    // keeps the global tight while letting this one path accept binaries.
+    let image_upload_router: Router<AppState> = Router::new()
+        .route("/donation-page/image", post(donation_page::upload_image))
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
+
     let app = Router::new()
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
@@ -225,6 +246,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/register", axum::routing::delete(registration::delete_registration))
         .route("/register/lookup", get(registration::lookup_by_npub))
         .route("/api/reservations/:nym", get(registration::list_reservations))
+        // Tighter per-route body caps for the donation CRUD endpoints.
+        // The global 64 KiB still applies; the smaller per-route limit wins.
+        // Save body is JSON with all v1 fields ~ <2 KiB in practice; 8 KiB
+        // is generous headroom. Archive carries only nym+npub+sig+ts.
+        .route(
+            "/donation-page",
+            put(donation_page::save).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/donation-page",
+            axum::routing::delete(donation_page::archive)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/donation-page/:nym", get(donation_page::get))
+        // Phase B step 10 cutover: removed `/lnurlp/donate-callback/:nym`
+        // and `/lnurlp/donate-status/:nym`. The flow is now POST
+        // `/<nym>/invoice` → page navigates to `/<nym>/i/<id>` → polls
+        // `/api/v1/invoices/:id/status`. The `donation_callback` module
+        // and `bullpay_did` cookie are kept in the binary for rollback
+        // safety; they're orphaned (no routes mount them) until Phase D
+        // deletes them.
+        // Phase B — Invoices: anonymous (sender-side) endpoints. Per-route
+        // body cap of 1 KiB on the create endpoint; the global 64 KiB still
+        // applies elsewhere. Status + offer-fetch endpoints are GET/POST
+        // with no body to validate (rate-limit is the gate).
+        .route(
+            "/:nym/invoice",
+            post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/:nym/i/:id", get(invoice::render_payment))
+        .route(
+            "/api/v1/invoices/:id/status",
+            get(invoice::status),
+        )
+        .route(
+            "/api/v1/invoices/:id/lightning",
+            post(invoice::fetch_lightning_offer),
+        )
+        .route(
+            "/api/v1/invoices/:id/liquid",
+            post(invoice::fetch_liquid_offer),
+        )
+        // Phase B step 5 — Schnorr-signed (recipient-side, wallet)
+        // endpoints. Body cap 8 KiB on POST to bound a misbehaving client;
+        // DELETE carries only npub+ts+sig. List uses GET + Query.
+        .route(
+            "/api/v1/:nym/invoices",
+            post(invoice::create_signed).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/v1/:nym/invoices",
+            get(invoice::list_signed),
+        )
+        .route(
+            "/api/v1/:nym/invoices/:id",
+            axum::routing::delete(invoice::cancel),
+        )
+        .route("/qr.svg", get(qr::generate))
         // Two routes during the rotation overlap window:
         // - `/webhook/boltz/:secret` — authenticated path. Handler verifies
         //   `:secret` in constant time against the configured current/previous
@@ -236,9 +315,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
+        .fallback(donation_render::render_or_404)
+        .layer(RequestBodyLimitLayer::new(64 * 1024))
+        .merge(image_upload_router)
+        .layer(tower_cookies::CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .layer(RequestBodyLimitLayer::new(64 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

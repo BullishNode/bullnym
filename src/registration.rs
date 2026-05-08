@@ -11,6 +11,7 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::reserved_nyms;
 use crate::AppState;
 
 /// Resolve the caller IP using the same logic as `/lnurlp/callback`:
@@ -155,6 +156,10 @@ pub async fn register(
             "must be 3-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
                 .to_string(),
         ));
+    }
+
+    if reserved_nyms::is_reserved(&req.nym) {
+        return Err(AppError::NymReserved);
     }
 
     descriptor::validate_descriptor(

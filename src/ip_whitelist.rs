@@ -4,9 +4,10 @@
 //! requirement. Supports both exact IPs ("203.0.113.42") and CIDR blocks
 //! ("10.0.0.0/8", "2001:db8::/32") for v4 and v6.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
+use axum::http::HeaderMap;
 use ipnet::IpNet;
 
 /// Precompiled whitelist entries. Build once at startup, reuse on every request.
@@ -104,6 +105,19 @@ pub fn resolve_caller_ip(
         }
     }
     peer
+}
+
+/// Convenience wrapper used by handlers: takes the axum-extracted peer +
+/// headers + a `trust_forwarded_for` config flag. Replaces the
+/// 5-line-per-module helper that several donation/registration modules
+/// were duplicating.
+pub fn caller_ip(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_for: bool,
+) -> Option<IpAddr> {
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    resolve_caller_ip(peer.map(|p| p.ip()), xff, trust_forwarded_for)
 }
 
 #[cfg(test)]

@@ -270,6 +270,146 @@ impl RateLimiter {
         )
     }
 
+    /// Per-source rate-limit on `GET /<nym>` donation-page HTML renders.
+    /// Public, browser-facing, no auth — bounds volumetric scraping. Uses
+    /// the `donation_html:` bucket prefix to keep its keyspace separate
+    /// from the Liquid-callback `ip:` and metadata `meta:ip:` buckets.
+    pub async fn check_donation_html_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("donation_html:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.donation_html_rate_limit,
+            self.cfg.donation_html_rate_window_secs,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Per-npub rate-limit on `POST /donation-page/image`. A real user
+    /// uploads avatar + OG once per session; six per hour is generous.
+    /// Atomic Postgres path (cross-replica consistent) since uploads are
+    /// low-volume and signature-verified.
+    pub async fn check_donation_image_uploads_per_npub(
+        &self,
+        npub_hex: &str,
+    ) -> Result<(), AppError> {
+        let bucket = format!("donation_image_npub:{npub_hex}");
+        self.atomic_sliding_window_check(
+            &bucket,
+            self.cfg.donation_image_uploads_per_npub_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+        .await
+    }
+
+    /// Per-source rate-limit on image uploads. In-memory bucket; hot path
+    /// before the more expensive npub check.
+    pub async fn check_donation_image_uploads_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let bucket = format!("donation_image_src:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.donation_image_uploads_per_source_per_min,
+            60,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Per-source rate-limit on `GET /lnurlp/donate-callback/<nym>`. Loose
+    /// — covers refresh-driven retries.
+    pub async fn check_donation_callback_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let bucket = format!("donation_cb:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.donation_callback_per_source_per_min,
+            60,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Per-source cap on FRESH Liquid donation-address allocations.
+    /// Counted directly out of `donation_allocations` (the rows are the
+    /// allocations themselves) — no separate event table needed. Only
+    /// the MISS path of `lookup_or_allocate_donation_address` calls this;
+    /// HIT paths never burn budget.
+    pub async fn check_donation_distinct_addrs_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let limit = self.cfg.distinct_donation_addresses_per_source_per_hour;
+        if limit == 0 {
+            return Ok(());
+        }
+        let key = source_key(ip);
+        let count = db::count_recent_donation_allocations_per_source(
+            &self.pool,
+            &key,
+            3600,
+        )
+        .await
+        .map_err(AppError::from)?;
+        if count >= limit as i64 {
+            return Err(AppError::RateLimitedNetwork);
+        }
+        Ok(())
+    }
+
+    /// Per-source rate-limit on anonymous `POST /<nym>/invoice` (Phase B).
+    /// Tighter than `donation_callback_per_source_per_min` because each
+    /// success path here creates a real invoice + Boltz reverse-swap;
+    /// page refreshes hit the existing invoice URL and don't re-fire.
+    pub async fn check_invoice_create_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let bucket = format!("invoice_create:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.invoice_create_per_source_per_min,
+            60,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Per-npub rate-limit on signed `POST /api/v1/<nym>/invoices`
+    /// (Phase B). Bounds wallet-origin invoice creation per identity, so
+    /// a stolen credential cannot mass-create invoices even within the
+    /// per-IP gate. Bucket key includes the lowercased npub; same
+    /// keyspace prefix discipline as the metadata gates so AB/BA
+    /// deadlocks with DB advisory locks are impossible.
+    pub async fn check_invoice_create_per_npub(
+        &self,
+        npub_hex: &str,
+    ) -> Result<(), AppError> {
+        let bucket = format!("invoice_create_npub:{}", npub_hex.to_lowercase());
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.invoice_create_per_npub_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Per-source rate-limit on the donation-status poll endpoint. Page
+    /// polls every ~3s; 60/min covers a normal session.
+    pub async fn check_donation_status_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let bucket = format!("donation_status:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.donation_status_per_source_per_min,
+            60,
+            AppError::RateLimitedSender,
+        )
+    }
+
     pub async fn check_lookup_distinct_npubs_per_ip(
         &self,
         ip: IpAddr,
