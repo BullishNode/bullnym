@@ -2025,15 +2025,23 @@ pub async fn cancel_invoice(
     Ok(result.rows_affected())
 }
 
-/// Background sweep: flip every unpaid invoice past its outer deadline
-/// to 'expired'. Idempotent (set-based UPDATE; predicate excludes already-
-/// terminal rows). Run from `gc.rs` on the periodic GC cycle.
+/// Background sweep: flip every unpaid OR in_progress invoice past its
+/// outer deadline to 'expired'. Idempotent (set-based UPDATE; predicate
+/// excludes already-terminal rows). Run from `gc.rs` on the periodic GC
+/// cycle.
+///
+/// `in_progress` is included because a payer may broadcast a tx that
+/// makes it to mempool (flipping the row to in_progress) but never
+/// confirms (RBF replaced, mempool eviction, low-fee drop). After the
+/// outer expiry we want the row out of the active corpus regardless of
+/// its mempool stage. Backed by the partial index
+/// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
 pub async fn expire_invoices_past_deadline(
     pool: &PgPool,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = 'expired' \
-         WHERE status = 'unpaid' AND expires_at < NOW()",
+         WHERE status IN ('unpaid', 'in_progress') AND expires_at < NOW()",
     )
     .execute(pool)
     .await?;
