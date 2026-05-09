@@ -221,11 +221,11 @@ async fn apply_action(
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupMempool, None).await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
-            // Phase B step 7: paid-equivalent. Mirror into invoice state.
-            invoice::flip_invoice_on_lightning_settlement(
+            // Get-paid Step 9: mempool sighting → invoice `in_progress`.
+            // The matching webhook arm in claimer.rs uses the same helper.
+            invoice::flip_invoice_on_lightning_in_progress(
                 pool,
                 swap.invoice_id,
-                swap.amount_sat,
                 &swap.boltz_swap_id,
             )
             .await;

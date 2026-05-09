@@ -94,6 +94,55 @@ const INVOICE_NUMBER_MAX: usize = 50;
 // Settlement hook (called by claimer/reconciler on Lightning settlement)
 // =====================================================================
 
+/// Flip an invoice to `in_progress` on the FIRST Boltz mempool sighting
+/// of the lockup tx for an invoice-bound swap. Called by the claimer
+/// (`transaction.mempool` webhook) and the reconciler (sync path that
+/// observes the same status without a webhook delivery) AFTER the
+/// forward-only CAS state-update succeeds.
+///
+/// Contract mirrors `flip_invoice_on_lightning_settlement`:
+/// - `invoice_id == None` → no-op (LNURL-only swaps without an invoice).
+/// - `mark_invoice_in_progress` is idempotent: a 0-rows-affected return
+///   means the invoice was already past `unpaid` (already in_progress,
+///   already paid/under/over, expired, cancelled). Logged at debug.
+/// - On error: LOG and RETURN. Never propagate. Settlement (paid) flows
+///   through `flip_invoice_on_lightning_settlement` later and self-heals.
+pub async fn flip_invoice_on_lightning_in_progress(
+    pool: &sqlx::PgPool,
+    invoice_id: Option<Uuid>,
+    boltz_swap_id: &str,
+) {
+    let Some(id) = invoice_id else {
+        return;
+    };
+    match db::mark_invoice_in_progress(pool, id).await {
+        Ok(rows) if rows > 0 => {
+            tracing::info!(
+                event = "invoice_in_progress_via_lightning",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "lightning mempool flipped invoice to in_progress"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                event = "invoice_in_progress_noop",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "invoice already past unpaid; in_progress flip is a no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "invoice_in_progress_failed",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "mark_invoice_in_progress failed (swap CAS already committed): {e}"
+            );
+        }
+    }
+}
+
 /// Flip an invoice via `mark_invoice_paid` after the corresponding
 /// Lightning swap reaches a paid-equivalent status. Called by claimer
 /// (webhook path) and reconciler (sync path) AFTER the forward-only CAS

@@ -206,7 +206,8 @@ async fn dispatch_webhook(
 
     match data.status.as_str() {
         "transaction.mempool" | "transaction.confirmed" => {
-            let new_status = if data.status == "transaction.mempool" {
+            let is_mempool = data.status == "transaction.mempool";
+            let new_status = if is_mempool {
                 SwapStatus::LockupMempool
             } else {
                 SwapStatus::LockupConfirmed
@@ -215,17 +216,27 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Phase B step 7: paid-equivalent status — donator's HTLC
-            // settled. Mirror into invoice state if this swap belongs to
-            // an invoice. Errors are swallowed (logged) per the helper's
-            // contract; the swap CAS has already committed.
-            invoice::flip_invoice_on_lightning_settlement(
-                &state.db,
-                swap.invoice_id,
-                swap.amount_sat,
-                &swap.boltz_swap_id,
-            )
-            .await;
+            // Get-paid Step 9: mempool sighting → invoice `in_progress`
+            // (early signal that the donator's HTLC has been routed).
+            // Confirmed sighting → invoice `paid` (settlement). Both
+            // helpers are idempotent + error-swallowing per their
+            // contracts; the swap CAS has already committed above.
+            if is_mempool {
+                invoice::flip_invoice_on_lightning_in_progress(
+                    &state.db,
+                    swap.invoice_id,
+                    &swap.boltz_swap_id,
+                )
+                .await;
+            } else {
+                invoice::flip_invoice_on_lightning_settlement(
+                    &state.db,
+                    swap.invoice_id,
+                    swap.amount_sat,
+                    &swap.boltz_swap_id,
+                )
+                .await;
+            }
 
             try_claim_with_retry(
                 &state.db,
