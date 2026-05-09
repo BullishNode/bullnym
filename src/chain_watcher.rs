@@ -12,6 +12,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::str::FromStr;
+
 use lwk_wollet::elements;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -107,6 +109,9 @@ pub async fn run(
                 ).await {
                     tracing::warn!("chain_watcher active poll failed: {e:?}");
                 }
+                poll_invoice_addresses(
+                    &pool, backend.as_ref(), rate_limiter.as_ref(), &cancel, "active",
+                ).await;
             }
             _ = idle_tick.tick() => {
                 // Idle tick scans all active users (active + idle subsets).
@@ -124,8 +129,121 @@ pub async fn run(
                 ).await {
                     tracing::warn!("chain_watcher idle poll failed: {e:?}");
                 }
+                poll_invoice_addresses(
+                    &pool, backend.as_ref(), rate_limiter.as_ref(), &cancel, "idle",
+                ).await;
             }
         }
+    }
+}
+
+/// Address-keyed scan for invoices' Liquid destinations. Single SQL
+/// query catches both linked and unlinked invoices; both descriptor-
+/// allocated (legacy) and wallet-supplied (new) addresses; running
+/// alongside the per-nym lookahead in `poll_nyms` (mark_invoice_paid is
+/// idempotent so the redundant catch in the legacy descriptor case is
+/// harmless).
+///
+/// Lenient v1 policy for Liquid: a single observed `has_history=true`
+/// flips the row directly to `paid` with `paid_amount_sat = amount_sat`.
+/// Proper txout-sum inspection (under/overpaid via Liquid) is deferred —
+/// the BTC watcher (Step 7) and Lightning claimer carry actual sat
+/// amounts so under/overpaid surfaces correctly via those rails.
+async fn poll_invoice_addresses(
+    pool: &PgPool,
+    backend: &(dyn UtxoBackend + Send + Sync),
+    rate_limiter: &RateLimiter,
+    cancel: &CancellationToken,
+    tier: &'static str,
+) {
+    let invoices = match db::list_unpaid_invoices_with_liquid_address(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("chain_watcher: list invoice addresses failed: {e}");
+            return;
+        }
+    };
+    let n_total = invoices.len();
+    if n_total == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut hits = 0usize;
+    for (invoice_id, address, amount_sat) in invoices {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if rate_limiter.check_electrum_watcher().await.is_err() {
+            tracing::debug!(
+                "chain_watcher: invoice scan watcher Electrum bucket exhausted, deferring"
+            );
+            break;
+        }
+
+        // Parse the wallet-supplied or descriptor-derived address into a
+        // Liquid script. Bad/foreign-network addresses are rejected at
+        // create time by the validators, so this should never fail in
+        // practice; defensively log+skip if it does.
+        let parsed = match elements::Address::from_str(&address) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    "chain_watcher: invoice liquid_address parse failed: {e}"
+                );
+                continue;
+            }
+        };
+        let script = parsed.script_pubkey();
+
+        match backend.has_history(&script).await {
+            Ok(true) => match db::mark_invoice_paid(pool, invoice_id, amount_sat, "liquid").await {
+                Ok(rows) if rows > 0 => {
+                    hits += 1;
+                    tracing::info!(
+                        event = "invoice_paid_via_liquid_addr_scan",
+                        invoice_id = %invoice_id,
+                        amount_sat = amount_sat,
+                        "chain_watcher: invoice Liquid address observed paid"
+                    );
+                }
+                Ok(_) => {
+                    // Already terminal — race with another flip path. No-op.
+                }
+                Err(e) => {
+                    tracing::error!(
+                        invoice_id = %invoice_id,
+                        "chain_watcher: mark_invoice_paid failed: {e}"
+                    );
+                }
+            },
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    "chain_watcher: invoice has_history failed: {e}"
+                );
+            }
+        }
+    }
+    let elapsed_ms = started.elapsed().as_millis();
+    // Quiet ticks (no invoices in scope) stay at debug; non-empty ticks
+    // log at info so the operator can see the address scan is alive
+    // without sifting through verbose-mode logs.
+    if n_total > 0 {
+        tracing::info!(
+            event = "chain_watcher_invoice_scan_tick",
+            tier = tier,
+            scanned = n_total,
+            hits = hits,
+            elapsed_ms = elapsed_ms,
+            "chain_watcher: invoice address scan tick"
+        );
+    } else {
+        tracing::debug!(
+            "chain_watcher: {} invoice address scan {} addrs, {} hits, {}ms",
+            tier, n_total, hits, elapsed_ms
+        );
     }
 }
 

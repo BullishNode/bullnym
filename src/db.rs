@@ -1891,8 +1891,7 @@ pub async fn list_invoices_by_npub(
 ///
 /// Scoped to the legacy descriptor-allocator path
 /// (`liquid_address_index IS NOT NULL`) — wallet-supplied invoices
-/// (`liquid_address_index IS NULL`) are not returned here; Step 11's
-/// address-keyed scan covers those.
+/// (`liquid_address_index IS NULL`) are covered by `list_unpaid_invoices_with_liquid_address`.
 pub async fn list_unpaid_invoice_liquid_addresses(
     pool: &PgPool,
     nym_owner: &str,
@@ -1908,6 +1907,36 @@ pub async fn list_unpaid_invoice_liquid_addresses(
          ORDER BY liquid_address_index ASC",
     )
     .bind(nym_owner)
+    .fetch_all(pool)
+    .await
+}
+
+/// Address-keyed scan for the chain watcher: every unpaid/in_progress
+/// invoice with a settable Liquid address, regardless of nym_owner (so
+/// linked + unlinked are covered uniformly) and regardless of how the
+/// address was sourced (descriptor allocator OR wallet-supplied).
+///
+/// `ORDER BY created_at ASC` is the multi-rail defense: in the
+/// vanishingly unlikely event two invoices ever share an address, the
+/// older one wins. `mark_invoice_paid`'s idempotent guard then keeps the
+/// other from also flipping. Bounded by `LIMIT 1000` so a runaway
+/// invoice pipeline can't blow the watcher's per-tick budget; the next
+/// tick re-queries.
+///
+/// Returned shape: `(invoice_id, liquid_address, amount_sat)`.
+pub async fn list_unpaid_invoices_with_liquid_address(
+    pool: &PgPool,
+) -> Result<Vec<(Uuid, String, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, String, i64)>(
+        "SELECT id, liquid_address, amount_sat \
+         FROM invoices \
+         WHERE status IN ('unpaid', 'in_progress') \
+           AND accept_liquid = TRUE \
+           AND liquid_address IS NOT NULL \
+           AND expires_at > NOW() \
+         ORDER BY created_at ASC \
+         LIMIT 1000",
+    )
     .fetch_all(pool)
     .await
 }
