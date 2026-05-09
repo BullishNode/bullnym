@@ -22,6 +22,7 @@ pub mod reconciler;
 pub mod registration;
 pub mod reserved_nyms;
 pub mod utxo;
+pub mod validators;
 
 use std::sync::Arc;
 

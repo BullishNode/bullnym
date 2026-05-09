@@ -2621,6 +2621,7 @@ dependencies = [
  "askama_axum",
  "async-trait",
  "axum",
+ "bitcoin",
  "boltz-client",
  "dashmap",
  "dotenvy",

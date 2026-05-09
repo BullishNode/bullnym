@@ -8,6 +8,9 @@ axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full", "signal"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migrate", "json"] }
 lwk_wollet = "0.14.0"
+# Bitcoin mainnet address validation for invoice handlers (validators.rs).
+# Only needed for parse + network-discriminate; no chainstate, no descriptors.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 boltz-client = { path = "../boltz/boltz-rust", features = ["electrum"] }
 secp256k1 = { version = "0.29", features = ["global-context"] }
 serde = { version = "1", features = ["derive"] }

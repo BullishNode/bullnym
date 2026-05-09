@@ -172,12 +172,15 @@ fn validate_lengths(req: &SaveDonationPageRequest) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Build the v1-signing payload fields in fixed order. The order MUST stay
-/// in lockstep with the mobile (`donation_page_constants.dart::buildSaveFields`).
+/// Build the v2-signing payload fields in fixed order — POST-NYM fields only.
+/// The nym is the first signed field but is passed to `verify_la_v2` as the
+/// explicit `nym_or_empty` parameter, NOT as part of `payload_fields`.
+///
+/// The order MUST stay in lockstep with the mobile
+/// (`donation_page_constants.dart::buildSavePayloadFields`).
 /// Optional fields that are absent become empty strings (NOT skipped) so the
 /// number and order of NUL separators is invariant to which fields are set.
 fn save_payload_fields<'a>(
-    nym: &'a str,
     header: &'a str,
     description: &'a str,
     display_currency: &'a str,
@@ -185,9 +188,8 @@ fn save_payload_fields<'a>(
     twitter: &'a str,
     instagram: &'a str,
     enabled_str: &'a str,
-) -> [&'a str; 8] {
+) -> [&'a str; 7] {
     [
-        nym,
         header,
         description,
         display_currency,
@@ -248,7 +250,6 @@ pub async fn save(
     let instagram = req.instagram.as_deref().unwrap_or("");
     let enabled_str = if req.enabled { "1" } else { "0" };
     let fields = save_payload_fields(
-        &req.nym,
         &req.header,
         &req.description,
         &req.display_currency,
@@ -257,9 +258,10 @@ pub async fn save(
         instagram,
         enabled_str,
     );
-    auth::verify_la_v1(
+    auth::verify_la_v2(
         ACTION_SAVE,
         &req.npub,
+        &req.nym,
         &fields,
         req.timestamp,
         &req.signature,
@@ -305,10 +307,11 @@ pub async fn archive(
         }
     }
 
-    auth::verify_la_v1(
+    auth::verify_la_v2(
         ACTION_ARCHIVE,
         &req.npub,
-        &[&req.nym],
+        &req.nym,
+        &[],
         req.timestamp,
         &req.signature,
     )?;
@@ -436,10 +439,11 @@ pub async fn upload_image(
     // the sig before computing the file's actual SHA-256 means an
     // attacker can't burn server CPU on a 2 MiB file hash with an
     // invalid sig.
-    auth::verify_la_v1(
+    auth::verify_la_v2(
         ACTION_IMAGE,
         &npub,
-        &[&nym, kind.as_str(), &claimed_sha],
+        &nym,
+        &[kind.as_str(), &claimed_sha],
         timestamp,
         &signature,
     )?;
@@ -581,7 +585,6 @@ mod tests {
     #[test]
     fn save_payload_fields_fixed_order() {
         let fields = save_payload_fields(
-            "alice",
             "Alice's Coffee",
             "Buy me a coffee!",
             "USD",
@@ -590,52 +593,54 @@ mod tests {
             "alice_ig",
             "1",
         );
-        assert_eq!(fields.len(), 8);
-        assert_eq!(fields[0], "alice");
-        assert_eq!(fields[3], "USD");
-        assert_eq!(fields[7], "1");
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[0], "Alice's Coffee");
+        assert_eq!(fields[2], "USD");
+        assert_eq!(fields[6], "1");
     }
 
-    /// Byte-exact contract test for the v1 signing protocol.
+    /// Byte-exact contract test for the v2 signing protocol.
     ///
-    /// The mobile builds the same v1 message with its own helper
-    /// (`donation_page_constants.dart::buildSaveFields` + the v1 wire
-    /// format from `lightning_address_v1_signing.dart`). Any reordering
-    /// of fields here MUST be matched on the mobile side or every signed
-    /// save from production wallets silently breaks.
+    /// The mobile builds the same v2 message with its own helper
+    /// (`core/nostr/bullpay_la_v2_signing.dart`). Any reordering of fields
+    /// here MUST be matched on the mobile side or every signed save from
+    /// production wallets silently breaks.
     ///
     /// This test pins the EXACT byte sequence that gets fed to SHA-256
     /// before Schnorr signing, for a known input vector. If a future
     /// commit changes field order or separator semantics, this test
     /// fails noisily and the breaking change is forced into the diff.
     #[test]
-    fn v1_save_message_byte_exact_contract() {
+    fn v2_save_message_byte_exact_contract() {
         let fields = save_payload_fields(
-            "alice",          // nym
-            "Alice's Coffee", // header
-            "Buy me a coffee!", // description
-            "USD",            // display_currency
+            "Alice's Coffee",        // header
+            "Buy me a coffee!",      // description
+            "USD",                   // display_currency
             "https://alice.example", // website
-            "alice",          // twitter
-            "alice_ig",       // instagram
-            "1",              // enabled
+            "alice",                 // twitter
+            "alice_ig",              // instagram
+            "1",                     // enabled
         );
         let npub = "00".repeat(32); // 64 hex chars
         let timestamp: u64 = 1_700_000_000;
-        let msg = crate::auth::build_la_v1_message(
+        let msg = crate::auth::build_la_v2_message(
             ACTION_SAVE,
             &npub,
+            "alice",
             &fields,
             timestamp,
         );
 
-        // Expected layout: bullpay-la-v1\0donation-page-save\0<npub>\0<f1>\0<f2>\0...\0<f8>\0<ts>
+        // Expected layout:
+        //   bullpay-la-v2\0donation-page-save\0<npub>\0alice\0<f1>\0...\0<f7>\0<ts>
         let mut expected: Vec<u8> = Vec::new();
-        expected.extend_from_slice(b"bullpay-la-v1");
+        expected.extend_from_slice(b"bullpay-la-v2");
         expected.push(0);
         expected.extend_from_slice(b"donation-page-save");
         expected.push(0);
         expected.extend_from_slice(npub.as_bytes());
+        expected.push(0);
+        expected.extend_from_slice(b"alice");
         expected.push(0);
         for f in &fields {
             expected.extend_from_slice(f.as_bytes());
@@ -643,24 +648,25 @@ mod tests {
         }
         expected.extend_from_slice(b"1700000000");
 
-        assert_eq!(msg, expected, "v1 byte order regression");
-        // 1 (after domain) + 1 (after action) + 1 (after npub) + 8 (after each field)
+        assert_eq!(msg, expected, "v2 byte order regression");
+        // 1 (after domain) + 1 (after action) + 1 (after npub) + 1 (after nym) + 7 (after each field)
         assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 11);
     }
 
     #[test]
-    fn v1_archive_message_byte_exact_contract() {
+    fn v2_archive_message_byte_exact_contract() {
         let npub = "ab".repeat(32);
         let timestamp: u64 = 1_700_000_000;
-        let msg = crate::auth::build_la_v1_message(
+        let msg = crate::auth::build_la_v2_message(
             ACTION_ARCHIVE,
             &npub,
-            &["alice"],
+            "alice",
+            &[],
             timestamp,
         );
 
         let mut expected: Vec<u8> = Vec::new();
-        expected.extend_from_slice(b"bullpay-la-v1");
+        expected.extend_from_slice(b"bullpay-la-v2");
         expected.push(0);
         expected.extend_from_slice(b"donation-page-archive");
         expected.push(0);
@@ -670,24 +676,25 @@ mod tests {
         expected.push(0);
         expected.extend_from_slice(b"1700000000");
 
-        assert_eq!(msg, expected, "v1 archive byte order regression");
+        assert_eq!(msg, expected, "v2 archive byte order regression");
     }
 
     #[test]
-    fn v1_image_message_byte_exact_contract() {
+    fn v2_image_message_byte_exact_contract() {
         let npub = "cd".repeat(32);
         let timestamp: u64 = 1_700_000_000;
         // SHA-256 of "test bytes" (lowercase hex)
         let sha256_hex = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
-        let msg = crate::auth::build_la_v1_message(
+        let msg = crate::auth::build_la_v2_message(
             ACTION_IMAGE,
             &npub,
-            &["alice", "avatar", sha256_hex],
+            "alice",
+            &["avatar", sha256_hex],
             timestamp,
         );
 
         let mut expected: Vec<u8> = Vec::new();
-        expected.extend_from_slice(b"bullpay-la-v1");
+        expected.extend_from_slice(b"bullpay-la-v2");
         expected.push(0);
         expected.extend_from_slice(b"donation-page-image");
         expected.push(0);
@@ -701,7 +708,7 @@ mod tests {
         expected.push(0);
         expected.extend_from_slice(b"1700000000");
 
-        assert_eq!(msg, expected, "v1 image byte order regression");
+        assert_eq!(msg, expected, "v2 image byte order regression");
     }
 
     fn make_req() -> SaveDonationPageRequest {

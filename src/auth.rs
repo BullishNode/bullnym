@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // 300s vs NIP-98's 60s default: mobile clocks drift more than desktop.
 pub const LA_AUTH_TS_WINDOW_SECS: u64 = 300;
 
-pub const LA_SIG_DOMAIN_TAG: &[u8] = b"bullpay-la-v1";
+pub const LA_SIG_DOMAIN_TAG: &[u8] = b"bullpay-la-v2";
 
 pub fn verify_signature(npub_hex: &str, message: &[u8], signature_hex: &str) -> Result<(), AppError> {
     let secp = Secp256k1::verification_only();
@@ -25,20 +25,31 @@ pub fn verify_signature(npub_hex: &str, message: &[u8], signature_hex: &str) -> 
         .map_err(|_| AppError::AuthError("signature verification failed".to_string()))
 }
 
-// Wire format mirrored in mobile `lightning_address_v1_signing.dart`:
-// `<domain>\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>`.
-pub fn build_la_v1_message(
+// Wire format mirrored in mobile `core/nostr/bullpay_la_v2_signing.dart`:
+//   `<domain>\x00<action>\x00<npub_hex>\x00<nym_or_empty>\x00(<field>\x00)*<timestamp>`.
+//
+// The first payload field is ALWAYS the nym, possibly empty for unlinked
+// (npub-keyed) actions like invoice-create / invoice-cancel / invoice-list.
+// `payload_fields` are the fields AFTER nym.
+pub fn build_la_v2_message(
     action: &str,
     npub_hex: &str,
+    nym_or_empty: &str,
     payload_fields: &[&str],
     timestamp: u64,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(64 + payload_fields.iter().map(|f| f.len() + 1).sum::<usize>());
+    let extra_field_bytes: usize = payload_fields.iter().map(|f| f.len() + 1).sum();
+    let mut msg = Vec::with_capacity(
+        LA_SIG_DOMAIN_TAG.len() + action.len() + npub_hex.len() + nym_or_empty.len()
+            + extra_field_bytes + 32,
+    );
     msg.extend_from_slice(LA_SIG_DOMAIN_TAG);
     msg.push(0);
     msg.extend_from_slice(action.as_bytes());
     msg.push(0);
     msg.extend_from_slice(npub_hex.as_bytes());
+    msg.push(0);
+    msg.extend_from_slice(nym_or_empty.as_bytes());
     msg.push(0);
     for field in payload_fields {
         msg.extend_from_slice(field.as_bytes());
@@ -59,15 +70,21 @@ pub fn check_ts_freshness(ts: u64) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn verify_la_v1(
+/// Verify a v2 signed action.
+///
+/// `nym_or_empty` is the FIRST payload field in the signed byte sequence and
+/// must be passed explicitly to make the empty-nym (unlinked) case
+/// unmistakable at every call site.
+pub fn verify_la_v2(
     action: &str,
     npub_hex: &str,
+    nym_or_empty: &str,
     payload_fields: &[&str],
     timestamp: u64,
     signature_hex: &str,
 ) -> Result<(), AppError> {
     check_ts_freshness(timestamp)?;
-    let msg = build_la_v1_message(action, npub_hex, payload_fields, timestamp);
+    let msg = build_la_v2_message(action, npub_hex, nym_or_empty, payload_fields, timestamp);
     verify_signature(npub_hex, &msg, signature_hex)
 }
 
@@ -140,47 +157,107 @@ mod tests {
     }
 
     #[test]
-    fn v1_message_format_is_nul_separated_and_domain_tagged() {
-        let msg = build_la_v1_message("register", "abcd", &["alice", "ct(...)"], 1700000000);
+    fn v2_message_format_is_nul_separated_and_domain_tagged() {
+        // register: nym='alice', payload=[ct_descriptor]. NUL count:
+        //   domain\0 action\0 npub\0 nym\0 ct\0 -> 5 NULs before timestamp.
+        let msg = build_la_v2_message(
+            "register",
+            "abcd",
+            "alice",
+            &["ct(...)"],
+            1700000000,
+        );
         assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 5);
         assert!(msg.starts_with(LA_SIG_DOMAIN_TAG));
-        let delete_msg = build_la_v1_message("delete", "abcd", &[], 1700000000);
-        assert_eq!(delete_msg.iter().filter(|&&b| b == 0).count(), 3);
+
+        // delete: nym='alice', payload=[]. NUL count:
+        //   domain\0 action\0 npub\0 nym\0 -> 4 NULs before timestamp.
+        let delete_msg = build_la_v2_message("delete", "abcd", "alice", &[], 1700000000);
+        assert_eq!(delete_msg.iter().filter(|&&b| b == 0).count(), 4);
     }
 
     #[test]
-    fn v1_signature_round_trip() {
+    fn v2_empty_nym_is_first_class() {
+        // invoice-create with empty nym (unlinked invoice):
+        //   domain\0 action\0 npub\0 \0 amount\0 -> 5 NULs before timestamp.
+        let msg = build_la_v2_message(
+            "invoice-create",
+            "abcd",
+            "",
+            &["100000"],
+            1700000000,
+        );
+        assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 5);
+        // The empty-nym slot MUST be present (two consecutive NULs after npub).
+        let domain_end = LA_SIG_DOMAIN_TAG.len();
+        let action = b"invoice-create";
+        let prefix_len = domain_end + 1 + action.len() + 1 + 4 + 1; // domain\0 action\0 npub\0
+        assert_eq!(msg[prefix_len], 0, "empty nym slot must be a single NUL");
+    }
+
+    #[test]
+    fn v2_signature_round_trip() {
         let (keypair, npub) = test_keypair();
         let ts = now_secs();
-        let msg = build_la_v1_message("register", &npub, &["alice", "ct(xpub...)"], ts);
+        let msg = build_la_v2_message("register", &npub, "alice", &["ct(xpub...)"], ts);
         let sig = sign_message(&keypair, &msg);
-        assert!(verify_la_v1("register", &npub, &["alice", "ct(xpub...)"], ts, &sig).is_ok());
+        assert!(verify_la_v2("register", &npub, "alice", &["ct(xpub...)"], ts, &sig).is_ok());
     }
 
     #[test]
-    fn v1_cross_action_replay_rejected() {
+    fn v2_empty_nym_round_trip() {
         let (keypair, npub) = test_keypair();
         let ts = now_secs();
-        let register_msg = build_la_v1_message("register", &npub, &["alice", "ct"], ts);
-        let sig = sign_message(&keypair, &register_msg);
-        assert!(verify_la_v1("delete", &npub, &[], ts, &sig).is_err());
+        let msg = build_la_v2_message("invoice-create", &npub, "", &["100000"], ts);
+        let sig = sign_message(&keypair, &msg);
+        assert!(verify_la_v2("invoice-create", &npub, "", &["100000"], ts, &sig).is_ok());
     }
 
     #[test]
-    fn v1_stale_timestamp_rejected() {
+    fn v2_cross_action_replay_rejected() {
+        let (keypair, npub) = test_keypair();
+        let ts = now_secs();
+        let register_msg = build_la_v2_message("register", &npub, "alice", &["ct"], ts);
+        let sig = sign_message(&keypair, &register_msg);
+        // Same nym, same fields, different action — must NOT validate.
+        assert!(verify_la_v2("delete", &npub, "alice", &[], ts, &sig).is_err());
+    }
+
+    #[test]
+    fn v2_nym_swap_replay_rejected() {
+        // A signature for nym='alice' must NOT validate as nym='bob'.
+        let (keypair, npub) = test_keypair();
+        let ts = now_secs();
+        let alice_msg = build_la_v2_message("register", &npub, "alice", &["ct"], ts);
+        let sig = sign_message(&keypair, &alice_msg);
+        assert!(verify_la_v2("register", &npub, "bob", &["ct"], ts, &sig).is_err());
+    }
+
+    #[test]
+    fn v2_empty_to_nonempty_nym_replay_rejected() {
+        // A signature with empty nym must NOT validate against a non-empty nym.
+        let (keypair, npub) = test_keypair();
+        let ts = now_secs();
+        let unlinked_msg = build_la_v2_message("invoice-create", &npub, "", &["100000"], ts);
+        let sig = sign_message(&keypair, &unlinked_msg);
+        assert!(verify_la_v2("invoice-create", &npub, "alice", &["100000"], ts, &sig).is_err());
+    }
+
+    #[test]
+    fn v2_stale_timestamp_rejected() {
         let (keypair, npub) = test_keypair();
         let stale_ts = now_secs() - LA_AUTH_TS_WINDOW_SECS - 60;
-        let msg = build_la_v1_message("register", &npub, &["alice", "ct"], stale_ts);
+        let msg = build_la_v2_message("register", &npub, "alice", &["ct"], stale_ts);
         let sig = sign_message(&keypair, &msg);
-        assert!(verify_la_v1("register", &npub, &["alice", "ct"], stale_ts, &sig).is_err());
+        assert!(verify_la_v2("register", &npub, "alice", &["ct"], stale_ts, &sig).is_err());
     }
 
     #[test]
-    fn v1_future_timestamp_outside_window_rejected() {
+    fn v2_future_timestamp_outside_window_rejected() {
         let (keypair, npub) = test_keypair();
         let future_ts = now_secs() + LA_AUTH_TS_WINDOW_SECS + 60;
-        let msg = build_la_v1_message("register", &npub, &["alice", "ct"], future_ts);
+        let msg = build_la_v2_message("register", &npub, "alice", &["ct"], future_ts);
         let sig = sign_message(&keypair, &msg);
-        assert!(verify_la_v1("register", &npub, &["alice", "ct"], future_ts, &sig).is_err());
+        assert!(verify_la_v2("register", &npub, "alice", &["ct"], future_ts, &sig).is_err());
     }
 }

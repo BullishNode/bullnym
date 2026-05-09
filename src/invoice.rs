@@ -1,35 +1,31 @@
-//! Invoices: unified payment-intent abstraction (Phase B).
+//! Invoices: unified payment-intent abstraction.
 //!
-//! Anonymous (sender-side) endpoints in this module:
+//! Three entry families share this module:
 //!
-//! - `POST /<nym>/invoice` — anonymous browser creates a checkout-origin
-//!   invoice. Body is JSON: `{ amount_sat }` OR
-//!   `{ fiat_amount_minor, fiat_currency }`. Returns `{ invoice_id }`.
-//!   Page navigates to `/<nym>/i/<id>`.
-//! - `GET /<nym>/i/<id>` — renders the payment view (Askama HTML). The
-//!   B9 template polishes this; the B4 stub is minimal and lives at
-//!   `templates/invoice_payment.html`.
-//! - `GET /api/v1/invoices/<id>/status` — polled by the page; returns
-//!   the current invoice state plus the latest Lightning BOLT11. Runs
-//!   the on-demand rate-refresh inline for fiat-denominated invoices
-//!   when the rate-lock has elapsed.
-//! - `POST /api/v1/invoices/<id>/lightning` — lazy-create the Lightning
-//!   offer if one doesn't exist yet. (Unlike donation-callback, the
-//!   default Phase-B flow eagerly creates the offer on
-//!   `POST /<nym>/invoice`; this endpoint exists for sat-denom invoices
-//!   that may have been created without the eager fetch, and for future
-//!   wallet-origin invoices.)
-//! - `POST /api/v1/invoices/<id>/liquid` — lazy-allocate the Liquid
-//!   address on first rail toggle. Idempotent — re-call returns the same
-//!   address.
+//! 1. **Anonymous (sender-side) checkout** — payment-page-driven:
+//!    - `POST /<nym>/invoice` body `{ amount_sat | (fiat_amount_minor + fiat_currency) }`
+//!    - `GET /<nym>/i/<id>` HTML render
 //!
-//! Schnorr-signed (recipient-side) endpoints arrive in B5 and live in
-//! the same module: `POST/DELETE/GET /api/v1/<nym>/invoices`.
+//! 2. **Public unlinked render** — wallet-only invoices that aren't shared via
+//!    a payment page:
+//!    - `GET /invoice/<id>` HTML render
+//!    - `GET /robots.txt` for the indexing posture
 //!
-//! Rate-limit gates currently reuse the existing `donation_callback` /
-//! `donation_status` / `donation_distinct_addrs` buckets. Phase B step 8
-//! introduces dedicated `check_invoice_create_per_source` (5/min) and
-//! per-npub gates and re-wires these handlers.
+//! 3. **Schnorr-signed (recipient-side, wallet)** endpoints:
+//!    - `POST   /api/v1/<nym>/invoices`     — linked invoice-create
+//!    - `POST   /api/v1/invoices`           — unlinked invoice-create
+//!    - `DELETE /api/v1/<nym>/invoices/<id>`— linked invoice-cancel
+//!    - `DELETE /api/v1/invoices/<id>`      — unlinked invoice-cancel
+//!    - `GET    /api/v1/invoices?npub=...`  — npub-keyed list (linked + unlinked)
+//!
+//! Both create paths verify a v2 Schnorr signature BEFORE any DB write, with
+//! the `nym_or_empty` slot driving the linked vs unlinked branch.
+//!
+//! Status-poll + Lightning lazy-fetch + Liquid lazy-allocation helpers remain
+//! shared across linked and unlinked invoices via `id`-only paths:
+//!    - `GET  /api/v1/invoices/<id>/status`
+//!    - `POST /api/v1/invoices/<id>/lightning`
+//!    - `POST /api/v1/invoices/<id>/liquid`  → 410 Gone (wallet supplies addr at create time)
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -37,7 +33,7 @@ use std::time::SystemTime;
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -46,18 +42,17 @@ use uuid::Uuid;
 
 use crate::auth;
 use crate::db;
-use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::validators;
 use crate::AppState;
 
 // =====================================================================
-// Action constants (v1 Schnorr signing)
+// Action constants (v2 Schnorr signing)
 //
 // Wire-protocol identifiers — must match mobile's
-// `invoice_constants.dart::INVOICE_*_ACTION`. Renaming any of these is a
-// wire-breaking change requiring lockstep mobile-server deploy. The plan
-// (Phase D note) explicitly opts out of renames for stability.
+// `core/nostr/bullpay_la_v2_signing.dart`. Renaming any of these is a
+// wire-breaking change requiring lockstep mobile-server deploy.
 // =====================================================================
 
 pub const ACTION_CREATE: &str = "invoice-create";
@@ -67,16 +62,36 @@ pub const ACTION_LIST: &str = "invoice-list";
 /// Hard upper bound on wallet-origin invoice expiry (30 days). Mobile is
 /// the source of the requested expiry (`expires_at_unix`); the server
 /// clamps to this ceiling so a runaway or malicious client cannot pin a
-/// row indefinitely. Plan defaults (1h / 24h / 7d) are mobile UI choices
-/// that fall under this cap.
+/// row indefinitely.
 const MAX_WALLET_EXPIRES_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Default cap on `list_invoices.limit`. Mobile can request a smaller
 /// page size; never larger.
 const LIST_LIMIT_MAX: i64 = 100;
 
+/// Default outer expiry for checkout-origin invoices. Matches the LNURL
+/// reverse-swap timebox; the donator should be done in well under an hour.
+const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 60 * 60;
+
+/// Inner rate-lock window for fiat-denominated invoices. The status
+/// endpoint refreshes the sat amount on the first poll after this elapses.
+const FIAT_RATE_LOCK_SECS: i64 = 15 * 60;
+
+/// Don't refresh the rate if the invoice is about to expire — the new
+/// BOLT11 would be worth less than nothing.
+const REFRESH_SAFETY_MARGIN_SECS: i64 = 60;
+
+/// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
+/// audit-greppable.
+const SAT_PER_BTC: i64 = 100_000_000;
+
+/// Per-field length caps for wallet-origin invoice fields.
+const PUBLIC_DESCRIPTION_MAX: usize = 1000;
+const RECIPIENT_LABEL_MAX: usize = 100;
+const INVOICE_NUMBER_MAX: usize = 50;
+
 // =====================================================================
-// Settlement hook (Phase B step 7)
+// Settlement hook (called by claimer/reconciler on Lightning settlement)
 // =====================================================================
 
 /// Flip an invoice via `mark_invoice_paid` after the corresponding
@@ -90,13 +105,7 @@ const LIST_LIMIT_MAX: i64 = 100;
 /// - `mark_invoice_paid` is idempotent: a 0-rows-affected return means
 ///   the invoice was already in a non-unpaid status (paid/under/over/
 ///   expired/cancelled). Logged at debug, not warn.
-/// - On error: LOG and RETURN. Never propagate. The donator's view is
-///   "did I pay" → that's already settled by the (committed) swap state
-///   update. A failed invoice flip is observability noise; the next
-///   webhook/reconciler tick re-fires this helper (via the `unpaid`
-///   predicate) and self-heals.
-///
-/// `boltz_swap_id` is included for log correlation; not load-bearing.
+/// - On error: LOG and RETURN. Never propagate.
 pub async fn flip_invoice_on_lightning_settlement(
     pool: &sqlx::PgPool,
     invoice_id: Option<Uuid>,
@@ -117,7 +126,6 @@ pub async fn flip_invoice_on_lightning_settlement(
             );
         }
         Ok(_) => {
-            // Already terminal (paid/under/over/expired/cancelled). Quiet.
             tracing::debug!(
                 event = "invoice_flip_noop",
                 invoice_id = %id,
@@ -126,9 +134,6 @@ pub async fn flip_invoice_on_lightning_settlement(
             );
         }
         Err(e) => {
-            // Swap state has already been CAS'd successfully; rolling
-            // back here is impossible. Log loudly and trust the next
-            // tick (or webhook delivery) to retry.
             tracing::error!(
                 event = "invoice_flip_failed",
                 invoice_id = %id,
@@ -141,28 +146,6 @@ pub async fn flip_invoice_on_lightning_settlement(
 }
 
 // =====================================================================
-// Constants
-// =====================================================================
-
-/// Default outer expiry for checkout-origin invoices. Matches the LNURL
-/// reverse-swap timebox; the donator should be done in well under an hour.
-const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 60 * 60;
-
-/// Inner rate-lock window for fiat-denominated invoices. The status
-/// endpoint refreshes the sat amount on the first poll after this elapses.
-const FIAT_RATE_LOCK_SECS: i64 = 15 * 60;
-
-/// Don't refresh the rate if the invoice is about to expire — the new
-/// BOLT11 would be worth less than nothing. The page renders the existing
-/// (stale) amount with a warning, and the invoice falls to `expired` at
-/// the next GC sweep.
-const REFRESH_SAFETY_MARGIN_SECS: i64 = 60;
-
-/// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
-/// audit-greppable.
-const SAT_PER_BTC: i64 = 100_000_000;
-
-// =====================================================================
 // Helpers
 // =====================================================================
 
@@ -173,6 +156,17 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Last 8 chars of an npub for log correlation. Full npub stays out of
+/// logs to honor the discipline outlined in the get-paid plan (F2).
+fn npub_log_tag(npub: &str) -> &str {
+    let len = npub.len();
+    if len > 8 {
+        &npub[len - 8..]
+    } else {
+        npub
+    }
+}
+
 /// Parse the Uuid path parameter, returning `InvoiceNotFound` (NOT
 /// `InvalidAmount` or 400) on parse failure. Reason: a malformed id is
 /// information-equivalent to an unknown id from the caller's perspective,
@@ -181,7 +175,10 @@ fn parse_invoice_id(s: &str) -> Result<Uuid, AppError> {
     Uuid::from_str(s).map_err(|_| AppError::InvoiceNotFound(s.to_string()))
 }
 
-/// Defensive HTML response headers. Mirrors `donation_render`'s posture.
+/// Defensive HTML response headers for invoice-render handlers. Adds
+/// indexing + caching posture beyond `donation_render`'s baseline so the
+/// invoice page (which is reachable at a guessable URL) cannot be
+/// indexed by crawlers and cannot be served from intermediate caches.
 fn html_response(html: String) -> Response {
     let mut resp = (StatusCode::OK, html).into_response();
     let h = resp.headers_mut();
@@ -200,6 +197,32 @@ fn html_response(html: String) -> Response {
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    h.insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow"),
+    );
+    resp
+}
+
+// =====================================================================
+// GET /robots.txt
+// =====================================================================
+
+/// Disallow indexing of the entire pay-service domain. Public LNURL
+/// endpoints are not indexable in any meaningful sense; the payment-page
+/// surface area renders user-supplied content and is private to whoever
+/// holds the URL.
+pub async fn robots_txt() -> Response {
+    let body = "User-agent: *\nDisallow: /\n";
+    let mut resp = (StatusCode::OK, body).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     resp
 }
@@ -237,10 +260,6 @@ pub async fn create_anonymous(
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
 
-    // Rate-limit BEFORE any DB write. Dedicated invoice-create bucket
-    // (5/min per source per the plan) — tighter than the 30/min
-    // donation_callback bucket because each successful create is a DB
-    // write + Boltz reverse-swap allocation.
     if !is_whitelisted {
         if let Some(ip) = ip {
             state
@@ -250,26 +269,29 @@ pub async fn create_anonymous(
         }
     }
 
-    // Validate input shape + amounts. Returns (sat_amount, optional fiat triple).
     let (amount_sat, fiat) = parse_create_request(&req, &state).await?;
 
-    // Verify the store is live (donation_pages row exists, enabled, not archived).
+    // Verify the store is live AND resolve the page owner's npub for the
+    // canonical invoice identity. The page→user join is required because
+    // donation_pages doesn't store npub directly.
     let page = db::get_donation_page_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
     if !page.enabled || page.is_archived {
         return Err(AppError::DonationPageNotFound(nym.clone()));
     }
+    let owner = db::get_user_by_nym(&state.db, &nym)
+        .await?
+        .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
     let new_invoice = db::NewInvoice {
-        nym: &nym,
+        nym_owner: Some(&nym),
+        npub_owner: &owner.npub,
         origin: "checkout",
         fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),
         fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
         amount_sat,
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
-        // Sat-denom: rate_lock_secs = expires_in_secs (so rate_locks_until ==
-        // expires_at, refresh path naturally never fires).
         rate_lock_secs: if fiat.is_some() {
             FIAT_RATE_LOCK_SECS
         } else {
@@ -277,15 +299,20 @@ pub async fn create_anonymous(
         },
         memo: None,
         recipient_label: None,
+        public_description: None,
+        invoice_number: None,
+        // Checkout-origin: BTC on-chain not exposed in v1; LN+Liquid via
+        // legacy descriptor allocator (lazy-allocated on first rail toggle).
+        accept_btc: false,
+        accept_ln: true,
+        accept_liquid: true,
+        bitcoin_address: None,
+        liquid_address: None,
         expires_in_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    // Eagerly create the Lightning offer so the page renders a QR
-    // immediately on /<nym>/i/<id> without an extra round-trip.
-    if let Err(e) = create_lightning_offer(&state, &nym, amount_sat as u64, invoice.id).await {
-        // Non-fatal: the page can lazy-fetch via POST /api/v1/invoices/<id>/lightning.
-        // We still return the invoice_id so the user can proceed.
+    if let Err(e) = create_lightning_offer(&state, &nym, amount_sat as u64, &invoice).await {
         tracing::warn!(
             invoice_id = %invoice.id,
             "eager Lightning offer creation failed (page can retry): {e}",
@@ -298,16 +325,6 @@ pub async fn create_anonymous(
 /// Validate the create-anonymous body and resolve the requested amount.
 ///
 /// Returns `(amount_sat, Option<(fiat_amount_minor, fiat_currency, rate_minor_per_btc)>)`.
-///
-/// Rules:
-/// - Exactly one of `amount_sat` or `(fiat_amount_minor + fiat_currency)`
-///   must be present; both or neither → `InvalidAmount`.
-/// - `amount_sat` must be within configured min/max sendable.
-/// - `fiat_amount_minor` must be > 0; `fiat_currency` must be a supported
-///   ISO 4217 code (validated by the schema CHECK + here for early reject).
-/// - On fiat path: pricer must return a fresh (non-stale) rate; falling
-///   back to a stale rate at create-time would lock the invoice at a stale
-///   rate the refresh loop would immediately re-quote.
 async fn parse_create_request(
     req: &CreateAnonymousRequest,
     state: &AppState,
@@ -341,7 +358,6 @@ async fn parse_create_request(
         return Ok((sat, None));
     }
 
-    // Fiat path: both fields required.
     let minor = req.fiat_amount_minor.ok_or_else(|| {
         AppError::InvalidAmount("missing fiat_amount_minor".into())
     })?;
@@ -351,10 +367,6 @@ async fn parse_create_request(
     if minor <= 0 {
         return Err(AppError::InvalidAmount("fiat_amount_minor must be > 0".into()));
     }
-    // Defensive upper bound: 1 billion minor units. With 2-decimal currencies
-    // (USD/CAD/EUR) that's $10M; with no decimals (e.g. JPY) that's 1B JPY.
-    // Prevents an overflow path through the SAT_PER_BTC multiplication below
-    // and short-circuits comically-large requests before pricer/Boltz spend.
     const MAX_FIAT_MINOR: i32 = 1_000_000_000;
     if minor > MAX_FIAT_MINOR {
         return Err(AppError::InvalidAmount(format!(
@@ -362,9 +374,6 @@ async fn parse_create_request(
         )));
     }
 
-    // Fetch the rate at creation time. We require a fresh rate here —
-    // creating with a stale rate would lock the invoice at a value the
-    // refresh loop would immediately re-quote.
     let rate = state.pricer.get_rate(currency).await.ok_or_else(|| {
         AppError::ServiceUnavailable("pricer unavailable for invoice creation".into())
     })?;
@@ -400,34 +409,26 @@ async fn parse_create_request(
 }
 
 // =====================================================================
-// GET /<nym>/i/<id> — render the payment view
+// GET /<nym>/i/<id> — render the linked payment view
 // =====================================================================
 
 #[derive(Template)]
 #[template(path = "invoice_payment.html")]
 struct InvoicePaymentTpl<'a> {
+    /// Nym for the linked render path; empty string for unlinked. Templates
+    /// gate URL construction on `is_unlinked` rather than this field.
     nym: &'a str,
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
     amount_sat: i64,
-    /// Pre-formatted "<major-amount> <currency>" string for the meta
-    /// line, so the template doesn't have to do per-currency precision
-    /// arithmetic. None for sat-denominated invoices.
     fiat_display: Option<String>,
-    /// True if the invoice is fiat-denominated (rate_minor_per_btc set).
-    /// Used by the JS countdown to decide whether to show "rate refreshes
-    /// in X" (fiat) or only "expires in X" (sat — never refreshes).
     is_fiat: bool,
 }
 
-/// Per-currency precision (minor units per major). Mirrors what the
-/// pricer reports for each supported currency. Centralized here so
-/// every fiat-rendering callsite uses the same conversion.
 fn currency_precision(currency: &str) -> u8 {
     match currency {
         "COP" => 0,
-        // USD/CAD/EUR/CRC/MXN/ARS/INR all 2-decimal.
         _ => 2,
     }
 }
@@ -453,18 +454,47 @@ pub async fn render_payment(
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
 
-    // Cross-nym lookup attempt: 404 with the same wire copy as missing-id.
-    if inv.nym != nym {
+    // Linked render path requires nym_owner == path nym. Cross-nym lookup
+    // (or unlinked invoice accessed via a /<nym>/i/<id> URL) returns 404
+    // with the same wire copy as missing-id.
+    if inv.nym_owner.as_deref() != Some(nym.as_str()) {
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
+    Ok(html_response(render_invoice_template(&state, &inv)?))
+}
+
+// =====================================================================
+// GET /invoice/<id> — render the unlinked (wallet-only) payment view
+// =====================================================================
+
+pub async fn render_unlinked_payment(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+) -> Result<Response, AppError> {
+    let id = parse_invoice_id(&id_str)?;
+    let inv = db::get_invoice_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+
+    // The unlinked render path serves both nym-linked AND nym-NULL invoices
+    // (the wallet may always share via /invoice/<id> regardless of linkage).
+    // Distinct handlers for the two paths only affect URL parsing.
+    Ok(html_response(render_invoice_template(&state, &inv)?))
+}
+
+fn render_invoice_template(
+    state: &AppState,
+    inv: &db::Invoice,
+) -> Result<String, AppError> {
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
     };
     let is_fiat = inv.rate_minor_per_btc.is_some();
+    let nym = inv.nym_owner.as_deref().unwrap_or("");
     let tpl = InvoicePaymentTpl {
-        nym: &inv.nym,
+        nym,
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
@@ -472,10 +502,8 @@ pub async fn render_payment(
         fiat_display,
         is_fiat,
     };
-    let html = tpl
-        .render()
-        .map_err(|e| AppError::DbError(format!("template render: {e}")))?;
-    Ok(html_response(html))
+    tpl.render()
+        .map_err(|e| AppError::DbError(format!("template render: {e}")))
 }
 
 // =====================================================================
@@ -494,8 +522,10 @@ pub struct InvoiceStatusResponse {
     pub paid_amount_sat: Option<i64>,
     pub lightning_pr: Option<String>,
     pub liquid_address: Option<String>,
-    /// True when fiat-denominated and the pricer is unavailable for a
-    /// scheduled refresh. Page surfaces a "rate may be stale" warning.
+    pub bitcoin_address: Option<String>,
+    pub accept_btc: bool,
+    pub accept_ln: bool,
+    pub accept_liquid: bool,
     pub rate_stale: bool,
 }
 
@@ -525,8 +555,6 @@ pub async fn status(
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
 
-    // On-demand rate refresh for fiat-denominated invoices when the rate-
-    // lock has elapsed AND there's enough headroom before outer expiry.
     let mut rate_stale = false;
     let now = unix_now();
     if inv.status == "unpaid"
@@ -569,21 +597,14 @@ pub async fn status(
         paid_amount_sat: inv.paid_amount_sat,
         lightning_pr,
         liquid_address: inv.liquid_address,
+        bitcoin_address: inv.bitcoin_address,
+        accept_btc: inv.accept_btc,
+        accept_ln: inv.accept_ln,
+        accept_liquid: inv.accept_liquid,
         rate_stale,
     }))
 }
 
-/// Refresh the rate on a fiat-denominated invoice: re-quote sats from the
-/// pricer, create a NEW Lightning swap pointing at this invoice, and
-/// update the invoice's rate fields. Concurrent refreshes are bounded by
-/// the existing `lightning_per_source` and pricer caches; the worst case
-/// is a duplicate swap_records row, which is harmless (lenient policy
-/// flips the invoice on either offer's settlement).
-///
-/// Returns:
-/// - `Ok(Some(refreshed_invoice))` on successful refresh.
-/// - `Ok(None)` when pricer is unreachable / stale / the invoice is no
-///   longer unpaid (status changed mid-refresh).
 async fn maybe_refresh_rate(
     state: &AppState,
     inv: &db::Invoice,
@@ -603,11 +624,8 @@ async fn maybe_refresh_rate(
         )));
     }
 
-    // Create a new Lightning swap for the refreshed amount. Errors here
-    // bubble — the caller marks rate_stale and returns the OLD amount,
-    // which is preferable to silently rotating the rate without a fresh
-    // BOLT11.
-    create_lightning_offer(state, &inv.nym, new_amount_sat as u64, inv.id).await?;
+    let nym = lightning_swap_nym(&state.db, inv).await?;
+    create_lightning_offer(state, &nym, new_amount_sat as u64, inv).await?;
 
     let updated = db::refresh_invoice_rate(
         &state.db,
@@ -670,14 +688,18 @@ pub async fn fetch_lightning_offer(
             inv.status
         )));
     }
+    if !inv.accept_ln {
+        return Err(AppError::InvalidAmount(
+            "invoice does not accept Lightning".into(),
+        ));
+    }
 
-    // If we already have a Lightning offer for this invoice, return it.
     if let Some(pr) = db::latest_lightning_pr_for_invoice(&state.db, inv.id).await? {
         return Ok(Json(LightningOfferResponse { pr }));
     }
 
-    // No swap yet — create one for the current amount_sat.
-    create_lightning_offer(&state, &inv.nym, inv.amount_sat as u64, inv.id).await?;
+    let nym = lightning_swap_nym(&state.db, &inv).await?;
+    create_lightning_offer(&state, &nym, inv.amount_sat as u64, &inv).await?;
 
     let pr = db::latest_lightning_pr_for_invoice(&state.db, inv.id)
         .await?
@@ -689,29 +711,57 @@ pub async fn fetch_lightning_offer(
     Ok(Json(LightningOfferResponse { pr }))
 }
 
+/// Resolve the nym to attribute on the swap_records row for `invoice`.
+/// Linked invoices use `nym_owner`; unlinked invoices fall back to the
+/// active registration of `npub_owner`. Returns `AuthError` when no
+/// active registration exists for the npub — Lightning requires a
+/// claimable Liquid wallet (legacy descriptor path) OR a wallet-supplied
+/// liquid_address (claim destination resolved by Step 10's
+/// `resolve_claim_address`).
+async fn lightning_swap_nym(
+    pool: &sqlx::PgPool,
+    invoice: &db::Invoice,
+) -> Result<String, AppError> {
+    if let Some(nym) = invoice.nym_owner.as_deref() {
+        return Ok(nym.to_string());
+    }
+    let user = db::get_user_by_npub(pool, &invoice.npub_owner)
+        .await?
+        .ok_or_else(|| {
+            AppError::AuthError(
+                "unlinked invoice's npub has no active registration".into(),
+            )
+        })?;
+    Ok(user.nym)
+}
+
 /// Internal: create a Boltz reverse swap and record it as the Lightning
-/// offer for `invoice_id`. Mirrors `lnurl::create_lightning_swap` but
-/// (1) sets `swap_records.invoice_id = Some(...)` so the claimer's
-/// invoice-flip hook (B7) can find the invoice on settlement, and
-/// (2) builds the description metadata against the invoice URL rather
-/// than the LNURL Lightning-Address path.
+/// offer for `invoice`. The `invoice_id` association is what lets the
+/// claimer's invoice-flip hook pair the Boltz settlement back to this
+/// invoice on payment.
 async fn create_lightning_offer(
     state: &AppState,
-    nym: &str,
+    swap_nym: &str,
     amount_sat: u64,
-    invoice_id: Uuid,
+    invoice: &db::Invoice,
 ) -> Result<(), AppError> {
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
 
-    // Description ties the BOLT11's hash to a stable, audit-greppable
-    // string. Donator's LN wallet shows the hash; we use the public
-    // invoice URL as the descriptive payload.
-    let description = format!(
-        "https://{}/{}/i/{}",
-        state.config.domain, nym, invoice_id
-    );
+    // Description URL: linked invoices use /<nym>/i/<id>; unlinked use
+    // /invoice/<id>. Donator's LN wallet shows the description hash; we
+    // bind it to the public invoice URL.
+    let description = match invoice.nym_owner.as_deref() {
+        Some(nym) => format!(
+            "https://{}/{}/i/{}",
+            state.config.domain, nym, invoice.id
+        ),
+        None => format!(
+            "https://{}/invoice/{}",
+            state.config.domain, invoice.id
+        ),
+    };
     let description_hash_hex = hex::encode(Sha256::digest(description.as_bytes()));
 
     let result = state
@@ -727,8 +777,16 @@ async fn create_lightning_offer(
     db::record_swap(
         &state.db,
         &db::NewSwapRecord {
-            nym,
+            nym: swap_nym,
             boltz_swap_id: &result.swap_id,
+            // For wallet-supplied liquid_address invoices, the claim
+            // destination is already known. Pre-populating address here
+            // would require also persisting address_index = NULL plumbed
+            // through `set_swap_address`; leave it None and let Step 10's
+            // `resolve_claim_address` rewrite read invoices.liquid_address
+            // at claim time. The Lightning path stays unchanged for the
+            // legacy descriptor flow (chain_watcher still bumps via
+            // `allocate_invoice_liquid_address`).
             address: None,
             address_index: None,
             amount_sat,
@@ -736,7 +794,7 @@ async fn create_lightning_offer(
             preimage_hex: &preimage_hex,
             claim_key_hex: &claim_key_hex,
             boltz_response_json: &boltz_response_json,
-            invoice_id: Some(invoice_id),
+            invoice_id: Some(invoice.id),
         },
     )
     .await
@@ -744,84 +802,55 @@ async fn create_lightning_offer(
         AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id))
     })?;
 
-    db::touch_user_callback(&state.db, nym).await;
+    db::touch_user_callback(&state.db, swap_nym).await;
     Ok(())
 }
 
 // =====================================================================
-// POST /api/v1/invoices/:id/liquid — lazy-allocate the Liquid address
+// POST /api/v1/invoices/:id/liquid — DEPRECATED (returns 410 Gone)
+//
+// Mobile now wallet-supplies the Liquid address at create time; the
+// lazy-allocation endpoint exists only for legacy donation-page checkout
+// flow (which uses `allocate_invoice_liquid_address` indirectly via the
+// chain watcher, not via this HTTP route). Keep the handler so existing
+// route registrations don't 404 — instead surface an actionable error.
 // =====================================================================
-
-#[derive(Serialize)]
-pub struct LiquidOfferResponse {
-    pub address: String,
-}
 
 pub async fn fetch_liquid_offer(
-    State(state): State<AppState>,
-    Path(id_str): Path<String>,
-    _peer_opt: Option<ConnectInfo<SocketAddr>>,
-    _headers: HeaderMap,
-) -> Result<Json<LiquidOfferResponse>, AppError> {
-    // No per-source gate here. The legacy
-    // `check_donation_distinct_addrs_per_source` queried the
-    // donation_allocations table that migration 019 drops; the right
-    // replacement is no gate at all. Allocation rate is bounded upstream
-    // by `check_invoice_create_per_source` (5/min) — every Liquid
-    // address exists 1:1 with an invoice, and creating an invoice is
-    // the rate-limited action. Re-toggles of an existing invoice's
-    // Liquid address are idempotent (allocate_invoice_liquid_address
-    // returns the existing pair). The status-poll's
-    // `check_donation_status_per_source` (60/min) covers status-driven
-    // re-fetches.
-
-    let id = parse_invoice_id(&id_str)?;
-    let inv = db::get_invoice_by_id(&state.db, id)
-        .await?
-        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
-    if inv.status != "unpaid" {
-        return Err(AppError::InvalidAmount(format!(
-            "invoice is {} (not unpaid); no Liquid offer available",
-            inv.status
-        )));
-    }
-
-    let address_pair = db::allocate_invoice_liquid_address(
-        &state.db,
-        inv.id,
-        |descriptor_str, idx| {
-            descriptor::derive_address(descriptor_str, idx).map_err(|e| {
-                sqlx::Error::Protocol(format!("address derivation failed: {e}"))
-            })
-        },
+    State(_state): State<AppState>,
+    Path(_id_str): Path<String>,
+) -> Result<Response, AppError> {
+    let mut resp = (
+        StatusCode::GONE,
+        "POST /api/v1/invoices/<id>/liquid is deprecated. Wallet supplies the \
+         Liquid address at invoice-create time."
+            .to_string(),
     )
-    .await?
-    .ok_or(AppError::InvoiceNotFound(id_str))?;
-
-    // Active-tier promotion so the chain watcher's 30s tick covers this nym.
-    db::touch_user_callback(&state.db, &inv.nym).await;
-
-    Ok(Json(LiquidOfferResponse {
-        address: address_pair.0,
-    }))
+        .into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(resp)
 }
 
 // =====================================================================
-// Schnorr-signed (recipient-side, wallet) endpoints — Phase B step 5
+// Schnorr-signed (recipient-side, wallet) endpoints — v2 wire format
 //
-// Three endpoints under `/api/v1/<nym>/invoices/...`:
-// - POST   create   (signed `invoice-create`)
-// - DELETE cancel   (signed `invoice-cancel`; invoice_id in path)
-// - GET    list     (signed `invoice-list`; query string)
+// `bullpay-la-v2` byte sequence:
+//   <domain>\0<action>\0<npub_hex>\0<nym_or_empty>\0(<field>\0)*<timestamp>
 //
-// All three verify the v1 Schnorr signature BEFORE any DB write, and bind
-// the request to the npub on record for the path's `nym` (no cross-nym
-// activity).
+// Linked path (`POST /api/v1/<nym>/invoices`): nym_or_empty = path nym.
+// Unlinked path (`POST /api/v1/invoices`): nym_or_empty = "".
+//
+// Both paths share `create_invoice_inner` after sig verify + ownership
+// check. The `nym` is the only structural divergence; everything else —
+// payload validation, address validation, fiat resolution, Lightning eager
+// offer — is identical.
 // =====================================================================
 
 /// Verify the signing npub owns `nym` AND the user row is currently
-/// active. Mirrors `donation_page::assert_nym_owner` exactly so the auth
-/// posture across signed endpoints is uniform.
+/// active. Used by the linked create/cancel paths.
 async fn assert_nym_owner(
     state: &AppState,
     nym: &str,
@@ -836,53 +865,64 @@ async fn assert_nym_owner(
     Ok(user)
 }
 
-// --- Field-order helpers (v1 Schnorr signing) ---
+// --- Field-order helpers (v2 Schnorr signing) ---
 //
 // Optional fields that are absent become EMPTY STRINGS (not skipped) so
 // the byte sequence is invariant under field presence. The mobile's
-// `buildLaV1Message` helper must produce the same byte sequence — these
-// arrays are the wire contract.
+// `core/nostr/bullpay_la_v2_signing.dart` must produce the same byte
+// sequence — these arrays are the wire contract.
+//
+// IMPORTANT: nym is NOT part of these payload helpers. It is passed
+// separately as `nym_or_empty` to `auth::verify_la_v2` / `build_la_v2_message`.
 
-// 8 args is the wire contract — `invoice-create` v1 signing fields, in
-// fixed order. Mobile must produce the same byte sequence, so this stays
-// flat instead of bundling into a struct.
+/// 12 fields in fixed order. The byte sequence is the wire contract.
 #[allow(clippy::too_many_arguments)]
 fn create_payload_fields<'a>(
-    nym: &'a str,
     amount_sat_or_empty: &'a str,
     fiat_amount_minor_or_empty: &'a str,
     fiat_currency_or_empty: &'a str,
-    memo_or_empty: &'a str,
-    recipient_label_or_empty: &'a str,
-    rail_preference: &'a str,
+    public_description_or_empty: &'a str,
+    recipient_name_or_empty: &'a str,
+    invoice_number_or_empty: &'a str,
+    accept_btc_bool: &'a str,
+    accept_ln_bool: &'a str,
+    accept_liquid_bool: &'a str,
+    bitcoin_address_or_empty: &'a str,
+    liquid_address_or_empty: &'a str,
     expires_at_unix: &'a str,
-) -> [&'a str; 8] {
+) -> [&'a str; 12] {
     [
-        nym,
         amount_sat_or_empty,
         fiat_amount_minor_or_empty,
         fiat_currency_or_empty,
-        memo_or_empty,
-        recipient_label_or_empty,
-        rail_preference,
+        public_description_or_empty,
+        recipient_name_or_empty,
+        invoice_number_or_empty,
+        accept_btc_bool,
+        accept_ln_bool,
+        accept_liquid_bool,
+        bitcoin_address_or_empty,
+        liquid_address_or_empty,
         expires_at_unix,
     ]
 }
 
-fn cancel_payload_fields<'a>(nym: &'a str, invoice_id: &'a str) -> [&'a str; 2] {
-    [nym, invoice_id]
+fn cancel_payload_fields(invoice_id: &str) -> [&str; 1] {
+    [invoice_id]
 }
 
 fn list_payload_fields<'a>(
-    nym: &'a str,
-    origin_or_empty: &'a str,
     since_unix_or_zero: &'a str,
     limit: &'a str,
-) -> [&'a str; 4] {
-    [nym, origin_or_empty, since_unix_or_zero, limit]
+    status_filter_or_empty: &'a str,
+) -> [&'a str; 3] {
+    [since_unix_or_zero, limit, status_filter_or_empty]
 }
 
-// --- POST /api/v1/<nym>/invoices ---
+// =====================================================================
+// POST /api/v1/<nym>/invoices  (linked)
+// POST /api/v1/invoices        (unlinked)
+// =====================================================================
 
 #[derive(Deserialize)]
 pub struct CreateSignedRequest {
@@ -890,13 +930,18 @@ pub struct CreateSignedRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
-    pub memo: Option<String>,
+    pub public_description: Option<String>,
+    /// `recipient_name` on the wire; mapped to the `recipient_label`
+    /// column in storage (no DB rename — defer to a v2 schema migration
+    /// if ever needed).
+    #[serde(rename = "recipient_name", alias = "recipient_label")]
     pub recipient_label: Option<String>,
-    /// "lightning" | "liquid" | "any". Drives default-rail UX hints; not
-    /// load-bearing on the server. Mobile must send "any" for v1.
-    pub rail_preference: String,
-    /// Outer expiry timestamp (Unix epoch seconds). Server clamps to
-    /// `[now+60, now+MAX_WALLET_EXPIRES_SECS]`.
+    pub invoice_number: Option<String>,
+    pub accept_btc: bool,
+    pub accept_ln: bool,
+    pub accept_liquid: bool,
+    pub bitcoin_address: Option<String>,
+    pub liquid_address: Option<String>,
     pub expires_at_unix: i64,
     pub timestamp: u64,
     pub signature: String,
@@ -908,12 +953,31 @@ pub struct CreateSignedResponse {
     pub share_url: String,
 }
 
-pub async fn create_signed(
+pub async fn create_signed_linked(
     State(state): State<AppState>,
     Path(nym): Path<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<CreateSignedRequest>,
+) -> Result<Json<CreateSignedResponse>, AppError> {
+    create_invoice_inner(&state, Some(nym), peer_opt, headers, req).await
+}
+
+pub async fn create_signed_unlinked(
+    State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateSignedRequest>,
+) -> Result<Json<CreateSignedResponse>, AppError> {
+    create_invoice_inner(&state, None, peer_opt, headers, req).await
+}
+
+async fn create_invoice_inner(
+    state: &AppState,
+    linked_nym: Option<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    req: CreateSignedRequest,
 ) -> Result<Json<CreateSignedResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
@@ -921,38 +985,63 @@ pub async fn create_signed(
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
 
-    // Per-IP cheap pre-validation gate (BEFORE Schnorr verify, before DB).
-    // Caps any single source across all signed-write actions and bounds
-    // signature-verify CPU spend under flood attack. The per-npub gate
-    // runs AFTER verify (see below) so a forged npub cannot grief a
-    // legitimate user by exhausting their bucket pre-verify.
+    // Pre-verify per-IP cheap gate. The per-npub gate runs AFTER signature
+    // verify so a forged npub cannot grief a legitimate user's bucket.
     if !is_whitelisted {
         if let Some(ip) = ip {
             state.rate_limiter.check_metadata_per_ip(ip).await?;
         }
     }
 
-    // Validate inputs BEFORE Schnorr verify — cheap rejections come first.
-    if !matches!(req.rail_preference.as_str(), "lightning" | "liquid" | "any") {
-        return Err(AppError::InvalidAmount(
-            "rail_preference must be 'lightning', 'liquid', or 'any'".into(),
-        ));
-    }
-    if let Some(memo) = &req.memo {
-        if memo.len() > 280 {
-            return Err(AppError::InvalidAmount("memo too long (max 280 chars)".into()));
+    // ---- Cheap input validation (BEFORE Schnorr verify) ----
+    if let Some(s) = &req.public_description {
+        if s.len() > PUBLIC_DESCRIPTION_MAX {
+            return Err(AppError::InvalidAmount(format!(
+                "public_description too long (max {PUBLIC_DESCRIPTION_MAX} chars)"
+            )));
         }
     }
-    if let Some(label) = &req.recipient_label {
-        if label.len() > 100 {
-            return Err(AppError::InvalidAmount(
-                "recipient_label too long (max 100 chars)".into(),
-            ));
+    if let Some(s) = &req.recipient_label {
+        if s.len() > RECIPIENT_LABEL_MAX {
+            return Err(AppError::InvalidAmount(format!(
+                "recipient_name too long (max {RECIPIENT_LABEL_MAX} chars)"
+            )));
+        }
+    }
+    if let Some(s) = &req.invoice_number {
+        if s.len() > INVOICE_NUMBER_MAX {
+            return Err(AppError::InvalidAmount(format!(
+                "invoice_number too long (max {INVOICE_NUMBER_MAX} chars)"
+            )));
         }
     }
 
-    // Outer expiry window. Reject too-soon (< 60s from now) and too-far
-    // (> MAX_WALLET_EXPIRES_SECS).
+    // Rail coherence — server-side echo of the SQL CHECKs in migration 021.
+    // Surfacing them here gives the caller a 400 with a useful message
+    // instead of a 500 from a constraint violation deep in INSERT.
+    if !req.accept_btc && !req.accept_ln && !req.accept_liquid {
+        return Err(AppError::InvalidAmount(
+            "at least one of accept_btc / accept_ln / accept_liquid must be true".into(),
+        ));
+    }
+    if req.accept_btc && req.bitcoin_address.is_none() {
+        return Err(AppError::InvalidAmount(
+            "accept_btc=true requires bitcoin_address".into(),
+        ));
+    }
+    if (req.accept_ln || req.accept_liquid) && req.liquid_address.is_none() {
+        return Err(AppError::InvalidAmount(
+            "accept_ln/accept_liquid=true requires liquid_address".into(),
+        ));
+    }
+    if let Some(addr) = req.bitcoin_address.as_deref() {
+        validators::validate_btc_mainnet_address(addr)?;
+    }
+    if let Some(addr) = req.liquid_address.as_deref() {
+        validators::validate_liquid_mainnet_address(addr)?;
+    }
+
+    // Outer expiry window: now+60s to now+30d.
     let now = unix_now();
     if req.expires_at_unix < now + 60 {
         return Err(AppError::InvalidAmount(
@@ -966,45 +1055,55 @@ pub async fn create_signed(
     }
     let expires_in_secs = req.expires_at_unix - now;
 
-    // Build the v1 payload + verify Schnorr sig. Empty strings replace
-    // absent optional fields so the byte sequence is invariant.
-    let amount_sat_str = req
-        .amount_sat
-        .map(|n| n.to_string())
-        .unwrap_or_default();
+    // ---- Build v2 payload + verify Schnorr sig ----
+    let amount_sat_str = req.amount_sat.map(|n| n.to_string()).unwrap_or_default();
     let fiat_minor_str = req
         .fiat_amount_minor
         .map(|n| n.to_string())
         .unwrap_or_default();
     let fiat_currency_str = req.fiat_currency.clone().unwrap_or_default();
-    let memo_str = req.memo.clone().unwrap_or_default();
-    let label_str = req.recipient_label.clone().unwrap_or_default();
+    let public_description_str = req.public_description.clone().unwrap_or_default();
+    let recipient_label_str = req.recipient_label.clone().unwrap_or_default();
+    let invoice_number_str = req.invoice_number.clone().unwrap_or_default();
+    let accept_btc_str = req.accept_btc.to_string();
+    let accept_ln_str = req.accept_ln.to_string();
+    let accept_liquid_str = req.accept_liquid.to_string();
+    let bitcoin_address_str = req.bitcoin_address.clone().unwrap_or_default();
+    let liquid_address_str = req.liquid_address.clone().unwrap_or_default();
     let expires_str = req.expires_at_unix.to_string();
     let fields = create_payload_fields(
-        &nym,
         &amount_sat_str,
         &fiat_minor_str,
         &fiat_currency_str,
-        &memo_str,
-        &label_str,
-        &req.rail_preference,
+        &public_description_str,
+        &recipient_label_str,
+        &invoice_number_str,
+        &accept_btc_str,
+        &accept_ln_str,
+        &accept_liquid_str,
+        &bitcoin_address_str,
+        &liquid_address_str,
         &expires_str,
     );
-    auth::verify_la_v1(
+    let nym_or_empty = linked_nym.as_deref().unwrap_or("");
+    auth::verify_la_v2(
         ACTION_CREATE,
         &req.npub,
+        nym_or_empty,
         &fields,
         req.timestamp,
         &req.signature,
     )?;
 
-    // Bind to the nym owner (cross-nym sig replay is rejected here).
-    assert_nym_owner(&state, &nym, &req.npub).await?;
+    // ---- Ownership check: linked vs unlinked ----
+    if let Some(nym) = linked_nym.as_deref() {
+        assert_nym_owner(state, nym, &req.npub).await?;
+    }
+    // For unlinked: signing npub IS the canonical npub_owner. No nym
+    // assertion needed; the v2 byte sequence binds nym_or_empty="" to the
+    // sig already.
 
-    // Per-npub gate AFTER signature verify: at this point we know the
-    // request was authenticated by the npub on record, so bumping its
-    // bucket is correct — no forge-and-grief vector. Bounds wallet-
-    // origin invoice creation per identity (100/h per the plan).
+    // Per-npub bucket AFTER sig verify (auth-bound).
     if !is_whitelisted {
         state
             .rate_limiter
@@ -1012,18 +1111,16 @@ pub async fn create_signed(
             .await?;
     }
 
-    // Resolve sat amount from sat or fiat path. Reuses the same helper as
-    // create_anonymous so the validation invariants stay aligned.
     let anon_shape = CreateAnonymousRequest {
         amount_sat: req.amount_sat,
         fiat_amount_minor: req.fiat_amount_minor,
         fiat_currency: req.fiat_currency.clone(),
     };
-    let (amount_sat, fiat) = parse_create_request(&anon_shape, &state).await?;
+    let (amount_sat, fiat) = parse_create_request(&anon_shape, state).await?;
 
-    // Insert the wallet-origin invoice.
     let new_invoice = db::NewInvoice {
-        nym: &nym,
+        nym_owner: linked_nym.as_deref(),
+        npub_owner: &req.npub,
         origin: "wallet",
         fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),
         fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
@@ -1032,35 +1129,59 @@ pub async fn create_signed(
         rate_lock_secs: if fiat.is_some() {
             FIAT_RATE_LOCK_SECS
         } else {
-            // Sat-denom: rate_locks_until == expires_at so refresh path
-            // never fires.
             expires_in_secs
         },
-        memo: req.memo.as_deref(),
+        memo: None,
         recipient_label: req.recipient_label.as_deref(),
+        public_description: req.public_description.as_deref(),
+        invoice_number: req.invoice_number.as_deref(),
+        accept_btc: req.accept_btc,
+        accept_ln: req.accept_ln,
+        accept_liquid: req.accept_liquid,
+        bitcoin_address: req.bitcoin_address.as_deref(),
+        liquid_address: req.liquid_address.as_deref(),
         expires_in_secs,
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    // Eagerly create the Lightning offer (wallet-origin defaults to
-    // both rails available; sender picks at view time).
-    if let Err(e) =
-        create_lightning_offer(&state, &nym, amount_sat as u64, invoice.id).await
-    {
-        tracing::warn!(
-            invoice_id = %invoice.id,
-            "wallet-origin eager Lightning offer failed (page can retry): {e}",
-        );
+    if invoice.accept_ln {
+        let swap_nym = lightning_swap_nym(&state.db, &invoice).await?;
+        if let Err(e) =
+            create_lightning_offer(state, &swap_nym, amount_sat as u64, &invoice).await
+        {
+            tracing::warn!(
+                invoice_id = %invoice.id,
+                npub_tag = npub_log_tag(&req.npub),
+                "wallet-origin eager Lightning offer failed (page can retry): {e}",
+            );
+        }
     }
 
-    let share_url = format!("https://{}/{}/i/{}", state.config.domain, nym, invoice.id);
+    let share_url = match linked_nym.as_deref() {
+        Some(nym) => format!("https://{}/{}/i/{}", state.config.domain, nym, invoice.id),
+        None => format!("https://{}/invoice/{}", state.config.domain, invoice.id),
+    };
+    tracing::info!(
+        event = "invoice_created",
+        invoice_id = %invoice.id,
+        npub_tag = npub_log_tag(&req.npub),
+        nym_or_unlinked = nym_or_empty,
+        accept_btc = invoice.accept_btc,
+        accept_ln = invoice.accept_ln,
+        accept_liquid = invoice.accept_liquid,
+        amount_sat = invoice.amount_sat,
+        "wallet-origin invoice created"
+    );
     Ok(Json(CreateSignedResponse {
         invoice_id: invoice.id,
         share_url,
     }))
 }
 
-// --- DELETE /api/v1/<nym>/invoices/<id> ---
+// =====================================================================
+// DELETE /api/v1/<nym>/invoices/<id>  (linked)
+// DELETE /api/v1/invoices/<id>        (unlinked)
+// =====================================================================
 
 #[derive(Deserialize)]
 pub struct CancelRequest {
@@ -1075,12 +1196,33 @@ pub struct CancelResponse {
     pub status: String,
 }
 
-pub async fn cancel(
+pub async fn cancel_linked(
     State(state): State<AppState>,
     Path((nym, id_str)): Path<(String, String)>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<CancelRequest>,
+) -> Result<Json<CancelResponse>, AppError> {
+    cancel_invoice_inner(&state, Some(nym), id_str, peer_opt, headers, req).await
+}
+
+pub async fn cancel_unlinked(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<CancelRequest>,
+) -> Result<Json<CancelResponse>, AppError> {
+    cancel_invoice_inner(&state, None, id_str, peer_opt, headers, req).await
+}
+
+async fn cancel_invoice_inner(
+    state: &AppState,
+    linked_nym: Option<String>,
+    id_str: String,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    req: CancelRequest,
 ) -> Result<Json<CancelResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
@@ -1095,69 +1237,97 @@ pub async fn cancel(
     }
 
     let id = parse_invoice_id(&id_str)?;
-
-    let fields = cancel_payload_fields(&nym, &id_str);
-    auth::verify_la_v1(
+    let nym_or_empty = linked_nym.as_deref().unwrap_or("");
+    let fields = cancel_payload_fields(&id_str);
+    auth::verify_la_v2(
         ACTION_CANCEL,
         &req.npub,
+        nym_or_empty,
         &fields,
         req.timestamp,
         &req.signature,
     )?;
-    assert_nym_owner(&state, &nym, &req.npub).await?;
 
-    // Verify the invoice belongs to this nym (defense-in-depth: the
-    // owner check above + this binding together prevent a signer who
-    // owns nym A from cancelling an invoice owned by nym B by tampering
-    // with the URL).
+    if let Some(nym) = linked_nym.as_deref() {
+        assert_nym_owner(state, nym, &req.npub).await?;
+    }
+
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
-    if inv.nym != nym {
+
+    // Ownership defense-in-depth: signed nym must match invoice.nym_owner
+    // (linked path), and signing npub must match invoice.npub_owner
+    // (both paths). The npub_owner check is the authoritative gate — it
+    // catches the case where a signer who owns nym A tampers with the
+    // URL to cancel an invoice owned by nym B.
+    if inv.npub_owner != req.npub {
         return Err(AppError::InvoiceNotFound(id_str));
+    }
+    if let Some(nym) = linked_nym.as_deref() {
+        if inv.nym_owner.as_deref() != Some(nym) {
+            return Err(AppError::InvoiceNotFound(id_str));
+        }
     }
 
     let rows = db::cancel_invoice(&state.db, id).await?;
-    // rows == 1: flip happened just now, status is now 'cancelled'.
-    // rows == 0: invoice was already non-unpaid (paid/under/over/expired/
-    // cancelled); preserve whatever it was at read-time. mark_invoice_paid
-    // and cancel_invoice are mutually idempotent — re-cancel of a
-    // cancelled row is a no-op.
     let final_status: String = if rows == 1 {
         "cancelled".to_string()
     } else {
         inv.status
     };
+    tracing::info!(
+        event = "invoice_cancelled",
+        invoice_id = %id,
+        npub_tag = npub_log_tag(&req.npub),
+        nym_or_unlinked = nym_or_empty,
+        rows = rows,
+        "invoice cancel"
+    );
     Ok(Json(CancelResponse {
         invoice_id: id,
         status: final_status,
     }))
 }
 
-// --- GET /api/v1/<nym>/invoices?... ---
+// =====================================================================
+// GET /api/v1/invoices?npub=...  (npub-keyed signed list, linked + unlinked)
+// =====================================================================
 
 #[derive(Deserialize)]
 pub struct ListSignedQuery {
     pub npub: String,
     pub timestamp: u64,
     pub signature: String,
-    /// Optional. "checkout" or "wallet". Empty/absent → both.
-    pub origin: Option<String>,
     /// Optional. Unix epoch seconds; only invoices created at-or-after.
     pub since_unix: Option<i64>,
     pub limit: i64,
+    /// Optional. One of the seven invoice statuses, or empty/absent for
+    /// unfiltered. The wire format treats absent + empty identically.
+    pub status: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct InvoiceListItem {
     pub id: Uuid,
+    /// `nym_owner`: linked invoices carry the merchant nym; unlinked
+    /// invoices carry `null`. The mobile decides URL construction from
+    /// this field (`/<nym>/i/<id>` vs `/invoice/<id>`).
+    pub nym_owner: Option<String>,
     pub origin: String,
     pub status: String,
     pub amount_sat: i64,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
-    pub memo: Option<String>,
+    pub public_description: Option<String>,
+    #[serde(rename = "recipient_name")]
     pub recipient_label: Option<String>,
+    pub invoice_number: Option<String>,
+    pub accept_btc: bool,
+    pub accept_ln: bool,
+    pub accept_liquid: bool,
+    pub bitcoin_address: Option<String>,
+    pub liquid_address: Option<String>,
     pub created_at_unix: i64,
     pub expires_at_unix: i64,
     pub paid_via: Option<String>,
@@ -1172,7 +1342,6 @@ pub struct ListInvoicesResponse {
 
 pub async fn list_signed(
     State(state): State<AppState>,
-    Path(nym): Path<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Query(params): Query<ListSignedQuery>,
@@ -1189,51 +1358,72 @@ pub async fn list_signed(
         }
     }
 
-    // Clamp limit to [1, LIST_LIMIT_MAX]. Negative → reject.
     if params.limit < 1 {
         return Err(AppError::InvalidAmount("limit must be >= 1".into()));
     }
     let limit = params.limit.min(LIST_LIMIT_MAX);
 
-    // Validate origin filter shape. Empty string == None for the byte
-    // sequence; both "checkout" and "wallet" pass through to db::list_invoices.
-    let origin_filter = match params.origin.as_deref() {
+    let status_filter: Option<&str> = match params.status.as_deref() {
         None | Some("") => None,
-        Some("checkout") => Some("checkout"),
-        Some("wallet") => Some("wallet"),
+        Some(s) if matches!(
+            s,
+            "unpaid" | "in_progress" | "paid" | "underpaid" | "overpaid" | "expired" | "cancelled"
+        ) =>
+        {
+            Some(s)
+        }
         Some(other) => {
             return Err(AppError::InvalidAmount(format!(
-                "origin must be 'checkout', 'wallet', or empty (got '{other}')"
-            )))
+                "status must be one of unpaid|in_progress|paid|underpaid|overpaid|expired|cancelled, or empty (got '{other}')"
+            )));
         }
     };
 
-    // Build the v1 payload. since_unix=None → "0", origin=None → empty.
-    let origin_str = origin_filter.unwrap_or("");
     let since_str = params.since_unix.unwrap_or(0).to_string();
     let limit_str = limit.to_string();
-    let fields = list_payload_fields(&nym, origin_str, &since_str, &limit_str);
-    auth::verify_la_v1(
+    let status_str = status_filter.unwrap_or("");
+    let fields = list_payload_fields(&since_str, &limit_str, status_str);
+    // Nym ALWAYS empty on the npub-keyed list — the action is identity-
+    // wide, not per-nym.
+    auth::verify_la_v2(
         ACTION_LIST,
         &params.npub,
+        "",
         &fields,
         params.timestamp,
         &params.signature,
     )?;
-    assert_nym_owner(&state, &nym, &params.npub).await?;
 
-    let rows = db::list_invoices(&state.db, &nym, origin_filter, params.since_unix, limit).await?;
+    // npub equality is structural here: the signed message embeds
+    // `params.npub` and we filter the DB on the same value. A mismatch
+    // would require a forged signature — unreachable past verify_la_v2.
+
+    let rows = db::list_invoices_by_npub(
+        &state.db,
+        &params.npub,
+        status_filter,
+        params.since_unix,
+        limit,
+    )
+    .await?;
     let invoices = rows
         .into_iter()
         .map(|inv| InvoiceListItem {
             id: inv.id,
+            nym_owner: inv.nym_owner,
             origin: inv.origin,
             status: inv.status,
             amount_sat: inv.amount_sat,
             fiat_amount_minor: inv.fiat_amount_minor,
             fiat_currency: inv.fiat_currency,
-            memo: inv.memo,
+            public_description: inv.public_description,
             recipient_label: inv.recipient_label,
+            invoice_number: inv.invoice_number,
+            accept_btc: inv.accept_btc,
+            accept_ln: inv.accept_ln,
+            accept_liquid: inv.accept_liquid,
+            bitcoin_address: inv.bitcoin_address,
+            liquid_address: inv.liquid_address,
             created_at_unix: inv.created_at_unix,
             expires_at_unix: inv.expires_at_unix,
             paid_via: inv.paid_via,
@@ -1254,43 +1444,53 @@ mod tests {
     /// sequence so any silent change fails the test.
     #[test]
     fn create_payload_field_order() {
-        let f = create_payload_fields("alice", "5000", "", "", "", "", "any", "1700000000");
+        let f = create_payload_fields(
+            "5000", "", "", "coffee", "Alice", "INV-1",
+            "false", "true", "true",
+            "", "lq1qq...", "1700000000",
+        );
         assert_eq!(
             f,
-            ["alice", "5000", "", "", "", "", "any", "1700000000"],
+            [
+                "5000", "", "", "coffee", "Alice", "INV-1",
+                "false", "true", "true",
+                "", "lq1qq...", "1700000000",
+            ],
             "create field order changed — mobile MUST update in lockstep"
         );
     }
 
     #[test]
     fn cancel_payload_field_order() {
-        let f = cancel_payload_fields("alice", "00000000-0000-0000-0000-000000000001");
+        let f = cancel_payload_fields("00000000-0000-0000-0000-000000000001");
         assert_eq!(
             f,
-            ["alice", "00000000-0000-0000-0000-000000000001"],
+            ["00000000-0000-0000-0000-000000000001"],
             "cancel field order changed — mobile MUST update in lockstep"
         );
     }
 
     #[test]
     fn list_payload_field_order() {
-        let f = list_payload_fields("alice", "wallet", "0", "100");
+        let f = list_payload_fields("0", "25", "unpaid");
         assert_eq!(
             f,
-            ["alice", "wallet", "0", "100"],
+            ["0", "25", "unpaid"],
             "list field order changed — mobile MUST update in lockstep"
         );
     }
 
-    /// Cross-action replay regression test: a `create` signature must NOT
-    /// validate as a `cancel`. (auth::verify_la_v1 enforces this via the
-    /// action component of the signed message; we add a hop through the
-    /// helpers here to catch a coding mistake that wires the wrong action
-    /// constant into a handler.)
     #[test]
     fn action_constants_distinct() {
         assert_ne!(ACTION_CREATE, ACTION_CANCEL);
         assert_ne!(ACTION_CREATE, ACTION_LIST);
         assert_ne!(ACTION_CANCEL, ACTION_LIST);
+    }
+
+    #[test]
+    fn npub_log_tag_truncates() {
+        assert_eq!(npub_log_tag("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"), "89abcdef");
+        assert_eq!(npub_log_tag("short"), "short");
+        assert_eq!(npub_log_tag(""), "");
     }
 }

@@ -1709,7 +1709,10 @@ pub async fn get_donation_page_by_nym(
 #[derive(Debug, sqlx::FromRow)]
 pub struct Invoice {
     pub id: Uuid,
-    pub nym: String,
+    /// Merchant payment-page nym; NULL for unlinked (wallet-only) invoices.
+    pub nym_owner: Option<String>,
+    /// Canonical recipient identity (hex x-only Schnorr pubkey). Always set.
+    pub npub_owner: String,
     pub origin: String,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
@@ -1717,6 +1720,12 @@ pub struct Invoice {
     pub rate_minor_per_btc: Option<i64>,
     pub memo: Option<String>,
     pub recipient_label: Option<String>,
+    pub bitcoin_address: Option<String>,
+    pub accept_btc: bool,
+    pub accept_ln: bool,
+    pub accept_liquid: bool,
+    pub public_description: Option<String>,
+    pub invoice_number: Option<String>,
     pub liquid_address: Option<String>,
     pub liquid_address_index: Option<i32>,
     pub status: String,
@@ -1737,9 +1746,11 @@ pub struct Invoice {
 /// (mirrors the SwapRecord pattern). FromRow matches by alias name, so
 /// the order is cosmetic.
 const INVOICE_COLUMNS: &str =
-    "id, nym, origin, fiat_amount_minor, fiat_currency, amount_sat, \
-     rate_minor_per_btc, memo, recipient_label, liquid_address, \
-     liquid_address_index, status, paid_via, paid_amount_sat, \
+    "id, nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+     rate_minor_per_btc, memo, recipient_label, \
+     bitcoin_address, accept_btc, accept_ln, accept_liquid, \
+     public_description, invoice_number, \
+     liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
      EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
      EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
      EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
@@ -1748,7 +1759,10 @@ const INVOICE_COLUMNS: &str =
      EXTRACT(EPOCH FROM cancelled_at)::BIGINT     AS cancelled_at_unix";
 
 pub struct NewInvoice<'a> {
-    pub nym: &'a str,
+    /// Merchant payment-page nym, or `None` for unlinked (wallet-only) invoices.
+    pub nym_owner: Option<&'a str>,
+    /// Canonical recipient identity (hex x-only Schnorr pubkey). Required.
+    pub npub_owner: &'a str,
     /// 'checkout' or 'wallet'. Caller validates against the enum upstream.
     pub origin: &'a str,
     pub fiat_amount_minor: Option<i32>,
@@ -1762,29 +1776,48 @@ pub struct NewInvoice<'a> {
     pub rate_lock_secs: i64,
     pub memo: Option<&'a str>,
     pub recipient_label: Option<&'a str>,
+    pub public_description: Option<&'a str>,
+    pub invoice_number: Option<&'a str>,
+    pub accept_btc: bool,
+    pub accept_ln: bool,
+    pub accept_liquid: bool,
+    /// Wallet-supplied BTC mainnet address (NULL when accept_btc=FALSE).
+    pub bitcoin_address: Option<&'a str>,
+    /// Wallet-supplied Liquid mainnet CT address (NULL when both
+    /// accept_ln=FALSE and accept_liquid=FALSE). When supplied at insert
+    /// time, the lazy allocator (`allocate_invoice_liquid_address`) is
+    /// not called and `liquid_address_index` stays NULL.
+    pub liquid_address: Option<&'a str>,
     /// Wall-clock seconds the invoice stays valid from `now()`.
     pub expires_in_secs: i64,
 }
 
-/// Insert a new invoice row. The Liquid address is NOT allocated here —
-/// `allocate_invoice_liquid_address` handles lazy allocation on first
-/// rail toggle. Lightning offers attach via a separate `record_swap` call
-/// that sets `swap_records.invoice_id`.
+/// Insert a new invoice row. For wallet-origin (Get-paid) invoices the
+/// caller passes the wallet-supplied `bitcoin_address` / `liquid_address`
+/// directly. For checkout-origin (legacy donation page) invoices, the
+/// Liquid address is left NULL and `allocate_invoice_liquid_address`
+/// handles lazy allocation on first rail toggle. Lightning offers attach
+/// via a separate `record_swap` call that sets `swap_records.invoice_id`.
 pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
 ) -> Result<Invoice, sqlx::Error> {
     sqlx::query_as::<_, Invoice>(&format!(
         "INSERT INTO invoices \
-            (nym, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+            (nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
              rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
+             public_description, invoice_number, \
+             accept_btc, accept_ln, accept_liquid, \
+             bitcoin_address, liquid_address, \
              expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, \
-                 NOW() + ($7 || ' seconds')::interval, $8, $9, \
-                 NOW() + ($10 || ' seconds')::interval) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 NOW() + ($8 || ' seconds')::interval, $9, $10, \
+                 $11, $12, $13, $14, $15, $16, $17, \
+                 NOW() + ($18 || ' seconds')::interval) \
          RETURNING {INVOICE_COLUMNS}"
     ))
-    .bind(invoice.nym)
+    .bind(invoice.nym_owner)
+    .bind(invoice.npub_owner)
     .bind(invoice.origin)
     .bind(invoice.fiat_amount_minor)
     .bind(invoice.fiat_currency)
@@ -1793,6 +1826,13 @@ pub async fn insert_invoice(
     .bind(invoice.rate_lock_secs)
     .bind(invoice.memo)
     .bind(invoice.recipient_label)
+    .bind(invoice.public_description)
+    .bind(invoice.invoice_number)
+    .bind(invoice.accept_btc)
+    .bind(invoice.accept_ln)
+    .bind(invoice.accept_liquid)
+    .bind(invoice.bitcoin_address)
+    .bind(invoice.liquid_address)
     .bind(invoice.expires_in_secs)
     .fetch_one(pool)
     .await
@@ -1810,64 +1850,64 @@ pub async fn get_invoice_by_id(
     .await
 }
 
-/// List invoices for a nym, newest-first, with optional filters.
+/// List invoices for an npub_owner, newest-first, with optional filters.
 ///
-/// `origin`: `Some("checkout")` or `Some("wallet")` filters by origin;
-/// `None` returns both. `since_unix`: only rows with `created_at >=` that
-/// epoch-second value; `None` skips the time filter. `limit` caps the
-/// result set (caller enforces upper bound; we don't second-guess here).
+/// `status_filter`: `Some("unpaid"|"paid"|...)` filters by status;
+/// `None` returns all statuses. `since_unix`: only rows with `created_at
+/// >=` that epoch-second value; `None` skips the time filter. `limit`
+/// caps the result set (caller enforces upper bound; we don't
+/// second-guess here).
 ///
 /// Predicate uses `($p::TYPE IS NULL OR ...)` so the planner can skip the
 /// filter entirely when not provided. The composite index
-/// `invoices_nym_created_idx` services the ORDER BY.
-pub async fn list_invoices(
+/// `invoices_npub_owner_status_created_idx` services the ORDER BY.
+pub async fn list_invoices_by_npub(
     pool: &PgPool,
-    nym: &str,
-    origin: Option<&str>,
+    npub_owner: &str,
+    status_filter: Option<&str>,
     since_unix: Option<i64>,
     limit: i64,
 ) -> Result<Vec<Invoice>, sqlx::Error> {
     sqlx::query_as::<_, Invoice>(&format!(
         "SELECT {INVOICE_COLUMNS} FROM invoices \
-         WHERE nym = $1 \
-           AND ($2::TEXT IS NULL OR origin = $2) \
+         WHERE npub_owner = $1 \
+           AND ($2::TEXT IS NULL OR status = $2) \
            AND ($3::BIGINT IS NULL OR created_at >= TO_TIMESTAMP($3)) \
          ORDER BY created_at DESC \
          LIMIT $4"
     ))
-    .bind(nym)
-    .bind(origin)
+    .bind(npub_owner)
+    .bind(status_filter)
     .bind(since_unix)
     .bind(limit)
     .fetch_all(pool)
     .await
 }
 
-/// List unpaid invoices' Liquid addresses for a nym, ordered by
+/// List unpaid invoices' Liquid addresses for a nym_owner, ordered by
 /// address_index. Returned shape `(invoice_id, address_index, address,
 /// amount_sat)` gives the chain watcher everything it needs to call
 /// `mark_invoice_paid` on a hit without a second round-trip per row.
 ///
-/// Service path: chain_watcher.rs scans this list on each tick and flips
-/// the matching invoice via `mark_invoice_paid` when a Liquid tx lands.
-/// Compensates for the address-allocation race that the
-/// donation_allocations scan handled: the watcher's lookahead loop
-/// alone misses addresses past `next_addr_idx` because the allocator
-/// bumps the index past the just-allocated value.
+/// Scoped to the legacy descriptor-allocator path
+/// (`liquid_address_index IS NOT NULL`) — wallet-supplied invoices
+/// (`liquid_address_index IS NULL`) are not returned here; Step 11's
+/// address-keyed scan covers those.
 pub async fn list_unpaid_invoice_liquid_addresses(
     pool: &PgPool,
-    nym: &str,
+    nym_owner: &str,
 ) -> Result<Vec<(Uuid, i32, String, i64)>, sqlx::Error> {
     sqlx::query_as::<_, (Uuid, i32, String, i64)>(
         "SELECT id, liquid_address_index, liquid_address, amount_sat \
          FROM invoices \
-         WHERE nym = $1 \
-           AND status = 'unpaid' \
+         WHERE nym_owner = $1 \
+           AND status IN ('unpaid', 'in_progress') \
+           AND accept_liquid = TRUE \
            AND liquid_address IS NOT NULL \
            AND liquid_address_index IS NOT NULL \
          ORDER BY liquid_address_index ASC",
     )
-    .bind(nym)
+    .bind(nym_owner)
     .fetch_all(pool)
     .await
 }
@@ -2003,14 +2043,17 @@ where
 {
     let mut tx = pool.begin().await?;
 
-    // Need the nym to scope the advisory lock and bump next_addr_idx.
-    let nym: Option<(String,)> = sqlx::query_as(
-        "SELECT nym FROM invoices WHERE id = $1 FOR UPDATE",
+    // Need the nym (nym_owner) to scope the advisory lock and bump
+    // next_addr_idx. Unlinked invoices (nym_owner IS NULL) cannot use
+    // this descriptor-allocator path — the caller must wallet-supply
+    // the address at insert time.
+    let nym: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT nym_owner FROM invoices WHERE id = $1 FOR UPDATE",
     )
     .bind(invoice_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((nym,)) = nym else {
+    let Some((Some(nym),)) = nym else {
         return Ok(None);
     };
 

@@ -288,21 +288,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/invoices/:id/liquid",
             post(invoice::fetch_liquid_offer),
         )
-        // Phase B step 5 — Schnorr-signed (recipient-side, wallet)
-        // endpoints. Body cap 8 KiB on POST to bound a misbehaving client;
-        // DELETE carries only npub+ts+sig. List uses GET + Query.
+        // Get-paid Phase 1 — Schnorr-signed v2 (recipient-side, wallet)
+        // endpoints, linked + unlinked. Body cap 8 KiB on signed POST to
+        // bound a misbehaving client; DELETE carries only npub+ts+sig.
+        // List uses GET + Query at the npub-keyed root.
         .route(
             "/api/v1/:nym/invoices",
-            post(invoice::create_signed).layer(DefaultBodyLimit::max(8 * 1024)),
+            post(invoice::create_signed_linked).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
-            "/api/v1/:nym/invoices",
-            get(invoice::list_signed),
+            "/api/v1/invoices",
+            post(invoice::create_signed_unlinked).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
             "/api/v1/:nym/invoices/:id",
-            axum::routing::delete(invoice::cancel),
+            axum::routing::delete(invoice::cancel_linked)
+                .layer(DefaultBodyLimit::max(1024)),
         )
+        .route(
+            "/api/v1/invoices/:id",
+            axum::routing::delete(invoice::cancel_unlinked)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/v1/invoices",
+            get(invoice::list_signed),
+        )
+        // Public unlinked render path. Privacy headers + indexing posture
+        // are applied via `invoice::html_response`; the parent fallback's
+        // donation_render path is bypassed via explicit registration.
+        .route("/invoice/:id", get(invoice::render_unlinked_payment))
+        .route("/robots.txt", get(invoice::robots_txt))
         .route("/qr.svg", get(qr::generate))
         // Two routes during the rotation overlap window:
         // - `/webhook/boltz/:secret` — authenticated path. Handler verifies
