@@ -23,6 +23,8 @@ pub struct Config {
     pub claim: ClaimConfig,
     #[serde(default)]
     pub reconciler: ReconcilerConfig,
+    #[serde(default)]
+    pub bitcoin_watcher: BitcoinWatcherConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
@@ -296,6 +298,79 @@ impl Default for ProofConfig {
 
 fn default_min_proof_value_sat() -> u64 { DEFAULT_MIN_PROOF_VALUE_SAT }
 fn default_message_tag() -> String { DEFAULT_MESSAGE_TAG.to_string() }
+
+// --- Bitcoin watcher config ---
+//
+// Polls mempool.bullbitcoin.com for invoice on-chain BTC settlement.
+// Active/idle tier split keeps load proportional to fresh-invoice
+// activity; the token bucket bounds RPS against the upstream API.
+
+const DEFAULT_BTC_WATCHER_ENDPOINT: &str = "https://mempool.bullbitcoin.com/api";
+const DEFAULT_BTC_WATCHER_ACTIVE_TICK_SECS: u64 = 30;
+const DEFAULT_BTC_WATCHER_IDLE_TICK_SECS: u64 = 300;
+const DEFAULT_BTC_WATCHER_ACTIVE_WINDOW_SECS: i64 = 3600;
+const DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED: u32 = 1;
+const DEFAULT_BTC_WATCHER_RATE_PER_SEC: u32 = 5;
+const DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BitcoinWatcherConfig {
+    /// When false, the watcher is not spawned at all. Useful in dev
+    /// environments without outbound network or when the operator wants
+    /// to drain the existing flow before flipping BTC support on.
+    #[serde(default = "default_btc_watcher_enabled")]
+    pub enabled: bool,
+    /// mempool.space-shape API root (no trailing slash). Defaults to
+    /// Bull's own instance to keep the watcher inside the trust
+    /// boundary; rate limits there are ours to set.
+    #[serde(default = "default_btc_watcher_endpoint")]
+    pub endpoint: String,
+    /// Active-tier poll period for "fresh" invoices (created within
+    /// `active_window_secs`).
+    #[serde(default = "default_btc_watcher_active_tick_secs")]
+    pub active_tick_secs: u64,
+    /// Idle-tier poll period for older invoices that stayed unpaid.
+    #[serde(default = "default_btc_watcher_idle_tick_secs")]
+    pub idle_tick_secs: u64,
+    /// An invoice is "active" if `created_at > NOW() - active_window_secs`.
+    #[serde(default = "default_btc_watcher_active_window_secs")]
+    pub active_window_secs: i64,
+    /// Confirmation depth at which a tx counts as "paid". 1 is plan
+    /// default; deployment-tunable.
+    #[serde(default = "default_btc_watcher_confirmations_required")]
+    pub confirmations_required: u32,
+    /// Token-bucket refill rate against the mempool endpoint.
+    #[serde(default = "default_btc_watcher_rate_per_sec")]
+    pub rate_per_sec: u32,
+    /// Per-request HTTP timeout. The watcher logs and skips a tick on
+    /// timeout rather than blocking the loop.
+    #[serde(default = "default_btc_watcher_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+impl Default for BitcoinWatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_btc_watcher_enabled(),
+            endpoint: default_btc_watcher_endpoint(),
+            active_tick_secs: default_btc_watcher_active_tick_secs(),
+            idle_tick_secs: default_btc_watcher_idle_tick_secs(),
+            active_window_secs: default_btc_watcher_active_window_secs(),
+            confirmations_required: default_btc_watcher_confirmations_required(),
+            rate_per_sec: default_btc_watcher_rate_per_sec(),
+            request_timeout_ms: default_btc_watcher_request_timeout_ms(),
+        }
+    }
+}
+
+fn default_btc_watcher_enabled() -> bool { true }
+fn default_btc_watcher_endpoint() -> String { DEFAULT_BTC_WATCHER_ENDPOINT.to_string() }
+fn default_btc_watcher_active_tick_secs() -> u64 { DEFAULT_BTC_WATCHER_ACTIVE_TICK_SECS }
+fn default_btc_watcher_idle_tick_secs() -> u64 { DEFAULT_BTC_WATCHER_IDLE_TICK_SECS }
+fn default_btc_watcher_active_window_secs() -> i64 { DEFAULT_BTC_WATCHER_ACTIVE_WINDOW_SECS }
+fn default_btc_watcher_confirmations_required() -> u32 { DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED }
+fn default_btc_watcher_rate_per_sec() -> u32 { DEFAULT_BTC_WATCHER_RATE_PER_SEC }
+fn default_btc_watcher_request_timeout_ms() -> u64 { DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS }
 
 // --- Rate limit config ---
 

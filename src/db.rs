@@ -1912,14 +1912,18 @@ pub async fn list_unpaid_invoice_liquid_addresses(
     .await
 }
 
-/// Idempotent invoice-paid flip. The `WHERE status = 'unpaid'` guard
-/// makes a re-call on the same id a no-op (returns 0 rows affected). The
-/// status is determined server-side from `paid_amount_sat` vs
-/// `amount_sat` so there's no SELECT-then-UPDATE race; whatever
-/// `amount_sat` is at flip-time decides under/over/exact.
+/// Idempotent invoice-paid flip. The `WHERE status IN ('unpaid',
+/// 'in_progress')` guard makes a re-call on the same id a no-op (returns
+/// 0 rows affected) once the invoice has reached any terminal status.
+/// Crucially, an `in_progress` row (mempool-seen but not yet confirmed)
+/// can still flip directly to paid/under/over once the confirming tx is
+/// observed — without this widening, the BTC watcher would deadlock its
+/// own state machine. The status is determined server-side from
+/// `paid_amount_sat` vs `amount_sat` so there's no SELECT-then-UPDATE
+/// race; whatever `amount_sat` is at flip-time decides under/over/exact.
 ///
-/// `paid_via`: 'lightning' or 'liquid' (validated against the column-level
-/// CHECK in migration 019).
+/// `paid_via`: 'lightning' | 'liquid' | 'bitcoin' (validated against the
+/// column-level CHECK in migration 021).
 ///
 /// Returns rows_affected: 1 = flip happened; 0 = invoice was already in
 /// a terminal status (paid/under/over/expired/cancelled). 0 is NOT an
@@ -1940,11 +1944,34 @@ pub async fn mark_invoice_paid(
             paid_via = $3, \
             paid_amount_sat = $2, \
             paid_at = NOW() \
-         WHERE id = $1 AND status = 'unpaid'",
+         WHERE id = $1 AND status IN ('unpaid', 'in_progress')",
     )
     .bind(id)
     .bind(paid_amount_sat)
     .bind(paid_via)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Flip an invoice to `in_progress` on the FIRST mempool sighting of a
+/// payment tx (BTC watcher, or the LN claimer's `transaction.mempool`
+/// hook in Step 9). Idempotent under the `WHERE status = 'unpaid'`
+/// guard: a second sighting tick is a no-op (returns 0). Crucially, a
+/// later `mark_invoice_paid` call can still advance an `in_progress`
+/// row to paid/under/over (predicate widened above).
+///
+/// Returns rows_affected: 1 = flip happened; 0 = no-op (already
+/// in_progress, paid, expired, cancelled, or row absent).
+pub async fn mark_invoice_in_progress(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices SET status = 'in_progress' \
+         WHERE id = $1 AND status = 'unpaid'",
+    )
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

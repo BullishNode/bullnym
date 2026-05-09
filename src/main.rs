@@ -13,7 +13,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, chain_watcher, claimer, config, donation_page, donation_render, gc,
+    bitcoin_watcher, boltz, chain_watcher, claimer, config, donation_page, donation_render, gc,
     invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler, registration,
     utxo::{self, UtxoBackend},
     AppState,
@@ -227,6 +227,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         tracing::warn!("chain watcher NOT started: utxo backend unavailable");
+    }
+
+    // Bitcoin watcher: polls mempool.bullbitcoin.com for invoice on-chain
+    // BTC settlement. Independent of the Liquid chain watcher above —
+    // separate API, separate rate-limit policy, separate cadence.
+    {
+        let pool = state.db.clone();
+        let cancel_btc = cancel.clone();
+        let btc_cfg = config.bitcoin_watcher.clone();
+        tokio::spawn(async move {
+            bitcoin_watcher::run(btc_cfg, pool, cancel_btc).await;
+        });
     }
 
     // Donation-page image upload needs a 2 MiB body cap, well above the
