@@ -9,6 +9,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {# Page is private to whoever holds the URL — match the X-Robots-Tag
+       header set by the response wrapper so crawlers respect either signal. #}
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Invoice · {{ domain }}</title>
 
     {# CSP: same-origin only, plus liquid.network WSS for 0-conf push.
@@ -149,7 +153,52 @@
 </head>
 <body>
     <main>
-        <h1>Pay <span class="nym">{{ nym }}</span></h1>
+        {# Header: linked invoices show the merchant's nym; unlinked
+           invoices (wallet-only) show a generic "Pay invoice" header. #}
+        {% if is_unlinked %}
+            <h1>Pay invoice</h1>
+        {% else %}
+            <h1>Pay <span class="nym">{{ nym }}</span></h1>
+        {% endif %}
+
+        {# Wallet-origin invoice metadata. Each block renders only when
+           the source field is present — askama auto-escapes every
+           interpolation; do NOT add `|safe` to user-controlled content. #}
+        {% match invoice_number %}
+            {% when Some with (n) %}<div class="meta">Invoice {{ n }}</div>
+            {% when None %}
+        {% endmatch %}
+        {% match recipient_name %}
+            {% when Some with (r) %}<div class="meta">Recipient: {{ r }}</div>
+            {% when None %}
+        {% endmatch %}
+        {% match public_description %}
+            {% when Some with (d) %}<div class="meta">{{ d }}</div>
+            {% when None %}
+        {% endmatch %}
+
+        {# Accepted-rails badge + per-rail addresses for wallet-origin
+           invoices. Donation-page checkout invoices have all three flags
+           set to defaults (accept_ln + accept_liquid only) and no
+           bitcoin_address; the addresses block is hidden when no address
+           is wallet-supplied. The dynamic rail toggle below still drives
+           the lazy Lightning/Liquid offer fetch for checkout flows. #}
+        {% if status == "unpaid" || status == "in_progress" %}
+            <div class="meta">
+                Accepted:
+                {% if accept_btc %}<span>BTC</span>{% endif %}
+                {% if accept_ln %}<span>Lightning</span>{% endif %}
+                {% if accept_liquid %}<span>Liquid</span>{% endif %}
+            </div>
+            {% match bitcoin_address %}
+                {% when Some with (a) %}<div class="meta">BTC: <code>{{ a }}</code></div>
+                {% when None %}
+            {% endmatch %}
+            {% match liquid_address %}
+                {% when Some with (a) %}<div class="meta">Liquid: <code>{{ a }}</code></div>
+                {% when None %}
+            {% endmatch %}
+        {% endif %}
 
         <div class="card" id="root" data-status="{{ status }}">
             {# Initial server-render branches. JS replaces this on status

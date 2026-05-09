@@ -467,12 +467,25 @@ struct InvoicePaymentTpl<'a> {
     /// Nym for the linked render path; empty string for unlinked. Templates
     /// gate URL construction on `is_unlinked` rather than this field.
     nym: &'a str,
+    /// True when nym_owner is None — page is reached via /invoice/<id>
+    /// rather than /<nym>/i/<id>. Drives header copy and URL templating.
+    is_unlinked: bool,
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
     amount_sat: i64,
     fiat_display: Option<String>,
     is_fiat: bool,
+    /// Wallet-origin public-facing fields. Askama auto-escapes every
+    /// `{{ }}` interpolation; do NOT add `|safe` to these in the template.
+    public_description: Option<&'a str>,
+    recipient_name: Option<&'a str>,
+    invoice_number: Option<&'a str>,
+    accept_btc: bool,
+    accept_ln: bool,
+    accept_liquid: bool,
+    bitcoin_address: Option<&'a str>,
+    liquid_address: Option<&'a str>,
 }
 
 fn currency_precision(currency: &str) -> u8 {
@@ -542,14 +555,24 @@ fn render_invoice_template(
     };
     let is_fiat = inv.rate_minor_per_btc.is_some();
     let nym = inv.nym_owner.as_deref().unwrap_or("");
+    let is_unlinked = inv.nym_owner.is_none();
     let tpl = InvoicePaymentTpl {
         nym,
+        is_unlinked,
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
         amount_sat: inv.amount_sat,
         fiat_display,
         is_fiat,
+        public_description: inv.public_description.as_deref(),
+        recipient_name: inv.recipient_label.as_deref(),
+        invoice_number: inv.invoice_number.as_deref(),
+        accept_btc: inv.accept_btc,
+        accept_ln: inv.accept_ln,
+        accept_liquid: inv.accept_liquid,
+        bitcoin_address: inv.bitcoin_address.as_deref(),
+        liquid_address: inv.liquid_address.as_deref(),
     };
     tpl.render()
         .map_err(|e| AppError::DbError(format!("template render: {e}")))
