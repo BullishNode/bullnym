@@ -20,6 +20,8 @@ use sqlx::PgPool;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
+use crate::db;
+
 #[derive(Debug, Clone, Copy)]
 pub struct GcConfig {
     pub tick_secs: u64,
@@ -29,6 +31,10 @@ pub struct GcConfig {
     /// recycled. 1h is enough for any real payer to land their tx; longer
     /// just lets attackers fill the per-nym pending cap without paying.
     pub outpoint_pending_ttl_secs: u64,
+    /// TTL for `donation_allocations` rows. Cookie-pinned bindings older
+    /// than this are pruned so abandoned cookies don't keep allocations
+    /// alive forever. Same value as the `bullpay_did` cookie max-age.
+    pub donation_allocation_ttl_days: u32,
 }
 
 impl Default for GcConfig {
@@ -37,6 +43,7 @@ impl Default for GcConfig {
             tick_secs: 600,         // 10 min
             retention_secs: 86_400, // 24 h — well past the longest 1h window
             outpoint_pending_ttl_secs: 3_600, // 1 h
+            donation_allocation_ttl_days: 30,
         }
     }
 }
@@ -57,11 +64,19 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
                 let removed_na = prune_nym_access_events(&pool, cfg.retention_secs).await;
                 let removed_oa =
                     prune_outpoint_addresses(&pool, cfg.outpoint_pending_ttl_secs).await;
+                // Phase B step 10 fix: donation_allocations is dropped in
+                // migration 019; prune_donation_allocations would error
+                // every tick. The replacement is `expire_invoices_past_deadline`
+                // which flips unpaid past-deadline invoices to 'expired'.
+                let removed_iv =
+                    expire_invoices_past_deadline(&pool).await;
                 tracing::info!(
-                    "rate-limit GC: pruned rate_limit_events={} nym_access_events={} outpoint_addresses_pending={}",
+                    "rate-limit GC: pruned rate_limit_events={} nym_access_events={} \
+                     outpoint_addresses_pending={} invoices_expired={}",
                     removed_rl,
                     removed_na,
-                    removed_oa
+                    removed_oa,
+                    removed_iv,
                 );
             }
         }
@@ -97,6 +112,19 @@ async fn prune_nym_access_events(pool: &PgPool, retention_secs: u64) -> u64 {
         Ok(r) => r.rows_affected(),
         Err(e) => {
             tracing::warn!("rate-limit GC: nym_access_events prune failed: {e}");
+            0
+        }
+    }
+}
+
+/// Phase B: flip unpaid invoices past `expires_at` to 'expired'. Set-based
+/// idempotent UPDATE — re-runs are safe; rows that have already settled
+/// to a non-unpaid status are excluded by the predicate.
+async fn expire_invoices_past_deadline(pool: &PgPool) -> u64 {
+    match db::expire_invoices_past_deadline(pool).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("rate-limit GC: expire_invoices_past_deadline failed: {e}");
             0
         }
     }

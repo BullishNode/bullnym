@@ -11,6 +11,7 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::reserved_nyms;
 use crate::AppState;
 
 /// Resolve the caller IP using the same logic as `/lnurlp/callback`:
@@ -48,37 +49,13 @@ async fn gate_register_per_ip(
 static NYM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\-]{1,30}[a-z0-9]$").unwrap());
 
-// Dispatches v1 (timestamped, domain-tagged) when `timestamp` is supplied,
-// otherwise falls back to legacy v0 with a deprecation warn. v0 path will
-// be removed once the deprecation log volume drops.
-fn verify_la_action_sig(
-    npub: &str,
-    action: &str,
-    v1_payload: &[&str],
-    timestamp: Option<u64>,
-    signature: &str,
-    v0_challenge: &[u8],
-) -> Result<(), AppError> {
-    if let Some(ts) = timestamp {
-        auth::verify_la_v1(action, npub, v1_payload, ts, signature)
-    } else {
-        tracing::warn!(
-            npub = %npub,
-            action = %action,
-            "deprecated v0 sig accepted; will be rejected after overlap window"
-        );
-        auth::verify_signature(npub, v0_challenge, signature)
-    }
-}
-
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub nym: String,
     pub ct_descriptor: String,
     pub npub: String,
     pub signature: String,
-    #[serde(default)]
-    pub timestamp: Option<u64>,
+    pub timestamp: u64,
 }
 
 /// Wire-shape view of a per-npub lifetime nym quota. Lives on every
@@ -119,10 +96,13 @@ pub struct DeleteResponse {
 #[derive(Deserialize)]
 pub struct UpdateRequest {
     pub npub: String,
+    /// Active nym for this npub. Included so the v2 sig binds the action to a
+    /// specific nym (cross-nym sig replay rejected). Server still asserts the
+    /// (npub, nym) pair matches the stored row.
+    pub nym: String,
     pub ct_descriptor: String,
     pub signature: String,
-    #[serde(default)]
-    pub timestamp: Option<u64>,
+    pub timestamp: u64,
 }
 
 #[derive(Serialize)]
@@ -157,6 +137,10 @@ pub async fn register(
         ));
     }
 
+    if reserved_nyms::is_reserved(&req.nym) {
+        return Err(AppError::NymReserved);
+    }
+
     descriptor::validate_descriptor(
         &req.ct_descriptor,
         state.config.limits.max_descriptor_len,
@@ -176,14 +160,13 @@ pub async fn register(
         }
     }
 
-    let v0_challenge = format!("{}{}", req.nym, req.ct_descriptor);
-    verify_la_action_sig(
-        &req.npub,
+    auth::verify_la_v2(
         "register",
-        &[&req.nym, &req.ct_descriptor],
+        &req.npub,
+        &req.nym,
+        &[&req.ct_descriptor],
         req.timestamp,
         &req.signature,
-        v0_challenge.as_bytes(),
     )?;
 
     // Atomic register flow under an advisory lock keyed on `npub`.
@@ -237,19 +220,30 @@ pub async fn update_registration(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let _ = gate_register_per_ip(&state, peer, &headers).await?;
 
-    verify_la_action_sig(
-        &req.npub,
+    auth::verify_la_v2(
         "update",
+        &req.npub,
+        &req.nym,
         &[&req.ct_descriptor],
         req.timestamp,
         &req.signature,
-        req.ct_descriptor.as_bytes(),
     )?;
 
     descriptor::validate_descriptor(
         &req.ct_descriptor,
         state.config.limits.max_descriptor_len,
     )?;
+
+    // Pre-flight: confirm the (npub, nym) pair matches a current registration
+    // BEFORE the descriptor write. Catches stale-nym replays.
+    let current = db::get_user_by_npub(&state.db, &req.npub).await?.ok_or_else(
+        || AppError::NymNotFound("no registration found for this key".to_string()),
+    )?;
+    if current.nym != req.nym {
+        return Err(AppError::AuthError(
+            "signer's claimed nym does not match the registration on file".to_string(),
+        ));
+    }
 
     let user = db::update_user_descriptor(&state.db, &req.npub, &req.ct_descriptor)
         .await?
@@ -266,15 +260,18 @@ pub async fn update_registration(
 #[derive(Deserialize)]
 pub struct DeleteRequest {
     pub npub: String,
+    /// Active nym for this npub. Included so the v2 sig binds the action to a
+    /// specific nym (cross-nym sig replay rejected). Server still asserts the
+    /// (npub, nym) pair matches the stored row.
+    pub nym: String,
     pub signature: String,
     /// When true, hard-delete all swap_records / outpoint_addresses for the
     /// nym in addition to deactivating it. The nym row itself is kept so the
     /// name stays reserved and the original npub can re-register it. Requires
-    /// the signature to be over `b"purge"` (not `b"delete"`).
+    /// the signature to be over action `"purge"` (not `"delete"`).
     #[serde(default)]
     pub purge: bool,
-    #[serde(default)]
-    pub timestamp: Option<u64>,
+    pub timestamp: u64,
 }
 
 /// DELETE /register — deactivate a Lightning Address registration.
@@ -292,15 +289,26 @@ pub async fn delete_registration(
     let _ = gate_register_per_ip(&state, peer, &headers).await?;
 
     let action = if req.purge { "purge" } else { "delete" };
-    let v0_challenge: &[u8] = if req.purge { b"purge" } else { b"delete" };
-    verify_la_action_sig(
-        &req.npub,
+    auth::verify_la_v2(
         action,
+        &req.npub,
+        &req.nym,
         &[],
         req.timestamp,
         &req.signature,
-        v0_challenge,
     )?;
+
+    // Pre-flight: confirm the (npub, nym) pair matches a current registration
+    // BEFORE the deactivate/purge fires. Catches stale-nym replays where the
+    // npub later registered a different nym.
+    let current = db::get_user_by_npub(&state.db, &req.npub).await?.ok_or_else(
+        || AppError::NymNotFound("no registration found for this key".to_string()),
+    )?;
+    if current.nym != req.nym {
+        return Err(AppError::AuthError(
+            "signer's claimed nym does not match the registration on file".to_string(),
+        ));
+    }
 
     if req.purge {
         match db::purge_user(&state.db, &req.npub).await? {

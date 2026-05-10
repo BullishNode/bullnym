@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::db::{self, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
+use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
 use crate::AppState;
@@ -205,7 +206,8 @@ async fn dispatch_webhook(
 
     match data.status.as_str() {
         "transaction.mempool" | "transaction.confirmed" => {
-            let new_status = if data.status == "transaction.mempool" {
+            let is_mempool = data.status == "transaction.mempool";
+            let new_status = if is_mempool {
                 SwapStatus::LockupMempool
             } else {
                 SwapStatus::LockupConfirmed
@@ -213,6 +215,28 @@ async fn dispatch_webhook(
             db::update_swap_status(&state.db, swap.id, new_status, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
+
+            // Get-paid Step 9: mempool sighting → invoice `in_progress`
+            // (early signal that the donator's HTLC has been routed).
+            // Confirmed sighting → invoice `paid` (settlement). Both
+            // helpers are idempotent + error-swallowing per their
+            // contracts; the swap CAS has already committed above.
+            if is_mempool {
+                invoice::flip_invoice_on_lightning_in_progress(
+                    &state.db,
+                    swap.invoice_id,
+                    &swap.boltz_swap_id,
+                )
+                .await;
+            } else {
+                invoice::flip_invoice_on_lightning_settlement(
+                    &state.db,
+                    swap.invoice_id,
+                    swap.amount_sat,
+                    &swap.boltz_swap_id,
+                )
+                .await;
+            }
 
             try_claim_with_retry(
                 &state.db,
@@ -297,6 +321,17 @@ async fn dispatch_webhook(
             db::update_swap_status(&state.db, swap.id, SwapStatus::LockupRefunded, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
+
+            // Phase B step 7: paid-equivalent — donator paid the LN
+            // side. The merchant fund-loss is tracked by the
+            // `swap_lockup_refunded` P0 alert (above), NOT invoice state.
+            invoice::flip_invoice_on_lightning_settlement(
+                &state.db,
+                swap.invoice_id,
+                swap.amount_sat,
+                &swap.boltz_swap_id,
+            )
+            .await;
         }
         _ => {
             // Other Boltz statuses (`swap.created`, `minerfee.paid`, etc.)
@@ -370,11 +405,25 @@ async fn try_claim_with_retry(
     }
 }
 
-/// Returns the claim destination for this swap, allocating one from the
-/// receiver's CT descriptor if it has not been set yet. Serialized on the
-/// `swap_records` row via `SELECT ... FOR UPDATE`, so concurrent webhook
-/// deliveries (e.g. transaction.mempool followed by transaction.confirmed)
-/// cannot double-allocate.
+/// Returns the claim destination for this swap. Three branches in order:
+///
+///   (A) **Cached**: a previous attempt already wrote `swap_records.address`.
+///       Return it as-is. This makes claim retries fully idempotent — the
+///       same destination is used across attempts whether the address came
+///       from the descriptor allocator or a wallet-supplied invoice.
+///
+///   (B) **Invoice-bound**: the swap was created for a Get-paid invoice.
+///       Read `invoices.liquid_address` (wallet-supplied at create time);
+///       persist it into `swap_records.address` (with `address_index = NULL`,
+///       since there is no descriptor index for wallet-supplied addresses).
+///
+///   (C) **LN-Address legacy**: the swap is for the ongoing LNURL
+///       Lightning Address flow. Bump `users.next_addr_idx` and derive a
+///       fresh CT address from the user's descriptor.
+///
+/// Serialized on the `swap_records` row via `SELECT ... FOR UPDATE`, so
+/// concurrent webhook deliveries (e.g. transaction.mempool followed by
+/// transaction.confirmed) can't double-allocate or split addresses.
 async fn resolve_claim_address(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
@@ -384,35 +433,86 @@ async fn resolve_claim_address(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    let row: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
-        "SELECT address, address_index FROM swap_records WHERE id = $1 FOR UPDATE",
+    // Re-read the swap row under FOR UPDATE — `swap` may be stale (the
+    // caller loaded it before this call, possibly on a previous attempt).
+    let row: Option<(Option<String>, Option<i32>, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT address, address_index, invoice_id FROM swap_records WHERE id = $1 FOR UPDATE",
     )
     .bind(swap.id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    if let Some((Some(addr), Some(_))) = &row {
+    let (cached_addr, _cached_idx, invoice_id) = row.ok_or_else(|| {
+        AppError::ClaimError(format!("swap_records row gone: {}", swap.id))
+    })?;
+
+    // (A) Cached destination — return as-is. Idempotent retries land on
+    //     the same address regardless of how it was first resolved.
+    if let Some(addr) = cached_addr {
         tx.commit()
             .await
             .map_err(|e| AppError::DbError(e.to_string()))?;
-        return Ok(addr.clone());
+        return Ok(addr);
     }
 
+    // (B) Invoice-bound — wallet supplied the destination at create time.
+    //     `liquid_address_index` stays NULL: there's no descriptor cursor
+    //     to bump for wallet addresses. Persist into swap_records.address
+    //     so the cache branch wins on the next retry.
+    if let Some(inv_id) = invoice_id {
+        let inv_row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT liquid_address FROM invoices WHERE id = $1",
+        )
+        .bind(inv_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        let addr = inv_row
+            .and_then(|(a,)| a)
+            .ok_or_else(|| {
+                AppError::ClaimError(format!(
+                    "invoice {inv_id} has no liquid_address"
+                ))
+            })?;
+
+        sqlx::query(
+            "UPDATE swap_records SET address = $1, address_index = NULL WHERE id = $2",
+        )
+        .bind(&addr)
+        .bind(swap.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+
+        tracing::info!(
+            event = "lightning_swap_address_from_invoice",
+            swap_id = %swap.id,
+            invoice_id = %inv_id,
+            "claim destination resolved from invoice.liquid_address"
+        );
+        return Ok(addr);
+    }
+
+    // (C) LN-Address legacy — descriptor allocator. The `is_active = TRUE`
+    //     filter from the original implementation is intentionally dropped
+    //     here. Funds locked up against a swap we created belong to the
+    //     receiver regardless of their current activation status — a user
+    //     who deactivated between swap creation and HTLC funding still gets
+    //     their claim. `purge_user` already refuses to run while in-flight
+    //     swaps exist (see db.rs:359), and it sets `ct_descriptor = ''`
+    //     which would surface as a derive failure here, so a purged-row
+    //     corner case fails loudly rather than silently strands.
     let user = db::get_user_by_nym(pool, &swap.nym)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("user not found: {}", swap.nym)))?;
 
-    // The `is_active = TRUE` filter from the original implementation is
-    // intentionally dropped here. Funds locked up against a swap we
-    // created belong to the receiver regardless of their current
-    // activation status — a user who deactivated between swap creation
-    // and HTLC funding still gets their claim. `purge_user` already
-    // refuses to run while in-flight swaps exist (see db.rs:359), and
-    // it sets `ct_descriptor = ''` which would surface as a derive
-    // failure here, so a purged-row corner case fails loudly rather
-    // than silently strands.
     let addr_index_row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
          WHERE nym = $1 \
@@ -516,6 +616,20 @@ async fn claim_swap(
                     last_error = %err_str,
                     "swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
+                // Phase B step 7: paid-equivalent — donator paid the LN
+                // side; merchant-side claim is stuck. Surface to the
+                // donator's invoice view as 'paid'. Operator-facing
+                // tracking lives on the swap_claim_stuck alert above,
+                // not in invoice state.
+                if let Ok(Some(swap)) = db::get_swap_by_id(pool, swap_id).await {
+                    invoice::flip_invoice_on_lightning_settlement(
+                        pool,
+                        swap.invoice_id,
+                        swap.amount_sat,
+                        &swap.boltz_swap_id,
+                    )
+                    .await;
+                }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
                 tracing::warn!(
@@ -751,6 +865,18 @@ async fn claim_swap_inner(
         // observability nuisance only.
         tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
     }
+
+    // Phase B step 7: paid-equivalent (terminal happy path). Mirror into
+    // invoice state. The chain_watcher's Liquid-side flip and this
+    // Lightning-side flip are mutually idempotent at the invoice level
+    // (mark_invoice_paid's `WHERE status = 'unpaid'` predicate).
+    invoice::flip_invoice_on_lightning_settlement(
+        pool,
+        swap.invoice_id,
+        swap.amount_sat,
+        &swap.boltz_swap_id,
+    )
+    .await;
 
     Ok(ClaimOutcome::Broadcast)
 }

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ header }}</title>
+
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="{{ header }}">
+    <meta property="og:description" content="{{ description }}">
+    <meta property="og:url" content="{{ public_url }}">
+    {% match og_url %}{% when Some with (url) %}<meta property="og:image" content="{{ url }}">{% when None %}{% endmatch %}
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="{{ header }}">
+    <meta name="twitter:description" content="{{ description }}">
+    {% match og_url %}{% when Some with (url) %}<meta name="twitter:image" content="{{ url }}">{% when None %}{% endmatch %}
+
+    {# CSP: tighter than donation_page.html — no remote scripts/fonts; the
+       only outbound network calls are same-origin (POST /<nym>/invoice). #}
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; img-src 'self' data:;
+                   style-src 'self' 'unsafe-inline';
+                   script-src 'self' 'unsafe-inline';
+                   connect-src 'self'">
+
+    <style>
+        :root {
+            --bg: #0E0E0E;
+            --fg: #F5F5F5;
+            --accent: #F7931A;
+            --muted: #888;
+            --card: #1A1A1A;
+            --border: #2A2A2A;
+        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            line-height: 1.5;
+        }
+        main { max-width: 480px; margin: 0 auto; padding: 16px; }
+        header { text-align: center; margin-bottom: 16px; }
+        .avatar {
+            width: 96px; height: 96px; border-radius: 50%;
+            object-fit: cover; margin-bottom: 12px;
+            border: 2px solid var(--border);
+        }
+        h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
+        .description {
+            color: var(--muted); font-size: 14px;
+            white-space: pre-line; margin: 0 0 12px;
+        }
+        .social { display: flex; justify-content: center; gap: 16px; }
+        .social a { color: var(--accent); text-decoration: none; font-size: 13px; }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 12px;
+        }
+        .row { display: flex; gap: 8px; align-items: center; }
+        .amount-input {
+            flex: 1;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--fg);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 18px;
+        }
+        .amount-input:focus { outline: 2px solid var(--accent); }
+        .currency-select {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--fg);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        button.primary {
+            width: 100%;
+            padding: 14px;
+            margin-top: 12px;
+            background: var(--accent);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .rate {
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+            margin-top: 8px;
+        }
+        .stale { color: var(--accent); }
+        .err {
+            color: #c97;
+            font-size: 13px;
+            text-align: center;
+            margin-top: 8px;
+            min-height: 16px;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <header>
+            {% match avatar_url %}{% when Some with (url) %}<img class="avatar" src="{{ url }}" alt="{{ nym }}">{% when None %}{% endmatch %}
+            <h1>{{ header }}</h1>
+            <p class="description">{{ description }}</p>
+            <div class="social">
+                {% match website %}{% when Some with (w) %}{% if !w.is_empty() %}<a href="{{ w }}" rel="noopener noreferrer" target="_blank">website</a>{% endif %}{% when None %}{% endmatch %}
+                {% match twitter %}{% when Some with (t) %}{% if !t.is_empty() %}<a href="https://twitter.com/{{ t }}" rel="noopener noreferrer" target="_blank">twitter</a>{% endif %}{% when None %}{% endmatch %}
+                {% match instagram %}{% when Some with (i) %}{% if !i.is_empty() %}<a href="https://instagram.com/{{ i }}" rel="noopener noreferrer" target="_blank">instagram</a>{% endif %}{% when None %}{% endmatch %}
+            </div>
+        </header>
+
+        <div class="card">
+            <div class="row">
+                <input id="amt" class="amount-input" type="number" step="any" min="0" inputmode="decimal" placeholder="0">
+                <select id="unit" class="currency-select">
+                    {# Crypto units. BTC and sat both produce sat-denominated invoices —
+                       JS converts BTC ×10^8 = sat. #}
+                    <option value="sat">sat</option>
+                    <option value="btc">BTC</option>
+                    {# All fiat currencies the server supports. The merchant's
+                       display_currency is the default-selected option. Sender
+                       can override per-payment. #}
+                    {% for c in supported_currencies %}
+                        <option value="fiat:{{ c }}">{{ c }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button id="continue-btn" class="primary" type="button" disabled>Continue</button>
+            <div class="err" id="err"></div>
+            <p class="rate">
+                {% if minor_per_btc > 0 %}
+                    1 BTC = {{ minor_per_btc }} {{ display_currency }} (minor){% if last_known_rate %} <span class="stale">(rate may be stale)</span>{% endif %}
+                {% else %}
+                    <span class="stale">rate unavailable for {{ display_currency }} — sat or BTC still works</span>
+                {% endif %}
+            </p>
+        </div>
+    </main>
+
+    <script>
+        // Phase B step 9: amount-entry stub. Submits to POST /<nym>/invoice
+        // and navigates to /<nym>/i/<id>. Server-side rate-limit gate
+        // (5/min per source) caps creation rate; the page does no
+        // client-side throttling beyond the disabled-button guard.
+        (function () {
+            const NYM = "{{ nym }}";
+            const DEFAULT_CURRENCY = "{{ display_currency }}";
+            const SAT_PER_BTC = 100000000;
+            // Per-currency precision (minor units per major). Mirrors what
+            // the pricer reports for each supported currency.
+            const PRECISIONS = {
+                "USD": 2, "CAD": 2, "EUR": 2, "CRC": 2,
+                "MXN": 2, "ARS": 2, "COP": 0, "INR": 2
+            };
+
+            const amt = document.getElementById('amt');
+            const unit = document.getElementById('unit');
+            const btn = document.getElementById('continue-btn');
+            const err = document.getElementById('err');
+
+            // Default-select the merchant's display currency. If it's not
+            // in the dropdown for any reason, leave the first option (sat)
+            // as the default.
+            if (DEFAULT_CURRENCY) {
+                const target = `fiat:${DEFAULT_CURRENCY}`;
+                if ([...unit.options].some(o => o.value === target)) {
+                    unit.value = target;
+                }
+            }
+
+            function valid() {
+                const v = parseFloat(amt.value);
+                return Number.isFinite(v) && v > 0;
+            }
+            function refreshBtn() {
+                btn.disabled = !valid();
+                err.textContent = '';
+            }
+            amt.addEventListener('input', refreshBtn);
+            unit.addEventListener('change', refreshBtn);
+
+            btn.addEventListener('click', async () => {
+                if (!valid()) return;
+                btn.disabled = true;
+                err.textContent = '';
+                let body;
+                const v = parseFloat(amt.value);
+                const u = unit.value;
+                if (u === 'sat') {
+                    body = { amount_sat: Math.round(v) };
+                } else if (u === 'btc') {
+                    // BTC → sat. Round to whole sat (no fractional sat).
+                    body = { amount_sat: Math.round(v * SAT_PER_BTC) };
+                } else if (u.startsWith('fiat:')) {
+                    const currency = u.slice(5);
+                    const precision = PRECISIONS[currency] ?? 2;
+                    const minor = Math.round(v * Math.pow(10, precision));
+                    body = {
+                        fiat_amount_minor: minor,
+                        fiat_currency: currency,
+                    };
+                } else {
+                    err.textContent = 'unknown unit';
+                    btn.disabled = false;
+                    return;
+                }
+                try {
+                    const res = await fetch(`/${NYM}/invoice`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const data = await res.json();
+                    if (data.status === 'ERROR' || !data.invoice_id) {
+                        err.textContent = data.reason || 'invoice creation failed';
+                        btn.disabled = false;
+                        return;
+                    }
+                    window.location.href = `/${NYM}/i/${data.invoice_id}`;
+                } catch (e) {
+                    err.textContent = 'network error — try again';
+                    btn.disabled = false;
+                }
+            });
+        })();
+    </script>
+</body>
+</html>

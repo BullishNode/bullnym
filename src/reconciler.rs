@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ReconcilerConfig;
 use crate::db::{self, ReconcilerSwap, SwapStatus};
+use crate::invoice;
 
 /// Spawn the reconciler background task. One task per process.
 pub fn spawn(
@@ -220,6 +221,14 @@ async fn apply_action(
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupMempool, None).await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
+            // Get-paid Step 9: mempool sighting → invoice `in_progress`.
+            // The matching webhook arm in claimer.rs uses the same helper.
+            invoice::flip_invoice_on_lightning_in_progress(
+                pool,
+                swap.invoice_id,
+                &swap.boltz_swap_id,
+            )
+            .await;
             Ok(())
         }
         AdvanceToLockupConfirmed => {
@@ -232,6 +241,14 @@ async fn apply_action(
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
+            // Phase B step 7: paid-equivalent. Mirror into invoice state.
+            invoice::flip_invoice_on_lightning_settlement(
+                pool,
+                swap.invoice_id,
+                swap.amount_sat,
+                &swap.boltz_swap_id,
+            )
+            .await;
             Ok(())
         }
         ScheduleImmediateClaim => {
@@ -270,6 +287,16 @@ async fn apply_action(
                 "FUND LOSS: boltz refunded lockup; user paid LN side, no on-chain claim"
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupRefunded, None).await?;
+            // Phase B step 7: paid-equivalent in the donator's view —
+            // they paid the LN side. Merchant fund-loss is tracked by
+            // the swap_lockup_refunded P0 alert above, NOT invoice state.
+            invoice::flip_invoice_on_lightning_settlement(
+                pool,
+                swap.invoice_id,
+                swap.amount_sat,
+                &swap.boltz_swap_id,
+            )
+            .await;
             Ok(())
         }
         NeedsManualAttention(reason) => {
@@ -303,6 +330,7 @@ mod tests {
             claim_txid: None,
             nym: "alice".to_string(),
             amount_sat: 100_000,
+            invoice_id: None,
         }
     }
 

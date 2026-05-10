@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full", "signal"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migrate", "json"] }
 lwk_wollet = "0.14.0"
+# Bitcoin mainnet address validation for invoice handlers (validators.rs).
+# Only needed for parse + network-discriminate; no chainstate, no descriptors.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 boltz-client = { path = "../boltz/boltz-rust", features = ["electrum"] }
 secp256k1 = { version = "0.29", features = ["global-context"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,7 +23,7 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 dotenvy = "0.15"
 tokio-util = "0.7"
@@ -29,6 +32,17 @@ electrum-client = "0.21"
 ipnet = "2"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 dashmap = "6"
+askama = "0.12"
+askama_axum = "0.4"
+tower-cookies = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Donation-page image pipeline (Phase 3): decode jpg/png/webp, resize,
+# re-encode as lossless WebP. `default-features` is intentional — we
+# rely on jpeg + png + webp decoders being on.
+image = "0.25"
+# Server-side QR code generation for the donation-page payment view.
+# Default features off — we only need the SVG renderer.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

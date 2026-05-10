@@ -1,0 +1,86 @@
+# nginx snippet for /etc/nginx/sites-enabled/bullpay
+#
+# Adds direct-from-disk serving for donation-page images at /img/<nym>/<file>.
+# pay-service handles the upload pipeline and writes resized WebP files to
+# /opt/payservice/data/images/<nym>/{avatar,og}.webp; nginx serves them
+# without proxying through Rust.
+#
+# Place the `location ^~ /img/` block BEFORE any catch-all `proxy_pass`.
+# `^~` priority ensures /img/* is matched before regex location blocks.
+
+# Per-IP request rate limiting (backstop layer; in addition to Rust-side
+# gates). Keep the donation_html and donation_api zones modest — Rust
+# already gates these and these zones only catch volumetric noise.
+limit_req_zone $binary_remote_addr zone=donation_html:10m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=donation_api:10m rate=5r/s;
+
+server {
+    # ... existing TLS / server_name config ...
+
+    # Static donation-page images. nginx serves these directly from disk.
+    location ^~ /img/ {
+        alias /opt/payservice/data/images/;
+        try_files $uri =404;
+
+        # 1-week cache. Image filenames don't include a content hash, so
+        # use Cache-Control with revalidation to keep updates visible.
+        add_header Cache-Control "public, max-age=86400, must-revalidate";
+        add_header X-Content-Type-Options nosniff always;
+
+        # Reject any attempt to reach Rust handlers via /img/*.
+        access_log off;
+        log_not_found off;
+    }
+
+    # Rate-limit the donation HTML fallback (GET /<nym>).
+    # Excludes explicit routes that have their own protection.
+    location ~ ^/(?!\.well-known/|register|webhook/|health|api/|img/|donation-page|lnurlp/) {
+        limit_req zone=donation_html burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Rate-limit the donation callback (Phase 4).
+    location /lnurlp/donate-callback/ {
+        limit_req zone=donation_api burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ... existing catch-all proxy_pass to pay-service for the rest ...
+    # location / {
+    #     proxy_pass http://127.0.0.1:8080;
+    #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    #     ...
+    # }
+}
+
+# Deploy:
+#   1. Create the image directory tree:
+#        sudo mkdir -p /opt/payservice/data/images
+#        sudo chown -R payservice:payservice /opt/payservice/data/images
+#        # nginx (typically www-data) needs READ access to serve images.
+#        # Two options for granting that:
+#        #   (a) chmod 755 /opt/payservice/data/images       (world-readable)
+#        #   (b) chown payservice:www-data ...; chmod 750 ... (group-readable)
+#        # Pick whichever matches local conventions. Don't leave it 700 —
+#        # nginx will return 403 to every donation-page image request.
+#        sudo chmod 755 /opt/payservice/data/images
+#   2. Edit /etc/nginx/sites-enabled/bullpay; integrate the blocks above.
+#      The `^~ /img/` and donation_html / donate-callback blocks are NOT
+#      drop-in appendables — they must be slotted in BEFORE any catch-all
+#      `location /` (or `proxy_pass` regex) that would shadow them. Run
+#      `nginx -T` first to inspect the existing live config and merge offline.
+#   3. nginx -t && sudo systemctl reload nginx.
+#   4. Verify:
+#        curl -I https://bullpay.ca/img/__nonexistent__/avatar.webp  → 404 from nginx
+#        curl -I https://bullpay.ca/health                            → 200 (proxied to pay-service)
+#        curl -I https://bullpay.ca/img/                              → 403 or 404
+#                                                                       (NEVER 200; nginx must
+#                                                                        not list directories)
