@@ -307,7 +307,13 @@ impl IntoResponse for AppError {
             AppError::RateLimitedNetwork => "Too many distinct wallets have used this service from this network. Retry later, or switch networks.".into(),
             AppError::BackendThrottled => "Liquid network backend is rate-limited. Retry later.".into(),
             AppError::TooManyPendingReservations => "This Lightning Address has reached the maximum number of unfulfilled payment reservations. Retry once existing reservations complete or expire.".into(),
-            AppError::ServiceUnavailable(_) => "The maximum number of registered users has been reached. New registrations are not being accepted.".into(),
+            AppError::ServiceUnavailable(reason) => {
+                if reason.contains("active user ceiling") {
+                    "The maximum number of registered users has been reached. New registrations are not being accepted.".into()
+                } else {
+                    format!("Service temporarily unavailable: {reason}.")
+                }
+            },
             AppError::PurgeBlocked(n) => format!(
                 "Deactivation is blocked: {n} payment(s) are still in flight. \
                  These payments must complete or expire first."

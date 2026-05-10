@@ -21,8 +21,9 @@
 //! Both create paths verify a v2 Schnorr signature BEFORE any DB write, with
 //! the `nym_or_empty` slot driving the linked vs unlinked branch.
 //!
-//! Status-poll + Lightning lazy-fetch + Liquid lazy-allocation helpers remain
-//! shared across linked and unlinked invoices via `id`-only paths:
+//! Status-poll and Lightning lazy-fetch helpers remain shared across linked
+//! and unlinked invoices via `id`-only paths. The former Liquid
+//! lazy-allocation route is retained only as an explicit 410:
 //!    - `GET  /api/v1/invoices/<id>/status`
 //!    - `POST /api/v1/invoices/<id>/lightning`
 //!    - `POST /api/v1/invoices/<id>/liquid`  → 410 Gone (wallet supplies addr at create time)
@@ -42,6 +43,7 @@ use uuid::Uuid;
 
 use crate::auth;
 use crate::db;
+use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
 use crate::validators;
@@ -333,6 +335,27 @@ pub async fn create_anonymous(
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
+    // Eagerly allocate a Liquid address from the donation page owner's
+    // descriptor. Both rails settle to this same address:
+    //   - Lightning: `claimer::resolve_claim_address` branch (B) routes
+    //     the Boltz claim to `invoice.liquid_address` once
+    //     `create_lightning_offer` (below) binds the swap to this invoice.
+    //   - Direct Liquid: customer pays the address directly; the
+    //     chain_watcher's address-keyed scan detects the inbound tx.
+    // The `invoices_ln_or_liquid_addr_chk` constraint requires
+    // `liquid_address` to be present at insert time when either LN or
+    // Liquid is accepted, so allocation must run BEFORE insert.
+    let (liquid_address, _liquid_index) = db::allocate_next_liquid_for_active_nym(
+        &state.db,
+        &nym,
+        |ct_descriptor, idx| {
+            descriptor::derive_address(ct_descriptor, idx)
+                .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
+        },
+    )
+    .await?
+    .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+
     let new_invoice = db::NewInvoice {
         nym_owner: Some(&nym),
         npub_owner: &owner.npub,
@@ -350,13 +373,17 @@ pub async fn create_anonymous(
         recipient_label: None,
         public_description: None,
         invoice_number: None,
-        // Checkout-origin: BTC on-chain not exposed in v1; LN+Liquid via
-        // legacy descriptor allocator (lazy-allocated on first rail toggle).
+        // Checkout-origin: server eagerly allocates one Liquid address
+        // from the donation page owner's descriptor (above). Both
+        // Lightning and direct Liquid rails settle to this address. BTC
+        // on-chain is not exposed for donation-page checkout in v1 —
+        // would require a separate Bitcoin descriptor / wallet-supplied
+        // address path.
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
         bitcoin_address: None,
-        liquid_address: None,
+        liquid_address: Some(&liquid_address),
         expires_in_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;

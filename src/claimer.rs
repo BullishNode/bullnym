@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
@@ -78,7 +79,7 @@ pub async fn webhook_with_secret(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: String,
-) -> Result<&'static str, AppError> {
+) -> Result<Response, AppError> {
     if !webhook_url_secret_matches(&secret, &state.config) {
         // Same shape as a route miss — don't leak whether the path
         // existed but the secret was wrong vs. the route doesn't exist.
@@ -93,9 +94,11 @@ pub async fn webhook_with_secret(
             "boltz webhook: URL secret mismatch from {:?}",
             caller_ip
         );
-        return Err(AppError::AuthError(StatusCode::NOT_FOUND.to_string()));
+        return Ok((StatusCode::NOT_FOUND, "").into_response());
     }
-    dispatch_webhook(state, peer_opt, headers, body).await
+    dispatch_webhook(state, peer_opt, headers, body)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 /// Legacy unauthenticated webhook entrypoint: `/webhook/boltz`. When
@@ -116,7 +119,7 @@ pub async fn webhook_unauthenticated(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: String,
-) -> Result<&'static str, AppError> {
+) -> Result<Response, AppError> {
     if !state.config.boltz_webhook_url_secret.is_empty() {
         let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
         let caller_ip = ip_whitelist::resolve_caller_ip(
@@ -128,12 +131,14 @@ pub async fn webhook_unauthenticated(
             "boltz webhook: hit on unauthenticated path while secret is configured (caller={:?})",
             caller_ip,
         );
-        return Err(AppError::AuthError(StatusCode::NOT_FOUND.to_string()));
+        return Ok((StatusCode::NOT_FOUND, "").into_response());
     }
     tracing::warn!(
         "boltz webhook: BOLTZ_WEBHOOK_URL_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
     );
-    dispatch_webhook(state, peer_opt, headers, body).await
+    dispatch_webhook(state, peer_opt, headers, body)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 /// Shared post-auth webhook handler.

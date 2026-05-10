@@ -9,33 +9,19 @@
 //! 1. Path sanity / reserved-slug fail → 404 (`donation_404.html`).
 //! 2. Row absent → 404.
 //! 3. `archived_at IS NOT NULL` → 200 + `donation_archived.html`.
-//! 4. Live → 200 + `donation_page.html` with embedded Pricer rate.
-//!
-//! On first visit, sets a `bullpay_did` UUID cookie (HttpOnly, Secure,
-//! SameSite=Lax). Phase 4 uses this cookie to pin Liquid donation
-//! addresses per (source_ip, device_id).
+//! 4. Live → 200 + `store_amount.html` with embedded Pricer rate.
 
 use askama::Template;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
-use tower_cookies::{Cookie, Cookies};
-use uuid::Uuid;
 
 use crate::db;
 use crate::donation_page::SUPPORTED_CURRENCIES;
 use crate::ip_whitelist;
 use crate::reserved_nyms;
 use crate::AppState;
-
-// Phase B step 10: cookie issuance is deprecated; the helpers below are
-// retained as dead code so a binary rollback to the legacy donate-callback
-// flow doesn't require restoring deleted code. Phase D removes them.
-#[allow(dead_code)]
-const COOKIE_NAME: &str = "bullpay_did";
-#[allow(dead_code)]
-const COOKIE_MAX_AGE_DAYS: i64 = 30;
 
 #[derive(Template)]
 #[template(path = "store_amount.html")]
@@ -50,16 +36,9 @@ struct DonationPageTpl<'a> {
     website: Option<&'a str>,
     twitter: Option<&'a str>,
     instagram: Option<&'a str>,
-    /// Legacy field — kept on the struct so call sites don't need to
-    /// drop it during the Phase B cutover. The new `store_amount.html`
-    /// template doesn't reference it; the donate-callback URL is gone.
-    /// Phase D removes the field once `donation_callback.rs` is deleted.
-    #[allow(dead_code)]
-    callback_url: String,
     /// Minor units per BTC. 0 means rate unavailable; the JS gates the
     /// Continue button accordingly.
     minor_per_btc: i64,
-    precision: u8,
     last_known_rate: bool,
     /// All currencies the server supports for fiat-denominated invoices.
     /// Rendered as `<option>` entries on the unit dropdown so the sender
@@ -92,25 +71,6 @@ fn is_valid_slug(s: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Issue a `bullpay_did` UUID cookie if the caller doesn't already have
-/// one. Idempotent: a re-render with the cookie present is a no-op so
-/// the device_id stays stable across reloads.
-#[allow(dead_code)]
-fn ensure_device_cookie(cookies: &Cookies) {
-    if cookies.get(COOKIE_NAME).is_some() {
-        return;
-    }
-    let id = Uuid::new_v4().to_string();
-    let cookie = Cookie::build((COOKIE_NAME, id))
-        .path("/")
-        .http_only(true)
-        .secure(true)
-        .same_site(tower_cookies::cookie::SameSite::Lax)
-        .max_age(tower_cookies::cookie::time::Duration::days(COOKIE_MAX_AGE_DAYS))
-        .build();
-    cookies.add(cookie);
-}
-
 /// Add a few defensive response headers that apply to all donation-page
 /// HTML responses.
 fn apply_security_headers(resp: &mut Response) {
@@ -131,9 +91,6 @@ fn apply_security_headers(resp: &mut Response) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
-    // CSP: no remote scripts/styles/images. The donation page renders
-    // entirely from inline assets; the only outbound network call is the
-    // donate-callback fetch (same-origin).
     // CSP: tight default with two narrow exceptions:
     // - 'unsafe-inline' for script and style — the page bundles its JS/CSS
     //   inline, no remote CDN. User-controlled fields are askama-escaped
@@ -190,7 +147,6 @@ fn render_archived(state: &AppState, nym: &str) -> Response {
 async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     let domain = &state.config.domain;
     let public_url = format!("https://{domain}/{}", page.nym);
-    let callback_url = format!("/lnurlp/donate-callback/{}", page.nym);
 
     // Image URLs only render if the corresponding hash is set (Phase 3
     // populates them on upload; v1 may not have either yet).
@@ -207,9 +163,9 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     // fiat conversion + disables the Donate button. The page still
     // renders (better than a hard 5xx).
     let rate = state.pricer.get_rate(&page.display_currency).await;
-    let (minor_per_btc, precision, last_known_rate) = match &rate {
-        Some(r) => (r.minor_per_btc, r.precision, r.last_known_rate),
-        None => (0, 2, false),
+    let (minor_per_btc, last_known_rate) = match &rate {
+        Some(r) => (r.minor_per_btc, r.last_known_rate),
+        None => (0, false),
     };
 
     let body = DonationPageTpl {
@@ -223,9 +179,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
         website: page.website.as_deref(),
         twitter: page.twitter.as_deref(),
         instagram: page.instagram.as_deref(),
-        callback_url,
         minor_per_btc,
-        precision,
         last_known_rate,
         supported_currencies: SUPPORTED_CURRENCIES,
     }
@@ -286,11 +240,6 @@ pub async fn render_or_404(
             return render_404(&state, nym);
         }
     };
-
-    // Phase B step 10: device-cookie issuance removed. The new flow uses
-    // URL pinning (`/<nym>/i/<invoice_id>`) instead of cookie pinning.
-    // The `ensure_device_cookie` helper and `COOKIE_NAME` constant remain
-    // in this file as dead code (Phase D removes them).
 
     if page.is_archived {
         return render_archived(&state, nym);

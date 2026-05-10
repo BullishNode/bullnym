@@ -232,13 +232,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bitcoin watcher: polls mempool.bullbitcoin.com for invoice on-chain
     // BTC settlement. Independent of the Liquid chain watcher above —
     // separate API, separate rate-limit policy, separate cadence.
-    {
+    if config.bitcoin_watcher.enabled {
         let pool = state.db.clone();
         let cancel_btc = cancel.clone();
         let btc_cfg = config.bitcoin_watcher.clone();
         tokio::spawn(async move {
             bitcoin_watcher::run(btc_cfg, pool, cancel_btc).await;
         });
+    } else {
+        tracing::info!("bitcoin watcher disabled by config");
     }
 
     // Donation-page image upload needs a 2 MiB body cap, well above the

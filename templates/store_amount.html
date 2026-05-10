@@ -16,8 +16,8 @@
     <meta name="twitter:description" content="{{ description }}">
     {% match og_url %}{% when Some with (url) %}<meta name="twitter:image" content="{{ url }}">{% when None %}{% endmatch %}
 
-    {# CSP: tighter than donation_page.html — no remote scripts/fonts; the
-       only outbound network calls are same-origin (POST /<nym>/invoice). #}
+    {# CSP: no remote scripts/fonts; the only outbound network calls are
+       same-origin (POST /<nym>/invoice). #}
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; img-src 'self' data:;
                    style-src 'self' 'unsafe-inline';

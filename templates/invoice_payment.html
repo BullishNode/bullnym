@@ -178,11 +178,9 @@
         {% endmatch %}
 
         {# Accepted-rails badge + per-rail addresses for wallet-origin
-           invoices. Donation-page checkout invoices have all three flags
-           set to defaults (accept_ln + accept_liquid only) and no
-           bitcoin_address; the addresses block is hidden when no address
-           is wallet-supplied. The dynamic rail toggle below still drives
-           the lazy Lightning/Liquid offer fetch for checkout flows. #}
+           invoices. Donation-page checkout invoices expose Lightning only;
+           wallet-origin invoices may expose any combination of BTC,
+           Lightning, and direct Liquid. #}
         {% if status == "unpaid" || status == "in_progress" %}
             <div class="meta">
                 Accepted:
@@ -205,9 +203,9 @@
                transitions; for the unpaid case the JS also drives QR/rail
                toggle. For terminal cases, JS polling continues briefly to
                capture late settlements but mostly just confirms state. #}
-            {% if status == "unpaid" %}
+            {% if status == "unpaid" || status == "in_progress" %}
                 <div class="status-line status-unpaid" id="status-line">
-                    Waiting for payment…
+                    {% if status == "in_progress" %}Payment detected…{% else %}Waiting for payment…{% endif %}
                 </div>
                 <div class="amount" id="amount-display">{{ amount_sat }} sat</div>
                 {% match fiat_display %}
@@ -217,8 +215,9 @@
                 {% endmatch %}
 
                 <div class="rail-toggle">
-                    <button id="rail-lightning" class="active" type="button">Lightning</button>
-                    <button id="rail-liquid" type="button">Liquid</button>
+                    {% if accept_ln %}<button id="rail-lightning" type="button">Lightning</button>{% endif %}
+                    {% if accept_btc %}<button id="rail-btc" type="button">BTC</button>{% endif %}
+                    {% if accept_liquid %}<button id="rail-liquid" type="button">Liquid</button>{% endif %}
                 </div>
 
                 <div class="qr-wrap" id="qr-wrap">
@@ -276,14 +275,19 @@
         //
         // Single state machine driven by polling /api/v1/invoices/<id>/status
         // every 3s. The page re-renders on status changes, fetches the
-        // appropriate offer (Lightning eagerly via the /lightning endpoint,
-        // Liquid lazily on rail toggle via /liquid), and stops polling when
-        // the invoice reaches a terminal status.
+        // appropriate payload (Lightning via the /lightning endpoint, BTC
+        // and Liquid from wallet-supplied invoice addresses), and stops
+        // polling when the invoice reaches a terminal status.
         (function () {
             const INVOICE_ID = "{{ invoice_id }}";
             const NYM = "{{ nym }}";
             const SAT_PER_BTC = 100_000_000;
             const POLL_INTERVAL_MS = 3000;
+            const ACCEPT_BTC = {{ accept_btc }};
+            const ACCEPT_LN = {{ accept_ln }};
+            const ACCEPT_LIQUID = {{ accept_liquid }};
+            const INITIAL_BITCOIN_ADDRESS = "{% match bitcoin_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
+            const INITIAL_LIQUID_ADDRESS = "{% match liquid_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
             ]);
@@ -301,21 +305,28 @@
             const statusLine = document.getElementById('status-line');
             const amountDisplay = document.getElementById('amount-display');
             const railLightning = document.getElementById('rail-lightning');
+            const railBtc = document.getElementById('rail-btc');
             const railLiquid = document.getElementById('rail-liquid');
             const qrWrap = document.getElementById('qr-wrap');
             const payloadText = document.getElementById('payload-text');
             const copyBtn = document.getElementById('copy-btn');
             const countdown = document.getElementById('countdown');
 
-            let currentRail = 'lightning';
+            let currentRail = ACCEPT_LN ? 'lightning' : (ACCEPT_BTC ? 'bitcoin' : 'liquid');
             let currentLightningPr = null;
-            let currentLiquidAddress = null;
+            let currentBitcoinAddress = INITIAL_BITCOIN_ADDRESS || null;
+            let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
             let currentAmountSat = {{ amount_sat }};
             let currentRateLocksUntilUnix = 0;
             let currentExpiresAtUnix = 0;
             let currentRateStale = false;
 
-            function bip21Uri(address, amountSat) {
+            function btcUri(address, amountSat) {
+                const btc = (amountSat / SAT_PER_BTC).toFixed(8);
+                return `bitcoin:${address}?amount=${btc}`;
+            }
+
+            function liquidUri(address, amountSat) {
                 const btc = (amountSat / SAT_PER_BTC).toFixed(8);
                 return `liquidnetwork:${address}?amount=${btc}`;
             }
@@ -336,28 +347,36 @@
 
             function setRail(rail) {
                 currentRail = rail;
+                if (railLightning) railLightning.classList.toggle('active', rail === 'lightning');
+                if (railBtc) railBtc.classList.toggle('active', rail === 'bitcoin');
+                if (railLiquid) railLiquid.classList.toggle('active', rail === 'liquid');
+
                 if (rail === 'lightning') {
-                    railLightning.classList.add('active');
-                    railLiquid.classList.remove('active');
                     if (currentLightningPr) {
                         setQrPayload(currentLightningPr);
-                    } else {
+                    } else if (initialStatus === 'unpaid') {
                         clearQr('Loading Lightning offer…');
                         fetchLightning();
+                    } else {
+                        clearQr('Payment in progress…');
+                    }
+                } else if (rail === 'bitcoin') {
+                    if (currentBitcoinAddress) {
+                        setQrPayload(btcUri(currentBitcoinAddress, currentAmountSat));
+                    } else {
+                        clearQr('Bitcoin address unavailable');
                     }
                 } else {
-                    railLightning.classList.remove('active');
-                    railLiquid.classList.add('active');
                     if (currentLiquidAddress) {
-                        setQrPayload(bip21Uri(currentLiquidAddress, currentAmountSat));
+                        setQrPayload(liquidUri(currentLiquidAddress, currentAmountSat));
                     } else {
-                        clearQr('Loading Liquid address…');
-                        fetchLiquid();
+                        clearQr('Liquid address unavailable');
                     }
                 }
             }
 
             async function fetchLightning() {
+                if (!ACCEPT_LN) return;
                 try {
                     const res = await fetch(
                         `/api/v1/invoices/${INVOICE_ID}/lightning`,
@@ -377,28 +396,9 @@
                 }
             }
 
-            async function fetchLiquid() {
-                try {
-                    const res = await fetch(
-                        `/api/v1/invoices/${INVOICE_ID}/liquid`,
-                        { method: 'POST' }
-                    );
-                    const data = await res.json();
-                    if (data.address) {
-                        currentLiquidAddress = data.address;
-                        if (currentRail === 'liquid') {
-                            setQrPayload(bip21Uri(data.address, currentAmountSat));
-                        }
-                    } else {
-                        clearQr('Liquid offer unavailable');
-                    }
-                } catch (e) {
-                    clearQr('Liquid offer unavailable');
-                }
-            }
-
-            railLightning.addEventListener('click', () => setRail('lightning'));
-            railLiquid.addEventListener('click', () => setRail('liquid'));
+            if (railLightning) railLightning.addEventListener('click', () => setRail('lightning'));
+            if (railBtc) railBtc.addEventListener('click', () => setRail('bitcoin'));
+            if (railLiquid) railLiquid.addEventListener('click', () => setRail('liquid'));
             copyBtn.addEventListener('click', async () => {
                 const text = payloadText.textContent;
                 if (!text || text === '—') return;
@@ -495,7 +495,13 @@
                     if (data.liquid_address && data.liquid_address !== currentLiquidAddress) {
                         currentLiquidAddress = data.liquid_address;
                         if (currentRail === 'liquid') {
-                            setQrPayload(bip21Uri(data.liquid_address, currentAmountSat));
+                            setQrPayload(liquidUri(data.liquid_address, currentAmountSat));
+                        }
+                    }
+                    if (data.bitcoin_address && data.bitcoin_address !== currentBitcoinAddress) {
+                        currentBitcoinAddress = data.bitcoin_address;
+                        if (currentRail === 'bitcoin') {
+                            setQrPayload(btcUri(data.bitcoin_address, currentAmountSat));
                         }
                     }
                     if (amountDisplay) {
@@ -514,8 +520,7 @@
                 }
             }
 
-            // Initial Lightning fetch (eager) on first paint.
-            fetchLightning();
+            setRail(currentRail);
             // Polling cadence: every 3s while the invoice is non-terminal.
             const pollTimer = setInterval(() => {
                 if (TERMINAL_STATUSES.has(root.dataset.status)) {

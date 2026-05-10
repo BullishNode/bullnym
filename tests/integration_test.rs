@@ -11,9 +11,11 @@ use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
-    BoltzConfig, Config, ElectrumConfig, LimitsConfig, ProofConfig, RateLimitConfig,
+    BitcoinWatcherConfig, BoltzConfig, ClaimConfig, Config, DonationConfig, ElectrumConfig,
+    LimitsConfig, PricerConfig, ProofConfig, RateLimitConfig, ReconcilerConfig,
 };
 use pay_service::ip_whitelist::IpWhitelist;
+use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
 use pay_service::{claimer, lnurl, nostr, registration, AppState};
 
@@ -47,12 +49,19 @@ fn test_config() -> Config {
             api_url: "http://127.0.0.1:1".to_string(),
             electrum_url: "blockstream.info:995".to_string(),
         },
+        pricer: PricerConfig::default(),
+        donation: DonationConfig::default(),
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),
         rate_limit: RateLimitConfig::default(),
         electrum: ElectrumConfig::default(),
+        claim: ClaimConfig::default(),
+        reconciler: ReconcilerConfig::default(),
+        bitcoin_watcher: BitcoinWatcherConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
+        boltz_webhook_url_secret: String::new(),
+        boltz_webhook_url_secret_previous: String::new(),
     }
 }
 
@@ -64,6 +73,7 @@ fn test_state(pool: PgPool) -> AppState {
     ).unwrap();
 
     let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), RateLimitConfig::default()));
+    let pricer = Arc::new(PricerClient::new(PricerConfig::default()).unwrap());
 
     AppState {
         db: pool,
@@ -72,6 +82,7 @@ fn test_state(pool: PgPool) -> AppState {
         ip_whitelist: Arc::new(IpWhitelist::default()),
         rate_limiter,
         utxo_backend: None,
+        pricer,
     }
 }
 
@@ -83,7 +94,7 @@ fn test_app(state: AppState) -> Router {
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route("/register", axum::routing::delete(registration::delete_registration))
-        .route("/webhook/boltz", post(claimer::webhook))
+        .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .with_state(state)
 }
 
@@ -353,6 +364,7 @@ async fn webhook_skips_terminal_swaps() {
         preimage_hex: "aa".repeat(32).as_str(),
         claim_key_hex: "bb".repeat(32).as_str(),
         boltz_response_json: "{}",
+        invoice_id: None,
     }).await.unwrap();
 
     // Mark as claimed
@@ -797,7 +809,7 @@ fn schnorr_sign_verify_roundtrip() {
     // 2. Sign SHA256(message) with schnorr
     // 3. Verify with our auth::verify_signature
     
-    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use secp256k1::{Keypair, Secp256k1};
     use sha2::{Digest, Sha256};
     
     let secp = Secp256k1::new();

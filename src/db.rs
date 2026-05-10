@@ -1783,21 +1783,31 @@ pub struct NewInvoice<'a> {
     pub accept_liquid: bool,
     /// Wallet-supplied BTC mainnet address (NULL when accept_btc=FALSE).
     pub bitcoin_address: Option<&'a str>,
-    /// Wallet-supplied Liquid mainnet CT address (NULL when both
-    /// accept_ln=FALSE and accept_liquid=FALSE). When supplied at insert
-    /// time, the lazy allocator (`allocate_invoice_liquid_address`) is
-    /// not called and `liquid_address_index` stays NULL.
+    /// Liquid mainnet CT address (NULL when both accept_ln=FALSE and
+    /// accept_liquid=FALSE). Two supply paths feed this field:
+    ///   - Wallet-origin (Get-paid): wallet supplies the address directly.
+    ///   - Checkout-origin (donation page): server eagerly allocates
+    ///     via `allocate_next_liquid_for_active_nym` BEFORE this insert.
+    /// In both cases `liquid_address_index` on the invoice row stays
+    /// NULL — the address is the chain_watcher's lookup key, not the
+    /// descriptor index.
     pub liquid_address: Option<&'a str>,
     /// Wall-clock seconds the invoice stays valid from `now()`.
     pub expires_in_secs: i64,
 }
 
-/// Insert a new invoice row. For wallet-origin (Get-paid) invoices the
-/// caller passes the wallet-supplied `bitcoin_address` / `liquid_address`
-/// directly. For checkout-origin (legacy donation page) invoices, the
-/// Liquid address is left NULL and `allocate_invoice_liquid_address`
-/// handles lazy allocation on first rail toggle. Lightning offers attach
-/// via a separate `record_swap` call that sets `swap_records.invoice_id`.
+/// Insert a new invoice row. The caller is responsible for populating
+/// `liquid_address` when `accept_ln` or `accept_liquid` is TRUE — the
+/// `invoices_ln_or_liquid_addr_chk` constraint requires it at INSERT
+/// time. Two supply paths:
+///   - Wallet-origin (Get-paid): the wallet supplies the address.
+///   - Checkout-origin (donation page): the caller invokes
+///     `allocate_next_liquid_for_active_nym` to bump the owner's
+///     descriptor index and derive the next address, then passes the
+///     result through `NewInvoice.liquid_address`.
+/// Lightning offers attach via a separate `record_swap` call that sets
+/// `swap_records.invoice_id`; the claimer routes the LN claim to the
+/// invoice's `liquid_address` via `resolve_claim_address` branch (B).
 pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
@@ -2165,6 +2175,60 @@ where
     .bind(address_index)
     .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
+    Ok(Some((address, address_index)))
+}
+
+/// Pre-insert sibling of [`allocate_invoice_liquid_address`]: bump
+/// `users.next_addr_idx` for an active nym and derive the next Liquid
+/// address WITHOUT touching any invoice row. Returns `(address, index)`
+/// so the caller can pass `address` into `NewInvoice.liquid_address`
+/// at insert time.
+///
+/// Use this when creating an invoice with `accept_ln = TRUE` or
+/// `accept_liquid = TRUE` and no wallet-supplied address — the
+/// `invoices_ln_or_liquid_addr_chk` constraint requires
+/// `liquid_address` to be set at INSERT time, so the allocator must
+/// run before insert. The donation-page checkout flow is the primary
+/// caller.
+///
+/// Shares the `donation:{nym}` advisory lock with
+/// [`allocate_invoice_liquid_address`] so concurrent allocator calls
+/// for the same nym serialize on the `next_addr_idx` bump.
+///
+/// Returns `Ok(None)` when the nym is unknown or `is_active = FALSE`.
+pub async fn allocate_next_liquid_for_active_nym<F>(
+    pool: &PgPool,
+    nym: &str,
+    derive_address: F,
+) -> Result<Option<(String, i32)>, sqlx::Error>
+where
+    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
+{
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation:{nym}"))
+        .execute(&mut *tx)
+        .await?;
+
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
+         WHERE nym = $1 AND is_active = TRUE \
+         RETURNING ct_descriptor, next_addr_idx - 1",
+    )
+    .bind(nym)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((ct_descriptor, address_index)) = row else {
+        return Ok(None);
+    };
+    let idx_u32 = u32::try_from(address_index).map_err(|_| {
+        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+    })?;
+    let address = derive_address(&ct_descriptor, idx_u32)?;
 
     tx.commit().await?;
     Ok(Some((address, address_index)))
