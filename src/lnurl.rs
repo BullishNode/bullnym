@@ -217,11 +217,9 @@ async fn serve_liquid(
     is_whitelisted: bool,
 ) -> Result<axum::response::Response, LiquidOutcome> {
     if !is_whitelisted {
-        let proof = params
-            .take_proof()
-            .ok_or(AppError::ProofOfFundsRequired {
-                min_sat: state.config.proof.min_proof_value_sat,
-            })?;
+        let proof = params.take_proof().ok_or(AppError::ProofOfFundsRequired {
+            min_sat: state.config.proof.min_proof_value_sat,
+        })?;
 
         // Sig verify (Hard — proof error if fails).
         let pubkey = verify_ownership_sig(
@@ -236,13 +234,17 @@ async fn serve_liquid(
         rl_gate(state.rate_limiter.check_per_pubkey(&proof.pubkey).await)?;
 
         // Idempotent cache lookup. Cache hits skip all subsequent gates.
-        if db::get_outpoint_address(&state.db, nym, &proof.outpoint).await?.is_none() {
+        if db::get_outpoint_address(&state.db, nym, &proof.outpoint)
+            .await?
+            .is_none()
+        {
             // Distinct-nym fan-out limits (Soft on rate-limit).
             if let Some(ip) = caller_ip {
                 rl_gate(state.rate_limiter.check_distinct_nyms_per_ip(ip, nym).await)?;
             }
             rl_gate(
-                state.rate_limiter
+                state
+                    .rate_limiter
                     .check_distinct_nyms_per_outpoint(&proof.outpoint, nym)
                     .await,
             )?;
@@ -252,10 +254,9 @@ async fn serve_liquid(
 
             let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
 
-            let backend = state
-                .utxo_backend
-                .as_ref()
-                .ok_or_else(|| AppError::ElectrumError("no blockchain backend configured".into()))?;
+            let backend = state.utxo_backend.as_ref().ok_or_else(|| {
+                AppError::ElectrumError("no blockchain backend configured".into())
+            })?;
 
             // Electrum bucket (Soft — backend saturation is a rate-limit signal).
             rl_gate(state.rate_limiter.check_electrum().await)?;
@@ -280,8 +281,7 @@ async fn serve_liquid(
                 return Err(AppError::UtxoSpent.into());
             }
 
-            db::allocate_outpoint_address(&state.db, nym, &proof.outpoint, &proof.pubkey)
-                .await?;
+            db::allocate_outpoint_address(&state.db, nym, &proof.outpoint, &proof.pubkey).await?;
         }
     }
 
@@ -435,8 +435,16 @@ pub async fn callback(
     }
 
     if requests_method(params.payment_method.as_deref(), "L-BTC") {
-        match serve_liquid(&state, &nym, &user, amount_sat, &params, caller_ip, is_whitelisted)
-            .await
+        match serve_liquid(
+            &state,
+            &nym,
+            &user,
+            amount_sat,
+            &params,
+            caller_ip,
+            is_whitelisted,
+        )
+        .await
         {
             Ok(resp) => return Ok(resp),
             Err(LiquidOutcome::Hard(e)) => return Err(e),
@@ -585,16 +593,21 @@ mod tests {
     fn description_hash_is_deterministic() {
         let meta = build_metadata("francis", "bullpay.ca");
         let hash1 = hex::encode(Sha256::digest(meta.as_bytes()));
-        let hash2 = hex::encode(Sha256::digest(build_metadata("francis", "bullpay.ca").as_bytes()));
+        let hash2 = hex::encode(Sha256::digest(
+            build_metadata("francis", "bullpay.ca").as_bytes(),
+        ));
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64);
     }
 
     #[test]
     fn description_hash_differs_per_nym() {
-        let h1 = hex::encode(Sha256::digest(build_metadata("alice", "bullpay.ca").as_bytes()));
-        let h2 = hex::encode(Sha256::digest(build_metadata("bob", "bullpay.ca").as_bytes()));
+        let h1 = hex::encode(Sha256::digest(
+            build_metadata("alice", "bullpay.ca").as_bytes(),
+        ));
+        let h2 = hex::encode(Sha256::digest(
+            build_metadata("bob", "bullpay.ca").as_bytes(),
+        ));
         assert_ne!(h1, h2);
     }
-
 }

@@ -135,10 +135,18 @@ impl Default for ReconcilerConfig {
     }
 }
 
-fn default_reconciler_interval_secs() -> u64 { DEFAULT_RECONCILER_INTERVAL_SECS }
-fn default_reconciler_min_age_secs() -> u64 { DEFAULT_RECONCILER_MIN_AGE_SECS }
-fn default_reconciler_max_per_tick() -> u32 { DEFAULT_RECONCILER_MAX_PER_TICK }
-fn default_reconciler_inter_call_delay_ms() -> u64 { DEFAULT_RECONCILER_INTER_CALL_DELAY_MS }
+fn default_reconciler_interval_secs() -> u64 {
+    DEFAULT_RECONCILER_INTERVAL_SECS
+}
+fn default_reconciler_min_age_secs() -> u64 {
+    DEFAULT_RECONCILER_MIN_AGE_SECS
+}
+fn default_reconciler_max_per_tick() -> u32 {
+    DEFAULT_RECONCILER_MAX_PER_TICK
+}
+fn default_reconciler_inter_call_delay_ms() -> u64 {
+    DEFAULT_RECONCILER_INTER_CALL_DELAY_MS
+}
 
 // --- Pricer config ---
 
@@ -174,9 +182,15 @@ impl Default for PricerConfig {
     }
 }
 
-fn default_pricer_url() -> String { DEFAULT_PRICER_URL.to_string() }
-fn default_pricer_cache_ttl_secs() -> u64 { DEFAULT_PRICER_CACHE_TTL_SECS }
-fn default_pricer_request_timeout_ms() -> u64 { DEFAULT_PRICER_REQUEST_TIMEOUT_MS }
+fn default_pricer_url() -> String {
+    DEFAULT_PRICER_URL.to_string()
+}
+fn default_pricer_cache_ttl_secs() -> u64 {
+    DEFAULT_PRICER_CACHE_TTL_SECS
+}
+fn default_pricer_request_timeout_ms() -> u64 {
+    DEFAULT_PRICER_REQUEST_TIMEOUT_MS
+}
 
 // --- Donation page (Phase 3 image pipeline) ---
 
@@ -229,12 +243,24 @@ impl Default for DonationConfig {
     }
 }
 
-fn default_donation_image_root() -> String { DEFAULT_DONATION_IMAGE_ROOT.to_string() }
-fn default_donation_image_max_bytes() -> usize { DEFAULT_DONATION_IMAGE_MAX_BYTES }
-fn default_donation_image_max_dimension() -> u32 { DEFAULT_DONATION_IMAGE_MAX_DIMENSION }
-fn default_donation_avatar_size() -> u32 { DEFAULT_DONATION_AVATAR_SIZE }
-fn default_donation_og_width() -> u32 { DEFAULT_DONATION_OG_WIDTH }
-fn default_donation_og_height() -> u32 { DEFAULT_DONATION_OG_HEIGHT }
+fn default_donation_image_root() -> String {
+    DEFAULT_DONATION_IMAGE_ROOT.to_string()
+}
+fn default_donation_image_max_bytes() -> usize {
+    DEFAULT_DONATION_IMAGE_MAX_BYTES
+}
+fn default_donation_image_max_dimension() -> u32 {
+    DEFAULT_DONATION_IMAGE_MAX_DIMENSION
+}
+fn default_donation_avatar_size() -> u32 {
+    DEFAULT_DONATION_AVATAR_SIZE
+}
+fn default_donation_og_width() -> u32 {
+    DEFAULT_DONATION_OG_WIDTH
+}
+fn default_donation_og_height() -> u32 {
+    DEFAULT_DONATION_OG_HEIGHT
+}
 
 const DEFAULT_POOL_SIZE: u32 = 10;
 const DEFAULT_MIN_SENDABLE_MSAT: u64 = 100_000;
@@ -258,7 +284,9 @@ pub struct LimitsConfig {
 }
 
 const DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB: i64 = 3;
-fn default_max_lifetime_nyms_per_npub() -> i64 { DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB }
+fn default_max_lifetime_nyms_per_npub() -> i64 {
+    DEFAULT_MAX_LIFETIME_NYMS_PER_NPUB
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -296,8 +324,12 @@ impl Default for ProofConfig {
     }
 }
 
-fn default_min_proof_value_sat() -> u64 { DEFAULT_MIN_PROOF_VALUE_SAT }
-fn default_message_tag() -> String { DEFAULT_MESSAGE_TAG.to_string() }
+fn default_min_proof_value_sat() -> u64 {
+    DEFAULT_MIN_PROOF_VALUE_SAT
+}
+fn default_message_tag() -> String {
+    DEFAULT_MESSAGE_TAG.to_string()
+}
 
 // --- Bitcoin watcher config ---
 //
@@ -363,14 +395,30 @@ impl Default for BitcoinWatcherConfig {
     }
 }
 
-fn default_btc_watcher_enabled() -> bool { true }
-fn default_btc_watcher_endpoint() -> String { DEFAULT_BTC_WATCHER_ENDPOINT.to_string() }
-fn default_btc_watcher_active_tick_secs() -> u64 { DEFAULT_BTC_WATCHER_ACTIVE_TICK_SECS }
-fn default_btc_watcher_idle_tick_secs() -> u64 { DEFAULT_BTC_WATCHER_IDLE_TICK_SECS }
-fn default_btc_watcher_active_window_secs() -> i64 { DEFAULT_BTC_WATCHER_ACTIVE_WINDOW_SECS }
-fn default_btc_watcher_confirmations_required() -> u32 { DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED }
-fn default_btc_watcher_rate_per_sec() -> u32 { DEFAULT_BTC_WATCHER_RATE_PER_SEC }
-fn default_btc_watcher_request_timeout_ms() -> u64 { DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS }
+fn default_btc_watcher_enabled() -> bool {
+    true
+}
+fn default_btc_watcher_endpoint() -> String {
+    DEFAULT_BTC_WATCHER_ENDPOINT.to_string()
+}
+fn default_btc_watcher_active_tick_secs() -> u64 {
+    DEFAULT_BTC_WATCHER_ACTIVE_TICK_SECS
+}
+fn default_btc_watcher_idle_tick_secs() -> u64 {
+    DEFAULT_BTC_WATCHER_IDLE_TICK_SECS
+}
+fn default_btc_watcher_active_window_secs() -> i64 {
+    DEFAULT_BTC_WATCHER_ACTIVE_WINDOW_SECS
+}
+fn default_btc_watcher_confirmations_required() -> u32 {
+    DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED
+}
+fn default_btc_watcher_rate_per_sec() -> u32 {
+    DEFAULT_BTC_WATCHER_RATE_PER_SEC
+}
+fn default_btc_watcher_request_timeout_ms() -> u64 {
+    DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS
+}
 
 // --- Rate limit config ---
 
@@ -597,55 +645,52 @@ impl Default for RateLimitConfig {
             max_active_users: default_max_active_users(),
             metadata_rate_limit: default_metadata_rate_limit(),
             metadata_rate_window_secs: default_metadata_rate_window_secs(),
-            metadata_distinct_nyms_per_ip_limit:
-                default_metadata_distinct_nyms_per_ip(),
+            metadata_distinct_nyms_per_ip_limit: default_metadata_distinct_nyms_per_ip(),
             metadata_distinct_nyms_per_ip_window_secs:
                 default_metadata_distinct_nyms_per_ip_window_secs(),
-            lookup_distinct_npubs_per_ip_limit:
-                default_lookup_distinct_npubs_per_ip(),
+            lookup_distinct_npubs_per_ip_limit: default_lookup_distinct_npubs_per_ip(),
             lookup_distinct_npubs_per_ip_window_secs:
                 default_lookup_distinct_npubs_per_ip_window_secs(),
-            chain_watcher_electrum_rate_per_sec:
-                default_chain_watcher_electrum_rate(),
-            chain_watcher_active_user_tick_secs:
-                default_chain_watcher_active_user_tick_secs(),
-            chain_watcher_idle_user_tick_secs:
-                default_chain_watcher_idle_user_tick_secs(),
-            chain_watcher_active_window_secs:
-                default_chain_watcher_active_window_secs(),
+            chain_watcher_electrum_rate_per_sec: default_chain_watcher_electrum_rate(),
+            chain_watcher_active_user_tick_secs: default_chain_watcher_active_user_tick_secs(),
+            chain_watcher_idle_user_tick_secs: default_chain_watcher_idle_user_tick_secs(),
+            chain_watcher_active_window_secs: default_chain_watcher_active_window_secs(),
             webhook_rate_limit: default_webhook_rate_limit(),
             webhook_rate_window_secs: default_webhook_rate_window_secs(),
             lightning_per_source_limit: default_lightning_per_source_limit(),
-            lightning_per_source_window_secs:
-                default_lightning_per_source_window_secs(),
+            lightning_per_source_window_secs: default_lightning_per_source_window_secs(),
             donation_html_rate_limit: default_donation_html_rate_limit(),
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
             donation_image_uploads_per_npub_per_hour:
                 default_donation_image_uploads_per_npub_per_hour(),
             donation_image_uploads_per_source_per_min:
                 default_donation_image_uploads_per_source_per_min(),
-            donation_callback_per_source_per_min:
-                default_donation_callback_per_source_per_min(),
+            donation_callback_per_source_per_min: default_donation_callback_per_source_per_min(),
             distinct_donation_addresses_per_source_per_hour:
                 default_distinct_donation_addresses_per_source_per_hour(),
-            donation_status_per_source_per_min:
-                default_donation_status_per_source_per_min(),
+            donation_status_per_source_per_min: default_donation_status_per_source_per_min(),
             donation_allocation_ttl_days: default_donation_allocation_ttl_days(),
-            invoice_create_per_source_per_min:
-                default_invoice_create_per_source_per_min(),
-            invoice_create_per_npub_per_hour:
-                default_invoice_create_per_npub_per_hour(),
+            invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
+            invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
         }
     }
 }
 
-fn default_per_ip_limit() -> u32 { 60 }
-fn default_per_ip_window_secs() -> u32 { 60 }
+fn default_per_ip_limit() -> u32 {
+    60
+}
+fn default_per_ip_window_secs() -> u32 {
+    60
+}
 /// Disabled by default (0). The per-pubkey sliding-window check is redundant
 /// with the per-outpoint distinct-nym check; field is kept for backwards
 /// compatibility with deployed configs that explicitly set a non-zero value.
-fn default_per_pubkey_limit() -> u32 { 0 }
-fn default_per_pubkey_window_secs() -> u32 { 3600 }
+fn default_per_pubkey_limit() -> u32 {
+    0
+}
+fn default_per_pubkey_window_secs() -> u32 {
+    3600
+}
 // --- v2 thresholds (asymmetric-defense principle) ---
 // Real payers touch 0-2 distinct nyms per day. Real merchants get paid by
 // many distinct payers per day. So per-source distinct-target caps are
@@ -653,90 +698,164 @@ fn default_per_pubkey_window_secs() -> u32 { 3600 }
 //
 // PR D adjustment: IPv4 cap raised 3→5 to accommodate CGNAT / office /
 // family-share IPs. IPv6 /56 cap stays at 3 (one real customer block).
-fn default_distinct_nyms_per_ip() -> u32 { 5 }
-fn default_distinct_nyms_per_ipv6_56() -> u32 { 3 }
-fn default_distinct_nyms_per_outpoint() -> u32 { 3 }
-fn default_distinct_nyms_window_secs() -> u32 { 3600 }
+fn default_distinct_nyms_per_ip() -> u32 {
+    5
+}
+fn default_distinct_nyms_per_ipv6_56() -> u32 {
+    3
+}
+fn default_distinct_nyms_per_outpoint() -> u32 {
+    3
+}
+fn default_distinct_nyms_window_secs() -> u32 {
+    3600
+}
 /// Memory bound only — the real defense against per-nym pollution is the
 /// per-source distinct-outpoints cap + the GC recycler on
 /// `outpoint_addresses` rows. This number should never fire under normal
 /// operation. (was 500; punished popular merchants.)
-fn default_max_pending_per_nym() -> u32 { 50_000 }
-fn default_recycle_days() -> u32 { 30 }
+fn default_max_pending_per_nym() -> u32 {
+    50_000
+}
+fn default_recycle_days() -> u32 {
+    30
+}
 /// Disabled by default: per-nym Lightning rate is wrong-shape. A popular
 /// merchant being paid via Lightning Address can legitimately exceed any
 /// per-nym rate — bursts during business hours are normal. Keep the field
 /// for backwards compat with deployed configs that explicitly set it.
-fn default_lightning_rate() -> u32 { 0 }
-fn default_global_electrum_rate() -> u32 { 50 }
-fn default_register_rate_limit() -> u32 { 5 }
-fn default_register_rate_window_secs() -> u32 { 60 }
+fn default_lightning_rate() -> u32 {
+    0
+}
+fn default_global_electrum_rate() -> u32 {
+    50
+}
+fn default_register_rate_limit() -> u32 {
+    5
+}
+fn default_register_rate_window_secs() -> u32 {
+    60
+}
 // PR D: 2→3 to accommodate phone-reset (new install regenerates Nostr
 // identity → 2nd npub from same IP) and family device-sharing.
-fn default_register_distinct_npubs_per_ip() -> u32 { 3 }
-fn default_register_distinct_npubs_per_ip_window_secs() -> u32 { 3600 }
+fn default_register_distinct_npubs_per_ip() -> u32 {
+    3
+}
+fn default_register_distinct_npubs_per_ip_window_secs() -> u32 {
+    3600
+}
 // PR D: 100_000 was ceremonial — at our user-base this would never fire
 // under attack OR organic growth. 10_000 is a meaningful "we're growing,
 // time to revisit capacity" trigger.
-fn default_max_active_users() -> u32 { 10_000 }
-fn default_metadata_rate_limit() -> u32 { 30 }
-fn default_metadata_rate_window_secs() -> u32 { 60 }
+fn default_max_active_users() -> u32 {
+    10_000
+}
+fn default_metadata_rate_limit() -> u32 {
+    30
+}
+fn default_metadata_rate_window_secs() -> u32 {
+    60
+}
 // PR D: 5→10. LUD-06 requires a metadata fetch per payment, so a small
 // office paying multiple Lightning Addresses easily exceeds 5/h.
 // Enumeration attack still blocked: 10/h × 70 Mullvad cities = 700/h
 // total, vs the 70K-candidate dictionary the attack needs.
-fn default_metadata_distinct_nyms_per_ip() -> u32 { 10 }
-fn default_metadata_distinct_nyms_per_ip_window_secs() -> u32 { 3600 }
-fn default_lookup_distinct_npubs_per_ip() -> u32 { 5 }
-fn default_lookup_distinct_npubs_per_ip_window_secs() -> u32 { 3600 }
-fn default_chain_watcher_electrum_rate() -> u32 { 50 }
-fn default_chain_watcher_active_user_tick_secs() -> u32 { 30 }
-fn default_chain_watcher_idle_user_tick_secs() -> u32 { 600 }
+fn default_metadata_distinct_nyms_per_ip() -> u32 {
+    10
+}
+fn default_metadata_distinct_nyms_per_ip_window_secs() -> u32 {
+    3600
+}
+fn default_lookup_distinct_npubs_per_ip() -> u32 {
+    5
+}
+fn default_lookup_distinct_npubs_per_ip_window_secs() -> u32 {
+    3600
+}
+fn default_chain_watcher_electrum_rate() -> u32 {
+    50
+}
+fn default_chain_watcher_active_user_tick_secs() -> u32 {
+    30
+}
+fn default_chain_watcher_idle_user_tick_secs() -> u32 {
+    600
+}
 /// 24h: a user who hasn't made a callback in a day is "idle" — payment
 /// flows on Lightning addresses are bursty (one callback per pay event)
 /// so 24h handles real-world traffic patterns comfortably.
-fn default_chain_watcher_active_window_secs() -> u32 { 86_400 }
-fn default_webhook_rate_limit() -> u32 { 10 }
-fn default_webhook_rate_window_secs() -> u32 { 60 }
+fn default_chain_watcher_active_window_secs() -> u32 {
+    86_400
+}
+fn default_webhook_rate_limit() -> u32 {
+    10
+}
+fn default_webhook_rate_window_secs() -> u32 {
+    60
+}
 /// 30 Lightning ops per source per hour. Lightning is the default rail
 /// and doesn't leak Liquid addresses, so the cap is loose — only there
 /// to bound Boltz API spend per source. (Replaces the wrong-shape
 /// per-nym `lightning_rate_per_minute`, which is now a no-op kept for
 /// backwards-compat with deployed configs.)
-fn default_lightning_per_source_limit() -> u32 { 30 }
-fn default_lightning_per_source_window_secs() -> u32 { 3600 }
+fn default_lightning_per_source_limit() -> u32 {
+    30
+}
+fn default_lightning_per_source_window_secs() -> u32 {
+    3600
+}
 /// 60/min: comfortable for a viral page being reloaded by many donators
 /// on the same NAT, while still bounding volumetric scraping. Per-source
 /// keying uses `source_key()` (IPv6 /56 aggregation).
-fn default_donation_html_rate_limit() -> u32 { 60 }
-fn default_donation_html_rate_window_secs() -> u32 { 60 }
+fn default_donation_html_rate_limit() -> u32 {
+    60
+}
+fn default_donation_html_rate_window_secs() -> u32 {
+    60
+}
 /// 6/h per npub: a real user uploads avatar + OG once per setup; six is
 /// generous headroom for retries and accidental re-uploads.
-fn default_donation_image_uploads_per_npub_per_hour() -> u32 { 6 }
+fn default_donation_image_uploads_per_npub_per_hour() -> u32 {
+    6
+}
 /// 3/min per source: defense-in-depth against IP-rotated abuse.
-fn default_donation_image_uploads_per_source_per_min() -> u32 { 3 }
+fn default_donation_image_uploads_per_source_per_min() -> u32 {
+    3
+}
 /// 30/min: loose enough that refresh-driven retries don't trip; tight
 /// enough that breadth scanning across nyms hits the per-source-distinct
 /// gate first.
-fn default_donation_callback_per_source_per_min() -> u32 { 30 }
+fn default_donation_callback_per_source_per_min() -> u32 {
+    30
+}
 /// 3 fresh Liquid donation addresses per source per hour. Same shape as
 /// the LUD-22 `distinct_nyms_per_outpoint` cap.
-fn default_distinct_donation_addresses_per_source_per_hour() -> u32 { 3 }
+fn default_distinct_donation_addresses_per_source_per_hour() -> u32 {
+    3
+}
 /// 60/min: page polls every ~3s during a session; comfortably covers
 /// normal use while bounding scrape-style abuse.
-fn default_donation_status_per_source_per_min() -> u32 { 60 }
+fn default_donation_status_per_source_per_min() -> u32 {
+    60
+}
 /// 30 days: matches the `bullpay_did` cookie expiry. After this, the
 /// cookie may still exist client-side but the binding is gone — donator
 /// gets a fresh address.
-fn default_donation_allocation_ttl_days() -> u32 { 30 }
+fn default_donation_allocation_ttl_days() -> u32 {
+    30
+}
 /// 5/min per source: anonymous invoice creation is a write+swap-alloc.
 /// Refresh hits the same invoice URL; new amounts mean new invoices,
 /// which 5 per minute comfortably covers an indecisive sender.
-fn default_invoice_create_per_source_per_min() -> u32 { 5 }
+fn default_invoice_create_per_source_per_min() -> u32 {
+    5
+}
 /// 100/h per npub: signed wallet-origin invoice creation. Real-world
 /// merchant volume is well under this; the cap bounds abuse via a
 /// stolen mobile credential without throttling legitimate use.
-fn default_invoice_create_per_npub_per_hour() -> u32 { 100 }
+fn default_invoice_create_per_npub_per_hour() -> u32 {
+    100
+}
 
 // --- Electrum / tx cache config ---
 
@@ -812,14 +931,28 @@ pub fn normalize_electrum_url(raw: &str) -> String {
     }
 }
 
-fn default_liquid_electrum_url() -> String { "ssl://blockstream.info:995".to_string() }
-fn default_electrum_cache_ttl() -> u64 { 3600 }
-fn default_electrum_cache_max() -> usize { 10_000 }
+fn default_liquid_electrum_url() -> String {
+    "ssl://blockstream.info:995".to_string()
+}
+fn default_electrum_cache_ttl() -> u64 {
+    3600
+}
+fn default_electrum_cache_max() -> usize {
+    10_000
+}
 
-fn default_pool_size() -> u32 { DEFAULT_POOL_SIZE }
-fn default_min_sendable() -> u64 { DEFAULT_MIN_SENDABLE_MSAT }
-fn default_max_sendable() -> u64 { DEFAULT_MAX_SENDABLE_MSAT }
-fn default_max_descriptor_len() -> usize { DEFAULT_MAX_DESCRIPTOR_LEN }
+fn default_pool_size() -> u32 {
+    DEFAULT_POOL_SIZE
+}
+fn default_min_sendable() -> u64 {
+    DEFAULT_MIN_SENDABLE_MSAT
+}
+fn default_max_sendable() -> u64 {
+    DEFAULT_MAX_SENDABLE_MSAT
+}
+fn default_max_descriptor_len() -> usize {
+    DEFAULT_MAX_DESCRIPTOR_LEN
+}
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -899,7 +1032,10 @@ mod tests {
         };
         assert_eq!(
             cfg.urls(),
-            vec!["ssl://primary:1".to_string(), "ssl://secondary:2".to_string()]
+            vec![
+                "ssl://primary:1".to_string(),
+                "ssl://secondary:2".to_string()
+            ]
         );
     }
 

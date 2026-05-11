@@ -52,12 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("database connection failed: {e}"))?;
     tracing::info!("connected to database");
 
-    let swap_master_key = SwapMasterKey::from_mnemonic(
-        &config.swap_mnemonic,
-        None,
-        Network::Mainnet,
-    )
-    .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
+    let swap_master_key =
+        SwapMasterKey::from_mnemonic(&config.swap_mnemonic, None, Network::Mainnet)
+            .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
 
     // Boltz does not HMAC-sign webhook deliveries; the only viable
     // authenticator is the URL itself. New swaps register
@@ -85,7 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "boltz service initialized ({}) webhook=https://{}/webhook/boltz/{}",
         config.boltz.api_url,
         config.domain,
-        if config.boltz_webhook_url_secret.is_empty() { "<unauthenticated>" } else { "<redacted>" }
+        if config.boltz_webhook_url_secret.is_empty() {
+            "<unauthenticated>"
+        } else {
+            "<redacted>"
+        }
     );
 
     // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
@@ -223,7 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tracing::info!(
             "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
-            active, idle,
+            active,
+            idle,
         );
     } else {
         tracing::warn!("chain watcher NOT started: utxo backend unavailable");
@@ -257,9 +259,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
-        .route("/register", axum::routing::delete(registration::delete_registration))
+        .route(
+            "/register",
+            axum::routing::delete(registration::delete_registration),
+        )
         .route("/register/lookup", get(registration::lookup_by_npub))
-        .route("/api/reservations/:nym", get(registration::list_reservations))
+        .route(
+            "/api/reservations/:nym",
+            get(registration::list_reservations),
+        )
         // Tighter per-route body caps for the donation CRUD endpoints.
         // The global 64 KiB still applies; the smaller per-route limit wins.
         // Save body is JSON with all v1 fields ~ <2 KiB in practice; 8 KiB
@@ -270,8 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/donation-page",
-            axum::routing::delete(donation_page::archive)
-                .layer(DefaultBodyLimit::max(1024)),
+            axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/donation-page/:nym", get(donation_page::get))
         // Phase B step 10 cutover: removed `/lnurlp/donate-callback/:nym`
@@ -290,10 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/:nym/i/:id", get(invoice::render_payment))
-        .route(
-            "/api/v1/invoices/:id/status",
-            get(invoice::status),
-        )
+        .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route(
             "/api/v1/invoices/:id/lightning",
             post(invoice::fetch_lightning_offer),
@@ -316,18 +320,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/api/v1/:nym/invoices/:id",
-            axum::routing::delete(invoice::cancel_linked)
-                .layer(DefaultBodyLimit::max(1024)),
+            axum::routing::delete(invoice::cancel_linked).layer(DefaultBodyLimit::max(1024)),
         )
         .route(
             "/api/v1/invoices/:id",
-            axum::routing::delete(invoice::cancel_unlinked)
-                .layer(DefaultBodyLimit::max(1024)),
+            axum::routing::delete(invoice::cancel_unlinked).layer(DefaultBodyLimit::max(1024)),
         )
-        .route(
-            "/api/v1/invoices",
-            get(invoice::list_signed),
-        )
+        .route("/api/v1/invoices", get(invoice::list_signed))
         // Public unlinked render path. Privacy headers + indexing posture
         // are applied via `invoice::html_response`; the parent fallback's
         // donation_render path is bypassed via explicit registration.

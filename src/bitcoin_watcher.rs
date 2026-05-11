@@ -79,15 +79,17 @@ pub struct BitcoinWatcher {
 }
 
 impl BitcoinWatcher {
-    pub fn new(
-        cfg: BitcoinWatcherConfig,
-        pool: PgPool,
-    ) -> Result<Self, reqwest::Error> {
+    pub fn new(cfg: BitcoinWatcherConfig, pool: PgPool) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .build()?;
         let bucket = Arc::new(AsyncMutex::new(TokenBucket::new(cfg.rate_per_sec)));
-        Ok(Self { cfg, http, pool, bucket })
+        Ok(Self {
+            cfg,
+            http,
+            pool,
+            bucket,
+        })
     }
 
     /// Top-level loop. Returns when `cancel` fires.
@@ -204,10 +206,7 @@ impl BitcoinWatcher {
             }
         };
         if !resp.status().is_success() {
-            tracing::warn!(
-                "bitcoin_watcher: tip request non-2xx: {}",
-                resp.status()
-            );
+            tracing::warn!("bitcoin_watcher: tip request non-2xx: {}", resp.status());
             return None;
         }
         let body = match resp.text().await {
@@ -254,9 +253,7 @@ impl BitcoinWatcher {
             );
             return;
         }
-        if status == reqwest::StatusCode::NOT_FOUND
-            || status == reqwest::StatusCode::BAD_REQUEST
-        {
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
             // Bad address (rejected by validator at create-time should mean
             // this never fires, but defense-in-depth). Don't retry.
             tracing::error!(
@@ -371,11 +368,7 @@ impl BitcoinWatcher {
 
 /// Convenience entry-point used by main.rs. Constructs the watcher and
 /// drives `run` until cancellation.
-pub async fn run(
-    cfg: BitcoinWatcherConfig,
-    pool: PgPool,
-    cancel: CancellationToken,
-) {
+pub async fn run(cfg: BitcoinWatcherConfig, pool: PgPool, cancel: CancellationToken) {
     if !cfg.enabled {
         tracing::warn!("bitcoin_watcher: disabled by config; not starting");
         return;

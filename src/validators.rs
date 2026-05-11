@@ -19,9 +19,11 @@ pub fn validate_btc_mainnet_address(addr: &str) -> Result<(), AppError> {
         .map_err(|e| AppError::InvalidAmount(format!("bitcoin_address: {e}")))?;
     unchecked
         .require_network(bitcoin::Network::Bitcoin)
-        .map_err(|_| AppError::InvalidAmount(
-            "bitcoin_address: expected mainnet (bc1.../1.../3...)".to_string(),
-        ))?;
+        .map_err(|_| {
+            AppError::InvalidAmount(
+                "bitcoin_address: expected mainnet (bc1.../1.../3...)".to_string(),
+            )
+        })?;
     Ok(())
 }
 
@@ -87,7 +89,10 @@ mod tests {
         let err = validate_btc_mainnet_address(addr).expect_err("testnet must be rejected");
         match err {
             AppError::InvalidAmount(msg) => {
-                assert!(msg.contains("mainnet"), "error must mention mainnet, got: {msg}");
+                assert!(
+                    msg.contains("mainnet"),
+                    "error must mention mainnet, got: {msg}"
+                );
             }
             other => panic!("expected InvalidAmount, got {other:?}"),
         }
@@ -115,7 +120,8 @@ mod tests {
     /// A known Liquid mainnet (LBTC) confidential address. Derived deterministically
     /// from a fixed test descriptor in `descriptor.rs`'s test vectors; pinning the
     /// literal here keeps the validator test independent of descriptor evolution.
-    const LIQUID_MAINNET_CT_ADDR: &str = "lq1qq2akvug2el2rg6lt6aewh9rzy7dl5guv44h9plgg6jadaqdcxr8xtv0v\
+    const LIQUID_MAINNET_CT_ADDR: &str =
+        "lq1qq2akvug2el2rg6lt6aewh9rzy7dl5guv44h9plgg6jadaqdcxr8xtv0v\
 6rxz0v9hu8tewzrt0v8tcqf0jvejphax09rt6r9q";
 
     #[test]
@@ -136,7 +142,9 @@ elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANU
     fn liquid_garbage_rejected() {
         assert!(validate_liquid_mainnet_address("").is_err());
         assert!(validate_liquid_mainnet_address("not-a-liquid-address").is_err());
-        assert!(validate_liquid_mainnet_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err());
+        assert!(
+            validate_liquid_mainnet_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err()
+        );
     }
 
     /// Documenting the reachable-string variable so the linter doesn't whine.

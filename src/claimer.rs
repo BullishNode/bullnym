@@ -92,10 +92,7 @@ pub async fn webhook_with_secret(
             xff,
             state.config.rate_limit.trust_forwarded_for,
         );
-        tracing::warn!(
-            "boltz webhook: URL secret mismatch from {:?}",
-            caller_ip
-        );
+        tracing::warn!("boltz webhook: URL secret mismatch from {:?}", caller_ip);
         return Ok((StatusCode::NOT_FOUND, "").into_response());
     }
     dispatch_webhook(state, peer_opt, headers, body)
@@ -450,9 +447,8 @@ async fn resolve_claim_address(
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    let (cached_addr, _cached_idx, invoice_id) = row.ok_or_else(|| {
-        AppError::ClaimError(format!("swap_records row gone: {}", swap.id))
-    })?;
+    let (cached_addr, _cached_idx, invoice_id) =
+        row.ok_or_else(|| AppError::ClaimError(format!("swap_records row gone: {}", swap.id)))?;
 
     // (A) Cached destination — return as-is. Idempotent retries land on
     //     the same address regardless of how it was first resolved.
@@ -468,30 +464,23 @@ async fn resolve_claim_address(
     //     to bump for wallet addresses. Persist into swap_records.address
     //     so the cache branch wins on the next retry.
     if let Some(inv_id) = invoice_id {
-        let inv_row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT liquid_address FROM invoices WHERE id = $1",
-        )
-        .bind(inv_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
+        let inv_row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT liquid_address FROM invoices WHERE id = $1")
+                .bind(inv_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
 
-        let addr = inv_row
-            .and_then(|(a,)| a)
-            .ok_or_else(|| {
-                AppError::ClaimError(format!(
-                    "invoice {inv_id} has no liquid_address"
-                ))
-            })?;
+        let addr = inv_row.and_then(|(a,)| a).ok_or_else(|| {
+            AppError::ClaimError(format!("invoice {inv_id} has no liquid_address"))
+        })?;
 
-        sqlx::query(
-            "UPDATE swap_records SET address = $1, address_index = NULL WHERE id = $2",
-        )
-        .bind(&addr)
-        .bind(swap.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
+        sqlx::query("UPDATE swap_records SET address = $1, address_index = NULL WHERE id = $2")
+            .bind(&addr)
+            .bind(swap.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
 
         tx.commit()
             .await
@@ -538,15 +527,13 @@ async fn resolve_claim_address(
         .map_err(|_| AppError::ClaimError("address index overflow".to_string()))?;
     let derived = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
-    sqlx::query(
-        "UPDATE swap_records SET address = $2, address_index = $3 WHERE id = $1",
-    )
-    .bind(swap.id)
-    .bind(&derived)
-    .bind(addr_index)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| AppError::DbError(e.to_string()))?;
+    sqlx::query("UPDATE swap_records SET address = $2, address_index = $3 WHERE id = $1")
+        .bind(swap.id)
+        .bind(&derived)
+        .bind(addr_index)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
 
     tx.commit()
         .await
@@ -681,13 +668,12 @@ async fn claim_swap_inner(
     // from the existing `register:` / `donation:` / raw-npub-hex usages
     // (db.rs:201, 1088), so no AB/BA deadlock is possible with those.
     let lock_key = format!("claim:{swap_id}");
-    let got_lock: bool = sqlx::query_scalar(
-        "SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)",
-    )
-    .bind(&lock_key)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| AppError::DbError(e.to_string()))?;
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
     if !got_lock {
         tracing::debug!("claim_swap: lock held for {swap_id}, skipping");
         return Ok(ClaimOutcome::SkippedLockHeld);
@@ -715,9 +701,8 @@ async fn claim_swap_inner(
         // Idempotent path: a previous attempt persisted the constructed
         // tx but failed somewhere between persistence and "Claimed"
         // status. Re-broadcast THAT tx, not a fresh one.
-        BtcLikeTransaction::from_hex(chain, hex).map_err(|e| {
-            AppError::ClaimError(format!("decode persisted claim_tx: {e}"))
-        })?
+        BtcLikeTransaction::from_hex(chain, hex)
+            .map_err(|e| AppError::ClaimError(format!("decode persisted claim_tx: {e}")))?
     } else {
         // Choose the claim path. `cooperative_refused` is set by either:
         //   - the webhook handler on `swap.expired` (PR #4), OR
@@ -758,7 +743,11 @@ async fn claim_swap_inner(
         };
         let hex = serialize_claim_tx_hex(&constructed)?;
         let txid = btc_like_txid(&constructed);
-        let claim_path = if use_cooperative { "cooperative" } else { "script" };
+        let claim_path = if use_cooperative {
+            "cooperative"
+        } else {
+            "script"
+        };
         // `WHERE claim_tx_hex IS NULL` makes this a no-op if a concurrent
         // attempt persisted first (defensive — the advisory lock should
         // have prevented this; the guard is there to fail closed).
@@ -831,36 +820,34 @@ async fn claim_swap_inner(
                     );
                     // fall through to Phase 3
                 }
-                Ok(false) => {
-                    match recover_claim_from_lockup_spend(&claim_tx, backend).await {
-                        Ok(Some(spending_txid)) => {
-                            tracing::info!(
-                                event = "claim_outspend_recovered",
-                                swap_id = %swap.boltz_swap_id,
-                                expected_txid = %txid,
-                                recovered_txid = %spending_txid,
-                                broadcast_error = %broadcast_err,
-                                "claim broadcast errored and expected txid was absent, but lockup outspend was found"
-                            );
-                            txid = spending_txid;
-                        }
-                        Ok(None) => {
-                            return Err(AppError::ClaimError(format!(
-                                "broadcast failed: {broadcast_err}"
-                            )));
-                        }
-                        Err(recovery_err) => {
-                            tracing::warn!(
-                                "claim outspend recovery failed for {}: {recovery_err}; \
-                                 treating broadcast as failed",
-                                swap.boltz_swap_id
-                            );
-                            return Err(AppError::ClaimError(format!(
-                                "broadcast failed: {broadcast_err}"
-                            )));
-                        }
+                Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                    Ok(Some(spending_txid)) => {
+                        tracing::info!(
+                            event = "claim_outspend_recovered",
+                            swap_id = %swap.boltz_swap_id,
+                            expected_txid = %txid,
+                            recovered_txid = %spending_txid,
+                            broadcast_error = %broadcast_err,
+                            "claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                        );
+                        txid = spending_txid;
                     }
-                }
+                    Ok(None) => {
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast failed: {broadcast_err}"
+                        )));
+                    }
+                    Err(recovery_err) => {
+                        tracing::warn!(
+                            "claim outspend recovery failed for {}: {recovery_err}; \
+                                 treating broadcast as failed",
+                            swap.boltz_swap_id
+                        );
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast failed: {broadcast_err}"
+                        )));
+                    }
+                },
                 Err(probe_err) => {
                     // Probe itself failed (Electrum hiccup). Conservatively
                     // assume the tx isn't on chain and propagate the
@@ -1026,9 +1013,7 @@ fn is_cooperative_refusal(err: &AppError) -> bool {
 /// both Liquid (elements consensus) and Bitcoin (consensus crate).
 fn serialize_claim_tx_hex(tx: &BtcLikeTransaction) -> Result<String, AppError> {
     Ok(match tx {
-        BtcLikeTransaction::Liquid(t) => {
-            hex::encode(boltz_client::elements::encode::serialize(t))
-        }
+        BtcLikeTransaction::Liquid(t) => hex::encode(boltz_client::elements::encode::serialize(t)),
         BtcLikeTransaction::Bitcoin(t) => {
             hex::encode(boltz_client::bitcoin::consensus::serialize(t))
         }
@@ -1108,7 +1093,11 @@ mod tests {
 
     #[test]
     fn url_secret_matches_current() {
-        assert!(url_secret_matches_pair("s3cr3t-current", "s3cr3t-current", ""));
+        assert!(url_secret_matches_pair(
+            "s3cr3t-current",
+            "s3cr3t-current",
+            ""
+        ));
     }
 
     #[test]
@@ -1127,8 +1116,16 @@ mod tests {
 
     #[test]
     fn url_secret_rejects_wrong() {
-        assert!(!url_secret_matches_pair("nope", "s3cr3t-current", "s3cr3t-previous"));
-        assert!(!url_secret_matches_pair("", "s3cr3t-current", "s3cr3t-previous"));
+        assert!(!url_secret_matches_pair(
+            "nope",
+            "s3cr3t-current",
+            "s3cr3t-previous"
+        ));
+        assert!(!url_secret_matches_pair(
+            "",
+            "s3cr3t-current",
+            "s3cr3t-previous"
+        ));
     }
 
     /// Empty configured secrets must never validate — even against an
@@ -1142,8 +1139,16 @@ mod tests {
 
     #[test]
     fn url_secret_rejects_length_mismatch() {
-        assert!(!url_secret_matches_pair("0123456789abcde", "0123456789abcdef", ""));
-        assert!(!url_secret_matches_pair("0123456789abcdef0", "0123456789abcdef", ""));
+        assert!(!url_secret_matches_pair(
+            "0123456789abcde",
+            "0123456789abcdef",
+            ""
+        ));
+        assert!(!url_secret_matches_pair(
+            "0123456789abcdef0",
+            "0123456789abcdef",
+            ""
+        ));
     }
 
     #[test]
@@ -1260,10 +1265,8 @@ mod tests {
             Some(elements::OutPoint::new(lockup_txid, 0)),
             claim_script.clone(),
         );
-        let spending_tx = test_liquid_tx(
-            Some(elements::OutPoint::new(lockup_txid, 0)),
-            claim_script,
-        );
+        let spending_tx =
+            test_liquid_tx(Some(elements::OutPoint::new(lockup_txid, 0)), claim_script);
         let spender = spending_tx.txid().to_string();
         let backend = Arc::new(MockUtxoBackend {
             raw_txs: HashMap::from([
@@ -1405,10 +1408,7 @@ pub fn spawn_background_claimer(
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "background claimer: swap {}: {e}",
-                                swap.boltz_swap_id
-                            );
+                            tracing::warn!("background claimer: swap {}: {e}", swap.boltz_swap_id);
                         }
                     }
                 }

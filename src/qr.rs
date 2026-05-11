@@ -41,11 +41,7 @@ pub async fn generate(
     }
 
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let ip = ip_whitelist::caller_ip(
-        peer,
-        &headers,
-        state.config.rate_limit.trust_forwarded_for,
-    );
+    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
@@ -62,9 +58,8 @@ pub async fn generate(
         }
     }
 
-    let qr = qrcode::QrCode::new(params.data.as_bytes()).map_err(|e| {
-        AppError::InvalidAmount(format!("qr encode failed: {e}"))
-    })?;
+    let qr = qrcode::QrCode::new(params.data.as_bytes())
+        .map_err(|e| AppError::InvalidAmount(format!("qr encode failed: {e}")))?;
 
     // Render with the page's color palette (dark scheme) so the QR
     // visually matches the surrounding UI without extra CSS work on

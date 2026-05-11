@@ -17,11 +17,7 @@ use crate::AppState;
 /// Resolve the caller IP using the same logic as `/lnurlp/callback`:
 /// rightmost X-Forwarded-For when `trust_forwarded_for`, otherwise the TCP
 /// peer. Returns `None` if neither source is available.
-fn caller_ip(
-    state: &AppState,
-    peer: Option<SocketAddr>,
-    headers: &HeaderMap,
-) -> Option<IpAddr> {
+fn caller_ip(state: &AppState, peer: Option<SocketAddr>, headers: &HeaderMap) -> Option<IpAddr> {
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     ip_whitelist::resolve_caller_ip(
         peer.map(|p| p.ip()),
@@ -72,7 +68,11 @@ pub struct QuotaView {
 
 impl QuotaView {
     fn new(used: i64, cap: i64) -> Self {
-        Self { used, cap, remaining: (cap - used).max(0) }
+        Self {
+            used,
+            cap,
+            remaining: (cap - used).max(0),
+        }
     }
 }
 
@@ -122,7 +122,9 @@ pub async fn register(
 
     // P1: gate before any CPU-expensive work (sig verify, descriptor parse).
     let ip = gate_register_per_ip(&state, peer, &headers).await?;
-    let is_whitelisted = ip.map(|ip| state.ip_whitelist.contains(ip)).unwrap_or(false);
+    let is_whitelisted = ip
+        .map(|ip| state.ip_whitelist.contains(ip))
+        .unwrap_or(false);
 
     // P1: hard ceiling on active users. New registrations are blocked once
     // the cap is reached; updates / lookups / deletes still work.
@@ -141,10 +143,7 @@ pub async fn register(
         return Err(AppError::NymReserved);
     }
 
-    descriptor::validate_descriptor(
-        &req.ct_descriptor,
-        state.config.limits.max_descriptor_len,
-    )?;
+    descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
 
     // P1: distinct-npubs-per-IP cap, applied after the cheap input
     // validation but BEFORE the Schnorr verify. Recording the npub here
@@ -174,15 +173,7 @@ pub async fn register(
     // re-registering the original nym reactivates the same row so swap
     // history follows the FK; a different nym becomes a fresh row.
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
-    match db::register_user_atomic(
-        &state.db,
-        &req.npub,
-        &req.nym,
-        &req.ct_descriptor,
-        cap,
-    )
-    .await?
-    {
+    match db::register_user_atomic(&state.db, &req.npub, &req.nym, &req.ct_descriptor, cap).await? {
         db::RegisterOutcome::Created(_) | db::RegisterOutcome::Reactivated(_) => {}
         db::RegisterOutcome::KeyAlreadyRegistered { nym } => {
             return Err(AppError::KeyAlreadyRegistered {
@@ -229,16 +220,13 @@ pub async fn update_registration(
         &req.signature,
     )?;
 
-    descriptor::validate_descriptor(
-        &req.ct_descriptor,
-        state.config.limits.max_descriptor_len,
-    )?;
+    descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
 
     // Pre-flight: confirm the (npub, nym) pair matches a current registration
     // BEFORE the descriptor write. Catches stale-nym replays.
-    let current = db::get_user_by_npub(&state.db, &req.npub).await?.ok_or_else(
-        || AppError::NymNotFound("no registration found for this key".to_string()),
-    )?;
+    let current = db::get_user_by_npub(&state.db, &req.npub)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
     if current.nym != req.nym {
         return Err(AppError::AuthError(
             "signer's claimed nym does not match the registration on file".to_string(),
@@ -301,9 +289,9 @@ pub async fn delete_registration(
     // Pre-flight: confirm the (npub, nym) pair matches a current registration
     // BEFORE the deactivate/purge fires. Catches stale-nym replays where the
     // npub later registered a different nym.
-    let current = db::get_user_by_npub(&state.db, &req.npub).await?.ok_or_else(
-        || AppError::NymNotFound("no registration found for this key".to_string()),
-    )?;
+    let current = db::get_user_by_npub(&state.db, &req.npub)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
     if current.nym != req.nym {
         return Err(AppError::AuthError(
             "signer's claimed nym does not match the registration on file".to_string(),
@@ -323,15 +311,19 @@ pub async fn delete_registration(
             db::PurgeOutcome::InFlightSwaps(n) => return Err(AppError::PurgeBlocked(n)),
         }
     } else {
-        let user = db::deactivate_user(&state.db, &req.npub).await?.ok_or_else(
-            || AppError::NymNotFound("no registration found for this key".to_string()),
-        )?;
+        let user = db::deactivate_user(&state.db, &req.npub)
+            .await?
+            .ok_or_else(|| {
+                AppError::NymNotFound("no registration found for this key".to_string())
+            })?;
         tracing::info!("deactivated registration for {}", user.nym);
     }
 
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
-    Ok(Json(DeleteResponse { quota: QuotaView::new(used, cap) }))
+    Ok(Json(DeleteResponse {
+        quota: QuotaView::new(used, cap),
+    }))
 }
 
 // --- Lookup ---
@@ -407,7 +399,9 @@ pub async fn lookup_by_npub(
             lifetime_nyms_cap: cap,
         }));
     }
-    Err(AppError::NymNotFound("no registration for this key".to_string()))
+    Err(AppError::NymNotFound(
+        "no registration for this key".to_string(),
+    ))
 }
 
 // --- Reservation sync ---

@@ -40,8 +40,8 @@ pub struct GcConfig {
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            tick_secs: 600,         // 10 min
-            retention_secs: 86_400, // 24 h — well past the longest 1h window
+            tick_secs: 600,                   // 10 min
+            retention_secs: 86_400,           // 24 h — well past the longest 1h window
             outpoint_pending_ttl_secs: 3_600, // 1 h
             donation_allocation_ttl_days: 30,
         }

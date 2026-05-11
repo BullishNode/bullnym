@@ -82,9 +82,9 @@ pub struct ParsedOutpoint {
 
 impl ParsedOutpoint {
     pub fn parse(s: &str) -> Result<Self, AppError> {
-        let (txid, vout) = s.split_once(':').ok_or_else(|| {
-            AppError::ProofOfFundsInvalid("outpoint must be txid:vout".into())
-        })?;
+        let (txid, vout) = s
+            .split_once(':')
+            .ok_or_else(|| AppError::ProofOfFundsInvalid("outpoint must be txid:vout".into()))?;
         if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(AppError::ProofOfFundsInvalid(
                 "outpoint txid must be 64 hex chars".into(),
@@ -314,7 +314,10 @@ where
             }
         }
 
-        let client = guard.client.as_ref().expect("client present after reconnect");
+        let client = guard
+            .client
+            .as_ref()
+            .expect("client present after reconnect");
         match op(client) {
             Ok(v) => return Ok(v),
             Err(electrum_client::Error::Protocol(p)) => {
@@ -337,9 +340,8 @@ where
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        electrum_client::Error::Message("electrum retries exhausted".into())
-    }))
+    Err(last_err
+        .unwrap_or_else(|| electrum_client::Error::Message("electrum retries exhausted".into())))
 }
 
 #[async_trait::async_trait]
@@ -409,9 +411,7 @@ impl UtxoBackend for ElectrumClient {
         .map_err(|e| AppError::ElectrumError(format!("scripthash.listunspent: {e}")))?;
 
         let utxos = result.as_array().ok_or_else(|| {
-            AppError::ElectrumError(
-                "scripthash.listunspent: expected JSON array response".into(),
-            )
+            AppError::ElectrumError("scripthash.listunspent: expected JSON array response".into())
         })?;
 
         Ok(utxos.iter().any(|u| {
@@ -443,9 +443,7 @@ impl UtxoBackend for ElectrumClient {
         .map_err(|e| AppError::ElectrumError(format!("scripthash.get_history: {e}")))?;
 
         let history = result.as_array().ok_or_else(|| {
-            AppError::ElectrumError(
-                "scripthash.get_history: expected JSON array response".into(),
-            )
+            AppError::ElectrumError("scripthash.get_history: expected JSON array response".into())
         })?;
 
         Ok(!history.is_empty())
@@ -501,9 +499,7 @@ fn history_txids(history: &serde_json::Value) -> Result<Vec<String>, AppError> {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .ok_or_else(|| {
-                    AppError::ElectrumError(
-                        "scripthash.get_history: entry missing tx_hash".into(),
-                    )
+                    AppError::ElectrumError("scripthash.get_history: entry missing tx_hash".into())
                 })
         })
         .collect()
@@ -583,13 +579,7 @@ mod tests {
     fn sig_for_different_nym_fails() {
         let (sk, pk) = test_keypair();
         let sig = sign(b"tag", "alice", "ab:0", &sk);
-        let got = verify_ownership_sig(
-            b"tag",
-            "bob",
-            "ab:0",
-            &hex::encode(pk.serialize()),
-            &sig,
-        );
+        let got = verify_ownership_sig(b"tag", "bob", "ab:0", &hex::encode(pk.serialize()), &sig);
         assert!(matches!(got, Err(AppError::ProofOfFundsInvalid(_))));
     }
 
@@ -597,13 +587,7 @@ mod tests {
     fn sig_for_different_outpoint_fails() {
         let (sk, pk) = test_keypair();
         let sig = sign(b"tag", "alice", "ab:0", &sk);
-        let got = verify_ownership_sig(
-            b"tag",
-            "alice",
-            "ab:1",
-            &hex::encode(pk.serialize()),
-            &sig,
-        );
+        let got = verify_ownership_sig(b"tag", "alice", "ab:1", &hex::encode(pk.serialize()), &sig);
         assert!(matches!(got, Err(AppError::ProofOfFundsInvalid(_))));
     }
 

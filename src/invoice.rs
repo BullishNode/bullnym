@@ -62,11 +62,11 @@ pub const ACTION_CREATE: &str = "invoice-create";
 pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
 
-/// Hard upper bound on wallet-origin invoice expiry (30 days). Mobile is
+/// Hard upper bound on wallet-origin invoice expiry (7 days). Mobile is
 /// the source of the requested expiry (`expires_at_unix`); the server
 /// clamps to this ceiling so a runaway or malicious client cannot pin a
-/// row indefinitely.
-const MAX_WALLET_EXPIRES_SECS: i64 = 30 * 24 * 60 * 60;
+/// row indefinitely or refresh Boltz offers forever.
+const MAX_WALLET_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Default cap on `list_invoices.limit`. Mobile can request a smaller
 /// page size; never larger.

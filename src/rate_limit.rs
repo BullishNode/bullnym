@@ -94,11 +94,7 @@ impl RateLimiter {
     // (CGNAT, office NAT, family WiFi). IPv6 /56 sources get a tighter
     // cap because /56 is the canonical ISP-customer block — one real
     // user / household per /56.
-    pub async fn check_distinct_nyms_per_ip(
-        &self,
-        ip: IpAddr,
-        nym: &str,
-    ) -> Result<(), AppError> {
+    pub async fn check_distinct_nyms_per_ip(&self, ip: IpAddr, nym: &str) -> Result<(), AppError> {
         let bucket = source_key(ip);
         let limit = match ip {
             IpAddr::V4(_) => self.cfg.distinct_nyms_per_ip_limit,
@@ -319,10 +315,7 @@ impl RateLimiter {
 
     /// Per-source rate-limit on `GET /lnurlp/donate-callback/<nym>`. Loose
     /// — covers refresh-driven retries.
-    pub async fn check_donation_callback_per_source(
-        &self,
-        ip: IpAddr,
-    ) -> Result<(), AppError> {
+    pub async fn check_donation_callback_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("donation_cb:{}", source_key(ip));
         self.inmem_sliding_check(
             &bucket,
@@ -346,13 +339,9 @@ impl RateLimiter {
             return Ok(());
         }
         let key = source_key(ip);
-        let count = db::count_recent_donation_allocations_per_source(
-            &self.pool,
-            &key,
-            3600,
-        )
-        .await
-        .map_err(AppError::from)?;
+        let count = db::count_recent_donation_allocations_per_source(&self.pool, &key, 3600)
+            .await
+            .map_err(AppError::from)?;
         if count >= limit as i64 {
             return Err(AppError::RateLimitedNetwork);
         }
@@ -363,10 +352,7 @@ impl RateLimiter {
     /// Tighter than `donation_callback_per_source_per_min` because each
     /// success path here creates a real invoice + Boltz reverse-swap;
     /// page refreshes hit the existing invoice URL and don't re-fire.
-    pub async fn check_invoice_create_per_source(
-        &self,
-        ip: IpAddr,
-    ) -> Result<(), AppError> {
+    pub async fn check_invoice_create_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("invoice_create:{}", source_key(ip));
         self.inmem_sliding_check(
             &bucket,
@@ -382,10 +368,7 @@ impl RateLimiter {
     /// per-IP gate. Bucket key includes the lowercased npub; same
     /// keyspace prefix discipline as the metadata gates so AB/BA
     /// deadlocks with DB advisory locks are impossible.
-    pub async fn check_invoice_create_per_npub(
-        &self,
-        npub_hex: &str,
-    ) -> Result<(), AppError> {
+    pub async fn check_invoice_create_per_npub(&self, npub_hex: &str) -> Result<(), AppError> {
         let bucket = format!("invoice_create_npub:{}", npub_hex.to_lowercase());
         self.inmem_sliding_check(
             &bucket,
@@ -397,10 +380,7 @@ impl RateLimiter {
 
     /// Per-source rate-limit on the donation-status poll endpoint. Page
     /// polls every ~3s; 60/min covers a normal session.
-    pub async fn check_donation_status_per_source(
-        &self,
-        ip: IpAddr,
-    ) -> Result<(), AppError> {
+    pub async fn check_donation_status_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("donation_status:{}", source_key(ip));
         self.inmem_sliding_check(
             &bucket,
@@ -528,12 +508,7 @@ impl RateLimiter {
         if limit == 0 {
             return Ok(());
         }
-        let count = db::record_and_count_rate_limit_atomic(
-            &self.pool,
-            bucket,
-            window_secs,
-        )
-        .await?;
+        let count = db::record_and_count_rate_limit_atomic(&self.pool, bucket, window_secs).await?;
         if count as u32 > limit {
             tracing::warn!(
                 event = "rate_limited",
@@ -562,13 +537,9 @@ impl RateLimiter {
         if limit == 0 {
             return Ok(());
         }
-        let count = db::record_and_count_distinct_nyms_atomic(
-            &self.pool,
-            source_key,
-            nym,
-            window_secs,
-        )
-        .await?;
+        let count =
+            db::record_and_count_distinct_nyms_atomic(&self.pool, source_key, nym, window_secs)
+                .await?;
         if count as u32 > limit {
             tracing::warn!(
                 event = "rate_limited",
@@ -626,14 +597,13 @@ impl InMemorySliding {
     /// Drop entries whose latest timestamp is older than `max_age`.
     /// Returns the number of entries removed.
     fn sweep_idle(&self, max_age: Duration) -> usize {
-        let cutoff = Instant::now().checked_sub(max_age).unwrap_or_else(Instant::now);
+        let cutoff = Instant::now()
+            .checked_sub(max_age)
+            .unwrap_or_else(Instant::now);
         let before = self.map.len();
         self.map.retain(|_, deque| {
             // Retain if the latest seen timestamp is recent enough.
-            deque
-                .back()
-                .map(|last| *last >= cutoff)
-                .unwrap_or(false)
+            deque.back().map(|last| *last >= cutoff).unwrap_or(false)
         });
         before.saturating_sub(self.map.len())
     }

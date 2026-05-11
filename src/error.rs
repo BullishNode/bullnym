@@ -34,20 +34,30 @@ pub enum AppError {
     MultipartInvalid(String),
     /// Decoded image dimensions exceeded `image_max_dimension`. Image-
     /// bomb defense — the full pixel buffer was never allocated.
-    ImageDimensionsTooLarge { max: u32 },
+    ImageDimensionsTooLarge {
+        max: u32,
+    },
     /// The caller's wallet already has an active address.
-    KeyAlreadyRegistered { nym: String, domain: String },
+    KeyAlreadyRegistered {
+        nym: String,
+        domain: String,
+    },
     /// Wallet has registered the cap of lifetime nyms. Carries both `used`
     /// and `cap` so the wire envelope ships the same `quota` object the
     /// mobile receives on lookup.
-    NymQuotaExceeded { used: i64, cap: i64 },
+    NymQuotaExceeded {
+        used: i64,
+        cap: i64,
+    },
     /// CT descriptor was rejected (`internal_reason` is for logging).
     InvalidDescriptor(String),
     /// Generic wallet auth failure (Schnorr sig fail, ts skew, npub parse).
     AuthError(String),
 
     // --- Liquid LUD-22 / proof of funds ---
-    ProofOfFundsRequired { min_sat: u64 },
+    ProofOfFundsRequired {
+        min_sat: u64,
+    },
     ProofOfFundsInvalid(String),
     UtxoNotFound,
     UtxoSpent,

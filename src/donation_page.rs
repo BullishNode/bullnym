@@ -43,8 +43,7 @@ const MAX_DESCRIPTION_LEN: usize = 280;
 const MAX_SOCIAL_LINK_LEN: usize = 200;
 const MAX_SOCIAL_HANDLE_LEN: usize = 50;
 
-pub const SUPPORTED_CURRENCIES: &[&str] =
-    &["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"];
+pub const SUPPORTED_CURRENCIES: &[&str] = &["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"];
 
 static TWITTER_HANDLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_]{1,50}$").unwrap());
@@ -153,14 +152,15 @@ fn validate_lengths(req: &SaveDonationPageRequest) -> Result<(), AppError> {
             ));
         }
         if t.len() > MAX_SOCIAL_HANDLE_LEN {
-            return Err(AppError::DonationPageInvalid("twitter handle too long".to_string()));
+            return Err(AppError::DonationPageInvalid(
+                "twitter handle too long".to_string(),
+            ));
         }
     }
     if let Some(i) = &req.instagram {
         if !i.is_empty() && !INSTAGRAM_HANDLE_REGEX.is_match(i) {
             return Err(AppError::DonationPageInvalid(
-                "instagram handle: 1-50 chars, alphanumeric, dot, underscore only"
-                    .to_string(),
+                "instagram handle: 1-50 chars, alphanumeric, dot, underscore only".to_string(),
             ));
         }
         if i.len() > MAX_SOCIAL_HANDLE_LEN {
@@ -202,11 +202,7 @@ fn save_payload_fields<'a>(
 
 /// Confirm the signing npub owns `nym` AND the user row is currently active.
 /// Returns the user record on success.
-async fn assert_nym_owner(
-    state: &AppState,
-    nym: &str,
-    npub: &str,
-) -> Result<db::User, AppError> {
+async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
     let user = db::get_user_by_npub(&state.db, npub)
         .await?
         .ok_or_else(|| AppError::AuthError("no active registration for this key".to_string()))?;
@@ -399,9 +395,10 @@ pub async fn upload_image(
             "sha256" => sha256_hex = Some(text_field(field).await?),
             "timestamp" => {
                 let s = text_field(field).await?;
-                timestamp = Some(s.parse().map_err(|_| {
-                    AppError::MultipartInvalid("timestamp must be a u64".into())
-                })?);
+                timestamp =
+                    Some(s.parse().map_err(|_| {
+                        AppError::MultipartInvalid("timestamp must be a u64".into())
+                    })?);
             }
             "signature" => signature = Some(text_field(field).await?),
             "file" => {
@@ -422,8 +419,8 @@ pub async fn upload_image(
     let nym = nym.ok_or_else(|| AppError::MultipartInvalid("missing 'nym'".into()))?;
     let npub = npub.ok_or_else(|| AppError::MultipartInvalid("missing 'npub'".into()))?;
     let kind_str = kind_str.ok_or_else(|| AppError::MultipartInvalid("missing 'kind'".into()))?;
-    let claimed_sha = sha256_hex
-        .ok_or_else(|| AppError::MultipartInvalid("missing 'sha256'".into()))?;
+    let claimed_sha =
+        sha256_hex.ok_or_else(|| AppError::MultipartInvalid("missing 'sha256'".into()))?;
     let timestamp =
         timestamp.ok_or_else(|| AppError::MultipartInvalid("missing 'timestamp'".into()))?;
     let signature =
@@ -494,11 +491,7 @@ pub async fn upload_image(
         og_width: state.config.donation.og_width,
         og_height: state.config.donation.og_height,
     };
-    let path = image_pipeline::image_path(
-        &state.config.donation.image_root_path,
-        &nym,
-        kind,
-    );
+    let path = image_pipeline::image_path(&state.config.donation.image_root_path, &nym, kind);
     let processed = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         let p = image_pipeline::process(&file_bytes, kind, &pipeline_cfg)?;
         image_pipeline::atomic_write(&path, &p.webp_bytes).map_err(|e| {
@@ -518,18 +511,12 @@ pub async fn upload_image(
         ImageKind::Avatar => "avatar_sha256",
         ImageKind::Og => "og_sha256",
     };
-    let row = db::update_donation_page_image_hash(
-        &state.db,
-        &nym,
-        column,
-        &processed.source_sha256,
-    )
-    .await?
-    .ok_or_else(|| {
-        AppError::DonationPageNotFound(
-            "donation page disappeared mid-upload".to_string(),
-        )
-    })?;
+    let row =
+        db::update_donation_page_image_hash(&state.db, &nym, column, &processed.source_sha256)
+            .await?
+            .ok_or_else(|| {
+                AppError::DonationPageNotFound("donation page disappeared mid-upload".to_string())
+            })?;
 
     Ok(Json(DonationPageView::from_row(row, &state.config.domain)))
 }
@@ -623,13 +610,7 @@ mod tests {
         );
         let npub = "00".repeat(32); // 64 hex chars
         let timestamp: u64 = 1_700_000_000;
-        let msg = crate::auth::build_la_v2_message(
-            ACTION_SAVE,
-            &npub,
-            "alice",
-            &fields,
-            timestamp,
-        );
+        let msg = crate::auth::build_la_v2_message(ACTION_SAVE, &npub, "alice", &fields, timestamp);
 
         // Expected layout:
         //   bullpay-la-v2\0donation-page-save\0<npub>\0alice\0<f1>\0...\0<f7>\0<ts>
@@ -657,13 +638,7 @@ mod tests {
     fn v2_archive_message_byte_exact_contract() {
         let npub = "ab".repeat(32);
         let timestamp: u64 = 1_700_000_000;
-        let msg = crate::auth::build_la_v2_message(
-            ACTION_ARCHIVE,
-            &npub,
-            "alice",
-            &[],
-            timestamp,
-        );
+        let msg = crate::auth::build_la_v2_message(ACTION_ARCHIVE, &npub, "alice", &[], timestamp);
 
         let mut expected: Vec<u8> = Vec::new();
         expected.extend_from_slice(b"bullpay-la-v2");

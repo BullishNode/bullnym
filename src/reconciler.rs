@@ -67,12 +67,9 @@ async fn run_one_tick(
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    let stale = db::list_non_terminal_swaps_oldest_first(
-        pool,
-        config.min_age_secs,
-        config.max_per_tick,
-    )
-    .await?;
+    let stale =
+        db::list_non_terminal_swaps_oldest_first(pool, config.min_age_secs, config.max_per_tick)
+            .await?;
 
     if stale.is_empty() {
         tracing::debug!("reconciler: no stale swaps");
@@ -97,10 +94,7 @@ async fn run_one_tick(
         let remote = match client.get_swap(&swap.boltz_swap_id).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(
-                    "reconciler: get_swap({}) failed: {e}",
-                    swap.boltz_swap_id
-                );
+                tracing::warn!("reconciler: get_swap({}) failed: {e}", swap.boltz_swap_id);
                 continue;
             }
         };
@@ -336,10 +330,7 @@ mod tests {
     #[test]
     fn boltz_swap_created_no_op() {
         let swap = fixture("pending");
-        assert_eq!(
-            decide_action(&swap, "swap.created"),
-            ReconcilerAction::Noop
-        );
+        assert_eq!(decide_action(&swap, "swap.created"), ReconcilerAction::Noop);
     }
 
     #[test]
@@ -383,7 +374,12 @@ mod tests {
 
     #[test]
     fn boltz_swap_expired_schedules_script_retry() {
-        for our in &["lockup_mempool", "lockup_confirmed", "claiming", "claim_failed"] {
+        for our in &[
+            "lockup_mempool",
+            "lockup_confirmed",
+            "claiming",
+            "claim_failed",
+        ] {
             let swap = fixture(our);
             assert_eq!(
                 decide_action(&swap, "swap.expired"),

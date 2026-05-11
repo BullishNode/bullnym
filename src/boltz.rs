@@ -23,7 +23,11 @@ pub struct BoltzService {
 }
 
 impl BoltzService {
-    pub fn new(boltz_url: &str, swap_master_key: SwapMasterKey, webhook_url: Option<String>) -> Self {
+    pub fn new(
+        boltz_url: &str,
+        swap_master_key: SwapMasterKey,
+        webhook_url: Option<String>,
+    ) -> Self {
         Self {
             api: BoltzApiClientV2::new(boltz_url.to_string(), None),
             swap_master_key,

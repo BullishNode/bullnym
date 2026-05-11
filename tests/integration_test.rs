@@ -78,7 +78,11 @@ fn test_state(pool: PgPool) -> AppState {
     AppState {
         db: pool,
         config: Arc::new(test_config()),
-        boltz: Arc::new(BoltzService::new("http://127.0.0.1:1", swap_master_key, None)),
+        boltz: Arc::new(BoltzService::new(
+            "http://127.0.0.1:1",
+            swap_master_key,
+            None,
+        )),
         ip_whitelist: Arc::new(IpWhitelist::default()),
         rate_limiter,
         utxo_backend: None,
@@ -93,7 +97,10 @@ fn test_app(state: AppState) -> Router {
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
-        .route("/register", axum::routing::delete(registration::delete_registration))
+        .route(
+            "/register",
+            axum::routing::delete(registration::delete_registration),
+        )
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .with_state(state)
 }
@@ -126,9 +133,15 @@ fn sign_with_keypair(keypair: &Keypair, message: &[u8]) -> String {
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
-    sqlx::query("DELETE FROM swap_records").execute(pool).await.ok();
+    sqlx::query("DELETE FROM swap_records")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM invoices").execute(pool).await.ok();
-    sqlx::query("DELETE FROM donation_pages").execute(pool).await.ok();
+    sqlx::query("DELETE FROM donation_pages")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
 }
 
@@ -172,12 +185,16 @@ async fn register_and_resolve() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig) = sign_registration("alice", TEST_DESCRIPTOR);
-    let (status, body) = post_json(&app, "/register", json!({
-        "nym": "alice",
-        "ct_descriptor": TEST_DESCRIPTOR,
-        "npub": npub,
-        "signature": sig,
-    }))
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "alice",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "signature": sig,
+        }),
+    )
     .await;
 
     assert_eq!(status, StatusCode::CREATED);
@@ -206,14 +223,24 @@ async fn register_duplicate_nym_rejected() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub1, sig1) = sign_registration("taken", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1,
+        }),
+    )
+    .await;
 
     let (npub2, sig2) = sign_registration("taken", TEST_DESCRIPTOR);
-    let (status, body) = post_json(&app, "/register", json!({
-        "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
+        }),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
@@ -244,10 +271,18 @@ async fn register_invalid_nym_rejected() {
 
     for bad_nym in ["AB", "a", "-bad", "bad-", "has space", "has_under", "a@b"] {
         let (npub, sig) = sign_registration(bad_nym, TEST_DESCRIPTOR);
-        let (_, body) = post_json(&app, "/register", json!({
-            "nym": bad_nym, "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-        })).await;
-        assert_eq!(body["status"], "ERROR", "nym '{bad_nym}' should be rejected");
+        let (_, body) = post_json(
+            &app,
+            "/register",
+            json!({
+                "nym": bad_nym, "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+            }),
+        )
+        .await;
+        assert_eq!(
+            body["status"], "ERROR",
+            "nym '{bad_nym}' should be rejected"
+        );
     }
 
     cleanup_db(&pool).await;
@@ -274,10 +309,15 @@ async fn address_indices_are_sequential() {
     cleanup_db(&pool).await;
 
     let (npub, _) = sign_registration("idxuser", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "idxuser", &npub, TEST_DESCRIPTOR).await.unwrap();
+    pay_service::db::create_user(&pool, "idxuser", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
 
     for expected in 0..5 {
-        let idx = pay_service::db::allocate_address_index(&pool, "idxuser").await.unwrap().unwrap();
+        let idx = pay_service::db::allocate_address_index(&pool, "idxuser")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(idx, expected);
     }
 
@@ -290,13 +330,18 @@ async fn concurrent_address_allocation_no_duplicates() {
     cleanup_db(&pool).await;
 
     let (npub, _) = sign_registration("concuser", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "concuser", &npub, TEST_DESCRIPTOR).await.unwrap();
+    pay_service::db::create_user(&pool, "concuser", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..10 {
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
-            pay_service::db::allocate_address_index(&pool, "concuser").await.unwrap().unwrap()
+            pay_service::db::allocate_address_index(&pool, "concuser")
+                .await
+                .unwrap()
+                .unwrap()
         }));
     }
 
@@ -323,10 +368,15 @@ async fn webhook_parses_boltz_envelope() {
     let app = test_app(test_state(pool.clone()));
 
     // Webhook for unknown swap returns error
-    let (status, body) = post_json(&app, "/webhook/boltz", json!({
-        "event": "swap.update",
-        "data": {"id": "nonexistent", "status": "transaction.mempool"}
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "nonexistent", "status": "transaction.mempool"}
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
 
@@ -354,34 +404,59 @@ async fn webhook_skips_terminal_swaps() {
     // Create a user and a fake swap record in "claimed" state
     cleanup_db(&pool).await;
     let (npub, _) = sign_registration("webhookuser", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "webhookuser", &npub, TEST_DESCRIPTOR).await.unwrap();
+    pay_service::db::create_user(&pool, "webhookuser", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
 
-    pay_service::db::record_swap(&pool, &pay_service::db::NewSwapRecord {
-        nym: "webhookuser",
-        boltz_swap_id: "FAKE_CLAIMED",
-        address: Some("lq1qqtest"),
-        address_index: Some(0),
-        amount_sat: 1000,
-        invoice: "lnbc...",
-        preimage_hex: "aa".repeat(32).as_str(),
-        claim_key_hex: "bb".repeat(32).as_str(),
-        boltz_response_json: "{}",
-        invoice_id: None,
-    }).await.unwrap();
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: "webhookuser",
+            boltz_swap_id: "FAKE_CLAIMED",
+            address: Some("lq1qqtest"),
+            address_index: Some(0),
+            amount_sat: 1000,
+            invoice: "lnbc...",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // Mark as claimed
-    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "FAKE_CLAIMED").await.unwrap().unwrap();
-    pay_service::db::update_swap_status(&pool, swap.id, pay_service::db::SwapStatus::Claimed, Some("txid123")).await.unwrap();
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "FAKE_CLAIMED")
+        .await
+        .unwrap()
+        .unwrap();
+    pay_service::db::update_swap_status(
+        &pool,
+        swap.id,
+        pay_service::db::SwapStatus::Claimed,
+        Some("txid123"),
+    )
+    .await
+    .unwrap();
 
     // Webhook should be silently accepted (not trigger a re-claim)
-    let (status, _) = post_json(&app, "/webhook/boltz", json!({
-        "event": "swap.update",
-        "data": {"id": "FAKE_CLAIMED", "status": "transaction.confirmed"}
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "FAKE_CLAIMED", "status": "transaction.confirmed"}
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Status should still be claimed
-    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "FAKE_CLAIMED").await.unwrap().unwrap();
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "FAKE_CLAIMED")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(swap.status, "claimed");
 
     cleanup_db(&pool).await;
@@ -398,9 +473,14 @@ async fn callback_rejects_invalid_amounts() {
 
     // Register a user first
     let (npub, sig) = sign_registration("amtuser", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "amtuser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "amtuser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
 
     // Below minimum (default 100k msat = 100 sats)
     let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=1000").await;
@@ -452,7 +532,9 @@ async fn delete_registration_deactivates_user() {
                 .method("DELETE")
                 .uri("/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"npub": npub_hex, "signature": del_sig.to_string()}).to_string()))
+                .body(Body::from(
+                    json!({"npub": npub_hex, "signature": del_sig.to_string()}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -477,20 +559,32 @@ async fn reregister_after_delete_succeeds() {
     let (npub, sig, keypair) = sign_registration_with_keypair("lifecycle1", TEST_DESCRIPTOR);
 
     // Register
-    let (status, _) = post_json(&app, "/register", json!({
-        "nym": "lifecycle1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "lifecycle1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     // Delete
     let del_sig = sign_with_keypair(&keypair, b"delete");
-    let resp = app.clone().oneshot(
-        Request::builder()
-            .method("DELETE").uri("/register")
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"npub": npub, "signature": del_sig}).to_string()))
-            .unwrap(),
-    ).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"npub": npub, "signature": del_sig}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Re-register with new nym, same npub
@@ -522,25 +616,44 @@ async fn reregister_same_nym_after_delete() {
     let (npub, sig, keypair) = sign_registration_with_keypair("samename", TEST_DESCRIPTOR);
 
     // Register
-    post_json(&app, "/register", json!({
-        "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
 
     // Delete
     let del_sig = sign_with_keypair(&keypair, b"delete");
-    app.clone().oneshot(
-        Request::builder()
-            .method("DELETE").uri("/register")
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"npub": npub, "signature": del_sig}).to_string()))
-            .unwrap(),
-    ).await.unwrap();
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"npub": npub, "signature": del_sig}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     // Re-register same nym — should reactivate
-    let re_sig = sign_with_keypair(&keypair, format!("{}{}", "samename", TEST_DESCRIPTOR).as_bytes());
-    let (status, body) = post_json(&app, "/register", json!({
-        "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
-    })).await;
+    let re_sig = sign_with_keypair(
+        &keypair,
+        format!("{}{}", "samename", TEST_DESCRIPTOR).as_bytes(),
+    );
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["nym"], "samename");
 
@@ -556,17 +669,27 @@ async fn register_while_active_rejected() {
     let (npub, sig, keypair) = sign_registration_with_keypair("active1", TEST_DESCRIPTOR);
 
     // Register first nym
-    let (status, _) = post_json(&app, "/register", json!({
-        "nym": "active1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "active1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     // Try registering second nym with same npub while first is active
     let msg2 = format!("{}{}", "active2", TEST_DESCRIPTOR);
     let sig2 = sign_with_keypair(&keypair, msg2.as_bytes());
-    let (status, body) = post_json(&app, "/register", json!({
-        "nym": "active2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig2,
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "active2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig2,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
 
@@ -582,24 +705,40 @@ async fn deleted_nym_reserved_from_others() {
     let (npub1, sig1, keypair1) = sign_registration_with_keypair("reserved", TEST_DESCRIPTOR);
 
     // User 1 registers and deletes
-    post_json(&app, "/register", json!({
-        "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1,
+        }),
+    )
+    .await;
 
     let del_sig = sign_with_keypair(&keypair1, b"delete");
-    app.clone().oneshot(
-        Request::builder()
-            .method("DELETE").uri("/register")
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"npub": npub1, "signature": del_sig}).to_string()))
-            .unwrap(),
-    ).await.unwrap();
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"npub": npub1, "signature": del_sig}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     // User 2 tries to claim the same nym — should fail
     let (npub2, sig2) = sign_registration("reserved", TEST_DESCRIPTOR);
-    let (_, body) = post_json(&app, "/register", json!({
-        "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
-    })).await;
+    let (_, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
+        }),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     cleanup_db(&pool).await;
@@ -721,11 +860,10 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
         .await
         .unwrap()
         .unwrap();
-    let expired_in_progress =
-        pay_service::db::get_invoice_by_id(&pool, expired_in_progress.id)
-            .await
-            .unwrap()
-            .unwrap();
+    let expired_in_progress = pay_service::db::get_invoice_by_id(&pool, expired_in_progress.id)
+        .await
+        .unwrap()
+        .unwrap();
     let expired_paid = pay_service::db::get_invoice_by_id(&pool, expired_paid.id)
         .await
         .unwrap()
@@ -755,8 +893,7 @@ async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
     let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
         .await
         .unwrap();
-    let invoice_ids: std::collections::HashSet<_> =
-        rows.into_iter().map(|(id, _, _)| id).collect();
+    let invoice_ids: std::collections::HashSet<_> = rows.into_iter().map(|(id, _, _)| id).collect();
 
     assert!(!invoice_ids.contains(&expired.id));
     assert!(invoice_ids.contains(&fresh.id));
@@ -820,20 +957,80 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
 }
 
 #[tokio::test]
+async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "claimretry").await;
+    let invoice = insert_test_invoice(&pool, "claimretry", &npub, "lq1claimretry", 60).await;
+
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: "claimretry",
+            boltz_swap_id: "claimretry-swap",
+            address: Some("lq1claimretryaddr"),
+            address_index: Some(0),
+            amount_sat: 1_000,
+            invoice: "lnbc-claimretry",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE swap_records \
+         SET status = 'claiming', \
+             claim_txid = 'retry-claim-txid', \
+             claim_tx_hex = 'deadbeef', \
+             next_claim_attempt_at = NOW() - INTERVAL '1 second' \
+         WHERE boltz_swap_id = 'claimretry-swap'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ready = pay_service::db::get_ready_to_claim_swaps(&pool)
+        .await
+        .unwrap();
+    let retry = ready
+        .iter()
+        .find(|row| row.boltz_swap_id == "claimretry-swap")
+        .expect("claiming swap with persisted claim tx must be retryable");
+
+    assert_eq!(retry.claim_txid.as_deref(), Some("retry-claim-txid"));
+    assert_eq!(retry.claim_tx_hex.as_deref(), Some("deadbeef"));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn purge_with_no_swaps_scrubs_descriptor_and_keeps_nym_reserved() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig, keypair) = sign_registration_with_keypair("purger1", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
 
     let purge_sig = sign_with_keypair(&keypair, b"purge");
-    let (status, _) = delete_request(&app, json!({
-        "npub": npub, "signature": purge_sig, "purge": true,
-    })).await;
+    let (status, _) = delete_request(
+        &app,
+        json!({
+            "npub": npub, "signature": purge_sig, "purge": true,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // LNURL no longer resolves
@@ -841,21 +1038,25 @@ async fn purge_with_no_swaps_scrubs_descriptor_and_keeps_nym_reserved() {
     assert_eq!(body["status"], "ERROR");
 
     // Row survives with scrubbed descriptor and is_active=false
-    let row: (bool, String) = sqlx::query_as(
-        "SELECT is_active, ct_descriptor FROM users WHERE nym = $1",
-    )
-    .bind("purger1")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row: (bool, String) =
+        sqlx::query_as("SELECT is_active, ct_descriptor FROM users WHERE nym = $1")
+            .bind("purger1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(!row.0);
     assert_eq!(row.1, "");
 
     // Another npub cannot claim the reserved nym
     let (npub2, sig2) = sign_registration("purger1", TEST_DESCRIPTOR);
-    let (_, body) = post_json(&app, "/register", json!({
-        "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
-    })).await;
+    let (_, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2,
+        }),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     cleanup_db(&pool).await;
@@ -868,25 +1069,38 @@ async fn purge_blocked_when_pending_swap_exists() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig, keypair) = sign_registration_with_keypair("purger2", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "purger2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
     insert_swap(&pool, "purger2", "pending", 0).await;
     insert_swap(&pool, "purger2", "lockup_confirmed", 1).await;
 
     let purge_sig = sign_with_keypair(&keypair, b"purge");
-    let (_, body) = delete_request(&app, json!({
-        "npub": npub, "signature": purge_sig, "purge": true,
-    })).await;
+    let (_, body) = delete_request(
+        &app,
+        json!({
+            "npub": npub, "signature": purge_sig, "purge": true,
+        }),
+    )
+    .await;
     assert_eq!(body["code"], "PurgeBlocked");
     assert!(body["reason"].as_str().unwrap().contains("2"));
 
     // User still active, swaps untouched
     let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE nym = 'purger2'")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(active);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger2'")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(count, 2);
 
     cleanup_db(&pool).await;
@@ -899,20 +1113,31 @@ async fn purge_drops_only_terminal_swap_history() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig, keypair) = sign_registration_with_keypair("purger3", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "purger3", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger3", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
     insert_swap(&pool, "purger3", "claimed", 0).await;
     insert_swap(&pool, "purger3", "expired", 1).await;
 
     let purge_sig = sign_with_keypair(&keypair, b"purge");
-    let (status, _) = delete_request(&app, json!({
-        "npub": npub, "signature": purge_sig, "purge": true,
-    })).await;
+    let (status, _) = delete_request(
+        &app,
+        json!({
+            "npub": npub, "signature": purge_sig, "purge": true,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger3'")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(count, 0);
 
     cleanup_db(&pool).await;
@@ -925,24 +1150,37 @@ async fn delete_signature_does_not_authorize_purge() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig, keypair) = sign_registration_with_keypair("purger4", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "purger4", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger4", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
     insert_swap(&pool, "purger4", "claimed", 0).await;
 
     // Sign the soft-delete challenge but try to use it for purge
     let delete_sig = sign_with_keypair(&keypair, b"delete");
-    let (status, _) = delete_request(&app, json!({
-        "npub": npub, "signature": delete_sig, "purge": true,
-    })).await;
+    let (status, _) = delete_request(
+        &app,
+        json!({
+            "npub": npub, "signature": delete_sig, "purge": true,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // User still active, swap_records intact
     let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE nym = 'purger4'")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(active);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger4'")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     cleanup_db(&pool).await;
@@ -955,20 +1193,37 @@ async fn purge_then_owner_reregisters_same_nym() {
     let app = test_app(test_state(pool.clone()));
 
     let (npub, sig, keypair) = sign_registration_with_keypair("purger5", TEST_DESCRIPTOR);
-    post_json(&app, "/register", json!({
-        "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
-    })).await;
+    post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig,
+        }),
+    )
+    .await;
 
     let purge_sig = sign_with_keypair(&keypair, b"purge");
-    delete_request(&app, json!({
-        "npub": npub, "signature": purge_sig, "purge": true,
-    })).await;
+    delete_request(
+        &app,
+        json!({
+            "npub": npub, "signature": purge_sig, "purge": true,
+        }),
+    )
+    .await;
 
     // Same owner re-registers same nym
-    let re_sig = sign_with_keypair(&keypair, format!("{}{}", "purger5", TEST_DESCRIPTOR).as_bytes());
-    let (status, body) = post_json(&app, "/register", json!({
-        "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
-    })).await;
+    let re_sig = sign_with_keypair(
+        &keypair,
+        format!("{}{}", "purger5", TEST_DESCRIPTOR).as_bytes(),
+    );
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig,
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["nym"], "purger5");
 
@@ -981,28 +1236,32 @@ fn schnorr_sign_verify_roundtrip() {
     // 1. Generate a keypair
     // 2. Sign SHA256(message) with schnorr
     // 3. Verify with our auth::verify_signature
-    
+
     use secp256k1::{Keypair, Secp256k1};
     use sha2::{Digest, Sha256};
-    
+
     let secp = Secp256k1::new();
     let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
     let (xonly, _parity) = keypair.x_only_public_key();
     let npub_hex = xonly.to_string();
-    
+
     let message = b"tester1ct(slip77(...),elwpkh(...))";
     let digest = Sha256::digest(message);
     let msg = secp256k1::Message::from_digest(*digest.as_ref());
     let sig = secp.sign_schnorr(&msg, &keypair);
     let sig_hex = sig.to_string();
-    
+
     println!("npub: {npub_hex}");
     println!("sig:  {sig_hex}");
     println!("sig len: {}", sig_hex.len());
-    
+
     // Verify using our auth module
     let result = pay_service::auth::verify_signature(&npub_hex, message, &sig_hex);
-    assert!(result.is_ok(), "Signature verification failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Signature verification failed: {:?}",
+        result
+    );
 }
 
 /// Two concurrent registers from the same npub, when only one slot remains
@@ -1021,16 +1280,20 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(
-        &pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, 3,
-    ).await.unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
-        .execute(&pool).await.unwrap();
-    pay_service::db::register_user_atomic(
-        &pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, 3,
-    ).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Two concurrent register calls — only one slot remains. Without the
     // advisory lock, both would pass `used < cap` (read=2) and both would
@@ -1039,22 +1302,30 @@ async fn register_concurrent_does_not_exceed_cap() {
     let sig_a = sign_with_keypair(&kp, format!("conc-a{}", TEST_DESCRIPTOR).as_bytes());
     let sig_b = sign_with_keypair(&kp, format!("conc-b{}", TEST_DESCRIPTOR).as_bytes());
 
-    let req_a = post_json(&app, "/register", json!({
-        "nym": "conc-a",
-        "ct_descriptor": TEST_DESCRIPTOR,
-        "npub": npub_hex,
-        "signature": sig_a,
-    }));
-    let req_b = post_json(&app, "/register", json!({
-        "nym": "conc-b",
-        "ct_descriptor": TEST_DESCRIPTOR,
-        "npub": npub_hex,
-        "signature": sig_b,
-    }));
+    let req_a = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "conc-a",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub_hex,
+            "signature": sig_a,
+        }),
+    );
+    let req_b = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "conc-b",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub_hex,
+            "signature": sig_b,
+        }),
+    );
     let ((status_a, body_a), (status_b, body_b)) = tokio::join!(req_a, req_b);
 
-    let success_count = (status_a == StatusCode::CREATED) as u32
-        + (status_b == StatusCode::CREATED) as u32;
+    let success_count =
+        (status_a == StatusCode::CREATED) as u32 + (status_b == StatusCode::CREATED) as u32;
     let quota_count = (body_a["code"] == "NymQuotaExceeded") as u32
         + (body_b["code"] == "NymQuotaExceeded") as u32;
 
@@ -1076,7 +1347,10 @@ async fn register_concurrent_does_not_exceed_cap() {
 
     // DB invariant: exactly cap rows under this npub.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
-        .bind(&npub_hex).fetch_one(&pool).await.unwrap();
+        .bind(&npub_hex)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(count, 3, "lifetime cap must hold under contention");
 
     cleanup_db(&pool).await;

@@ -108,7 +108,10 @@ pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>,
     .await
 }
 
-pub async fn get_inactive_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
+pub async fn get_inactive_user_by_npub(
+    pool: &PgPool,
+    npub: &str,
+) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = FALSE \
@@ -138,10 +141,7 @@ pub async fn mark_user_used<'e, E: sqlx::PgExecutor<'e>>(
 /// Total nyms ever registered under this npub (active + inactive). Used
 /// to enforce `max_lifetime_nyms_per_npub` so one key can't squat the
 /// namespace via dereg/rereg cycles.
-pub async fn count_lifetime_nyms_by_npub(
-    pool: &PgPool,
-    npub: &str,
-) -> Result<i64, sqlx::Error> {
+pub async fn count_lifetime_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
         .bind(npub)
         .fetch_one(pool)
@@ -159,9 +159,12 @@ pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
 ) -> Result<(Option<String>, Vec<PreviousNym>, i64), sqlx::Error> {
-    let row: (Option<String>, Option<sqlx::types::Json<Vec<PreviousNym>>>, Option<i64>) =
-        sqlx::query_as(
-            "SELECT \
+    let row: (
+        Option<String>,
+        Option<sqlx::types::Json<Vec<PreviousNym>>>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT \
                 (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE LIMIT 1) \
                     AS active_nym, \
                 (SELECT json_agg(json_build_object('nym', nym, 'created_at', created_at) \
@@ -169,11 +172,15 @@ pub async fn lookup_status_by_npub(
                    FROM users WHERE npub = $1 AND is_active = FALSE) \
                     AS previous_nyms, \
                 (SELECT COUNT(*) FROM users WHERE npub = $1) AS used",
-        )
-        .bind(npub)
-        .fetch_one(pool)
-        .await?;
-    Ok((row.0, row.1.map(|j| j.0).unwrap_or_default(), row.2.unwrap_or(0)))
+    )
+    .bind(npub)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        row.0,
+        row.1.map(|j| j.0).unwrap_or_default(),
+        row.2.unwrap_or(0),
+    ))
 }
 
 /// Outcome of `register_user_atomic`. Mirrors the three branches of the
@@ -654,10 +661,7 @@ pub async fn update_swap_status(
 /// path.
 ///
 /// Idempotent. Status is not touched here — the row stays claimable.
-pub async fn mark_cooperative_refused(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<(), sqlx::Error> {
+pub async fn mark_cooperative_refused(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE swap_records \
          SET cooperative_refused = TRUE, updated_at = NOW() \
@@ -877,10 +881,7 @@ pub async fn schedule_script_path_retry(pool: &PgPool, id: Uuid) -> Result<u64, 
 /// and zeros out `next_claim_attempt_at` so a hypothetical future
 /// retry (after a reconciler-induced state change) doesn't wait on a
 /// stale schedule.
-pub async fn clear_claim_failure_state(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<(), sqlx::Error> {
+pub async fn clear_claim_failure_state(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE swap_records \
          SET last_claim_error = NULL, \
@@ -899,12 +900,17 @@ pub async fn clear_claim_failure_state(
 /// by the rescue runbook); `<= NOW()` means the backoff window has
 /// elapsed. Both `claim_stuck` and `lockup_refunded` are excluded
 /// implicitly via the IN-list — both are terminal.
+///
+/// Do not filter on `claim_txid IS NULL`: `claim_swap` persists
+/// `(claim_tx_hex, claim_txid)` before first broadcast so a retry can
+/// rebroadcast the exact same transaction. Filtering rows that already
+/// have `claim_txid` strands swaps after a post-construction broadcast
+/// error.
 pub async fn get_ready_to_claim_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, SwapRecord>(&format!(
         "SELECT {SWAP_RECORD_COLUMNS} \
          FROM swap_records \
          WHERE status IN ('lockup_mempool', 'lockup_confirmed', 'claiming', 'claim_failed') \
-           AND claim_txid IS NULL \
            AND (next_claim_attempt_at IS NULL OR next_claim_attempt_at <= NOW()) \
          ORDER BY next_claim_attempt_at NULLS FIRST"
     ))
@@ -959,10 +965,7 @@ pub async fn list_reservations_for_nym(
     .await
 }
 
-pub async fn count_unfulfilled_reservations(
-    pool: &PgPool,
-    nym: &str,
-) -> Result<i64, sqlx::Error> {
+pub async fn count_unfulfilled_reservations(pool: &PgPool, nym: &str) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM outpoint_addresses \
          WHERE nym = $1 AND fulfilled = FALSE",
@@ -1050,10 +1053,7 @@ pub async fn mark_reservation_fulfilled(
 /// this is the first time we've seen `event_id` (caller should do the
 /// work) or `false` if it was already processed (caller short-circuits
 /// to 200 OK without acting).
-pub async fn try_record_webhook_event(
-    pool: &PgPool,
-    event_id: &str,
-) -> Result<bool, sqlx::Error> {
+pub async fn try_record_webhook_event(pool: &PgPool, event_id: &str) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO processed_webhook_events (event_id) VALUES ($1) \
          ON CONFLICT (event_id) DO NOTHING",
@@ -1069,10 +1069,9 @@ pub async fn try_record_webhook_event(
 /// Count rows with `is_active = TRUE` for the registration ceiling check.
 /// Single-shot atomic query; used on the cheap path before signature verify.
 pub async fn count_active_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    let row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
-            .fetch_one(pool)
-            .await?;
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
+        .fetch_one(pool)
+        .await?;
     Ok(row.0)
 }
 
@@ -1222,12 +1221,11 @@ pub async fn list_recently_active_nyms_for_watcher(
 /// logged but not propagated — failing to update activity should never
 /// fail a successful payment-address lookup.
 pub async fn touch_user_callback(pool: &PgPool, nym: &str) {
-    if let Err(e) = sqlx::query(
-        "UPDATE users SET last_callback_at = NOW() WHERE nym = $1 AND is_active = TRUE",
-    )
-    .bind(nym)
-    .execute(pool)
-    .await
+    if let Err(e) =
+        sqlx::query("UPDATE users SET last_callback_at = NOW() WHERE nym = $1 AND is_active = TRUE")
+            .bind(nym)
+            .execute(pool)
+            .await
     {
         tracing::warn!("touch_user_callback: nym={nym} failed: {e}");
     }
@@ -1399,9 +1397,11 @@ pub async fn update_donation_page_image_hash(
                        display_currency, preset_amounts, website, twitter, \
                        instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
-        _ => return Err(sqlx::Error::Protocol(format!(
-            "invalid image kind column: {kind_column}"
-        ))),
+        _ => {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid image kind column: {kind_column}"
+            )))
+        }
     };
     sqlx::query_as::<_, DonationPage>(sql)
         .bind(nym)
@@ -1502,9 +1502,8 @@ where
     .fetch_one(&mut *tx)
     .await?;
     let (ct_descriptor, address_index) = row;
-    let idx_u32 = u32::try_from(address_index).map_err(|_| {
-        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
-    })?;
+    let idx_u32 = u32::try_from(address_index)
+        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
     let address = derive_address(&ct_descriptor, idx_u32)?;
 
     // ON CONFLICT here means there's an existing row for this
@@ -1660,10 +1659,7 @@ pub async fn get_donation_allocation_paid_status(
 /// Recycler: drop donation_allocations rows older than `ttl_days`. Run
 /// periodically from `gc.rs` so abandoned cookies don't keep allocations
 /// alive forever.
-pub async fn prune_donation_allocations(
-    pool: &PgPool,
-    ttl_days: u32,
-) -> Result<u64, sqlx::Error> {
+pub async fn prune_donation_allocations(pool: &PgPool, ttl_days: u32) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "DELETE FROM donation_allocations \
          WHERE last_used_at < NOW() - ($1 || ' days')::interval",
@@ -1848,10 +1844,7 @@ pub async fn insert_invoice(
     .await
 }
 
-pub async fn get_invoice_by_id(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<Option<Invoice>, sqlx::Error> {
+pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as::<_, Invoice>(&format!(
         "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1"
     ))
@@ -2020,10 +2013,7 @@ pub async fn mark_invoice_paid(
 ///
 /// Returns rows_affected: 1 = flip happened; 0 = no-op (already
 /// in_progress, paid, expired, cancelled, or row absent).
-pub async fn mark_invoice_in_progress(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<u64, sqlx::Error> {
+pub async fn mark_invoice_in_progress(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = 'in_progress' \
          WHERE id = $1 AND status = 'unpaid'",
@@ -2039,10 +2029,7 @@ pub async fn mark_invoice_in_progress(
 /// non-unpaid returns 0 rows affected. Caller verifies the Schnorr
 /// signature AND that the invoice's nym maps to the verifying npub
 /// upstream — this fn does not re-check ownership.
-pub async fn cancel_invoice(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<u64, sqlx::Error> {
+pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = 'cancelled', cancelled_at = NOW() \
          WHERE id = $1 AND status = 'unpaid'",
@@ -2064,9 +2051,7 @@ pub async fn cancel_invoice(
 /// outer expiry we want the row out of the active corpus regardless of
 /// its mempool stage. Backed by the partial index
 /// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
-pub async fn expire_invoices_past_deadline(
-    pool: &PgPool,
-) -> Result<u64, sqlx::Error> {
+pub async fn expire_invoices_past_deadline(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = 'expired' \
          WHERE status IN ('unpaid', 'in_progress') AND expires_at < NOW()",
@@ -2139,12 +2124,11 @@ where
     // next_addr_idx. Unlinked invoices (nym_owner IS NULL) cannot use
     // this descriptor-allocator path — the caller must wallet-supply
     // the address at insert time.
-    let nym: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT nym_owner FROM invoices WHERE id = $1 FOR UPDATE",
-    )
-    .bind(invoice_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let nym: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT nym_owner FROM invoices WHERE id = $1 FOR UPDATE")
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let Some((Some(nym),)) = nym else {
         return Ok(None);
     };
@@ -2179,9 +2163,8 @@ where
     let Some((ct_descriptor, address_index)) = row else {
         return Ok(None);
     };
-    let idx_u32 = u32::try_from(address_index).map_err(|_| {
-        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
-    })?;
+    let idx_u32 = u32::try_from(address_index)
+        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
     let address = derive_address(&ct_descriptor, idx_u32)?;
 
     sqlx::query(
@@ -2243,9 +2226,8 @@ where
     let Some((ct_descriptor, address_index)) = row else {
         return Ok(None);
     };
-    let idx_u32 = u32::try_from(address_index).map_err(|_| {
-        sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
-    })?;
+    let idx_u32 = u32::try_from(address_index)
+        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
     let address = derive_address(&ct_descriptor, idx_u32)?;
 
     tx.commit().await?;

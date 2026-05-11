@@ -31,8 +31,7 @@ impl IpWhitelist {
             let net = if s.contains('/') {
                 IpNet::from_str(s).map_err(|e| format!("invalid CIDR {s:?}: {e}"))?
             } else {
-                let addr = IpAddr::from_str(s)
-                    .map_err(|e| format!("invalid IP {s:?}: {e}"))?;
+                let addr = IpAddr::from_str(s).map_err(|e| format!("invalid IP {s:?}: {e}"))?;
                 IpNet::from(addr)
             };
             nets.push(net);
@@ -67,13 +66,7 @@ pub fn source_key(ip: IpAddr) -> String {
             // /56 = first 7 octets verbatim, 8th masked to 0.
             format!(
                 "v6:/56:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}00::",
-                octets[0],
-                octets[1],
-                octets[2],
-                octets[3],
-                octets[4],
-                octets[5],
-                octets[6]
+                octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6]
             )
         }
     }

@@ -9,7 +9,11 @@ pub const LA_AUTH_TS_WINDOW_SECS: u64 = 300;
 
 pub const LA_SIG_DOMAIN_TAG: &[u8] = b"bullpay-la-v2";
 
-pub fn verify_signature(npub_hex: &str, message: &[u8], signature_hex: &str) -> Result<(), AppError> {
+pub fn verify_signature(
+    npub_hex: &str,
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<(), AppError> {
     let secp = Secp256k1::verification_only();
 
     let pubkey = XOnlyPublicKey::from_str(npub_hex)
@@ -40,8 +44,12 @@ pub fn build_la_v2_message(
 ) -> Vec<u8> {
     let extra_field_bytes: usize = payload_fields.iter().map(|f| f.len() + 1).sum();
     let mut msg = Vec::with_capacity(
-        LA_SIG_DOMAIN_TAG.len() + action.len() + npub_hex.len() + nym_or_empty.len()
-            + extra_field_bytes + 32,
+        LA_SIG_DOMAIN_TAG.len()
+            + action.len()
+            + npub_hex.len()
+            + nym_or_empty.len()
+            + extra_field_bytes
+            + 32,
     );
     msg.extend_from_slice(LA_SIG_DOMAIN_TAG);
     msg.push(0);
@@ -65,7 +73,9 @@ pub fn check_ts_freshness(ts: u64) -> Result<(), AppError> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if now.abs_diff(ts) > LA_AUTH_TS_WINDOW_SECS {
-        return Err(AppError::AuthError("timestamp outside allowed window".into()));
+        return Err(AppError::AuthError(
+            "timestamp outside allowed window".into(),
+        ));
     }
     Ok(())
 }
@@ -160,13 +170,7 @@ mod tests {
     fn v2_message_format_is_nul_separated_and_domain_tagged() {
         // register: nym='alice', payload=[ct_descriptor]. NUL count:
         //   domain\0 action\0 npub\0 nym\0 ct\0 -> 5 NULs before timestamp.
-        let msg = build_la_v2_message(
-            "register",
-            "abcd",
-            "alice",
-            &["ct(...)"],
-            1700000000,
-        );
+        let msg = build_la_v2_message("register", "abcd", "alice", &["ct(...)"], 1700000000);
         assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 5);
         assert!(msg.starts_with(LA_SIG_DOMAIN_TAG));
 
@@ -180,13 +184,7 @@ mod tests {
     fn v2_empty_nym_is_first_class() {
         // invoice-create with empty nym (unlinked invoice):
         //   domain\0 action\0 npub\0 \0 amount\0 -> 5 NULs before timestamp.
-        let msg = build_la_v2_message(
-            "invoice-create",
-            "abcd",
-            "",
-            &["100000"],
-            1700000000,
-        );
+        let msg = build_la_v2_message("invoice-create", "abcd", "", &["100000"], 1700000000);
         assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 5);
         // The empty-nym slot MUST be present (two consecutive NULs after npub).
         let domain_end = LA_SIG_DOMAIN_TAG.len();

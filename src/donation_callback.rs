@@ -154,8 +154,7 @@ async fn callback_lightning(
         }
     }
 
-    let (lnurl_resp, swap_id) =
-        lnurl::create_lightning_swap(state, nym, amount_sat).await?;
+    let (lnurl_resp, swap_id) = lnurl::create_lightning_swap(state, nym, amount_sat).await?;
 
     let resp = LightningCallback {
         pr: lnurl_resp.pr,
@@ -176,7 +175,10 @@ async fn callback_liquid(
     // Read or assign the device_id cookie. Phase 2's `donation_render`
     // already sets this on first page load, but assign here too in case
     // the donator hit the callback URL without going through the page.
-    let device_id = match cookies.get(COOKIE_NAME).and_then(|c| Uuid::from_str(c.value()).ok()) {
+    let device_id = match cookies
+        .get(COOKIE_NAME)
+        .and_then(|c| Uuid::from_str(c.value()).ok())
+    {
         Some(id) => id,
         None => {
             let id = Uuid::new_v4();
@@ -192,9 +194,7 @@ async fn callback_liquid(
         }
     };
 
-    let src_key = ip
-        .map(source_key)
-        .unwrap_or_else(|| "unknown".to_string());
+    let src_key = ip.map(source_key).unwrap_or_else(|| "unknown".to_string());
 
     // Cookie HIT vs MISS pre-probe. The per-source distinct-allocations
     // gate exists to bound FRESH allocations only — refreshing the page
@@ -242,9 +242,8 @@ async fn callback_liquid(
         device_id,
         state.config.rate_limit.donation_allocation_ttl_days,
         |descriptor_str, idx| {
-            descriptor::derive_address(descriptor_str, idx).map_err(|e| {
-                sqlx::Error::Protocol(format!("address derivation failed: {e}"))
-            })
+            descriptor::derive_address(descriptor_str, idx)
+                .map_err(|e| sqlx::Error::Protocol(format!("address derivation failed: {e}")))
         },
     )
     .await?;
@@ -346,11 +345,9 @@ fn map_lightning_status(swap_status: &str) -> DonationState {
         // the merchant to claim. From the donator's perspective, their
         // payment is complete — what happens between Boltz and the
         // merchant's claim is not the donator's concern.
-        "lockup_mempool"
-        | "lockup_confirmed"
-        | "claiming"
-        | "claimed"
-        | "claim_failed" => DonationState::Paid,
+        "lockup_mempool" | "lockup_confirmed" | "claiming" | "claimed" | "claim_failed" => {
+            DonationState::Paid
+        }
         // Invoice expired without donator payment.
         "expired" => DonationState::Expired,
         // Unknown or future status: report Waiting. Conservative.
@@ -442,9 +439,6 @@ mod tests {
             map_lightning_status("cancelled"),
             DonationState::Waiting
         ));
-        assert!(matches!(
-            map_lightning_status(""),
-            DonationState::Waiting
-        ));
+        assert!(matches!(map_lightning_status(""), DonationState::Waiting));
     }
 }

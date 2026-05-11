@@ -242,7 +242,10 @@ async fn poll_invoice_addresses(
     } else {
         tracing::debug!(
             "chain_watcher: {} invoice address scan {} addrs, {} hits, {}ms",
-            tier, n_total, hits, elapsed_ms
+            tier,
+            n_total,
+            hits,
+            elapsed_ms
         );
     }
 }
@@ -315,13 +318,8 @@ async fn poll_nyms(
             };
             match backend.has_history(&script).await {
                 Ok(true) => {
-                    let marked = db::mark_invoice_paid(
-                        pool,
-                        *invoice_id,
-                        *amount_sat,
-                        "liquid",
-                    )
-                    .await?;
+                    let marked =
+                        db::mark_invoice_paid(pool, *invoice_id, *amount_sat, "liquid").await?;
                     if marked > 0 {
                         tracing::info!(
                             event = "invoice_paid_observed",
@@ -433,7 +431,9 @@ async fn poll_nyms(
     let elapsed_ms = started.elapsed().as_millis();
     tracing::debug!(
         "chain_watcher: {} tick scanned {} nyms in {}ms",
-        tier, n_total, elapsed_ms
+        tier,
+        n_total,
+        elapsed_ms
     );
     Ok(())
 }

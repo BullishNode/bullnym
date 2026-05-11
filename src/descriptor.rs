@@ -32,7 +32,10 @@ mod tests {
     #[test]
     fn derive_valid_address() {
         let addr = derive_address(TEST_CT_DESC, 0).expect("descriptor must parse");
-        assert!(addr.starts_with("lq1qq"), "expected confidential address, got {addr}");
+        assert!(
+            addr.starts_with("lq1qq"),
+            "expected confidential address, got {addr}"
+        );
     }
 
     #[test]

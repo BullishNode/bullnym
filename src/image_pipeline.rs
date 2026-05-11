@@ -363,10 +363,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_parent_and_renames() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pay-service-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("pay-service-test-{}", uuid::Uuid::new_v4()));
         let target = tmp.join("alice").join("avatar.webp");
         atomic_write(&target, b"hello").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"hello");
