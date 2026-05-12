@@ -18,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
 
 use crate::db;
-use crate::donation_page::SUPPORTED_CURRENCIES;
 use crate::ip_whitelist;
+use crate::pricer::CurrencyView;
 use crate::reserved_nyms;
 use crate::AppState;
 
@@ -43,7 +43,7 @@ struct DonationPageTpl<'a> {
     /// All currencies the server supports for fiat-denominated invoices.
     /// Rendered as `<option>` entries on the unit dropdown so the sender
     /// is not constrained to the merchant's display preference.
-    supported_currencies: &'static [&'static str],
+    supported_currencies: Vec<CurrencyView>,
 }
 
 #[derive(Template)]
@@ -165,6 +165,8 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
         None => (0, false),
     };
 
+    let supported_currencies = state.pricer.supported_currencies().to_vec();
+
     let body = DonationPageTpl {
         nym: &page.nym,
         header: &page.header,
@@ -178,7 +180,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
         instagram: page.instagram.as_deref(),
         minor_per_btc,
         last_known_rate,
-        supported_currencies: SUPPORTED_CURRENCIES,
+        supported_currencies,
     }
     .render()
     .unwrap_or_else(|e| format!("template render failed: {e}"));

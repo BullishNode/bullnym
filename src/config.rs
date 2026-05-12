@@ -170,6 +170,12 @@ pub struct PricerConfig {
     /// cached rate (if any).
     #[serde(default = "default_pricer_request_timeout_ms")]
     pub request_timeout_ms: u64,
+    /// Fiat currencies the server will expose to clients and accept for
+    /// invoice creation. Keep this list aligned with the configured pricer
+    /// backend; unsupported submitted currencies are rejected before any
+    /// upstream pricing request is attempted.
+    #[serde(default = "default_pricer_supported_currencies")]
+    pub supported_currencies: Vec<String>,
 }
 
 impl Default for PricerConfig {
@@ -178,6 +184,7 @@ impl Default for PricerConfig {
             url: DEFAULT_PRICER_URL.to_string(),
             cache_ttl_secs: DEFAULT_PRICER_CACHE_TTL_SECS,
             request_timeout_ms: DEFAULT_PRICER_REQUEST_TIMEOUT_MS,
+            supported_currencies: default_pricer_supported_currencies(),
         }
     }
 }
@@ -190,6 +197,12 @@ fn default_pricer_cache_ttl_secs() -> u64 {
 }
 fn default_pricer_request_timeout_ms() -> u64 {
     DEFAULT_PRICER_REQUEST_TIMEOUT_MS
+}
+fn default_pricer_supported_currencies() -> Vec<String> {
+    ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 // --- Donation page (Phase 3 image pipeline) ---

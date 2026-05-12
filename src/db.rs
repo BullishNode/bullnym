@@ -1691,8 +1691,8 @@ pub async fn get_donation_page_by_nym(
 // Unified payment-intent abstraction. `origin` discriminates two creation
 // flows: 'checkout' (anonymous browser, server-rate-limited per source) and
 // 'wallet' (recipient's mobile, Schnorr-signed). Lightning offers attach
-// 1:N via `swap_records.invoice_id`; Liquid offer is 1:1, lazy-allocated
-// on first rail toggle.
+// 1:N via `swap_records.invoice_id`; Liquid offer is 1:1 and present at
+// invoice creation for flows that accept Liquid or Lightning.
 //
 // Timestamp columns are NOT read into Rust structs as DateTime values —
 // the workspace deliberately avoids the chrono/time sqlx feature flag.

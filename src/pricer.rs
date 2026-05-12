@@ -49,6 +49,7 @@ pub struct PricerClient {
     cfg: PricerConfig,
     http: reqwest::Client,
     cache: Arc<DashMap<String, CachedRate>>,
+    supported_currencies: Arc<Vec<CurrencyView>>,
 }
 
 /// Sanity bounds on a freshly-fetched rate. Rejects garbage upstream
@@ -69,6 +70,7 @@ impl PricerClient {
         if !lower.starts_with("http://") && !lower.starts_with("https://") {
             return Err(PricerInitError::BadScheme(cfg.url.clone()));
         }
+        let supported_currencies = normalize_supported_currencies(&cfg.supported_currencies);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .build()
@@ -77,7 +79,19 @@ impl PricerClient {
             cfg,
             http,
             cache: Arc::new(DashMap::new()),
+            supported_currencies: Arc::new(supported_currencies),
         })
+    }
+
+    /// Server-authoritative currency list for mobile and public donation
+    /// pages. The same list gates invoice creation before pricer calls.
+    pub fn supported_currencies(&self) -> &[CurrencyView] {
+        self.supported_currencies.as_slice()
+    }
+
+    pub fn is_supported_currency(&self, currency: &str) -> bool {
+        let currency = normalize_currency_code(currency);
+        self.supported_currencies.iter().any(|c| c.code == currency)
     }
 
     /// Fetch a fresh rate for `currency` (e.g. "USD"), or return the cached
@@ -85,7 +99,7 @@ impl PricerClient {
     /// non-empty cache, returns the stale rate with `last_known_rate=true`.
     /// On upstream error and empty cache, returns `None`.
     pub async fn get_rate(&self, currency: &str) -> Option<RateView> {
-        let currency = currency.to_uppercase();
+        let currency = normalize_currency_code(currency);
 
         // Fast path: cached and within TTL.
         if let Some(entry) = self.cache.get(&currency) {
@@ -195,6 +209,53 @@ impl PricerClient {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrencyView {
+    pub code: String,
+    pub precision: u8,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SupportedCurrenciesResponse {
+    pub currencies: Vec<CurrencyView>,
+}
+
+pub async fn supported_currencies(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> axum::Json<SupportedCurrenciesResponse> {
+    axum::Json(SupportedCurrenciesResponse {
+        currencies: state.pricer.supported_currencies().to_vec(),
+    })
+}
+
+pub fn normalize_currency_code(currency: &str) -> String {
+    currency.trim().to_uppercase()
+}
+
+pub fn currency_precision(currency: &str) -> u8 {
+    match normalize_currency_code(currency).as_str() {
+        "COP" => 0,
+        _ => 2,
+    }
+}
+
+fn normalize_supported_currencies(currencies: &[String]) -> Vec<CurrencyView> {
+    let mut codes: Vec<String> = currencies
+        .iter()
+        .map(|c| normalize_currency_code(c))
+        .filter(|c| !c.is_empty())
+        .collect();
+    codes.sort();
+    codes.dedup();
+    codes
+        .into_iter()
+        .map(|code| CurrencyView {
+            precision: currency_precision(&code),
+            code,
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub enum PricerInitError {
     BadScheme(String),
@@ -275,6 +336,31 @@ impl std::error::Error for PricerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_currencies_are_normalized_and_deduped() {
+        let currencies = vec![
+            "usd".to_string(),
+            " USD ".to_string(),
+            "cop".to_string(),
+            "".to_string(),
+        ];
+        let normalized = normalize_supported_currencies(&currencies);
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|c| c.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["COP", "USD"]
+        );
+        assert_eq!(normalized[0].precision, 0);
+        assert_eq!(normalized[1].precision, 2);
+    }
+
+    #[test]
+    fn currency_code_normalization_trims_and_uppercases() {
+        assert_eq!(normalize_currency_code(" usd "), "USD");
+    }
 
     #[test]
     fn rate_view_serializes_with_expected_fields() {

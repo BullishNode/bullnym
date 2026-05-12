@@ -47,6 +47,7 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::pricer;
 use crate::validators;
 use crate::AppState;
 
@@ -295,6 +296,9 @@ pub struct CreateAnonymousRequest {
 #[derive(Serialize)]
 pub struct CreateInvoiceResponse {
     pub invoice_id: Uuid,
+    pub lightning_pr: String,
+    pub liquid_address: String,
+    pub expires_at_unix: i64,
 }
 
 pub async fn create_anonymous(
@@ -384,24 +388,31 @@ pub async fn create_anonymous(
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    if let Err(e) = create_lightning_offer(&state, &nym, amount_sat as u64, &invoice).await {
-        tracing::error!(
-            invoice_id = %invoice.id,
-            "eager Lightning offer creation failed; checkout invoice will not be returned: {e}",
-        );
-        if let Err(cleanup_err) =
-            db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
-        {
+    let lightning_pr = match create_lightning_offer(&state, &nym, amount_sat as u64, &invoice).await
+    {
+        Ok(pr) => pr,
+        Err(e) => {
             tracing::error!(
                 invoice_id = %invoice.id,
-                "failed to clean up checkout invoice after Boltz creation failure: {cleanup_err}",
+                "eager Lightning offer creation failed; checkout invoice will not be returned: {e}",
             );
+            if let Err(cleanup_err) =
+                db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
+            {
+                tracing::error!(
+                    invoice_id = %invoice.id,
+                    "failed to clean up checkout invoice after Boltz creation failure: {cleanup_err}",
+                );
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
 
     Ok(Json(CreateInvoiceResponse {
         invoice_id: invoice.id,
+        lightning_pr,
+        liquid_address,
+        expires_at_unix: invoice.expires_at_unix,
     }))
 }
 
@@ -448,6 +459,12 @@ async fn parse_create_request(
         .fiat_currency
         .as_deref()
         .ok_or_else(|| AppError::InvalidAmount("missing fiat_currency".into()))?;
+    let currency = pricer::normalize_currency_code(currency);
+    if !state.pricer.is_supported_currency(&currency) {
+        return Err(AppError::InvalidAmount(format!(
+            "unsupported fiat_currency {currency}; fetch /api/v1/supported-currencies"
+        )));
+    }
     if minor <= 0 {
         return Err(AppError::InvalidAmount(
             "fiat_amount_minor must be > 0".into(),
@@ -460,7 +477,7 @@ async fn parse_create_request(
         )));
     }
 
-    let rate = state.pricer.get_rate(currency).await.ok_or_else(|| {
+    let rate = state.pricer.get_rate(&currency).await.ok_or_else(|| {
         AppError::ServiceUnavailable("pricer unavailable for invoice creation".into())
     })?;
     if rate.last_known_rate {
@@ -488,10 +505,7 @@ async fn parse_create_request(
         )));
     }
 
-    Ok((
-        amount_sat,
-        Some((minor, currency.to_uppercase(), rate.minor_per_btc)),
-    ))
+    Ok((amount_sat, Some((minor, currency, rate.minor_per_btc))))
 }
 
 // =====================================================================
@@ -525,15 +539,8 @@ struct InvoicePaymentTpl<'a> {
     liquid_address: Option<&'a str>,
 }
 
-fn currency_precision(currency: &str) -> u8 {
-    match currency {
-        "COP" => 0,
-        _ => 2,
-    }
-}
-
 fn format_fiat_major(minor: i32, currency: &str) -> String {
-    let p = currency_precision(currency);
+    let p = pricer::currency_precision(currency);
     if p == 0 {
         format!("{minor} {currency}")
     } else {
@@ -836,13 +843,11 @@ async fn ensure_reusable_lightning_offer(
     }
 
     let nym = lightning_swap_nym(&state.db, inv).await?;
-    create_lightning_offer(state, &nym, inv.amount_sat as u64, inv).await?;
-
-    let pr = db::latest_lightning_pr_for_invoice(&state.db, inv.id)
-        .await?
-        .ok_or_else(|| AppError::BoltzError("swap created but no BOLT11 row found".into()))?;
+    let pr = create_lightning_offer(state, &nym, inv.amount_sat as u64, inv).await?;
     Ok(Some(pr))
 }
+
+const BOLT11_REFRESH_MARGIN_SECS: u64 = 120;
 
 fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
     let Ok(now) = u64::try_from(now_unix) else {
@@ -851,7 +856,8 @@ fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
     let Ok(invoice) = Bolt11Invoice::from_str(pr) else {
         return false;
     };
-    !invoice.would_expire(Duration::from_secs(now))
+    let now_with_margin = now.saturating_add(BOLT11_REFRESH_MARGIN_SECS);
+    !invoice.would_expire(Duration::from_secs(now_with_margin))
 }
 
 /// Resolve the nym to attribute on the swap_records row for `invoice`.
@@ -885,7 +891,7 @@ async fn create_lightning_offer(
     swap_nym: &str,
     amount_sat: u64,
     invoice: &db::Invoice,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
@@ -904,6 +910,7 @@ async fn create_lightning_offer(
         .create_reverse_swap(swap_key_index, amount_sat, &description_hash_hex)
         .await?;
 
+    let lightning_pr = result.invoice.clone();
     let preimage_hex = hex::encode(&result.preimage);
     let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
     let boltz_response_json = serde_json::to_string(&result.boltz_response)
@@ -925,7 +932,7 @@ async fn create_lightning_offer(
             address: None,
             address_index: None,
             amount_sat,
-            invoice: &result.invoice,
+            invoice: &lightning_pr,
             preimage_hex: &preimage_hex,
             claim_key_hex: &claim_key_hex,
             boltz_response_json: &boltz_response_json,
@@ -936,7 +943,7 @@ async fn create_lightning_offer(
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
 
     db::touch_user_callback(&state.db, swap_nym).await;
-    Ok(())
+    Ok(lightning_pr)
 }
 
 // =====================================================================
@@ -1662,7 +1669,8 @@ mod tests {
         // after expiry, independently of the merchant invoice lifetime.
         let pr = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
 
-        assert!(bolt11_is_reusable_at(pr, 1_496_314_658 + 3_599));
+        assert!(bolt11_is_reusable_at(pr, 1_496_314_658 + 3_479));
+        assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_481));
         assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_601));
         assert!(!bolt11_is_reusable_at("not-a-bolt11", 1_496_314_658));
     }

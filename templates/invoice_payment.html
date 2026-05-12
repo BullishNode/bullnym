@@ -177,10 +177,8 @@
             {% when None %}
         {% endmatch %}
 
-        {# Accepted-rails badge + per-rail addresses for wallet-origin
-           invoices. Donation-page checkout invoices expose Lightning only;
-           wallet-origin invoices may expose any combination of BTC,
-           Lightning, and direct Liquid. #}
+        {# Accepted-rails badge. The QR/copy card below reveals only the
+           currently selected rail, defaulting to Lightning when available. #}
         {% if status == "unpaid" || status == "in_progress" %}
             <div class="meta">
                 Accepted:
@@ -188,14 +186,6 @@
                 {% if accept_ln %}<span>Lightning</span>{% endif %}
                 {% if accept_liquid %}<span>Liquid</span>{% endif %}
             </div>
-            {% match bitcoin_address %}
-                {% when Some with (a) %}<div class="meta">BTC: <code>{{ a }}</code></div>
-                {% when None %}
-            {% endmatch %}
-            {% match liquid_address %}
-                {% when Some with (a) %}<div class="meta">Liquid: <code>{{ a }}</code></div>
-                {% when None %}
-            {% endmatch %}
         {% endif %}
 
         <div class="card" id="root" data-status="{{ status }}">

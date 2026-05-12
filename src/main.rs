@@ -265,6 +265,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/register/lookup", get(registration::lookup_by_npub))
         .route(
+            "/api/v1/supported-currencies",
+            get(pricer::supported_currencies),
+        )
+        .route(
             "/api/reservations/:nym",
             get(registration::list_reservations),
         )

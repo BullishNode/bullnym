@@ -26,6 +26,7 @@ use crate::db;
 use crate::error::AppError;
 use crate::image_pipeline::{self, ImageKind, PipelineConfig};
 use crate::ip_whitelist;
+use crate::pricer::{normalize_currency_code, PricerClient};
 use crate::AppState;
 
 // --- Action names ---
@@ -42,8 +43,6 @@ const MAX_HEADER_LEN: usize = 80;
 const MAX_DESCRIPTION_LEN: usize = 280;
 const MAX_SOCIAL_LINK_LEN: usize = 200;
 const MAX_SOCIAL_HANDLE_LEN: usize = 50;
-
-pub const SUPPORTED_CURRENCIES: &[&str] = &["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"];
 
 static TWITTER_HANDLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_]{1,50}$").unwrap());
@@ -117,7 +116,7 @@ impl DonationPageView {
 
 // --- Validation helpers ---
 
-fn validate_lengths(req: &SaveDonationPageRequest) -> Result<(), AppError> {
+fn validate_lengths(req: &SaveDonationPageRequest, pricer: &PricerClient) -> Result<(), AppError> {
     if req.header.is_empty() || req.header.len() > MAX_HEADER_LEN {
         return Err(AppError::DonationPageInvalid(format!(
             "header must be 1..={MAX_HEADER_LEN} chars"
@@ -128,9 +127,15 @@ fn validate_lengths(req: &SaveDonationPageRequest) -> Result<(), AppError> {
             "description must be 1..={MAX_DESCRIPTION_LEN} chars"
         )));
     }
-    if !SUPPORTED_CURRENCIES.contains(&req.display_currency.as_str()) {
+    let normalized_currency = normalize_currency_code(&req.display_currency);
+    if req.display_currency != normalized_currency {
+        return Err(AppError::DonationPageInvalid(
+            "display_currency must be a canonical uppercase ISO 4217 code".to_string(),
+        ));
+    }
+    if !pricer.is_supported_currency(&req.display_currency) {
         return Err(AppError::DonationPageInvalid(format!(
-            "display_currency must be one of {SUPPORTED_CURRENCIES:?}"
+            "display_currency is not supported; fetch /api/v1/supported-currencies"
         )));
     }
     if let Some(w) = &req.website {
@@ -237,7 +242,7 @@ pub async fn save(
     }
 
     // Cheap input validation BEFORE signature verification.
-    validate_lengths(&req)?;
+    validate_lengths(&req, &state.pricer)?;
 
     // Build the v1 payload and verify the Schnorr sig. The exact byte
     // sequence here MUST match the mobile's signing helper.
@@ -702,44 +707,55 @@ mod tests {
         }
     }
 
+    fn test_pricer() -> PricerClient {
+        PricerClient::new(Default::default()).unwrap()
+    }
+
     #[test]
     fn validates_minimal_request() {
-        assert!(validate_lengths(&make_req()).is_ok());
+        assert!(validate_lengths(&make_req(), &test_pricer()).is_ok());
     }
 
     #[test]
     fn rejects_empty_header() {
         let mut req = make_req();
         req.header = String::new();
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 
     #[test]
     fn rejects_long_header() {
         let mut req = make_req();
         req.header = "a".repeat(MAX_HEADER_LEN + 1);
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 
     #[test]
     fn rejects_long_description() {
         let mut req = make_req();
         req.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 
     #[test]
     fn rejects_unknown_currency() {
         let mut req = make_req();
         req.display_currency = "BTC".to_string();
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
+    }
+
+    #[test]
+    fn rejects_non_canonical_currency() {
+        let mut req = make_req();
+        req.display_currency = "usd".to_string();
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 
     #[test]
     fn rejects_non_https_website() {
         let mut req = make_req();
         req.website = Some("http://insecure.example".to_string());
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 
     #[test]
@@ -748,13 +764,13 @@ mod tests {
         req.website = None;
         req.twitter = None;
         req.instagram = None;
-        assert!(validate_lengths(&req).is_ok());
+        assert!(validate_lengths(&req, &test_pricer()).is_ok());
     }
 
     #[test]
     fn rejects_bad_twitter_handle() {
         let mut req = make_req();
         req.twitter = Some("has space".to_string());
-        assert!(validate_lengths(&req).is_err());
+        assert!(validate_lengths(&req, &test_pricer()).is_err());
     }
 }

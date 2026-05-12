@@ -19,8 +19,8 @@
 -- settlement on a stale BOLT11 still flips the invoice (lenient policy:
 -- under/overpaid status reflects the rate mismatch).
 --
--- Liquid offer is 1:1 — one address per invoice, allocated lazily on
--- first rail toggle.
+-- Liquid offer is 1:1 — one address per invoice, present at invoice
+-- creation for flows that accept Liquid or Lightning.
 --
 -- This migration also folds donation_allocations into invoices.liquid_address
 -- (DROP at the bottom). All call sites moving to invoices in the same Phase
@@ -64,7 +64,8 @@ CREATE TABLE invoices (
     recipient_label      TEXT         CHECK (recipient_label IS NULL
                                               OR length(recipient_label) <= 100),
 
-    -- Liquid offer (lazy-allocated; NULL until the sender toggles to Liquid).
+    -- Liquid offer. Present at invoice creation for flows that accept
+    -- Liquid or Lightning; NULL for invoices that do not use either rail.
     liquid_address       TEXT,
     liquid_address_index INTEGER,
 
