@@ -13,8 +13,10 @@ use uuid::Uuid;
 use lwk_wollet::elements;
 
 use boltz_client::network::electrum::ElectrumLiquidClient;
-use boltz_client::network::{Chain, LiquidChain};
-use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateReverseResponse};
+use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
+use boltz_client::swaps::boltz::{
+    BoltzApiClientV2, CreateChainResponse, CreateReverseResponse, Side,
+};
 use boltz_client::swaps::{
     BtcLikeTransaction, ChainClient, SwapScript, SwapTransactionParams, TransactionOptions,
 };
@@ -23,7 +25,7 @@ use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
 use crate::config::Config;
-use crate::db::{self, SwapStatus};
+use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::invoice;
@@ -194,6 +196,14 @@ async fn dispatch_webhook(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
     else {
+        if let Some(chain_swap) = db::get_chain_swap_by_boltz_id(&state.db, &data.id)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?
+        {
+            handle_chain_swap_webhook(&state, &chain_swap, &data.status).await?;
+            return Ok("ok");
+        }
+
         // Unknown swap_id is not an error condition for Boltz to retry —
         // either we never created the swap here, or the row was purged.
         // Returning 200 stops the (5×60s) retry storm. PR #4 hardens
@@ -220,27 +230,15 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Get-paid Step 9: mempool sighting → invoice `in_progress`
-            // (early signal that the donator's HTLC has been routed).
-            // Confirmed sighting → invoice `paid` (settlement). Both
-            // helpers are idempotent + error-swallowing per their
-            // contracts; the swap CAS has already committed above.
-            if is_mempool {
-                invoice::flip_invoice_on_lightning_in_progress(
-                    &state.db,
-                    swap.invoice_id,
-                    &swap.boltz_swap_id,
-                )
-                .await;
-            } else {
-                invoice::flip_invoice_on_lightning_settlement(
-                    &state.db,
-                    swap.invoice_id,
-                    swap.amount_sat,
-                    &swap.boltz_swap_id,
-                )
-                .await;
-            }
+            // Lockup sightings are only payment evidence. They may show
+            // the public page as "payment detected", but accounting is
+            // recorded only after our claim succeeds below.
+            invoice::flip_invoice_on_lightning_in_progress(
+                &state.db,
+                swap.invoice_id,
+                &swap.boltz_swap_id,
+            )
+            .await;
 
             try_claim_with_retry(
                 &state.db,
@@ -249,6 +247,7 @@ async fn dispatch_webhook(
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
+                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
             )
             .await;
         }
@@ -318,24 +317,19 @@ async fn dispatch_webhook(
             tracing::error!(
                 event = "swap_lockup_refunded",
                 swap_id = %data.id,
-                nym = %swap.nym,
+                nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                 amount_sat = swap.amount_sat,
                 "FUND LOSS: boltz refunded lockup; user paid LN side, no on-chain claim"
             );
             db::update_swap_status(&state.db, swap.id, SwapStatus::LockupRefunded, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
+            db::mark_invoice_settlement_status(&state.db, swap.invoice_id, "refunded")
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Phase B step 7: paid-equivalent — donator paid the LN
-            // side. The merchant fund-loss is tracked by the
-            // `swap_lockup_refunded` P0 alert (above), NOT invoice state.
-            invoice::flip_invoice_on_lightning_settlement(
-                &state.db,
-                swap.invoice_id,
-                swap.amount_sat,
-                &swap.boltz_swap_id,
-            )
-            .await;
+            // Do not record an invoice payment event here. A refunded
+            // lockup means the merchant-side claim did not settle.
         }
         _ => {
             // Other Boltz statuses (`swap.created`, `minerfee.paid`, etc.)
@@ -347,6 +341,126 @@ async fn dispatch_webhook(
     }
 
     Ok("ok")
+}
+
+async fn handle_chain_swap_webhook(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+) -> Result<(), AppError> {
+    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    if status.is_terminal() {
+        tracing::debug!(
+            "ignoring webhook for terminal chain swap {} ({})",
+            swap.boltz_swap_id,
+            swap.status
+        );
+        return Ok(());
+    }
+
+    let next = match boltz_status {
+        "swap.created" => return Ok(()),
+        "transaction.mempool" => ChainSwapStatus::UserLockMempool,
+        "transaction.confirmed" => ChainSwapStatus::UserLockConfirmed,
+        "transaction.server.mempool" => ChainSwapStatus::ServerLockMempool,
+        "transaction.server.confirmed" => ChainSwapStatus::ServerLockConfirmed,
+        "transaction.claimed" => ChainSwapStatus::Claimed,
+        "swap.expired" => ChainSwapStatus::Expired,
+        "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
+            ChainSwapStatus::LockupFailed
+        }
+        "transaction.refunded" => ChainSwapStatus::Refunded,
+        _ => {
+            tracing::debug!(
+                "ignoring chain-swap webhook status: {} for {}",
+                boltz_status,
+                swap.boltz_swap_id
+            );
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        event = "chain_swap_webhook",
+        swap_id = %swap.boltz_swap_id,
+        from = %swap.status,
+        to = %next,
+        boltz_status,
+        "chain swap status advanced from Boltz webhook"
+    );
+
+    db::update_chain_swap_status(&state.db, swap.id, next, None)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    if matches!(
+        next,
+        ChainSwapStatus::UserLockMempool
+            | ChainSwapStatus::UserLockConfirmed
+            | ChainSwapStatus::ServerLockMempool
+            | ChainSwapStatus::ServerLockConfirmed
+    ) {
+        invoice::flip_invoice_on_bitcoin_boltz_in_progress(
+            &state.db,
+            Some(swap.invoice_id),
+            &swap.boltz_swap_id,
+        )
+        .await;
+    }
+
+    if matches!(
+        next,
+        ChainSwapStatus::ServerLockMempool | ChainSwapStatus::ServerLockConfirmed
+    ) {
+        try_claim_chain_swap_with_retry(
+            &state.db,
+            swap,
+            &state.config.boltz.electrum_url,
+            &state.config.boltz.api_url,
+            state.config.claim.max_claim_attempts,
+            state.utxo_backend.as_ref(),
+            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn try_claim_chain_swap_with_retry(
+    pool: &sqlx::PgPool,
+    swap: &db::ChainSwapRecord,
+    electrum_url: &str,
+    boltz_url: &str,
+    max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
+) {
+    match claim_chain_swap(
+        pool,
+        swap.id,
+        electrum_url,
+        boltz_url,
+        max_claim_attempts,
+        utxo_backend,
+        tolerances,
+    )
+    .await
+    {
+        Ok(ClaimOutcome::Broadcast) => {}
+        Ok(ClaimOutcome::AlreadyTerminal) => {}
+        Ok(ClaimOutcome::SkippedLockHeld) => {
+            tracing::debug!(
+                "webhook chain-swap claim skipped (lock held) for swap {}",
+                swap.boltz_swap_id
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "webhook chain-swap claim attempt failed for {}: {e}",
+                swap.boltz_swap_id
+            );
+        }
+    }
 }
 
 /// Outcome of a single `claim_swap` invocation.
@@ -381,6 +495,7 @@ async fn try_claim_with_retry(
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) {
     match claim_swap(
         pool,
@@ -389,6 +504,7 @@ async fn try_claim_with_retry(
         boltz_url,
         max_claim_attempts,
         utxo_backend,
+        tolerances,
     )
     .await
     {
@@ -504,24 +620,31 @@ async fn resolve_claim_address(
     //     swaps exist (see db.rs:359), and it sets `ct_descriptor = ''`
     //     which would surface as a derive failure here, so a purged-row
     //     corner case fails loudly rather than silently strands.
-    let user = db::get_user_by_nym(pool, &swap.nym)
+    let nym = swap.nym.as_deref().ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "swap {} has no nym and no invoice claim destination",
+            swap.id
+        ))
+    })?;
+
+    let user = db::get_user_by_nym(pool, nym)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| AppError::ClaimError(format!("user not found: {}", swap.nym)))?;
+        .ok_or_else(|| AppError::ClaimError(format!("user not found: {nym}")))?;
 
     let addr_index_row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
          WHERE nym = $1 \
          RETURNING next_addr_idx - 1",
     )
-    .bind(&swap.nym)
+    .bind(nym)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let addr_index = addr_index_row
         .map(|(idx,)| idx)
-        .ok_or_else(|| AppError::ClaimError(format!("address allocation failed: {}", swap.nym)))?;
+        .ok_or_else(|| AppError::ClaimError(format!("address allocation failed: {nym}")))?;
 
     let addr_index_u32 = u32::try_from(addr_index)
         .map_err(|_| AppError::ClaimError("address index overflow".to_string()))?;
@@ -541,7 +664,7 @@ async fn resolve_claim_address(
 
     tracing::info!(
         event = "lightning_swap_address_allocated_at_claim",
-        nym = %swap.nym,
+        nym = %nym,
         swap_id = %swap.id,
         address_index = addr_index,
         "claim-time descriptor allocation"
@@ -593,12 +716,21 @@ async fn claim_swap(
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
     // Outer wrapper: records every Err uniformly via
     // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
     // are Ok variants and do NOT count as failures (no attempt was
     // really made).
-    let result = claim_swap_inner(pool, swap_id, electrum_url, boltz_url, utxo_backend).await;
+    let result = claim_swap_inner(
+        pool,
+        swap_id,
+        electrum_url,
+        boltz_url,
+        utxo_backend,
+        tolerances,
+    )
+    .await;
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
@@ -610,19 +742,17 @@ async fn claim_swap(
                     last_error = %err_str,
                     "swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
-                // Phase B step 7: paid-equivalent — donator paid the LN
-                // side; merchant-side claim is stuck. Surface to the
-                // donator's invoice view as 'paid'. Operator-facing
-                // tracking lives on the swap_claim_stuck alert above,
-                // not in invoice state.
-                if let Ok(Some(swap)) = db::get_swap_by_id(pool, swap_id).await {
-                    invoice::flip_invoice_on_lightning_settlement(
-                        pool,
-                        swap.invoice_id,
-                        swap.amount_sat,
-                        &swap.boltz_swap_id,
-                    )
-                    .await;
+                // Do not record invoice payment here. `claim_stuck`
+                // requires operator recovery; the customer-facing
+                // invoice can remain payment-detected until recovered.
+                if let Err(e) =
+                    db::mark_invoice_settlement_status_for_swap(pool, swap_id, "claim_stuck").await
+                {
+                    tracing::error!(
+                        event = "invoice_claim_stuck_mark_failed",
+                        swap_id = %swap_id,
+                        "failed to mark invoice settlement_status=claim_stuck: {e}"
+                    );
                 }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
@@ -656,6 +786,7 @@ async fn claim_swap_inner(
     electrum_url: &str,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
     // ----- Phase 1: acquire single-flight, prepare the claim tx.
     let mut tx = pool
@@ -879,21 +1010,283 @@ async fn claim_swap_inner(
     db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    if let Err(e) = db::mark_invoice_settlement_status(pool, swap.invoice_id, "settled").await {
+        tracing::warn!(
+            event = "invoice_settlement_status_mark_failed",
+            swap_id = %swap.boltz_swap_id,
+            "failed to mark invoice settlement_status=settled: {e}"
+        );
+    }
     if let Err(e) = db::clear_claim_failure_state(pool, swap.id).await {
         // Non-fatal: row is Claimed; stale last-error fields are an
         // observability nuisance only.
         tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
     }
 
-    // Phase B step 7: paid-equivalent (terminal happy path). Mirror into
-    // invoice state. The chain_watcher's Liquid-side flip and this
-    // Lightning-side flip are mutually idempotent at the invoice level
-    // (mark_invoice_paid's `WHERE status = 'unpaid'` predicate).
+    // Merchant-side claim succeeded. This is the Lightning accounting
+    // boundary; lockup confirmation, refund, and claim-stuck states do
+    // not record invoice payment events.
     invoice::flip_invoice_on_lightning_settlement(
         pool,
         swap.invoice_id,
         swap.amount_sat,
         &swap.boltz_swap_id,
+        &txid,
+        tolerances,
+    )
+    .await;
+
+    Ok(ClaimOutcome::Broadcast)
+}
+
+async fn claim_chain_swap(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    electrum_url: &str,
+    boltz_url: &str,
+    max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
+) -> Result<ClaimOutcome, AppError> {
+    let result = claim_chain_swap_inner(
+        pool,
+        chain_swap_id,
+        electrum_url,
+        boltz_url,
+        utxo_backend,
+        tolerances,
+    )
+    .await;
+    if let Err(ref e) = result {
+        let err_str = e.to_string();
+        match db::record_chain_swap_claim_failure(pool, chain_swap_id, &err_str, max_claim_attempts)
+            .await
+        {
+            Ok(db::ClaimFailureOutcome::Stuck) => {
+                tracing::error!(
+                    event = "chain_swap_claim_stuck",
+                    swap_id = %chain_swap_id,
+                    attempts = max_claim_attempts,
+                    last_error = %err_str,
+                    "chain swap reached max_claim_attempts; transitioned to claim_stuck"
+                );
+                if let Ok(Some(row)) = db::get_chain_swap_by_id(pool, chain_swap_id).await {
+                    if let Err(e) = db::mark_invoice_settlement_status(
+                        pool,
+                        Some(row.invoice_id),
+                        "claim_stuck",
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            event = "invoice_chain_swap_claim_stuck_mark_failed",
+                            swap_id = %chain_swap_id,
+                            "failed to mark invoice settlement_status=claim_stuck: {e}"
+                        );
+                    }
+                }
+            }
+            Ok(db::ClaimFailureOutcome::Scheduled) => {
+                tracing::warn!(
+                    event = "chain_swap_claim_failure_scheduled",
+                    swap_id = %chain_swap_id,
+                    last_error = %err_str,
+                    "chain swap claim failed; scheduled for retry"
+                );
+            }
+            Ok(db::ClaimFailureOutcome::NoOp) => {
+                tracing::debug!(
+                    "chain-swap claim failure for {} arrived after terminal state",
+                    chain_swap_id
+                );
+            }
+            Err(db_err) => {
+                tracing::error!(
+                    "failed to record chain-swap claim failure for {}: {db_err}",
+                    chain_swap_id
+                );
+            }
+        }
+    }
+    result
+}
+
+async fn claim_chain_swap_inner(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    electrum_url: &str,
+    boltz_url: &str,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
+) -> Result<ClaimOutcome, AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+    if !got_lock {
+        return Ok(ClaimOutcome::SkippedLockHeld);
+    }
+
+    let swap = db::get_chain_swap_by_id(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
+
+    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    if status.is_terminal() {
+        return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+    if !matches!(
+        status,
+        ChainSwapStatus::ServerLockMempool
+            | ChainSwapStatus::ServerLockConfirmed
+            | ChainSwapStatus::Claiming
+            | ChainSwapStatus::ClaimFailed
+    ) {
+        return Ok(ClaimOutcome::AlreadyTerminal);
+    }
+
+    let invoice = db::get_invoice_by_id(pool, swap.invoice_id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id)))?;
+    let output_address = invoice.liquid_address.ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "invoice {} has no liquid_address for chain-swap claim",
+            swap.invoice_id
+        ))
+    })?;
+
+    let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
+        BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
+            .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))?
+    } else {
+        let constructed =
+            construct_chain_claim_tx(&swap, &output_address, electrum_url, boltz_url).await?;
+        let hex = serialize_claim_tx_hex(&constructed)?;
+        let txid = btc_like_txid(&constructed);
+        sqlx::query(
+            "UPDATE chain_swap_records \
+             SET claim_tx_hex = $2, claim_txid = $3 \
+             WHERE id = $1 AND claim_tx_hex IS NULL",
+        )
+        .bind(swap.id)
+        .bind(&hex)
+        .bind(&txid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+        constructed
+    };
+
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(swap.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    let liquid_client =
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
+    let mut txid = btc_like_txid(&claim_tx);
+    if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
+        if let Some(backend) = utxo_backend {
+            match backend.tx_exists(&txid).await {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "chain_claim_broadcast_probe_recovered",
+                        swap_id = %swap.boltz_swap_id,
+                        txid = %txid,
+                        broadcast_error = %broadcast_err,
+                        "chain claim broadcast errored but tx is on chain; treating as success"
+                    );
+                }
+                Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                    Ok(Some(spending_txid)) => {
+                        tracing::info!(
+                            event = "chain_claim_outspend_recovered",
+                            swap_id = %swap.boltz_swap_id,
+                            expected_txid = %txid,
+                            recovered_txid = %spending_txid,
+                            broadcast_error = %broadcast_err,
+                            "chain claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                        );
+                        txid = spending_txid;
+                    }
+                    Ok(None) => {
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast chain claim failed: {broadcast_err}"
+                        )));
+                    }
+                    Err(recovery_err) => {
+                        tracing::warn!(
+                            "chain claim outspend recovery failed for {}: {recovery_err}; treating broadcast as failed",
+                            swap.boltz_swap_id
+                        );
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast chain claim failed: {broadcast_err}"
+                        )));
+                    }
+                },
+                Err(probe_err) => {
+                    tracing::warn!(
+                        "chain claim tx_exists probe failed for {}: {probe_err}; treating broadcast as failed",
+                        swap.boltz_swap_id
+                    );
+                    return Err(AppError::ClaimError(format!(
+                        "broadcast chain claim failed: {broadcast_err}"
+                    )));
+                }
+            }
+        } else {
+            return Err(AppError::ClaimError(format!(
+                "broadcast chain claim failed: {broadcast_err}"
+            )));
+        }
+    }
+
+    db::update_chain_swap_status(pool, swap.id, ChainSwapStatus::Claimed, Some(&txid))
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    if let Err(e) = db::clear_chain_swap_claim_failure_state(pool, swap.id).await {
+        tracing::warn!(
+            "clear_chain_swap_claim_failure_state for {}: {e}",
+            swap.boltz_swap_id
+        );
+    }
+    if let Err(e) = db::mark_invoice_settlement_status(pool, Some(swap.invoice_id), "settled").await
+    {
+        tracing::warn!(
+            event = "invoice_chain_swap_settlement_status_mark_failed",
+            swap_id = %swap.boltz_swap_id,
+            "failed to mark invoice settlement_status=settled: {e}"
+        );
+    }
+    invoice::flip_invoice_on_bitcoin_boltz_settlement(
+        pool,
+        Some(swap.invoice_id),
+        swap.user_lock_amount_sat,
+        &swap.boltz_swap_id,
+        &txid,
+        tolerances,
     )
     .await;
 
@@ -978,6 +1371,75 @@ async fn construct_claim_tx(
         .construct_claim(&preimage, params)
         .await
         .map_err(|e| AppError::ClaimError(format!("construct_claim failed: {e}")))
+}
+
+async fn construct_chain_claim_tx(
+    swap: &db::ChainSwapRecord,
+    output_address: &str,
+    electrum_url: &str,
+    boltz_url: &str,
+) -> Result<BtcLikeTransaction, AppError> {
+    let preimage_bytes = hex::decode(&swap.preimage_hex)
+        .map_err(|e| AppError::ClaimError(format!("invalid chain preimage hex: {e}")))?;
+    let preimage = Preimage::from_vec(preimage_bytes)
+        .map_err(|e| AppError::ClaimError(format!("invalid chain preimage: {e}")))?;
+
+    let claim_key_bytes = hex::decode(&swap.claim_key_hex)
+        .map_err(|e| AppError::ClaimError(format!("invalid chain claim key hex: {e}")))?;
+    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
+        .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?;
+    let secp = boltz_client::Secp256k1::new();
+    let claim_secret_key =
+        boltz_client::bitcoin::secp256k1::SecretKey::from_slice(&claim_key_bytes)
+            .map_err(|e| AppError::ClaimError(format!("invalid chain claim secret key: {e}")))?;
+    let refund_secret_key =
+        boltz_client::bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
+            .map_err(|e| AppError::ClaimError(format!("invalid chain refund secret key: {e}")))?;
+    let claim_keypair = Keypair::from_secret_key(&secp, &claim_secret_key);
+    let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
+
+    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
+        .map_err(|e| AppError::ClaimError(format!("invalid chain boltz response json: {e}")))?;
+
+    let claim_public_key = boltz_client::PublicKey::new(claim_keypair.public_key());
+    let refund_public_key = boltz_client::PublicKey::new(refund_keypair.public_key());
+    let claim_script = SwapScript::chain_from_swap_resp(
+        Chain::Liquid(LiquidChain::Liquid),
+        Side::Claim,
+        boltz_response.claim_details.clone(),
+        claim_public_key,
+    )
+    .map_err(|e| AppError::ClaimError(format!("chain claim script build failed: {e}")))?;
+    let lockup_script = SwapScript::chain_from_swap_resp(
+        Chain::Bitcoin(BitcoinChain::Bitcoin),
+        Side::Lockup,
+        boltz_response.lockup_details.clone(),
+        refund_public_key,
+    )
+    .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
+
+    let liquid_client =
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let chain_client = ChainClient::new().with_liquid(liquid_client);
+    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
+
+    let params = SwapTransactionParams {
+        keys: claim_keypair,
+        output_address: output_address.to_string(),
+        fee: Fee::Relative(0.1),
+        swap_id: swap.boltz_swap_id.clone(),
+        chain_client: &chain_client,
+        boltz_client: &boltz_api,
+        options: Some(
+            TransactionOptions::default().with_chain_claim(refund_keypair, lockup_script),
+        ),
+    };
+
+    claim_script
+        .construct_claim(&preimage, params)
+        .await
+        .map_err(|e| AppError::ClaimError(format!("construct_chain_claim failed: {e}")))
 }
 
 /// Heuristic classifier for cooperative-claim refusals from Boltz.
@@ -1215,6 +1677,13 @@ mod tests {
             Ok(false)
         }
 
+        async fn history_txids(
+            &self,
+            _script_pubkey: &elements::Script,
+        ) -> Result<Vec<String>, AppError> {
+            Ok(Vec::new())
+        }
+
         async fn find_spending_txid(
             &self,
             _script_pubkey: &elements::Script,
@@ -1386,6 +1855,7 @@ pub fn spawn_background_claimer(
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),
+                        db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
                     )
                     .await
                     {
@@ -1416,12 +1886,65 @@ pub fn spawn_background_claimer(
                 tracing::info!("background claimer: no unclaimed swaps found");
             }
 
+            let ready_chain = match db::get_ready_to_claim_chain_swaps(&pool).await {
+                Ok(swaps) => swaps,
+                Err(e) => {
+                    tracing::error!("background claimer: chain-swap db query failed: {e}");
+                    Vec::new()
+                }
+            };
+            if !ready_chain.is_empty() {
+                tracing::info!(
+                    "background claimer: found {} chain swap(s) ready to claim",
+                    ready_chain.len()
+                );
+                for swap in &ready_chain {
+                    match claim_chain_swap(
+                        &pool,
+                        swap.id,
+                        &config.boltz.electrum_url,
+                        &config.boltz.api_url,
+                        config.claim.max_claim_attempts,
+                        utxo_backend.as_ref(),
+                        db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+                    )
+                    .await
+                    {
+                        Ok(ClaimOutcome::Broadcast) => {
+                            tracing::info!(
+                                "background claimer: claimed chain swap {}",
+                                swap.boltz_swap_id
+                            );
+                        }
+                        Ok(ClaimOutcome::SkippedLockHeld) => {
+                            tracing::debug!(
+                                "background claimer: skipped chain swap {} (lock held)",
+                                swap.boltz_swap_id
+                            );
+                        }
+                        Ok(ClaimOutcome::AlreadyTerminal) => {
+                            tracing::debug!(
+                                "background claimer: skipped chain swap {} (already terminal)",
+                                swap.boltz_swap_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "background claimer: chain swap {}: {e}",
+                                swap.boltz_swap_id
+                            );
+                        }
+                    }
+                }
+            }
+
             if tick_count % HEARTBEAT_EVERY_N_TICKS == 0 {
                 tracing::info!(
                     target: "claimer",
                     event = "claimer_heartbeat",
                     tick = tick_count,
                     ready_count = ready.len(),
+                    ready_chain_count = ready_chain.len(),
                     "background claimer heartbeat"
                 );
             }

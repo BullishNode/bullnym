@@ -69,7 +69,7 @@ pub const ACTION_LIST: &str = "invoice-list";
 /// row indefinitely or refresh Boltz offers forever.
 const MAX_WALLET_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
 
-/// Default cap on `list_invoices.limit`. Mobile can request a smaller
+/// Default cap on `list_invoices.pageSize`. Mobile can request a smaller
 /// page size; never larger.
 const LIST_LIMIT_MAX: i64 = 100;
 
@@ -77,14 +77,6 @@ const LIST_LIMIT_MAX: i64 = 100;
 /// BOLT11s may expire sooner and are refreshed while the invoice is live;
 /// this cap prevents abandoned checkout invoices from refreshing forever.
 const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
-
-/// Inner rate-lock window for fiat-denominated invoices. The status
-/// endpoint refreshes the sat amount on the first poll after this elapses.
-const FIAT_RATE_LOCK_SECS: i64 = 15 * 60;
-
-/// Don't refresh the rate if the invoice is about to expire — the new
-/// BOLT11 would be worth less than nothing.
-const REFRESH_SAFETY_MARGIN_SECS: i64 = 60;
 
 /// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
 /// audit-greppable.
@@ -130,6 +122,14 @@ pub async fn flip_invoice_on_lightning_in_progress(
             );
         }
         Ok(_) => {
+            if let Err(e) = db::mark_invoice_settlement_status(pool, Some(id), "pending").await {
+                tracing::warn!(
+                    event = "invoice_pending_settlement_failed",
+                    invoice_id = %id,
+                    boltz_swap_id = %boltz_swap_id,
+                    "failed to mark invoice settlement pending: {e}"
+                );
+            }
             tracing::debug!(
                 event = "invoice_in_progress_noop",
                 invoice_id = %id,
@@ -148,35 +148,100 @@ pub async fn flip_invoice_on_lightning_in_progress(
     }
 }
 
-/// Flip an invoice via `mark_invoice_paid` after the corresponding
-/// Lightning swap reaches a paid-equivalent status. Called by claimer
-/// (webhook path) and reconciler (sync path) AFTER the forward-only CAS
-/// state-update succeeds.
+/// Flip an invoice to `in_progress` on the FIRST payer-side BTC lockup
+/// sighting for an invoice-bound Boltz BTC-to-LBTC chain swap. Accounting
+/// is still recorded only after the server claims the LBTC output.
+pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
+    pool: &sqlx::PgPool,
+    invoice_id: Option<Uuid>,
+    boltz_swap_id: &str,
+) {
+    let Some(id) = invoice_id else {
+        return;
+    };
+    match db::mark_invoice_in_progress(pool, id).await {
+        Ok(rows) if rows > 0 => {
+            tracing::info!(
+                event = "invoice_in_progress_via_bitcoin_boltz_chain",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "bitcoin chain-swap lockup flipped invoice to in_progress"
+            );
+        }
+        Ok(_) => {
+            if let Err(e) = db::mark_invoice_settlement_status(pool, Some(id), "pending").await {
+                tracing::warn!(
+                    event = "invoice_bitcoin_boltz_pending_settlement_failed",
+                    invoice_id = %id,
+                    boltz_swap_id = %boltz_swap_id,
+                    "failed to mark invoice settlement pending: {e}"
+                );
+            }
+            tracing::debug!(
+                event = "invoice_bitcoin_boltz_in_progress_noop",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "invoice already past unpaid; bitcoin chain-swap in_progress flip is a no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "invoice_bitcoin_boltz_in_progress_failed",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "mark_invoice_in_progress failed (chain-swap CAS already committed): {e}"
+            );
+        }
+    }
+}
+
+/// Record an invoice payment event after the corresponding Lightning
+/// reverse swap is claimed by the merchant wallet. Lockup mempool,
+/// lockup confirmation, refund, and claim-stuck states are not enough:
+/// they prove only payer-side progress, not merchant-side settlement.
 ///
 /// Contract:
 /// - `invoice_id == None` → no-op (LNURL Lightning Address swaps and
 ///   legacy donation rows have no associated invoice).
-/// - `mark_invoice_paid` is idempotent: a 0-rows-affected return means
-///   the invoice was already in a non-unpaid status (paid/under/over/
-///   expired/cancelled). Logged at debug, not warn.
+/// - `record_invoice_payment` is idempotent on
+///   `lightning_boltz_reverse:<boltz_swap_id>`.
 /// - On error: LOG and RETURN. Never propagate.
 pub async fn flip_invoice_on_lightning_settlement(
     pool: &sqlx::PgPool,
     invoice_id: Option<Uuid>,
     amount_sat: i64,
     boltz_swap_id: &str,
+    claim_txid: &str,
+    tolerances: db::InvoiceAccountingTolerances,
 ) {
     let Some(id) = invoice_id else {
         return;
     };
-    match db::mark_invoice_paid(pool, id, amount_sat, "lightning").await {
+    let event_key = format!("lightning_boltz_reverse:{boltz_swap_id}");
+    match db::record_invoice_payment(
+        pool,
+        id,
+        db::InvoicePaymentEvidence {
+            rail: "lightning",
+            source: "lightning_boltz_reverse",
+            event_key: &event_key,
+            amount_sat,
+            txid: Some(claim_txid),
+            vout: None,
+            boltz_swap_id: Some(boltz_swap_id),
+            address: None,
+        },
+        tolerances,
+    )
+    .await
+    {
         Ok(rows) if rows > 0 => {
             tracing::info!(
-                event = "invoice_paid_via_lightning",
+                event = "invoice_payment_event_lightning",
                 invoice_id = %id,
                 boltz_swap_id = %boltz_swap_id,
                 amount_sat = amount_sat,
-                "lightning settlement flipped invoice"
+                "lightning settlement recorded invoice payment"
             );
         }
         Ok(_) => {
@@ -184,7 +249,7 @@ pub async fn flip_invoice_on_lightning_settlement(
                 event = "invoice_flip_noop",
                 invoice_id = %id,
                 boltz_swap_id = %boltz_swap_id,
-                "invoice already in terminal status; no-op"
+                "invoice payment event already recorded or invoice cancelled; no-op"
             );
         }
         Err(e) => {
@@ -193,7 +258,70 @@ pub async fn flip_invoice_on_lightning_settlement(
                 invoice_id = %id,
                 boltz_swap_id = %boltz_swap_id,
                 amount_sat = amount_sat,
-                "mark_invoice_paid failed (swap CAS already committed): {e}"
+                "record_invoice_payment failed (swap CAS already committed): {e}"
+            );
+        }
+    }
+}
+
+/// Record an invoice payment event after a BTC-to-LBTC Boltz chain swap
+/// has been claimed to the merchant's Liquid address. This is the
+/// Donation Page Bitcoin-rail settlement boundary: user BTC lockup and
+/// Boltz server lockup are only progress signals; the merchant is paid
+/// after our Liquid claim broadcasts successfully.
+pub async fn flip_invoice_on_bitcoin_boltz_settlement(
+    pool: &sqlx::PgPool,
+    invoice_id: Option<Uuid>,
+    amount_sat: i64,
+    boltz_swap_id: &str,
+    claim_txid: &str,
+    tolerances: db::InvoiceAccountingTolerances,
+) {
+    let Some(id) = invoice_id else {
+        return;
+    };
+    let event_key = format!("bitcoin_boltz_chain:{boltz_swap_id}");
+    match db::record_invoice_payment(
+        pool,
+        id,
+        db::InvoicePaymentEvidence {
+            rail: "bitcoin",
+            source: "bitcoin_boltz_chain",
+            event_key: &event_key,
+            amount_sat,
+            txid: Some(claim_txid),
+            vout: None,
+            boltz_swap_id: Some(boltz_swap_id),
+            address: None,
+        },
+        tolerances,
+    )
+    .await
+    {
+        Ok(rows) if rows > 0 => {
+            tracing::info!(
+                event = "invoice_payment_event_bitcoin_boltz",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                amount_sat = amount_sat,
+                "bitcoin chain-swap settlement recorded invoice payment"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                event = "invoice_bitcoin_boltz_flip_noop",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "invoice payment event already recorded or invoice cancelled; no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "invoice_bitcoin_boltz_flip_failed",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                amount_sat = amount_sat,
+                "record_invoice_payment failed (chain-swap CAS already committed): {e}"
             );
         }
     }
@@ -298,6 +426,8 @@ pub struct CreateInvoiceResponse {
     pub invoice_id: Uuid,
     pub lightning_pr: String,
     pub liquid_address: String,
+    pub bitcoin_chain_address: Option<String>,
+    pub bitcoin_chain_bip21: Option<String>,
     pub expires_at_unix: i64,
 }
 
@@ -339,12 +469,17 @@ pub async fn create_anonymous(
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
     // Eagerly allocate a Liquid address from the donation page owner's
-    // descriptor. Both rails settle to this same address:
+    // CT descriptor. Donation Page checkout never uses customer- or
+    // merchant-supplied payout addresses; every customer-facing settlement
+    // rail resolves back to this descriptor-derived Liquid address:
     //   - Lightning: `claimer::resolve_claim_address` branch (B) routes
     //     the Boltz claim to `invoice.liquid_address` once
     //     `create_lightning_offer` (below) binds the swap to this invoice.
-    //   - Direct Liquid: customer pays the address directly; the
+    //   - Direct Liquid: customer pays this address directly; the
     //     chain_watcher's address-keyed scan detects the inbound tx.
+    //   - BTC via Boltz chain swap: customer pays Boltz's Bitcoin lockup
+    //     address; the chain-swap claimer spends the resulting LBTC to
+    //     this same `invoice.liquid_address`.
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
@@ -355,6 +490,8 @@ pub async fn create_anonymous(
         })
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+    let liquid_blinding_key_hex =
+        descriptor::derive_blinding_key_hex(&owner.ct_descriptor, &liquid_address)?;
 
     let new_invoice = db::NewInvoice {
         nym_owner: Some(&nym),
@@ -364,31 +501,27 @@ pub async fn create_anonymous(
         fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
         amount_sat,
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
-        rate_lock_secs: if fiat.is_some() {
-            FIAT_RATE_LOCK_SECS
-        } else {
-            CHECKOUT_DEFAULT_EXPIRES_SECS
-        },
+        rate_lock_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
         memo: None,
         recipient_label: None,
         public_description: None,
         invoice_number: None,
-        // Checkout-origin: server eagerly allocates one Liquid address
-        // from the donation page owner's descriptor (above). Both
-        // Lightning and direct Liquid rails settle to this address. BTC
-        // on-chain is not exposed for donation-page checkout in v1 —
-        // would require a separate Bitcoin descriptor / wallet-supplied
-        // address path.
+        // Checkout-origin: direct BTC stays disabled on the invoice row.
+        // Donation Page BTC, when available, is represented separately as a
+        // Boltz chain-swap lockup so bitcoin_watcher never mistakes the
+        // Boltz deposit address for merchant-settled direct BTC.
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
         bitcoin_address: None,
         liquid_address: Some(&liquid_address),
+        liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
         expires_in_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    let lightning_pr = match create_lightning_offer(&state, &nym, amount_sat as u64, &invoice).await
+    let lightning_pr = match create_lightning_offer(&state, Some(&nym), amount_sat as u64, &invoice)
+        .await
     {
         Ok(pr) => pr,
         Err(e) => {
@@ -407,11 +540,26 @@ pub async fn create_anonymous(
             return Err(e);
         }
     };
+    let bitcoin_chain_offer =
+        match create_bitcoin_chain_offer(&state, Some(&nym), amount_sat as u64, &invoice).await {
+            Ok(offer) => offer,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_id = %invoice.id,
+                    "BTC-to-LBTC chain-swap offer unavailable for checkout invoice: {e}",
+                );
+                None
+            }
+        };
 
     Ok(Json(CreateInvoiceResponse {
         invoice_id: invoice.id,
         lightning_pr,
         liquid_address,
+        bitcoin_chain_address: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.lockup_address.clone()),
+        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
         expires_at_unix: invoice.expires_at_unix,
     }))
 }
@@ -524,9 +672,10 @@ struct InvoicePaymentTpl<'a> {
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
+    settlement_status: &'a str,
     amount_sat: i64,
+    remaining_amount_sat: i64,
     fiat_display: Option<String>,
-    is_fiat: bool,
     /// Wallet-origin public-facing fields. Askama auto-escapes every
     /// `{{ }}` interpolation; do NOT add `|safe` to these in the template.
     public_description: Option<&'a str>,
@@ -535,8 +684,11 @@ struct InvoicePaymentTpl<'a> {
     accept_btc: bool,
     accept_ln: bool,
     accept_liquid: bool,
-    bitcoin_address: Option<&'a str>,
-    liquid_address: Option<&'a str>,
+    bitcoin_chain_address: Option<&'a str>,
+    bitcoin_address_js: String,
+    bitcoin_chain_address_js: String,
+    bitcoin_chain_bip21_js: String,
+    liquid_address_js: String,
 }
 
 fn format_fiat_major(minor: i32, currency: &str) -> String {
@@ -549,6 +701,23 @@ fn format_fiat_major(minor: i32, currency: &str) -> String {
         let frac = (minor as i64 % divisor).unsigned_abs();
         format!("{major}.{frac:0>width$} {currency}", width = p as usize)
     }
+}
+
+fn js_string_literal(value: Option<&str>) -> Result<String, AppError> {
+    let json = serde_json::to_string(value.unwrap_or(""))
+        .map_err(|e| AppError::DbError(format!("js string encode: {e}")))?;
+    Ok(json
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026"))
+}
+
+fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
+    matches!(inv.status.as_str(), "unpaid" | "partially_paid")
+        && !matches!(
+            inv.settlement_status.as_str(),
+            "pending" | "claim_stuck" | "refunded"
+        )
 }
 
 pub async fn render_payment(
@@ -567,7 +736,7 @@ pub async fn render_payment(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
-    Ok(html_response(render_invoice_template(&state, &inv)?))
+    Ok(html_response(render_invoice_template(&state, &inv).await?))
 }
 
 // =====================================================================
@@ -586,34 +755,49 @@ pub async fn render_unlinked_payment(
     // The unlinked render path serves both nym-linked AND nym-NULL invoices
     // (the wallet may always share via /invoice/<id> regardless of linkage).
     // Distinct handlers for the two paths only affect URL parsing.
-    Ok(html_response(render_invoice_template(&state, &inv)?))
+    Ok(html_response(render_invoice_template(&state, &inv).await?))
 }
 
-fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
+async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
     };
-    let is_fiat = inv.rate_minor_per_btc.is_some();
+    let remaining_sat = remaining_amount_sat(inv);
+    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(inv) {
+        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+    } else {
+        None
+    };
     let nym = inv.nym_owner.as_deref().unwrap_or("");
     let is_unlinked = inv.nym_owner.is_none();
+    let bitcoin_chain_address = bitcoin_chain_offer
+        .as_ref()
+        .map(|offer| offer.lockup_address.as_str());
+    let bitcoin_chain_bip21 = bitcoin_chain_offer
+        .as_ref()
+        .and_then(|offer| offer.lockup_bip21.as_deref());
     let tpl = InvoicePaymentTpl {
         nym,
         is_unlinked,
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
+        settlement_status: &inv.settlement_status,
         amount_sat: inv.amount_sat,
+        remaining_amount_sat: remaining_sat,
         fiat_display,
-        is_fiat,
         public_description: inv.public_description.as_deref(),
         recipient_name: inv.recipient_label.as_deref(),
         invoice_number: inv.invoice_number.as_deref(),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
-        bitcoin_address: inv.bitcoin_address.as_deref(),
-        liquid_address: inv.liquid_address.as_deref(),
+        bitcoin_chain_address,
+        bitcoin_address_js: js_string_literal(inv.bitcoin_address.as_deref())?,
+        bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
+        bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
+        liquid_address_js: js_string_literal(inv.liquid_address.as_deref())?,
     };
     tpl.render()
         .map_err(|e| AppError::DbError(format!("template render: {e}")))
@@ -626,7 +810,13 @@ fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String
 #[derive(Serialize)]
 pub struct InvoiceStatusResponse {
     pub status: String,
+    pub pricing_mode: String,
+    pub settlement_status: String,
     pub amount_sat: i64,
+    pub fiat_amount_minor: Option<i32>,
+    pub fiat_currency: Option<String>,
+    pub remaining_amount_sat: i64,
+    pub payment_tolerance_sat: i64,
     pub rate_minor_per_btc: Option<i64>,
     pub rate_locks_until_unix: i64,
     pub expires_at_unix: i64,
@@ -636,10 +826,11 @@ pub struct InvoiceStatusResponse {
     pub lightning_pr: Option<String>,
     pub liquid_address: Option<String>,
     pub bitcoin_address: Option<String>,
+    pub bitcoin_chain_address: Option<String>,
+    pub bitcoin_chain_bip21: Option<String>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
-    pub rate_stale: bool,
 }
 
 pub async fn status(
@@ -664,44 +855,31 @@ pub async fn status(
     }
 
     let id = parse_invoice_id(&id_str)?;
-    let mut inv = db::get_invoice_by_id(&state.db, id)
+    let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
 
-    let mut rate_stale = false;
-    let now = unix_now();
-    if inv.status == "unpaid"
-        && inv.fiat_currency.is_some()
-        && inv.rate_locks_until_unix <= now
-        && inv.expires_at_unix > now + REFRESH_SAFETY_MARGIN_SECS
-    {
-        match maybe_refresh_rate(&state, &inv).await {
-            Ok(Some(refreshed)) => inv = refreshed,
-            Ok(None) => rate_stale = true,
-            Err(e) => {
-                tracing::warn!(
-                    invoice_id = %inv.id,
-                    "on-demand rate refresh failed: {e}"
-                );
-                rate_stale = true;
-            }
-        }
-    }
-
-    let lightning_pr = match ensure_reusable_lightning_offer(&state, &inv).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            tracing::warn!(
-                invoice_id = %inv.id,
-                "failed to refresh lightning offer for status response: {e}"
-            );
-            None
-        }
+    let remaining_sat = remaining_amount_sat(&inv);
+    let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
+    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
+        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+    } else {
+        None
     };
+    let tolerance_sat = payment_tolerance_sat(
+        &inv,
+        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+    );
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
+        pricing_mode: inv.pricing_mode,
+        settlement_status: inv.settlement_status,
         amount_sat: inv.amount_sat,
+        fiat_amount_minor: inv.fiat_amount_minor,
+        fiat_currency: inv.fiat_currency,
+        remaining_amount_sat: remaining_sat,
+        payment_tolerance_sat: tolerance_sat,
         rate_minor_per_btc: inv.rate_minor_per_btc,
         rate_locks_until_unix: inv.rate_locks_until_unix,
         expires_at_unix: inv.expires_at_unix,
@@ -711,52 +889,14 @@ pub async fn status(
         lightning_pr,
         liquid_address: inv.liquid_address,
         bitcoin_address: inv.bitcoin_address,
+        bitcoin_chain_address: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.lockup_address.clone()),
+        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
-        rate_stale,
     }))
-}
-
-async fn maybe_refresh_rate(
-    state: &AppState,
-    inv: &db::Invoice,
-) -> Result<Option<db::Invoice>, AppError> {
-    let currency = inv.fiat_currency.as_ref().expect("checked by caller");
-    let fiat_minor = inv.fiat_amount_minor.expect("checked by caller");
-
-    let rate = match state.pricer.get_rate(currency).await {
-        Some(r) if !r.last_known_rate => r,
-        _ => return Ok(None),
-    };
-
-    let new_amount_sat = ((fiat_minor as i64) * SAT_PER_BTC) / rate.minor_per_btc;
-    if new_amount_sat <= 0 {
-        return Err(AppError::InvalidAmount(format!(
-            "refreshed amount_sat {new_amount_sat} <= 0"
-        )));
-    }
-
-    let nym = lightning_swap_nym(&state.db, inv).await?;
-    create_lightning_offer(state, &nym, new_amount_sat as u64, inv).await?;
-
-    let updated = db::refresh_invoice_rate(
-        &state.db,
-        inv.id,
-        new_amount_sat,
-        rate.minor_per_btc,
-        FIAT_RATE_LOCK_SECS,
-    )
-    .await?;
-    if updated == 0 {
-        return Ok(None);
-    }
-
-    db::get_invoice_by_id(&state.db, inv.id)
-        .await
-        .map_err(AppError::from)
-        .and_then(|opt| opt.ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string())))
-        .map(Some)
 }
 
 // =====================================================================
@@ -790,9 +930,9 @@ pub async fn fetch_lightning_offer(
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
-    if inv.status != "unpaid" {
+    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") {
         return Err(AppError::InvalidAmount(format!(
-            "invoice is {} (not unpaid); no Lightning offer available",
+            "invoice is {} (not payable); no Lightning offer available",
             inv.status
         )));
     }
@@ -820,31 +960,130 @@ async fn ensure_reusable_lightning_offer(
     state: &AppState,
     inv: &db::Invoice,
 ) -> Result<Option<String>, AppError> {
-    if !matches!(inv.status.as_str(), "unpaid" | "in_progress") || !inv.accept_ln {
+    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") || !inv.accept_ln {
         return Ok(None);
     }
 
     let now = unix_now();
-    if let Some(pr) = db::latest_lightning_pr_for_invoice(&state.db, inv.id).await? {
-        if bolt11_is_reusable_at(&pr, now) {
+    let amount_sat = remaining_amount_sat(inv);
+    if amount_sat <= 0 {
+        return Ok(None);
+    }
+    if let Some((pr, pr_amount_sat)) =
+        db::latest_lightning_pr_for_invoice(&state.db, inv.id).await?
+    {
+        if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
             return Ok(Some(pr));
-        }
-        if inv.status != "unpaid" {
-            return Ok(None);
         }
         tracing::info!(
             invoice_id = %inv.id,
-            "latest BOLT11 expired; requesting replacement offer from Boltz",
+            "latest BOLT11 expired or amount changed; requesting replacement offer from Boltz",
         );
     }
 
-    if inv.status != "unpaid" || inv.expires_at_unix <= now {
+    if inv.expires_at_unix <= now {
         return Ok(None);
     }
 
-    let nym = lightning_swap_nym(&state.db, inv).await?;
-    let pr = create_lightning_offer(state, &nym, inv.amount_sat as u64, inv).await?;
-    Ok(Some(pr))
+    let lock_key = format!("invoice-lightning:{}", inv.id);
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+        .bind(&lock_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    let result = async {
+        let latest: Option<(String, i64)> = sqlx::query_as(
+            "SELECT invoice, amount_sat FROM swap_records \
+             WHERE invoice_id = $1 \
+             ORDER BY created_at DESC \
+             LIMIT 1",
+        )
+        .bind(inv.id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+        if let Some((pr, pr_amount_sat)) = latest {
+            if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
+                return Ok(Some(pr));
+            }
+        }
+        let pr =
+            create_lightning_offer(state, lightning_swap_nym(inv), amount_sat as u64, inv).await?;
+        Ok(Some(pr))
+    }
+    .await;
+
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+        .bind(&lock_key)
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::error!(
+            invoice_id = %inv.id,
+            "failed to unlock invoice lightning refresh advisory lock: {e}"
+        );
+    }
+
+    result
+}
+
+/// Read-only counterpart to `ensure_reusable_lightning_offer`.
+///
+/// Status polling must not create Boltz swaps. It may return the latest
+/// still-payable BOLT11, but if the latest offer is expired, the wrong
+/// amount, or absent, callers must explicitly hit
+/// `POST /api/v1/invoices/:id/lightning` to create/refresh the offer.
+async fn latest_reusable_lightning_offer(
+    pool: &sqlx::PgPool,
+    inv: &db::Invoice,
+) -> Result<Option<String>, AppError> {
+    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") || !inv.accept_ln {
+        return Ok(None);
+    }
+
+    let amount_sat = remaining_amount_sat(inv);
+    if amount_sat <= 0 || inv.expires_at_unix <= unix_now() {
+        return Ok(None);
+    }
+
+    let Some((pr, pr_amount_sat)) = db::latest_lightning_pr_for_invoice(pool, inv.id).await? else {
+        return Ok(None);
+    };
+    if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, unix_now()) {
+        Ok(Some(pr))
+    } else {
+        Ok(None)
+    }
+}
+
+fn remaining_amount_sat(inv: &db::Invoice) -> i64 {
+    inv.amount_sat
+        .saturating_sub(inv.paid_amount_sat.unwrap_or(0))
+        .max(0)
+}
+
+fn payment_tolerance_sat(inv: &db::Invoice, tolerances: db::InvoiceAccountingTolerances) -> i64 {
+    let mut accepted = Vec::new();
+    if inv.accept_btc {
+        accepted.push(tolerances.btc_sat);
+    }
+    if inv.accept_liquid {
+        accepted.push(tolerances.liquid_sat);
+    }
+    if inv.accept_ln {
+        accepted.push(tolerances.lightning_sat);
+    }
+    let rail_tolerance = accepted
+        .into_iter()
+        .min()
+        .unwrap_or(tolerances.lightning_sat);
+    rail_tolerance.min((inv.amount_sat / 100).max(1))
 }
 
 const BOLT11_REFRESH_MARGIN_SECS: u64 = 120;
@@ -860,26 +1099,8 @@ fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
     !invoice.would_expire(Duration::from_secs(now_with_margin))
 }
 
-/// Resolve the nym to attribute on the swap_records row for `invoice`.
-/// Linked invoices use `nym_owner`; unlinked invoices fall back to the
-/// active registration of `npub_owner`. Returns `AuthError` when no
-/// active registration exists for the npub — Lightning requires a
-/// claimable Liquid wallet (legacy descriptor path) OR a wallet-supplied
-/// liquid_address (claim destination resolved by Step 10's
-/// `resolve_claim_address`).
-async fn lightning_swap_nym(
-    pool: &sqlx::PgPool,
-    invoice: &db::Invoice,
-) -> Result<String, AppError> {
-    if let Some(nym) = invoice.nym_owner.as_deref() {
-        return Ok(nym.to_string());
-    }
-    let user = db::get_user_by_npub(pool, &invoice.npub_owner)
-        .await?
-        .ok_or_else(|| {
-            AppError::AuthError("unlinked invoice's npub has no active registration".into())
-        })?;
-    Ok(user.nym)
+fn lightning_swap_nym(invoice: &db::Invoice) -> Option<&str> {
+    invoice.nym_owner.as_deref()
 }
 
 /// Internal: create a Boltz reverse swap and record it as the Lightning
@@ -888,7 +1109,7 @@ async fn lightning_swap_nym(
 /// invoice on payment.
 async fn create_lightning_offer(
     state: &AppState,
-    swap_nym: &str,
+    swap_nym: Option<&str>,
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<String, AppError> {
@@ -942,8 +1163,78 @@ async fn create_lightning_offer(
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
 
-    db::touch_user_callback(&state.db, swap_nym).await;
+    if let Some(nym) = swap_nym {
+        db::touch_user_callback(&state.db, nym).await;
+    }
     Ok(lightning_pr)
+}
+
+struct BitcoinChainOffer {
+    lockup_address: String,
+    lockup_bip21: Option<String>,
+}
+
+/// Internal: create a Boltz BTC-to-LBTC chain swap for a Donation Page
+/// checkout invoice. The payer sees a Bitcoin lockup address; after
+/// Boltz locks LBTC on the server side, the chain-swap claimer spends
+/// that LBTC to `invoice.liquid_address`.
+async fn create_bitcoin_chain_offer(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<Option<BitcoinChainOffer>, AppError> {
+    if invoice.liquid_address.is_none() {
+        return Ok(None);
+    }
+
+    let claim_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("chain claim key allocation failed: {e}")))?;
+    let refund_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("chain refund key allocation failed: {e}")))?;
+
+    let result = state
+        .boltz
+        .create_btc_to_lbtc_chain_swap(claim_key_index, refund_key_index, amount_sat)
+        .await?;
+
+    let preimage_hex = hex::encode(&result.preimage);
+    let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
+    let refund_key_hex = hex::encode(result.refund_keypair.secret_bytes());
+    let boltz_response_json = serde_json::to_string(&result.boltz_response).map_err(|e| {
+        AppError::BoltzError(format!("failed to serialize chain-swap response: {e}"))
+    })?;
+
+    db::record_chain_swap(
+        &state.db,
+        &db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: swap_nym,
+            boltz_swap_id: &result.swap_id,
+            lockup_address: &result.lockup_address,
+            lockup_bip21: result.lockup_bip21.as_deref(),
+            user_lock_amount_sat: result.user_lock_amount_sat as i64,
+            server_lock_amount_sat: result.server_lock_amount_sat as i64,
+            preimage_hex: &preimage_hex,
+            claim_key_hex: &claim_key_hex,
+            refund_key_hex: &refund_key_hex,
+            boltz_response_json: &boltz_response_json,
+        },
+    )
+    .await
+    .map_err(|e| {
+        AppError::DbError(format!(
+            "failed to record chain swap {}: {e}",
+            result.swap_id
+        ))
+    })?;
+
+    Ok(Some(BitcoinChainOffer {
+        lockup_address: result.lockup_address,
+        lockup_bip21: result.lockup_bip21,
+    }))
 }
 
 // =====================================================================
@@ -1011,7 +1302,7 @@ async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db:
 // IMPORTANT: nym is NOT part of these payload helpers. It is passed
 // separately as `nym_or_empty` to `auth::verify_la_v2` / `build_la_v2_message`.
 
-/// 12 fields in fixed order. The byte sequence is the wire contract.
+/// 13 fields in fixed order. The byte sequence is the wire contract.
 #[allow(clippy::too_many_arguments)]
 fn create_payload_fields<'a>(
     amount_sat_or_empty: &'a str,
@@ -1025,8 +1316,9 @@ fn create_payload_fields<'a>(
     accept_liquid_bool: &'a str,
     bitcoin_address_or_empty: &'a str,
     liquid_address_or_empty: &'a str,
+    liquid_blinding_key_hex_or_empty: &'a str,
     expires_at_unix: &'a str,
-) -> [&'a str; 12] {
+) -> [&'a str; 13] {
     [
         amount_sat_or_empty,
         fiat_amount_minor_or_empty,
@@ -1039,6 +1331,7 @@ fn create_payload_fields<'a>(
         accept_liquid_bool,
         bitcoin_address_or_empty,
         liquid_address_or_empty,
+        liquid_blinding_key_hex_or_empty,
         expires_at_unix,
     ]
 }
@@ -1048,11 +1341,11 @@ fn cancel_payload_fields(invoice_id: &str) -> [&str; 1] {
 }
 
 fn list_payload_fields<'a>(
-    since_unix_or_zero: &'a str,
-    limit: &'a str,
+    page: &'a str,
+    page_size: &'a str,
     status_filter_or_empty: &'a str,
 ) -> [&'a str; 3] {
-    [since_unix_or_zero, limit, status_filter_or_empty]
+    [page, page_size, status_filter_or_empty]
 }
 
 // =====================================================================
@@ -1078,6 +1371,7 @@ pub struct CreateSignedRequest {
     pub accept_liquid: bool,
     pub bitcoin_address: Option<String>,
     pub liquid_address: Option<String>,
+    pub liquid_blinding_key_hex: Option<String>,
     pub expires_at_unix: i64,
     pub timestamp: u64,
     pub signature: String,
@@ -1170,12 +1464,25 @@ async fn create_invoice_inner(
             "accept_ln/accept_liquid=true requires liquid_address".into(),
         ));
     }
-    if let Some(addr) = req.bitcoin_address.as_deref() {
-        validators::validate_btc_mainnet_address(addr)?;
-    }
-    if let Some(addr) = req.liquid_address.as_deref() {
-        validators::validate_liquid_mainnet_address(addr)?;
-    }
+    let canonical_bitcoin_address = if let Some(addr) = req.bitcoin_address.as_deref() {
+        Some(validators::canonical_btc_mainnet_address(addr)?)
+    } else {
+        None
+    };
+    let canonical_liquid_address = if let Some(addr) = req.liquid_address.as_deref() {
+        let canonical = validators::canonical_liquid_mainnet_address(addr)?;
+        if req.accept_liquid {
+            let key = req.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
+                AppError::InvalidAmount(
+                    "accept_liquid=true requires liquid_blinding_key_hex".into(),
+                )
+            })?;
+            validators::validate_liquid_blinding_key_matches_address(&canonical, key)?;
+        }
+        Some(canonical)
+    } else {
+        None
+    };
 
     // Outer expiry window: now+60s to now+30d.
     let now = unix_now();
@@ -1206,6 +1513,7 @@ async fn create_invoice_inner(
     let accept_liquid_str = req.accept_liquid.to_string();
     let bitcoin_address_str = req.bitcoin_address.clone().unwrap_or_default();
     let liquid_address_str = req.liquid_address.clone().unwrap_or_default();
+    let liquid_blinding_key_str = req.liquid_blinding_key_hex.clone().unwrap_or_default();
     let expires_str = req.expires_at_unix.to_string();
     let fields = create_payload_fields(
         &amount_sat_str,
@@ -1219,6 +1527,7 @@ async fn create_invoice_inner(
         &accept_liquid_str,
         &bitcoin_address_str,
         &liquid_address_str,
+        &liquid_blinding_key_str,
         &expires_str,
     );
     let nym_or_empty = linked_nym.as_deref().unwrap_or("");
@@ -1262,11 +1571,7 @@ async fn create_invoice_inner(
         fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
         amount_sat,
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
-        rate_lock_secs: if fiat.is_some() {
-            FIAT_RATE_LOCK_SECS
-        } else {
-            expires_in_secs
-        },
+        rate_lock_secs: expires_in_secs,
         memo: None,
         recipient_label: req.recipient_label.as_deref(),
         public_description: req.public_description.as_deref(),
@@ -1274,15 +1579,21 @@ async fn create_invoice_inner(
         accept_btc: req.accept_btc,
         accept_ln: req.accept_ln,
         accept_liquid: req.accept_liquid,
-        bitcoin_address: req.bitcoin_address.as_deref(),
-        liquid_address: req.liquid_address.as_deref(),
+        bitcoin_address: canonical_bitcoin_address.as_deref(),
+        liquid_address: canonical_liquid_address.as_deref(),
+        liquid_blinding_key_hex: req.liquid_blinding_key_hex.as_deref(),
         expires_in_secs,
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
     if invoice.accept_ln {
-        let swap_nym = lightning_swap_nym(&state.db, &invoice).await?;
-        if let Err(e) = create_lightning_offer(state, &swap_nym, amount_sat as u64, &invoice).await
+        if let Err(e) = create_lightning_offer(
+            state,
+            lightning_swap_nym(&invoice),
+            amount_sat as u64,
+            &invoice,
+        )
+        .await
         {
             tracing::warn!(
                 invoice_id = %invoice.id,
@@ -1434,9 +1745,9 @@ pub struct ListSignedQuery {
     pub npub: String,
     pub timestamp: u64,
     pub signature: String,
-    /// Optional. Unix epoch seconds; only invoices created at-or-after.
-    pub since_unix: Option<i64>,
-    pub limit: i64,
+    pub page: i64,
+    #[serde(rename = "pageSize")]
+    pub page_size: i64,
     /// Optional. One of the seven invoice statuses, or empty/absent for
     /// unfiltered. The wire format treats absent + empty identically.
     pub status: Option<String>,
@@ -1451,7 +1762,10 @@ pub struct InvoiceListItem {
     pub nym_owner: Option<String>,
     pub origin: String,
     pub status: String,
+    pub pricing_mode: String,
+    pub settlement_status: String,
     pub amount_sat: i64,
+    pub remaining_amount_sat: i64,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     pub public_description: Option<String>,
@@ -1473,6 +1787,10 @@ pub struct InvoiceListItem {
 #[derive(Serialize)]
 pub struct ListInvoicesResponse {
     pub invoices: Vec<InvoiceListItem>,
+    pub page: i64,
+    #[serde(rename = "pageSize")]
+    pub page_size: i64,
+    pub has_more: bool,
 }
 
 pub async fn list_signed(
@@ -1493,10 +1811,16 @@ pub async fn list_signed(
         }
     }
 
-    if params.limit < 1 {
-        return Err(AppError::InvalidAmount("limit must be >= 1".into()));
+    if params.page < 1 {
+        return Err(AppError::InvalidAmount("page must be >= 1".into()));
     }
-    let limit = params.limit.min(LIST_LIMIT_MAX);
+    if params.page > 1000 {
+        return Err(AppError::InvalidAmount("page must be <= 1000".into()));
+    }
+    if params.page_size < 1 {
+        return Err(AppError::InvalidAmount("pageSize must be >= 1".into()));
+    }
+    let page_size = params.page_size.min(LIST_LIMIT_MAX);
 
     let status_filter: Option<&str> = match params.status.as_deref() {
         None | Some("") => None,
@@ -1505,6 +1829,7 @@ pub async fn list_signed(
                 s,
                 "unpaid"
                     | "in_progress"
+                    | "partially_paid"
                     | "paid"
                     | "underpaid"
                     | "overpaid"
@@ -1516,15 +1841,15 @@ pub async fn list_signed(
         }
         Some(other) => {
             return Err(AppError::InvalidAmount(format!(
-                "status must be one of unpaid|in_progress|paid|underpaid|overpaid|expired|cancelled, or empty (got '{other}')"
+                "status must be one of unpaid|in_progress|partially_paid|paid|underpaid|overpaid|expired|cancelled, or empty (got '{other}')"
             )));
         }
     };
 
-    let since_str = params.since_unix.unwrap_or(0).to_string();
-    let limit_str = limit.to_string();
+    let page_str = params.page.to_string();
+    let page_size_str = page_size.to_string();
     let status_str = status_filter.unwrap_or("");
-    let fields = list_payload_fields(&since_str, &limit_str, status_str);
+    let fields = list_payload_fields(&page_str, &page_size_str, status_str);
     // Nym ALWAYS empty on the npub-keyed list — the action is identity-
     // wide, not per-nym.
     auth::verify_la_v2(
@@ -1544,37 +1869,49 @@ pub async fn list_signed(
         &state.db,
         &params.npub,
         status_filter,
-        params.since_unix,
-        limit,
+        params.page,
+        page_size,
     )
     .await?;
+    let has_more = rows.len() >= page_size as usize;
     let invoices = rows
         .into_iter()
-        .map(|inv| InvoiceListItem {
-            id: inv.id,
-            nym_owner: inv.nym_owner,
-            origin: inv.origin,
-            status: inv.status,
-            amount_sat: inv.amount_sat,
-            fiat_amount_minor: inv.fiat_amount_minor,
-            fiat_currency: inv.fiat_currency,
-            public_description: inv.public_description,
-            recipient_label: inv.recipient_label,
-            invoice_number: inv.invoice_number,
-            accept_btc: inv.accept_btc,
-            accept_ln: inv.accept_ln,
-            accept_liquid: inv.accept_liquid,
-            bitcoin_address: inv.bitcoin_address,
-            liquid_address: inv.liquid_address,
-            created_at_unix: inv.created_at_unix,
-            expires_at_unix: inv.expires_at_unix,
-            paid_via: inv.paid_via,
-            paid_at_unix: inv.paid_at_unix,
-            paid_amount_sat: inv.paid_amount_sat,
+        .map(|inv| {
+            let remaining = remaining_amount_sat(&inv);
+            InvoiceListItem {
+                id: inv.id,
+                nym_owner: inv.nym_owner,
+                origin: inv.origin,
+                status: inv.status,
+                pricing_mode: inv.pricing_mode,
+                settlement_status: inv.settlement_status,
+                amount_sat: inv.amount_sat,
+                remaining_amount_sat: remaining,
+                fiat_amount_minor: inv.fiat_amount_minor,
+                fiat_currency: inv.fiat_currency,
+                public_description: inv.public_description,
+                recipient_label: inv.recipient_label,
+                invoice_number: inv.invoice_number,
+                accept_btc: inv.accept_btc,
+                accept_ln: inv.accept_ln,
+                accept_liquid: inv.accept_liquid,
+                bitcoin_address: inv.bitcoin_address,
+                liquid_address: inv.liquid_address,
+                created_at_unix: inv.created_at_unix,
+                expires_at_unix: inv.expires_at_unix,
+                paid_via: inv.paid_via,
+                paid_at_unix: inv.paid_at_unix,
+                paid_amount_sat: inv.paid_amount_sat,
+            }
         })
         .collect();
 
-    Ok(Json(ListInvoicesResponse { invoices }))
+    Ok(Json(ListInvoicesResponse {
+        invoices,
+        page: params.page,
+        page_size,
+        has_more,
+    }))
 }
 
 #[cfg(test)]
@@ -1598,6 +1935,7 @@ mod tests {
             "true",
             "",
             "lq1qq...",
+            "abcd",
             "1700000000",
         );
         assert_eq!(
@@ -1614,6 +1952,7 @@ mod tests {
                 "true",
                 "",
                 "lq1qq...",
+                "abcd",
                 "1700000000",
             ],
             "create field order changed — mobile MUST update in lockstep"
@@ -1632,10 +1971,10 @@ mod tests {
 
     #[test]
     fn list_payload_field_order() {
-        let f = list_payload_fields("0", "25", "unpaid");
+        let f = list_payload_fields("1", "50", "unpaid");
         assert_eq!(
             f,
-            ["0", "25", "unpaid"],
+            ["1", "50", "unpaid"],
             "list field order changed — mobile MUST update in lockstep"
         );
     }
@@ -1673,5 +2012,155 @@ mod tests {
         assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_481));
         assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_601));
         assert!(!bolt11_is_reusable_at("not-a-bolt11", 1_496_314_658));
+    }
+
+    #[test]
+    fn partially_paid_template_remains_payable_for_remaining_amount() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "partially_paid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 2_500,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_chain_address: None,
+            bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        };
+
+        let html = tpl.render().expect("template renders");
+        assert!(html.contains("Partially paid"));
+        assert!(html.contains("2500 sat remaining"));
+        assert!(html.contains("id=\"rail-lightning\""));
+        assert!(html.contains("let currentAmountSat = 2500;"));
+    }
+
+    #[test]
+    fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "unpaid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 10_000,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_chain_address: None,
+            bitcoin_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        };
+
+        let html = tpl.render().expect("template renders");
+        assert!(html.contains("Refreshing Lightning offer"));
+        assert!(html.contains("fetchLightning();"));
+        assert!(html.contains("method: 'POST'"));
+        assert!(html.contains("/lightning"));
+    }
+
+    #[test]
+    fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "unpaid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 10_000,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_chain_address: Some("bc1qboltzlockup"),
+            bitcoin_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(Some("bc1qboltzlockup")).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(Some(
+                "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address",
+            ))
+            .unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        };
+
+        let html = tpl.render().expect("template renders");
+        assert!(html.contains("id=\"rail-btc\""));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000\\u0026label=Send%20to%20L-BTC%20address\""));
+        assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS"));
+    }
+
+    #[test]
+    fn api_tolerance_uses_configured_values() {
+        let mut inv = invoice_fixture();
+        inv.accept_btc = false;
+        inv.accept_liquid = true;
+        inv.accept_ln = false;
+        let tolerances = db::InvoiceAccountingTolerances {
+            btc_sat: 900,
+            liquid_sat: 42,
+            lightning_sat: 3,
+        };
+
+        assert_eq!(payment_tolerance_sat(&inv, tolerances), 42);
+    }
+
+    fn invoice_fixture() -> db::Invoice {
+        db::Invoice {
+            id: Uuid::nil(),
+            nym_owner: Some("alice".to_string()),
+            npub_owner: "npub".to_string(),
+            origin: "wallet".to_string(),
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 10_000,
+            rate_minor_per_btc: None,
+            memo: None,
+            recipient_label: None,
+            bitcoin_address: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            public_description: None,
+            invoice_number: None,
+            liquid_address: None,
+            liquid_address_index: None,
+            status: "unpaid".to_string(),
+            paid_via: None,
+            paid_amount_sat: None,
+            pricing_mode: "sat_fixed".to_string(),
+            settlement_status: "none".to_string(),
+            liquid_blinding_key_hex: None,
+            created_at_unix: 0,
+            expires_at_unix: 0,
+            rate_locked_at_unix: 0,
+            rate_locks_until_unix: 0,
+            paid_at_unix: None,
+            cancelled_at_unix: None,
+        }
     }
 }

@@ -350,7 +350,7 @@ pub(crate) async fn create_lightning_swap(
     db::record_swap(
         &state.db,
         &db::NewSwapRecord {
-            nym,
+            nym: Some(nym),
             boltz_swap_id: &result.swap_id,
             address: None,
             address_index: None,

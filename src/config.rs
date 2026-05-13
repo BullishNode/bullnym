@@ -25,6 +25,8 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     #[serde(default)]
     pub bitcoin_watcher: BitcoinWatcherConfig,
+    #[serde(default)]
+    pub invoice_accounting: InvoiceAccountingConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
@@ -50,6 +52,40 @@ pub struct Config {
     /// swaps register the new URL). Empty = no overlap.
     #[serde(skip)]
     pub boltz_webhook_url_secret_previous: String,
+}
+
+const DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT: i64 = 300;
+const DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT: i64 = 60;
+const DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT: i64 = 1;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InvoiceAccountingConfig {
+    #[serde(default = "default_btc_shortfall_tolerance_sat")]
+    pub btc_shortfall_tolerance_sat: i64,
+    #[serde(default = "default_liquid_shortfall_tolerance_sat")]
+    pub liquid_shortfall_tolerance_sat: i64,
+    #[serde(default = "default_lightning_shortfall_tolerance_sat")]
+    pub lightning_shortfall_tolerance_sat: i64,
+}
+
+impl Default for InvoiceAccountingConfig {
+    fn default() -> Self {
+        Self {
+            btc_shortfall_tolerance_sat: DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT,
+            liquid_shortfall_tolerance_sat: DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT,
+            lightning_shortfall_tolerance_sat: DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT,
+        }
+    }
+}
+
+fn default_btc_shortfall_tolerance_sat() -> i64 {
+    DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT
+}
+fn default_liquid_shortfall_tolerance_sat() -> i64 {
+    DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT
+}
+fn default_lightning_shortfall_tolerance_sat() -> i64 {
+    DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT
 }
 
 #[derive(Debug, Clone, Deserialize)]

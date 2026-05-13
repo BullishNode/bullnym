@@ -13,7 +13,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    bitcoin_watcher, boltz, chain_watcher, claimer, config, donation_page, donation_render, gc,
+    bitcoin_watcher, boltz, chain_watcher, claimer, config, db, donation_page, donation_render, gc,
     invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler, registration,
     utxo::{self, UtxoBackend},
     AppState,
@@ -217,10 +217,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cancel_watcher = cancel.clone();
         let watcher_cfg =
             chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
+        let accounting_tolerances =
+            db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
         let active = watcher_cfg.active_tick_secs;
         let idle = watcher_cfg.idle_tick_secs;
         tokio::spawn(async move {
-            chain_watcher::run(pool, backend, rl, cancel_watcher, watcher_cfg).await;
+            chain_watcher::run(
+                pool,
+                backend,
+                rl,
+                cancel_watcher,
+                watcher_cfg,
+                accounting_tolerances,
+            )
+            .await;
         });
         tracing::info!(
             "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
@@ -238,8 +248,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pool = state.db.clone();
         let cancel_btc = cancel.clone();
         let btc_cfg = config.bitcoin_watcher.clone();
+        let accounting_tolerances =
+            db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
         tokio::spawn(async move {
-            bitcoin_watcher::run(btc_cfg, pool, cancel_btc).await;
+            bitcoin_watcher::run(btc_cfg, accounting_tolerances, pool, cancel_btc).await;
         });
     } else {
         tracing::info!("bitcoin watcher disabled by config");
