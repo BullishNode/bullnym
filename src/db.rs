@@ -2409,6 +2409,93 @@ pub async fn latest_lightning_pr_for_invoice(
     Ok(row)
 }
 
+// --- BTC-to-LBTC chain swaps (Donation Page only, not publicly exposed yet) ---
+
+pub struct NewChainSwapRecord<'a> {
+    pub invoice_id: Uuid,
+    pub nym: Option<&'a str>,
+    pub boltz_swap_id: &'a str,
+    pub lockup_address: &'a str,
+    pub lockup_bip21: Option<&'a str>,
+    pub user_lock_amount_sat: i64,
+    pub server_lock_amount_sat: i64,
+    pub preimage_hex: &'a str,
+    pub claim_key_hex: &'a str,
+    pub refund_key_hex: &'a str,
+    pub boltz_response_json: &'a str,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct ChainSwapRecord {
+    pub id: Uuid,
+    pub invoice_id: Uuid,
+    pub nym: Option<String>,
+    pub boltz_swap_id: String,
+    pub from_chain: String,
+    pub to_chain: String,
+    pub lockup_address: String,
+    pub lockup_bip21: Option<String>,
+    pub user_lock_amount_sat: i64,
+    pub server_lock_amount_sat: i64,
+    pub preimage_hex: String,
+    pub claim_key_hex: String,
+    pub refund_key_hex: String,
+    pub boltz_response_json: String,
+    pub status: String,
+    pub claim_txid: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+const CHAIN_SWAP_RECORD_COLUMNS: &str =
+    "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
+     lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
+     preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
+     EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
+     EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
+
+pub async fn record_chain_swap(
+    pool: &PgPool,
+    swap: &NewChainSwapRecord<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "INSERT INTO chain_swap_records \
+             (invoice_id, nym, boltz_swap_id, from_chain, to_chain, lockup_address, lockup_bip21, \
+              user_lock_amount_sat, server_lock_amount_sat, preimage_hex, claim_key_hex, \
+              refund_key_hex, boltz_response_json) \
+         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11) \
+         RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
+    ))
+    .bind(swap.invoice_id)
+    .bind(swap.nym)
+    .bind(swap.boltz_swap_id)
+    .bind(swap.lockup_address)
+    .bind(swap.lockup_bip21)
+    .bind(swap.user_lock_amount_sat)
+    .bind(swap.server_lock_amount_sat)
+    .bind(swap.preimage_hex)
+    .bind(swap.claim_key_hex)
+    .bind(swap.refund_key_hex)
+    .bind(swap.boltz_response_json)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn latest_chain_swap_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
+         WHERE invoice_id = $1 \
+         ORDER BY created_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

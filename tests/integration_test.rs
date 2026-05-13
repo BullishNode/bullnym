@@ -185,6 +185,10 @@ fn sign_purge_with_keypair(keypair: &Keypair, npub: &str, nym: &str) -> (String,
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    sqlx::query("DELETE FROM chain_swap_records")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM swap_records")
         .execute(pool)
         .await
@@ -1203,6 +1207,48 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     assert_eq!(
         pr.as_ref().map(|(bolt11, _)| bolt11.as_str()),
         Some("lnbc-new")
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "chainswaprec").await;
+    let invoice = insert_test_invoice(&pool, "chainswaprec", &npub, "lq1chainswaprec", 60).await;
+
+    let row = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("chainswaprec"),
+            boltz_swap_id: "chain-swap-rec-1",
+            lockup_address: "bc1qchainswaplockup",
+            lockup_bip21: Some("bitcoin:bc1qchainswaplockup?amount=0.00001000"),
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"chain-swap-rec-1\"}",
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.from_chain, "BTC");
+    assert_eq!(row.to_chain, "L-BTC");
+
+    let latest = pay_service::db::latest_chain_swap_for_invoice(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.boltz_swap_id, "chain-swap-rec-1");
+    assert_eq!(
+        latest.lockup_bip21.as_deref(),
+        Some("bitcoin:bc1qchainswaplockup?amount=0.00001000")
     );
 
     cleanup_db(&pool).await;
