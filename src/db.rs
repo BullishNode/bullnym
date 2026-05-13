@@ -2508,6 +2508,9 @@ pub struct ChainSwapRecord {
     pub boltz_response_json: String,
     pub status: String,
     pub claim_txid: Option<String>,
+    pub claim_tx_hex: Option<String>,
+    pub claim_attempts: i32,
+    pub last_claim_error: Option<String>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -2522,6 +2525,7 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
     "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
+     claim_tx_hex, claim_attempts, last_claim_error, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
 

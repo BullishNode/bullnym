@@ -1349,6 +1349,9 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     assert_eq!(row.status, "pending");
     assert_eq!(row.from_chain, "BTC");
     assert_eq!(row.to_chain, "L-BTC");
+    assert_eq!(row.claim_tx_hex, None);
+    assert_eq!(row.claim_attempts, 0);
+    assert_eq!(row.last_claim_error, None);
 
     let latest = pay_service::db::latest_chain_swap_for_invoice(&pool, invoice.id)
         .await
