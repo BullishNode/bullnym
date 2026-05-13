@@ -148,6 +148,53 @@ pub async fn flip_invoice_on_lightning_in_progress(
     }
 }
 
+/// Flip an invoice to `in_progress` on the FIRST payer-side BTC lockup
+/// sighting for an invoice-bound Boltz BTC-to-LBTC chain swap. Accounting
+/// is still recorded only after the server claims the LBTC output.
+pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
+    pool: &sqlx::PgPool,
+    invoice_id: Option<Uuid>,
+    boltz_swap_id: &str,
+) {
+    let Some(id) = invoice_id else {
+        return;
+    };
+    match db::mark_invoice_in_progress(pool, id).await {
+        Ok(rows) if rows > 0 => {
+            tracing::info!(
+                event = "invoice_in_progress_via_bitcoin_boltz_chain",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "bitcoin chain-swap lockup flipped invoice to in_progress"
+            );
+        }
+        Ok(_) => {
+            if let Err(e) = db::mark_invoice_settlement_status(pool, Some(id), "pending").await {
+                tracing::warn!(
+                    event = "invoice_bitcoin_boltz_pending_settlement_failed",
+                    invoice_id = %id,
+                    boltz_swap_id = %boltz_swap_id,
+                    "failed to mark invoice settlement pending: {e}"
+                );
+            }
+            tracing::debug!(
+                event = "invoice_bitcoin_boltz_in_progress_noop",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "invoice already past unpaid; bitcoin chain-swap in_progress flip is a no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "invoice_bitcoin_boltz_in_progress_failed",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "mark_invoice_in_progress failed (chain-swap CAS already committed): {e}"
+            );
+        }
+    }
+}
+
 /// Record an invoice payment event after the corresponding Lightning
 /// reverse swap is claimed by the merchant wallet. Lockup mempool,
 /// lockup confirmation, refund, and claim-stuck states are not enough:
@@ -634,6 +681,14 @@ fn js_string_literal(value: Option<&str>) -> Result<String, AppError> {
         .replace('&', "\\u0026"))
 }
 
+fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
+    matches!(inv.status.as_str(), "unpaid" | "partially_paid")
+        && !matches!(
+            inv.settlement_status.as_str(),
+            "pending" | "claim_stuck" | "refunded"
+        )
+}
+
 pub async fn render_payment(
     State(state): State<AppState>,
     Path((nym, id_str)): Path<(String, String)>,
@@ -677,7 +732,12 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
     };
-    let bitcoin_chain_offer = db::latest_chain_swap_for_invoice(&state.db, inv.id).await?;
+    let remaining_sat = remaining_amount_sat(inv);
+    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(inv) {
+        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+    } else {
+        None
+    };
     let nym = inv.nym_owner.as_deref().unwrap_or("");
     let is_unlinked = inv.nym_owner.is_none();
     let bitcoin_chain_address = bitcoin_chain_offer
@@ -694,7 +754,7 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
         status: &inv.status,
         settlement_status: &inv.settlement_status,
         amount_sat: inv.amount_sat,
-        remaining_amount_sat: remaining_amount_sat(inv),
+        remaining_amount_sat: remaining_sat,
         fiat_display,
         public_description: inv.public_description.as_deref(),
         recipient_name: inv.recipient_label.as_deref(),
@@ -768,10 +828,13 @@ pub async fn status(
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
 
-    let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
-    let bitcoin_chain_offer = db::latest_chain_swap_for_invoice(&state.db, inv.id).await?;
-
     let remaining_sat = remaining_amount_sat(&inv);
+    let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
+    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
+        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+    } else {
+        None
+    };
     let tolerance_sat = payment_tolerance_sat(
         &inv,
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),

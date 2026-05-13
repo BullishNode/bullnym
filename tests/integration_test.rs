@@ -568,6 +568,12 @@ async fn webhook_advances_chain_swap_records() {
         .unwrap()
         .unwrap();
     assert_eq!(row.status, "server_lock_confirmed");
+    let invoice_after = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice_after.status, "in_progress");
+    assert_eq!(invoice_after.settlement_status, "pending");
 
     cleanup_db(&pool).await;
 }
@@ -1353,7 +1359,7 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     assert_eq!(row.claim_attempts, 0);
     assert_eq!(row.last_claim_error, None);
 
-    let latest = pay_service::db::latest_chain_swap_for_invoice(&pool, invoice.id)
+    let latest = pay_service::db::latest_payable_chain_swap_for_invoice(&pool, invoice.id, 1_000)
         .await
         .unwrap()
         .unwrap();
@@ -1361,6 +1367,29 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     assert_eq!(
         latest.lockup_bip21.as_deref(),
         Some("bitcoin:bc1qchainswaplockup?amount=0.00001000")
+    );
+    let wrong_amount =
+        pay_service::db::latest_payable_chain_swap_for_invoice(&pool, invoice.id, 999)
+            .await
+            .unwrap();
+    assert!(
+        wrong_amount.is_none(),
+        "chain-swap offers must match the invoice's current remaining amount"
+    );
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapStatus::Expired,
+        None,
+    )
+    .await
+    .unwrap();
+    let stale = pay_service::db::latest_payable_chain_swap_for_invoice(&pool, invoice.id, 1_000)
+        .await
+        .unwrap();
+    assert!(
+        stale.is_none(),
+        "expired chain swaps must not be exposed as payable offers"
     );
 
     cleanup_db(&pool).await;

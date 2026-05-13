@@ -395,6 +395,21 @@ async fn handle_chain_swap_webhook(
 
     if matches!(
         next,
+        ChainSwapStatus::UserLockMempool
+            | ChainSwapStatus::UserLockConfirmed
+            | ChainSwapStatus::ServerLockMempool
+            | ChainSwapStatus::ServerLockConfirmed
+    ) {
+        invoice::flip_invoice_on_bitcoin_boltz_in_progress(
+            &state.db,
+            Some(swap.invoice_id),
+            &swap.boltz_swap_id,
+        )
+        .await;
+    }
+
+    if matches!(
+        next,
         ChainSwapStatus::ServerLockMempool | ChainSwapStatus::ServerLockConfirmed
     ) {
         try_claim_chain_swap_with_retry(
@@ -403,6 +418,7 @@ async fn handle_chain_swap_webhook(
             &state.config.boltz.electrum_url,
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
+            state.utxo_backend.as_ref(),
             db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
         )
         .await;
@@ -416,6 +432,7 @@ async fn try_claim_chain_swap_with_retry(
     electrum_url: &str,
     boltz_url: &str,
     max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) {
     match claim_chain_swap(
@@ -424,6 +441,7 @@ async fn try_claim_chain_swap_with_retry(
         electrum_url,
         boltz_url,
         max_claim_attempts,
+        utxo_backend,
         tolerances,
     )
     .await
@@ -1026,10 +1044,18 @@ async fn claim_chain_swap(
     electrum_url: &str,
     boltz_url: &str,
     max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
-    let result =
-        claim_chain_swap_inner(pool, chain_swap_id, electrum_url, boltz_url, tolerances).await;
+    let result = claim_chain_swap_inner(
+        pool,
+        chain_swap_id,
+        electrum_url,
+        boltz_url,
+        utxo_backend,
+        tolerances,
+    )
+    .await;
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_chain_swap_claim_failure(pool, chain_swap_id, &err_str, max_claim_attempts)
@@ -1089,6 +1115,7 @@ async fn claim_chain_swap_inner(
     chain_swap_id: Uuid,
     electrum_url: &str,
     boltz_url: &str,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
     let mut tx = pool
@@ -1178,12 +1205,63 @@ async fn claim_chain_swap_inner(
         ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
-    chain_client
-        .try_broadcast_tx(&claim_tx)
-        .await
-        .map_err(|e| AppError::ClaimError(format!("broadcast chain claim failed: {e}")))?;
+    let mut txid = btc_like_txid(&claim_tx);
+    if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
+        if let Some(backend) = utxo_backend {
+            match backend.tx_exists(&txid).await {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "chain_claim_broadcast_probe_recovered",
+                        swap_id = %swap.boltz_swap_id,
+                        txid = %txid,
+                        broadcast_error = %broadcast_err,
+                        "chain claim broadcast errored but tx is on chain; treating as success"
+                    );
+                }
+                Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                    Ok(Some(spending_txid)) => {
+                        tracing::info!(
+                            event = "chain_claim_outspend_recovered",
+                            swap_id = %swap.boltz_swap_id,
+                            expected_txid = %txid,
+                            recovered_txid = %spending_txid,
+                            broadcast_error = %broadcast_err,
+                            "chain claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                        );
+                        txid = spending_txid;
+                    }
+                    Ok(None) => {
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast chain claim failed: {broadcast_err}"
+                        )));
+                    }
+                    Err(recovery_err) => {
+                        tracing::warn!(
+                            "chain claim outspend recovery failed for {}: {recovery_err}; treating broadcast as failed",
+                            swap.boltz_swap_id
+                        );
+                        return Err(AppError::ClaimError(format!(
+                            "broadcast chain claim failed: {broadcast_err}"
+                        )));
+                    }
+                },
+                Err(probe_err) => {
+                    tracing::warn!(
+                        "chain claim tx_exists probe failed for {}: {probe_err}; treating broadcast as failed",
+                        swap.boltz_swap_id
+                    );
+                    return Err(AppError::ClaimError(format!(
+                        "broadcast chain claim failed: {broadcast_err}"
+                    )));
+                }
+            }
+        } else {
+            return Err(AppError::ClaimError(format!(
+                "broadcast chain claim failed: {broadcast_err}"
+            )));
+        }
+    }
 
-    let txid = btc_like_txid(&claim_tx);
     db::update_chain_swap_status(pool, swap.id, ChainSwapStatus::Claimed, Some(&txid))
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1825,6 +1903,7 @@ pub fn spawn_background_claimer(
                         &config.boltz.electrum_url,
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
+                        utxo_backend.as_ref(),
                         db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
                     )
                     .await

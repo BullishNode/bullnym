@@ -2474,7 +2474,7 @@ pub async fn latest_lightning_pr_for_invoice(
     Ok(row)
 }
 
-// --- BTC-to-LBTC chain swaps (Donation Page only, not publicly exposed yet) ---
+// --- BTC-to-LBTC chain swaps (Donation Page checkout BTC rail) ---
 
 pub struct NewChainSwapRecord<'a> {
     pub invoice_id: Uuid,
@@ -2580,17 +2580,21 @@ pub async fn get_chain_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
-pub async fn latest_chain_swap_for_invoice(
+pub async fn latest_payable_chain_swap_for_invoice(
     pool: &PgPool,
     invoice_id: Uuid,
+    amount_sat: i64,
 ) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
          WHERE invoice_id = $1 \
+           AND status = 'pending' \
+           AND user_lock_amount_sat = $2 \
          ORDER BY created_at DESC \
          LIMIT 1"
     ))
     .bind(invoice_id)
+    .bind(amount_sat)
     .fetch_optional(pool)
     .await
 }
