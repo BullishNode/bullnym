@@ -202,6 +202,53 @@ pub async fn flip_invoice_on_lightning_settlement(
     }
 }
 
+/// Record an invoice payment event after a BTC-to-LBTC Boltz chain swap
+/// has been claimed to the merchant's Liquid address. This is the
+/// Donation Page Bitcoin-rail settlement boundary: user BTC lockup and
+/// Boltz server lockup are only progress signals; the merchant is paid
+/// after our Liquid claim broadcasts successfully.
+pub async fn flip_invoice_on_bitcoin_boltz_settlement(
+    pool: &sqlx::PgPool,
+    invoice_id: Option<Uuid>,
+    amount_sat: i64,
+    boltz_swap_id: &str,
+    tolerances: db::InvoiceAccountingTolerances,
+) {
+    let Some(id) = invoice_id else {
+        return;
+    };
+    let event_key = format!("bitcoin_boltz_chain:{boltz_swap_id}");
+    match db::record_invoice_payment(pool, id, "bitcoin", &event_key, amount_sat, tolerances).await
+    {
+        Ok(rows) if rows > 0 => {
+            tracing::info!(
+                event = "invoice_payment_event_bitcoin_boltz",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                amount_sat = amount_sat,
+                "bitcoin chain-swap settlement recorded invoice payment"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                event = "invoice_bitcoin_boltz_flip_noop",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                "invoice payment event already recorded or invoice cancelled; no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "invoice_bitcoin_boltz_flip_failed",
+                invoice_id = %id,
+                boltz_swap_id = %boltz_swap_id,
+                amount_sat = amount_sat,
+                "record_invoice_payment failed (chain-swap CAS already committed): {e}"
+            );
+        }
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================

@@ -1367,6 +1367,123 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
 }
 
 #[tokio::test]
+async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "chainretry").await;
+    let invoice = insert_test_invoice(&pool, "chainretry", &npub, "lq1chainretry", 60).await;
+
+    let row = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("chainretry"),
+            boltz_swap_id: "chainretry-swap",
+            lockup_address: "bc1qchainretrylockup",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"chainretry-swap\"}",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapStatus::ServerLockConfirmed,
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', \
+             claim_txid = 'chain-retry-claim-txid', \
+             claim_tx_hex = 'deadbeef', \
+             next_claim_attempt_at = NOW() - INTERVAL '1 second' \
+         WHERE boltz_swap_id = 'chainretry-swap'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ready = pay_service::db::get_ready_to_claim_chain_swaps(&pool)
+        .await
+        .unwrap();
+    let retry = ready
+        .iter()
+        .find(|row| row.boltz_swap_id == "chainretry-swap")
+        .expect("claiming chain swap with persisted claim tx must be retryable");
+
+    assert_eq!(retry.claim_txid.as_deref(), Some("chain-retry-claim-txid"));
+    assert_eq!(retry.claim_tx_hex.as_deref(), Some("deadbeef"));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "chainfail").await;
+    let invoice = insert_test_invoice(&pool, "chainfail", &npub, "lq1chainfail", 60).await;
+
+    let row = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("chainfail"),
+            boltz_swap_id: "chainfail-swap",
+            lockup_address: "bc1qchainfaillockup",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"chainfail-swap\"}",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapStatus::ServerLockConfirmed,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let outcome = pay_service::db::record_chain_swap_claim_failure(
+        &pool,
+        row.id,
+        "synthetic claim failure",
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, pay_service::db::ClaimFailureOutcome::Stuck);
+
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "chainfail-swap")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "claim_stuck");
+    assert_eq!(row.claim_attempts, 1);
+    assert_eq!(
+        row.last_claim_error.as_deref(),
+        Some("synthetic claim failure")
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

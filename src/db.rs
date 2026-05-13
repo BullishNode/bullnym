@@ -2568,6 +2568,18 @@ pub async fn get_chain_swap_by_boltz_id(
     .await
 }
 
+pub async fn get_chain_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+}
+
 pub async fn latest_chain_swap_for_invoice(
     pool: &PgPool,
     invoice_id: Uuid,
@@ -2601,6 +2613,92 @@ pub async fn update_chain_swap_status(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+pub async fn get_ready_to_claim_chain_swaps(
+    pool: &PgPool,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE status IN ('server_lock_mempool', 'server_lock_confirmed', 'claiming', 'claim_failed') \
+           AND (next_claim_attempt_at IS NULL OR next_claim_attempt_at <= NOW()) \
+         ORDER BY next_claim_attempt_at NULLS FIRST"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn record_chain_swap_claim_failure(
+    pool: &PgPool,
+    id: Uuid,
+    error_msg: &str,
+    max_attempts: i32,
+) -> Result<ClaimFailureOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let bumped: Option<(i32,)> = sqlx::query_as(
+        "UPDATE chain_swap_records \
+         SET claim_attempts = claim_attempts + 1, \
+             last_claim_error = $2, \
+             last_claim_error_at = NOW(), \
+             updated_at = NOW(), \
+             next_claim_attempt_at = NOW() + ( \
+                 CASE \
+                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '30 seconds' \
+                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '60 seconds' \
+                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '120 seconds' \
+                     WHEN claim_attempts + 1 = 4 THEN INTERVAL '300 seconds' \
+                     WHEN claim_attempts + 1 = 5 THEN INTERVAL '600 seconds' \
+                     WHEN claim_attempts + 1 = 6 THEN INTERVAL '1800 seconds' \
+                     ELSE INTERVAL '3600 seconds' \
+                 END \
+             ) * (0.8 + 0.4 * random()) \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
+         RETURNING claim_attempts",
+    )
+    .bind(id)
+    .bind(error_msg)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match bumped {
+        None => ClaimFailureOutcome::NoOp,
+        Some((attempts,)) if attempts >= max_attempts => {
+            sqlx::query(
+                "UPDATE chain_swap_records \
+                 SET status = 'claim_stuck', updated_at = NOW() \
+                 WHERE id = $1 \
+                   AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            ClaimFailureOutcome::Stuck
+        }
+        Some(_) => ClaimFailureOutcome::Scheduled,
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+pub async fn clear_chain_swap_claim_failure_state(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET last_claim_error = NULL, \
+             last_claim_error_at = NULL, \
+             next_claim_attempt_at = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
