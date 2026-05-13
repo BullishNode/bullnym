@@ -606,10 +606,11 @@ struct InvoicePaymentTpl<'a> {
     accept_btc: bool,
     accept_ln: bool,
     accept_liquid: bool,
-    bitcoin_address: Option<&'a str>,
     bitcoin_chain_address: Option<&'a str>,
-    bitcoin_chain_bip21: Option<&'a str>,
-    liquid_address: Option<&'a str>,
+    bitcoin_address_js: String,
+    bitcoin_chain_address_js: String,
+    bitcoin_chain_bip21_js: String,
+    liquid_address_js: String,
 }
 
 fn format_fiat_major(minor: i32, currency: &str) -> String {
@@ -622,6 +623,15 @@ fn format_fiat_major(minor: i32, currency: &str) -> String {
         let frac = (minor as i64 % divisor).unsigned_abs();
         format!("{major}.{frac:0>width$} {currency}", width = p as usize)
     }
+}
+
+fn js_string_literal(value: Option<&str>) -> Result<String, AppError> {
+    let json = serde_json::to_string(value.unwrap_or(""))
+        .map_err(|e| AppError::DbError(format!("js string encode: {e}")))?;
+    Ok(json
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026"))
 }
 
 pub async fn render_payment(
@@ -670,6 +680,12 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
     let bitcoin_chain_offer = db::latest_chain_swap_for_invoice(&state.db, inv.id).await?;
     let nym = inv.nym_owner.as_deref().unwrap_or("");
     let is_unlinked = inv.nym_owner.is_none();
+    let bitcoin_chain_address = bitcoin_chain_offer
+        .as_ref()
+        .map(|offer| offer.lockup_address.as_str());
+    let bitcoin_chain_bip21 = bitcoin_chain_offer
+        .as_ref()
+        .and_then(|offer| offer.lockup_bip21.as_deref());
     let tpl = InvoicePaymentTpl {
         nym,
         is_unlinked,
@@ -686,14 +702,11 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
-        bitcoin_address: inv.bitcoin_address.as_deref(),
-        bitcoin_chain_address: bitcoin_chain_offer
-            .as_ref()
-            .map(|offer| offer.lockup_address.as_str()),
-        bitcoin_chain_bip21: bitcoin_chain_offer
-            .as_ref()
-            .and_then(|offer| offer.lockup_bip21.as_deref()),
-        liquid_address: inv.liquid_address.as_deref(),
+        bitcoin_chain_address,
+        bitcoin_address_js: js_string_literal(inv.bitcoin_address.as_deref())?,
+        bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
+        bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
+        liquid_address_js: js_string_literal(inv.liquid_address.as_deref())?,
     };
     tpl.render()
         .map_err(|e| AppError::DbError(format!("template render: {e}")))
@@ -1920,10 +1933,11 @@ mod tests {
             accept_btc: true,
             accept_ln: true,
             accept_liquid: true,
-            bitcoin_address: Some("bc1qexample"),
             bitcoin_chain_address: None,
-            bitcoin_chain_bip21: None,
-            liquid_address: Some("lq1qqexample"),
+            bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
         };
 
         let html = tpl.render().expect("template renders");
@@ -1951,10 +1965,11 @@ mod tests {
             accept_btc: false,
             accept_ln: true,
             accept_liquid: true,
-            bitcoin_address: None,
             bitcoin_chain_address: None,
-            bitcoin_chain_bip21: None,
-            liquid_address: Some("lq1qqexample"),
+            bitcoin_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
         };
 
         let html = tpl.render().expect("template renders");
@@ -1982,18 +1997,20 @@ mod tests {
             accept_btc: false,
             accept_ln: true,
             accept_liquid: true,
-            bitcoin_address: None,
             bitcoin_chain_address: Some("bc1qboltzlockup"),
-            bitcoin_chain_bip21: Some(
+            bitcoin_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(Some("bc1qboltzlockup")).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(Some(
                 "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address",
-            ),
-            liquid_address: Some("lq1qqexample"),
+            ))
+            .unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
         };
 
         let html = tpl.render().expect("template renders");
         assert!(html.contains("id=\"rail-btc\""));
         assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
-        assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000&amp;label=Send%20to%20L-BTC%20address\""));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000\\u0026label=Send%20to%20L-BTC%20address\""));
         assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
         assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS"));
     }

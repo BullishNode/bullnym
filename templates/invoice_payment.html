@@ -302,10 +302,10 @@
             const ACCEPT_BTC = {{ accept_btc }};
             const ACCEPT_LN = {{ accept_ln }};
             const ACCEPT_LIQUID = {{ accept_liquid }};
-            const INITIAL_BITCOIN_ADDRESS = "{% match bitcoin_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
-            const INITIAL_BITCOIN_CHAIN_ADDRESS = "{% match bitcoin_chain_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
-            const INITIAL_BITCOIN_CHAIN_BIP21 = "{% match bitcoin_chain_bip21 %}{% when Some with (u) %}{{ u }}{% when None %}{% endmatch %}";
-            const INITIAL_LIQUID_ADDRESS = "{% match liquid_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
+            const INITIAL_BITCOIN_ADDRESS = {{ bitcoin_address_js|safe }};
+            const INITIAL_BITCOIN_CHAIN_ADDRESS = {{ bitcoin_chain_address_js|safe }};
+            const INITIAL_BITCOIN_CHAIN_BIP21 = {{ bitcoin_chain_bip21_js|safe }};
+            const INITIAL_LIQUID_ADDRESS = {{ liquid_address_js|safe }};
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
             ]);
