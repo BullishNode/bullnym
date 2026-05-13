@@ -234,11 +234,11 @@ async fn apply_action(
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
-            // Phase B step 7: paid-equivalent. Mirror into invoice state.
-            invoice::flip_invoice_on_lightning_settlement(
+            // Confirmed lockup is still settlement-pending. The claimer
+            // records accounting only after our claim succeeds.
+            invoice::flip_invoice_on_lightning_in_progress(
                 pool,
                 swap.invoice_id,
-                swap.amount_sat,
                 &swap.boltz_swap_id,
             )
             .await;
@@ -275,28 +275,21 @@ async fn apply_action(
             tracing::error!(
                 event = "swap_lockup_refunded",
                 swap_id = %swap.boltz_swap_id,
-                nym = %swap.nym,
+                nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                 amount_sat = swap.amount_sat,
                 "FUND LOSS: boltz refunded lockup; user paid LN side, no on-chain claim"
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupRefunded, None).await?;
-            // Phase B step 7: paid-equivalent in the donator's view —
-            // they paid the LN side. Merchant fund-loss is tracked by
-            // the swap_lockup_refunded P0 alert above, NOT invoice state.
-            invoice::flip_invoice_on_lightning_settlement(
-                pool,
-                swap.invoice_id,
-                swap.amount_sat,
-                &swap.boltz_swap_id,
-            )
-            .await;
+            db::mark_invoice_settlement_status(pool, swap.invoice_id, "refunded").await?;
+            // Do not record an invoice payment event. A refunded lockup
+            // is an incident, not merchant-side settlement.
             Ok(())
         }
         NeedsManualAttention(reason) => {
             tracing::error!(
                 event = "reconciler_needs_attention",
                 swap_id = %swap.boltz_swap_id,
-                nym = %swap.nym,
+                nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                 our_status = %swap.status,
                 reason,
                 "reconciler cannot progress this swap; manual intervention required"
@@ -321,7 +314,7 @@ mod tests {
             status: our_status.to_string(),
             cooperative_refused: false,
             claim_txid: None,
-            nym: "alice".to_string(),
+            nym: Some("alice".to_string()),
             amount_sat: 100_000,
             invoice_id: None,
         }

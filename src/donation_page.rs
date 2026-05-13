@@ -6,9 +6,9 @@
 //! - `GET /donation-page/:nym` — public read of current state. Used by
 //!   mobile to populate the editor before save.
 //!
-//! All write actions are authenticated via the existing v1 Schnorr scheme
-//! (`bullpay-la-v1\0<action>\0<npub>\0<fields...>\0<timestamp>`). The mobile
-//! must hold the same Nostr identity that registered the nym; the handler
+//! All write actions are authenticated via the Bullpay Schnorr scheme
+//! (`bullpay-la-v2\0<action>\0<npub>\0<nym>\0<fields...>\0<timestamp>`). The
+//! mobile must hold the same Nostr identity that registered the nym; the handler
 //! looks up the active user by npub and asserts `req.nym == user.nym`
 //! before doing any DB write.
 
@@ -341,8 +341,8 @@ pub async fn archive(
 /// - `signature`   (text, hex Schnorr sig)
 /// - `file`        (binary, JPEG/PNG/WebP, ≤2 MiB)
 ///
-/// Wire format for the v1 message:
-///   bullpay-la-v1\0donation-page-image\0<npub>\0<nym>\0<kind>\0<sha256>\0<timestamp>
+/// Wire format:
+///   bullpay-la-v2\0donation-page-image\0<npub>\0<nym>\0<kind>\0<sha256>\0<timestamp>
 pub async fn upload_image(
     State(state): State<AppState>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,

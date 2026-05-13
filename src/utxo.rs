@@ -123,6 +123,14 @@ pub trait UtxoBackend: Send + Sync {
     /// landing at a nym's next-unused address. (added by chain_watcher)
     async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
 
+    /// Return txids touching this script (mempool + confirmed), newest/oldest
+    /// ordering is backend-defined. Callers must use idempotency keys when
+    /// acting on the returned txs.
+    async fn history_txids(
+        &self,
+        script_pubkey: &elements::Script,
+    ) -> Result<Vec<String>, AppError>;
+
     /// Find the transaction that spends `(txid:vout)` for a known Liquid
     /// script. Used by claim recovery when a rebroadcast says already-spent
     /// but our expected claim txid is absent.
@@ -447,6 +455,30 @@ impl UtxoBackend for ElectrumClient {
         })?;
 
         Ok(!history.is_empty())
+    }
+
+    async fn history_txids(
+        &self,
+        script_pubkey: &elements::Script,
+    ) -> Result<Vec<String>, AppError> {
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
+
+        let state = self.state.clone();
+        let urls = self.urls.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            run_op_blocking(&state, &urls, "scripthash.get_history", |client| {
+                use electrum_client::ElectrumApi;
+                client.raw_call(
+                    "blockchain.scripthash.get_history",
+                    vec![electrum_client::Param::String(scripthash_hex.clone())],
+                )
+            })
+        })
+        .await
+        .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
+        .map_err(|e| AppError::ElectrumError(format!("scripthash.get_history: {e}")))?;
+
+        history_txids(&result)
     }
 
     async fn find_spending_txid(

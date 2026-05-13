@@ -55,6 +55,30 @@ pub fn validate_liquid_mainnet_address(addr: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub fn validate_liquid_blinding_key_matches_address(
+    addr: &str,
+    blinding_key_hex: &str,
+) -> Result<(), AppError> {
+    use lwk_wollet::elements::{secp256k1_zkp, Address};
+
+    let parsed = Address::from_str(addr)
+        .map_err(|e| AppError::InvalidAmount(format!("liquid_address: {e}")))?;
+    let expected = parsed.blinding_pubkey.ok_or_else(|| {
+        AppError::InvalidAmount("liquid_address: must be confidential (blinded)".into())
+    })?;
+    let key = secp256k1_zkp::SecretKey::from_str(blinding_key_hex).map_err(|_| {
+        AppError::InvalidAmount("liquid_blinding_key_hex: invalid secret key".into())
+    })?;
+    let secp = secp256k1_zkp::Secp256k1::new();
+    let actual = key.public_key(&secp);
+    if actual != expected {
+        return Err(AppError::InvalidAmount(
+            "liquid_blinding_key_hex does not match liquid_address".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

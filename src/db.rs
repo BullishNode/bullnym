@@ -459,7 +459,7 @@ pub async fn allocate_address_index(pool: &PgPool, nym: &str) -> Result<Option<i
 // --- Swap records ---
 
 pub struct NewSwapRecord<'a> {
-    pub nym: &'a str,
+    pub nym: Option<&'a str>,
     pub boltz_swap_id: &'a str,
     pub address: Option<&'a str>,
     pub address_index: Option<i32>,
@@ -468,10 +468,9 @@ pub struct NewSwapRecord<'a> {
     pub preimage_hex: &'a str,
     pub claim_key_hex: &'a str,
     pub boltz_response_json: &'a str,
-    /// Set when this swap is the Lightning offer for a specific invoice
-    /// (Phase B). The chain of rate refreshes inserts multiple swaps per
-    /// invoice; the claimer's invoice-flip hook (Phase B step 7) reads
-    /// this column to know which invoice to flip on settlement.
+    /// Set when this swap is the Lightning offer for a specific invoice.
+    /// The claimer records an invoice payment event through this id only
+    /// after merchant-side claim success.
     pub invoice_id: Option<Uuid>,
 }
 
@@ -495,7 +494,9 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     .bind(swap.invoice_id)
     .execute(&mut *tx)
     .await?;
-    mark_user_used(&mut *tx, swap.nym).await?;
+    if let Some(nym) = swap.nym {
+        mark_user_used(&mut *tx, nym).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -525,7 +526,7 @@ pub async fn set_swap_address(
 #[derive(Debug, sqlx::FromRow)]
 pub struct SwapRecord {
     pub id: Uuid,
-    pub nym: String,
+    pub nym: Option<String>,
     pub boltz_swap_id: String,
     pub address: Option<String>,
     pub address_index: Option<i32>,
@@ -560,9 +561,9 @@ pub struct SwapRecord {
     /// or known refusal substrings). Future attempts skip cooperative and
     /// take the script path.
     pub cooperative_refused: bool,
-    /// Phase B: when this swap is the Lightning offer for an invoice, the
-    /// claimer's settlement hook reads this to flip the corresponding
-    /// invoice via `mark_invoice_paid`. NULL for LNURL Lightning Address
+    /// When this swap is the Lightning offer for an invoice, the claimer
+    /// records a payment event against this invoice only after the
+    /// merchant-side claim succeeds. NULL for LNURL Lightning Address
     /// swaps and for legacy donation-page rows.
     pub invoice_id: Option<Uuid>,
     // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
@@ -783,11 +784,11 @@ pub struct ReconcilerSwap {
     pub status: String,
     pub cooperative_refused: bool,
     pub claim_txid: Option<String>,
-    pub nym: String,
+    pub nym: Option<String>,
     pub amount_sat: i64,
-    /// Phase B: when this swap is the Lightning offer for an invoice,
-    /// the reconciler's settlement hook flips the invoice via
-    /// `mark_invoice_paid` after a paid-equivalent CAS succeeds.
+    /// When this swap is the Lightning offer for an invoice, the claimer
+    /// records a payment event against this invoice after merchant-side
+    /// claim success. The reconciler only nudges claim retries.
     pub invoice_id: Option<Uuid>,
 }
 
@@ -1727,6 +1728,9 @@ pub struct Invoice {
     pub status: String,
     pub paid_via: Option<String>,
     pub paid_amount_sat: Option<i64>,
+    pub pricing_mode: String,
+    pub settlement_status: String,
+    pub liquid_blinding_key_hex: Option<String>,
     /// Unix epoch seconds. See section comment above for the timestamp
     /// projection convention.
     pub created_at_unix: i64,
@@ -1747,6 +1751,7 @@ const INVOICE_COLUMNS: &str =
      bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      public_description, invoice_number, \
      liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
+     pricing_mode, settlement_status, liquid_blinding_key_hex, \
      EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
      EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
      EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
@@ -1788,6 +1793,7 @@ pub struct NewInvoice<'a> {
     /// NULL — the address is the chain_watcher's lookup key, not the
     /// descriptor index.
     pub liquid_address: Option<&'a str>,
+    pub liquid_blinding_key_hex: Option<&'a str>,
     /// Wall-clock seconds the invoice stays valid from `now()`.
     pub expires_in_secs: i64,
 }
@@ -1814,12 +1820,13 @@ pub async fn insert_invoice(
              rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
              public_description, invoice_number, \
              accept_btc, accept_ln, accept_liquid, \
-             bitcoin_address, liquid_address, \
+             bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
              expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  NOW() + ($8 || ' seconds')::interval, $9, $10, \
                  $11, $12, $13, $14, $15, $16, $17, \
-                 NOW() + ($18 || ' seconds')::interval) \
+                 CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
+                 NOW() + ($19 || ' seconds')::interval) \
          RETURNING {INVOICE_COLUMNS}"
     ))
     .bind(invoice.nym_owner)
@@ -1839,6 +1846,7 @@ pub async fn insert_invoice(
     .bind(invoice.accept_liquid)
     .bind(invoice.bitcoin_address)
     .bind(invoice.liquid_address)
+    .bind(invoice.liquid_blinding_key_hex)
     .bind(invoice.expires_in_secs)
     .fetch_one(pool)
     .await
@@ -1874,10 +1882,8 @@ pub async fn delete_unpaid_invoice_without_swaps(
 /// List invoices for an npub_owner, newest-first, with optional filters.
 ///
 /// `status_filter`: `Some("unpaid"|"paid"|...)` filters by status;
-/// `None` returns all statuses. `since_unix`: only rows with `created_at
-/// >=` that epoch-second value; `None` skips the time filter. `limit`
-/// caps the result set (caller enforces upper bound; we don't
-/// second-guess here).
+/// `None` returns all statuses. `page` is one-based and `page_size`
+/// is caller-clamped.
 ///
 /// Predicate uses `($p::TYPE IS NULL OR ...)` so the planner can skip the
 /// filter entirely when not provided. The composite index
@@ -1886,29 +1892,29 @@ pub async fn list_invoices_by_npub(
     pool: &PgPool,
     npub_owner: &str,
     status_filter: Option<&str>,
-    since_unix: Option<i64>,
-    limit: i64,
+    page: i64,
+    page_size: i64,
 ) -> Result<Vec<Invoice>, sqlx::Error> {
+    let offset = (page.saturating_sub(1)).saturating_mul(page_size);
     sqlx::query_as::<_, Invoice>(&format!(
         "SELECT {INVOICE_COLUMNS} FROM invoices \
          WHERE npub_owner = $1 \
            AND ($2::TEXT IS NULL OR status = $2) \
-           AND ($3::BIGINT IS NULL OR created_at >= TO_TIMESTAMP($3)) \
          ORDER BY created_at DESC \
-         LIMIT $4"
+         LIMIT $3 OFFSET $4"
     ))
     .bind(npub_owner)
     .bind(status_filter)
-    .bind(since_unix)
-    .bind(limit)
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
 
 /// List unpaid invoices' Liquid addresses for a nym_owner, ordered by
 /// address_index. Returned shape `(invoice_id, address_index, address,
-/// amount_sat)` gives the chain watcher everything it needs to call
-/// `mark_invoice_paid` on a hit without a second round-trip per row.
+/// remaining amount and blinding key) gives the chain watcher everything
+/// it needs to unblind candidate txs and record exact payment events.
 ///
 /// Scoped to the legacy descriptor-allocator path
 /// (`liquid_address_index IS NOT NULL`) — wallet-supplied invoices
@@ -1916,14 +1922,15 @@ pub async fn list_invoices_by_npub(
 pub async fn list_unpaid_invoice_liquid_addresses(
     pool: &PgPool,
     nym_owner: &str,
-) -> Result<Vec<(Uuid, i32, String, i64)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, i32, String, i64)>(
-        "SELECT id, liquid_address_index, liquid_address, amount_sat \
+) -> Result<Vec<(Uuid, i32, String, i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, i32, String, i64, String)>(
+        "SELECT id, liquid_address_index, liquid_address, amount_sat, liquid_blinding_key_hex \
          FROM invoices \
          WHERE nym_owner = $1 \
-           AND status IN ('unpaid', 'in_progress') \
+           AND status IN ('unpaid', 'in_progress', 'partially_paid') \
            AND accept_liquid = TRUE \
            AND liquid_address IS NOT NULL \
+           AND liquid_blinding_key_hex IS NOT NULL \
            AND liquid_address_index IS NOT NULL \
          ORDER BY liquid_address_index ASC",
     )
@@ -1937,23 +1944,23 @@ pub async fn list_unpaid_invoice_liquid_addresses(
 /// linked + unlinked are covered uniformly) and regardless of how the
 /// address was sourced (descriptor allocator OR wallet-supplied).
 ///
-/// `ORDER BY created_at ASC` is the multi-rail defense: in the
-/// vanishingly unlikely event two invoices ever share an address, the
-/// older one wins. `mark_invoice_paid`'s idempotent guard then keeps the
-/// other from also flipping. Bounded by `LIMIT 1000` so a runaway
-/// invoice pipeline can't blow the watcher's per-tick budget; the next
-/// tick re-queries.
+/// `ORDER BY created_at ASC` keeps scans deterministic if a client ever
+/// reuses a wallet-supplied address. Payment events are idempotent by
+/// outpoint, so repeated watcher ticks do not double count. Bounded by
+/// `LIMIT 1000` so a runaway invoice pipeline can't blow the watcher's
+/// per-tick budget; the next tick re-queries.
 ///
 /// Returned shape: `(invoice_id, liquid_address, amount_sat)`.
 pub async fn list_unpaid_invoices_with_liquid_address(
     pool: &PgPool,
-) -> Result<Vec<(Uuid, String, i64)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, String, i64)>(
-        "SELECT id, liquid_address, amount_sat \
+) -> Result<Vec<(Uuid, String, i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, String, i64, String)>(
+        "SELECT id, liquid_address, GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0), liquid_blinding_key_hex \
          FROM invoices \
-         WHERE status IN ('unpaid', 'in_progress') \
+         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') \
            AND accept_liquid = TRUE \
            AND liquid_address IS NOT NULL \
+           AND liquid_blinding_key_hex IS NOT NULL \
            AND expires_at > NOW() \
          ORDER BY created_at ASC \
          LIMIT 1000",
@@ -1962,66 +1969,243 @@ pub async fn list_unpaid_invoices_with_liquid_address(
     .await
 }
 
-/// Idempotent invoice-paid flip. The `WHERE status IN ('unpaid',
-/// 'in_progress')` guard makes a re-call on the same id a no-op (returns
-/// 0 rows affected) once the invoice has reached any terminal status.
-/// Crucially, an `in_progress` row (mempool-seen but not yet confirmed)
-/// can still flip directly to paid/under/over once the confirming tx is
-/// observed — without this widening, the BTC watcher would deadlock its
-/// own state machine. The status is determined server-side from
-/// `paid_amount_sat` vs `amount_sat` so there's no SELECT-then-UPDATE
-/// race; whatever `amount_sat` is at flip-time decides under/over/exact.
-///
-/// `paid_via`: 'lightning' | 'liquid' | 'bitcoin' (validated against the
-/// column-level CHECK in migration 021).
-///
-/// Returns rows_affected: 1 = flip happened; 0 = invoice was already in
-/// a terminal status (paid/under/over/expired/cancelled). 0 is NOT an
-/// error — the caller (webhook/chain-watcher) should treat it as success.
-pub async fn mark_invoice_paid(
+#[derive(Debug, Clone, Copy)]
+pub struct InvoiceAccountingTolerances {
+    pub btc_sat: i64,
+    pub liquid_sat: i64,
+    pub lightning_sat: i64,
+}
+
+impl Default for InvoiceAccountingTolerances {
+    fn default() -> Self {
+        Self {
+            btc_sat: 300,
+            liquid_sat: 60,
+            lightning_sat: 1,
+        }
+    }
+}
+
+impl From<&crate::config::InvoiceAccountingConfig> for InvoiceAccountingTolerances {
+    fn from(cfg: &crate::config::InvoiceAccountingConfig) -> Self {
+        Self {
+            btc_sat: cfg.btc_shortfall_tolerance_sat,
+            liquid_sat: cfg.liquid_shortfall_tolerance_sat,
+            lightning_sat: cfg.lightning_shortfall_tolerance_sat,
+        }
+    }
+}
+
+impl InvoiceAccountingTolerances {
+    fn for_rail(self, rail: &str) -> i64 {
+        match rail {
+            "bitcoin" => self.btc_sat,
+            "liquid" => self.liquid_sat,
+            "lightning" => self.lightning_sat,
+            _ => 0,
+        }
+        .max(0)
+    }
+}
+
+fn payment_tolerance_sat_for_amount(
+    amount_sat: i64,
+    rail: &str,
+    tolerances: InvoiceAccountingTolerances,
+) -> i64 {
+    let one_percent = (amount_sat / 100).max(1);
+    tolerances.for_rail(rail).min(one_percent).max(0)
+}
+
+pub async fn record_invoice_payment(
     pool: &PgPool,
     id: Uuid,
-    paid_amount_sat: i64,
-    paid_via: &str,
+    rail: &str,
+    event_key: &str,
+    amount_sat: i64,
+    tolerances: InvoiceAccountingTolerances,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE invoices SET \
-            status = (CASE \
-                WHEN $2 = amount_sat THEN 'paid' \
-                WHEN $2 <  amount_sat THEN 'underpaid' \
-                ELSE                       'overpaid' \
-            END), \
-            paid_via = $3, \
-            paid_amount_sat = $2, \
-            paid_at = NOW() \
-         WHERE id = $1 AND status IN ('unpaid', 'in_progress')",
+    if amount_sat <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "payment amount_sat must be > 0".into(),
+        ));
+    }
+    if !matches!(rail, "bitcoin" | "liquid" | "lightning") {
+        return Err(sqlx::Error::Protocol(format!(
+            "unknown invoice payment rail: {rail}"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let inv = sqlx::query_as::<_, Invoice>(&format!(
+        "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if inv.status == "cancelled" {
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    let inserted: Option<(Uuid,)> = sqlx::query_as(
+        "INSERT INTO invoice_payment_events \
+            (invoice_id, rail, event_key, amount_sat) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (event_key) DO NOTHING \
+         RETURNING id",
     )
     .bind(id)
-    .bind(paid_amount_sat)
-    .bind(paid_via)
-    .execute(pool)
+    .bind(rail)
+    .bind(event_key)
+    .bind(amount_sat)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected())
+
+    if inserted.is_none() {
+        tx.commit().await?;
+        return Ok(0);
+    }
+
+    let (received_sat,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount_sat), 0)::BIGINT \
+         FROM invoice_payment_events WHERE invoice_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let rails: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT rail FROM invoice_payment_events WHERE invoice_id = $1 ORDER BY rail",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let paid_via = if rails.len() == 1 {
+        rails[0].0.as_str()
+    } else {
+        "mixed"
+    };
+
+    let tolerance_sat = payment_tolerance_sat_for_amount(inv.amount_sat, rail, tolerances);
+    let remaining_sat = inv.amount_sat.saturating_sub(received_sat);
+    let expired = inv.expires_at_unix <= chrono_like_unix_now();
+    let new_status = if received_sat > inv.amount_sat {
+        "overpaid"
+    } else if remaining_sat <= tolerance_sat {
+        "paid"
+    } else if expired {
+        "underpaid"
+    } else {
+        "partially_paid"
+    };
+    let settlement_status = if matches!(new_status, "paid" | "overpaid") {
+        "settled"
+    } else {
+        "none"
+    };
+
+    sqlx::query(
+        "UPDATE invoices SET \
+            status = $2, \
+            paid_via = $3, \
+            paid_amount_sat = $4, \
+            settlement_status = $5, \
+            paid_at = CASE WHEN $2 IN ('paid', 'overpaid') THEN COALESCE(paid_at, NOW()) ELSE paid_at END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(new_status)
+    .bind(paid_via)
+    .bind(received_sat)
+    .bind(settlement_status)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(1)
+}
+
+fn chrono_like_unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Flip an invoice to `in_progress` on the FIRST mempool sighting of a
 /// payment tx (BTC watcher, or the LN claimer's `transaction.mempool`
 /// hook in Step 9). Idempotent under the `WHERE status = 'unpaid'`
 /// guard: a second sighting tick is a no-op (returns 0). Crucially, a
-/// later `mark_invoice_paid` call can still advance an `in_progress`
-/// row to paid/under/over (predicate widened above).
+/// later `record_invoice_payment` call can still advance an
+/// `in_progress` row to paid/under/over.
 ///
 /// Returns rows_affected: 1 = flip happened; 0 = no-op (already
 /// in_progress, paid, expired, cancelled, or row absent).
 pub async fn mark_invoice_in_progress(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE invoices SET status = 'in_progress' \
+        "UPDATE invoices SET status = 'in_progress', settlement_status = 'pending' \
          WHERE id = $1 AND status = 'unpaid'",
     )
     .bind(id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+pub async fn mark_invoice_settlement_status(
+    pool: &PgPool,
+    id: Option<Uuid>,
+    settlement_status: &str,
+) -> Result<u64, sqlx::Error> {
+    let Some(id) = id else {
+        return Ok(0);
+    };
+    if !matches!(
+        settlement_status,
+        "none" | "pending" | "settled" | "claim_stuck" | "refunded" | "failed"
+    ) {
+        return Err(sqlx::Error::Protocol(format!(
+            "unknown invoice settlement_status: {settlement_status}"
+        )));
+    }
+    sqlx::query(
+        "UPDATE invoices SET settlement_status = $2 \
+         WHERE id = $1 AND status NOT IN ('paid', 'underpaid', 'overpaid', 'expired', 'cancelled')",
+    )
+    .bind(id)
+    .bind(settlement_status)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
+pub async fn mark_invoice_settlement_status_for_swap(
+    pool: &PgPool,
+    swap_id: Uuid,
+    settlement_status: &str,
+) -> Result<u64, sqlx::Error> {
+    if !matches!(
+        settlement_status,
+        "none" | "pending" | "settled" | "claim_stuck" | "refunded" | "failed"
+    ) {
+        return Err(sqlx::Error::Protocol(format!(
+            "unknown invoice settlement_status: {settlement_status}"
+        )));
+    }
+    sqlx::query(
+        "UPDATE invoices i SET settlement_status = $2 \
+         FROM swap_records s \
+         WHERE s.id = $1 \
+           AND s.invoice_id = i.id \
+           AND i.status NOT IN ('paid', 'underpaid', 'overpaid', 'expired', 'cancelled')",
+    )
+    .bind(swap_id)
+    .bind(settlement_status)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
 }
 
 /// Cancel an unpaid invoice (recipient-initiated via signed
@@ -2053,43 +2237,12 @@ pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error>
 /// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
 pub async fn expire_invoices_past_deadline(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE invoices SET status = 'expired' \
-         WHERE status IN ('unpaid', 'in_progress') AND expires_at < NOW()",
+        "UPDATE invoices SET status = CASE \
+            WHEN status = 'partially_paid' THEN 'underpaid' \
+            ELSE 'expired' \
+         END \
+         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') AND expires_at < NOW()",
     )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Update an invoice's sat amount + rate after a fiat-denominated rate
-/// refresh. Caller orchestrates: pricer.get_rate → boltz.create_reverse_swap
-/// → record_swap (with invoice_id set) → refresh_invoice_rate. The
-/// `WHERE status = 'unpaid'` guard makes this idempotent under the
-/// concurrent-poll race (two viewers triggering refresh at the same
-/// time). Both swaps land in `swap_records` pointing at this invoice;
-/// either BOLT11 settlement still flips the invoice (lenient policy).
-///
-/// Returns rows_affected: 1 = updated; 0 = invoice no longer unpaid
-/// (paid/cancelled/expired in the meantime).
-pub async fn refresh_invoice_rate(
-    pool: &PgPool,
-    id: Uuid,
-    new_amount_sat: i64,
-    new_rate_minor_per_btc: i64,
-    new_rate_lock_secs: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE invoices SET \
-            amount_sat = $2, \
-            rate_minor_per_btc = $3, \
-            rate_locked_at = NOW(), \
-            rate_locks_until = NOW() + ($4 || ' seconds')::interval \
-         WHERE id = $1 AND status = 'unpaid'",
-    )
-    .bind(id)
-    .bind(new_amount_sat)
-    .bind(new_rate_minor_per_btc)
-    .bind(new_rate_lock_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -2243,9 +2396,9 @@ where
 pub async fn latest_lightning_pr_for_invoice(
     pool: &PgPool,
     invoice_id: Uuid,
-) -> Result<Option<String>, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT invoice FROM swap_records \
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT invoice, amount_sat FROM swap_records \
          WHERE invoice_id = $1 \
          ORDER BY created_at DESC \
          LIMIT 1",
@@ -2253,23 +2406,7 @@ pub async fn latest_lightning_pr_for_invoice(
     .bind(invoice_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(s,)| s))
-}
-
-/// Pure helper: which invoice status should an unpaid invoice flip to,
-/// given the amount actually received? Mirrors the SQL CASE WHEN in
-/// `mark_invoice_paid` exactly. Exposed for handlers/tracing that need
-/// to predict the post-flip status without round-tripping to the DB.
-///
-/// Invariant (tested below): this and the SQL CASE WHEN must stay aligned.
-pub fn invoice_status_after_payment(paid_amount_sat: i64, amount_sat: i64) -> &'static str {
-    if paid_amount_sat == amount_sat {
-        "paid"
-    } else if paid_amount_sat < amount_sat {
-        "underpaid"
-    } else {
-        "overpaid"
-    }
+    Ok(row)
 }
 
 #[cfg(test)]
@@ -2340,38 +2477,5 @@ mod tests {
     #[test]
     fn swap_status_unknown_rejected() {
         assert!("garbage".parse::<SwapStatus>().is_err());
-    }
-
-    // --- Invoice helpers (Phase B) ---
-
-    #[test]
-    fn invoice_status_paid_exact() {
-        assert_eq!(invoice_status_after_payment(5000, 5000), "paid");
-        assert_eq!(invoice_status_after_payment(1, 1), "paid");
-    }
-
-    #[test]
-    fn invoice_status_underpaid() {
-        assert_eq!(invoice_status_after_payment(4999, 5000), "underpaid");
-        assert_eq!(invoice_status_after_payment(0, 5000), "underpaid");
-    }
-
-    #[test]
-    fn invoice_status_overpaid() {
-        assert_eq!(invoice_status_after_payment(5001, 5000), "overpaid");
-        assert_eq!(invoice_status_after_payment(i64::MAX, 5000), "overpaid");
-    }
-
-    /// The Rust helper and the SQL CASE WHEN in `mark_invoice_paid` must
-    /// agree on every boundary. If you change one, change the other.
-    /// This test documents the boundaries; the SQL itself is verified at
-    /// query-execution time and via integration tests.
-    #[test]
-    fn invoice_status_boundaries() {
-        // Boundary at amount_sat: equal → paid; below → underpaid;
-        // above → overpaid. Cross at exactly amount_sat == paid.
-        assert_eq!(invoice_status_after_payment(99, 100), "underpaid");
-        assert_eq!(invoice_status_after_payment(100, 100), "paid");
-        assert_eq!(invoice_status_after_payment(101, 100), "overpaid");
     }
 }

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use std::str::FromStr;
 
+use elements::encode::deserialize;
 use lwk_wollet::elements;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -76,6 +77,7 @@ pub async fn run(
     rate_limiter: Arc<RateLimiter>,
     cancel: CancellationToken,
     cfg: ChainWatcherConfig,
+    tolerances: db::InvoiceAccountingTolerances,
 ) {
     let mut active_tick = tokio::time::interval(Duration::from_secs(cfg.active_tick_secs));
     let mut idle_tick = tokio::time::interval(Duration::from_secs(cfg.idle_tick_secs));
@@ -105,12 +107,12 @@ pub async fn run(
                 };
                 if let Err(e) = poll_nyms(
                     &pool, backend.as_ref(), rate_limiter.as_ref(),
-                    cfg.lookahead, nyms, &cancel, "active",
+                    cfg.lookahead, tolerances, nyms, &cancel, "active",
                 ).await {
                     tracing::warn!("chain_watcher active poll failed: {e:?}");
                 }
                 poll_invoice_addresses(
-                    &pool, backend.as_ref(), rate_limiter.as_ref(), &cancel, "active",
+                    &pool, backend.as_ref(), rate_limiter.as_ref(), tolerances, &cancel, "active",
                 ).await;
             }
             _ = idle_tick.tick() => {
@@ -125,12 +127,12 @@ pub async fn run(
                 };
                 if let Err(e) = poll_nyms(
                     &pool, backend.as_ref(), rate_limiter.as_ref(),
-                    cfg.lookahead, nyms, &cancel, "idle",
+                    cfg.lookahead, tolerances, nyms, &cancel, "idle",
                 ).await {
                     tracing::warn!("chain_watcher idle poll failed: {e:?}");
                 }
                 poll_invoice_addresses(
-                    &pool, backend.as_ref(), rate_limiter.as_ref(), &cancel, "idle",
+                    &pool, backend.as_ref(), rate_limiter.as_ref(), tolerances, &cancel, "idle",
                 ).await;
             }
         }
@@ -140,19 +142,17 @@ pub async fn run(
 /// Address-keyed scan for invoices' Liquid destinations. Single SQL
 /// query catches both linked and unlinked invoices; both descriptor-
 /// allocated (legacy) and wallet-supplied (new) addresses; running
-/// alongside the per-nym lookahead in `poll_nyms` (mark_invoice_paid is
-/// idempotent so the redundant catch in the legacy descriptor case is
-/// harmless).
+/// alongside the per-nym lookahead in `poll_nyms`. Payment events are
+/// idempotent by outpoint, so the redundant catch in the legacy
+/// descriptor case is harmless.
 ///
-/// Lenient v1 policy for Liquid: a single observed `has_history=true`
-/// flips the row directly to `paid` with `paid_amount_sat = amount_sat`.
-/// Proper txout-sum inspection (under/overpaid via Liquid) is deferred —
-/// the BTC watcher (Step 7) and Lightning claimer carry actual sat
-/// amounts so under/overpaid surfaces correctly via those rails.
+/// Direct Liquid accounting: inspect raw tx outputs, unblind outputs that
+/// match the invoice script, and record exact LBTC amounts idempotently.
 async fn poll_invoice_addresses(
     pool: &PgPool,
     backend: &(dyn UtxoBackend + Send + Sync),
     rate_limiter: &RateLimiter,
+    tolerances: db::InvoiceAccountingTolerances,
     cancel: &CancellationToken,
     tier: &'static str,
 ) {
@@ -169,7 +169,7 @@ async fn poll_invoice_addresses(
     }
     let started = std::time::Instant::now();
     let mut hits = 0usize;
-    for (invoice_id, address, amount_sat) in invoices {
+    for (invoice_id, address, _remaining_minor, blinding_key_hex) in invoices {
         if cancel.is_cancelled() {
             return;
         }
@@ -196,32 +196,21 @@ async fn poll_invoice_addresses(
         };
         let script = parsed.script_pubkey();
 
-        match backend.has_history(&script).await {
-            Ok(true) => match db::mark_invoice_paid(pool, invoice_id, amount_sat, "liquid").await {
-                Ok(rows) if rows > 0 => {
-                    hits += 1;
-                    tracing::info!(
-                        event = "invoice_paid_via_liquid_addr_scan",
-                        invoice_id = %invoice_id,
-                        amount_sat = amount_sat,
-                        "chain_watcher: invoice Liquid address observed paid"
-                    );
-                }
-                Ok(_) => {
-                    // Already terminal — race with another flip path. No-op.
-                }
-                Err(e) => {
-                    tracing::error!(
-                        invoice_id = %invoice_id,
-                        "chain_watcher: mark_invoice_paid failed: {e}"
-                    );
-                }
-            },
-            Ok(false) => {}
+        match record_liquid_events_for_script(
+            pool,
+            backend,
+            invoice_id,
+            &script,
+            &blinding_key_hex,
+            tolerances,
+        )
+        .await
+        {
+            Ok(n) => hits += n,
             Err(e) => {
                 tracing::warn!(
                     invoice_id = %invoice_id,
-                    "chain_watcher: invoice has_history failed: {e}"
+                    "chain_watcher: invoice Liquid output scan failed: {e}"
                 );
             }
         }
@@ -250,11 +239,92 @@ async fn poll_invoice_addresses(
     }
 }
 
+async fn record_liquid_events_for_script(
+    pool: &PgPool,
+    backend: &(dyn UtxoBackend + Send + Sync),
+    invoice_id: uuid::Uuid,
+    script: &elements::Script,
+    blinding_key_hex: &str,
+    tolerances: db::InvoiceAccountingTolerances,
+) -> Result<usize, AppError> {
+    let blinding_key = elements::secp256k1_zkp::SecretKey::from_str(blinding_key_hex)
+        .map_err(|e| AppError::InvalidAmount(format!("stored Liquid blinding key invalid: {e}")))?;
+    let txids = backend.history_txids(script).await?;
+    if txids.is_empty() {
+        return Ok(0);
+    }
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut recorded = 0usize;
+    for txid in txids {
+        let raw = backend.get_raw_tx(&txid).await?;
+        let tx: elements::Transaction = deserialize(&raw)
+            .map_err(|e| AppError::ElectrumError(format!("liquid tx decode: {e}")))?;
+        for (vout, txout) in tx.output.iter().enumerate() {
+            if &txout.script_pubkey != script {
+                continue;
+            }
+            let secrets = match txout.unblind(&secp, blinding_key) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(
+                        invoice_id = %invoice_id,
+                        txid = %txid,
+                        vout = vout,
+                        "chain_watcher: matching Liquid output did not unblind: {e}"
+                    );
+                    continue;
+                }
+            };
+            if secrets.asset != elements::AssetId::LIQUID_BTC {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    txid = %txid,
+                    vout = vout,
+                    asset = %secrets.asset,
+                    "chain_watcher: ignoring non-LBTC Liquid invoice output"
+                );
+                continue;
+            }
+            let amount_sat = i64::try_from(secrets.value)
+                .map_err(|_| AppError::InvalidAmount("Liquid output amount overflow".into()))?;
+            let event_key = format!("liquid_direct:{txid}:{vout}");
+            match db::record_invoice_payment(
+                pool, invoice_id, "liquid", &event_key, amount_sat, tolerances,
+            )
+            .await
+            {
+                Ok(rows) if rows > 0 => {
+                    recorded += 1;
+                    tracing::info!(
+                        event = "invoice_payment_event_liquid",
+                        invoice_id = %invoice_id,
+                        txid = %txid,
+                        vout = vout,
+                        amount_sat = amount_sat,
+                        "chain_watcher: recorded Liquid invoice payment event"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        invoice_id = %invoice_id,
+                        txid = %txid,
+                        vout = vout,
+                        "chain_watcher: record_invoice_payment failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(recorded)
+}
+
 async fn poll_nyms(
     pool: &PgPool,
     backend: &(dyn UtxoBackend + Send + Sync),
     rate_limiter: &RateLimiter,
     lookahead: u32,
+    tolerances: db::InvoiceAccountingTolerances,
     nyms: Vec<db::ActiveNymForWatcher>,
     cancel: &CancellationToken,
     tier: &'static str,
@@ -266,24 +336,6 @@ async fn poll_nyms(
             return Ok(());
         }
 
-        // Phase B replacement of the Phase 4 donation_allocations scan.
-        // Scan UNPAID invoice Liquid addresses first. The address-allocation
-        // race the donation_allocations scan was solving is identical
-        // for invoices: `allocate_invoice_liquid_address` bumps
-        // `users.next_addr_idx` past the just-allocated index, so the
-        // lookahead loop below would skip invoice addresses forever.
-        // We compensate by scanning invoices directly. Each row carries
-        // its own `liquid_address` (no re-derivation needed) and
-        // `amount_sat` (so `mark_invoice_paid` lands the right state
-        // without a second round-trip).
-        //
-        // Lenient policy: the chain watcher reports `paid_amount_sat ==
-        // amount_sat` (i.e. always 'paid', never 'underpaid'/'overpaid'
-        // via this path). Proper amount inspection (Liquid txout sum)
-        // arrives later; for v1 a single-conf tx at the address is
-        // treated as exact-amount payment. Lightning settlement (via
-        // claimer) carries the actual sat amount and DOES surface
-        // under/overpaid correctly.
         let unpaid_invoices = match db::list_unpaid_invoice_liquid_addresses(pool, &n.nym).await {
             Ok(v) => v,
             Err(e) => {
@@ -294,7 +346,9 @@ async fn poll_nyms(
                 Vec::new()
             }
         };
-        for (invoice_id, addr_index, _address, amount_sat) in &unpaid_invoices {
+        for (invoice_id, addr_index, _address, _remaining_minor, blinding_key_hex) in
+            &unpaid_invoices
+        {
             if cancel.is_cancelled() {
                 return Ok(());
             }
@@ -316,25 +370,20 @@ async fn poll_nyms(
                     continue;
                 }
             };
-            match backend.has_history(&script).await {
-                Ok(true) => {
-                    let marked =
-                        db::mark_invoice_paid(pool, *invoice_id, *amount_sat, "liquid").await?;
-                    if marked > 0 {
-                        tracing::info!(
-                            event = "invoice_paid_observed",
-                            nym = %n.nym,
-                            invoice_id = %invoice_id,
-                            addr_index = idx,
-                            amount_sat = amount_sat,
-                            "chain_watcher: invoice Liquid address observed paid"
-                        );
-                    }
-                }
-                Ok(false) => {}
+            match record_liquid_events_for_script(
+                pool,
+                backend,
+                *invoice_id,
+                &script,
+                blinding_key_hex,
+                tolerances,
+            )
+            .await
+            {
+                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(
-                        "chain_watcher: invoice has_history failed for nym={} idx={}: {e}",
+                        "chain_watcher: invoice Liquid output scan failed for nym={} idx={}: {e}",
                         n.nym,
                         idx
                     );

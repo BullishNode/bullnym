@@ -1,8 +1,9 @@
 <!DOCTYPE html>
-{# Phase B step 9: invoice payment view. Renders the initial state from
+{# Invoice payment view. Renders the initial state from
    the server-side `Invoice` row and lets the client JS poll
    `/api/v1/invoices/<id>/status` to drive transitions. All six statuses
-   are handled (unpaid / paid / underpaid / overpaid / expired / cancelled).
+   are handled (unpaid / in_progress / partially_paid / paid / underpaid /
+   overpaid / expired / cancelled).
    Askama auto-escapes every `{{ }}` interpolation; `|safe` is forbidden
    on user-controlled fields. #}
 <html lang="en">
@@ -179,7 +180,7 @@
 
         {# Accepted-rails badge. The QR/copy card below reveals only the
            currently selected rail, defaulting to Lightning when available. #}
-        {% if status == "unpaid" || status == "in_progress" %}
+        {% if status == "unpaid" || (status == "partially_paid" && settlement_status != "pending" && settlement_status != "claim_stuck" && settlement_status != "refunded") %}
             <div class="meta">
                 Accepted:
                 {% if accept_btc %}<span>BTC</span>{% endif %}
@@ -193,11 +194,13 @@
                transitions; for the unpaid case the JS also drives QR/rail
                toggle. For terminal cases, JS polling continues briefly to
                capture late settlements but mostly just confirms state. #}
-            {% if status == "unpaid" || status == "in_progress" %}
+            {% if status == "unpaid" || (status == "partially_paid" && settlement_status != "pending" && settlement_status != "claim_stuck" && settlement_status != "refunded") %}
                 <div class="status-line status-unpaid" id="status-line">
-                    {% if status == "in_progress" %}Payment detected…{% else %}Waiting for payment…{% endif %}
+                    {% if status == "partially_paid" %}Partially paid — remaining amount due{% else %}Waiting for payment…{% endif %}
                 </div>
-                <div class="amount" id="amount-display">{{ amount_sat }} sat</div>
+                <div class="amount" id="amount-display">
+                    {% if status == "partially_paid" %}{{ remaining_amount_sat }} sat remaining{% else %}{{ amount_sat }} sat{% endif %}
+                </div>
                 {% match fiat_display %}
                     {% when Some with (s) %}
                         <div class="meta">≈ {{ s }} (locked at create)</div>
@@ -220,6 +223,24 @@
                 </div>
 
                 <div class="countdown" id="countdown">…</div>
+            {% else if status == "in_progress" || settlement_status == "pending" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-unpaid">…</div>
+                    <div class="status-line status-unpaid">Payment detected</div>
+                    <div class="meta">Confirming settlement.</div>
+                </div>
+            {% else if settlement_status == "claim_stuck" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Payment needs review</div>
+                    <div class="meta">Settlement is delayed. The operator has been alerted.</div>
+                </div>
+            {% else if settlement_status == "refunded" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-err">!</div>
+                    <div class="status-line status-err">Settlement failed</div>
+                    <div class="meta">The payment could not be settled.</div>
+                </div>
             {% else if status == "paid" %}
                 <div class="terminal-block">
                     <div class="terminal-icon status-paid">✓</div>
@@ -261,8 +282,6 @@
     </main>
 
     <script>
-        // Phase B step 9: invoice payment view JS.
-        //
         // Single state machine driven by polling /api/v1/invoices/<id>/status
         // every 3s. The page re-renders on status changes, fetches the
         // appropriate payload (Lightning via the /lightning endpoint, BTC
@@ -288,10 +307,6 @@
                 // Already terminal — no polling needed.
                 return;
             }
-            // is_fiat: true ⇒ rate refresh window applies; false (sat-denom)
-            // ⇒ never refreshes, only the outer expires_at countdown.
-            const IS_FIAT = {{ is_fiat }};
-
             const statusLine = document.getElementById('status-line');
             const amountDisplay = document.getElementById('amount-display');
             const railLightning = document.getElementById('rail-lightning');
@@ -306,10 +321,9 @@
             let currentLightningPr = null;
             let currentBitcoinAddress = INITIAL_BITCOIN_ADDRESS || null;
             let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
-            let currentAmountSat = {{ amount_sat }};
-            let currentRateLocksUntilUnix = 0;
+            const targetAmountSat = {{ amount_sat }};
+            let currentAmountSat = {{ remaining_amount_sat }};
             let currentExpiresAtUnix = 0;
-            let currentRateStale = false;
 
             function btcUri(address, amountSat) {
                 const btc = (amountSat / SAT_PER_BTC).toFixed(8);
@@ -346,7 +360,7 @@
                 if (rail === 'lightning') {
                     if (currentLightningPr) {
                         setQrPayload(currentLightningPr);
-                    } else if (initialStatus === 'unpaid') {
+                    } else if (root.dataset.status === 'unpaid' || root.dataset.status === 'partially_paid') {
                         clearQr('Loading Lightning offer…');
                         fetchLightning();
                     } else {
@@ -414,17 +428,7 @@
 
             function refreshCountdown() {
                 if (TERMINAL_STATUSES.has(root.dataset.status)) return;
-                if (currentRateStale) {
-                    countdown.innerHTML = '<span class="stale">rate may be stale</span>';
-                } else if (IS_FIAT && currentRateLocksUntilUnix > 0) {
-                    // Fiat-denominated only: show rate-refresh countdown.
-                    // Sat-denominated invoices don't have a rate to refresh,
-                    // so we fall through to the outer expires countdown.
-                    countdown.textContent = formatCountdown(
-                        currentRateLocksUntilUnix,
-                        'rate refreshes'
-                    );
-                } else if (currentExpiresAtUnix > 0) {
+                if (currentExpiresAtUnix > 0) {
                     countdown.textContent = formatCountdown(
                         currentExpiresAtUnix,
                         'expires'
@@ -441,15 +445,15 @@
                 if (status === 'paid') {
                     icon = '✓'; cls = 'status-paid';
                     title = 'Paid';
-                    detail = `${paidAmountSat || currentAmountSat} sat${paidVia ? ' via ' + paidVia : ''}`;
+                    detail = `${paidAmountSat || targetAmountSat} sat${paidVia ? ' via ' + paidVia : ''}`;
                 } else if (status === 'underpaid') {
                     icon = '!'; cls = 'status-warn';
                     title = 'Underpaid';
-                    detail = `Expected ${currentAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
+                    detail = `Expected ${targetAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
                 } else if (status === 'overpaid') {
                     icon = '!'; cls = 'status-warn';
                     title = 'Overpaid';
-                    detail = `Expected ${currentAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
+                    detail = `Expected ${targetAmountSat} sat${paidAmountSat != null ? ', got ' + paidAmountSat + ' sat' : ''}`;
                 } else if (status === 'expired') {
                     icon = '×'; cls = 'status-err';
                     title = 'Expired';
@@ -475,6 +479,36 @@
                 }
             }
 
+            function renderPartiallyPaidState() {
+                root.dataset.status = 'partially_paid';
+                if (statusLine) {
+                    statusLine.textContent = 'Partially paid — remaining amount due';
+                }
+            }
+
+            function renderPendingSettlementState() {
+                root.dataset.status = 'in_progress';
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon status-unpaid">…</div>
+                        <div class="status-line status-unpaid">Payment detected</div>
+                        <div class="meta">Confirming settlement.</div>
+                    </div>
+                `;
+            }
+
+            function renderSettlementIncidentState(kind) {
+                const refunded = kind === 'refunded';
+                root.dataset.status = kind;
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon ${refunded ? 'status-err' : 'status-warn'}">!</div>
+                        <div class="status-line ${refunded ? 'status-err' : 'status-warn'}">${refunded ? 'Settlement failed' : 'Payment needs review'}</div>
+                        <div class="meta">${refunded ? 'The payment could not be settled.' : 'Settlement is delayed. The operator has been alerted.'}</div>
+                    </div>
+                `;
+            }
+
             async function pollStatus() {
                 try {
                     const res = await fetch(
@@ -483,10 +517,8 @@
                     const data = await res.json();
                     if (data.status === 'ERROR') return;
 
-                    currentAmountSat = data.amount_sat;
-                    currentRateLocksUntilUnix = data.rate_locks_until_unix || 0;
+                    currentAmountSat = data.remaining_amount_sat ?? data.amount_sat;
                     currentExpiresAtUnix = data.expires_at_unix || 0;
-                    currentRateStale = !!data.rate_stale;
                     if (TERMINAL_STATUSES.has(data.status)) {
                         renderTerminalView(
                             data.status,
@@ -495,9 +527,22 @@
                         );
                         return;
                     }
+                    if (data.settlement_status === 'pending') {
+                        renderPendingSettlementState();
+                        return;
+                    }
+                    if (data.settlement_status === 'claim_stuck' || data.settlement_status === 'refunded') {
+                        renderSettlementIncidentState(data.settlement_status);
+                        return;
+                    }
                     if (data.status === 'in_progress') {
                         if (root.dataset.status !== 'in_progress') {
                             renderInProgressState();
+                        }
+                    }
+                    if (data.status === 'partially_paid') {
+                        if (root.dataset.status !== 'partially_paid') {
+                            renderPartiallyPaidState();
                         }
                     }
                     if (data.lightning_pr && data.lightning_pr !== currentLightningPr) {
@@ -519,7 +564,9 @@
                         }
                     }
                     if (amountDisplay) {
-                        amountDisplay.textContent = `${currentAmountSat} sat`;
+                        amountDisplay.textContent = data.status === 'partially_paid'
+                            ? `${currentAmountSat} sat remaining`
+                            : `${currentAmountSat} sat`;
                     }
                 } catch (e) {
                     // Network blip — keep polling.

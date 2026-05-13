@@ -220,27 +220,15 @@ async fn dispatch_webhook(
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Get-paid Step 9: mempool sighting → invoice `in_progress`
-            // (early signal that the donator's HTLC has been routed).
-            // Confirmed sighting → invoice `paid` (settlement). Both
-            // helpers are idempotent + error-swallowing per their
-            // contracts; the swap CAS has already committed above.
-            if is_mempool {
-                invoice::flip_invoice_on_lightning_in_progress(
-                    &state.db,
-                    swap.invoice_id,
-                    &swap.boltz_swap_id,
-                )
-                .await;
-            } else {
-                invoice::flip_invoice_on_lightning_settlement(
-                    &state.db,
-                    swap.invoice_id,
-                    swap.amount_sat,
-                    &swap.boltz_swap_id,
-                )
-                .await;
-            }
+            // Lockup sightings are only payment evidence. They may show
+            // the public page as "payment detected", but accounting is
+            // recorded only after our claim succeeds below.
+            invoice::flip_invoice_on_lightning_in_progress(
+                &state.db,
+                swap.invoice_id,
+                &swap.boltz_swap_id,
+            )
+            .await;
 
             try_claim_with_retry(
                 &state.db,
@@ -249,6 +237,7 @@ async fn dispatch_webhook(
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
+                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
             )
             .await;
         }
@@ -318,24 +307,19 @@ async fn dispatch_webhook(
             tracing::error!(
                 event = "swap_lockup_refunded",
                 swap_id = %data.id,
-                nym = %swap.nym,
+                nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
                 amount_sat = swap.amount_sat,
                 "FUND LOSS: boltz refunded lockup; user paid LN side, no on-chain claim"
             );
             db::update_swap_status(&state.db, swap.id, SwapStatus::LockupRefunded, None)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
+            db::mark_invoice_settlement_status(&state.db, swap.invoice_id, "refunded")
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
 
-            // Phase B step 7: paid-equivalent — donator paid the LN
-            // side. The merchant fund-loss is tracked by the
-            // `swap_lockup_refunded` P0 alert (above), NOT invoice state.
-            invoice::flip_invoice_on_lightning_settlement(
-                &state.db,
-                swap.invoice_id,
-                swap.amount_sat,
-                &swap.boltz_swap_id,
-            )
-            .await;
+            // Do not record an invoice payment event here. A refunded
+            // lockup means the merchant-side claim did not settle.
         }
         _ => {
             // Other Boltz statuses (`swap.created`, `minerfee.paid`, etc.)
@@ -381,6 +365,7 @@ async fn try_claim_with_retry(
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) {
     match claim_swap(
         pool,
@@ -389,6 +374,7 @@ async fn try_claim_with_retry(
         boltz_url,
         max_claim_attempts,
         utxo_backend,
+        tolerances,
     )
     .await
     {
@@ -504,24 +490,31 @@ async fn resolve_claim_address(
     //     swaps exist (see db.rs:359), and it sets `ct_descriptor = ''`
     //     which would surface as a derive failure here, so a purged-row
     //     corner case fails loudly rather than silently strands.
-    let user = db::get_user_by_nym(pool, &swap.nym)
+    let nym = swap.nym.as_deref().ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "swap {} has no nym and no invoice claim destination",
+            swap.id
+        ))
+    })?;
+
+    let user = db::get_user_by_nym(pool, nym)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| AppError::ClaimError(format!("user not found: {}", swap.nym)))?;
+        .ok_or_else(|| AppError::ClaimError(format!("user not found: {nym}")))?;
 
     let addr_index_row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
          WHERE nym = $1 \
          RETURNING next_addr_idx - 1",
     )
-    .bind(&swap.nym)
+    .bind(nym)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let addr_index = addr_index_row
         .map(|(idx,)| idx)
-        .ok_or_else(|| AppError::ClaimError(format!("address allocation failed: {}", swap.nym)))?;
+        .ok_or_else(|| AppError::ClaimError(format!("address allocation failed: {nym}")))?;
 
     let addr_index_u32 = u32::try_from(addr_index)
         .map_err(|_| AppError::ClaimError("address index overflow".to_string()))?;
@@ -541,7 +534,7 @@ async fn resolve_claim_address(
 
     tracing::info!(
         event = "lightning_swap_address_allocated_at_claim",
-        nym = %swap.nym,
+        nym = %nym,
         swap_id = %swap.id,
         address_index = addr_index,
         "claim-time descriptor allocation"
@@ -593,12 +586,21 @@ async fn claim_swap(
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
     // Outer wrapper: records every Err uniformly via
     // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
     // are Ok variants and do NOT count as failures (no attempt was
     // really made).
-    let result = claim_swap_inner(pool, swap_id, electrum_url, boltz_url, utxo_backend).await;
+    let result = claim_swap_inner(
+        pool,
+        swap_id,
+        electrum_url,
+        boltz_url,
+        utxo_backend,
+        tolerances,
+    )
+    .await;
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
@@ -610,19 +612,17 @@ async fn claim_swap(
                     last_error = %err_str,
                     "swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
-                // Phase B step 7: paid-equivalent — donator paid the LN
-                // side; merchant-side claim is stuck. Surface to the
-                // donator's invoice view as 'paid'. Operator-facing
-                // tracking lives on the swap_claim_stuck alert above,
-                // not in invoice state.
-                if let Ok(Some(swap)) = db::get_swap_by_id(pool, swap_id).await {
-                    invoice::flip_invoice_on_lightning_settlement(
-                        pool,
-                        swap.invoice_id,
-                        swap.amount_sat,
-                        &swap.boltz_swap_id,
-                    )
-                    .await;
+                // Do not record invoice payment here. `claim_stuck`
+                // requires operator recovery; the customer-facing
+                // invoice can remain payment-detected until recovered.
+                if let Err(e) =
+                    db::mark_invoice_settlement_status_for_swap(pool, swap_id, "claim_stuck").await
+                {
+                    tracing::error!(
+                        event = "invoice_claim_stuck_mark_failed",
+                        swap_id = %swap_id,
+                        "failed to mark invoice settlement_status=claim_stuck: {e}"
+                    );
                 }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
@@ -656,6 +656,7 @@ async fn claim_swap_inner(
     electrum_url: &str,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
     // ----- Phase 1: acquire single-flight, prepare the claim tx.
     let mut tx = pool
@@ -879,21 +880,28 @@ async fn claim_swap_inner(
     db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    if let Err(e) = db::mark_invoice_settlement_status(pool, swap.invoice_id, "settled").await {
+        tracing::warn!(
+            event = "invoice_settlement_status_mark_failed",
+            swap_id = %swap.boltz_swap_id,
+            "failed to mark invoice settlement_status=settled: {e}"
+        );
+    }
     if let Err(e) = db::clear_claim_failure_state(pool, swap.id).await {
         // Non-fatal: row is Claimed; stale last-error fields are an
         // observability nuisance only.
         tracing::warn!("clear_claim_failure_state for {}: {e}", swap.boltz_swap_id);
     }
 
-    // Phase B step 7: paid-equivalent (terminal happy path). Mirror into
-    // invoice state. The chain_watcher's Liquid-side flip and this
-    // Lightning-side flip are mutually idempotent at the invoice level
-    // (mark_invoice_paid's `WHERE status = 'unpaid'` predicate).
+    // Merchant-side claim succeeded. This is the Lightning accounting
+    // boundary; lockup confirmation, refund, and claim-stuck states do
+    // not record invoice payment events.
     invoice::flip_invoice_on_lightning_settlement(
         pool,
         swap.invoice_id,
         swap.amount_sat,
         &swap.boltz_swap_id,
+        tolerances,
     )
     .await;
 
@@ -1215,6 +1223,13 @@ mod tests {
             Ok(false)
         }
 
+        async fn history_txids(
+            &self,
+            _script_pubkey: &elements::Script,
+        ) -> Result<Vec<String>, AppError> {
+            Ok(Vec::new())
+        }
+
         async fn find_spending_txid(
             &self,
             _script_pubkey: &elements::Script,
@@ -1386,6 +1401,7 @@ pub fn spawn_background_claimer(
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),
+                        db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
                     )
                     .await
                     {
