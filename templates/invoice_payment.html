@@ -304,6 +304,7 @@
             const ACCEPT_LIQUID = {{ accept_liquid }};
             const INITIAL_BITCOIN_ADDRESS = "{% match bitcoin_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
             const INITIAL_BITCOIN_CHAIN_ADDRESS = "{% match bitcoin_chain_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
+            const INITIAL_BITCOIN_CHAIN_BIP21 = "{% match bitcoin_chain_bip21 %}{% when Some with (u) %}{{ u }}{% when None %}{% endmatch %}";
             const INITIAL_LIQUID_ADDRESS = "{% match liquid_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
@@ -328,6 +329,7 @@
             let currentRail = ACCEPT_LN ? 'lightning' : ((ACCEPT_BTC || INITIAL_BITCOIN_CHAIN_ADDRESS) ? 'bitcoin' : 'liquid');
             let currentLightningPr = null;
             let currentBitcoinAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS || null;
+            let currentBitcoinBip21 = INITIAL_BITCOIN_CHAIN_BIP21 || null;
             let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
@@ -336,6 +338,10 @@
             function btcUri(address, amountSat) {
                 const btc = (amountSat / SAT_PER_BTC).toFixed(8);
                 return `bitcoin:${address}?amount=${btc}`;
+            }
+
+            function bitcoinPayload(address, bip21, amountSat) {
+                return bip21 || btcUri(address, amountSat);
             }
 
             function liquidUri(address, amountSat) {
@@ -376,7 +382,7 @@
                     }
                 } else if (rail === 'bitcoin') {
                     if (currentBitcoinAddress) {
-                        setQrPayload(btcUri(currentBitcoinAddress, currentAmountSat));
+                        setQrPayload(bitcoinPayload(currentBitcoinAddress, currentBitcoinBip21, currentAmountSat));
                     } else {
                         clearQr('Bitcoin address unavailable');
                     }
@@ -575,10 +581,17 @@
                         }
                     }
                     const nextBitcoinAddress = data.bitcoin_chain_address || data.bitcoin_address;
+                    const nextBitcoinBip21 = data.bitcoin_chain_bip21 || null;
+                    if (nextBitcoinBip21 !== currentBitcoinBip21) {
+                        currentBitcoinBip21 = nextBitcoinBip21;
+                        if (currentRail === 'bitcoin' && currentBitcoinAddress) {
+                            setQrPayload(bitcoinPayload(currentBitcoinAddress, currentBitcoinBip21, currentAmountSat));
+                        }
+                    }
                     if (nextBitcoinAddress && nextBitcoinAddress !== currentBitcoinAddress) {
                         currentBitcoinAddress = nextBitcoinAddress;
                         if (currentRail === 'bitcoin') {
-                            setQrPayload(btcUri(nextBitcoinAddress, currentAmountSat));
+                            setQrPayload(bitcoinPayload(nextBitcoinAddress, currentBitcoinBip21, currentAmountSat));
                         }
                     }
                     if (amountDisplay) {
