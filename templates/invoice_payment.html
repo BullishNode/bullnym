@@ -550,6 +550,15 @@
                         if (currentRail === 'lightning') {
                             setQrPayload(currentLightningPr);
                         }
+                    } else if (
+                        ACCEPT_LN &&
+                        !data.lightning_pr &&
+                        currentRail === 'lightning' &&
+                        (data.status === 'unpaid' || data.status === 'partially_paid')
+                    ) {
+                        currentLightningPr = null;
+                        clearQr('Refreshing Lightning offer…');
+                        fetchLightning();
                     }
                     if (data.liquid_address && data.liquid_address !== currentLiquidAddress) {
                         currentLiquidAddress = data.liquid_address;

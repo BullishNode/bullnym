@@ -677,16 +677,7 @@ pub async fn status(
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
 
-    let lightning_pr = match ensure_reusable_lightning_offer(&state, &inv).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            tracing::warn!(
-                invoice_id = %inv.id,
-                "failed to refresh lightning offer for status response: {e}"
-            );
-            None
-        }
-    };
+    let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
 
     let remaining_sat = remaining_amount_sat(&inv);
     let tolerance_sat = payment_tolerance_sat(
@@ -850,6 +841,35 @@ async fn ensure_reusable_lightning_offer(
     }
 
     result
+}
+
+/// Read-only counterpart to `ensure_reusable_lightning_offer`.
+///
+/// Status polling must not create Boltz swaps. It may return the latest
+/// still-payable BOLT11, but if the latest offer is expired, the wrong
+/// amount, or absent, callers must explicitly hit
+/// `POST /api/v1/invoices/:id/lightning` to create/refresh the offer.
+async fn latest_reusable_lightning_offer(
+    pool: &sqlx::PgPool,
+    inv: &db::Invoice,
+) -> Result<Option<String>, AppError> {
+    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") || !inv.accept_ln {
+        return Ok(None);
+    }
+
+    let amount_sat = remaining_amount_sat(inv);
+    if amount_sat <= 0 || inv.expires_at_unix <= unix_now() {
+        return Ok(None);
+    }
+
+    let Some((pr, pr_amount_sat)) = db::latest_lightning_pr_for_invoice(pool, inv.id).await? else {
+        return Ok(None);
+    };
+    if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, unix_now()) {
+        Ok(Some(pr))
+    } else {
+        Ok(None)
+    }
 }
 
 fn remaining_amount_sat(inv: &db::Invoice) -> i64 {
@@ -1758,6 +1778,35 @@ mod tests {
         assert!(html.contains("2500 sat remaining"));
         assert!(html.contains("id=\"rail-lightning\""));
         assert!(html.contains("let currentAmountSat = 2500;"));
+    }
+
+    #[test]
+    fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "unpaid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 10_000,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some("lq1qqexample"),
+        };
+
+        let html = tpl.render().expect("template renders");
+        assert!(html.contains("Refreshing Lightning offer"));
+        assert!(html.contains("fetchLightning();"));
+        assert!(html.contains("method: 'POST'"));
+        assert!(html.contains("/lightning"));
     }
 
     #[test]
