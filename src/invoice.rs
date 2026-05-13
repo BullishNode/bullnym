@@ -211,14 +211,29 @@ pub async fn flip_invoice_on_lightning_settlement(
     invoice_id: Option<Uuid>,
     amount_sat: i64,
     boltz_swap_id: &str,
+    claim_txid: &str,
     tolerances: db::InvoiceAccountingTolerances,
 ) {
     let Some(id) = invoice_id else {
         return;
     };
     let event_key = format!("lightning_boltz_reverse:{boltz_swap_id}");
-    match db::record_invoice_payment(pool, id, "lightning", &event_key, amount_sat, tolerances)
-        .await
+    match db::record_invoice_payment(
+        pool,
+        id,
+        db::InvoicePaymentEvidence {
+            rail: "lightning",
+            source: "lightning_boltz_reverse",
+            event_key: &event_key,
+            amount_sat,
+            txid: Some(claim_txid),
+            vout: None,
+            boltz_swap_id: Some(boltz_swap_id),
+            address: None,
+        },
+        tolerances,
+    )
+    .await
     {
         Ok(rows) if rows > 0 => {
             tracing::info!(
@@ -259,13 +274,29 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
     invoice_id: Option<Uuid>,
     amount_sat: i64,
     boltz_swap_id: &str,
+    claim_txid: &str,
     tolerances: db::InvoiceAccountingTolerances,
 ) {
     let Some(id) = invoice_id else {
         return;
     };
     let event_key = format!("bitcoin_boltz_chain:{boltz_swap_id}");
-    match db::record_invoice_payment(pool, id, "bitcoin", &event_key, amount_sat, tolerances).await
+    match db::record_invoice_payment(
+        pool,
+        id,
+        db::InvoicePaymentEvidence {
+            rail: "bitcoin",
+            source: "bitcoin_boltz_chain",
+            event_key: &event_key,
+            amount_sat,
+            txid: Some(claim_txid),
+            vout: None,
+            boltz_swap_id: Some(boltz_swap_id),
+            address: None,
+        },
+        tolerances,
+    )
+    .await
     {
         Ok(rows) if rows > 0 => {
             tracing::info!(

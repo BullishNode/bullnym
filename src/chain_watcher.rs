@@ -200,6 +200,7 @@ async fn poll_invoice_addresses(
             pool,
             backend,
             invoice_id,
+            &address,
             &script,
             &blinding_key_hex,
             tolerances,
@@ -243,6 +244,7 @@ async fn record_liquid_events_for_script(
     pool: &PgPool,
     backend: &(dyn UtxoBackend + Send + Sync),
     invoice_id: uuid::Uuid,
+    address: &str,
     script: &elements::Script,
     blinding_key_hex: &str,
     tolerances: db::InvoiceAccountingTolerances,
@@ -288,8 +290,22 @@ async fn record_liquid_events_for_script(
             let amount_sat = i64::try_from(secrets.value)
                 .map_err(|_| AppError::InvalidAmount("Liquid output amount overflow".into()))?;
             let event_key = format!("liquid_direct:{txid}:{vout}");
+            let vout_i32 = i32::try_from(vout)
+                .map_err(|_| AppError::InvalidAmount("Liquid output vout overflow".into()))?;
             match db::record_invoice_payment(
-                pool, invoice_id, "liquid", &event_key, amount_sat, tolerances,
+                pool,
+                invoice_id,
+                db::InvoicePaymentEvidence {
+                    rail: "liquid",
+                    source: "liquid_direct",
+                    event_key: &event_key,
+                    amount_sat,
+                    txid: Some(&txid),
+                    vout: Some(vout_i32),
+                    boltz_swap_id: None,
+                    address: Some(address),
+                },
+                tolerances,
             )
             .await
             {
@@ -346,7 +362,7 @@ async fn poll_nyms(
                 Vec::new()
             }
         };
-        for (invoice_id, addr_index, _address, _remaining_minor, blinding_key_hex) in
+        for (invoice_id, addr_index, address, _remaining_minor, blinding_key_hex) in
             &unpaid_invoices
         {
             if cancel.is_cancelled() {
@@ -374,6 +390,7 @@ async fn poll_nyms(
                 pool,
                 backend,
                 *invoice_id,
+                address,
                 &script,
                 blinding_key_hex,
                 tolerances,

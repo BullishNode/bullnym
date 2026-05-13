@@ -2109,24 +2109,89 @@ fn payment_tolerance_sat_for_amount(
     tolerances.for_rail(rail).min(one_percent).max(0)
 }
 
+pub struct InvoicePaymentEvidence<'a> {
+    pub rail: &'a str,
+    pub source: &'a str,
+    pub event_key: &'a str,
+    pub amount_sat: i64,
+    pub txid: Option<&'a str>,
+    pub vout: Option<i32>,
+    pub boltz_swap_id: Option<&'a str>,
+    pub address: Option<&'a str>,
+}
+
+impl InvoicePaymentEvidence<'_> {
+    fn validate(&self) -> Result<(), sqlx::Error> {
+        if self.amount_sat <= 0 {
+            return Err(sqlx::Error::Protocol(
+                "payment amount_sat must be > 0".into(),
+            ));
+        }
+        if !matches!(self.rail, "bitcoin" | "liquid" | "lightning") {
+            return Err(sqlx::Error::Protocol(format!(
+                "unknown invoice payment rail: {}",
+                self.rail
+            )));
+        }
+
+        match self.source {
+            "bitcoin_direct" if self.rail == "bitcoin" => {
+                if self.txid.is_none()
+                    || self.vout.is_none()
+                    || self.vout.is_some_and(|v| v < 0)
+                    || self.address.is_none()
+                    || self.boltz_swap_id.is_some()
+                {
+                    return Err(sqlx::Error::Protocol(
+                        "bitcoin_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
+                    ));
+                }
+            }
+            "liquid_direct" if self.rail == "liquid" => {
+                if self.txid.is_none()
+                    || self.vout.is_none()
+                    || self.vout.is_some_and(|v| v < 0)
+                    || self.address.is_none()
+                    || self.boltz_swap_id.is_some()
+                {
+                    return Err(sqlx::Error::Protocol(
+                        "liquid_direct evidence requires txid, non-negative vout, address, and no boltz_swap_id".into(),
+                    ));
+                }
+            }
+            "lightning_boltz_reverse" if self.rail == "lightning" => {
+                if self.txid.is_none() || self.boltz_swap_id.is_none() || self.vout.is_some() {
+                    return Err(sqlx::Error::Protocol(
+                        "lightning_boltz_reverse evidence requires txid, boltz_swap_id, and no vout".into(),
+                    ));
+                }
+            }
+            "bitcoin_boltz_chain" if self.rail == "bitcoin" => {
+                if self.txid.is_none() || self.boltz_swap_id.is_none() || self.vout.is_some() {
+                    return Err(sqlx::Error::Protocol(
+                        "bitcoin_boltz_chain evidence requires txid, boltz_swap_id, and no vout"
+                            .into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "invalid invoice payment source/rail pair: {}/{}",
+                    self.source, self.rail
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub async fn record_invoice_payment(
     pool: &PgPool,
     id: Uuid,
-    rail: &str,
-    event_key: &str,
-    amount_sat: i64,
+    evidence: InvoicePaymentEvidence<'_>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<u64, sqlx::Error> {
-    if amount_sat <= 0 {
-        return Err(sqlx::Error::Protocol(
-            "payment amount_sat must be > 0".into(),
-        ));
-    }
-    if !matches!(rail, "bitcoin" | "liquid" | "lightning") {
-        return Err(sqlx::Error::Protocol(format!(
-            "unknown invoice payment rail: {rail}"
-        )));
-    }
+    evidence.validate()?;
 
     let mut tx = pool.begin().await?;
     let inv = sqlx::query_as::<_, Invoice>(&format!(
@@ -2143,15 +2208,20 @@ pub async fn record_invoice_payment(
 
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO invoice_payment_events \
-            (invoice_id, rail, event_key, amount_sat) \
-         VALUES ($1, $2, $3, $4) \
+            (invoice_id, rail, source, event_key, amount_sat, txid, vout, boltz_swap_id, address) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (event_key) DO NOTHING \
          RETURNING id",
     )
     .bind(id)
-    .bind(rail)
-    .bind(event_key)
-    .bind(amount_sat)
+    .bind(evidence.rail)
+    .bind(evidence.source)
+    .bind(evidence.event_key)
+    .bind(evidence.amount_sat)
+    .bind(evidence.txid)
+    .bind(evidence.vout)
+    .bind(evidence.boltz_swap_id)
+    .bind(evidence.address)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -2180,7 +2250,7 @@ pub async fn record_invoice_payment(
         "mixed"
     };
 
-    let tolerance_sat = payment_tolerance_sat_for_amount(inv.amount_sat, rail, tolerances);
+    let tolerance_sat = payment_tolerance_sat_for_amount(inv.amount_sat, evidence.rail, tolerances);
     let remaining_sat = inv.amount_sat.saturating_sub(received_sat);
     let expired = inv.expires_at_unix <= chrono_like_unix_now();
     let new_status = if received_sat > inv.amount_sat {

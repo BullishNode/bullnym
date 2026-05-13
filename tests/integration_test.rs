@@ -1043,6 +1043,44 @@ async fn insert_test_invoice(
     .unwrap()
 }
 
+fn liquid_direct_evidence<'a>(
+    event_key: &'a str,
+    amount_sat: i64,
+    txid: &'a str,
+    vout: i32,
+    address: &'a str,
+) -> pay_service::db::InvoicePaymentEvidence<'a> {
+    pay_service::db::InvoicePaymentEvidence {
+        rail: "liquid",
+        source: "liquid_direct",
+        event_key,
+        amount_sat,
+        txid: Some(txid),
+        vout: Some(vout),
+        boltz_swap_id: None,
+        address: Some(address),
+    }
+}
+
+fn bitcoin_direct_evidence<'a>(
+    event_key: &'a str,
+    amount_sat: i64,
+    txid: &'a str,
+    vout: i32,
+    address: &'a str,
+) -> pay_service::db::InvoicePaymentEvidence<'a> {
+    pay_service::db::InvoicePaymentEvidence {
+        rail: "bitcoin",
+        source: "bitcoin_direct",
+        event_key,
+        amount_sat,
+        txid: Some(txid),
+        vout: Some(vout),
+        boltz_swap_id: None,
+        address: Some(address),
+    }
+}
+
 async fn insert_test_btc_invoice(
     pool: &PgPool,
     nym: &str,
@@ -1249,9 +1287,13 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     pay_service::db::record_invoice_payment(
         &pool,
         expired_paid.id,
-        "liquid",
-        "liquid_direct:test-expired-paid:0",
-        1_000,
+        liquid_direct_evidence(
+            "liquid_direct:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+            1_000,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            "lq1expiredpaid",
+        ),
         pay_service::db::InvoiceAccountingTolerances::default(),
     )
     .await
@@ -1302,9 +1344,13 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let rows = pay_service::db::record_invoice_payment(
         &pool,
         invoice.id,
-        "liquid",
-        "liquid_direct:txpartial:0",
-        400,
+        liquid_direct_evidence(
+            "liquid_direct:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0",
+            400,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0,
+            "lq1eventacct",
+        ),
         tolerances,
     )
     .await
@@ -1324,9 +1370,13 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let duplicate_rows = pay_service::db::record_invoice_payment(
         &pool,
         invoice.id,
-        "liquid",
-        "liquid_direct:txpartial:0",
-        400,
+        liquid_direct_evidence(
+            "liquid_direct:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0",
+            400,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0,
+            "lq1eventacct",
+        ),
         tolerances,
     )
     .await
@@ -1336,9 +1386,13 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let rows = pay_service::db::record_invoice_payment(
         &pool,
         invoice.id,
-        "bitcoin",
-        "bitcoin_direct:txcomplete:0",
-        590,
+        bitcoin_direct_evidence(
+            "bitcoin_direct:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:0",
+            590,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            0,
+            "bc1qeventacct",
+        ),
         tolerances,
     )
     .await
@@ -1358,9 +1412,13 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let rows = pay_service::db::record_invoice_payment(
         &pool,
         invoice.id,
-        "bitcoin",
-        "bitcoin_direct:txover:1",
-        20,
+        bitcoin_direct_evidence(
+            "bitcoin_direct:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:1",
+            20,
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            1,
+            "bc1qeventacct",
+        ),
         tolerances,
     )
     .await
@@ -1374,6 +1432,150 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     assert_eq!(overpaid.status, "overpaid");
     assert_eq!(overpaid.settlement_status, "settled");
     assert_eq!(overpaid.paid_amount_sat, Some(1_010));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_payment_events_store_direct_and_boltz_evidence() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "eventevidence").await;
+    let invoice = insert_test_invoice(&pool, "eventevidence", &npub, "lq1eventevidence", 60).await;
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+
+    let _ = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1111111111111111111111111111111111111111111111111111111111111111:2",
+            100,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            2,
+            "lq1eventevidence",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    let direct: (String, String, String, i32, Option<String>, String, i64) = sqlx::query_as(
+        "SELECT rail, source, txid, vout, boltz_swap_id, address, amount_sat \
+         FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind("liquid_direct:1111111111111111111111111111111111111111111111111111111111111111:2")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(direct.0, "liquid");
+    assert_eq!(direct.1, "liquid_direct");
+    assert_eq!(
+        direct.2,
+        "1111111111111111111111111111111111111111111111111111111111111111"
+    );
+    assert_eq!(direct.3, 2);
+    assert!(direct.4.is_none());
+    assert_eq!(direct.5, "lq1eventevidence");
+    assert_eq!(direct.6, 100);
+
+    invoice::flip_invoice_on_lightning_settlement(
+        &pool,
+        Some(invoice.id),
+        100,
+        "boltz-reverse-evidence",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        tolerances,
+    )
+    .await;
+    let boltz: (String, String, String, Option<i32>, String, Option<String>) = sqlx::query_as(
+        "SELECT rail, source, txid, vout, boltz_swap_id, address \
+         FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind("lightning_boltz_reverse:boltz-reverse-evidence")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(boltz.0, "lightning");
+    assert_eq!(boltz.1, "lightning_boltz_reverse");
+    assert_eq!(
+        boltz.2,
+        "2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    assert!(boltz.3.is_none());
+    assert_eq!(boltz.4, "boltz-reverse-evidence");
+    assert!(boltz.5.is_none());
+
+    invoice::flip_invoice_on_bitcoin_boltz_settlement(
+        &pool,
+        Some(invoice.id),
+        100,
+        "boltz-chain-evidence",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        tolerances,
+    )
+    .await;
+    let chain: (String, String, String, Option<i32>, String, Option<String>) = sqlx::query_as(
+        "SELECT rail, source, txid, vout, boltz_swap_id, address \
+         FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind("bitcoin_boltz_chain:boltz-chain-evidence")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(chain.0, "bitcoin");
+    assert_eq!(chain.1, "bitcoin_boltz_chain");
+    assert_eq!(
+        chain.2,
+        "3333333333333333333333333333333333333333333333333333333333333333"
+    );
+    assert!(chain.3.is_none());
+    assert_eq!(chain.4, "boltz-chain-evidence");
+    assert!(chain.5.is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_payment_event_constraints_reject_invalid_evidence() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "eventconstraints").await;
+    let invoice =
+        insert_test_invoice(&pool, "eventconstraints", &npub, "lq1eventconstraints", 60).await;
+
+    let wrong_rail = sqlx::query(
+        "INSERT INTO invoice_payment_events \
+            (invoice_id, rail, source, event_key, amount_sat, txid, vout, address) \
+         VALUES ($1, 'bitcoin', 'liquid_direct', $2, 1, $3, 0, 'lq1eventconstraints')",
+    )
+    .bind(invoice.id)
+    .bind("liquid_direct:4444444444444444444444444444444444444444444444444444444444444444:0")
+    .bind("4444444444444444444444444444444444444444444444444444444444444444")
+    .execute(&pool)
+    .await;
+    assert!(wrong_rail.is_err());
+
+    let missing_direct_address = sqlx::query(
+        "INSERT INTO invoice_payment_events \
+            (invoice_id, rail, source, event_key, amount_sat, txid, vout) \
+         VALUES ($1, 'liquid', 'liquid_direct', $2, 1, $3, 0)",
+    )
+    .bind(invoice.id)
+    .bind("liquid_direct:5555555555555555555555555555555555555555555555555555555555555555:0")
+    .bind("5555555555555555555555555555555555555555555555555555555555555555")
+    .execute(&pool)
+    .await;
+    assert!(missing_direct_address.is_err());
+
+    let missing_boltz_txid = sqlx::query(
+        "INSERT INTO invoice_payment_events \
+            (invoice_id, rail, source, event_key, amount_sat, boltz_swap_id) \
+         VALUES ($1, 'lightning', 'lightning_boltz_reverse', $2, 1, 'swap-without-txid')",
+    )
+    .bind(invoice.id)
+    .bind("lightning_boltz_reverse:swap-without-txid")
+    .execute(&pool)
+    .await;
+    assert!(missing_boltz_txid.is_err());
 
     cleanup_db(&pool).await;
 }
@@ -1455,9 +1657,13 @@ async fn expired_partial_payment_becomes_underpaid() {
     pay_service::db::record_invoice_payment(
         &pool,
         invoice.id,
-        "liquid",
-        "liquid_direct:txunderpaid:0",
-        400,
+        liquid_direct_evidence(
+            "liquid_direct:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0",
+            400,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            0,
+            "lq1eventunderpaid",
+        ),
         pay_service::db::InvoiceAccountingTolerances::default(),
     )
     .await

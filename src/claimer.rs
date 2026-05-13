@@ -1031,6 +1031,7 @@ async fn claim_swap_inner(
         swap.invoice_id,
         swap.amount_sat,
         &swap.boltz_swap_id,
+        &txid,
         tolerances,
     )
     .await;
@@ -1284,6 +1285,7 @@ async fn claim_chain_swap_inner(
         Some(swap.invoice_id),
         swap.user_lock_amount_sat,
         &swap.boltz_swap_id,
+        &txid,
         tolerances,
     )
     .await;

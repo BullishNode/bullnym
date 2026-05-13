@@ -316,12 +316,28 @@ impl BitcoinWatcher {
                         }
                         let received_sat = output.value as i64;
                         let event_key = format!("bitcoin_direct:{}:{}", tx.txid, vout);
+                        let Ok(vout_i32) = i32::try_from(vout) else {
+                            tracing::error!(
+                                invoice_id = %inv.id,
+                                txid = %tx.txid,
+                                vout = vout,
+                                "bitcoin_watcher: vout index overflow"
+                            );
+                            continue;
+                        };
                         match db::record_invoice_payment(
                             &self.pool,
                             inv.id,
-                            "bitcoin",
-                            &event_key,
-                            received_sat,
+                            db::InvoicePaymentEvidence {
+                                rail: "bitcoin",
+                                source: "bitcoin_direct",
+                                event_key: &event_key,
+                                amount_sat: received_sat,
+                                txid: Some(&tx.txid),
+                                vout: Some(vout_i32),
+                                boltz_swap_id: None,
+                                address: Some(&inv.bitcoin_address),
+                            },
                             self.tolerances,
                         )
                         .await
