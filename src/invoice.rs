@@ -348,6 +348,8 @@ pub struct CreateInvoiceResponse {
     pub invoice_id: Uuid,
     pub lightning_pr: String,
     pub liquid_address: String,
+    pub bitcoin_chain_address: Option<String>,
+    pub bitcoin_chain_bip21: Option<String>,
     pub expires_at_unix: i64,
 }
 
@@ -389,12 +391,17 @@ pub async fn create_anonymous(
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
     // Eagerly allocate a Liquid address from the donation page owner's
-    // descriptor. Both rails settle to this same address:
+    // CT descriptor. Donation Page checkout never uses customer- or
+    // merchant-supplied payout addresses; every customer-facing settlement
+    // rail resolves back to this descriptor-derived Liquid address:
     //   - Lightning: `claimer::resolve_claim_address` branch (B) routes
     //     the Boltz claim to `invoice.liquid_address` once
     //     `create_lightning_offer` (below) binds the swap to this invoice.
-    //   - Direct Liquid: customer pays the address directly; the
+    //   - Direct Liquid: customer pays this address directly; the
     //     chain_watcher's address-keyed scan detects the inbound tx.
+    //   - BTC via Boltz chain swap: customer pays Boltz's Bitcoin lockup
+    //     address; the chain-swap claimer spends the resulting LBTC to
+    //     this same `invoice.liquid_address`.
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
@@ -421,12 +428,10 @@ pub async fn create_anonymous(
         recipient_label: None,
         public_description: None,
         invoice_number: None,
-        // Checkout-origin: server eagerly allocates one Liquid address
-        // from the donation page owner's descriptor (above). Both
-        // Lightning and direct Liquid rails settle to this address. BTC
-        // on-chain is not exposed for donation-page checkout in v1 —
-        // would require a separate Bitcoin descriptor / wallet-supplied
-        // address path.
+        // Checkout-origin: direct BTC stays disabled on the invoice row.
+        // Donation Page BTC, when available, is represented separately as a
+        // Boltz chain-swap lockup so bitcoin_watcher never mistakes the
+        // Boltz deposit address for merchant-settled direct BTC.
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
@@ -457,11 +462,26 @@ pub async fn create_anonymous(
             return Err(e);
         }
     };
+    let bitcoin_chain_offer =
+        match create_bitcoin_chain_offer(&state, Some(&nym), amount_sat as u64, &invoice).await {
+            Ok(offer) => offer,
+            Err(e) => {
+                tracing::warn!(
+                    invoice_id = %invoice.id,
+                    "BTC-to-LBTC chain-swap offer unavailable for checkout invoice: {e}",
+                );
+                None
+            }
+        };
 
     Ok(Json(CreateInvoiceResponse {
         invoice_id: invoice.id,
         lightning_pr,
         liquid_address,
+        bitcoin_chain_address: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.lockup_address.clone()),
+        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
         expires_at_unix: invoice.expires_at_unix,
     }))
 }
@@ -587,6 +607,7 @@ struct InvoicePaymentTpl<'a> {
     accept_ln: bool,
     accept_liquid: bool,
     bitcoin_address: Option<&'a str>,
+    bitcoin_chain_address: Option<&'a str>,
     liquid_address: Option<&'a str>,
 }
 
@@ -618,7 +639,7 @@ pub async fn render_payment(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
-    Ok(html_response(render_invoice_template(&state, &inv)?))
+    Ok(html_response(render_invoice_template(&state, &inv).await?))
 }
 
 // =====================================================================
@@ -637,14 +658,15 @@ pub async fn render_unlinked_payment(
     // The unlinked render path serves both nym-linked AND nym-NULL invoices
     // (the wallet may always share via /invoice/<id> regardless of linkage).
     // Distinct handlers for the two paths only affect URL parsing.
-    Ok(html_response(render_invoice_template(&state, &inv)?))
+    Ok(html_response(render_invoice_template(&state, &inv).await?))
 }
 
-fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
+async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
     };
+    let bitcoin_chain_offer = db::latest_chain_swap_for_invoice(&state.db, inv.id).await?;
     let nym = inv.nym_owner.as_deref().unwrap_or("");
     let is_unlinked = inv.nym_owner.is_none();
     let tpl = InvoicePaymentTpl {
@@ -664,6 +686,9 @@ fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
         bitcoin_address: inv.bitcoin_address.as_deref(),
+        bitcoin_chain_address: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.lockup_address.as_str()),
         liquid_address: inv.liquid_address.as_deref(),
     };
     tpl.render()
@@ -693,6 +718,8 @@ pub struct InvoiceStatusResponse {
     pub lightning_pr: Option<String>,
     pub liquid_address: Option<String>,
     pub bitcoin_address: Option<String>,
+    pub bitcoin_chain_address: Option<String>,
+    pub bitcoin_chain_bip21: Option<String>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
@@ -725,6 +752,7 @@ pub async fn status(
         .ok_or(AppError::InvoiceNotFound(id_str))?;
 
     let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
+    let bitcoin_chain_offer = db::latest_chain_swap_for_invoice(&state.db, inv.id).await?;
 
     let remaining_sat = remaining_amount_sat(&inv);
     let tolerance_sat = payment_tolerance_sat(
@@ -750,6 +778,10 @@ pub async fn status(
         lightning_pr,
         liquid_address: inv.liquid_address,
         bitcoin_address: inv.bitcoin_address,
+        bitcoin_chain_address: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.lockup_address.clone()),
+        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
@@ -1024,6 +1056,74 @@ async fn create_lightning_offer(
         db::touch_user_callback(&state.db, nym).await;
     }
     Ok(lightning_pr)
+}
+
+struct BitcoinChainOffer {
+    lockup_address: String,
+    lockup_bip21: Option<String>,
+}
+
+/// Internal: create a Boltz BTC-to-LBTC chain swap for a Donation Page
+/// checkout invoice. The payer sees a Bitcoin lockup address; after
+/// Boltz locks LBTC on the server side, the chain-swap claimer spends
+/// that LBTC to `invoice.liquid_address`.
+async fn create_bitcoin_chain_offer(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<Option<BitcoinChainOffer>, AppError> {
+    if invoice.liquid_address.is_none() {
+        return Ok(None);
+    }
+
+    let claim_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("chain claim key allocation failed: {e}")))?;
+    let refund_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("chain refund key allocation failed: {e}")))?;
+
+    let result = state
+        .boltz
+        .create_btc_to_lbtc_chain_swap(claim_key_index, refund_key_index, amount_sat)
+        .await?;
+
+    let preimage_hex = hex::encode(&result.preimage);
+    let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
+    let refund_key_hex = hex::encode(result.refund_keypair.secret_bytes());
+    let boltz_response_json = serde_json::to_string(&result.boltz_response).map_err(|e| {
+        AppError::BoltzError(format!("failed to serialize chain-swap response: {e}"))
+    })?;
+
+    db::record_chain_swap(
+        &state.db,
+        &db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: swap_nym,
+            boltz_swap_id: &result.swap_id,
+            lockup_address: &result.lockup_address,
+            lockup_bip21: result.lockup_bip21.as_deref(),
+            user_lock_amount_sat: result.user_lock_amount_sat as i64,
+            server_lock_amount_sat: result.server_lock_amount_sat as i64,
+            preimage_hex: &preimage_hex,
+            claim_key_hex: &claim_key_hex,
+            refund_key_hex: &refund_key_hex,
+            boltz_response_json: &boltz_response_json,
+        },
+    )
+    .await
+    .map_err(|e| {
+        AppError::DbError(format!(
+            "failed to record chain swap {}: {e}",
+            result.swap_id
+        ))
+    })?;
+
+    Ok(Some(BitcoinChainOffer {
+        lockup_address: result.lockup_address,
+        lockup_bip21: result.lockup_bip21,
+    }))
 }
 
 // =====================================================================
@@ -1817,6 +1917,7 @@ mod tests {
             accept_ln: true,
             accept_liquid: true,
             bitcoin_address: Some("bc1qexample"),
+            bitcoin_chain_address: None,
             liquid_address: Some("lq1qqexample"),
         };
 
@@ -1846,6 +1947,7 @@ mod tests {
             accept_ln: true,
             accept_liquid: true,
             bitcoin_address: None,
+            bitcoin_chain_address: None,
             liquid_address: Some("lq1qqexample"),
         };
 
@@ -1854,6 +1956,35 @@ mod tests {
         assert!(html.contains("fetchLightning();"));
         assert!(html.contains("method: 'POST'"));
         assert!(html.contains("/lightning"));
+    }
+
+    #[test]
+    fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "unpaid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 10_000,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_address: None,
+            bitcoin_chain_address: Some("bc1qboltzlockup"),
+            liquid_address: Some("lq1qqexample"),
+        };
+
+        let html = tpl.render().expect("template renders");
+        assert!(html.contains("id=\"rail-btc\""));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
+        assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS"));
     }
 
     #[test]

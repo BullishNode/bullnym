@@ -183,7 +183,10 @@
         {% if status == "unpaid" || (status == "partially_paid" && settlement_status != "pending" && settlement_status != "claim_stuck" && settlement_status != "refunded") %}
             <div class="meta">
                 Accepted:
-                {% if accept_btc %}<span>BTC</span>{% endif %}
+                {% match bitcoin_chain_address %}
+                    {% when Some with (_) %}<span>BTC</span>
+                    {% when None %}{% if accept_btc %}<span>BTC</span>{% endif %}
+                {% endmatch %}
                 {% if accept_ln %}<span>Lightning</span>{% endif %}
                 {% if accept_liquid %}<span>Liquid</span>{% endif %}
             </div>
@@ -209,7 +212,10 @@
 
                 <div class="rail-toggle">
                     {% if accept_ln %}<button id="rail-lightning" type="button">Lightning</button>{% endif %}
-                    {% if accept_btc %}<button id="rail-btc" type="button">BTC</button>{% endif %}
+                    {% match bitcoin_chain_address %}
+                        {% when Some with (_) %}<button id="rail-btc" type="button">BTC</button>
+                        {% when None %}{% if accept_btc %}<button id="rail-btc" type="button">BTC</button>{% endif %}
+                    {% endmatch %}
                     {% if accept_liquid %}<button id="rail-liquid" type="button">Liquid</button>{% endif %}
                 </div>
 
@@ -285,8 +291,9 @@
         // Single state machine driven by polling /api/v1/invoices/<id>/status
         // every 3s. The page re-renders on status changes, fetches the
         // appropriate payload (Lightning via the /lightning endpoint, BTC
-        // and Liquid from wallet-supplied invoice addresses), and stops
-        // polling when the invoice reaches a terminal status.
+        // via a Boltz chain-swap lockup when present, and Liquid via the
+        // invoice's Liquid settlement address), and stops polling when the
+        // invoice reaches a terminal status.
         (function () {
             const INVOICE_ID = "{{ invoice_id }}";
             const NYM = "{{ nym }}";
@@ -296,6 +303,7 @@
             const ACCEPT_LN = {{ accept_ln }};
             const ACCEPT_LIQUID = {{ accept_liquid }};
             const INITIAL_BITCOIN_ADDRESS = "{% match bitcoin_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
+            const INITIAL_BITCOIN_CHAIN_ADDRESS = "{% match bitcoin_chain_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
             const INITIAL_LIQUID_ADDRESS = "{% match liquid_address %}{% when Some with (a) %}{{ a }}{% when None %}{% endmatch %}";
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
@@ -317,9 +325,9 @@
             const copyBtn = document.getElementById('copy-btn');
             const countdown = document.getElementById('countdown');
 
-            let currentRail = ACCEPT_LN ? 'lightning' : (ACCEPT_BTC ? 'bitcoin' : 'liquid');
+            let currentRail = ACCEPT_LN ? 'lightning' : ((ACCEPT_BTC || INITIAL_BITCOIN_CHAIN_ADDRESS) ? 'bitcoin' : 'liquid');
             let currentLightningPr = null;
-            let currentBitcoinAddress = INITIAL_BITCOIN_ADDRESS || null;
+            let currentBitcoinAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS || null;
             let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
@@ -566,10 +574,11 @@
                             setQrPayload(liquidUri(data.liquid_address, currentAmountSat));
                         }
                     }
-                    if (data.bitcoin_address && data.bitcoin_address !== currentBitcoinAddress) {
-                        currentBitcoinAddress = data.bitcoin_address;
+                    const nextBitcoinAddress = data.bitcoin_chain_address || data.bitcoin_address;
+                    if (nextBitcoinAddress && nextBitcoinAddress !== currentBitcoinAddress) {
+                        currentBitcoinAddress = nextBitcoinAddress;
                         if (currentRail === 'bitcoin') {
-                            setQrPayload(btcUri(data.bitcoin_address, currentAmountSat));
+                            setQrPayload(btcUri(nextBitcoinAddress, currentAmountSat));
                         }
                     }
                     if (amountDisplay) {
