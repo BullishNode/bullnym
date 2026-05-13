@@ -1433,20 +1433,25 @@ async fn create_invoice_inner(
             "accept_ln/accept_liquid=true requires liquid_address".into(),
         ));
     }
-    if let Some(addr) = req.bitcoin_address.as_deref() {
-        validators::validate_btc_mainnet_address(addr)?;
-    }
-    if let Some(addr) = req.liquid_address.as_deref() {
-        validators::validate_liquid_mainnet_address(addr)?;
+    let canonical_bitcoin_address = if let Some(addr) = req.bitcoin_address.as_deref() {
+        Some(validators::canonical_btc_mainnet_address(addr)?)
+    } else {
+        None
+    };
+    let canonical_liquid_address = if let Some(addr) = req.liquid_address.as_deref() {
+        let canonical = validators::canonical_liquid_mainnet_address(addr)?;
         if req.accept_liquid {
             let key = req.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
                 AppError::InvalidAmount(
                     "accept_liquid=true requires liquid_blinding_key_hex".into(),
                 )
             })?;
-            validators::validate_liquid_blinding_key_matches_address(addr, key)?;
+            validators::validate_liquid_blinding_key_matches_address(&canonical, key)?;
         }
-    }
+        Some(canonical)
+    } else {
+        None
+    };
 
     // Outer expiry window: now+60s to now+30d.
     let now = unix_now();
@@ -1543,8 +1548,8 @@ async fn create_invoice_inner(
         accept_btc: req.accept_btc,
         accept_ln: req.accept_ln,
         accept_liquid: req.accept_liquid,
-        bitcoin_address: req.bitcoin_address.as_deref(),
-        liquid_address: req.liquid_address.as_deref(),
+        bitcoin_address: canonical_bitcoin_address.as_deref(),
+        liquid_address: canonical_liquid_address.as_deref(),
         liquid_blinding_key_hex: req.liquid_blinding_key_hex.as_deref(),
         expires_in_secs,
     };

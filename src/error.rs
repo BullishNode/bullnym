@@ -65,6 +65,14 @@ pub enum AppError {
 
     // --- Amount validation (LNURL callback) ---
     InvalidAmount(String),
+    /// Wallet-origin invoice tried to reuse a BTC receive address that is
+    /// already assigned to an invoice. Address reuse makes chain payment
+    /// attribution ambiguous, so it is rejected at create time.
+    BitcoinAddressAlreadyUsed,
+    /// Wallet-origin invoice tried to reuse a Liquid receive address that is
+    /// already assigned to an invoice. Address reuse makes chain payment
+    /// attribution ambiguous, so it is rejected at create time.
+    LiquidAddressAlreadyUsed,
 
     // --- Capacity / rate-limit ---
     /// One source (IP, pubkey, etc.) is making too many requests.
@@ -144,7 +152,9 @@ impl AppError {
             | Self::UtxoNotFound
             | Self::UtxoSpent
             | Self::PubkeyUtxoMismatch
-            | Self::InvalidAmount(_) => ErrorClass::Identity,
+            | Self::InvalidAmount(_)
+            | Self::BitcoinAddressAlreadyUsed
+            | Self::LiquidAddressAlreadyUsed => ErrorClass::Identity,
 
             Self::RateLimitedSender
             | Self::RateLimitedRecipient
@@ -187,6 +197,8 @@ impl AppError {
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
 
             Self::InvalidAmount(_) => "InvalidAmount",
+            Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
+            Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
 
             Self::RateLimitedSender => "RateLimitedSender",
             Self::RateLimitedRecipient => "RateLimitedRecipient",
@@ -245,6 +257,8 @@ impl std::fmt::Display for AppError {
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
 
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
+            Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
+            Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
 
             Self::RateLimitedSender => write!(f, "rate limited (sender)"),
             Self::RateLimitedRecipient => write!(f, "rate limited (recipient)"),
@@ -311,6 +325,12 @@ impl IntoResponse for AppError {
             AppError::PubkeyUtxoMismatch => "The proof-of-funds public key does not match the script of the referenced UTXO.".into(),
 
             AppError::InvalidAmount(reason) => reason.clone(),
+            AppError::BitcoinAddressAlreadyUsed => {
+                "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
+            }
+            AppError::LiquidAddressAlreadyUsed => {
+                "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
+            }
 
             AppError::RateLimitedSender => "Request rate limit exceeded for this source. Retry later.".into(),
             AppError::RateLimitedRecipient => "This Lightning Address has reached its request rate limit on the server. Retry later.".into(),
@@ -397,6 +417,12 @@ impl From<sqlx::Error> for AppError {
                     nym: String::new(),
                     domain: String::new(),
                 };
+            }
+            if db_err.constraint() == Some("invoice_payment_addresses_bitcoin_address_key") {
+                return AppError::BitcoinAddressAlreadyUsed;
+            }
+            if db_err.constraint() == Some("invoice_payment_addresses_liquid_address_key") {
+                return AppError::LiquidAddressAlreadyUsed;
             }
         }
         AppError::DbError(e.to_string())

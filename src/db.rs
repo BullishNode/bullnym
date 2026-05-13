@@ -1879,7 +1879,9 @@ pub async fn insert_invoice(
     pool: &PgPool,
     invoice: &NewInvoice<'_>,
 ) -> Result<Invoice, sqlx::Error> {
-    sqlx::query_as::<_, Invoice>(&format!(
+    let mut tx = pool.begin().await?;
+
+    let inserted = sqlx::query_as::<_, Invoice>(&format!(
         "INSERT INTO invoices \
             (nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
              rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
@@ -1913,8 +1915,33 @@ pub async fn insert_invoice(
     .bind(invoice.liquid_address)
     .bind(invoice.liquid_blinding_key_hex)
     .bind(invoice.expires_in_secs)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if let Some(address) = invoice.bitcoin_address {
+        sqlx::query(
+            "INSERT INTO invoice_payment_addresses (invoice_id, rail, address) \
+             VALUES ($1, 'bitcoin', $2)",
+        )
+        .bind(inserted.id)
+        .bind(address)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some(address) = invoice.liquid_address {
+        sqlx::query(
+            "INSERT INTO invoice_payment_addresses (invoice_id, rail, address) \
+             VALUES ($1, 'liquid', $2)",
+        )
+        .bind(inserted.id)
+        .bind(address)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {

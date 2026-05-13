@@ -19,7 +19,7 @@ use pay_service::config::{
 use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
-use pay_service::{claimer, lnurl, nostr, registration, AppState};
+use pay_service::{claimer, invoice, lnurl, nostr, registration, AppState};
 
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
@@ -104,6 +104,7 @@ fn test_app(state: AppState) -> Router {
             "/register",
             axum::routing::delete(registration::delete_registration),
         )
+        .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .with_state(state)
 }
@@ -179,6 +180,47 @@ fn sign_delete_with_keypair(keypair: &Keypair, npub: &str, nym: &str) -> (String
 
 fn sign_purge_with_keypair(keypair: &Keypair, npub: &str, nym: &str) -> (String, u64) {
     sign_la_action(keypair, "purge", npub, nym, &[])
+}
+
+fn sign_invoice_create_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    bitcoin_address: &str,
+    expires_at_unix: i64,
+) -> (String, u64) {
+    let amount_sat = "1000";
+    let fiat_amount_minor = "";
+    let fiat_currency = "";
+    let public_description = "";
+    let recipient_name = "";
+    let invoice_number = "";
+    let accept_btc = "true";
+    let accept_ln = "false";
+    let accept_liquid = "false";
+    let liquid_address = "";
+    let liquid_blinding_key_hex = "";
+    let expires_at = expires_at_unix.to_string();
+    sign_la_action(
+        keypair,
+        "invoice-create",
+        npub,
+        "",
+        &[
+            amount_sat,
+            fiat_amount_minor,
+            fiat_currency,
+            public_description,
+            recipient_name,
+            invoice_number,
+            accept_btc,
+            accept_ln,
+            accept_liquid,
+            bitcoin_address,
+            liquid_address,
+            liquid_blinding_key_hex,
+            &expires_at,
+        ],
+    )
 }
 
 // Valid CT descriptor (lwk 0.14, h-notation)
@@ -999,6 +1041,191 @@ async fn insert_test_invoice(
     )
     .await
     .unwrap()
+}
+
+async fn insert_test_btc_invoice(
+    pool: &PgPool,
+    nym: &str,
+    npub: &str,
+    bitcoin_address: &str,
+) -> Result<pay_service::db::Invoice, sqlx::Error> {
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some(nym),
+            npub_owner: npub,
+            origin: "wallet",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: false,
+            accept_liquid: false,
+            bitcoin_address: Some(bitcoin_address),
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn invoice_insert_rejects_reused_bitcoin_address() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btcreuse").await;
+    let address = "bc1qreuseinvoiceaddress000000000000000000000000";
+
+    let first = insert_test_btc_invoice(&pool, "btcreuse", &npub, address).await;
+    assert!(first.is_ok());
+
+    let err = insert_test_btc_invoice(&pool, "btcreuse", &npub, address)
+        .await
+        .unwrap_err();
+    let app_error = pay_service::error::AppError::from(err);
+    assert_eq!(app_error.code(), "BitcoinAddressAlreadyUsed");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE bitcoin_address = $1")
+        .bind(address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("invoicecase", TEST_DESCRIPTOR);
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let lower = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let upper = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+
+    let (sig_upper, ts_upper) =
+        sign_invoice_create_with_keypair(&keypair, &npub, upper, expires_at_unix);
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": upper,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": ts_upper,
+            "signature": sig_upper,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["invoice_id"].is_string(), "body: {body}");
+
+    let stored: String =
+        sqlx::query_scalar("SELECT bitcoin_address FROM invoices WHERE npub_owner = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, lower);
+
+    let (sig_lower, ts_lower) =
+        sign_invoice_create_with_keypair(&keypair, &npub, lower, expires_at_unix);
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": lower,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": ts_lower,
+            "signature": sig_lower,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "BitcoinAddressAlreadyUsed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_insert_rejects_reused_liquid_address() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "liqreuse").await;
+    let address = "lq1qqreuseinvoiceaddress000000000000000000000000";
+
+    let _ = insert_test_invoice(&pool, "liqreuse", &npub, address, 3_600).await;
+
+    let err = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some("liqreuse"),
+            npub_owner: &npub,
+            origin: "wallet",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(address),
+            liquid_blinding_key_hex: Some("22".repeat(32).as_str()),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap_err();
+    let app_error = pay_service::error::AppError::from(err);
+    assert_eq!(app_error.code(), "LiquidAddressAlreadyUsed");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE liquid_address = $1")
+        .bind(address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    cleanup_db(&pool).await;
 }
 
 // --- Invoice lifecycle / watcher database coverage ---
