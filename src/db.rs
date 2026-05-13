@@ -26,6 +26,71 @@ pub enum SwapStatus {
     LockupRefunded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapStatus {
+    Pending,
+    UserLockMempool,
+    UserLockConfirmed,
+    ServerLockMempool,
+    ServerLockConfirmed,
+    Claiming,
+    Claimed,
+    ClaimFailed,
+    ClaimStuck,
+    Expired,
+    LockupFailed,
+    Refunded,
+}
+
+impl ChainSwapStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Claimed | Self::ClaimStuck | Self::Expired | Self::LockupFailed | Self::Refunded
+        )
+    }
+}
+
+impl fmt::Display for ChainSwapStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::UserLockMempool => "user_lock_mempool",
+            Self::UserLockConfirmed => "user_lock_confirmed",
+            Self::ServerLockMempool => "server_lock_mempool",
+            Self::ServerLockConfirmed => "server_lock_confirmed",
+            Self::Claiming => "claiming",
+            Self::Claimed => "claimed",
+            Self::ClaimFailed => "claim_failed",
+            Self::ClaimStuck => "claim_stuck",
+            Self::Expired => "expired",
+            Self::LockupFailed => "lockup_failed",
+            Self::Refunded => "refunded",
+        })
+    }
+}
+
+impl FromStr for ChainSwapStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "user_lock_mempool" => Ok(Self::UserLockMempool),
+            "user_lock_confirmed" => Ok(Self::UserLockConfirmed),
+            "server_lock_mempool" => Ok(Self::ServerLockMempool),
+            "server_lock_confirmed" => Ok(Self::ServerLockConfirmed),
+            "claiming" => Ok(Self::Claiming),
+            "claimed" => Ok(Self::Claimed),
+            "claim_failed" => Ok(Self::ClaimFailed),
+            "claim_stuck" => Ok(Self::ClaimStuck),
+            "expired" => Ok(Self::Expired),
+            "lockup_failed" => Ok(Self::LockupFailed),
+            "refunded" => Ok(Self::Refunded),
+            other => Err(format!("unknown chain swap status: {other}")),
+        }
+    }
+}
+
 impl SwapStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -2447,6 +2512,12 @@ pub struct ChainSwapRecord {
     pub updated_at_unix: i64,
 }
 
+impl ChainSwapRecord {
+    pub fn parsed_status(&self) -> Result<ChainSwapStatus, String> {
+        self.status.parse()
+    }
+}
+
 const CHAIN_SWAP_RECORD_COLUMNS: &str =
     "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
@@ -2481,6 +2552,18 @@ pub async fn record_chain_swap(
     .await
 }
 
+pub async fn get_chain_swap_by_boltz_id(
+    pool: &PgPool,
+    boltz_swap_id: &str,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records WHERE boltz_swap_id = $1"
+    ))
+    .bind(boltz_swap_id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn latest_chain_swap_for_invoice(
     pool: &PgPool,
     invoice_id: Uuid,
@@ -2494,6 +2577,26 @@ pub async fn latest_chain_swap_for_invoice(
     .bind(invoice_id)
     .fetch_optional(pool)
     .await
+}
+
+pub async fn update_chain_swap_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: ChainSwapStatus,
+    claim_txid: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = $2, claim_txid = COALESCE($3, claim_txid), updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(id)
+    .bind(status.to_string())
+    .bind(claim_txid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]
@@ -2513,6 +2616,21 @@ mod tests {
         SwapStatus::Expired,
         SwapStatus::ClaimStuck,
         SwapStatus::LockupRefunded,
+    ];
+
+    const ALL_CHAIN_SWAP_STATUSES: &[ChainSwapStatus] = &[
+        ChainSwapStatus::Pending,
+        ChainSwapStatus::UserLockMempool,
+        ChainSwapStatus::UserLockConfirmed,
+        ChainSwapStatus::ServerLockMempool,
+        ChainSwapStatus::ServerLockConfirmed,
+        ChainSwapStatus::Claiming,
+        ChainSwapStatus::Claimed,
+        ChainSwapStatus::ClaimFailed,
+        ChainSwapStatus::ClaimStuck,
+        ChainSwapStatus::Expired,
+        ChainSwapStatus::LockupFailed,
+        ChainSwapStatus::Refunded,
     ];
 
     #[test]
@@ -2564,5 +2682,35 @@ mod tests {
     #[test]
     fn swap_status_unknown_rejected() {
         assert!("garbage".parse::<SwapStatus>().is_err());
+    }
+
+    #[test]
+    fn chain_swap_status_round_trip() {
+        for status in ALL_CHAIN_SWAP_STATUSES {
+            let s = status.to_string();
+            let parsed: ChainSwapStatus = s.parse().unwrap();
+            assert_eq!(parsed, *status);
+        }
+    }
+
+    #[test]
+    fn chain_swap_status_terminal() {
+        assert!(ChainSwapStatus::Claimed.is_terminal());
+        assert!(ChainSwapStatus::ClaimStuck.is_terminal());
+        assert!(ChainSwapStatus::Expired.is_terminal());
+        assert!(ChainSwapStatus::LockupFailed.is_terminal());
+        assert!(ChainSwapStatus::Refunded.is_terminal());
+        assert!(!ChainSwapStatus::Pending.is_terminal());
+        assert!(!ChainSwapStatus::UserLockMempool.is_terminal());
+        assert!(!ChainSwapStatus::UserLockConfirmed.is_terminal());
+        assert!(!ChainSwapStatus::ServerLockMempool.is_terminal());
+        assert!(!ChainSwapStatus::ServerLockConfirmed.is_terminal());
+        assert!(!ChainSwapStatus::Claiming.is_terminal());
+        assert!(!ChainSwapStatus::ClaimFailed.is_terminal());
+    }
+
+    #[test]
+    fn chain_swap_status_unknown_rejected() {
+        assert!("garbage".parse::<ChainSwapStatus>().is_err());
     }
 }

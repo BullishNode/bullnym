@@ -23,7 +23,7 @@ use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
 use crate::config::Config;
-use crate::db::{self, SwapStatus};
+use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::invoice;
@@ -194,6 +194,14 @@ async fn dispatch_webhook(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
     else {
+        if let Some(chain_swap) = db::get_chain_swap_by_boltz_id(&state.db, &data.id)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?
+        {
+            handle_chain_swap_webhook(&state, &chain_swap, &data.status).await?;
+            return Ok("ok");
+        }
+
         // Unknown swap_id is not an error condition for Boltz to retry —
         // either we never created the swap here, or the row was purged.
         // Returning 200 stops the (5×60s) retry storm. PR #4 hardens
@@ -331,6 +339,58 @@ async fn dispatch_webhook(
     }
 
     Ok("ok")
+}
+
+async fn handle_chain_swap_webhook(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+) -> Result<(), AppError> {
+    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    if status.is_terminal() {
+        tracing::debug!(
+            "ignoring webhook for terminal chain swap {} ({})",
+            swap.boltz_swap_id,
+            swap.status
+        );
+        return Ok(());
+    }
+
+    let next = match boltz_status {
+        "swap.created" => return Ok(()),
+        "transaction.mempool" => ChainSwapStatus::UserLockMempool,
+        "transaction.confirmed" => ChainSwapStatus::UserLockConfirmed,
+        "transaction.server.mempool" => ChainSwapStatus::ServerLockMempool,
+        "transaction.server.confirmed" => ChainSwapStatus::ServerLockConfirmed,
+        "transaction.claimed" => ChainSwapStatus::Claimed,
+        "swap.expired" => ChainSwapStatus::Expired,
+        "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
+            ChainSwapStatus::LockupFailed
+        }
+        "transaction.refunded" => ChainSwapStatus::Refunded,
+        _ => {
+            tracing::debug!(
+                "ignoring chain-swap webhook status: {} for {}",
+                boltz_status,
+                swap.boltz_swap_id
+            );
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        event = "chain_swap_webhook",
+        swap_id = %swap.boltz_swap_id,
+        from = %swap.status,
+        to = %next,
+        boltz_status,
+        "chain swap status advanced from Boltz webhook"
+    );
+
+    db::update_chain_swap_status(&state.db, swap.id, next, None)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    Ok(())
 }
 
 /// Outcome of a single `claim_swap` invocation.

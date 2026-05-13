@@ -185,6 +185,10 @@ fn sign_purge_with_keypair(keypair: &Keypair, npub: &str, nym: &str) -> (String,
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    sqlx::query("DELETE FROM processed_webhook_events")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM chain_swap_records")
         .execute(pool)
         .await
@@ -516,6 +520,111 @@ async fn webhook_skips_terminal_swaps() {
         .unwrap()
         .unwrap();
     assert_eq!(swap.status, "claimed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn webhook_advances_chain_swap_records() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let app = test_app(state);
+
+    let npub = create_test_user(&pool, "chainwebhook").await;
+    let invoice = insert_test_invoice(&pool, "chainwebhook", &npub, "lq1chainwebhook", 60).await;
+    pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("chainwebhook"),
+            boltz_swap_id: "CHAIN_WEBHOOK_1",
+            lockup_address: "bc1qchainwebhooklockup",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"CHAIN_WEBHOOK_1\"}",
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_WEBHOOK_1", "status": "transaction.server.confirmed"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "CHAIN_WEBHOOK_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "server_lock_confirmed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn webhook_skips_terminal_chain_swap_records() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let app = test_app(state);
+
+    let npub = create_test_user(&pool, "chainterminal").await;
+    let invoice = insert_test_invoice(&pool, "chainterminal", &npub, "lq1chainterminal", 60).await;
+    let row = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("chainterminal"),
+            boltz_swap_id: "CHAIN_TERMINAL_1",
+            lockup_address: "bc1qchainterminallockup",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"CHAIN_TERMINAL_1\"}",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapStatus::Claimed,
+        Some("chain-claim-txid"),
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_TERMINAL_1", "status": "transaction.refunded"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "CHAIN_TERMINAL_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "claimed");
+    assert_eq!(row.claim_txid.as_deref(), Some("chain-claim-txid"));
 
     cleanup_db(&pool).await;
 }
