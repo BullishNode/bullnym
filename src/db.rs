@@ -315,9 +315,11 @@ pub async fn register_user_atomic(
     .await?;
 
     if let Some(prior) = prior_inactive.as_ref().filter(|u| u.nym == nym) {
-        // Reactivate same nym — no rename, FK from swap_records still aligned.
+        // Reactivate same nym. Keep next_addr_idx monotonic: historical
+        // invoices/reservations may still hold addresses from this descriptor,
+        // and rewinding can collide with the global single-use address index.
         let user = sqlx::query_as::<_, User>(
-            "UPDATE users SET ct_descriptor = $3, is_active = TRUE, next_addr_idx = 0 \
+            "UPDATE users SET ct_descriptor = $3, is_active = TRUE \
              WHERE npub = $1 AND nym = $2 AND is_active = FALSE \
              RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
         )
@@ -326,8 +328,8 @@ pub async fn register_user_atomic(
         .bind(ct_descriptor)
         .fetch_one(&mut *tx)
         .await?;
-        // Descriptor reset means any cached outpoint→addr_index mappings now
-        // point into the wrong keyspace. Drop them.
+        // Descriptor may have changed, so cached outpoint→addr_index mappings
+        // can point into the wrong keyspace. Drop them.
         sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
             .bind(&user.nym)
             .execute(&mut *tx)
@@ -383,7 +385,7 @@ pub async fn update_user_descriptor(
 ) -> Result<Option<User>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let user_opt = sqlx::query_as::<_, User>(
-        "UPDATE users SET ct_descriptor = $2, next_addr_idx = 0 \
+        "UPDATE users SET ct_descriptor = $2 \
          WHERE npub = $1 AND is_active = TRUE \
          RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
@@ -488,7 +490,7 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     // expire to 'expired' status.
 
     let purged = sqlx::query_as::<_, User>(
-        "UPDATE users SET is_active = FALSE, ct_descriptor = '', next_addr_idx = 0 \
+        "UPDATE users SET is_active = FALSE, ct_descriptor = '' \
          WHERE id = $1 \
          RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
     )
@@ -2375,7 +2377,7 @@ pub async fn mark_invoice_settlement_status_for_swap(
 /// non-unpaid returns 0 rows affected. Caller verifies the Schnorr
 /// signature AND that the invoice's nym maps to the verifying npub
 /// upstream — this fn does not re-check ownership.
-pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
+pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<(u64, String), sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = 'cancelled', cancelled_at = NOW() \
          WHERE id = $1 AND status = 'unpaid'",
@@ -2383,7 +2385,15 @@ pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error>
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    let rows = result.rows_affected();
+    if rows == 1 {
+        return Ok((rows, "cancelled".to_string()));
+    }
+    let status = sqlx::query_scalar::<_, String>("SELECT status FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    Ok((rows, status))
 }
 
 /// Background sweep: flip every unpaid OR in_progress invoice past its

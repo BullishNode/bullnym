@@ -63,10 +63,11 @@ pub const ACTION_CREATE: &str = "invoice-create";
 pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
 
-/// Hard upper bound on wallet-origin invoice expiry (7 days). Mobile is
-/// the source of the requested expiry (`expires_at_unix`); the server
-/// clamps to this ceiling so a runaway or malicious client cannot pin a
-/// row indefinitely or refresh Boltz offers forever.
+/// Hard upper bound and default for wallet-origin invoice expiry (7 days).
+/// Clients may omit `expires_at_unix`; the server then uses this default.
+/// When a client does request an expiry, the server still caps it here so
+/// a runaway or malicious client cannot pin a row indefinitely or refresh
+/// Boltz offers forever.
 const MAX_WALLET_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Default cap on `list_invoices.pageSize`. Mobile can request a smaller
@@ -828,8 +829,11 @@ pub struct InvoiceStatusResponse {
     pub bitcoin_address: Option<String>,
     pub bitcoin_chain_address: Option<String>,
     pub bitcoin_chain_bip21: Option<String>,
+    #[serde(default)]
     pub accept_btc: bool,
+    #[serde(default)]
     pub accept_ln: bool,
+    #[serde(default)]
     pub accept_liquid: bool,
 }
 
@@ -1372,7 +1376,7 @@ pub struct CreateSignedRequest {
     pub bitcoin_address: Option<String>,
     pub liquid_address: Option<String>,
     pub liquid_blinding_key_hex: Option<String>,
-    pub expires_at_unix: i64,
+    pub expires_at_unix: Option<i64>,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -1484,19 +1488,26 @@ async fn create_invoice_inner(
         None
     };
 
-    // Outer expiry window: now+60s to now+30d.
+    // Outer expiry window: now+60s to now+7d. Omitted expiry defaults to
+    // the server cap; the signed payload uses an empty expiry field in that
+    // case, so clients do not need to know server time to create an invoice.
     let now = unix_now();
-    if req.expires_at_unix < now + 60 {
-        return Err(AppError::InvalidAmount(
-            "expires_at_unix must be at least 60 seconds in the future".into(),
-        ));
-    }
-    if req.expires_at_unix > now + MAX_WALLET_EXPIRES_SECS {
-        return Err(AppError::InvalidAmount(format!(
-            "expires_at_unix beyond {MAX_WALLET_EXPIRES_SECS}s cap"
-        )));
-    }
-    let expires_in_secs = req.expires_at_unix - now;
+    let expires_in_secs = match req.expires_at_unix {
+        Some(expires_at_unix) => {
+            if expires_at_unix < now + 60 {
+                return Err(AppError::InvalidAmount(
+                    "expires_at_unix must be at least 60 seconds in the future".into(),
+                ));
+            }
+            if expires_at_unix > now + MAX_WALLET_EXPIRES_SECS {
+                return Err(AppError::InvalidAmount(format!(
+                    "expires_at_unix beyond {MAX_WALLET_EXPIRES_SECS}s cap"
+                )));
+            }
+            expires_at_unix - now
+        }
+        None => MAX_WALLET_EXPIRES_SECS,
+    };
 
     // ---- Build v2 payload + verify Schnorr sig ----
     let amount_sat_str = req.amount_sat.map(|n| n.to_string()).unwrap_or_default();
@@ -1514,7 +1525,10 @@ async fn create_invoice_inner(
     let bitcoin_address_str = req.bitcoin_address.clone().unwrap_or_default();
     let liquid_address_str = req.liquid_address.clone().unwrap_or_default();
     let liquid_blinding_key_str = req.liquid_blinding_key_hex.clone().unwrap_or_default();
-    let expires_str = req.expires_at_unix.to_string();
+    let expires_str = req
+        .expires_at_unix
+        .map(|expires_at_unix| expires_at_unix.to_string())
+        .unwrap_or_default();
     let fields = create_payload_fields(
         &amount_sat_str,
         &fiat_minor_str,
@@ -1716,12 +1730,7 @@ async fn cancel_invoice_inner(
         }
     }
 
-    let rows = db::cancel_invoice(&state.db, id).await?;
-    let final_status: String = if rows == 1 {
-        "cancelled".to_string()
-    } else {
-        inv.status
-    };
+    let (rows, final_status) = db::cancel_invoice(&state.db, id).await?;
     tracing::info!(
         event = "invoice_cancelled",
         invoice_id = %id,

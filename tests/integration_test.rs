@@ -223,6 +223,46 @@ fn sign_invoice_create_with_keypair(
     )
 }
 
+fn sign_invoice_create_without_expiry_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    bitcoin_address: &str,
+) -> (String, u64) {
+    let amount_sat = "1000";
+    let fiat_amount_minor = "";
+    let fiat_currency = "";
+    let public_description = "";
+    let recipient_name = "";
+    let invoice_number = "";
+    let accept_btc = "true";
+    let accept_ln = "false";
+    let accept_liquid = "false";
+    let liquid_address = "";
+    let liquid_blinding_key_hex = "";
+    let expires_at = "";
+    sign_la_action(
+        keypair,
+        "invoice-create",
+        npub,
+        "",
+        &[
+            amount_sat,
+            fiat_amount_minor,
+            fiat_currency,
+            public_description,
+            recipient_name,
+            invoice_number,
+            accept_btc,
+            accept_ln,
+            accept_liquid,
+            bitcoin_address,
+            liquid_address,
+            liquid_blinding_key_hex,
+            expires_at,
+        ],
+    )
+}
+
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
@@ -1043,6 +1083,80 @@ async fn insert_test_invoice(
     .unwrap()
 }
 
+#[tokio::test]
+async fn registration_lifecycle_keeps_address_index_monotonic() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _) = sign_registration("idxlife", TEST_DESCRIPTOR);
+
+    pay_service::db::create_user(&pool, "idxlife", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET next_addr_idx = 4 WHERE npub = $1")
+        .bind(&npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let updated = pay_service::db::update_user_descriptor(&pool, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.next_addr_idx, 4);
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    let reactivated =
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, 5)
+            .await
+            .unwrap();
+    match reactivated {
+        pay_service::db::RegisterOutcome::Reactivated(user) => {
+            assert_eq!(user.next_addr_idx, 4);
+        }
+        _ => panic!("expected reactivation"),
+    }
+
+    let purged = pay_service::db::purge_user(&pool, &npub).await.unwrap();
+    match purged {
+        pay_service::db::PurgeOutcome::Purged(user) => {
+            assert_eq!(user.next_addr_idx, 4);
+        }
+        _ => panic!("expected purge"),
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn cancel_invoice_returns_final_status_on_repeated_cancel() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "cancelidem").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "cancelidem",
+        &npub,
+        "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv",
+        3_600,
+    )
+    .await;
+
+    let first = pay_service::db::cancel_invoice(&pool, invoice.id)
+        .await
+        .unwrap();
+    let second = pay_service::db::cancel_invoice(&pool, invoice.id)
+        .await
+        .unwrap();
+
+    assert_eq!(first, (1, "cancelled".to_string()));
+    assert_eq!(second, (0, "cancelled".to_string()));
+
+    cleanup_db(&pool).await;
+}
+
 fn liquid_direct_evidence<'a>(
     event_key: &'a str,
     amount_sat: i64,
@@ -1214,6 +1328,58 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "BitcoinAddressAlreadyUsed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_create_defaults_expiry_when_omitted() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("invoicedefault", TEST_DESCRIPTOR);
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+    let (sig, ts) = sign_invoice_create_without_expiry_with_keypair(&keypair, &npub, address);
+    let before = auth_timestamp() as i64;
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "bitcoin_address": address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "timestamp": ts,
+            "signature": sig,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["invoice_id"].is_string(), "body: {body}");
+    let expires_at_unix: i64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM expires_at)::BIGINT FROM invoices WHERE npub_owner = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        expires_at_unix >= before + 7 * 24 * 60 * 60 - 2,
+        "expires_at_unix={expires_at_unix}, before={before}"
+    );
+    assert!(
+        expires_at_unix <= before + 7 * 24 * 60 * 60 + 2,
+        "expires_at_unix={expires_at_unix}, before={before}"
+    );
 
     cleanup_db(&pool).await;
 }
