@@ -829,11 +829,8 @@ pub struct InvoiceStatusResponse {
     pub bitcoin_address: Option<String>,
     pub bitcoin_chain_address: Option<String>,
     pub bitcoin_chain_bip21: Option<String>,
-    #[serde(default)]
     pub accept_btc: bool,
-    #[serde(default)]
     pub accept_ln: bool,
-    #[serde(default)]
     pub accept_liquid: bool,
 }
 
@@ -1370,8 +1367,11 @@ pub struct CreateSignedRequest {
     #[serde(rename = "recipient_name", alias = "recipient_label")]
     pub recipient_label: Option<String>,
     pub invoice_number: Option<String>,
+    #[serde(default)]
     pub accept_btc: bool,
+    #[serde(default)]
     pub accept_ln: bool,
+    #[serde(default)]
     pub accept_liquid: bool,
     pub bitcoin_address: Option<String>,
     pub liquid_address: Option<String>,
