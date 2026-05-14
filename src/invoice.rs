@@ -87,6 +87,8 @@ const SAT_PER_BTC: i64 = 100_000_000;
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
 const RECIPIENT_LABEL_MAX: usize = 100;
 const INVOICE_NUMBER_MAX: usize = 50;
+const LIQUID_BTC_ASSET_ID: &str =
+    "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
 
 // =====================================================================
 // Settlement hook (called by claimer/reconciler on Lightning settlement)
@@ -690,6 +692,7 @@ struct InvoicePaymentTpl<'a> {
     bitcoin_chain_address_js: String,
     bitcoin_chain_bip21_js: String,
     liquid_address_js: String,
+    liquid_btc_asset_id: &'a str,
 }
 
 fn format_fiat_major(minor: i32, currency: &str) -> String {
@@ -799,6 +802,7 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
         bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
         bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
         liquid_address_js: js_string_literal(inv.liquid_address.as_deref())?,
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
     };
     tpl.render()
         .map_err(|e| AppError::DbError(format!("template render: {e}")))
@@ -2198,6 +2202,7 @@ mod tests {
             bitcoin_chain_address_js: js_string_literal(None).unwrap(),
             bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
             liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+            liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
         };
 
         let html = tpl.render().expect("template renders");
@@ -2230,6 +2235,7 @@ mod tests {
             bitcoin_chain_address_js: js_string_literal(None).unwrap(),
             bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
             liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+            liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
         };
 
         let html = tpl.render().expect("template renders");
@@ -2265,6 +2271,7 @@ mod tests {
             ))
             .unwrap(),
             liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+            liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
         };
 
         let html = tpl.render().expect("template renders");
@@ -2273,6 +2280,39 @@ mod tests {
         assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000\\u0026label=Send%20to%20L-BTC%20address\""));
         assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
         assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS"));
+    }
+
+    #[test]
+    fn template_liquid_uri_pins_lbtc_asset() {
+        let tpl = InvoicePaymentTpl {
+            nym: "alice",
+            is_unlinked: false,
+            invoice_id: Uuid::nil().to_string(),
+            domain: "bullpay.ca",
+            status: "unpaid",
+            settlement_status: "none",
+            amount_sat: 10_000,
+            remaining_amount_sat: 10_000,
+            fiat_display: None,
+            public_description: None,
+            recipient_name: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_chain_address: None,
+            bitcoin_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+            bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+            liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+            liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+        };
+
+        let html = tpl.render().expect("template renders");
+
+        assert!(html.contains(
+            "liquidnetwork:${address}?amount=${btc}&assetid=6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+        ));
     }
 
     #[test]

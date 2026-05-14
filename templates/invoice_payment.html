@@ -346,7 +346,7 @@
 
             function liquidUri(address, amountSat) {
                 const btc = (amountSat / SAT_PER_BTC).toFixed(8);
-                return `liquidnetwork:${address}?amount=${btc}`;
+                return `liquidnetwork:${address}?amount=${btc}&assetid={{ liquid_btc_asset_id }}`;
             }
 
             function setQrPayload(text) {
