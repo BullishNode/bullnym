@@ -1325,7 +1325,7 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "BitcoinAddressAlreadyUsed");
 
@@ -1428,6 +1428,40 @@ async fn invoice_insert_rejects_reused_liquid_address() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn checkout_liquid_allocator_skips_addresses_already_assigned_to_invoices() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "allocskip").await;
+    let reused = "lq1allocskipreused000000000000000000000000";
+    let fresh = "lq1allocskipfresh0000000000000000000000000";
+
+    let _ = insert_test_invoice(&pool, "allocskip", &npub, reused, 3_600).await;
+
+    let allocated = pay_service::db::allocate_next_liquid_for_active_nym(
+        &pool,
+        "allocskip",
+        |_descriptor, idx| match idx {
+            0 => Ok(reused.to_string()),
+            1 => Ok(fresh.to_string()),
+            other => Err(sqlx::Error::Protocol(format!("unexpected index {other}"))),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(allocated, (fresh.to_string(), 1));
+    let next_idx: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+        .bind("allocskip")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(next_idx, 2);
 
     cleanup_db(&pool).await;
 }
@@ -1598,6 +1632,40 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     assert_eq!(overpaid.status, "overpaid");
     assert_eq!(overpaid.settlement_status, "settled");
     assert_eq!(overpaid.paid_amount_sat, Some(1_010));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_status_surfaces_partial_payment_remaining_amount() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "partialstatus").await;
+    let invoice = insert_test_invoice(&pool, "partialstatus", &npub, "lq1partialstatus", 60).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:abababababababababababababababababababababababababababababababab:0",
+            400,
+            "abababababababababababababababababababababababababababababababab",
+            0,
+            "lq1partialstatus",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "partially_paid");
+    assert_eq!(body["paid_amount_sat"], 400);
+    assert_eq!(body["remaining_amount_sat"], 600);
+    assert_eq!(body["settlement_status"], "none");
 
     cleanup_db(&pool).await;
 }

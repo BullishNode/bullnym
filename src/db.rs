@@ -2530,7 +2530,7 @@ pub async fn allocate_next_liquid_for_active_nym<F>(
     derive_address: F,
 ) -> Result<Option<(String, i32)>, sqlx::Error>
 where
-    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
+    F: Fn(&str, u32) -> Result<String, sqlx::Error>,
 {
     let mut tx = pool.begin().await?;
 
@@ -2540,23 +2540,53 @@ where
         .await?;
 
     let row: Option<(String, i32)> = sqlx::query_as(
-        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
-         WHERE nym = $1 AND is_active = TRUE \
-         RETURNING ct_descriptor, next_addr_idx - 1",
+        "SELECT ct_descriptor, next_addr_idx FROM users WHERE nym = $1 AND is_active = TRUE",
     )
     .bind(nym)
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some((ct_descriptor, address_index)) = row else {
+    let Some((ct_descriptor, mut address_index)) = row else {
         return Ok(None);
     };
-    let idx_u32 = u32::try_from(address_index)
-        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
-    let address = derive_address(&ct_descriptor, idx_u32)?;
+
+    for _ in 0..100 {
+        let idx_u32 = u32::try_from(address_index).map_err(|_| {
+            sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+        })?;
+        let address = derive_address(&ct_descriptor, idx_u32)?;
+        let in_use: bool = sqlx::query_scalar(
+            "SELECT \
+                EXISTS(SELECT 1 FROM invoice_payment_addresses WHERE rail = 'liquid' AND address = $1) \
+                OR EXISTS(SELECT 1 FROM donation_allocations WHERE address = $1)",
+        )
+        .bind(&address)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !in_use {
+            sqlx::query("UPDATE users SET next_addr_idx = $2 WHERE nym = $1")
+                .bind(nym)
+                .bind(address_index + 1)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(Some((address, address_index)));
+        }
+
+        address_index += 1;
+    }
+
+    sqlx::query("UPDATE users SET next_addr_idx = $2 WHERE nym = $1")
+        .bind(nym)
+        .bind(address_index)
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
-    Ok(Some((address, address_index)))
+    Err(sqlx::Error::Protocol(format!(
+        "could not allocate unused Liquid address for {nym} after 100 attempts"
+    )))
 }
 
 /// Read the most recent BOLT11 for an invoice (latest swap_records row

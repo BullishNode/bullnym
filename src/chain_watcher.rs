@@ -278,7 +278,7 @@ async fn record_liquid_events_for_script(
                 }
             };
             if secrets.asset != elements::AssetId::LIQUID_BTC {
-                tracing::warn!(
+                tracing::debug!(
                     invoice_id = %invoice_id,
                     txid = %txid,
                     vout = vout,

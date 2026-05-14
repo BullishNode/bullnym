@@ -378,6 +378,9 @@ impl IntoResponse for AppError {
         // endpoints for consistency. Auth: 401. Hard ceiling: 503.
         let status = match &self {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
+            AppError::BitcoinAddressAlreadyUsed | AppError::LiquidAddressAlreadyUsed => {
+                StatusCode::CONFLICT
+            }
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::OK,
         };
