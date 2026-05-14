@@ -2556,9 +2556,10 @@ where
         })?;
         let address = derive_address(&ct_descriptor, idx_u32)?;
         let in_use: bool = sqlx::query_scalar(
-            "SELECT \
-                EXISTS(SELECT 1 FROM invoice_payment_addresses WHERE rail = 'liquid' AND address = $1) \
-                OR EXISTS(SELECT 1 FROM donation_allocations WHERE address = $1)",
+            "SELECT EXISTS( \
+                SELECT 1 FROM invoice_payment_addresses \
+                WHERE rail = 'liquid' AND address = $1 \
+            )",
         )
         .bind(&address)
         .fetch_one(&mut *tx)
