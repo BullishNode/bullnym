@@ -339,7 +339,12 @@ pub(crate) async fn create_lightning_swap(
     // the descriptor index at claim time. See docs/lud-22-vs-mrh-research.md.
     let result = state
         .boltz
-        .create_reverse_swap(swap_key_index, amount_sat, &description_hash_hex)
+        .create_reverse_swap(
+            swap_key_index,
+            amount_sat,
+            None,
+            Some(&description_hash_hex),
+        )
         .await?;
 
     let preimage_hex = hex::encode(&result.preimage);

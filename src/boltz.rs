@@ -53,7 +53,8 @@ impl BoltzService {
         &self,
         swap_key_index: u64,
         amount_sat: u64,
-        description_hash: &str,
+        description: Option<&str>,
+        description_hash: Option<&str>,
     ) -> Result<SwapResult, AppError> {
         let keypair = self
             .swap_master_key
@@ -73,8 +74,8 @@ impl BoltzService {
             invoice: None,
             invoice_amount: Some(amount_sat),
             preimage_hash: Some(preimage.sha256),
-            description: None,
-            description_hash: Some(description_hash.to_string()),
+            description: description.map(str::to_owned),
+            description_hash: description_hash.map(str::to_owned),
             address: None,
             address_signature: None,
             referral_id: None,

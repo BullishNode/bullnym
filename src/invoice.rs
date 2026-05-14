@@ -1104,6 +1104,66 @@ fn lightning_swap_nym(invoice: &db::Invoice) -> Option<&str> {
     invoice.nym_owner.as_deref()
 }
 
+fn invoice_public_url(domain: &str, nym_owner: Option<&str>, invoice_id: Uuid) -> String {
+    match nym_owner {
+        Some(nym) => format!("https://{domain}/{nym}/i/{invoice_id}"),
+        None => format!("https://{domain}/invoice/{invoice_id}"),
+    }
+}
+
+struct BoltzInvoiceDescription {
+    description: Option<String>,
+    description_hash: Option<String>,
+}
+
+fn boltz_invoice_description_for_url(url: &str) -> BoltzInvoiceDescription {
+    if url.is_ascii() && url.len() <= 100 {
+        return BoltzInvoiceDescription {
+            description: Some(url.to_string()),
+            description_hash: None,
+        };
+    }
+
+    BoltzInvoiceDescription {
+        description: None,
+        description_hash: Some(hex::encode(Sha256::digest(url.as_bytes()))),
+    }
+}
+
+fn append_bip21_message(bip21: &str, message: &str) -> String {
+    let encoded = percent_encode_query_value(message);
+    let (base, query) = match bip21.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (bip21, None),
+    };
+    let mut params: Vec<&str> = query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            let key = part.split_once('=').map_or(*part, |(key, _)| key);
+            key != "message"
+        })
+        .collect();
+    let message_param = format!("message={encoded}");
+    params.push(&message_param);
+
+    format!("{base}?{}", params.join("&"))
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 /// Internal: create a Boltz reverse swap and record it as the Lightning
 /// offer for `invoice`. The `invoice_id` association is what lets the
 /// claimer's invoice-flip hook pair the Boltz settlement back to this
@@ -1118,18 +1178,21 @@ async fn create_lightning_offer(
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
 
-    // Description URL: linked invoices use /<nym>/i/<id>; unlinked use
-    // /invoice/<id>. Donator's LN wallet shows the description hash; we
-    // bind it to the public invoice URL.
-    let description = match invoice.nym_owner.as_deref() {
-        Some(nym) => format!("https://{}/{}/i/{}", state.config.domain, nym, invoice.id),
-        None => format!("https://{}/invoice/{}", state.config.domain, invoice.id),
-    };
-    let description_hash_hex = hex::encode(Sha256::digest(description.as_bytes()));
+    let public_url = invoice_public_url(
+        &state.config.domain,
+        invoice.nym_owner.as_deref(),
+        invoice.id,
+    );
+    let boltz_description = boltz_invoice_description_for_url(&public_url);
 
     let result = state
         .boltz
-        .create_reverse_swap(swap_key_index, amount_sat, &description_hash_hex)
+        .create_reverse_swap(
+            swap_key_index,
+            amount_sat,
+            boltz_description.description.as_deref(),
+            boltz_description.description_hash.as_deref(),
+        )
         .await?;
 
     let lightning_pr = result.invoice.clone();
@@ -1200,6 +1263,15 @@ async fn create_bitcoin_chain_offer(
         .boltz
         .create_btc_to_lbtc_chain_swap(claim_key_index, refund_key_index, amount_sat)
         .await?;
+    let public_url = invoice_public_url(
+        &state.config.domain,
+        invoice.nym_owner.as_deref(),
+        invoice.id,
+    );
+    let lockup_bip21 = result
+        .lockup_bip21
+        .as_deref()
+        .map(|bip21| append_bip21_message(bip21, &public_url));
 
     let preimage_hex = hex::encode(&result.preimage);
     let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
@@ -1215,7 +1287,7 @@ async fn create_bitcoin_chain_offer(
             nym: swap_nym,
             boltz_swap_id: &result.swap_id,
             lockup_address: &result.lockup_address,
-            lockup_bip21: result.lockup_bip21.as_deref(),
+            lockup_bip21: lockup_bip21.as_deref(),
             user_lock_amount_sat: result.user_lock_amount_sat as i64,
             server_lock_amount_sat: result.server_lock_amount_sat as i64,
             preimage_hex: &preimage_hex,
@@ -1234,7 +1306,7 @@ async fn create_bitcoin_chain_offer(
 
     Ok(Some(BitcoinChainOffer {
         lockup_address: result.lockup_address,
-        lockup_bip21: result.lockup_bip21,
+        lockup_bip21,
     }))
 }
 
@@ -2021,6 +2093,86 @@ mod tests {
         assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_481));
         assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_601));
         assert!(!bolt11_is_reusable_at("not-a-bolt11", 1_496_314_658));
+    }
+
+    #[test]
+    fn invoice_public_url_builds_linked_and_unlinked_urls() {
+        let id = Uuid::nil();
+
+        assert_eq!(
+            invoice_public_url("bullpay.ca", Some("alice"), id),
+            "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            invoice_public_url("bullpay.ca", None, id),
+            "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn boltz_invoice_description_uses_url_when_it_fits() {
+        let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+
+        let description = boltz_invoice_description_for_url(url);
+
+        assert_eq!(description.description.as_deref(), Some(url));
+        assert!(description.description_hash.is_none());
+    }
+
+    #[test]
+    fn max_bullpay_invoice_url_fits_boltz_description_limit() {
+        let url = invoice_public_url(
+            "bullpay.ca",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Uuid::nil(),
+        );
+
+        assert_eq!(url.len(), 90);
+        assert_eq!(
+            boltz_invoice_description_for_url(&url)
+                .description
+                .as_deref(),
+            Some(url.as_str())
+        );
+    }
+
+    #[test]
+    fn boltz_invoice_description_hashes_url_when_too_long() {
+        let url = format!(
+            "https://really-long-bullpay-domain.example/{}/i/00000000-0000-0000-0000-000000000000",
+            "a".repeat(32)
+        );
+
+        let description = boltz_invoice_description_for_url(&url);
+        let expected_hash = hex::encode(Sha256::digest(url.as_bytes()));
+
+        assert!(description.description.is_none());
+        assert_eq!(
+            description.description_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn append_bip21_message_adds_encoded_invoice_url() {
+        let bip21 = "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address";
+        let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+
+        assert_eq!(
+            append_bip21_message(bip21, url),
+            "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address&message=https%3A%2F%2Fbullpay.ca%2Falice%2Fi%2F00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn append_bip21_message_replaces_existing_message() {
+        let bip21 = "bitcoin:bc1qboltzlockup?amount=0.00010000&message=old";
+        let url = "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000";
+
+        assert_eq!(
+            append_bip21_message(bip21, url),
+            "bitcoin:bc1qboltzlockup?amount=0.00010000&message=https%3A%2F%2Fbullpay.ca%2Finvoice%2F00000000-0000-0000-0000-000000000000"
+        );
     }
 
     #[test]
