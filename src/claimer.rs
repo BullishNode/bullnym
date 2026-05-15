@@ -102,11 +102,8 @@ pub async fn webhook_with_secret(
         .map(IntoResponse::into_response)
 }
 
-/// Legacy unauthenticated webhook entrypoint: `/webhook/boltz`. When
-/// `boltz_webhook_url_secret` is configured this path is locked down —
-/// production must register the authenticated URL with Boltz instead.
-/// Kept on the router so dev environments without a configured secret
-/// keep working as before.
+/// Compatibility webhook entrypoint: `/webhook/boltz`.
+/// See docs/compatibility-ledger.md for removal policy.
 ///
 /// **First-time secret rollout (operational note).** The webhook URL is
 /// captured Boltz-side at swap-creation time. Setting the secret on a

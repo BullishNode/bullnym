@@ -57,9 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
 
     // Boltz does not HMAC-sign webhook deliveries; the only viable
-    // authenticator is the URL itself. New swaps register
-    // `/webhook/boltz/{secret}`; if the secret is unset we register the
-    // legacy unauthenticated path so dev environments still work.
+    // authenticator is the URL itself. Compatibility details live in
+    // docs/compatibility-ledger.md.
     let webhook_url = if config.boltz_webhook_url_secret.is_empty() {
         tracing::warn!(
             "BOLTZ_WEBHOOK_URL_SECRET unset — registering unauthenticated webhook URL (DEV ONLY)"
@@ -342,14 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/invoice/:id", get(invoice::render_unlinked_payment))
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/qr.svg", get(qr::generate))
-        // Two routes during the rotation overlap window:
-        // - `/webhook/boltz/:secret` — authenticated path. Handler verifies
-        //   `:secret` in constant time against the configured current/previous
-        //   secret(s); 404 on mismatch.
-        // - `/webhook/boltz` — legacy unauthenticated path, kept so dev
-        //   environments without a configured secret still function. In
-        //   production the handler refuses to process requests on this
-        //   path when the secret is configured.
+        // See docs/compatibility-ledger.md for webhook compatibility policy.
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))

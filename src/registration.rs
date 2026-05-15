@@ -343,12 +343,10 @@ pub struct LookupResponse {
     pub quota: QuotaView,
     /// All inactive nyms for this npub, most-recent first.
     pub previous_nyms: Vec<db::PreviousNym>,
-    /// Legacy field — kept until the next mobile build hits 95% adoption,
-    /// then removed by `pay-service:remove-legacy-quota-keys`. New clients
-    /// MUST read `quota.used`.
+    /// Compatibility field. New clients MUST read `quota.used`; see
+    /// docs/compatibility-ledger.md for removal policy.
     pub lifetime_nyms_used: i64,
-    /// Legacy field — see `lifetime_nyms_used`. New clients MUST read
-    /// `quota.cap`.
+    /// Compatibility field. New clients MUST read `quota.cap`.
     pub lifetime_nyms_cap: i64,
 }
 

@@ -40,10 +40,8 @@ pub struct Config {
     /// at swap creation time; the handler matches the path segment in
     /// constant time.
     ///
-    /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. When empty,
-    /// authentication is disabled (legacy/dev mode) — production MUST
-    /// set this. Rotation: see the runbook; existing in-flight swaps'
-    /// webhook URLs persist Boltz-side and 404 against a rotated secret.
+    /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. See
+    /// docs/compatibility-ledger.md for fallback and rotation policy.
     #[serde(skip)]
     pub boltz_webhook_url_secret: String,
     /// Optional previous URL secret. Accepted in addition to
@@ -967,12 +965,7 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         config.swap_mnemonic = std::env::var("SWAP_MNEMONIC")
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
-        // Optional in dev / required in prod. When empty, the webhook
-        // handler logs a warning on every request and falls back to
-        // unauthenticated mode (legacy behaviour). `BOLTZ_WEBHOOK_SECRET`
-        // is read for backwards-compat — the previous code expected an
-        // HMAC header that Boltz never sends; the value is now reused
-        // as the URL-path secret instead.
+        // See docs/compatibility-ledger.md for the env-var fallback.
         config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
             .or_else(|_| std::env::var("BOLTZ_WEBHOOK_SECRET"))
             .unwrap_or_default();
