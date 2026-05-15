@@ -1,16 +1,57 @@
 # bullnym
 
-The problem that Bullnym attempts to solve is that because the BULL wallet relies on an atomic-swap server (boltz) to allow users to receive Lightning Network payments, the BULL wallet cannot offer Lightning Address (LNURL-PAY) to its users.
+bullnym is BULL Bitcoin's payment processing backend. It started as a
+Lightning Address server for the BULL wallet and now exposes three product
+surfaces backed by the same non-custodial Liquid settlement model:
 
-This is a significant UX downside of the BULL wallet compared to other custodial Lightning wallets, and other graduated wallets such as Spark-enabled wallets.
+1. **Lightning Address** — a public `nym@domain` LNURL-pay endpoint. Standard
+   senders receive a BOLT11 invoice backed by a Boltz reverse swap; LUD-22
+   senders can receive a direct Liquid address after proving UTXO ownership.
+2. **Donation Pages** — public pages at `https://<domain>/<nym>` where a payer
+   enters an amount and receives a payment page with Lightning, Liquid, and
+   Bitcoin payment instructions.
+3. **Invoices** — recipient-created receivables with signed mobile APIs,
+   public payment URLs, fixed-sat or fiat-priced amounts, invoice listing,
+   cancellation, and payment-status accounting.
 
-The solution is a server compatible with LNURL which has 3 main functions:
+The account identity is the Nostr `npub`. A **nym** is an optional public
+payment namespace owned by that `npub`: Lightning Addresses and Donation Pages
+are attached to a nym and use the nym's Liquid confidential descriptor for
+settlement. Invoices can be linked to a nym for routing and presentation, but
+they do not have to be. Wallet-origin invoices use recipient-supplied Bitcoin
+and/or Liquid addresses instead of requiring the server to store a descriptor.
 
-1. It receives and stores Liquid confidential descriptors for the user (recipient)
-2. It generates and assigns a Lightning Network address associated to that descriptor
-3. It creates a reverse submarine swap on behalf of the user (recipient) when a sender calls the LNURL endpoints and requests a bolt11 for that address.
+## Product model
 
-The Lightning Address is called a "nym".
+| Product | Who creates it | Public URL | Payment rails | Settlement destination |
+|---|---|---|---|---|
+| Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Fresh address from the active nym CT descriptor |
+| Donation Page | Recipient configures a page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the active nym CT descriptor |
+| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from Donation Pages use a nym-derived Liquid address |
+
+Payment sessions use fixed-sat accounting. Fiat-denominated invoices convert
+the requested fiat amount to sats at creation/rate-lock time and store the
+rate metadata for auditability. Accounting comes from idempotent payment
+events, not from trusting one webhook or one status flip.
+
+## Why Lightning Address needed a server
+
+The original problem Bullnym solved is that the BULL wallet relies on an
+atomic-swap server (Boltz) to allow users to receive Lightning Network
+payments, so the wallet cannot offer Lightning Address (LNURL-PAY) by itself.
+
+This is a significant UX downside compared to custodial Lightning wallets and
+other graduated wallets such as Spark-enabled wallets.
+
+The LNURL-compatible service has three main functions:
+
+1. It receives and stores Liquid confidential descriptors for the user
+   (recipient).
+2. It generates and assigns a Lightning Address associated with that descriptor.
+3. It creates a reverse submarine swap on behalf of the user when a sender
+   calls the LNURL endpoints and requests a BOLT11 invoice for that address.
+
+That Lightning Address is called a "nym".
 
 ## Risks and tradeoffs. Is it custodial?
 
@@ -103,32 +144,45 @@ The Bullnym server supports NIP05 registration. This allows users to optionally 
 
 ## Architecture
 
-bullnym is a Rust/Axum HTTP server with a Postgres backend, four background workers, and stateful integrations with a Liquid Electrum server and the Boltz API.
+bullnym is a Rust/Axum HTTP server with a Postgres backend, server-rendered
+payment pages, signed mobile APIs, and stateful integrations with Liquid
+Electrum, Boltz, the Bull pricer, and a Bitcoin mempool API.
 
 ```
 HTTP layer (Axum)
-├── /.well-known/lnurlp/:nym         LUD-06 metadata
-├── /.well-known/nostr.json          NIP-05 identity provider
-├── /lnurlp/callback/:nym            LNURL-pay callback (Lightning + LUD-22 L-BTC)
-├── /register {POST,PUT,DELETE}      Nym lifecycle, BIP-340 Schnorr-authenticated
-├── /register/lookup                 Recover registration state by npub
-├── /api/reservations/:nym           List the nym's pending LUD-22 reservations
-├── /webhook/boltz                   Boltz reverse-swap status (HMAC-SHA256)
-└── /health                          Liveness probe
+├── /.well-known/lnurlp/:nym          Lightning Address metadata
+├── /lnurlp/callback/:nym             LNURL-pay callback (Lightning + LUD-22)
+├── /register {POST,PUT,DELETE}       Nym lifecycle, Schnorr-authenticated
+├── /donation-page {PUT,DELETE}       Signed donation-page management
+├── /donation-page/:nym               Public donation-page JSON state
+├── /:nym                             Server-rendered donation page (fallback)
+├── /:nym/invoice                     Anonymous checkout invoice creation
+├── /:nym/i/:id                       Linked invoice/payment page
+├── /invoice/:id                      Unlinked invoice/payment page
+├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
+├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
+└── /health                           Liveness probe
 
-Background tasks (spawned in main, joined on SIGINT)
-├── claimer                          Webhook drain + MuSig2 cooperative claims
-├── chain_watcher                    Liquid Electrum polling, deposit detection, TTL recycle
-├── rate-limit GC                    Prunes sliding-window counter rows in Postgres
-└── in-memory rate-limit sweep       Evicts idle per-IP buckets from process memory
+Background tasks (spawned in main, cancelled on SIGINT)
+├── claimer                           Boltz webhook drain + MuSig2 cooperative claims
+├── reconciler                        Polls Boltz for non-terminal swaps after missed webhooks
+├── chain_watcher                     Liquid Electrum deposit detection + LUD-22 TTL recycle
+├── bitcoin_watcher                   Bitcoin direct invoice detection
+├── rate-limit GC                     Prunes sliding-window counter rows in Postgres
+└── in-memory rate-limit sweep        Evicts idle per-IP buckets from process memory
 
 Stateful dependencies
-├── PostgreSQL                       Users, swap records, rate-limit counters
-├── Boltz API v2                     Reverse-swap creation, MuSig2 cooperative claim
-└── Liquid Electrum                  UTXO ownership verification, deposit polling
+├── PostgreSQL                        Nyms, donation pages, invoices, swaps, payment events
+├── Boltz API v2                      Reverse swaps, chain swaps, MuSig2 cooperative claims
+├── Liquid Electrum                   LUD-22 proof checks, Liquid deposit polling
+├── Bitcoin mempool API               Direct BTC invoice detection
+└── Bull pricer                       Fiat-to-sat conversion for donation pages and invoices
 ```
 
-The server is stateless across processes — all durable state lives in Postgres. Restart-safety is provided by the claimer's startup scan (it re-checks every unclaimed swap on boot) and by exclusion constraints / unique indexes that make every claim and every address allocation idempotent.
+The server is stateless across processes; durable state lives in Postgres.
+Restart-safety is provided by startup scans, the Boltz reconciler, unique
+indexes, idempotent payment-event keys, and compare-and-set style status
+updates around claim and accounting transitions.
 
 ## HTTP API
 
@@ -154,19 +208,67 @@ Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `
 
 All write operations require a BIP-340 Schnorr signature over a domain-tagged payload (see Authentication).
 
+### Donation pages
+
+| Method | Path | Purpose |
+|---|---|---|
+| `PUT` | `/donation-page` | Create or update the public page for a nym |
+| `DELETE` | `/donation-page` | Soft-archive the page; the nym remains reserved |
+| `POST` | `/donation-page/image` | Upload avatar or OpenGraph image; server normalizes to WebP |
+| `GET` | `/donation-page/:nym` | Public JSON state used by mobile |
+| `GET` | `/:nym` | Server-rendered public donation page |
+| `POST` | `/:nym/invoice` | Anonymous payer creates a checkout invoice from the page amount |
+| `GET` | `/:nym/i/:id` | Public payment page for the checkout invoice |
+
+Donation-page management is signed by the same Nostr/BIP-340 identity that owns
+the nym. Runtime payments are represented as `origin = 'checkout'` invoice
+rows, so the donation flow shares invoice status, payment-event accounting,
+Lightning offer refresh, Liquid address detection, and Bitcoin chain-swap
+settlement machinery.
+
+### Invoices
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/:nym/invoices` | Signed creation of a nym-linked wallet invoice |
+| `POST` | `/api/v1/invoices` | Signed creation of an unlinked wallet invoice |
+| `DELETE` | `/api/v1/:nym/invoices/:id` | Signed cancellation of a linked invoice |
+| `DELETE` | `/api/v1/invoices/:id` | Signed cancellation of an unlinked invoice |
+| `GET` | `/api/v1/invoices?npub=...` | Signed list endpoint for mobile dashboard state |
+| `GET` | `/invoice/:id` | Public unlinked payment page |
+| `GET` | `/api/v1/invoices/:id/status` | Public payment status for polling payment pages |
+| `POST` | `/api/v1/invoices/:id/lightning` | Create or refresh the current BOLT11 offer |
+| `POST` | `/api/v1/invoices/:id/liquid` | Deprecated; returns `410 Gone` because wallet-origin Liquid addresses are supplied at invoice creation |
+| `GET` | `/api/v1/supported-currencies` | Fiat currencies accepted by server-side pricing |
+
+Wallet-origin invoices are `origin = 'wallet'`. They are recipient-created,
+cancellable while unpaid, and may be linked to a nym or shared through the
+unlinked `/invoice/:id` route. They carry explicit recipient-supplied Bitcoin
+and/or Liquid settlement addresses; the server does not need a stored wallet
+descriptor to create or settle them. Checkout-origin invoices are payer-created
+from a donation page, inherit the donation page's nym-derived Liquid settlement
+address, and have a shorter outer expiry.
+
 ### Webhook
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/webhook/boltz` | Boltz reverse-swap status notifications, used by the claimer to drive MuSig2 cooperative claims |
+| `POST` | `/webhook/boltz/:secret` | Boltz reverse-swap and chain-swap notifications, authenticated by URL-path secret |
+| `POST` | `/webhook/boltz` | Legacy unauthenticated route for development only; production refuses it when a secret is configured |
 
-Authenticated by `Boltz-HMAC-Signature: <hex(HMAC-SHA256(secret, body))>`, compared in constant time. Independent of HMAC, the route is rate-limited per source so a leaked secret does not turn into a webhook bomb.
+Boltz does not sign webhook deliveries. New swaps therefore register a webhook
+URL containing `BOLTZ_WEBHOOK_URL_SECRET`; the handler compares the path segment
+in constant time. `BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS` can be accepted during a
+rotation overlap window.
 
 ## Authentication
 
-### Lightning Address v1 signing
+### Schnorr signing
 
-Mobile clients sign a domain-tagged byte string with the BIP-340 Schnorr key derived from BIP85 (the same Nostr keypair used for registration):
+Mobile clients sign domain-tagged byte strings with the BIP-340 Schnorr key
+derived from BIP85 (the same Nostr keypair used for registration).
+
+Lightning Address registration uses the v1 payload:
 
 ```
 bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
@@ -179,6 +281,12 @@ bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
 | `delete` | (none) |
 
 The server verifies the Schnorr signature against `SHA-256(message)` and rejects timestamps outside `±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged, untimestamped) is still accepted with a deprecation warning to support older mobile builds; it will be removed once warning volume drops.
+
+Donation pages and invoices use the same key material with product-specific
+actions such as `donation-page-save`, `donation-page-archive`,
+`donation-page-image`, `invoice-create`, `invoice-cancel`, and `invoice-list`.
+Their payloads are domain-separated so a signature for one product action
+cannot be replayed as another.
 
 ### IP whitelist
 
@@ -197,6 +305,20 @@ pool_size = 10                  # Postgres connection pool
 api_url      = "https://api.boltz.exchange/v2"
 electrum_url = "blockstream.info:995"  # Boltz client's transitive Electrum dep
 
+[pricer]
+url                    = "https://api.bullbitcoin.com/public/price"
+cache_ttl_secs         = 60
+request_timeout_ms     = 2000
+supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP","INR"]
+
+[donation]
+image_root_path       = "/opt/payservice/data/images"
+image_max_bytes       = 2_097_152
+image_max_dimension   = 10_000
+avatar_size           = 256
+og_width              = 1200
+og_height             = 630
+
 [limits]
 min_sendable_msat          = 100_000          # 100 sats
 max_sendable_msat          = 25_000_000_000   # 25 M sats
@@ -212,6 +334,16 @@ liquid_urls       = ["les.bullbitcoin.com:995"]  # First reachable wins; rotates
 cache_ttl_secs    = 3600
 cache_max_entries = 10_000
 
+[bitcoin_watcher]
+enabled                  = true
+endpoint                 = "https://mempool.bullbitcoin.com/api"
+confirmations_required  = 1
+
+[invoice_accounting]
+btc_shortfall_tolerance_sat       = 300
+liquid_shortfall_tolerance_sat    = 60
+lightning_shortfall_tolerance_sat = 1
+
 [rate_limit]
 trust_forwarded_for = true                    # Set true behind a known reverse proxy
 ip_whitelist        = []                      # CIDRs that bypass all gates
@@ -226,7 +358,9 @@ The `[rate_limit]` table has many tunables, organized by feature group with comm
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres DSN, e.g. `postgres://payservice:...@localhost/payservice` |
 | `SWAP_MNEMONIC` | yes | 12-word BIP39 mnemonic for the Boltz `SwapMasterKey` (preimage and claim-key derivation) |
-| `BOLTZ_WEBHOOK_SECRET` | recommended | Shared HMAC secret for `/webhook/boltz`. Empty disables auth (dev only); production must set it. |
+| `BOLTZ_WEBHOOK_URL_SECRET` | recommended | URL-path secret registered with Boltz as `/webhook/boltz/:secret`. Empty disables auth (dev only); production must set it. |
+| `BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS` | no | Previous URL-path secret accepted during rotation overlap. |
+| `BOLTZ_WEBHOOK_SECRET` | no | Backwards-compatible alias for `BOLTZ_WEBHOOK_URL_SECRET`. |
 
 `.env` at the project root is read at startup via `dotenvy`.
 
@@ -237,7 +371,11 @@ Postgres is the single source of truth. All migrations are plain SQL under `migr
 Major tables:
 
 - **`users`** — one row per nym. Holds `npub`, `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
-- **`swap_records`** — one row per Boltz reverse swap. References `users(nym)`. Includes `boltz_swap_id`, `address`, `address_index`, `amount_sat`, `invoice`, MuSig2 claim state. `address` is nullable on the Lightning path: addresses are now allocated at claim time (since the MRH deprecation), not at swap creation.
+- **`donation_pages`** — one row per nym. Stores public page copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Deletion is soft so a removed page can render a stable archived response.
+- **`invoices`** — unified payment-session table for donation-page checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
+- **`invoice_payment_events`** — idempotent accounting evidence keyed by rail-specific event keys such as `liquid_direct:<txid>:<vout>`, `bitcoin_direct:<txid>:<vout>`, or `lightning_boltz_reverse:<swap_id>`.
+- **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to a donation-page or invoice payment session. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
+- **`chain_swap_records`** — one row per BTC-to-LBTC Boltz chain swap used by donation-page checkout flows. Tracks lockup address, claim address, Boltz status, invoice association, and claim lifecycle.
 - **`outpoint_addresses`** — LUD-22 `(nym, outpoint) → address_index` cache. UNIQUE constraint enforces the idempotent-mapping defense.
 - **`nym_access_events`** — sliding-window counters for the distinct-nyms-per-IP and distinct-nyms-per-outpoint caps.
 - **`processed_webhook_events`** — webhook idempotency guard.
@@ -245,12 +383,27 @@ Major tables:
 
 ## Background tasks
 
-All four are spawned in `main` and shut down via a single `CancellationToken` on `SIGINT`.
+Background tasks are spawned in `main` and shut down through a shared
+`CancellationToken` on `SIGINT`.
 
-- **`claimer::spawn_background_claimer`** — drains the webhook queue and Boltz events. On `transaction.mempool` it allocates a fresh address index and performs a MuSig2 cooperative claim (Taproot key-path) to the user's CT descriptor. Falls back to the script-path spend with the preimage if Boltz is unresponsive.
-- **`chain_watcher::run`** — polls Liquid Electrum on a per-user tick. Active users (callback within 24 h) tick every 30 s; idle users every 10 min. Uses a dedicated Electrum token bucket so a callback storm cannot starve the watcher (and vice versa). Releases unfunded LUD-22 reservations after their TTL and detects deposits to addresses already handed out.
-- **`gc::run`** — every 10 min, prunes rate-limit and access-event rows older than 24 h. Without this, sliding-window queries grow O(N).
-- **In-memory rate-limit sweep** — every 5 min, evicts in-process counter buckets idle for more than 2 h. Bounds RSS under unique-IP bursts.
+- **`claimer::spawn_background_claimer`** — drains Boltz webhooks and claimable
+  swaps. On lockup detection it drives MuSig2 cooperative claims to the
+  invoice or nym settlement address, records payment events, and marks
+  exhausted retry budgets as `claim_stuck`.
+- **`reconciler::run`** — periodically polls Boltz for non-terminal swaps.
+  This catches missed webhooks and state-machine surprises without waiting for
+  manual operator intervention.
+- **`chain_watcher::run`** — polls Liquid Electrum. It verifies direct Liquid
+  invoice payments, detects donation-page checkout payments, releases unfunded
+  LUD-22 reservations after TTL, and uses separate rate buckets so callbacks
+  cannot starve settlement detection.
+- **`bitcoin_watcher::run`** — polls the configured mempool API for
+  wallet-origin direct Bitcoin invoice outputs and records idempotent payment
+  events once the configured confirmation policy is met.
+- **`gc::run`** — prunes rate-limit and access-event rows. Without this,
+  sliding-window queries grow O(N).
+- **In-memory rate-limit sweep** — evicts idle per-IP buckets from process
+  memory and bounds RSS under unique-IP bursts.
 
 ## Building and running locally
 
@@ -266,7 +419,7 @@ done
 cat > .env <<'EOF'
 DATABASE_URL=postgres://payservice:devpass@localhost/payservice
 SWAP_MNEMONIC=<12-word BIP39 mnemonic>
-BOLTZ_WEBHOOK_SECRET=<32-byte hex>
+BOLTZ_WEBHOOK_URL_SECRET=<unguessable URL token>
 EOF
 
 # Build + run
