@@ -67,6 +67,82 @@ fn json_rpc_response_decodes_pricer_shape() {
 }
 
 #[test]
+fn rate_guardrail_accepts_supported_currency_ranges() {
+    let usd = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "USD".to_string(),
+        index_price: 90_000_000,
+        precision: 2,
+    };
+    let crc = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "CRC".to_string(),
+        index_price: 5_000_000_000,
+        precision: 2,
+    };
+    let cop = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "COP".to_string(),
+        index_price: 450_000_000,
+        precision: 0,
+    };
+
+    assert!(validate_rate_element(&usd).is_ok());
+    assert!(validate_rate_element(&crc).is_ok());
+    assert!(validate_rate_element(&cop).is_ok());
+}
+
+#[test]
+fn rate_guardrail_rejects_non_positive_rates() {
+    let zero = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "USD".to_string(),
+        index_price: 0,
+        precision: 2,
+    };
+
+    assert!(validate_rate_element(&zero).is_err());
+}
+
+#[test]
+fn rate_guardrail_rejects_absurd_currency_specific_rates() {
+    let usd = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "USD".to_string(),
+        index_price: 1_000_000_001,
+        precision: 2,
+    };
+    let crc = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "CRC".to_string(),
+        index_price: 500_000_000_001,
+        precision: 2,
+    };
+    let cop = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "COP".to_string(),
+        index_price: 50_000_000_001,
+        precision: 0,
+    };
+
+    assert!(validate_rate_element(&usd).is_err());
+    assert!(validate_rate_element(&crc).is_err());
+    assert!(validate_rate_element(&cop).is_err());
+}
+
+#[test]
+fn rate_guardrail_rejects_currencies_without_explicit_ceiling() {
+    let unknown = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "XYZ".to_string(),
+        index_price: 100,
+        precision: 2,
+    };
+
+    assert!(validate_rate_element(&unknown).is_err());
+}
+
+#[test]
 fn json_rpc_error_decodes() {
     let raw = r#"{
         "jsonrpc": "2.0",

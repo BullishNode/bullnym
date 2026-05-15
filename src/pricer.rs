@@ -53,12 +53,11 @@ pub struct PricerClient {
 }
 
 /// Sanity bounds on a freshly-fetched rate. Rejects garbage upstream
-/// responses (negative, zero, absurdly large) before they hit the cache
-/// and feed the donation-page JS. Values outside this range cause the
-/// page to render with `minor_per_btc=0` (Donate button disabled),
-/// which is preferable to silently doing 0-sat-equivalent math.
+/// responses before they hit the cache and feed the donation-page JS.
+/// Values outside this range cause the page to render with
+/// `minor_per_btc=0` (Donate button disabled), which is preferable to
+/// silently doing 0-sat-equivalent math.
 const PRICER_MIN_MINOR_PER_BTC: i64 = 1;
-const PRICER_MAX_MINOR_PER_BTC: i64 = 1_000_000_000_000; // 10 trillion minor units / BTC
 
 impl PricerClient {
     pub fn new(cfg: PricerConfig) -> Result<Self, PricerInitError> {
@@ -180,17 +179,10 @@ impl PricerClient {
             .ok_or_else(|| PricerError::Decode("missing result".into()))?
             .element;
 
-        // Sanity-check: upstream that returns a garbage rate (negative,
-        // zero, absurdly large) should NOT poison the cache. Reject so
-        // the page falls back to last-known cached value (or 0 if no
-        // cache, which disables the Donate button — preferable to
-        // silent 0-sat math).
-        if element.index_price < PRICER_MIN_MINOR_PER_BTC
-            || element.index_price > PRICER_MAX_MINOR_PER_BTC
-        {
+        if let Err(reason) = validate_rate_element(&element) {
             return Err(PricerError::Decode(format!(
-                "indexPrice {} out of sane range [{}, {}]",
-                element.index_price, PRICER_MIN_MINOR_PER_BTC, PRICER_MAX_MINOR_PER_BTC
+                "indexPrice {} for {} rejected: {}",
+                element.index_price, element.to_currency, reason
             )));
         }
 
@@ -206,6 +198,35 @@ impl PricerClient {
             fetched_at_unix: now_unix,
             last_known_rate: false,
         })
+    }
+}
+
+fn validate_rate_element(element: &RateElement) -> Result<(), String> {
+    if element.index_price < PRICER_MIN_MINOR_PER_BTC {
+        return Err(format!("below minimum {PRICER_MIN_MINOR_PER_BTC}"));
+    }
+
+    let max = max_minor_per_btc(&element.to_currency)
+        .ok_or_else(|| "currency has no configured ceiling".to_string())?;
+    if element.index_price > max {
+        return Err(format!("above currency ceiling {max}"));
+    }
+
+    Ok(())
+}
+
+fn max_minor_per_btc(currency: &str) -> Option<i64> {
+    match normalize_currency_code(currency).as_str() {
+        // Roughly a $10M/BTC equivalent ceiling per supported currency.
+        // These are not market predictions; they catch unit/decimal/feed
+        // failures while leaving a wide operational margin.
+        "USD" | "CAD" | "EUR" => Some(1_000_000_000),
+        "CRC" => Some(500_000_000_000),
+        "MXN" => Some(20_000_000_000),
+        "COP" => Some(50_000_000_000),
+        "INR" => Some(100_000_000_000),
+        "ARS" => Some(5_000_000_000_000),
+        _ => None,
     }
 }
 
