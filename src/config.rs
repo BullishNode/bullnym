@@ -585,7 +585,7 @@ pub struct RateLimitConfig {
     pub chain_watcher_active_window_secs: u32,
 
     /// Per-source rate-limit on `/webhook/boltz`. Bounds webhook-bomb
-    /// blast radius even if the HMAC secret leaks. Real Boltz traffic
+    /// blast radius even if the URL secret leaks. Real Boltz traffic
     /// hits one swap_id at a time with ~5 events end-to-end, well under
     /// 10/min.
     #[serde(default = "default_webhook_rate_limit")]
