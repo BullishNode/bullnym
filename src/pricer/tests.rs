@@ -26,6 +26,20 @@ fn currency_code_normalization_trims_and_uppercases() {
 }
 
 #[test]
+fn pricer_init_rejects_supported_currency_without_ceiling() {
+    let cfg = PricerConfig {
+        supported_currencies: vec!["USD".to_string(), "XYZ".to_string()],
+        ..PricerConfig::default()
+    };
+
+    match PricerClient::new(cfg) {
+        Err(PricerInitError::MissingRateCeiling(currency)) => assert_eq!(currency, "XYZ"),
+        Err(err) => panic!("unexpected pricer init error: {err}"),
+        Ok(_) => panic!("expected missing ceiling error"),
+    }
+}
+
+#[test]
 fn rate_view_serializes_with_expected_fields() {
     let view = RateView {
         currency: "USD".to_string(),

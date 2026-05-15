@@ -70,6 +70,12 @@ impl PricerClient {
             return Err(PricerInitError::BadScheme(cfg.url.clone()));
         }
         let supported_currencies = normalize_supported_currencies(&cfg.supported_currencies);
+        if let Some(currency) = supported_currencies
+            .iter()
+            .find(|currency| max_minor_per_btc(&currency.code).is_none())
+        {
+            return Err(PricerInitError::MissingRateCeiling(currency.code.clone()));
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .build()
@@ -280,6 +286,7 @@ fn normalize_supported_currencies(currencies: &[String]) -> Vec<CurrencyView> {
 #[derive(Debug)]
 pub enum PricerInitError {
     BadScheme(String),
+    MissingRateCeiling(String),
     Build(reqwest::Error),
 }
 
@@ -288,6 +295,9 @@ impl std::fmt::Display for PricerInitError {
         match self {
             Self::BadScheme(url) => {
                 write!(f, "pricer URL must be http:// or https://; got {url:?}")
+            }
+            Self::MissingRateCeiling(currency) => {
+                write!(f, "pricer currency {currency} has no rate ceiling")
             }
             Self::Build(e) => write!(f, "pricer client build failed: {e}"),
         }
