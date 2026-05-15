@@ -26,10 +26,10 @@ use crate::db;
 pub struct GcConfig {
     pub tick_secs: u64,
     pub retention_secs: u64,
-    /// TTL for unfulfilled `outpoint_addresses` rows (D1 fix). Rows that
-    /// the chain watcher hasn't observed paid within this window are
-    /// recycled. 1h is enough for any real payer to land their tx; longer
-    /// just lets attackers fill the per-nym pending cap without paying.
+    /// TTL for unfulfilled `outpoint_addresses` rows. Rows that the chain
+    /// watcher hasn't observed paid within this window are recycled. 1h is
+    /// enough for any real payer to land their tx; longer just lets
+    /// attackers fill the per-nym pending cap without paying.
     pub outpoint_pending_ttl_secs: u64,
 }
 
@@ -119,10 +119,10 @@ async fn expire_invoices_past_deadline(pool: &PgPool) -> u64 {
     }
 }
 
-/// D1 fix: recycle unfulfilled `outpoint_addresses` rows whose chain
-/// watcher never observed a payment. The per-nym pending-reservation cap
-/// is otherwise filled forever by an attacker submitting valid proofs
-/// over UTXOs they never intend to spend.
+/// Recycle unfulfilled `outpoint_addresses` rows whose chain watcher never
+/// observed a payment. The per-nym pending-reservation cap is otherwise
+/// filled forever by an attacker submitting valid proofs over UTXOs they
+/// never intend to spend.
 async fn prune_outpoint_addresses(pool: &PgPool, ttl_secs: u64) -> u64 {
     match sqlx::query(
         "DELETE FROM outpoint_addresses \

@@ -630,11 +630,10 @@ pub struct SwapRecord {
     // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
     // columns in the schema but intentionally NOT read into this struct.
     // Reading TIMESTAMPTZ requires the `time` or `chrono` sqlx feature
-    // flag, which the workspace deliberately avoids (see DonationPage
-    // comment at db.rs around line 935). All timestamp comparisons
-    // happen server-side in SQL (e.g. `WHERE next_claim_attempt_at IS
-    // NULL OR next_claim_attempt_at <= NOW()`), and the values are only
-    // surfaced to operators via direct DB queries (the runbook).
+    // flag, which the workspace deliberately avoids. All timestamp
+    // comparisons happen server-side in SQL (e.g.
+    // `WHERE next_claim_attempt_at IS NULL OR next_claim_attempt_at <= NOW()`),
+    // and the values are surfaced to operators through direct DB queries.
 }
 
 impl SwapRecord {

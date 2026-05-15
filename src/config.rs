@@ -586,7 +586,7 @@ pub struct RateLimitConfig {
     #[serde(default = "default_chain_watcher_active_window_secs")]
     pub chain_watcher_active_window_secs: u32,
 
-    /// Per-source rate-limit on `/webhook/boltz` (D2). Bounds webhook-bomb
+    /// Per-source rate-limit on `/webhook/boltz`. Bounds webhook-bomb
     /// blast radius even if the HMAC secret leaks. Real Boltz traffic
     /// hits one swap_id at a time with ~5 events end-to-end, well under
     /// 10/min.
@@ -595,9 +595,9 @@ pub struct RateLimitConfig {
     #[serde(default = "default_webhook_rate_window_secs")]
     pub webhook_rate_window_secs: u32,
 
-    /// Per-source rate-limit on Lightning ops, covering BOTH explicit
-    /// `network=lightning` callbacks AND Liquid→Lightning soft fallbacks
-    /// (PR C). 0 disables the check.
+    /// Per-source rate-limit on Lightning ops, covering both explicit
+    /// `network=lightning` callbacks and Liquid-to-Lightning soft fallbacks.
+    /// 0 disables the check.
     ///
     /// Per-source (not per-nym) is correct shape under the v2 principle:
     /// many payers paying one merchant via Lightning is normal; one
@@ -760,17 +760,16 @@ fn default_register_rate_limit() -> u32 {
 fn default_register_rate_window_secs() -> u32 {
     60
 }
-// PR D: 2→3 to accommodate phone-reset (new install regenerates Nostr
-// identity → 2nd npub from same IP) and family device-sharing.
+// Accommodates phone reset (new install regenerates the Nostr identity)
+// and family device sharing from one IP.
 fn default_register_distinct_npubs_per_ip() -> u32 {
     3
 }
 fn default_register_distinct_npubs_per_ip_window_secs() -> u32 {
     3600
 }
-// PR D: 100_000 was ceremonial — at our user-base this would never fire
-// under attack OR organic growth. 10_000 is a meaningful "we're growing,
-// time to revisit capacity" trigger.
+// Meaningful operational capacity trigger: high enough for organic growth,
+// low enough to fire before surprise scale changes become invisible.
 fn default_max_active_users() -> u32 {
     10_000
 }
@@ -780,10 +779,9 @@ fn default_metadata_rate_limit() -> u32 {
 fn default_metadata_rate_window_secs() -> u32 {
     60
 }
-// PR D: 5→10. LUD-06 requires a metadata fetch per payment, so a small
-// office paying multiple Lightning Addresses easily exceeds 5/h.
-// Enumeration attack still blocked: 10/h × 70 Mullvad cities = 700/h
-// total, vs the 70K-candidate dictionary the attack needs.
+// LUD-06 requires a metadata fetch per payment, so a small office paying
+// multiple Lightning Addresses can exceed 5/h. Enumeration is still bounded
+// by the distinct-target cap.
 fn default_metadata_distinct_nyms_per_ip() -> u32 {
     10
 }

@@ -89,11 +89,10 @@ impl RateLimiter {
 
     // --- Distinct-nyms per IP (Liquid callback) ---
     //
-    // Asymmetric limit by IP family (PR D): IPv4 sources get a looser
-    // cap because a single /32 is often shared by many real users
-    // (CGNAT, office NAT, family WiFi). IPv6 /56 sources get a tighter
-    // cap because /56 is the canonical ISP-customer block — one real
-    // user / household per /56.
+    // Asymmetric limit by IP family: IPv4 sources get a looser cap because
+    // a single /32 is often shared by many real users (CGNAT, office NAT,
+    // family WiFi). IPv6 /56 sources get a tighter cap because /56 is the
+    // canonical ISP-customer block.
     pub async fn check_distinct_nyms_per_ip(&self, ip: IpAddr, nym: &str) -> Result<(), AppError> {
         let bucket = source_key(ip);
         let limit = match ip {
@@ -233,12 +232,9 @@ impl RateLimiter {
         .await
     }
 
-    /// Distinct npubs-queried per IP via `GET /register/lookup`. Same
-    /// shape as the metadata distinct-nyms cap but for the npub-side
-    /// enumeration vector. Uses the `lookup:ip:` source-key prefix.
-    /// Per-source rate-limit on `/webhook/boltz` (D2). Even after HMAC
-    /// auth, webhook-bombing from one source is bounded by this. Real
-    /// Boltz traffic is well under 10/min/IP for a healthy swap.
+    /// Per-source rate-limit on `/webhook/boltz`. Webhook-bombing from one
+    /// source is bounded even when the URL secret is valid. Real Boltz
+    /// traffic is well under 10/min/IP for a healthy swap.
     pub async fn check_webhook_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("webhook:{}", source_key(ip));
         // Webhook errors go back to Boltz, not a wallet — copy is irrelevant
@@ -251,11 +247,11 @@ impl RateLimiter {
         )
     }
 
-    /// Per-source Lightning ops cap (PR C). Covers BOTH explicit
-    /// `network=lightning` callbacks AND Liquid→Lightning soft fallbacks.
-    /// Loose by design (30/h default) — Lightning is the default rail and
-    /// doesn't leak Liquid addresses; the cap exists only to bound
-    /// per-source Boltz API spend.
+    /// Per-source Lightning ops cap. Covers both explicit
+    /// `network=lightning` callbacks and Liquid-to-Lightning soft fallbacks.
+    /// Loose by design: Lightning is the default rail and doesn't leak
+    /// Liquid addresses; the cap exists only to bound per-source Boltz API
+    /// spend.
     pub async fn check_lightning_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("lightning:{}", source_key(ip));
         self.inmem_sliding_check(
@@ -353,6 +349,9 @@ impl RateLimiter {
         )
     }
 
+    /// Distinct npubs queried per IP via `GET /register/lookup`. Same shape
+    /// as the metadata distinct-nyms cap but for the npub-side enumeration
+    /// vector. Uses the `lookup:ip:` source-key prefix.
     pub async fn check_lookup_distinct_npubs_per_ip(
         &self,
         ip: IpAddr,

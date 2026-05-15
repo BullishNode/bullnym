@@ -1,7 +1,7 @@
 LUD-22: Currency negotiation for `payRequest`.
 ================================================
 
-`author: BullishNode` `discussion: https://github.com/lnurl/luds/issues/XXX`
+`author: BullishNode` `status: draft`
 
 ---
 

@@ -165,7 +165,7 @@ pub async fn metadata(
     }))
 }
 
-// --- Soft-fallback: Liquid rate-limit → Lightning (PR C) ---
+// --- Soft fallback: Liquid rate-limit to Lightning ---
 
 /// Internal outcome of attempting the Liquid path. Distinguishes
 /// fallback-eligible rate-limit failures from hard errors that should
@@ -492,8 +492,6 @@ mod tests {
         assert!(meta.contains("text/plain"));
     }
 
-    // --- PR C: rl_gate behavior ---
-    //
     // The fallback contract: rate-limit-class errors from Liquid-side
     // gates become `SoftRateLimited` (caller may fall back to Lightning).
     // Anything else stays `Hard(AppError)` and propagates unchanged.
