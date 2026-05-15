@@ -256,6 +256,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("bitcoin watcher disabled by config");
     }
 
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    tracing::info!("listening on {listen_addr}");
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("received shutdown signal");
+        cancel.cancel();
+    })
+    .await?;
+
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+fn build_router(state: AppState) -> Router {
     // Donation-page image upload needs a 2 MiB body cap, well above the
     // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
     // image route in its own sub-router with its own RequestBodyLimitLayer
@@ -264,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/donation-page/image", post(donation_page::upload_image))
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
 
-    let app = Router::new()
+    Router::new()
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
@@ -350,24 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(image_upload_router)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    tracing::info!("listening on {listen_addr}");
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("received shutdown signal");
-        cancel.cancel();
-    })
-    .await?;
-
-    tracing::info!("shutdown complete");
-    Ok(())
+        .with_state(state)
 }
 
 async fn health() -> &'static str {
