@@ -3,14 +3,14 @@ use super::*;
 #[test]
 fn sniff_jpeg() {
     let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
-    bytes.extend(std::iter::repeat(0).take(20));
+    bytes.extend(std::iter::repeat_n(0, 20));
     assert_eq!(sniff_format(&bytes), Some(SniffedFormat::Jpeg));
 }
 
 #[test]
 fn sniff_png() {
     let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    bytes.extend(std::iter::repeat(0).take(20));
+    bytes.extend(std::iter::repeat_n(0, 20));
     assert_eq!(sniff_format(&bytes), Some(SniffedFormat::Png));
 }
 
@@ -19,7 +19,7 @@ fn sniff_webp() {
     let mut bytes = b"RIFF".to_vec();
     bytes.extend([0, 0, 0, 0]);
     bytes.extend(b"WEBP");
-    bytes.extend(std::iter::repeat(0).take(20));
+    bytes.extend(std::iter::repeat_n(0, 20));
     assert_eq!(sniff_format(&bytes), Some(SniffedFormat::Webp));
 }
 

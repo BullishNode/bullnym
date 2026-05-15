@@ -29,7 +29,7 @@ fn currency_code_normalization_trims_and_uppercases() {
 fn rate_view_serializes_with_expected_fields() {
     let view = RateView {
         currency: "USD".to_string(),
-        minor_per_btc: 9_187_800_00,
+        minor_per_btc: 918_780_000,
         precision: 2,
         fetched_at_unix: 1_700_000_000,
         last_known_rate: false,

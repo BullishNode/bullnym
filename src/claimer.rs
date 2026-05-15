@@ -1661,7 +1661,7 @@ pub fn spawn_background_claimer(
                 }
             }
 
-            if tick_count % HEARTBEAT_EVERY_N_TICKS == 0 {
+            if tick_count.is_multiple_of(HEARTBEAT_EVERY_N_TICKS) {
                 tracing::info!(
                     target: "claimer",
                     event = "claimer_heartbeat",

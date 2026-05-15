@@ -104,8 +104,9 @@ pub struct NewInvoice<'a> {
     ///   - Wallet-origin (Get-paid): wallet supplies the address directly.
     ///   - Checkout-origin (donation page): server eagerly allocates
     ///     via `allocate_next_liquid_for_active_nym` BEFORE this insert.
+    ///
     /// In both cases `liquid_address_index` on the invoice row stays
-    /// NULL — the address is the chain_watcher's lookup key, not the
+    /// NULL; the address is the chain watcher's lookup key, not the
     /// descriptor index.
     pub liquid_address: Option<&'a str>,
     pub liquid_blinding_key_hex: Option<&'a str>,
@@ -122,6 +123,7 @@ pub struct NewInvoice<'a> {
 ///     `allocate_next_liquid_for_active_nym` to bump the owner's
 ///     descriptor index and derive the next address, then passes the
 ///     result through `NewInvoice.liquid_address`.
+///
 /// Lightning offers attach via a separate `record_swap` call that sets
 /// `swap_records.invoice_id`; the claimer routes the LN claim to the
 /// invoice's `liquid_address` via `resolve_claim_address` branch (B).

@@ -68,9 +68,6 @@ struct MempoolTxStatus {
     block_height: Option<u32>,
 }
 
-/// `/blocks/tip/height` returns a bare integer (text body, integer literal).
-/// We use `text()` + `parse::<u32>()` to avoid a JSON wrapper.
-
 pub struct BitcoinWatcher {
     cfg: BitcoinWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
@@ -203,6 +200,7 @@ impl BitcoinWatcher {
     }
 
     async fn fetch_tip_height(&self) -> Option<u32> {
+        // `/blocks/tip/height` returns a bare integer.
         let url = format!("{}/blocks/tip/height", self.cfg.endpoint);
         let resp = match self.http.get(&url).send().await {
             Ok(r) => r,

@@ -61,6 +61,14 @@ impl ChainWatcherConfig {
     }
 }
 
+struct ChainWatcherPollCtx<'a> {
+    pool: &'a PgPool,
+    backend: &'a (dyn UtxoBackend + Send + Sync),
+    rate_limiter: &'a RateLimiter,
+    tolerances: db::InvoiceAccountingTolerances,
+    cancel: &'a CancellationToken,
+}
+
 /// Run the chain watcher loop. Spawned for the lifetime of the server.
 /// Two cadences:
 ///   - `active_tick_secs`: scans only users with a recent callback.
@@ -106,8 +114,16 @@ pub async fn run(
                     }
                 };
                 if let Err(e) = poll_nyms(
-                    &pool, backend.as_ref(), rate_limiter.as_ref(),
-                    cfg.lookahead, tolerances, nyms, &cancel, "active",
+                    ChainWatcherPollCtx {
+                        pool: &pool,
+                        backend: backend.as_ref(),
+                        rate_limiter: rate_limiter.as_ref(),
+                        tolerances,
+                        cancel: &cancel,
+                    },
+                    cfg.lookahead,
+                    nyms,
+                    "active",
                 ).await {
                     tracing::warn!("chain_watcher active poll failed: {e:?}");
                 }
@@ -126,8 +142,16 @@ pub async fn run(
                     }
                 };
                 if let Err(e) = poll_nyms(
-                    &pool, backend.as_ref(), rate_limiter.as_ref(),
-                    cfg.lookahead, tolerances, nyms, &cancel, "idle",
+                    ChainWatcherPollCtx {
+                        pool: &pool,
+                        backend: backend.as_ref(),
+                        rate_limiter: rate_limiter.as_ref(),
+                        tolerances,
+                        cancel: &cancel,
+                    },
+                    cfg.lookahead,
+                    nyms,
+                    "idle",
                 ).await {
                     tracing::warn!("chain_watcher idle poll failed: {e:?}");
                 }
@@ -333,23 +357,20 @@ async fn record_liquid_events_for_script(
 }
 
 async fn poll_nyms(
-    pool: &PgPool,
-    backend: &(dyn UtxoBackend + Send + Sync),
-    rate_limiter: &RateLimiter,
+    ctx: ChainWatcherPollCtx<'_>,
     lookahead: u32,
-    tolerances: db::InvoiceAccountingTolerances,
     nyms: Vec<db::ActiveNymForWatcher>,
-    cancel: &CancellationToken,
     tier: &'static str,
 ) -> Result<(), AppError> {
     let n_total = nyms.len();
     let started = std::time::Instant::now();
     for n in nyms {
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return Ok(());
         }
 
-        let unpaid_invoices = match db::list_unpaid_invoice_liquid_addresses(pool, &n.nym).await {
+        let unpaid_invoices = match db::list_unpaid_invoice_liquid_addresses(ctx.pool, &n.nym).await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -362,10 +383,10 @@ async fn poll_nyms(
         for (invoice_id, addr_index, address, _remaining_minor, blinding_key_hex) in
             &unpaid_invoices
         {
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() {
                 return Ok(());
             }
-            if rate_limiter.check_electrum_watcher().await.is_err() {
+            if ctx.rate_limiter.check_electrum_watcher().await.is_err() {
                 break;
             }
             let idx = match u32::try_from(*addr_index) {
@@ -384,13 +405,13 @@ async fn poll_nyms(
                 }
             };
             match record_liquid_events_for_script(
-                pool,
-                backend,
+                ctx.pool,
+                ctx.backend,
                 *invoice_id,
                 address,
                 &script,
                 blinding_key_hex,
-                tolerances,
+                ctx.tolerances,
             )
             .await
             {
@@ -441,7 +462,7 @@ async fn poll_nyms(
             // callback storm cannot starve the watcher. If our bucket
             // exhausts, drop the rest of this nym's lookahead and try
             // again on the next tick.
-            if rate_limiter.check_electrum_watcher().await.is_err() {
+            if ctx.rate_limiter.check_electrum_watcher().await.is_err() {
                 tracing::debug!(
                     "chain_watcher: watcher Electrum bucket exhausted, deferring nym={} idx={}",
                     n.nym,
@@ -450,9 +471,9 @@ async fn poll_nyms(
                 break;
             }
 
-            match backend.has_history(&script).await {
+            match ctx.backend.has_history(&script).await {
                 Ok(true) => {
-                    db::advance_next_addr_idx(pool, &n.nym, idx).await?;
+                    db::advance_next_addr_idx(ctx.pool, &n.nym, idx).await?;
                     // Flip every still-pending reservation that pointed at
                     // this idx. In last-unused mode multiple concurrent
                     // senders share an addr_index, so one observed payment
@@ -461,7 +482,7 @@ async fn poll_nyms(
                     // inflated and the per-nym pending cap could fire on a
                     // legitimate busy nym.
                     let fulfilled =
-                        db::mark_reservations_fulfilled_at_idx(pool, &n.nym, idx).await?;
+                        db::mark_reservations_fulfilled_at_idx(ctx.pool, &n.nym, idx).await?;
                     // Note: invoice Liquid addresses are caught earlier
                     // by the dedicated unpaid-invoice scan above (their
                     // index sits BEHIND `next_addr_idx` after allocation,

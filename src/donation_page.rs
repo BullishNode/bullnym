@@ -134,9 +134,9 @@ fn validate_lengths(req: &SaveDonationPageRequest, pricer: &PricerClient) -> Res
         ));
     }
     if !pricer.is_supported_currency(&req.display_currency) {
-        return Err(AppError::DonationPageInvalid(format!(
-            "display_currency is not supported; fetch /api/v1/supported-currencies"
-        )));
+        return Err(AppError::DonationPageInvalid(
+            "display_currency is not supported; fetch /api/v1/supported-currencies".to_string(),
+        ));
     }
     if let Some(w) = &req.website {
         if w.len() > MAX_SOCIAL_LINK_LEN {

@@ -58,7 +58,7 @@ pub struct PricerClient {
 /// page to render with `minor_per_btc=0` (Donate button disabled),
 /// which is preferable to silently doing 0-sat-equivalent math.
 const PRICER_MIN_MINOR_PER_BTC: i64 = 1;
-const PRICER_MAX_MINOR_PER_BTC: i64 = 10_000_000_000_00; // 10 trillion minor units / BTC
+const PRICER_MAX_MINOR_PER_BTC: i64 = 1_000_000_000_000; // 10 trillion minor units / BTC
 
 impl PricerClient {
     pub fn new(cfg: PricerConfig) -> Result<Self, PricerInitError> {

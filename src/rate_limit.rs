@@ -534,10 +534,7 @@ struct InMemorySliding {
 
 impl InMemorySliding {
     fn check_and_record(&self, key: &str, limit: u32, window: Duration) -> InmemOutcome {
-        let mut entry = self
-            .map
-            .entry(key.to_string())
-            .or_insert_with(VecDeque::new);
+        let mut entry = self.map.entry(key.to_string()).or_default();
         let now = Instant::now();
         let cutoff = now.checked_sub(window).unwrap_or(now);
         // Drop expired timestamps. Deque is FIFO so once we hit one inside
