@@ -119,8 +119,8 @@ pub trait UtxoBackend: Send + Sync {
     ) -> Result<bool, AppError>;
 
     /// Check whether the given script has any history (mempool + confirmed)
-    /// on the Liquid network. Used by the chain_watcher to detect payments
-    /// landing at a nym's next-unused address. (added by chain_watcher)
+    /// on the Liquid network. Used by the chain watcher to detect payments
+    /// landing at a nym's next-unused address.
     async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
 
     /// Return txids touching this script (mempool + confirmed), newest/oldest

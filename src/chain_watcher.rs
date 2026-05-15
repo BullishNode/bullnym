@@ -84,8 +84,8 @@ pub async fn run(
     active_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Skip the immediate-first-tick so we don't slam the DB/Electrum at
-    // boot before the rest of the server has finished warming up.
+    // Skip the immediate first tick to avoid a burst of DB/Electrum work
+    // before the rest of the server has finished warming up.
     active_tick.tick().await;
     idle_tick.tick().await;
 

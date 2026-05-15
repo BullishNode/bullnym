@@ -45,7 +45,7 @@ impl Default for GcConfig {
 
 pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
     let mut tick = interval(Duration::from_secs(cfg.tick_secs));
-    // Skip the initial immediate tick so we don't fire during startup.
+    // Skip the initial immediate tick to avoid cleanup work during startup.
     tick.tick().await;
 
     loop {
