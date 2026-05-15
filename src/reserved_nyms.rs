@@ -40,35 +40,4 @@ pub fn is_reserved(nym: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn known_slugs_blocked() {
-        assert!(is_reserved("register"));
-        assert!(is_reserved("health"));
-        assert!(is_reserved("donation-page"));
-    }
-
-    #[test]
-    fn invoice_slugs_blocked() {
-        assert!(is_reserved("i"));
-        assert!(is_reserved("invoice"));
-        assert!(is_reserved("invoices"));
-    }
-
-    #[test]
-    fn ordinary_slugs_allowed() {
-        assert!(!is_reserved("alice"));
-        assert!(!is_reserved("bob123"));
-        assert!(!is_reserved("my-shop"));
-    }
-
-    #[test]
-    fn case_sensitive() {
-        // Nyms are lowercased by NYM_REGEX before reaching is_reserved, so
-        // case-sensitive matching here is sufficient. A capitalized slug
-        // would already fail NYM_REGEX upstream.
-        assert!(!is_reserved("Register"));
-    }
-}
+mod tests;
