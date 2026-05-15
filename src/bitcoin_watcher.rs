@@ -292,11 +292,7 @@ impl BitcoinWatcher {
 
         let mut saw_mempool = false;
         for tx in &txs {
-            let has_matching_output = tx.vout.iter().any(|v| {
-                v.scriptpubkey_address.as_deref() == Some(inv.bitcoin_address.as_str())
-                    && v.value > 0
-            });
-            if !has_matching_output {
+            if !tx_has_output_for_address(tx, &inv.bitcoin_address) {
                 continue;
             }
 
@@ -307,67 +303,7 @@ impl BitcoinWatcher {
                 };
                 let confs = tip.saturating_sub(height).saturating_add(1);
                 if confs >= self.cfg.confirmations_required {
-                    for (vout, output) in tx.vout.iter().enumerate() {
-                        if output.scriptpubkey_address.as_deref()
-                            != Some(inv.bitcoin_address.as_str())
-                            || output.value == 0
-                        {
-                            continue;
-                        }
-                        let received_sat = output.value as i64;
-                        let event_key = format!("bitcoin_direct:{}:{}", tx.txid, vout);
-                        let Ok(vout_i32) = i32::try_from(vout) else {
-                            tracing::error!(
-                                invoice_id = %inv.id,
-                                txid = %tx.txid,
-                                vout = vout,
-                                "bitcoin_watcher: vout index overflow"
-                            );
-                            continue;
-                        };
-                        match db::record_invoice_payment(
-                            &self.pool,
-                            inv.id,
-                            db::InvoicePaymentEvidence {
-                                rail: "bitcoin",
-                                source: "bitcoin_direct",
-                                event_key: &event_key,
-                                amount_sat: received_sat,
-                                txid: Some(&tx.txid),
-                                vout: Some(vout_i32),
-                                boltz_swap_id: None,
-                                address: Some(&inv.bitcoin_address),
-                            },
-                            self.tolerances,
-                        )
-                        .await
-                        {
-                            Ok(rows) if rows > 0 => {
-                                tracing::info!(
-                                    event = "invoice_payment_event_bitcoin",
-                                    invoice_id = %inv.id,
-                                    txid = %tx.txid,
-                                    vout = vout,
-                                    received_sat = received_sat,
-                                    amount_sat = inv.amount_sat,
-                                    confirmations = confs,
-                                    "bitcoin_watcher: invoice BTC payment event recorded"
-                                );
-                            }
-                            Ok(_) => {
-                                // Duplicate event or invoice no longer payable. Keep scanning
-                                // because a later output/tx can still be new evidence.
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    invoice_id = %inv.id,
-                                    txid = %tx.txid,
-                                    vout = vout,
-                                    "bitcoin_watcher: record_invoice_payment failed: {e}"
-                                );
-                            }
-                        }
-                    }
+                    self.record_confirmed_outputs(inv, tx, confs).await;
                     continue;
                 }
                 // Confirmed but not yet at threshold — treat as mempool for
@@ -409,10 +345,88 @@ impl BitcoinWatcher {
         }
     }
 
+    async fn record_confirmed_outputs(&self, inv: &InvoiceForBtcPoll, tx: &MempoolTx, confs: u32) {
+        for (vout, output) in tx.vout.iter().enumerate() {
+            if output.scriptpubkey_address.as_deref() != Some(inv.bitcoin_address.as_str())
+                || output.value == 0
+            {
+                continue;
+            }
+            self.record_confirmed_output(inv, tx, output.value, vout, confs)
+                .await;
+        }
+    }
+
+    async fn record_confirmed_output(
+        &self,
+        inv: &InvoiceForBtcPoll,
+        tx: &MempoolTx,
+        received_sat: u64,
+        vout: usize,
+        confs: u32,
+    ) {
+        let event_key = format!("bitcoin_direct:{}:{}", tx.txid, vout);
+        let Ok(vout_i32) = i32::try_from(vout) else {
+            tracing::error!(
+                invoice_id = %inv.id,
+                txid = %tx.txid,
+                vout = vout,
+                "bitcoin_watcher: vout index overflow"
+            );
+            return;
+        };
+
+        match db::record_invoice_payment(
+            &self.pool,
+            inv.id,
+            db::InvoicePaymentEvidence {
+                rail: "bitcoin",
+                source: "bitcoin_direct",
+                event_key: &event_key,
+                amount_sat: received_sat as i64,
+                txid: Some(&tx.txid),
+                vout: Some(vout_i32),
+                boltz_swap_id: None,
+                address: Some(&inv.bitcoin_address),
+            },
+            self.tolerances,
+        )
+        .await
+        {
+            Ok(rows) if rows > 0 => {
+                tracing::info!(
+                    event = "invoice_payment_event_bitcoin",
+                    invoice_id = %inv.id,
+                    txid = %tx.txid,
+                    vout = vout,
+                    received_sat = received_sat,
+                    amount_sat = inv.amount_sat,
+                    confirmations = confs,
+                    "bitcoin_watcher: invoice BTC payment event recorded"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    invoice_id = %inv.id,
+                    txid = %tx.txid,
+                    vout = vout,
+                    "bitcoin_watcher: record_invoice_payment failed: {e}"
+                );
+            }
+        }
+    }
+
     async fn try_acquire_token(&self) -> bool {
         let mut bucket = self.bucket.lock().await;
         bucket.try_consume()
     }
+}
+
+fn tx_has_output_for_address(tx: &MempoolTx, address: &str) -> bool {
+    tx.vout
+        .iter()
+        .any(|v| v.scriptpubkey_address.as_deref() == Some(address) && v.value > 0)
 }
 
 /// Convenience entry-point used by main.rs. Constructs the watcher and
