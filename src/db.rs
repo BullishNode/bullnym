@@ -2025,23 +2025,30 @@ pub async fn cancel_invoice(
     Ok(result.rows_affected())
 }
 
-/// Background sweep: flip every unpaid OR in_progress invoice past its
-/// outer deadline to 'expired'. Idempotent (set-based UPDATE; predicate
-/// excludes already-terminal rows). Run from `gc.rs` on the periodic GC
-/// cycle.
+/// Background sweep: terminalize every active invoice past its outer
+/// deadline. Unpaid / in-progress rows become `expired`; partially paid rows
+/// become `underpaid` so users and payment pages see the actual money state.
+/// Idempotent (set-based UPDATE; predicate excludes already-terminal rows).
+/// Run from `gc.rs` on the periodic GC cycle.
 ///
 /// `in_progress` is included because a payer may broadcast a tx that
 /// makes it to mempool (flipping the row to in_progress) but never
 /// confirms (RBF replaced, mempool eviction, low-fee drop). After the
 /// outer expiry we want the row out of the active corpus regardless of
-/// its mempool stage. Backed by the partial index
-/// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
+/// its mempool stage. `partially_paid` is included because checkout invoices
+/// can otherwise remain non-terminal until their long donation-page expiry.
+/// Backed by the partial `invoices_active_expiry_idx`.
 pub async fn expire_invoices_past_deadline(
     pool: &PgPool,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE invoices SET status = 'expired' \
-         WHERE status IN ('unpaid', 'in_progress') AND expires_at < NOW()",
+        "UPDATE invoices \
+         SET status = CASE \
+             WHEN status = 'partially_paid' THEN 'underpaid' \
+             ELSE 'expired' \
+         END \
+         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') \
+           AND expires_at < NOW()",
     )
     .execute(pool)
     .await?;
@@ -2309,5 +2316,12 @@ mod tests {
         assert_eq!(invoice_status_after_payment(99, 100), "underpaid");
         assert_eq!(invoice_status_after_payment(100, 100), "paid");
         assert_eq!(invoice_status_after_payment(101, 100), "overpaid");
+    }
+
+    #[test]
+    fn expiry_sweep_mentions_partially_paid_underpaid() {
+        let sql = include_str!("db.rs");
+        assert!(sql.contains("'partially_paid' THEN 'underpaid'"));
+        assert!(sql.contains("'unpaid', 'in_progress', 'partially_paid'"));
     }
 }
