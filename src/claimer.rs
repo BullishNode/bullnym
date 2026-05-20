@@ -352,26 +352,33 @@ async fn handle_chain_swap_webhook(
         return Ok(());
     }
 
-    let next = match boltz_status {
-        "swap.created" => return Ok(()),
-        "transaction.mempool" => ChainSwapStatus::UserLockMempool,
-        "transaction.confirmed" => ChainSwapStatus::UserLockConfirmed,
-        "transaction.server.mempool" => ChainSwapStatus::ServerLockMempool,
-        "transaction.server.confirmed" => ChainSwapStatus::ServerLockConfirmed,
-        "transaction.claimed" => ChainSwapStatus::Claimed,
-        "swap.expired" => ChainSwapStatus::Expired,
-        "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
-            ChainSwapStatus::LockupFailed
-        }
-        "transaction.refunded" => ChainSwapStatus::Refunded,
-        _ => {
-            tracing::debug!(
-                "ignoring chain-swap webhook status: {} for {}",
-                boltz_status,
-                swap.boltz_swap_id
-            );
-            return Ok(());
-        }
+    if boltz_status == "transaction.claimed" {
+        tracing::info!(
+            event = "chain_swap_boltz_claimed_observed",
+            swap_id = %swap.boltz_swap_id,
+            local_status = %swap.status,
+            "boltz reports chain swap claimed; local claim path remains authoritative for invoice accounting"
+        );
+        try_claim_chain_swap_with_retry(
+            &state.db,
+            swap,
+            &state.config.boltz.electrum_url,
+            &state.config.boltz.api_url,
+            state.config.claim.max_claim_attempts,
+            state.utxo_backend.as_ref(),
+            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let Some(next) = chain_swap_status_from_boltz_status(boltz_status) else {
+        tracing::debug!(
+            "ignoring chain-swap webhook status: {} for {}",
+            boltz_status,
+            swap.boltz_swap_id
+        );
+        return Ok(());
     };
 
     tracing::info!(
@@ -418,6 +425,22 @@ async fn handle_chain_swap_webhook(
         .await;
     }
     Ok(())
+}
+
+fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapStatus> {
+    match boltz_status {
+        "swap.created" => None,
+        "transaction.mempool" => Some(ChainSwapStatus::UserLockMempool),
+        "transaction.confirmed" => Some(ChainSwapStatus::UserLockConfirmed),
+        "transaction.server.mempool" => Some(ChainSwapStatus::ServerLockMempool),
+        "transaction.server.confirmed" => Some(ChainSwapStatus::ServerLockConfirmed),
+        "swap.expired" => Some(ChainSwapStatus::Expired),
+        "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
+            Some(ChainSwapStatus::LockupFailed)
+        }
+        "transaction.refunded" => Some(ChainSwapStatus::Refunded),
+        _ => None,
+    }
 }
 
 async fn try_claim_chain_swap_with_retry(

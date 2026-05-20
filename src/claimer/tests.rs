@@ -100,6 +100,18 @@ fn cooperative_refusal_rejects_unrelated_errors() {
     }
 }
 
+#[test]
+fn chain_swap_boltz_claimed_does_not_terminalize_local_status() {
+    assert_eq!(
+        chain_swap_status_from_boltz_status("transaction.server.mempool"),
+        Some(ChainSwapStatus::ServerLockMempool)
+    );
+    assert_eq!(
+        chain_swap_status_from_boltz_status("transaction.claimed"),
+        None
+    );
+}
+
 struct MockUtxoBackend {
     raw_txs: HashMap<String, Vec<u8>>,
     find_calls: Mutex<Vec<(String, u32)>>,
