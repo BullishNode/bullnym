@@ -4,6 +4,7 @@ use super::*;
 fn known_slugs_blocked() {
     assert!(is_reserved("register"));
     assert!(is_reserved("health"));
+    assert!(is_reserved("version"));
     assert!(is_reserved("donation-page"));
 }
 

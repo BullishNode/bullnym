@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth;
+use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
@@ -445,8 +446,16 @@ pub async fn create_anonymous(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::InvoiceCreate,
+        peer,
+        &headers,
+        "anonymous_invoice_create",
+        Some(&nym),
+    );
 
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state
                 .rate_limiter
@@ -466,7 +475,7 @@ pub async fn create_anonymous(
     if !page.enabled || page.is_archived {
         return Err(AppError::DonationPageNotFound(nym.clone()));
     }
-    let owner = db::get_user_by_nym(&state.db, &nym)
+    let owner = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
@@ -812,6 +821,21 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
 // =====================================================================
 
 #[derive(Serialize)]
+pub struct BitcoinDirectObservationResponse {
+    pub source: String,
+    pub rail: String,
+    pub txid: String,
+    pub vout: i32,
+    pub address: String,
+    pub amount_sat: i64,
+    pub confirmations: i32,
+    pub block_height: Option<i32>,
+    pub state: String,
+    pub first_seen_at_unix: i64,
+    pub last_seen_at_unix: i64,
+}
+
+#[derive(Serialize)]
 pub struct InvoiceStatusResponse {
     pub status: String,
     pub pricing_mode: String,
@@ -830,6 +854,7 @@ pub struct InvoiceStatusResponse {
     pub lightning_pr: Option<String>,
     pub liquid_address: Option<String>,
     pub bitcoin_address: Option<String>,
+    pub bitcoin_direct_observations: Vec<BitcoinDirectObservationResponse>,
     pub bitcoin_chain_address: Option<String>,
     pub bitcoin_chain_bip21: Option<String>,
     pub accept_btc: bool,
@@ -848,8 +873,16 @@ pub async fn status(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::InvoiceStatus,
+        peer,
+        &headers,
+        "invoice_status",
+        Some(&id_str),
+    );
 
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state
                 .rate_limiter
@@ -859,6 +892,15 @@ pub async fn status(
     }
 
     let id = parse_invoice_id(&id_str)?;
+    db::terminalize_stale_checkout_partial_invoice(
+        &state.db,
+        id,
+        state
+            .config
+            .invoice_accounting
+            .checkout_partial_terminal_grace_secs,
+    )
+    .await?;
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
@@ -874,6 +916,23 @@ pub async fn status(
         &inv,
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
     );
+    let bitcoin_direct_observations = db::list_invoice_payment_observations(&state.db, inv.id, 10)
+        .await?
+        .into_iter()
+        .map(|obs| BitcoinDirectObservationResponse {
+            source: obs.source,
+            rail: obs.rail,
+            txid: obs.txid,
+            vout: obs.vout,
+            address: obs.address,
+            amount_sat: obs.amount_sat,
+            confirmations: obs.confirmations,
+            block_height: obs.block_height,
+            state: obs.last_seen_state,
+            first_seen_at_unix: obs.first_seen_at_unix,
+            last_seen_at_unix: obs.last_seen_at_unix,
+        })
+        .collect();
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -893,6 +952,7 @@ pub async fn status(
         lightning_pr,
         liquid_address: inv.liquid_address,
         bitcoin_address: inv.bitcoin_address,
+        bitcoin_direct_observations,
         bitcoin_chain_address: bitcoin_chain_offer
             .as_ref()
             .map(|offer| offer.lockup_address.clone()),
@@ -923,8 +983,16 @@ pub async fn fetch_lightning_offer(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::LiveMoneyOffer,
+        peer,
+        &headers,
+        "invoice_lightning_offer",
+        Some(&id_str),
+    );
 
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state.rate_limiter.check_lightning_per_source(ip).await?;
         }
@@ -1484,10 +1552,18 @@ async fn create_invoice_inner(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        state,
+        CertificationScope::InvoiceCreate,
+        peer,
+        &headers,
+        "signed_invoice_create",
+        Some(&req.npub),
+    );
 
     // Pre-verify per-IP cheap gate. The per-npub gate runs AFTER signature
     // verify so a forged npub cannot grief a legitimate user's bucket.
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state.rate_limiter.check_metadata_per_ip(ip).await?;
         }
@@ -1629,7 +1705,7 @@ async fn create_invoice_inner(
     // sig already.
 
     // Per-npub bucket AFTER sig verify (auth-bound).
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         state
             .rate_limiter
             .check_invoice_create_per_npub(&req.npub)
@@ -1755,8 +1831,16 @@ async fn cancel_invoice_inner(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        state,
+        CertificationScope::MetadataLookup,
+        peer,
+        &headers,
+        "signed_invoice_cancel",
+        Some(&req.npub),
+    );
 
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state.rate_limiter.check_metadata_per_ip(ip).await?;
         }
@@ -1879,8 +1963,16 @@ pub async fn list_signed(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::MetadataLookup,
+        peer,
+        &headers,
+        "signed_invoice_list",
+        Some(&params.npub),
+    );
 
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state.rate_limiter.check_metadata_per_ip(ip).await?;
         }

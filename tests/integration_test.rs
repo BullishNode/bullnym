@@ -12,14 +12,14 @@ use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
-    BitcoinWatcherConfig, BoltzConfig, ClaimConfig, Config, DonationConfig, ElectrumConfig,
-    InvoiceAccountingConfig, LimitsConfig, PricerConfig, ProofConfig, RateLimitConfig,
-    ReconcilerConfig,
+    BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
+    ElectrumConfig, InvoiceAccountingConfig, LimitsConfig, PricerConfig, ProofConfig,
+    RateLimitConfig, ReconcilerConfig,
 };
 use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
-use pay_service::{claimer, invoice, lnurl, nostr, registration, AppState};
+use pay_service::{certification, claimer, invoice, lnurl, nostr, registration, AppState};
 
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
@@ -56,6 +56,7 @@ fn test_config() -> Config {
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),
         rate_limit: RateLimitConfig::default(),
+        certification: CertificationConfig::default(),
         electrum: ElectrumConfig::default(),
         claim: ClaimConfig::default(),
         reconciler: ReconcilerConfig::default(),
@@ -87,6 +88,7 @@ fn test_state(pool: PgPool) -> AppState {
             None,
         )),
         ip_whitelist: Arc::new(IpWhitelist::default()),
+        certification: Arc::new(certification::CertificationAllowlist::default()),
         rate_limiter,
         utxo_backend: None,
         pricer,
@@ -105,6 +107,8 @@ fn test_app(state: AppState) -> Router {
             axum::routing::delete(registration::delete_registration),
         )
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
+        .route("/api/v1/invoices/:id/status", get(invoice::status))
+        .route("/certification/preflight", get(certification::preflight))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .with_state(state)
 }
@@ -1195,6 +1199,30 @@ fn bitcoin_direct_evidence<'a>(
     }
 }
 
+fn bitcoin_direct_observation<'a>(
+    event_key: &'a str,
+    amount_sat: i64,
+    txid: &'a str,
+    vout: i32,
+    address: &'a str,
+    confirmations: i32,
+    block_height: Option<i32>,
+    last_seen_state: &'a str,
+) -> pay_service::db::NewInvoicePaymentObservation<'a> {
+    pay_service::db::NewInvoicePaymentObservation {
+        rail: "bitcoin",
+        source: "bitcoin_direct",
+        event_key,
+        txid,
+        vout,
+        address,
+        amount_sat,
+        confirmations,
+        block_height,
+        last_seen_state,
+    }
+}
+
 async fn insert_test_btc_invoice(
     pool: &PgPool,
     nym: &str,
@@ -1466,6 +1494,63 @@ async fn checkout_liquid_allocator_skips_addresses_already_assigned_to_invoices(
     cleanup_db(&pool).await;
 }
 
+#[tokio::test]
+async fn liquid_outpoint_reservation_reuses_original_index_after_cursor_advances() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let _npub = create_test_user(&pool, "liquidlastunused").await;
+    let outpoint_a = "00".repeat(32);
+    let outpoint_b = "11".repeat(32);
+    let pubkey_a = "02".repeat(33);
+    let pubkey_b = "03".repeat(33);
+
+    let first = pay_service::db::allocate_outpoint_address(
+        &pool,
+        "liquidlastunused",
+        &outpoint_a,
+        &pubkey_a,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first, 0);
+
+    sqlx::query("UPDATE users SET next_addr_idx = 7 WHERE nym = $1")
+        .bind("liquidlastunused")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let repeated = pay_service::db::allocate_outpoint_address(
+        &pool,
+        "liquidlastunused",
+        &outpoint_a,
+        &pubkey_a,
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, 0);
+
+    let different_outpoint = pay_service::db::allocate_outpoint_address(
+        &pool,
+        "liquidlastunused",
+        &outpoint_b,
+        &pubkey_b,
+    )
+    .await
+    .unwrap();
+    assert_eq!(different_outpoint, 7);
+
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outpoint_addresses WHERE nym = $1")
+            .bind("liquidlastunused")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reservations, 2);
+
+    cleanup_db(&pool).await;
+}
+
 // --- Invoice lifecycle / watcher database coverage ---
 
 #[tokio::test]
@@ -1632,6 +1717,485 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     assert_eq!(overpaid.status, "overpaid");
     assert_eq!(overpaid.settlement_status, "settled");
     assert_eq!(overpaid.paid_amount_sat, Some(1_010));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bitcoin_payment_observations_do_not_count_as_paid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btcobserve").await;
+    let invoice = insert_test_btc_invoice(&pool, "btcobserve", &npub, "bc1qbtcobserve")
+        .await
+        .unwrap();
+
+    let rows = pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            "bitcoin_direct:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0",
+            1_000,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            0,
+            "bc1qbtcobserve",
+            0,
+            None,
+            "seen_unconfirmed",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice.status, "unpaid");
+    assert_eq!(invoice.settlement_status, "none");
+    assert_eq!(invoice.paid_amount_sat, None);
+    assert_eq!(invoice.paid_via, None);
+
+    let observations = pay_service::db::list_invoice_payment_observations(&pool, invoice.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].last_seen_state, "seen_unconfirmed");
+    assert_eq!(observations[0].confirmations, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn bitcoin_payment_observation_upsert_updates_confirmation_state() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btcconfirm").await;
+    let invoice = insert_test_btc_invoice(&pool, "btcconfirm", &npub, "bc1qbtcconfirm")
+        .await
+        .unwrap();
+    let event_key =
+        "bitcoin_direct:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff:1";
+    let txid = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            event_key,
+            1_000,
+            txid,
+            1,
+            "bc1qbtcconfirm",
+            0,
+            None,
+            "seen_unconfirmed",
+        ),
+    )
+    .await
+    .unwrap();
+    pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            event_key,
+            1_000,
+            txid,
+            1,
+            "bc1qbtcconfirm",
+            2,
+            Some(800_000),
+            "awaiting_confirmations",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let observations = pay_service::db::list_invoice_payment_observations(&pool, invoice.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].confirmations, 2);
+    assert_eq!(observations[0].block_height, Some(800_000));
+    assert_eq!(observations[0].last_seen_state, "awaiting_confirmations");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn missing_bitcoin_observation_is_marked_not_seen_without_accounting_change() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btcmissing").await;
+    let invoice = insert_test_btc_invoice(&pool, "btcmissing", &npub, "bc1qbtcmissing")
+        .await
+        .unwrap();
+
+    pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            "bitcoin_direct:1111111111111111111111111111111111111111111111111111111111111111:0",
+            500,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            0,
+            "bc1qbtcmissing",
+            0,
+            None,
+            "seen_unconfirmed",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let rows =
+        pay_service::db::mark_missing_bitcoin_payment_observations_not_seen(&pool, invoice.id, &[])
+            .await
+            .unwrap();
+    assert_eq!(rows, 1);
+
+    let observations = pay_service::db::list_invoice_payment_observations(&pool, invoice.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(observations[0].last_seen_state, "not_seen");
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice.paid_amount_sat, None);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_status_exposes_bitcoin_direct_observations() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btcstatus").await;
+    let invoice = insert_test_btc_invoice(&pool, "btcstatus", &npub, "bc1qbtcstatusx")
+        .await
+        .unwrap();
+    pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            "bitcoin_direct:2222222222222222222222222222222222222222222222222222222222222222:0",
+            750,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            0,
+            "bc1qbtcstatusx",
+            0,
+            None,
+            "seen_unconfirmed",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let observations = body["bitcoin_direct_observations"].as_array().unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0]["source"], "bitcoin_direct");
+    assert_eq!(observations[0]["rail"], "bitcoin");
+    assert_eq!(
+        observations[0]["txid"],
+        "2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    assert_eq!(observations[0]["vout"], 0);
+    assert_eq!(observations[0]["amount_sat"], 750);
+    assert_eq!(observations[0]["state"], "seen_unconfirmed");
+    assert_eq!(body["status"], "unpaid");
+    assert_eq!(body["paid_amount_sat"], Value::Null);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn stale_checkout_partial_terminalizes_to_underpaid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "checkoutstale").await;
+    let invoice =
+        insert_test_invoice(&pool, "checkoutstale", &npub, "lq1checkoutstale", 3_600).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1212121212121212121212121212121212121212121212121212121212121212:0",
+            400,
+            "1212121212121212121212121212121212121212121212121212121212121212",
+            0,
+            "lq1checkoutstale",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+         SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows = pay_service::db::terminalize_stale_checkout_partial_invoice(&pool, invoice.id, 900)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    let underpaid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(underpaid.status, "underpaid");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn stale_wallet_partial_stays_payable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "walletpartial").await;
+    let blinding_key = "11".repeat(32);
+    let invoice = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some("walletpartial"),
+            npub_owner: &npub,
+            origin: "wallet",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some("lq1walletpartial"),
+            liquid_blinding_key_hex: Some(&blinding_key),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap();
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1313131313131313131313131313131313131313131313131313131313131313:0",
+            400,
+            "1313131313131313131313131313131313131313131313131313131313131313",
+            0,
+            "lq1walletpartial",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+         SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows = pay_service::db::terminalize_stale_checkout_partial_invoice(&pool, invoice.id, 900)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    let partial = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.status, "partially_paid");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "underwatch").await;
+    let invoice = insert_test_invoice(&pool, "underwatch", &npub, "lq1underwatch", 3_600).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1414141414141414141414141414141414141414141414141414141414141414:0",
+            400,
+            "1414141414141414141414141414141414141414141414141414141414141414",
+            0,
+            "lq1underwatch",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+         SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::terminalize_stale_checkout_partial_invoice(&pool, invoice.id, 900)
+        .await
+        .unwrap();
+
+    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+        .await
+        .unwrap();
+    assert!(candidates
+        .iter()
+        .any(|(candidate_id, address, _, _)| *candidate_id == invoice.id
+            && address == "lq1underwatch"));
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1515151515151515151515151515151515151515151515151515151515151515:1",
+            600,
+            "1515151515151515151515151515151515151515151515151515151515151515",
+            1,
+            "lq1underwatch",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    let paid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.status, "paid");
+    assert_eq!(paid.paid_amount_sat, Some(1_000));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn checkout_underpaid_insufficient_topup_stays_underpaid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "undertopup").await;
+    let invoice = insert_test_invoice(&pool, "undertopup", &npub, "lq1undertopup", 3_600).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1616161616161616161616161616161616161616161616161616161616161616:0",
+            300,
+            "1616161616161616161616161616161616161616161616161616161616161616",
+            0,
+            "lq1undertopup",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+         SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::terminalize_stale_checkout_partial_invoice(&pool, invoice.id, 900)
+        .await
+        .unwrap();
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1717171717171717171717171717171717171717171717171717171717171717:1",
+            200,
+            "1717171717171717171717171717171717171717171717171717171717171717",
+            1,
+            "lq1undertopup",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    let underpaid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(underpaid.status, "underpaid");
+    assert_eq!(underpaid.paid_amount_sat, Some(500));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_status_terminalizes_stale_checkout_partial_before_response() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "statusunder").await;
+    let invoice = insert_test_invoice(&pool, "statusunder", &npub, "lq1statusunder", 3_600).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:1818181818181818181818181818181818181818181818181818181818181818:0",
+            400,
+            "1818181818181818181818181818181818181818181818181818181818181818",
+            0,
+            "lq1statusunder",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_payment_events \
+         SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "underpaid");
+    assert_eq!(body["paid_amount_sat"], 400);
+    assert_eq!(body["remaining_amount_sat"], 600);
 
     cleanup_db(&pool).await;
 }

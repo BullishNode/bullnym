@@ -172,6 +172,31 @@ received_sat = SUM(payment_events.amount_sat)
 remaining_sat = max(amount_sat - received_sat, 0)
 ```
 
+## Payment Observations
+
+Payment observations are non-accounting evidence. They exist so users and
+operators can distinguish "nothing seen" from "payment seen, waiting for
+confirmations."
+
+Current observation scope:
+
+- direct Bitcoin invoice outputs only
+- source: `bitcoin_direct`
+- rail: `bitcoin`
+- event key: `bitcoin_direct:<txid>:<vout>`
+
+Observation states:
+
+- `seen_unconfirmed`: the output is in mempool and has zero confirmations.
+- `awaiting_confirmations`: the output is confirmed but below the configured
+  confirmation threshold.
+- `counted`: the watcher saw enough confirmations and recorded the accounting
+  event through `invoice_payment_events`.
+- `not_seen`: a later watcher poll no longer saw a previously uncounted output.
+
+Observations must never be summed into `paid_amount_sat`, must never set
+`paid_via`, and must never set `paid_at`. They are status evidence only.
+
 ## Payment Status
 
 Payment status is the product/accounting state of the session.

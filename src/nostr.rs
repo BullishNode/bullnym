@@ -33,13 +33,9 @@ pub async fn nostr_json(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     lnurl::gate_metadata_per_ip(&state, peer, &headers, Some(&query.name)).await?;
 
-    let user = db::get_user_by_nym(&state.db, &query.name)
+    let user = db::get_active_user_by_nym(&state.db, &query.name)
         .await?
         .ok_or_else(|| AppError::NymNotFound(query.name.clone()))?;
-
-    if !user.is_active {
-        return Err(AppError::NymNotFound(query.name));
-    }
 
     let mut names = HashMap::new();
     names.insert(user.nym, user.npub);

@@ -1,0 +1,54 @@
+# Bullnym Product Surface Coverage
+
+This is Bullnym server's coverage ledger. It records what the current evidence proves, what remains unknown, what is blocked by missing preconditions, and what historical evidence is invalid for product correctness. Its purpose is coverage accounting and rerun avoidance; it is not a new product claim.
+
+Evidence rules:
+
+- Scenario outcomes come from the test-evidence docs under `docs/server-improvement-from-tests/`.
+- Server ownership and routes may be sourced from `src/main.rs` route registration and handler module names.
+- If neither evidence docs nor route registration identify ownership clearly, mark ownership as unknown.
+- Skipped, blocked, contaminated, or setup-gated surfaces are unassessed. They are not failed unless a specific valid failed scenario is cited.
+- Rerun policies are conditional. A known-good surface becomes stale when related server code, schema, provider behavior, or deployment assumptions change.
+
+Statuses:
+
+- `proven`: clean evidence exists and the behavior is not affected by current unverified server changes.
+- `partial`: useful evidence exists, but edge cases or adjacent flows remain unproven.
+- `unknown`: no trustworthy evidence yet; do not claim reliability.
+- `blocked`: do not run until preflight requirements are met.
+- `invalid-history`: exclude from product correctness; retain only as operational evidence.
+
+Do not convert `unknown` or `blocked` into `failed` without evidence. Do not rerun `proven` surfaces unless touched server code makes the old evidence stale.
+
+| Surface | Server ownership / routes | Status | Evidence | Blocker / gap | Next verification | Rerun policy |
+| --- | --- | --- | --- | --- | --- | --- |
+| Build and deploy provenance | `/version`, `/health`, nginx deploy preflight | `partial` | ITEM-001 added `/version`; invalid Liquid `1779153846` proves `/health` was insufficient. | Production deploy must still prove DB migrations separately from binary marker. | Preflight `/version` for expected commit, dirty flag, runtime mode, and schema marker before any live-money run. | Do not rerun broad payment suites for provenance-only changes; run deploy preflight and one rail smoke. |
+| Liquid direct invoice happy paths | `src/chain_watcher.rs`, `src/db/invoices.rs`, `/api/v1/invoices/:id/status` | `proven` | Clean live matrix `1779135713`; Liquid V2 `1779151124` had 20/22 passes. | ITEM-002 changed checkout partial terminalization, not normal exact-pay accounting. | One `LQ-01` smoke after deploy or state-machine changes. | Do not rerun full Liquid V2 happy-path batch unless Liquid watcher/accounting/state code changed. |
+| Liquid checkout underpay recovery | `src/db/invoices.rs`, `src/gc.rs`, status endpoint | `partial` | `LQ-21` exposed stale checkout partial behavior; ITEM-002 implemented terminalization and recoverable underpaid watch. | Needs post-deploy live rerun with current schema marker. | `LQ-21`, one exact payment-page Liquid smoke, one retry-after-underpay case. | Do not rerun full Liquid V2 suite unless transition rules change globally. |
+| Lightning invoice exact payments | Boltz reverse swap flow, `src/claimer.rs`, `src/reconciler.rs`, status endpoint | `proven` | Clean live matrix `1779135713`; LN storm 20 and 90 sequential passed. | Edge cases beyond exact sequential payments remain unknown. | One Jungle exact-pay invoice smoke after unrelated deploys. | Do not rerun 90-payment storm unless LN/Boltz/settlement code changed or scale measurement is explicit. |
+| Lightning edge cases | Boltz reverse swap lifecycle, `src/claimer.rs`, `src/reconciler.rs` | `unknown` | Broad ARS skipped many `LN-*` edge cases due setup/rate-limit/Jungle gates. | Underpay/overpay, post-cancel, post-expiry, duplicate, and long-expiry semantics are not certified. | Assess Boltz/LN state mapping, then targeted live edge cases. | Do not use happy-path LN storm as a substitute for edge semantics. |
+| Direct Bitcoin invoice observation | `src/bitcoin_watcher.rs`, `invoice_payment_observations`, status endpoint | `partial` | `BTC-01` broadcast/unconfirmed timeout; ITEM-003 added persisted direct BTC observations. | Needs live proof that server observes tx before confirmation and exposes txid/state. | `BTC-01` with low-priority fee and status assertion for `seen_unconfirmed` or `awaiting_confirmations`. | Do not rerun LN/Liquid live matrix for direct BTC observation changes. |
+| Direct Bitcoin edge cases | `src/bitcoin_watcher.rs`, payment event accounting | `blocked` | `BTC-02` through `BTC-20` were skipped/unassessed; BTC surface remains mostly unproven. | Requires funded BDK sender, explicit unconfirmed status, mempool fee source, and no silent skips. | After `BTC-01` passes, run targeted BTC underpay/overpay/late/cancel/reuse cases. | Do not run full BTC suite before preflight is green. |
+| Donation/payment page Liquid exact flow | Donation checkout routes, invoice creation, chain watcher | `partial` | Clean live matrix and Liquid V2 include successful payment-page Liquid behavior. | Retry and bad-attempt isolation remain less proven than exact payment. | One exact payment-page Liquid smoke after payment-page or invoice state changes. | Do not repeat known-good exact Liquid paths after unrelated changes. |
+| Donation/payment page BTC chain swap | Chain-swap offer/status fields, `src/invoice.rs`, `src/claimer.rs` | `unknown` | `DCHAIN-01` through `DCHAIN-04` were skipped/unassessed. | Eligibility, small-donation hiding, JS payload, and status chain fields are not certified. | Targeted DCHAIN run after direct BTC status is explicit and preflight passes. | Do not use direct BTC invoice tests as a substitute; chain swaps are different. |
+| Signed invoice create/list/cancel auth | `/api/v1/invoices`, signed action verification, ownership checks | `unknown` | `INVS-*` and related signed cases were skipped/unassessed under ARS setup/rate-limit contamination. | Forged signatures, stale timestamps, replay, cross-npub isolation, cancel idempotency, metadata round-trip not certified. | Code audit and targeted signed CRUD/auth certification after allowlist/preflight exists. | Do not treat live payment happy paths as proof of signed control-plane security. |
+| Anonymous invoice control plane | Anonymous invoice/payment-page creation, render/status agreement | `unknown` | Many `INV-*` control-plane cases were skipped/unassessed. | HTML/JSON agreement, cross-nym access, offer idempotency, trailing slash render, and BTC chain-swap payment remain unproven. | Targeted control-plane run after status projection and route behavior are audited. | Do not treat money-flow exact pays as proof of control-plane correctness. |
+| Registration, LNURL, NIP-05 lookup | `/register`, `/.well-known/nostr.json`, `/.well-known/lnurlp/:nym`, `/lnurlp/callback/:nym` | `partial` | Some registration and metadata flows pass; `R10`, `R16`, `C01`, `C02`, `C08` show lookup/callback candidates. | Rate-limit contamination prevents clean distinction between lookup bug and setup denial. | Isolate lookup helper, then rerun `R10`, `R16`, `C01`; expand only if those pass. | Do not run live payment suites for lookup-only fixes. |
+| Rate limiting and certification support | Rate limiter, IP whitelist, proof gates | `blocked` | Broad ARS/certify had hundreds of skips and repeated `RateLimitedNetwork`; redteam showed production caps work. | No safe certification allowlist/introspection yet. | Add scoped certification allowlisting and preflight; run setup and one abuse-control check. | Do not run broad ARS until preflight proves zero setup skips. |
+| Operator recovery and outage behavior | Claimer, reconciler, dependency clients, runbooks | `blocked` | `OP-01` through `OP-08` were skipped/unassessed or manual; runbooks exist. | No guarded operator mode/admin controls for repeatable certification. | Add operator-readable journey/recovery controls before outage drills. | Do not use raw DB mutation playbooks as certification proof. |
+| Webhook/reconciler/claim recovery | `/webhook/boltz`, `src/claimer.rs`, `src/reconciler.rs` | `partial` | Unit tests cover many lifecycle statuses; live outage/recovery paths are playbook-only. | Recovery scheduling and stuck-claim operator visibility are not live-certified. | Targeted recovery scenario after operator controls are explicit. | Do not treat LN exact payments as proof of recovery behavior. |
+| Public UX/rendering safety | Askama templates, donation render, invoice page, QR generation | `unknown` | `UX-01` through `UX-05` were skipped/unassessed; local tests cover some escaping/image behavior. | Unicode/RTL/zero-width/max-length/QR/status shape not certified across public pages. | Static render audit plus targeted UX scenario set. | Do not treat payment success as proof of safe rendering. |
+| Concurrency and scale | Invoice create/list/status, address allocation, watcher scans | `unknown` | `CC-01` through `CC-03` were skipped/unassessed; sequential LN volume passed. | Concurrent create, list latency, status bursts, and address allocation contention not assessed. | Query/index review and targeted concurrency run after certification preflight. | Do not treat sequential LN storm as proof of API concurrency. |
+| Invalid stale-binary Liquid run | Deployment process, not product behavior | `invalid-history` | Liquid `1779153846` failed 0/22 due stale/incompatible deploy. | None for product correctness; retained as provenance evidence. | Use only to justify `/version` and deploy gates. | Do not draw any product-correctness conclusion from that run. |
+| External funding failures | BDK/Jungle wallet balances and return loop | `blocked` | BDK zero-balance BTC run; Jungle balance exhaustion in live matrix. | Wallet balances and immediate return-flow preflight must be true before live-money runs. | Balance and return-path preflight before BTC/LN volume. | Do not treat wallet exhaustion as server failure. |
+
+## Minimal Next Verification
+
+After deploying the current server-improvement patch set, run only:
+
+1. `/version` preflight for expected commit, dirty flag, runtime mode, and schema marker.
+2. `LQ-21` plus one exact payment-page Liquid smoke for ITEM-002.
+3. `BTC-01` with direct BTC observation assertion for ITEM-003.
+4. One Jungle Lightning exact-pay smoke to confirm unrelated happy path.
+
+Stop there unless one of those targeted checks fails or the changed server code touches the corresponding broader surface.

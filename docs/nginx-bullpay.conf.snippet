@@ -43,7 +43,7 @@ server {
 
     # Rate-limit the donation HTML fallback (GET /<nym>).
     # Excludes explicit routes that have their own protection.
-    location ~ ^/(?!\.well-known/|register|webhook/|health|api/|img/|donation-page|lnurlp/) {
+    location ~ ^/(?!\.well-known/|register|webhook/|health|version|certification/|api/|img/|donation-page|lnurlp/) {
         limit_req zone=donation_html burst=10 nodelay;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
@@ -80,6 +80,8 @@ server {
 #   4. Verify:
 #        curl -I https://bullpay.ca/img/__nonexistent__/avatar.webp  → 404 from nginx
 #        curl -I https://bullpay.ca/health                            → 200 (proxied to pay-service)
+#        curl -I https://bullpay.ca/version                           → 200 (proxied to pay-service)
+#        curl -I https://bullpay.ca/certification/preflight            → 200 (proxied to pay-service)
 #        curl -I https://bullpay.ca/img/                              → 403 or 404
 #                                                                       (NEVER 200; nginx must
 #                                                                        not list directories)

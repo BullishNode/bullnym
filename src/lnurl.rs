@@ -7,6 +7,7 @@ use lwk_wollet::elements;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
@@ -122,6 +123,16 @@ pub(crate) async fn gate_metadata_per_ip(
     if state.ip_whitelist.contains(ip) {
         return Ok(());
     }
+    if certification::allows_scope(
+        state,
+        CertificationScope::MetadataLookup,
+        peer,
+        headers,
+        "metadata",
+        nym,
+    ) {
+        return Ok(());
+    }
     state.rate_limiter.check_metadata_per_ip(ip).await?;
     if let Some(n) = nym {
         state
@@ -144,13 +155,9 @@ pub async fn metadata(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     gate_metadata_per_ip(&state, peer, &headers, Some(&nym)).await?;
 
-    let user = db::get_user_by_nym(&state.db, &nym)
+    let _user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
-
-    if !user.is_active {
-        return Err(AppError::NymNotFound(nym));
-    }
 
     let callback = format!("https://{}/lnurlp/callback/{}", state.config.domain, nym);
 
@@ -205,6 +212,14 @@ fn rl_gate<T>(result: Result<T, AppError>) -> Result<T, LiquidOutcome> {
     }
 }
 
+fn liquid_response_addr_index(
+    current_next_addr_idx: i32,
+    reserved_addr_index: Option<i32>,
+) -> Result<u32, AppError> {
+    let addr_index = reserved_addr_index.unwrap_or(current_next_addr_idx);
+    u32::try_from(addr_index).map_err(|_| AppError::DbError("address index overflow".to_string()))
+}
+
 /// Liquid LUD-22 path. On rate-limit, returns `SoftRateLimited` so the
 /// caller can transparently route to Lightning (the default rail).
 async fn serve_liquid(
@@ -216,7 +231,7 @@ async fn serve_liquid(
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
 ) -> Result<axum::response::Response, LiquidOutcome> {
-    if !is_whitelisted {
+    let reserved_addr_index = if !is_whitelisted {
         let proof = params.take_proof().ok_or(AppError::ProofOfFundsRequired {
             min_sat: state.config.proof.min_proof_value_sat,
         })?;
@@ -234,59 +249,62 @@ async fn serve_liquid(
         rl_gate(state.rate_limiter.check_per_pubkey(&proof.pubkey).await)?;
 
         // Idempotent cache lookup. Cache hits skip all subsequent gates.
-        if db::get_outpoint_address(&state.db, nym, &proof.outpoint)
-            .await?
-            .is_none()
-        {
-            // Distinct-nym fan-out limits (Soft on rate-limit).
-            if let Some(ip) = caller_ip {
-                rl_gate(state.rate_limiter.check_distinct_nyms_per_ip(ip, nym).await)?;
+        let addr_index = match db::get_outpoint_address(&state.db, nym, &proof.outpoint).await? {
+            Some(cached) => cached.addr_index,
+            None => {
+                // Distinct-nym fan-out limits (Soft on rate-limit).
+                if let Some(ip) = caller_ip {
+                    rl_gate(state.rate_limiter.check_distinct_nyms_per_ip(ip, nym).await)?;
+                }
+                rl_gate(
+                    state
+                        .rate_limiter
+                        .check_distinct_nyms_per_outpoint(&proof.outpoint, nym)
+                        .await,
+                )?;
+
+                // Per-nym pending reservation cap (Soft).
+                rl_gate(state.rate_limiter.check_pending_reservations(nym).await)?;
+
+                let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
+
+                let backend = state.utxo_backend.as_ref().ok_or_else(|| {
+                    AppError::ElectrumError("no blockchain backend configured".into())
+                })?;
+
+                // Electrum bucket (Soft — backend saturation is a rate-limit signal).
+                rl_gate(state.rate_limiter.check_electrum().await)?;
+
+                let raw_tx = backend.get_raw_tx(&parsed.txid_hex).await?;
+                let tx: elements::Transaction = elements::encode::deserialize(&raw_tx)
+                    .map_err(|e| AppError::ElectrumError(format!("tx decode: {e}")))?;
+
+                let txout = tx
+                    .output
+                    .get(parsed.vout as usize)
+                    .ok_or(AppError::UtxoNotFound)?;
+
+                if !script_matches_pubkey(&txout.script_pubkey, &pubkey) {
+                    return Err(AppError::PubkeyUtxoMismatch.into());
+                }
+
+                let unspent = backend
+                    .is_unspent(&txout.script_pubkey, &parsed.txid_hex, parsed.vout)
+                    .await?;
+                if !unspent {
+                    return Err(AppError::UtxoSpent.into());
+                }
+
+                db::allocate_outpoint_address(&state.db, nym, &proof.outpoint, &proof.pubkey)
+                    .await?
             }
-            rl_gate(
-                state
-                    .rate_limiter
-                    .check_distinct_nyms_per_outpoint(&proof.outpoint, nym)
-                    .await,
-            )?;
+        };
+        Some(addr_index)
+    } else {
+        None
+    };
 
-            // Per-nym pending reservation cap (Soft).
-            rl_gate(state.rate_limiter.check_pending_reservations(nym).await)?;
-
-            let parsed = ParsedOutpoint::parse(&proof.outpoint)?;
-
-            let backend = state.utxo_backend.as_ref().ok_or_else(|| {
-                AppError::ElectrumError("no blockchain backend configured".into())
-            })?;
-
-            // Electrum bucket (Soft — backend saturation is a rate-limit signal).
-            rl_gate(state.rate_limiter.check_electrum().await)?;
-
-            let raw_tx = backend.get_raw_tx(&parsed.txid_hex).await?;
-            let tx: elements::Transaction = elements::encode::deserialize(&raw_tx)
-                .map_err(|e| AppError::ElectrumError(format!("tx decode: {e}")))?;
-
-            let txout = tx
-                .output
-                .get(parsed.vout as usize)
-                .ok_or(AppError::UtxoNotFound)?;
-
-            if !script_matches_pubkey(&txout.script_pubkey, &pubkey) {
-                return Err(AppError::PubkeyUtxoMismatch.into());
-            }
-
-            let unspent = backend
-                .is_unspent(&txout.script_pubkey, &parsed.txid_hex, parsed.vout)
-                .await?;
-            if !unspent {
-                return Err(AppError::UtxoSpent.into());
-            }
-
-            db::allocate_outpoint_address(&state.db, nym, &proof.outpoint, &proof.pubkey).await?;
-        }
-    }
-
-    let addr_index_u32 = u32::try_from(user.next_addr_idx)
-        .map_err(|_| AppError::DbError("address index overflow".to_string()))?;
+    let addr_index_u32 = liquid_response_addr_index(user.next_addr_idx, reserved_addr_index)?;
     let address = descriptor::derive_address(&user.ct_descriptor, addr_index_u32)?;
 
     let resp = serde_json::json!({ "L-BTC": { "address": address } });
@@ -409,12 +427,9 @@ pub async fn callback(
     }
     let amount_sat = params.amount / 1000;
 
-    let user = db::get_user_by_nym(&state.db, &nym)
+    let user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
-    if !user.is_active {
-        return Err(AppError::NymNotFound(nym.clone()));
-    }
 
     // --- Caller IP + whitelist ---
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());

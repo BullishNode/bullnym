@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bitcoin_watcher;
 pub mod boltz;
+pub mod certification;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod registration;
 pub mod reserved_nyms;
 pub mod utxo;
 pub mod validators;
+pub mod version;
 
 use std::sync::Arc;
 
@@ -32,6 +34,7 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     pub boltz: Arc<boltz::BoltzService>,
     pub ip_whitelist: Arc<ip_whitelist::IpWhitelist>,
+    pub certification: Arc<certification::CertificationAllowlist>,
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub pricer: Arc<pricer::PricerClient>,

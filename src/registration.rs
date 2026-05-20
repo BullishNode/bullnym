@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 
 use crate::auth;
+use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
@@ -34,8 +35,16 @@ async fn gate_register_per_ip(
     headers: &HeaderMap,
 ) -> Result<Option<IpAddr>, AppError> {
     let ip = caller_ip(state, peer, headers);
+    let is_certification_allowed = certification::allows_scope(
+        state,
+        CertificationScope::RegistrationSetup,
+        peer,
+        headers,
+        "register",
+        None,
+    );
     if let Some(ip) = ip {
-        if !state.ip_whitelist.contains(ip) {
+        if !state.ip_whitelist.contains(ip) && !is_certification_allowed {
             state.rate_limiter.check_register_per_ip(ip).await?;
         }
     }
@@ -125,6 +134,14 @@ pub async fn register(
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::RegistrationSetup,
+        peer,
+        &headers,
+        "register",
+        Some(&req.npub),
+    );
 
     // Hard ceiling on active users. New registrations are blocked once
     // the cap is reached; updates / lookups / deletes still work.
@@ -150,7 +167,7 @@ pub async fn register(
     // (without it being verified) is fine because the limiter only counts
     // distinct values — adversarial garbage just consumes the attacker's
     // own bucket faster.
-    if !is_whitelisted {
+    if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state
                 .rate_limiter
@@ -364,7 +381,16 @@ pub async fn lookup_by_npub(
     // register rate caps query speed; this caps total enumeration
     // breadth even for a slow attacker.
     if let Some(ip) = ip {
-        if !state.ip_whitelist.contains(ip) {
+        if !state.ip_whitelist.contains(ip)
+            && !certification::allows_scope(
+                &state,
+                CertificationScope::RegistrationSetup,
+                peer,
+                &headers,
+                "register_lookup",
+                Some(&params.npub),
+            )
+        {
             state
                 .rate_limiter
                 .check_lookup_distinct_npubs_per_ip(ip, &params.npub)
@@ -442,12 +468,9 @@ pub async fn list_reservations(
     auth::verify_signature(&params.npub, message.as_bytes(), &params.sig)?;
 
     // Bind to the nym owner on record.
-    let user = db::get_user_by_nym(&state.db, &nym)
+    let user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
-    if !user.is_active {
-        return Err(AppError::NymNotFound(nym));
-    }
     if user.npub != params.npub {
         return Err(AppError::AuthError("signer does not own this nym".into()));
     }

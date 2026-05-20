@@ -73,6 +73,28 @@ fn rl_gate_ok_passes_through() {
 }
 
 #[test]
+fn liquid_response_addr_index_uses_current_cursor_without_reservation() {
+    assert_eq!(liquid_response_addr_index(7, None).unwrap(), 7);
+}
+
+#[test]
+fn liquid_response_addr_index_uses_reserved_index_when_present() {
+    assert_eq!(liquid_response_addr_index(7, Some(2)).unwrap(), 2);
+}
+
+#[test]
+fn liquid_response_addr_index_rejects_negative_current_cursor() {
+    let err = liquid_response_addr_index(-1, None).unwrap_err();
+    assert_eq!(err.code(), "InternalError");
+}
+
+#[test]
+fn liquid_response_addr_index_rejects_negative_reserved_index() {
+    let err = liquid_response_addr_index(7, Some(-1)).unwrap_err();
+    assert_eq!(err.code(), "InternalError");
+}
+
+#[test]
 fn requests_method_single() {
     assert!(requests_method(Some("L-BTC"), "L-BTC"));
     assert!(!requests_method(Some("L-BTC"), "BTC-SP"));

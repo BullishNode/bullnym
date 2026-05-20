@@ -48,7 +48,6 @@ struct InvoiceForBtcPoll {
 /// shape. Fields outside this subset are ignored.
 #[derive(Deserialize, Debug)]
 struct MempoolTx {
-    #[allow(dead_code)]
     txid: String,
     vout: Vec<MempoolVout>,
     status: MempoolTxStatus,
@@ -289,27 +288,46 @@ impl BitcoinWatcher {
         };
 
         let mut saw_mempool = false;
+        let mut seen_event_keys = Vec::new();
         for tx in &txs {
-            if !tx_has_output_for_address(tx, &inv.bitcoin_address) {
-                continue;
-            }
-
-            if tx.status.confirmed {
-                let height = match tx.status.block_height {
-                    Some(h) => h,
-                    None => continue, // confirmed-without-height is unreachable but defensive.
-                };
-                let confs = tip.saturating_sub(height).saturating_add(1);
-                if confs >= self.cfg.confirmations_required {
-                    self.record_confirmed_outputs(inv, tx, confs).await;
-                    continue;
+            for observation in bitcoin_direct_observations_for_tx(
+                tx,
+                &inv.bitcoin_address,
+                tip,
+                self.cfg.confirmations_required,
+            ) {
+                seen_event_keys.push(observation.event_key.clone());
+                if observation.last_seen_state == "counted" {
+                    if self
+                        .record_confirmed_output(
+                            inv,
+                            tx,
+                            observation.amount_sat,
+                            observation.vout as usize,
+                            observation.confirmations as u32,
+                        )
+                        .await
+                    {
+                        self.upsert_bitcoin_observation(inv, &observation).await;
+                    }
+                } else {
+                    saw_mempool = true;
+                    self.upsert_bitcoin_observation(inv, &observation).await;
                 }
-                // Confirmed but not yet at threshold — treat as mempool for
-                // the in_progress flip; subsequent ticks will re-check.
-                saw_mempool = true;
-            } else {
-                saw_mempool = true;
             }
+        }
+
+        if let Err(e) = db::mark_missing_bitcoin_payment_observations_not_seen(
+            &self.pool,
+            inv.id,
+            &seen_event_keys,
+        )
+        .await
+        {
+            tracing::warn!(
+                invoice_id = %inv.id,
+                "bitcoin_watcher: stale observation update failed: {e}"
+            );
         }
 
         if saw_mempool {
@@ -343,15 +361,39 @@ impl BitcoinWatcher {
         }
     }
 
-    async fn record_confirmed_outputs(&self, inv: &InvoiceForBtcPoll, tx: &MempoolTx, confs: u32) {
-        for (vout, output) in tx.vout.iter().enumerate() {
-            if output.scriptpubkey_address.as_deref() != Some(inv.bitcoin_address.as_str())
-                || output.value == 0
-            {
-                continue;
+    async fn upsert_bitcoin_observation(
+        &self,
+        inv: &InvoiceForBtcPoll,
+        observation: &BtcDirectObservation,
+    ) {
+        match db::upsert_invoice_payment_observation(
+            &self.pool,
+            inv.id,
+            db::NewInvoicePaymentObservation {
+                rail: "bitcoin",
+                source: "bitcoin_direct",
+                event_key: &observation.event_key,
+                txid: &observation.txid,
+                vout: observation.vout,
+                address: &inv.bitcoin_address,
+                amount_sat: observation.amount_sat as i64,
+                confirmations: observation.confirmations as i32,
+                block_height: observation.block_height.map(|h| h as i32),
+                last_seen_state: observation.last_seen_state,
+            },
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    invoice_id = %inv.id,
+                    txid = %observation.txid,
+                    vout = observation.vout,
+                    state = observation.last_seen_state,
+                    "bitcoin_watcher: payment observation upsert failed: {e}"
+                );
             }
-            self.record_confirmed_output(inv, tx, output.value, vout, confs)
-                .await;
         }
     }
 
@@ -362,7 +404,7 @@ impl BitcoinWatcher {
         received_sat: u64,
         vout: usize,
         confs: u32,
-    ) {
+    ) -> bool {
         let event_key = format!("bitcoin_direct:{}:{}", tx.txid, vout);
         let Ok(vout_i32) = i32::try_from(vout) else {
             tracing::error!(
@@ -371,7 +413,7 @@ impl BitcoinWatcher {
                 vout = vout,
                 "bitcoin_watcher: vout index overflow"
             );
-            return;
+            return false;
         };
 
         match db::record_invoice_payment(
@@ -402,8 +444,20 @@ impl BitcoinWatcher {
                     confirmations = confs,
                     "bitcoin_watcher: invoice BTC payment event recorded"
                 );
+                true
             }
-            Ok(_) => {}
+            Ok(_) => match db::invoice_payment_event_exists(&self.pool, inv.id, &event_key).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::warn!(
+                        invoice_id = %inv.id,
+                        txid = %tx.txid,
+                        vout = vout,
+                        "bitcoin_watcher: payment event existence check failed: {e}"
+                    );
+                    false
+                }
+            },
             Err(e) => {
                 tracing::error!(
                     invoice_id = %inv.id,
@@ -411,6 +465,7 @@ impl BitcoinWatcher {
                     vout = vout,
                     "bitcoin_watcher: record_invoice_payment failed: {e}"
                 );
+                false
             }
         }
     }
@@ -421,10 +476,64 @@ impl BitcoinWatcher {
     }
 }
 
-fn tx_has_output_for_address(tx: &MempoolTx, address: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BtcDirectObservation {
+    event_key: String,
+    txid: String,
+    vout: i32,
+    amount_sat: u64,
+    confirmations: u32,
+    block_height: Option<u32>,
+    last_seen_state: &'static str,
+}
+
+fn bitcoin_direct_observations_for_tx(
+    tx: &MempoolTx,
+    address: &str,
+    tip: u32,
+    confirmations_required: u32,
+) -> Vec<BtcDirectObservation> {
+    let (confirmations, block_height, last_seen_state) = if tx.status.confirmed {
+        let Some(height) = tx.status.block_height else {
+            return Vec::new();
+        };
+        let confs = tip.saturating_sub(height).saturating_add(1);
+        let state = if confs >= confirmations_required {
+            "counted"
+        } else {
+            "awaiting_confirmations"
+        };
+        (confs, Some(height), state)
+    } else {
+        (0, None, "seen_unconfirmed")
+    };
+
     tx.vout
         .iter()
-        .any(|v| v.scriptpubkey_address.as_deref() == Some(address) && v.value > 0)
+        .enumerate()
+        .filter_map(|(vout, output)| {
+            if output.scriptpubkey_address.as_deref() != Some(address) || output.value == 0 {
+                return None;
+            }
+            let Ok(vout_i32) = i32::try_from(vout) else {
+                tracing::error!(
+                    txid = %tx.txid,
+                    vout = vout,
+                    "bitcoin_watcher: vout index overflow"
+                );
+                return None;
+            };
+            Some(BtcDirectObservation {
+                event_key: format!("bitcoin_direct:{}:{vout}", tx.txid),
+                txid: tx.txid.clone(),
+                vout: vout_i32,
+                amount_sat: output.value,
+                confirmations,
+                block_height,
+                last_seen_state,
+            })
+        })
+        .collect()
 }
 
 /// Convenience entry-point used by main.rs. Constructs the watcher and
@@ -447,4 +556,91 @@ pub async fn run(
         }
     };
     watcher.run(cancel).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tx(txid: &str, confirmed: bool, block_height: Option<u32>) -> MempoolTx {
+        MempoolTx {
+            txid: txid.to_string(),
+            vout: vec![
+                MempoolVout {
+                    scriptpubkey_address: Some("bc1qother".to_string()),
+                    value: 2_000,
+                },
+                MempoolVout {
+                    scriptpubkey_address: Some("bc1qtarget".to_string()),
+                    value: 6_000,
+                },
+            ],
+            status: MempoolTxStatus {
+                confirmed,
+                block_height,
+            },
+        }
+    }
+
+    #[test]
+    fn observation_helper_marks_mempool_output_unconfirmed() {
+        let observations = bitcoin_direct_observations_for_tx(
+            &tx(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                false,
+                None,
+            ),
+            "bc1qtarget",
+            800_000,
+            2,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].event_key,
+            "bitcoin_direct:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"
+        );
+        assert_eq!(observations[0].amount_sat, 6_000);
+        assert_eq!(observations[0].confirmations, 0);
+        assert_eq!(observations[0].block_height, None);
+        assert_eq!(observations[0].last_seen_state, "seen_unconfirmed");
+    }
+
+    #[test]
+    fn observation_helper_marks_below_threshold_confirmed_output_awaiting_confirmations() {
+        let observations = bitcoin_direct_observations_for_tx(
+            &tx(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                true,
+                Some(799_999),
+            ),
+            "bc1qtarget",
+            800_000,
+            3,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].confirmations, 2);
+        assert_eq!(observations[0].block_height, Some(799_999));
+        assert_eq!(observations[0].last_seen_state, "awaiting_confirmations");
+    }
+
+    #[test]
+    fn observation_helper_marks_threshold_confirmed_output_counted() {
+        let observations = bitcoin_direct_observations_for_tx(
+            &tx(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                true,
+                Some(799_998),
+            ),
+            "bc1qtarget",
+            800_000,
+            3,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].confirmations, 3);
+        assert_eq!(observations[0].block_height, Some(799_998));
+        assert_eq!(observations[0].last_seen_state, "counted");
+    }
 }

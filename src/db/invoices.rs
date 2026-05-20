@@ -300,7 +300,8 @@ pub async fn list_unpaid_invoices_with_liquid_address(
     sqlx::query_as::<_, (Uuid, String, i64, String)>(
         "SELECT id, liquid_address, GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0), liquid_blinding_key_hex \
          FROM invoices \
-         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') \
+         WHERE (status IN ('unpaid', 'in_progress', 'partially_paid') \
+                OR (origin = 'checkout' AND status = 'underpaid')) \
            AND accept_liquid = TRUE \
            AND liquid_address IS NOT NULL \
            AND liquid_blinding_key_hex IS NOT NULL \
@@ -369,6 +370,180 @@ pub struct InvoicePaymentEvidence<'a> {
     pub vout: Option<i32>,
     pub boltz_swap_id: Option<&'a str>,
     pub address: Option<&'a str>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct InvoicePaymentObservation {
+    pub rail: String,
+    pub source: String,
+    pub event_key: String,
+    pub txid: String,
+    pub vout: i32,
+    pub address: String,
+    pub amount_sat: i64,
+    pub confirmations: i32,
+    pub block_height: Option<i32>,
+    pub last_seen_state: String,
+    pub first_seen_at_unix: i64,
+    pub last_seen_at_unix: i64,
+}
+
+pub struct NewInvoicePaymentObservation<'a> {
+    pub rail: &'a str,
+    pub source: &'a str,
+    pub event_key: &'a str,
+    pub txid: &'a str,
+    pub vout: i32,
+    pub address: &'a str,
+    pub amount_sat: i64,
+    pub confirmations: i32,
+    pub block_height: Option<i32>,
+    pub last_seen_state: &'a str,
+}
+
+impl NewInvoicePaymentObservation<'_> {
+    fn validate(&self) -> Result<(), sqlx::Error> {
+        if self.rail != "bitcoin" || self.source != "bitcoin_direct" {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid invoice payment observation source/rail pair: {}/{}",
+                self.source, self.rail
+            )));
+        }
+        if self.amount_sat <= 0 {
+            return Err(sqlx::Error::Protocol(
+                "observation amount_sat must be > 0".into(),
+            ));
+        }
+        if self.vout < 0 {
+            return Err(sqlx::Error::Protocol(
+                "observation vout must be non-negative".into(),
+            ));
+        }
+        if self.txid.len() != 64 || !self.txid.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(sqlx::Error::Protocol(
+                "observation txid must be 64 hex characters".into(),
+            ));
+        }
+        let expected_event_key = format!("bitcoin_direct:{}:{}", self.txid, self.vout);
+        if self.event_key != expected_event_key {
+            return Err(sqlx::Error::Protocol(
+                "observation event_key must be bitcoin_direct:<txid>:<vout>".into(),
+            ));
+        }
+        if self.address.len() < 14 || self.address.len() > 90 {
+            return Err(sqlx::Error::Protocol(
+                "observation address length is invalid".into(),
+            ));
+        }
+        if self.confirmations < 0 {
+            return Err(sqlx::Error::Protocol(
+                "observation confirmations must be non-negative".into(),
+            ));
+        }
+        match self.last_seen_state {
+            "seen_unconfirmed" => {
+                if self.confirmations != 0 || self.block_height.is_some() {
+                    return Err(sqlx::Error::Protocol(
+                        "seen_unconfirmed observation must have zero confirmations and no block height".into(),
+                    ));
+                }
+            }
+            "awaiting_confirmations" | "counted" => {
+                if self.confirmations <= 0 || self.block_height.is_none() {
+                    return Err(sqlx::Error::Protocol(
+                        "confirmed observation must include confirmations and block height".into(),
+                    ));
+                }
+            }
+            "not_seen" => {}
+            _ => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "unknown observation state: {}",
+                    self.last_seen_state
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub async fn upsert_invoice_payment_observation(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    observation: NewInvoicePaymentObservation<'_>,
+) -> Result<u64, sqlx::Error> {
+    observation.validate()?;
+    sqlx::query(
+        "INSERT INTO invoice_payment_observations \
+            (invoice_id, rail, source, event_key, txid, vout, address, amount_sat, \
+             confirmations, block_height, last_seen_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (event_key) DO UPDATE SET \
+             amount_sat = EXCLUDED.amount_sat, \
+             confirmations = EXCLUDED.confirmations, \
+             block_height = EXCLUDED.block_height, \
+             last_seen_state = EXCLUDED.last_seen_state, \
+             last_seen_at = NOW() \
+         WHERE invoice_payment_observations.invoice_id = EXCLUDED.invoice_id",
+    )
+    .bind(invoice_id)
+    .bind(observation.rail)
+    .bind(observation.source)
+    .bind(observation.event_key)
+    .bind(observation.txid)
+    .bind(observation.vout)
+    .bind(observation.address)
+    .bind(observation.amount_sat)
+    .bind(observation.confirmations)
+    .bind(observation.block_height)
+    .bind(observation.last_seen_state)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
+pub async fn mark_missing_bitcoin_payment_observations_not_seen(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    seen_event_keys: &[String],
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE invoice_payment_observations \
+         SET last_seen_state = 'not_seen', last_seen_at = NOW() \
+         WHERE invoice_id = $1 \
+           AND source = 'bitcoin_direct' \
+           AND rail = 'bitcoin' \
+           AND last_seen_state IN ('seen_unconfirmed', 'awaiting_confirmations') \
+           AND NOT (event_key = ANY($2::TEXT[]))",
+    )
+    .bind(invoice_id)
+    .bind(seen_event_keys)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
+pub async fn list_invoice_payment_observations(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    limit: i64,
+) -> Result<Vec<InvoicePaymentObservation>, sqlx::Error> {
+    sqlx::query_as::<_, InvoicePaymentObservation>(
+        "SELECT rail, source, event_key, txid, vout, address, amount_sat, \
+                confirmations, block_height, last_seen_state, \
+                EXTRACT(EPOCH FROM first_seen_at)::BIGINT AS first_seen_at_unix, \
+                EXTRACT(EPOCH FROM last_seen_at)::BIGINT AS last_seen_at_unix \
+         FROM invoice_payment_observations \
+         WHERE invoice_id = $1 \
+           AND source = 'bitcoin_direct' \
+           AND rail = 'bitcoin' \
+         ORDER BY last_seen_at DESC, first_seen_at DESC \
+         LIMIT $2",
+    )
+    .bind(invoice_id)
+    .bind(limit.clamp(0, 50))
+    .fetch_all(pool)
+    .await
 }
 
 impl InvoicePaymentEvidence<'_> {
@@ -508,6 +683,8 @@ pub async fn record_invoice_payment(
         "overpaid"
     } else if remaining_sat <= tolerance_sat {
         "paid"
+    } else if inv.status == "underpaid" {
+        "underpaid"
     } else if expired {
         "underpaid"
     } else {
@@ -538,6 +715,23 @@ pub async fn record_invoice_payment(
 
     tx.commit().await?;
     Ok(1)
+}
+
+pub async fn invoice_payment_event_exists(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    event_key: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM invoice_payment_events \
+            WHERE invoice_id = $1 AND event_key = $2 \
+        )",
+    )
+    .bind(invoice_id)
+    .bind(event_key)
+    .fetch_one(pool)
+    .await
 }
 
 fn chrono_like_unix_now() -> i64 {
@@ -665,6 +859,62 @@ pub async fn expire_invoices_past_deadline(pool: &PgPool) -> Result<u64, sqlx::E
          END \
          WHERE status IN ('unpaid', 'in_progress', 'partially_paid') AND expires_at < NOW()",
     )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn terminalize_stale_checkout_partial_invoice(
+    pool: &PgPool,
+    id: Uuid,
+    grace_secs: u64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoices i \
+         SET status = 'underpaid' \
+         WHERE i.id = $1 \
+           AND i.origin = 'checkout' \
+           AND i.status = 'partially_paid' \
+           AND i.settlement_status NOT IN ('pending', 'claim_stuck', 'refunded') \
+           AND ( \
+             SELECT MAX(e.created_at) \
+             FROM invoice_payment_events e \
+             WHERE e.invoice_id = i.id \
+           ) < NOW() - ($2 || ' seconds')::interval",
+    )
+    .bind(id)
+    .bind(grace_secs as i64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn terminalize_stale_checkout_partial_invoices(
+    pool: &PgPool,
+    grace_secs: u64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "WITH stale AS ( \
+             SELECT i.id \
+             FROM invoices i \
+             JOIN LATERAL ( \
+               SELECT MAX(e.created_at) AS latest_payment_at \
+               FROM invoice_payment_events e \
+               WHERE e.invoice_id = i.id \
+             ) ev ON TRUE \
+             WHERE i.origin = 'checkout' \
+               AND i.status = 'partially_paid' \
+               AND i.settlement_status NOT IN ('pending', 'claim_stuck', 'refunded') \
+               AND ev.latest_payment_at < NOW() - ($1 || ' seconds')::interval \
+             ORDER BY ev.latest_payment_at ASC \
+             LIMIT 1000 \
+         ) \
+         UPDATE invoices i \
+         SET status = 'underpaid' \
+         FROM stale \
+         WHERE i.id = stale.id",
+    )
+    .bind(grace_secs as i64)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

@@ -13,10 +13,11 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    bitcoin_watcher, boltz, chain_watcher, claimer, config, db, donation_page, donation_render, gc,
-    invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler, registration,
+    bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, donation_page,
+    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler,
+    registration,
     utxo::{self, UtxoBackend},
-    AppState,
+    version, AppState,
 };
 
 #[tokio::main]
@@ -97,6 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.rate_limit.ip_whitelist.len(),
         );
     }
+    let certification_allowlist =
+        certification::CertificationAllowlist::parse(&config.certification)
+            .map_err(|e| format!("certification allowlist parse error: {e}"))?;
+    if certification_allowlist.enabled() {
+        tracing::warn!(
+            scopes = ?certification_allowlist.configured_scopes(),
+            "certification allowlist loaded; scoped bypasses require source allowlist and token"
+        );
+    }
 
     // Electrum backend for Liquid UTXO verification. The client is resilient
     // to stale TCP connections and rotates through `liquid_urls` on failure;
@@ -140,12 +150,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(config);
     let boltz = Arc::new(boltz_service);
     let whitelist = Arc::new(whitelist);
+    let certification_allowlist = Arc::new(certification_allowlist);
 
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
         boltz: boltz.clone(),
         ip_whitelist: whitelist.clone(),
+        certification: certification_allowlist.clone(),
         rate_limiter: rate_limiter.clone(),
         utxo_backend,
         pricer: pricer_client,
@@ -180,9 +192,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // queries get progressively slower as inactive rows accumulate.
     {
         let pool = pool.clone();
+        let gc_cfg = gc::GcConfig {
+            checkout_partial_terminal_grace_secs: config
+                .invoice_accounting
+                .checkout_partial_terminal_grace_secs,
+            ..gc::GcConfig::default()
+        };
         let cancel_gc = cancel.clone();
         tokio::spawn(async move {
-            gc::run(pool, cancel_gc, gc::GcConfig::default()).await;
+            gc::run(pool, cancel_gc, gc_cfg).await;
         });
         tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
     }
@@ -366,6 +384,8 @@ fn build_router(state: AppState) -> Router {
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
+        .route("/version", get(version::version))
+        .route("/certification/preflight", get(certification::preflight))
         .fallback(donation_render::render_or_404)
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .merge(image_upload_router)

@@ -23,6 +23,16 @@ pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, s
     .await
 }
 
+pub async fn get_active_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+         FROM users WHERE nym = $1 AND is_active = TRUE",
+    )
+    .bind(nym)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
@@ -90,7 +100,7 @@ pub async fn lookup_status_by_npub(
         Option<i64>,
     ) = sqlx::query_as(
         "SELECT \
-                (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE LIMIT 1) \
+                (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1) \
                     AS active_nym, \
                 (SELECT json_agg(json_build_object('nym', nym, 'created_at', created_at) \
                                  ORDER BY created_at DESC) \

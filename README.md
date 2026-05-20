@@ -161,7 +161,8 @@ HTTP layer (Axum)
 ├── /invoice/:id                      Unlinked invoice/payment page
 ├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
 ├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
-└── /health                           Liveness probe
+├── /health                           Liveness probe
+└── /version                          Build provenance for deploy/test preflight
 
 Background tasks (spawned in main, cancelled on SIGINT)
 ├── claimer                           Boltz webhook drain + MuSig2 cooperative claims
@@ -292,6 +293,12 @@ cannot be replayed as another.
 
 `rate_limit.ip_whitelist` accepts CIDR ranges. Whitelisted callers bypass all rate limits and the LUD-22 proof-of-funds check. Used for known partners and the simulator suite. Parsing is fail-closed: a typo in a CIDR aborts startup loudly.
 
+### Certification allowlist
+
+`[certification]` is separate from `rate_limit.ip_whitelist`. It is for scoped test/certification windows and requires an allowed source, `X-Bullnym-Certification-Token`, and an explicit scope. It does not bypass LUD-22 proof-of-funds, pending-reservation caps, Electrum buckets, webhook caps, or the active-user ceiling.
+
+Use `/certification/preflight?scopes=registration_setup,metadata_lookup,invoice_create,invoice_status,live_money_offer` before broad ARS. If `ready` is false, stop before moving money.
+
 ## Configuration
 
 `config.toml` has the operational knobs; secrets and connection strings come from the environment.
@@ -328,6 +335,12 @@ max_lifetime_nyms_per_npub = 3                # Hard cap per npub (incl. inactiv
 [proof]
 min_proof_value_sat = 1000                    # LUD-22 UTXO ownership floor
 message_tag         = "bullpay-lnurlp-v1"
+
+[certification]
+enabled = false
+source_allowlist = []                         # CIDRs/IPs allowed to request scoped bypasses
+token = ""                                    # Sent as X-Bullnym-Certification-Token
+scopes = []                                   # registration_setup, metadata_lookup, invoice_create, invoice_status, live_money_offer
 
 [electrum]
 liquid_urls       = ["les.bullbitcoin.com:995"]  # First reachable wins; rotates on transport failure
@@ -426,6 +439,7 @@ EOF
 cargo run --release
 # → listening on 0.0.0.0:8080
 curl -fsS http://localhost:8080/health   # → "ok"
+curl -fsS http://localhost:8080/version  # → build provenance JSON
 ```
 
 `Cargo.toml` references `boltz-client` via a path dependency to a sibling checkout of `SatoshiPortal/boltz-rust`. Clone it as `../boltz/boltz-rust` relative to this repo, or adjust the path.
@@ -438,6 +452,53 @@ Production runs on a hardened Linux VM under systemd as user `payservice`, behin
 - **Migrations.** Applied manually via `psql` against the production DB. The service does not run `sqlx::migrate!()` in-process. `_sqlx_migrations` is not present.
 - **Rollback.** VM snapshots are taken before every deploy, and the prior binary is kept at `/opt/payservice/bin/pay-service.bak` for fast rollback without a snapshot restore.
 - **Electrum URL scheme.** `[electrum]` URLs should be prefixed `ssl://`. The server warns and assumes `ssl://` for bare `host:port`, but explicit prefixes silence the warning and avoid a long-standing source of plain-TCP-against-TLS-port outages.
+
+### Build provenance and preflight
+
+`/health` is only a liveness probe. Deployment and live-money tests must gate on `/version`.
+
+Build release artifacts with explicit metadata:
+
+```bash
+BULLNYM_BUILD_COMMIT="$(git rev-parse HEAD)" \
+BULLNYM_BUILD_BRANCH="$(git branch --show-current)" \
+BULLNYM_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+BULLNYM_BUILD_DIRTY="$(git diff-index --quiet HEAD -- && echo false || echo true)" \
+cargo build --release
+```
+
+Before promoting a binary or running live-money tests, fetch `https://bullpay.ca/version` and abort if any of these are false:
+
+- `service == "pay-service"`
+- `build_commit` equals the expected Git commit and is not `"unknown"`
+- `build_dirty == "false"` unless a dirty emergency build was explicitly approved
+- `runtime_mode` is the expected mode and is not `"unknown"`
+- `expected_schema_marker == "030_invoice_payment_observations"`
+
+Set the runtime mode in the systemd unit or environment file used by the running service:
+
+```systemd
+Environment=BULLNYM_RUNTIME_MODE=production
+```
+
+Executable preflight example:
+
+```bash
+EXPECTED_COMMIT="$(git rev-parse HEAD)"
+EXPECTED_MODE="production"
+curl -fsS https://bullpay.ca/version | jq -e \
+  --arg commit "$EXPECTED_COMMIT" \
+  --arg mode "$EXPECTED_MODE" \
+  '.service == "pay-service"
+   and .build_commit == $commit
+   and .build_commit != "unknown"
+   and .build_dirty == "false"
+   and .runtime_mode == $mode
+   and .runtime_mode != "unknown"
+   and .expected_schema_marker == "030_invoice_payment_observations"'
+```
+
+The schema marker is the schema expected by the binary. It does not prove the production database has applied every migration; migration verification remains a separate deploy responsibility.
 
 ## Dependencies
 
