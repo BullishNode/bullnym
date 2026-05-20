@@ -106,7 +106,17 @@ fn test_app(state: AppState) -> Router {
             "/register",
             axum::routing::delete(registration::delete_registration),
         )
+        .route("/api/v1/:nym/invoices", post(invoice::create_signed_linked))
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
+        .route("/api/v1/invoices", get(invoice::list_signed))
+        .route(
+            "/api/v1/:nym/invoices/:id",
+            axum::routing::delete(invoice::cancel_linked),
+        )
+        .route(
+            "/api/v1/invoices/:id",
+            axum::routing::delete(invoice::cancel_unlinked),
+        )
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
@@ -267,6 +277,33 @@ fn sign_invoice_create_without_expiry_with_keypair(
     )
 }
 
+fn sign_invoice_cancel_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    invoice_id: &str,
+) -> (String, u64) {
+    sign_la_action(keypair, "invoice-cancel", npub, nym, &[invoice_id])
+}
+
+fn sign_invoice_list_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    page: i64,
+    page_size: i64,
+    status: &str,
+) -> (String, u64) {
+    let page = page.to_string();
+    let page_size = page_size.to_string();
+    sign_la_action(
+        keypair,
+        "invoice-list",
+        npub,
+        "",
+        &[&page, &page_size, status],
+    )
+}
+
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
@@ -314,6 +351,25 @@ async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
@@ -1408,6 +1464,126 @@ async fn signed_invoice_create_defaults_expiry_when_omitted() {
         expires_at_unix <= before + 7 * 24 * 60 * 60 + 2,
         "expires_at_unix={expires_at_unix}, before={before}"
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_list_is_auth_bound_and_npub_isolated() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (alice_npub, _, _, alice_keypair) =
+        sign_registration_with_keypair("listalice", TEST_DESCRIPTOR);
+    let (bob_npub, _, _, bob_keypair) = sign_registration_with_keypair("listbob", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "listalice", &alice_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&pool, "listbob", &bob_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let alice_invoice =
+        insert_test_invoice(&pool, "listalice", &alice_npub, "lq1listalice", 3_600).await;
+    let _bob_invoice = insert_test_invoice(&pool, "listbob", &bob_npub, "lq1listbob", 3_600).await;
+
+    let (sig, timestamp) = sign_invoice_list_with_keypair(&alice_keypair, &alice_npub, 1, 10, "");
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={alice_npub}&page=1&pageSize=10&timestamp={timestamp}&signature={sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let invoices = body["invoices"].as_array().unwrap();
+    assert_eq!(invoices.len(), 1, "body: {body}");
+    assert_eq!(invoices[0]["id"], alice_invoice.id.to_string());
+    assert_eq!(invoices[0]["nym_owner"], "listalice");
+
+    let (forged_sig, forged_timestamp) =
+        sign_invoice_list_with_keypair(&bob_keypair, &alice_npub, 1, 10, "");
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={alice_npub}&page=1&pageSize=10&timestamp={forged_timestamp}&signature={forged_sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "AuthError");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_cancel_is_owner_bound_and_idempotent() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (alice_npub, _, _, alice_keypair) =
+        sign_registration_with_keypair("cancelalice", TEST_DESCRIPTOR);
+    let (bob_npub, _, _, bob_keypair) =
+        sign_registration_with_keypair("cancelbob", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "cancelalice", &alice_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&pool, "cancelbob", &bob_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice =
+        insert_test_invoice(&pool, "cancelalice", &alice_npub, "lq1cancelalice", 3_600).await;
+    let invoice_id = invoice.id.to_string();
+
+    let (wrong_sig, wrong_timestamp) =
+        sign_invoice_cancel_with_keypair(&bob_keypair, &bob_npub, "cancelbob", &invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/cancelbob/invoices/{invoice_id}"),
+        json!({
+            "npub": bob_npub,
+            "timestamp": wrong_timestamp,
+            "signature": wrong_sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], "InvoiceNotFound");
+    let still_unpaid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_unpaid.status, "unpaid");
+
+    let (sig, timestamp) =
+        sign_invoice_cancel_with_keypair(&alice_keypair, &alice_npub, "cancelalice", &invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/cancelalice/invoices/{invoice_id}"),
+        json!({
+            "npub": alice_npub,
+            "timestamp": timestamp,
+            "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["invoice_id"], invoice_id);
+    assert_eq!(body["status"], "cancelled");
+
+    let (sig, timestamp) =
+        sign_invoice_cancel_with_keypair(&alice_keypair, &alice_npub, "cancelalice", &invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/cancelalice/invoices/{invoice_id}"),
+        json!({
+            "npub": alice_npub,
+            "timestamp": timestamp,
+            "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "cancelled");
 
     cleanup_db(&pool).await;
 }

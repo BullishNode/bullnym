@@ -45,6 +45,7 @@ Two ARS manifest-evaluation reports were also present, but they do not contain s
   - [ITEM-005 Scoped Certification Allowlist](items/ITEM-005-scoped-certification-allowlist.md)
   - [ITEM-006 Registration NIP-05 Lookup Consistency](items/ITEM-006-registration-nip05-lookup-consistency.md)
   - [ITEM-007 Liquid Callback Last-Unused Semantics](items/ITEM-007-liquid-callback-last-unused-semantics.md)
+  - [ITEM-008 Signed Invoice CRUD/Auth Certification](items/ITEM-008-signed-invoice-crud-auth-certification.md)
 
 ## Method
 
