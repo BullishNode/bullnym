@@ -50,6 +50,16 @@ Two ARS manifest-evaluation reports were also present, but they do not contain s
   - [ITEM-010 Invoice State-Machine Edges](items/ITEM-010-invoice-state-machine-edges.md)
   - [ITEM-011 Public Rendering Safety](items/ITEM-011-public-rendering-safety.md)
   - [ITEM-012 Rate-Limit And Certification Diagnostics](items/ITEM-012-rate-limit-and-certification-diagnostics.md)
+  - [ITEM-013 Bitcoin Edge Surface](items/ITEM-013-bitcoin-edge-surface.md)
+  - [ITEM-014 Lightning Edge Surface](items/ITEM-014-lightning-edge-surface.md)
+  - [ITEM-015 Donation BTC Chain-Swap Surface](items/ITEM-015-donation-btc-chain-swap-surface.md)
+  - [ITEM-016 Concurrency And Scale](items/ITEM-016-concurrency-and-scale.md)
+  - [ITEM-017 Operator Controls And Journey Views](items/ITEM-017-operator-controls-and-journey-views.md)
+  - [ITEM-018 Dependency Outage Behavior](items/ITEM-018-dependency-outage-behavior.md)
+  - [ITEM-019 Webhook/Reconciler/Claim Recovery](items/ITEM-019-webhook-reconciler-claim-recovery.md)
+  - [ITEM-020 Error Taxonomy](items/ITEM-020-error-taxonomy.md)
+  - [ITEM-021 Maintainability Extraction](items/ITEM-021-maintainability-extraction.md)
+  - [ITEM-022 Status Polling Performance](items/ITEM-022-status-polling-performance.md)
 
 ## Method
 
