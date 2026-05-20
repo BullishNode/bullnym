@@ -117,6 +117,8 @@ fn test_app(state: AppState) -> Router {
             "/api/v1/invoices/:id",
             axum::routing::delete(invoice::cancel_unlinked),
         )
+        .route("/:nym/i/:id", get(invoice::render_payment))
+        .route("/invoice/:id", get(invoice::render_unlinked_payment))
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
@@ -1584,6 +1586,111 @@ async fn signed_invoice_cancel_is_owner_bound_and_idempotent() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["status"], "cancelled");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_render_paths_preserve_linked_owner_boundary() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "renderowner").await;
+    let invoice = insert_test_invoice(&pool, "renderowner", &npub, "lq1renderowner", 3_600).await;
+
+    let (status, _body) = get_path(&app, &format!("/renderowner/i/{}", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_path(&app, &format!("/wrongnym/i/{}", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], "InvoiceNotFound");
+
+    let (status, _body) = get_path(&app, &format!("/invoice/{}", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_status_and_render_share_terminal_state_after_payment() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "renderpaid").await;
+    let invoice = insert_test_invoice(&pool, "renderpaid", &npub, "lq1renderpaid", 3_600).await;
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:6161616161616161616161616161616161616161616161616161616161616161:0",
+            1_000,
+            "6161616161616161616161616161616161616161616161616161616161616161",
+            0,
+            "lq1renderpaid",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "paid");
+    assert_eq!(body["remaining_amount_sat"], 0);
+    assert_eq!(body["lightning_pr"], Value::Null);
+
+    let (status, _body) = get_path(&app, &format!("/renderpaid/i/{}", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_cancel_after_paid_is_terminal_noop() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("cancelpaid", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "cancelpaid", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(&pool, "cancelpaid", &npub, "lq1cancelpaid", 3_600).await;
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:6262626262626262626262626262626262626262626262626262626262626262:0",
+            1_000,
+            "6262626262626262626262626262626262626262626262626262626262626262",
+            0,
+            "lq1cancelpaid",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    let invoice_id = invoice.id.to_string();
+    let (sig, timestamp) =
+        sign_invoice_cancel_with_keypair(&keypair, &npub, "cancelpaid", &invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/cancelpaid/invoices/{invoice_id}"),
+        json!({
+            "npub": npub,
+            "timestamp": timestamp,
+            "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "paid");
+    let still_paid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_paid.status, "paid");
 
     cleanup_db(&pool).await;
 }

@@ -46,6 +46,8 @@ Two ARS manifest-evaluation reports were also present, but they do not contain s
   - [ITEM-006 Registration NIP-05 Lookup Consistency](items/ITEM-006-registration-nip05-lookup-consistency.md)
   - [ITEM-007 Liquid Callback Last-Unused Semantics](items/ITEM-007-liquid-callback-last-unused-semantics.md)
   - [ITEM-008 Signed Invoice CRUD/Auth Certification](items/ITEM-008-signed-invoice-crud-auth-certification.md)
+  - [ITEM-009 Anonymous Invoice Control-Plane](items/ITEM-009-anonymous-invoice-control-plane.md)
+  - [ITEM-010 Invoice State-Machine Edges](items/ITEM-010-invoice-state-machine-edges.md)
 
 ## Method
 
