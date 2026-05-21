@@ -31,7 +31,7 @@ live in feature modules such as `registration`, `lnurl`, `donation_page`, and
 | `POST` | `/donation-page/image` | Schnorr signed multipart | Upload avatar or OpenGraph image. Server normalizes to WebP. |
 | `GET` | `/donation-page/:nym` | Public | JSON state used by mobile and clients. |
 | `GET` | `/:nym` | Public fallback | Server-rendered donation page. |
-| `POST` | `/:nym/invoice` | Public | Create a payer checkout invoice from the page amount. |
+| `POST` | `/:nym/invoice` | Public | Create a payer checkout invoice from the page amount. Allocates one Liquid settlement address for the checkout session. |
 | `GET` | `/:nym/i/:id` | Public | Render the payment page for a linked checkout or linked wallet invoice. |
 
 ## Invoices

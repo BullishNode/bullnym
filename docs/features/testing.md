@@ -36,6 +36,13 @@ The bullnym-test VM is a deployed server/payment-rail harness. It is for:
   invoice accounting, and status polling
 - donation-page checkout and address allocation
 
+For donation pages, test page render and checkout creation separately:
+
+- `GET /:nym` should not allocate a Liquid address or advance the page cursor.
+- `POST /:nym/invoice` should allocate exactly one checkout settlement address.
+- Status polling and payment-page refresh should not allocate additional
+  descriptor addresses.
+
 It proves that a deployed Bullnym build and payment rails handled a scenario.
 
 It does not prove:

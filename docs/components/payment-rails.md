@@ -32,6 +32,11 @@ mempool API. Donation-page checkout uses a page descriptor address when
 present; wallet-origin invoices use a Liquid address and blinding key supplied
 by mobile at creation time.
 
+For donation pages, the direct Liquid address is allocated when the checkout
+invoice is created. Rendering `GET /:nym` does not allocate an address; a
+later Liquid-specific status poll or page refresh does not allocate a second
+address.
+
 Liquid accounting uses idempotent event keys:
 
 ```text

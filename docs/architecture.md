@@ -87,8 +87,11 @@ For signed client actions:
 
 For public payment pages:
 
-1. The server renders the donation page or invoice page.
-2. The payer creates or refreshes payment instructions.
+1. The server renders the donation page or invoice page. Donation-page render
+   does not allocate a Liquid address.
+2. The payer creates a checkout invoice or refreshes payment instructions.
+   Checkout invoice creation allocates one Liquid settlement address; status
+   polling and page rendering do not.
 3. Watchers, webhooks, and the reconciler update payment and settlement state.
 4. The page polls invoice status until terminal or expired.
 
@@ -104,7 +107,8 @@ Lightning payments use Boltz reverse swaps:
 
 Direct Liquid payments:
 
-1. Bullnym exposes a Liquid address.
+1. Bullnym exposes a Liquid address. Donation-page checkout addresses are
+   allocated at checkout invoice creation, not at page render time.
 2. The payer broadcasts a Liquid transaction.
 3. The Liquid watcher detects the matching output through Liquid Electrum
    scripthash history and raw transaction fetches.
@@ -136,6 +140,9 @@ Bullnym has two descriptor-backed receive domains:
 The split prevents Get Paid page receives from consuming the Lightning Address
 wallet path. Legacy donation pages without a page descriptor fall back to the
 nym descriptor until migrated.
+
+Donation-page cursor advancement is tied to checkout invoice creation. A
+plain `GET /:nym` render and invoice status polling are non-allocating reads.
 
 Wallet-origin invoices do not use server-stored descriptors. Mobile supplies
 concrete settlement addresses for those invoices.

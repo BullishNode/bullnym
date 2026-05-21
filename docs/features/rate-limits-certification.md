@@ -12,6 +12,7 @@ external calls, webhooks, and signed write paths.
 | LNURL callback | Protect Boltz and Liquid Electrum calls. |
 | LUD-22 proof checks | Bound Liquid UTXO verification and descriptor-index allocation. |
 | Donation-page render | Protect public HTML fallback. |
+| Donation checkout creation | Protect page descriptor cursor allocation and eager checkout offer creation. |
 | Image upload | Bound per-owner image processing cost. |
 | Invoice create/list/status | Protect signed dashboard and public polling surfaces. |
 | Webhook | Bound webhook-bombing from a single source. |
@@ -29,6 +30,12 @@ LUD-22 protects descriptor cursors with:
 
 These controls make address allocation costly to abuse and prevent repeated
 requests for the same outpoint from advancing the cursor.
+
+Donation-page descriptor allocation is different from LUD-22. Opening the page
+does not allocate an address, but `POST /:nym/invoice` currently allocates the
+checkout settlement address immediately. Protecting that cursor depends on the
+anonymous invoice-create rate limit and certification preflight, not on a
+Liquid-specific proof-of-funds request.
 
 ## IP Whitelist
 

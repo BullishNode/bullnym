@@ -25,8 +25,10 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 LNURL Lightning claims and LUD-22 Liquid allocation.
 
 `donation_pages.next_addr_idx` belongs to Get Paid donation checkout. It is
-used when `donation_pages.ct_descriptor` is present. Legacy pages without a
-page descriptor use the nym descriptor and cursor until migrated.
+advanced when `POST /:nym/invoice` creates a checkout invoice and
+`donation_pages.ct_descriptor` is present. Plain donation-page render does not
+advance it. Legacy pages without a page descriptor use the nym descriptor and
+cursor until migrated.
 
 Wallet-origin invoices store concrete addresses and do not advance either
 descriptor cursor.
@@ -40,6 +42,10 @@ descriptor cursor.
 
 Both origins share status projection, payment accounting, Lightning offer
 refresh, and public payment-page rendering.
+
+Checkout invoices store one Liquid settlement address at creation time. That
+address backs Lightning reverse-swap claims, direct Liquid, and donation-page
+Bitcoin chain-swap claims.
 
 ## Status Fields
 

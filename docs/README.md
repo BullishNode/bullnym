@@ -33,6 +33,12 @@ so it does not get confused with the product contract.
 - [Testing Boundaries](features/testing.md): what local tests, bullnym-test,
   and mobile validation each prove.
 
+## Decisions
+
+- [Decision Repository](decisions/README.md): cross-repository architecture and
+  product decisions for Bullnym, Bull Bitcoin Mobile, Get Paid, deterministic
+  wallets, Nostr roles, and payment rails.
+
 ## Reference
 
 - [Payment Architecture](payment-architecture.md): cross-product payment

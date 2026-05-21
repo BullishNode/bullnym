@@ -27,12 +27,28 @@ the session Liquid address from this descriptor and advances
 Legacy pages without a page descriptor fall back to the nym Lightning Address
 descriptor and cursor.
 
+Opening or rendering the donation page does not allocate a Liquid address and
+does not advance the descriptor cursor. Allocation happens when the payer
+submits an amount and creates a checkout invoice with `POST /:nym/invoice`.
+That checkout invoice gets one Liquid settlement address up front because all
+customer-facing rails settle to the same Liquid destination:
+
+- Lightning reverse swaps claim to it.
+- Direct Liquid pays it.
+- Bitcoin chain swaps claim LBTC to it.
+
+The current implementation does not wait for a later Liquid-specific click
+before deriving that checkout settlement address. The anti-abuse boundary for
+this cursor is therefore checkout-invoice creation rate limiting, not donation
+page HTML rendering.
+
 ## Checkout Flow
 
 1. Payer opens `GET /:nym`.
 2. The rendered page fetches fiat rate data if needed.
 3. Payer submits an amount to `POST /:nym/invoice`.
-4. Bullnym creates an `origin = 'checkout'` invoice.
+4. Bullnym allocates one Liquid settlement address and creates an
+   `origin = 'checkout'` invoice.
 5. Bullnym renders `GET /:nym/i/:id`.
 6. The payment page exposes Lightning, Liquid, and eligible Bitcoin options.
 7. The page polls `/api/v1/invoices/:id/status`.
