@@ -36,6 +36,8 @@ the requested fiat amount to sats at creation/rate-lock time and store the
 rate metadata for auditability. Accounting comes from idempotent payment
 events, not from trusting one webhook or one status flip.
 
+For component and feature documentation, start with [docs/README.md](docs/README.md).
+
 ## Why Lightning Address needed a server
 
 The original problem Bullnym solved is that the BULL wallet relies on an
