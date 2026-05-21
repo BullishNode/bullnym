@@ -52,7 +52,7 @@ async fn gate_register_per_ip(
 }
 
 static NYM_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\-]{1,30}[a-z0-9]$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap());
 static NOSTR_PUBKEY_HEX_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").unwrap());
 
@@ -155,7 +155,7 @@ pub async fn register(
 
     if !NYM_REGEX.is_match(&req.nym) {
         return Err(AppError::NymInvalid(
-            "must be 3-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
+            "must be 1-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
                 .to_string(),
         ));
     }

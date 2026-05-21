@@ -12,8 +12,8 @@ fn valid_nyms() {
 
 #[test]
 fn too_short() {
-    assert!(!NYM_REGEX.is_match("ab"));
-    assert!(!NYM_REGEX.is_match("a"));
+    assert!(NYM_REGEX.is_match("ab"));
+    assert!(NYM_REGEX.is_match("a"));
     assert!(!NYM_REGEX.is_match(""));
 }
 

@@ -295,7 +295,7 @@ impl IntoResponse for AppError {
         let reason: String = match &self {
             AppError::NymNotFound(_) => "No Lightning Address is registered with this name.".into(),
             AppError::NymTaken => "This name is already registered.".into(),
-            AppError::NymInvalid(_) => "This name contains characters that are not allowed. Names must be 3–32 characters: lowercase letters, numbers, and hyphens, with no leading or trailing hyphen.".into(),
+            AppError::NymInvalid(_) => "This name contains characters that are not allowed. Names must be 1–32 characters: lowercase letters, numbers, and hyphens, with no leading or trailing hyphen.".into(),
             AppError::NymReserved => "This name is reserved by the server. Choose a different name.".into(),
             AppError::DonationPageInvalid(reason) => format!("Donation page rejected: {reason}."),
             AppError::DonationPageNotFound(_) => "No donation page exists for this name.".into(),
