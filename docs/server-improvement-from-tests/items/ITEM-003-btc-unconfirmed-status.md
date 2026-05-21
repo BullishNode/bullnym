@@ -205,7 +205,10 @@ Accepted. The revised plan is:
   - `cargo test bitcoin_payment_observations_do_not_count_as_paid` fails at preflight with `TEST_DATABASE_URL must be set to run integration tests: NotPresent`.
 - Remaining risk:
   - Watcher HTTP path is not mocked in local tests.
-  - Final proof requires targeted `BTC-01` rerun after deploy with `/version.expected_schema_marker = "030_invoice_payment_observations"`.
+- Final proof requires targeted `BTC-01` rerun after deploy. On current builds,
+  the preflight marker is `/version.expected_schema_marker =
+  "031_get_paid_descriptors"`; the `030_invoice_payment_observations` migration
+  remains the feature's schema prerequisite but is no longer the latest marker.
 
 ## Closure Decision
 

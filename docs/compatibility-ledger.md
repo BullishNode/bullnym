@@ -50,3 +50,27 @@ policy inline.
   fields.
 - Removal condition: mobile versions that read `quota.used` and `quota.cap`
   have reached the agreed adoption threshold.
+
+## Registration Verification Npub
+
+- Current field: `verification_npub`
+- Compatibility behavior: if omitted at registration time, the server stores
+  `verification_npub = npub`.
+- Compatibility reason: older clients used one key for both Bullnym request
+  authentication and public NIP-05 verification. Current Get Paid clients can
+  keep the server-auth key separate from the key published in
+  `/.well-known/nostr.json`.
+- Removal condition: old clients that omit `verification_npub` are no longer
+  supported, and the registration contract is intentionally made strict.
+
+## Donation Page Descriptor
+
+- Current field: `ct_descriptor` on signed `PUT /donation-page` requests.
+- Compatibility behavior: if omitted or empty, the server preserves the
+  existing page descriptor; checkout falls back to the nym's Lightning Address
+  descriptor when no page descriptor exists.
+- Compatibility reason: Get Paid now uses a page-specific deterministic
+  descriptor with an independent address cursor, while older clients only knew
+  about the nym descriptor.
+- Removal condition: every supported client supplies the page descriptor before
+  enabling checkout, and legacy donation pages have been migrated or archived.

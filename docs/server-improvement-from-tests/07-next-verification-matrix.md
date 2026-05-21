@@ -4,6 +4,12 @@ The next test run should verify server changes, not repeat known-good evidence.
 
 Read this with the server-owned [Product Surface Coverage](../product-surface-coverage.md) ledger. The coverage ledger states what is proven, partial, unknown, blocked, or invalid-history; this matrix states what to run next.
 
+Current server schema marker: `031_get_paid_descriptors`.
+
+Scope boundary: use bullnym-test for deployed server/payment-rail scenarios
+only. Use the Bull Bitcoin mobile repository for mobile deterministic wallet
+paths, signed payload generation, Flutter tests, and device/emulator flows.
+
 ## Run Policy
 
 | Policy | Meaning |
@@ -43,6 +49,7 @@ Read this with the server-owned [Product Surface Coverage](../product-surface-co
 | Safe certification allowlist | ARS setup/preflight and one rate-limit abuse control | Full broad ARS until preflight proves zero setup skips. |
 | Operator controls/views | `LQ-21` without raw DB mutation; one restart/reconciler path if control added | LN storm volume. |
 | Status polling optimization | One live matrix smoke with timing/query/provider metrics; optional small LN batch | 90-payment storm unless measuring scale. |
+| Get Paid descriptor split | Mobile contract tests locally, then targeted VM rail smokes for BDK direct BTC, LWK direct Liquid, Jungle Lightning-to-Liquid, BDK donation chain swap, and exact donation Liquid checkout | Broad LN/Liquid volume, ARS, or VM-only claims about mobile behavior. |
 
 ## Blocked Until Preconditions Are True
 
@@ -58,31 +65,24 @@ Read this with the server-owned [Product Surface Coverage](../product-surface-co
 A certification run is valid only if:
 
 1. `/version` matches the expected Bullnym commit.
-2. Migrations/schema version match the expected server build.
+2. `/version.expected_schema_marker` is the expected marker for the build, and
+   DB migrations have been independently verified.
 3. Required wallet balances are above threshold.
 4. Safe certification allowlist is active if broad ARS is used.
 5. No scenario silently skips. Blocked preconditions fail preflight before money moves.
 
-## Minimal Next Run After First Server Patch
+## Minimal Next Run For Get Paid Compatibility
 
-If the first patch is `/version` only:
+After deploying a `031_get_paid_descriptors` build:
 
-1. Preflight `/version`.
-2. `LQ-01` smoke.
-3. One Jungle Lightning invoice smoke.
-4. Stop.
-
-If the first patch is underpay state-machine behavior:
-
-1. Preflight `/version`.
-2. `LQ-21`.
-3. One exact payment-page Liquid payment.
-4. One invoice Liquid exact payment smoke.
-5. Stop.
-
-If the first patch is BTC unconfirmed behavior:
-
-1. Preflight `/version`.
-2. `BTC-01` expecting `seen_unconfirmed` or equivalent.
-3. One Liquid smoke to prove unrelated paths still work.
-4. Stop.
+1. Preflight `/version` for expected commit, clean build, runtime mode, and
+   `expected_schema_marker = "031_get_paid_descriptors"`.
+2. Verify the target mobile branch locally: registration payload including
+   `verification_npub`, donation-page descriptor payload, invoice create/list/cancel,
+   and deterministic descriptor/address expectations.
+3. Run bullnym-test VM smokes only for changed or still-partial rails:
+   BDK direct BTC invoice, LWK direct Liquid invoice, Jungle Lightning offer
+   settling through Boltz to LWK, BDK donation-page BTC chain swap settling to
+   the page Liquid descriptor, and exact donation-page Liquid checkout.
+4. Stop unless a targeted check fails or the touched code invalidates a broader
+   proven surface.

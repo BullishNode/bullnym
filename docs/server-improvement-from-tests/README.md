@@ -4,6 +4,14 @@ Date: 2026-05-19
 
 This review package turns the `bullnym-test` live and ARS run history into a Bullnym server improvement backlog. The test suite is treated as evidence, not as the project being optimized.
 
+Status note as of schema marker `031_get_paid_descriptors`: this directory is
+historical evidence plus the server-improvement record. Use
+`../product-surface-coverage.md`, `../payment-architecture.md`, and the root
+README for current testing boundaries. In particular, bullnym-test is for
+deployed server/payment-rail verification; mobile compatibility must be proven
+in the Bull Bitcoin mobile repository and only then exercised against Bullnym
+with targeted API/payment smokes.
+
 ## Source Evidence
 
 The current evidence set is the tester VM report snapshot copied into:
@@ -76,4 +84,6 @@ Two ARS manifest-evaluation reports were also present, but they do not contain s
 - The Liquid `0/22` failure run from `bullnym-run-1779153846-liquidv2.json` is not treated as a product regression. It was caused by deploying a stale/incompatible binary from the wrong checkout. It is evidence for release provenance controls.
 - Broad ARS runs have many skips due to rate-limit and missing preconditions. They are not proof of server correctness or incorrectness, but they are evidence that production certification needs server-side test allowlisting and stronger preflight.
 - Clean live-money passes are useful optimization evidence. They show which paths can be moved to smoke-only verification unless related server code changes.
-- `bullnym-test` work should now be constrained to verification. The primary output should be Bullnym server fixes and server operational improvements.
+- `bullnym-test` work should now be constrained to deployed server/payment-rail
+  verification. It should not be used as a substitute for mobile Flutter,
+  deterministic wallet-path, signed-payload, or device-flow validation.

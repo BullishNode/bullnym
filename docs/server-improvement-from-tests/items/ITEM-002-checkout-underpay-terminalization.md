@@ -168,4 +168,9 @@ Residual risk:
 
 ## Closure Decision
 
-Closed for ITEM-002. Remaining production/staging validation is the targeted live rerun: `LQ-21` plus one exact checkout Liquid smoke after deploying a build whose `/version.expected_schema_marker` is `029_checkout_underpaid_liquid_watch`.
+Closed for ITEM-002. Remaining production/staging validation is the targeted
+live rerun: `LQ-21` plus one exact checkout Liquid smoke after deploying the
+current build. On current builds, preflight expects
+`/version.expected_schema_marker = "031_get_paid_descriptors"`; the
+`029_checkout_underpaid_liquid_watch` migration remains this item's schema
+prerequisite but is no longer the latest marker.

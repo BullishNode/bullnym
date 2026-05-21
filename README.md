@@ -16,18 +16,20 @@ surfaces backed by the same non-custodial Liquid settlement model:
 
 The account identity is the Nostr `npub`. A **nym** is an optional public
 payment namespace owned by that `npub`: Lightning Addresses and Donation Pages
-are attached to a nym and use the nym's Liquid confidential descriptor for
-settlement. Invoices can be linked to a nym for routing and presentation, but
-they do not have to be. Wallet-origin invoices use recipient-supplied Bitcoin
-and/or Liquid addresses instead of requiring the server to store a descriptor.
+are attached to a nym. Lightning Address uses the nym's Liquid confidential
+descriptor. Donation Pages can use an independent Get Paid descriptor with its
+own address cursor, falling back to the nym descriptor for legacy pages.
+Invoices can be linked to a nym for routing and presentation, but they do not
+have to be. Wallet-origin invoices use recipient-supplied Bitcoin and/or
+Liquid addresses instead of requiring the server to store a descriptor.
 
 ## Product model
 
 | Product | Who creates it | Public URL | Payment rails | Settlement destination |
 |---|---|---|---|---|
 | Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Fresh address from the active nym CT descriptor |
-| Donation Page | Recipient configures a page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the active nym CT descriptor |
-| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from Donation Pages use a nym-derived Liquid address |
+| Donation Page | Recipient configures a page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the donation-page CT descriptor, with legacy fallback to the active nym CT descriptor |
+| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from Donation Pages use the page-derived Liquid address |
 
 Payment sessions use fixed-sat accounting. Fiat-denominated invoices convert
 the requested fiat amount to sats at creation/rate-lock time and store the
@@ -222,10 +224,12 @@ All write operations require a BIP-340 Schnorr signature over a domain-tagged pa
 | `GET` | `/:nym/i/:id` | Public payment page for the checkout invoice |
 
 Donation-page management is signed by the same Nostr/BIP-340 identity that owns
-the nym. Runtime payments are represented as `origin = 'checkout'` invoice
-rows, so the donation flow shares invoice status, payment-event accounting,
-Lightning offer refresh, Liquid address detection, and Bitcoin chain-swap
-settlement machinery.
+the nym. Current clients include a page-specific `ct_descriptor`; legacy saves
+without it preserve any existing page descriptor and checkout falls back to the
+nym descriptor only when no page descriptor exists. Runtime payments are
+represented as `origin = 'checkout'` invoice rows, so the donation flow shares
+invoice status, payment-event accounting, Lightning offer refresh, Liquid
+address detection, and Bitcoin chain-swap settlement machinery.
 
 ### Invoices
 
@@ -247,8 +251,8 @@ cancellable while unpaid, and may be linked to a nym or shared through the
 unlinked `/invoice/:id` route. They carry explicit recipient-supplied Bitcoin
 and/or Liquid settlement addresses; the server does not need a stored wallet
 descriptor to create or settle them. Checkout-origin invoices are payer-created
-from a donation page, inherit the donation page's nym-derived Liquid settlement
-address, and have a shorter outer expiry.
+from a donation page, inherit the donation page's descriptor-derived Liquid
+settlement address, and have a shorter outer expiry.
 
 ### Webhook
 
@@ -277,11 +281,17 @@ bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
 
 | Action | Payload fields |
 |---|---|
-| `register` | `nym`, `ct_descriptor` |
+| `register` | `nym`, `ct_descriptor`, optional `verification_npub` |
 | `update` | `ct_descriptor` |
 | `delete` | (none) |
 
-The server verifies the Schnorr signature against `SHA-256(message)` and rejects timestamps outside `±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged, untimestamped) is still accepted with a deprecation warning to support older mobile builds; it will be removed once warning volume drops.
+If `verification_npub` is supplied, it is included in the signed register
+payload and becomes the key published through NIP-05. If omitted, the server
+stores `verification_npub = npub` for legacy clients. The server verifies the
+Schnorr signature against `SHA-256(message)` and rejects timestamps outside
+`±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged,
+untimestamped) is still accepted with a deprecation warning to support older
+mobile builds; it will be removed once warning volume drops.
 
 Donation pages and invoices use the same key material with product-specific
 actions such as `donation-page-save`, `donation-page-archive`,
@@ -383,8 +393,8 @@ Postgres is the single source of truth. All migrations are plain SQL under `migr
 
 Major tables:
 
-- **`users`** — one row per nym. Holds `npub`, `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
-- **`donation_pages`** — one row per nym. Stores public page copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Deletion is soft so a removed page can render a stable archived response.
+- **`users`** — one row per nym. Holds the server-auth `npub`, public `verification_npub`, Lightning Address `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, and `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
+- **`donation_pages`** — one row per nym. Stores the Get Paid page descriptor and independent address cursor, public page copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Deletion is soft so a removed page can render a stable archived response.
 - **`invoices`** — unified payment-session table for donation-page checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
 - **`invoice_payment_events`** — idempotent accounting evidence keyed by rail-specific event keys such as `liquid_direct:<txid>:<vout>`, `bitcoin_direct:<txid>:<vout>`, or `lightning_boltz_reverse:<swap_id>`.
 - **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to a donation-page or invoice payment session. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
@@ -444,61 +454,67 @@ curl -fsS http://localhost:8080/version  # → build provenance JSON
 
 `Cargo.toml` references `boltz-client` via a path dependency to a sibling checkout of `SatoshiPortal/boltz-rust`. Clone it as `../boltz/boltz-rust` relative to this repo, or adjust the path.
 
-## Deployment notes
+## Testing
 
-Production runs on a hardened Linux VM under systemd as user `payservice`, behind nginx with TLS via Let's Encrypt at `bullpay.ca`. The binary is built locally (`cargo build --release`) and `scp`'d to the VM — no Rust toolchain is installed on prod. Both hosts run the same glibc and arch.
+Use the smallest test layer that proves the behavior being changed.
 
-- **Reverse proxy.** nginx terminates TLS and forwards to `127.0.0.1:8080`. `X-Forwarded-For` is set, so `[rate_limit] trust_forwarded_for = true` is required for per-IP gating to work.
-- **Migrations.** Applied manually via `psql` against the production DB. The service does not run `sqlx::migrate!()` in-process. `_sqlx_migrations` is not present.
-- **Rollback.** VM snapshots are taken before every deploy, and the prior binary is kept at `/opt/payservice/bin/pay-service.bak` for fast rollback without a snapshot restore.
-- **Electrum URL scheme.** `[electrum]` URLs should be prefixed `ssl://`. The server warns and assumes `ssl://` for bare `host:port`, but explicit prefixes silence the warning and avoid a long-standing source of plain-TCP-against-TLS-port outages.
+### Local server tests
 
-### Build provenance and preflight
-
-`/health` is only a liveness probe. Deployment and live-money tests must gate on `/version`.
-
-Build release artifacts with explicit metadata:
+Local Rust tests are the first line for server-owned behavior: request
+validation, auth message construction, invoice state transitions, config
+parsing, accounting helpers, route wiring, and compile-time coverage of the
+DB-backed integration suite.
 
 ```bash
-BULLNYM_BUILD_COMMIT="$(git rev-parse HEAD)" \
-BULLNYM_BUILD_BRANCH="$(git branch --show-current)" \
-BULLNYM_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-BULLNYM_BUILD_DIRTY="$(git diff-index --quiet HEAD -- && echo false || echo true)" \
-cargo build --release
+cargo test --lib
+cargo test --tests --no-run
 ```
 
-Before promoting a binary or running live-money tests, fetch `https://bullpay.ca/version` and abort if any of these are false:
+DB-backed integration tests require `TEST_DATABASE_URL` and an initialized test
+database with the migrations applied. They are appropriate for route-level
+ownership checks, cross-npub isolation, persistence behavior, and status
+responses that need real SQL constraints.
 
-- `service == "pay-service"`
-- `build_commit` equals the expected Git commit and is not `"unknown"`
-- `build_dirty == "false"` unless a dirty emergency build was explicitly approved
-- `runtime_mode` is the expected mode and is not `"unknown"`
-- `expected_schema_marker == "030_invoice_payment_observations"`
+### bullnym-test VM
 
-Set the runtime mode in the systemd unit or environment file used by the running service:
+The bullnym-test VM is an external server/payment harness for deployed Bullnym
+endpoints. Use it when the behavior depends on live rails or infrastructure
+outside the Rust process:
 
-```systemd
-Environment=BULLNYM_RUNTIME_MODE=production
-```
+- BDK-origin Bitcoin sends to wallet-created invoices.
+- LWK-origin Liquid sends to wallet-created invoices and donation checkout
+  invoices.
+- Boltz reverse swaps for Lightning offers that settle to Liquid.
+- Boltz chain swaps for Bitcoin donation-page checkout.
+- Invoice accounting, payment-event idempotency, watcher behavior, and public
+  status polling.
+- Donation-page checkout rendering, offer creation, and address allocation
+  safety.
 
-Executable preflight example:
+The VM should not be treated as a mobile test environment. It does not run the
+Bull Bitcoin app, Flutter tests, emulator/device flows, mobile wallet
+derivation, local mobile storage, or app UI. A VM pass proves that the deployed
+server and payment rails handled the scenario; it does not prove that a mobile
+branch generated the same payloads or presented the flow correctly.
 
-```bash
-EXPECTED_COMMIT="$(git rev-parse HEAD)"
-EXPECTED_MODE="production"
-curl -fsS https://bullpay.ca/version | jq -e \
-  --arg commit "$EXPECTED_COMMIT" \
-  --arg mode "$EXPECTED_MODE" \
-  '.service == "pay-service"
-   and .build_commit == $commit
-   and .build_commit != "unknown"
-   and .build_dirty == "false"
-   and .runtime_mode == $mode
-   and .runtime_mode != "unknown"
-   and .expected_schema_marker == "030_invoice_payment_observations"'
-```
+### Mobile compatibility
 
-The schema marker is the schema expected by the binary. It does not prove the production database has applied every migration; migration verification remains a separate deploy responsibility.
+Mobile compatibility must be validated in the Bull Bitcoin mobile repository
+against the target branch. The important contract is narrow:
+
+- Mobile derives the expected signing keys, descriptors, and recipient
+  addresses.
+- Mobile signs the exact Bullnym payloads for nym, donation-page, and invoice
+  actions.
+- Bullnym accepts those requests, persists the descriptor or supplied
+  destinations, and returns the documented response shapes.
+- Payment rails settle to the destinations supplied by mobile, not to
+  server-owned wallet material.
+
+Use mobile unit/widget tests, static analysis, and emulator or device flows for
+app-owned behavior. Use bullnym-test only after the API contract is known to be
+compatible and the remaining question is whether a deployed server/payment-rail
+scenario works end to end.
 
 ## Dependencies
 

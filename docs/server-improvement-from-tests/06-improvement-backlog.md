@@ -2,6 +2,11 @@
 
 This is the combined Bullnym server backlog from the evidence review. It includes both fixes and optimizations.
 
+Status note as of `031_get_paid_descriptors`: the table below is the original
+evidence-derived backlog. Several high-priority items have since been
+implemented or partially closed. Use the product-surface coverage ledger and
+next-verification matrix for current rerun decisions.
+
 ## P0: Money Safety / Users Stuck / Release Safety
 
 | ID | Type | Title | Evidence | Server work |
@@ -70,16 +75,22 @@ These are not automatically defects, but they must enter the adversarial item pr
 
 ## Recommended Implementation Order
 
-1. Add `/version` and deploy provenance checks.
-2. Add state transition event structure or transition helper scaffolding.
-3. Fix underpay/partial terminalization semantics for payment-page attempts.
-4. Expose BTC unconfirmed state.
-5. Build the server-owned coverage map from `ISSUE-009` through `ISSUE-017`.
-6. Isolate and fix nym lookup consistency.
-7. Add safe certification allowlisting.
-8. Audit signed invoice CRUD/auth edges.
-9. Assess anonymous invoice/payment-page control-plane edges.
-10. Assess donation-page BTC chain-swap behavior.
-11. Add operator-readable payment journey views.
-12. Add dependency/recovery diagnostics.
-13. Optimize status polling after correctness states are explicit.
+1. Completed: add `/version` and deploy provenance checks.
+2. Completed/partial: fix underpay/partial terminalization semantics for
+   payment-page attempts.
+3. Completed/partial: expose BTC unconfirmed state through observations.
+4. Completed: build the server-owned coverage map from `ISSUE-009` through
+   `ISSUE-017`.
+5. Completed/partial: add safe certification allowlisting and diagnostics.
+6. Completed/partial: audit signed invoice CRUD/auth edges with route-level
+   regression coverage.
+7. Completed/partial: assess anonymous invoice/payment-page control-plane
+   edges with route-level coverage.
+8. Current: verify Get Paid descriptor compatibility across server, VM rails,
+   and the target mobile branch.
+9. Next: assess donation-page BTC chain-swap behavior with targeted VM runs.
+10. Next: add operator-readable payment journey views only where recovery
+    drills show repeated ambiguity.
+11. Next: add dependency/recovery diagnostics where outage drills need them.
+12. Next: optimize status polling after correctness states are explicit and
+    measured.

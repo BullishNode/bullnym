@@ -2,6 +2,13 @@
 
 This is Bullnym server's coverage ledger. It records what the current evidence proves, what remains unknown, what is blocked by missing preconditions, and what historical evidence is invalid for product correctness. Its purpose is coverage accounting and rerun avoidance; it is not a new product claim.
 
+Current schema marker: `031_get_paid_descriptors`.
+
+Testing boundary: bullnym-test is a deployed server/payment-rail harness, not a
+mobile test environment. It can prove BDK/LWK/Jungle/Boltz payment behavior
+against Bullnym endpoints. It cannot prove Flutter flows, mobile deterministic
+wallet derivation, app storage, or device UI behavior.
+
 Evidence rules:
 
 - Scenario outcomes come from the test-evidence docs under `docs/server-improvement-from-tests/`.
@@ -23,6 +30,7 @@ Do not convert `unknown` or `blocked` into `failed` without evidence. Do not rer
 | Surface | Server ownership / routes | Status | Evidence | Blocker / gap | Next verification | Rerun policy |
 | --- | --- | --- | --- | --- | --- | --- |
 | Build and deploy provenance | `/version`, `/health`, nginx deploy preflight | `partial` | ITEM-001 added `/version`; invalid Liquid `1779153846` proves `/health` was insufficient. | Production deploy must still prove DB migrations separately from binary marker. | Preflight `/version` for expected commit, dirty flag, runtime mode, and schema marker before any live-money run. | Do not rerun broad payment suites for provenance-only changes; run deploy preflight and one rail smoke. |
+| Get Paid descriptor split | `/register`, `/donation-page`, NIP-05, checkout allocation | `partial` | Local and production smoke covered `verification_npub`, page descriptor save/read, legacy fallback, and cleanup after `031_get_paid_descriptors`. | Full proof requires target mobile branch compatibility plus VM payment rails using the new descriptor split. | Validate mobile contract locally, then run VM BDK/LWK/Jungle/Boltz rail smokes against a deployed `031_get_paid_descriptors` build. | Do not use VM payment success as proof of mobile derivation/signing; do not rerun unrelated LN/Liquid volume for descriptor-only changes. |
 | Liquid direct invoice happy paths | `src/chain_watcher.rs`, `src/db/invoices.rs`, `/api/v1/invoices/:id/status` | `proven` | Clean live matrix `1779135713`; Liquid V2 `1779151124` had 20/22 passes. | ITEM-002 changed checkout partial terminalization, not normal exact-pay accounting. | One `LQ-01` smoke after deploy or state-machine changes. | Do not rerun full Liquid V2 happy-path batch unless Liquid watcher/accounting/state code changed. |
 | Liquid checkout underpay recovery | `src/db/invoices.rs`, `src/gc.rs`, status endpoint | `partial` | `LQ-21` exposed stale checkout partial behavior; ITEM-002 implemented terminalization and recoverable underpaid watch. | Needs post-deploy live rerun with current schema marker. | `LQ-21`, one exact payment-page Liquid smoke, one retry-after-underpay case. | Do not rerun full Liquid V2 suite unless transition rules change globally. |
 | Lightning invoice exact payments | Boltz reverse swap flow, `src/claimer.rs`, `src/reconciler.rs`, status endpoint | `proven` | Clean live matrix `1779135713`; LN storm 20 and 90 sequential passed. | Edge cases beyond exact sequential payments remain unknown. | One Jungle exact-pay invoice smoke after unrelated deploys. | Do not rerun 90-payment storm unless LN/Boltz/settlement code changed or scale measurement is explicit. |
@@ -45,11 +53,20 @@ Do not convert `unknown` or `blocked` into `failed` without evidence. Do not rer
 
 ## Minimal Next Verification
 
-After deploying the current server-improvement patch set, run only:
+After deploying a build with schema marker `031_get_paid_descriptors`, run only
+the checks that exercise changed compatibility and the still-partial on-chain
+rails:
 
 1. `/version` preflight for expected commit, dirty flag, runtime mode, and schema marker.
-2. `LQ-21` plus one exact payment-page Liquid smoke for ITEM-002.
-3. `BTC-01` with direct BTC observation assertion for ITEM-003.
-4. One Jungle Lightning exact-pay smoke to confirm unrelated happy path.
+2. Target mobile branch contract validation in the mobile repo: registration
+   with `verification_npub`, donation-page descriptor save, invoice create/list/cancel,
+   and descriptor/address derivation expectations.
+3. bullnym-test VM rail smokes:
+   - BDK sender to wallet-origin direct BTC invoice.
+   - LWK sender to wallet-origin direct Liquid invoice.
+   - Jungle sender to Lightning offer settling through Boltz reverse swap to LWK.
+   - BDK sender to donation-page BTC chain swap settling to the page Liquid descriptor.
+4. One exact donation-page Liquid checkout smoke to prove the page descriptor
+   cursor is being used.
 
 Stop there unless one of those targeted checks fails or the changed server code touches the corresponding broader surface.
