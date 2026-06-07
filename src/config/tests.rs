@@ -120,12 +120,14 @@ fn production_base_config() -> Config {
         donation: DonationConfig::default(),
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),
+        features: FeaturesConfig::default(),
         rate_limit: RateLimitConfig::default(),
         certification: CertificationConfig::default(),
         electrum: ElectrumConfig::default(),
         claim: ClaimConfig::default(),
         reconciler: ReconcilerConfig::default(),
         bitcoin_watcher: BitcoinWatcherConfig::default(),
+        workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: "postgres://payservice@example/payservice".to_string(),
         swap_mnemonic: "abandon abandon abandon".to_string(),
@@ -213,4 +215,36 @@ fn image_pixel_cap_must_be_nonzero() {
     assert!(err
         .to_string()
         .contains("donation.image_max_pixels must be > 0"));
+}
+
+#[test]
+fn feature_flags_default_enabled() {
+    let cfg = FeaturesConfig::default();
+
+    assert!(cfg.lightning_address);
+    assert!(cfg.invoices);
+    assert!(cfg.payment_pages);
+}
+
+#[test]
+fn feature_flags_parse_independently() {
+    let cfg: FeaturesConfig = toml::from_str(
+        r#"
+        lightning_address = true
+        invoices = false
+        payment_pages = true
+        "#,
+    )
+    .unwrap();
+
+    assert!(cfg.lightning_address);
+    assert!(!cfg.invoices);
+    assert!(cfg.payment_pages);
+}
+
+#[test]
+fn workers_default_enabled() {
+    let cfg = WorkersConfig::default();
+
+    assert!(cfg.enabled);
 }

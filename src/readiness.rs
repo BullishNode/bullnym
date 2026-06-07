@@ -1,9 +1,13 @@
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, Json};
 use serde::Serialize;
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::version::EXPECTED_SCHEMA_MARKER;
 use crate::AppState;
+
+const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
@@ -66,26 +70,33 @@ pub async fn ready(
 }
 
 async fn check_database(pool: &sqlx::PgPool) -> ComponentStatus {
-    match sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool).await {
-        Ok(1) => ComponentStatus::ok(),
-        Ok(_) => ComponentStatus::error("unexpected database probe result"),
-        Err(e) => {
+    match timeout(
+        READINESS_DB_TIMEOUT,
+        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
+    )
+    .await
+    {
+        Ok(Ok(1)) => ComponentStatus::ok(),
+        Ok(Ok(_)) => ComponentStatus::error("unexpected database probe result"),
+        Ok(Err(e)) => {
             tracing::warn!("readiness database probe failed: {e}");
             ComponentStatus::error("database probe failed")
         }
+        Err(_) => ComponentStatus::error("database probe timed out"),
     }
 }
 
 async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
-    match schema_marker_present(pool).await {
-        Ok(true) => ComponentStatus::ok(),
-        Ok(false) => ComponentStatus::error(format!(
+    match timeout(READINESS_DB_TIMEOUT, schema_marker_present(pool)).await {
+        Ok(Ok(true)) => ComponentStatus::ok(),
+        Ok(Ok(false)) => ComponentStatus::error(format!(
             "expected schema marker {EXPECTED_SCHEMA_MARKER} is not present"
         )),
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("readiness schema probe failed: {e}");
             ComponentStatus::error("schema probe failed")
         }
+        Err(_) => ComponentStatus::error("schema probe timed out"),
     }
 }
 

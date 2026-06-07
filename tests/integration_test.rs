@@ -13,8 +13,8 @@ use tower::ServiceExt;
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
-    ElectrumConfig, InvoiceAccountingConfig, LimitsConfig, PricerConfig, ProofConfig,
-    RateLimitConfig, ReconcilerConfig,
+    ElectrumConfig, FeaturesConfig, InvoiceAccountingConfig, LimitsConfig, PricerConfig,
+    ProofConfig, RateLimitConfig, ReconcilerConfig, WorkersConfig,
 };
 use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
@@ -55,12 +55,14 @@ fn test_config() -> Config {
         donation: DonationConfig::default(),
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),
+        features: FeaturesConfig::default(),
         rate_limit: RateLimitConfig::default(),
         certification: CertificationConfig::default(),
         electrum: ElectrumConfig::default(),
         claim: ClaimConfig::default(),
         reconciler: ReconcilerConfig::default(),
         bitcoin_watcher: BitcoinWatcherConfig::default(),
+        workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),

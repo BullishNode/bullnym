@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::Router;
 use boltz_client::network::Network;
@@ -56,6 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS is set; webhook secret rotation overlap is active"
         );
     }
+    tracing::info!(
+        "features: lightning_address={} invoices={} payment_pages={} workers={}",
+        config.features.lightning_address,
+        config.features.invoices,
+        config.features.payment_pages,
+        config.workers.enabled,
+    );
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
@@ -175,114 +183,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
-    claimer::spawn_background_claimer(
-        pool.clone(),
-        config.clone(),
-        state.utxo_backend.clone(),
-        cancel.clone(),
-    );
+    if config.workers.enabled {
+        tracing::info!("background workers enabled");
+        claimer::spawn_background_claimer(
+            pool.clone(),
+            config.clone(),
+            state.utxo_backend.clone(),
+            cancel.clone(),
+        );
 
-    // Reconciler: polls boltz_api.get_swap for every non-terminal swap
-    // older than `min_age_secs` and patches our DB to match Boltz's
-    // view. Closes the dropped-webhook gap (Boltz's webhook delivery
-    // gives up after ~5 min) by querying state directly.
-    reconciler::spawn(
-        pool.clone(),
-        config.boltz.api_url.clone(),
-        Arc::new(config.reconciler.clone()),
-        cancel.clone(),
-    );
-    tracing::info!(
-        "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
-        config.reconciler.interval_secs,
-        config.reconciler.min_age_secs,
-        config.reconciler.max_per_tick,
-    );
+        // Reconciler: polls boltz_api.get_swap for every non-terminal swap
+        // older than `min_age_secs` and patches our DB to match Boltz's
+        // view. Closes the dropped-webhook gap (Boltz's webhook delivery
+        // gives up after ~5 min) by querying state directly.
+        reconciler::spawn(
+            pool.clone(),
+            config.boltz.api_url.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+        );
+        tracing::info!(
+            "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
+            config.reconciler.interval_secs,
+            config.reconciler.min_age_secs,
+            config.reconciler.max_per_tick,
+        );
 
-    // Periodic GC of rate-limit tables. Without this, sliding-window
-    // queries get progressively slower as inactive rows accumulate.
-    {
-        let pool = pool.clone();
-        let gc_cfg = gc::GcConfig {
-            checkout_partial_terminal_grace_secs: config
-                .invoice_accounting
-                .checkout_partial_terminal_grace_secs,
-            ..gc::GcConfig::default()
-        };
-        let cancel_gc = cancel.clone();
-        tokio::spawn(async move {
-            gc::run(pool, cancel_gc, gc_cfg).await;
-        });
-        tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
-    }
+        // Periodic GC of rate-limit tables. Without this, sliding-window
+        // queries get progressively slower as inactive rows accumulate.
+        {
+            let pool = pool.clone();
+            let gc_cfg = gc::GcConfig {
+                checkout_partial_terminal_grace_secs: config
+                    .invoice_accounting
+                    .checkout_partial_terminal_grace_secs,
+                ..gc::GcConfig::default()
+            };
+            let cancel_gc = cancel.clone();
+            tokio::spawn(async move {
+                gc::run(pool, cancel_gc, gc_cfg).await;
+            });
+            tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
+        }
 
-    // Periodic in-memory sweep for the per-IP / register / metadata
-    // sliding-window counters. Without this, one-shot bursts of unique
-    // IPs would leave entries behind forever.
-    {
-        let rl = rate_limiter.clone();
-        let cancel_sweep = cancel.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
-            tick.tick().await;
-            loop {
-                tokio::select! {
-                    _ = cancel_sweep.cancelled() => return,
-                    _ = tick.tick() => {
-                        let evicted = rl.sweep_inmemory(std::time::Duration::from_secs(7200));
-                        if evicted > 0 {
-                            tracing::info!("rate-limit in-mem sweep: evicted {} idle entries", evicted);
+        // Periodic in-memory sweep for the per-IP / register / metadata
+        // sliding-window counters. Without this, one-shot bursts of unique
+        // IPs would leave entries behind forever.
+        {
+            let rl = rate_limiter.clone();
+            let cancel_sweep = cancel.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = cancel_sweep.cancelled() => return,
+                        _ = tick.tick() => {
+                            let evicted = rl.sweep_inmemory(std::time::Duration::from_secs(7200));
+                            if evicted > 0 {
+                                tracing::info!("rate-limit in-mem sweep: evicted {} idle entries", evicted);
+                            }
                         }
                     }
                 }
-            }
-        });
-    }
+            });
+        }
 
-    if let Some(backend) = state.utxo_backend.clone() {
-        let pool = state.db.clone();
-        let rl = rate_limiter.clone();
-        let cancel_watcher = cancel.clone();
-        let watcher_cfg =
-            chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
-        let accounting_tolerances =
-            db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
-        let active = watcher_cfg.active_tick_secs;
-        let idle = watcher_cfg.idle_tick_secs;
-        tokio::spawn(async move {
-            chain_watcher::run(
-                pool,
-                backend,
-                rl,
-                cancel_watcher,
-                watcher_cfg,
-                accounting_tolerances,
-            )
-            .await;
-        });
-        tracing::info!(
-            "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
-            active,
-            idle,
+        if let Some(backend) = state.utxo_backend.clone() {
+            let pool = state.db.clone();
+            let rl = rate_limiter.clone();
+            let cancel_watcher = cancel.clone();
+            let watcher_cfg =
+                chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
+            let accounting_tolerances =
+                db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
+            let active = watcher_cfg.active_tick_secs;
+            let idle = watcher_cfg.idle_tick_secs;
+            tokio::spawn(async move {
+                chain_watcher::run(
+                    pool,
+                    backend,
+                    rl,
+                    cancel_watcher,
+                    watcher_cfg,
+                    accounting_tolerances,
+                )
+                .await;
+            });
+            tracing::info!(
+                "chain watcher started (active tick {}s, idle tick {}s, lookahead 10)",
+                active,
+                idle,
+            );
+        } else {
+            tracing::warn!("chain watcher NOT started: utxo backend unavailable");
+        }
+
+        // Bitcoin watcher: polls mempool.bullbitcoin.com for invoice on-chain
+        // BTC settlement. Independent of the Liquid chain watcher above —
+        // separate API, separate rate-limit policy, separate cadence.
+        if config.bitcoin_watcher.enabled {
+            let pool = state.db.clone();
+            let cancel_btc = cancel.clone();
+            let btc_cfg = config.bitcoin_watcher.clone();
+            let accounting_tolerances =
+                db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
+            tokio::spawn(async move {
+                bitcoin_watcher::run(btc_cfg, accounting_tolerances, pool, cancel_btc).await;
+            });
+        } else {
+            tracing::info!("bitcoin watcher disabled by config");
+        }
+    } else {
+        tracing::warn!(
+            "background workers disabled by config; HTTP routes are active but claims, \
+             reconciliation, watchers, and GC will not run in this process"
         );
-    } else {
-        tracing::warn!("chain watcher NOT started: utxo backend unavailable");
-    }
-
-    // Bitcoin watcher: polls mempool.bullbitcoin.com for invoice on-chain
-    // BTC settlement. Independent of the Liquid chain watcher above —
-    // separate API, separate rate-limit policy, separate cadence.
-    if config.bitcoin_watcher.enabled {
-        let pool = state.db.clone();
-        let cancel_btc = cancel.clone();
-        let btc_cfg = config.bitcoin_watcher.clone();
-        let accounting_tolerances =
-            db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
-        tokio::spawn(async move {
-            bitcoin_watcher::run(btc_cfg, accounting_tolerances, pool, cancel_btc).await;
-        });
-    } else {
-        tracing::info!("bitcoin watcher disabled by config");
     }
 
     let app = build_router(state);
@@ -306,89 +322,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn build_router(state: AppState) -> Router {
-    // Donation-page image upload needs a 2 MiB body cap, well above the
-    // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
-    // image route in its own sub-router with its own RequestBodyLimitLayer
-    // keeps the global tight while letting this one path accept binaries.
-    let image_upload_router: Router<AppState> = Router::new()
-        .route("/donation-page/image", post(donation_page::upload_image))
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
+    let features = state.config.features.clone();
+    let invoice_sessions_enabled = features.invoices || features.payment_pages;
 
-    Router::new()
-        .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
-        .route("/.well-known/nostr.json", get(nostr::nostr_json))
-        .route("/lnurlp/callback/:nym", get(lnurl::callback))
-        .route("/register", post(registration::register))
-        .route("/register", put(registration::update_registration))
-        .route(
-            "/register",
-            axum::routing::delete(registration::delete_registration),
-        )
-        .route("/register/lookup", get(registration::lookup_by_npub))
-        .route(
-            "/api/v1/supported-currencies",
-            get(pricer::supported_currencies),
-        )
-        .route(
-            "/api/reservations/:nym",
-            get(registration::list_reservations),
-        )
-        // Tighter per-route body caps for the donation CRUD endpoints.
-        // The global 64 KiB still applies; the smaller per-route limit wins.
-        // Save body is JSON with all v1 fields ~ <2 KiB in practice; 8 KiB
-        // is generous headroom. Archive carries only nym+npub+sig+ts.
-        .route(
-            "/donation-page",
-            put(donation_page::save).layer(DefaultBodyLimit::max(8 * 1024)),
-        )
-        .route(
-            "/donation-page",
-            axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
-        )
-        .route("/donation-page/:nym", get(donation_page::get))
-        // Donation checkout now uses invoice sessions instead of the
-        // removed donation callback/status endpoints.
-        // Anonymous checkout invoice endpoints. The create route keeps a
-        // tight body cap; status and offer routes are rate-limit gated.
-        .route(
-            "/:nym/invoice",
-            post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
-        )
-        .route("/:nym/i/:id", get(invoice::render_payment))
-        .route("/api/v1/invoices/:id/status", get(invoice::status))
-        .route(
-            "/api/v1/invoices/:id/lightning",
-            post(invoice::fetch_lightning_offer),
-        )
-        .route(
-            "/api/v1/invoices/:id/liquid",
-            post(invoice::fetch_liquid_offer),
-        )
-        // Schnorr-signed recipient invoice endpoints, linked + unlinked.
-        // Body cap 8 KiB on signed POST to
-        // bound a misbehaving client; DELETE carries only npub+ts+sig.
-        // List uses GET + Query at the npub-keyed root.
-        .route(
-            "/api/v1/:nym/invoices",
-            post(invoice::create_signed_linked).layer(DefaultBodyLimit::max(8 * 1024)),
-        )
-        .route(
-            "/api/v1/invoices",
-            post(invoice::create_signed_unlinked).layer(DefaultBodyLimit::max(8 * 1024)),
-        )
-        .route(
-            "/api/v1/:nym/invoices/:id",
-            axum::routing::delete(invoice::cancel_linked).layer(DefaultBodyLimit::max(1024)),
-        )
-        .route(
-            "/api/v1/invoices/:id",
-            axum::routing::delete(invoice::cancel_unlinked).layer(DefaultBodyLimit::max(1024)),
-        )
-        .route("/api/v1/invoices", get(invoice::list_signed))
-        // Public unlinked render path. Privacy headers + indexing posture
-        // are applied via `invoice::html_response`; the parent fallback's
-        // donation_render path is bypassed via explicit registration.
-        .route("/invoice/:id", get(invoice::render_unlinked_payment))
+    let mut router: Router<AppState> = Router::new()
+        .route("/api/v1/supported-currencies", get(pricer::supported_currencies))
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/qr.svg", get(qr::generate))
         // See docs/compatibility-ledger.md for webhook compatibility policy.
@@ -397,10 +335,111 @@ fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness::ready))
         .route("/version", get(version::version))
-        .route("/certification/preflight", get(certification::preflight))
-        .fallback(donation_render::render_or_404)
+        .route("/certification/preflight", get(certification::preflight));
+
+    if features.lightning_address {
+        router = router
+            .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
+            .route("/.well-known/nostr.json", get(nostr::nostr_json))
+            .route("/lnurlp/callback/:nym", get(lnurl::callback))
+            .route("/register", post(registration::register))
+            .route("/register", put(registration::update_registration))
+            .route(
+                "/register",
+                axum::routing::delete(registration::delete_registration),
+            )
+            .route("/register/lookup", get(registration::lookup_by_npub))
+            .route(
+                "/api/reservations/:nym",
+                get(registration::list_reservations),
+            );
+    }
+
+    if features.payment_pages {
+        // Tighter per-route body caps for the donation CRUD endpoints.
+        // The global 64 KiB still applies; the smaller per-route limit wins.
+        // Save body is JSON with all v1 fields ~ <2 KiB in practice; 8 KiB
+        // is generous headroom. Archive carries only nym+npub+sig+ts.
+        router = router
+            .route(
+                "/donation-page",
+                put(donation_page::save).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/donation-page",
+                axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/donation-page/:nym", get(donation_page::get))
+            // Donation checkout now uses invoice sessions instead of the
+            // removed donation callback/status endpoints.
+            // Anonymous checkout invoice endpoints. The create route keeps a
+            // tight body cap; status and offer routes are rate-limit gated.
+            .route(
+                "/:nym/invoice",
+                post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/:nym/i/:id", get(invoice::render_payment));
+
+        // Donation-page image upload needs a 2 MiB body cap, well above the
+        // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
+        // image route in its own sub-router with its own RequestBodyLimitLayer
+        // keeps the global tight while letting this one path accept binaries.
+        let image_upload_router: Router<AppState> = Router::new()
+            .route("/donation-page/image", post(donation_page::upload_image))
+            .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
+        router = router.merge(image_upload_router);
+    }
+
+    if invoice_sessions_enabled {
+        router = router
+            .route("/api/v1/invoices/:id/status", get(invoice::status))
+            .route(
+                "/api/v1/invoices/:id/lightning",
+                post(invoice::fetch_lightning_offer),
+            )
+            .route(
+                "/api/v1/invoices/:id/liquid",
+                post(invoice::fetch_liquid_offer),
+            );
+    }
+
+    if features.invoices {
+        // Schnorr-signed recipient invoice endpoints, linked + unlinked.
+        // Body cap 8 KiB on signed POST to
+        // bound a misbehaving client; DELETE carries only npub+ts+sig.
+        // List uses GET + Query at the npub-keyed root.
+        router = router
+            .route(
+                "/api/v1/:nym/invoices",
+                post(invoice::create_signed_linked).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/invoices",
+                post(invoice::create_signed_unlinked).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/:nym/invoices/:id",
+                axum::routing::delete(invoice::cancel_linked).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/api/v1/invoices/:id",
+                axum::routing::delete(invoice::cancel_unlinked).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/api/v1/invoices", get(invoice::list_signed))
+            // Public unlinked render path. Privacy headers + indexing posture
+            // are applied via `invoice::html_response`; the parent fallback's
+            // donation_render path is bypassed via explicit registration.
+            .route("/invoice/:id", get(invoice::render_unlinked_payment));
+    }
+
+    let router = if features.payment_pages {
+        router.fallback(donation_render::render_or_404)
+    } else {
+        router.fallback(not_found)
+    };
+
+    router
         .layer(RequestBodyLimitLayer::new(64 * 1024))
-        .merge(image_upload_router)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -408,4 +447,8 @@ fn build_router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }

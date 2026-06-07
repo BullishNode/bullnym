@@ -331,6 +331,11 @@ cache_ttl_secs         = 60
 request_timeout_ms     = 2000
 supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP","INR"]
 
+[features]
+lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
+invoices          = true    # wallet-origin invoice APIs and /invoice/:id
+payment_pages     = true    # donation/payment-page APIs and checkout invoices
+
 [donation]
 image_root_path       = "/opt/payservice/data/images"
 image_max_bytes       = 2_097_152
@@ -365,6 +370,9 @@ cache_max_entries = 10_000
 enabled                  = true
 endpoint                 = "https://mempool.bullbitcoin.com/api"
 confirmations_required  = 1
+
+[workers]
+enabled = true                              # Set false for standby/web-only instances
 
 [invoice_accounting]
 btc_shortfall_tolerance_sat       = 300

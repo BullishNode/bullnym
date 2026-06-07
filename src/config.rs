@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub proof: ProofConfig,
     #[serde(default)]
+    pub features: FeaturesConfig,
+    #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub certification: CertificationConfig,
@@ -27,6 +29,8 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     #[serde(default)]
     pub bitcoin_watcher: BitcoinWatcherConfig,
+    #[serde(default)]
+    pub workers: WorkersConfig,
     #[serde(default)]
     pub invoice_accounting: InvoiceAccountingConfig,
     #[serde(skip)]
@@ -58,6 +62,56 @@ const DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT: i64 = 300;
 const DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT: i64 = 60;
 const DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT: i64 = 1;
 const DEFAULT_CHECKOUT_PARTIAL_TERMINAL_GRACE_SECS: u64 = 900;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeaturesConfig {
+    /// Lightning Address and registration APIs:
+    /// `/.well-known/lnurlp`, `/.well-known/nostr.json`, `/lnurlp/callback`,
+    /// `/register*`, and reservation inspection.
+    #[serde(default = "default_feature_enabled")]
+    pub lightning_address: bool,
+    /// Wallet-origin invoice APIs and standalone invoice payment pages.
+    #[serde(default = "default_feature_enabled")]
+    pub invoices: bool,
+    /// Donation/payment-page APIs and donation checkout invoice sessions.
+    #[serde(default = "default_feature_enabled")]
+    pub payment_pages: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            lightning_address: default_feature_enabled(),
+            invoices: default_feature_enabled(),
+            payment_pages: default_feature_enabled(),
+        }
+    }
+}
+
+fn default_feature_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkersConfig {
+    /// When false, the HTTP server starts without background workers.
+    /// Use this for standby/web-only instances so failover does not
+    /// duplicate claim, watcher, reconciler, or GC loops.
+    #[serde(default = "default_workers_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for WorkersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_workers_enabled(),
+        }
+    }
+}
+
+fn default_workers_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InvoiceAccountingConfig {
