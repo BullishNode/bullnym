@@ -56,18 +56,35 @@ struct WebhookData {
 ///   leaks "wrong length" via timing but the configured secret is a
 ///   fixed long random string; the worst case is the attacker learns
 ///   "you didn't pick this length", which is uninteresting.
-fn url_secret_matches_pair(presented: &str, current: &str, previous: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlSecretMatch {
+    Current,
+    Previous,
+    None,
+}
+
+fn match_url_secret_pair(presented: &str, current: &str, previous: &str) -> UrlSecretMatch {
     fn ct_eq(a: &str, b: &str) -> bool {
         if b.is_empty() || a.len() != b.len() {
             return false;
         }
         a.as_bytes().ct_eq(b.as_bytes()).into()
     }
-    ct_eq(presented, current) || ct_eq(presented, previous)
+    if ct_eq(presented, current) {
+        UrlSecretMatch::Current
+    } else if ct_eq(presented, previous) {
+        UrlSecretMatch::Previous
+    } else {
+        UrlSecretMatch::None
+    }
 }
 
-fn webhook_url_secret_matches(presented: &str, config: &Config) -> bool {
-    url_secret_matches_pair(
+fn url_secret_matches_pair(presented: &str, current: &str, previous: &str) -> bool {
+    match_url_secret_pair(presented, current, previous) != UrlSecretMatch::None
+}
+
+fn match_webhook_url_secret(presented: &str, config: &Config) -> UrlSecretMatch {
+    match_url_secret_pair(
         presented,
         &config.boltz_webhook_url_secret,
         &config.boltz_webhook_url_secret_previous,
@@ -84,18 +101,26 @@ pub async fn webhook_with_secret(
     headers: HeaderMap,
     body: String,
 ) -> Result<Response, AppError> {
-    if !webhook_url_secret_matches(&secret, &state.config) {
-        // Same shape as a route miss — don't leak whether the path
-        // existed but the secret was wrong vs. the route doesn't exist.
-        // Webhook-bomb rate-limit is still applied below.
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        let caller_ip = ip_whitelist::resolve_caller_ip(
-            peer_opt.map(|ConnectInfo(addr)| addr.ip()),
-            xff,
-            state.config.rate_limit.trust_forwarded_for,
-        );
-        tracing::warn!("boltz webhook: URL secret mismatch from {:?}", caller_ip);
-        return Ok((StatusCode::NOT_FOUND, "").into_response());
+    match match_webhook_url_secret(&secret, &state.config) {
+        UrlSecretMatch::Current => {
+            tracing::debug!("boltz webhook: URL secret matched current secret");
+        }
+        UrlSecretMatch::Previous => {
+            tracing::warn!("boltz webhook: URL secret matched previous rotation secret");
+        }
+        UrlSecretMatch::None => {
+            // Same shape as a route miss — don't leak whether the path
+            // existed but the secret was wrong vs. the route doesn't exist.
+            // Webhook-bomb rate-limit is still applied below.
+            let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+            let caller_ip = ip_whitelist::resolve_caller_ip(
+                peer_opt.map(|ConnectInfo(addr)| addr.ip()),
+                xff,
+                state.config.rate_limit.trust_forwarded_for,
+            );
+            tracing::warn!("boltz webhook: URL secret mismatch from {:?}", caller_ip);
+            return Ok((StatusCode::NOT_FOUND, "").into_response());
+        }
     }
     dispatch_webhook(state, peer_opt, headers, body)
         .await

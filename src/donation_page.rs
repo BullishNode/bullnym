@@ -509,6 +509,7 @@ pub async fn upload_image(
     let pipeline_cfg = PipelineConfig {
         max_bytes: state.config.donation.image_max_bytes,
         max_dimension: state.config.donation.image_max_dimension,
+        max_pixels: state.config.donation.image_max_pixels,
         avatar_size: state.config.donation.avatar_size,
         og_width: state.config.donation.og_width,
         og_height: state.config.donation.og_height,

@@ -166,6 +166,7 @@ HTTP layer (Axum)
 ├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
 ├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
 ├── /health                           Liveness probe
+├── /ready                            DB/schema readiness probe
 └── /version                          Build provenance for deploy/test preflight
 
 Background tasks (spawned in main, cancelled on SIGINT)
@@ -316,7 +317,7 @@ Use `/certification/preflight?scopes=registration_setup,metadata_lookup,invoice_
 `config.toml` has the operational knobs; secrets and connection strings come from the environment.
 
 ```toml
-domain    = "bullpay.ca"        # Public hostname; used in LUD-06 metadata + identifiers
+domain    = "pay.example.com"   # Public hostname; used in LUD-06 metadata + identifiers
 listen    = "127.0.0.1:8080"    # Bind address (loopback when behind nginx)
 pool_size = 10                  # Postgres connection pool
 
@@ -333,7 +334,8 @@ supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP","INR"]
 [donation]
 image_root_path       = "/opt/payservice/data/images"
 image_max_bytes       = 2_097_152
-image_max_dimension   = 10_000
+image_max_dimension   = 5_000
+image_max_pixels      = 12_000_000
 avatar_size           = 256
 og_width              = 1200
 og_height             = 630
@@ -451,6 +453,7 @@ EOF
 cargo run --release
 # → listening on 0.0.0.0:8080
 curl -fsS http://localhost:8080/health   # → "ok"
+curl -fsS http://localhost:8080/ready    # → DB/schema readiness JSON
 curl -fsS http://localhost:8080/version  # → build provenance JSON
 ```
 
@@ -517,6 +520,19 @@ Use mobile unit/widget tests, static analysis, and emulator or device flows for
 app-owned behavior. Use bullnym-test only after the API contract is known to be
 compatible and the remaining question is whether a deployed server/payment-rail
 scenario works end to end.
+
+## Release preflight
+
+Bullnym currently uses a local `boltz-client` path dependency at
+`../boltz/boltz-rust`. Before cutting or deploying a production artifact, verify
+that both worktrees are clean:
+
+```bash
+scripts/release-preflight.sh
+```
+
+The check intentionally fails on uncommitted Bullnym or Boltz changes. A
+production binary must be traceable to committed source revisions.
 
 ## Dependencies
 

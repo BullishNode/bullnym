@@ -19,6 +19,7 @@ pub mod nostr;
 pub mod pricer;
 pub mod qr;
 pub mod rate_limit;
+pub mod readiness;
 pub mod reconciler;
 pub mod registration;
 pub mod reserved_nyms;

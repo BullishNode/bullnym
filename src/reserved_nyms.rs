@@ -5,6 +5,7 @@
 pub const RESERVED_NYMS: &[&str] = &[
     "register",
     "health",
+    "ready",
     "version",
     "webhook",
     "lnurlp",

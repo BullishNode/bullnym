@@ -67,6 +67,7 @@ fn default_cfg() -> PipelineConfig {
     PipelineConfig {
         max_bytes: 2 * 1024 * 1024,
         max_dimension: 10_000,
+        max_pixels: 12_000_000,
         avatar_size: 256,
         og_width: 1200,
         og_height: 630,
@@ -123,6 +124,16 @@ fn process_rejects_huge_dimensions() {
     let png = make_test_png(200, 200);
     let err = process(&png, ImageKind::Avatar, &cfg).unwrap_err();
     assert!(matches!(err, AppError::ImageDimensionsTooLarge { .. }));
+}
+
+#[test]
+fn process_rejects_huge_pixel_area() {
+    let mut cfg = default_cfg();
+    cfg.max_dimension = 1_000;
+    cfg.max_pixels = 10_000;
+    let png = make_test_png(200, 200);
+    let err = process(&png, ImageKind::Avatar, &cfg).unwrap_err();
+    assert!(matches!(err, AppError::ImagePixelsTooLarge { .. }));
 }
 
 #[test]

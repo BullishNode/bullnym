@@ -58,5 +58,6 @@ live in feature modules such as `registration`, `lnurl`, `donation_page`, and
 | `GET` | `/qr.svg` | Generate QR SVGs for payment data. |
 | `GET` | `/robots.txt` | Prevent indexing of payment pages. |
 | `GET` | `/health` | Liveness probe only. |
+| `GET` | `/ready` | Operator readiness probe for database connectivity and expected schema marker. |
 | `GET` | `/version` | Build provenance and expected schema marker. |
 | `GET` | `/certification/preflight` | Scoped certification readiness check. |

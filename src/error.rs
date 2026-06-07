@@ -37,6 +37,11 @@ pub enum AppError {
     ImageDimensionsTooLarge {
         max: u32,
     },
+    /// Decoded image area exceeded `image_max_pixels`. Image-bomb defense
+    /// paired with the per-axis cap.
+    ImagePixelsTooLarge {
+        max_pixels: u64,
+    },
     /// The caller's wallet already has an active address.
     KeyAlreadyRegistered {
         nym: String,
@@ -143,6 +148,7 @@ impl AppError {
             | Self::InvoiceNotFound(_)
             | Self::ImageInvalid(_)
             | Self::ImageDimensionsTooLarge { .. }
+            | Self::ImagePixelsTooLarge { .. }
             | Self::MultipartInvalid(_)
             | Self::KeyAlreadyRegistered { .. }
             | Self::NymQuotaExceeded { .. }
@@ -184,6 +190,7 @@ impl AppError {
             Self::InvoiceNotFound(_) => "InvoiceNotFound",
             Self::ImageInvalid(_) => "ImageInvalid",
             Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
+            Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
             Self::MultipartInvalid(_) => "MultipartInvalid",
             Self::KeyAlreadyRegistered { .. } => "KeyAlreadyRegistered",
             Self::NymQuotaExceeded { .. } => "NymQuotaExceeded",
@@ -237,6 +244,9 @@ impl std::fmt::Display for AppError {
             Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
             Self::ImageDimensionsTooLarge { max } => {
                 write!(f, "image dimensions exceed {max}px cap")
+            }
+            Self::ImagePixelsTooLarge { max_pixels } => {
+                write!(f, "image pixel area exceeds {max_pixels} pixel cap")
             }
             Self::MultipartInvalid(reason) => write!(f, "multipart invalid: {reason}"),
             Self::KeyAlreadyRegistered { nym, domain } => {
@@ -303,6 +313,9 @@ impl IntoResponse for AppError {
             AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
             AppError::ImageDimensionsTooLarge { max } => format!(
                 "Image dimensions are too large. Maximum {max}×{max} pixels."
+            ),
+            AppError::ImagePixelsTooLarge { max_pixels } => format!(
+                "Image dimensions are too large. Maximum {max_pixels} total pixels."
             ),
             AppError::MultipartInvalid(_) => "Upload form was malformed. Retry from the app.".into(),
             AppError::KeyAlreadyRegistered { nym, domain } => format!(

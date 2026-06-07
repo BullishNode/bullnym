@@ -10,7 +10,8 @@
 //!    only matches. Magic bytes pin the decoder format — never trust
 //!    filename or `Content-Type` header.
 //! 3. Header-only dimension probe via `image::ImageReader::into_dimensions()`
-//!    — rejects image-bombs without allocating the full pixel buffer.
+//!    — rejects image-bombs by per-axis and total-pixel budget without
+//!    allocating the full pixel buffer.
 //! 4. Full decode (now safe; dimensions are bounded).
 //! 5. Resize to target box (avatar 256×256, OG 1200×630).
 //! 6. Encode avatar as WebP and OG as JPEG.
@@ -100,6 +101,7 @@ pub struct ProcessedImage {
 pub struct PipelineConfig {
     pub max_bytes: usize,
     pub max_dimension: u32,
+    pub max_pixels: u64,
     pub avatar_size: u32,
     pub og_width: u32,
     pub og_height: u32,
@@ -111,8 +113,8 @@ pub struct PipelineConfig {
 /// Errors:
 /// - `ImageInvalid` for: oversize body, unrecognized magic bytes, decode
 ///   failure, encoder failure.
-/// - `ImageDimensionsTooLarge` for: header-reported dimensions exceed
-///   `max_dimension`.
+/// - `ImageDimensionsTooLarge`/`ImagePixelsTooLarge` for: header-reported
+///   dimensions exceed configured pre-decode memory budgets.
 pub fn process(
     bytes: &[u8],
     kind: ImageKind,
@@ -153,6 +155,12 @@ pub fn process(
     if w > cfg.max_dimension || h > cfg.max_dimension {
         return Err(AppError::ImageDimensionsTooLarge {
             max: cfg.max_dimension,
+        });
+    }
+    let pixels = u64::from(w) * u64::from(h);
+    if pixels > cfg.max_pixels {
+        return Err(AppError::ImagePixelsTooLarge {
+            max_pixels: cfg.max_pixels,
         });
     }
 

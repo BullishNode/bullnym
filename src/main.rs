@@ -14,8 +14,8 @@ use tower_http::trace::TraceLayer;
 
 use pay_service::{
     bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, donation_page,
-    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, reconciler,
-    registration,
+    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
+    reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -45,6 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::Config::load(&config_path)?;
     tracing::info!("loaded config for domain: {}", config.domain);
+    if config.rate_limit.trust_forwarded_for {
+        tracing::warn!(
+            "rate_limit.trust_forwarded_for=true; only run this behind a trusted reverse proxy \
+             that overwrites X-Forwarded-For at the network boundary"
+        );
+    }
+    if !config.boltz_webhook_url_secret_previous.is_empty() {
+        tracing::warn!(
+            "BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS is set; webhook secret rotation overlap is active"
+        );
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
@@ -384,6 +395,7 @@ fn build_router(state: AppState) -> Router {
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
+        .route("/ready", get(readiness::ready))
         .route("/version", get(version::version))
         .route("/certification/preflight", get(certification::preflight))
         .fallback(donation_render::render_or_404)

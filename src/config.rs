@@ -251,7 +251,8 @@ fn default_pricer_supported_currencies() -> Vec<String> {
 
 const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
 const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
-const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 10_000;
+const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 5_000;
+const DEFAULT_DONATION_IMAGE_MAX_PIXELS: u64 = 12_000_000;
 const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
 const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
 const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
@@ -271,9 +272,15 @@ pub struct DonationConfig {
     pub image_max_bytes: usize,
     /// Reject images whose decoded dimensions exceed this in either
     /// axis. Image-bomb defense: read the header dimensions first
-    /// (cheap), reject before allocating the full pixel buffer.
+    /// (cheap), reject before allocating the full pixel buffer. The
+    /// default is intentionally below large-camera panoramas because decode
+    /// memory grows with pixels, not upload bytes.
     #[serde(default = "default_donation_image_max_dimension")]
     pub image_max_dimension: u32,
+    /// Reject images whose decoded pixel area exceeds this value before
+    /// allocating the full pixel buffer.
+    #[serde(default = "default_donation_image_max_pixels")]
+    pub image_max_pixels: u64,
     /// Output size for resized avatar (square).
     #[serde(default = "default_donation_avatar_size")]
     pub avatar_size: u32,
@@ -291,6 +298,7 @@ impl Default for DonationConfig {
             image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
             image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
             image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
+            image_max_pixels: DEFAULT_DONATION_IMAGE_MAX_PIXELS,
             avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
             og_width: DEFAULT_DONATION_OG_WIDTH,
             og_height: DEFAULT_DONATION_OG_HEIGHT,
@@ -306,6 +314,9 @@ fn default_donation_image_max_bytes() -> usize {
 }
 fn default_donation_image_max_dimension() -> u32 {
     DEFAULT_DONATION_IMAGE_MAX_DIMENSION
+}
+fn default_donation_image_max_pixels() -> u64 {
+    DEFAULT_DONATION_IMAGE_MAX_PIXELS
 }
 fn default_donation_avatar_size() -> u32 {
     DEFAULT_DONATION_AVATAR_SIZE
@@ -996,11 +1007,28 @@ impl Config {
         config.boltz_webhook_url_secret_previous =
             std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
 
-        config.validate()?;
+        let runtime_mode =
+            std::env::var("BULLNYM_RUNTIME_MODE").unwrap_or_else(|_| "unknown".into());
+        let allow_public_listen = std::env::var("BULLNYM_ALLOW_PUBLIC_LISTEN")
+            .map(|v| env_flag_enabled(&v))
+            .unwrap_or(false);
+        config.validate_for_runtime(&runtime_mode, allow_public_listen)?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_for_runtime(
+        &self,
+        runtime_mode: &str,
+        allow_public_listen: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.validate_common()?;
+        if runtime_mode == "production" {
+            self.validate_production(allow_public_listen)?;
+        }
+        Ok(())
+    }
+
+    fn validate_common(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.limits.min_sendable_msat > self.limits.max_sendable_msat {
             return Err("min_sendable_msat must be <= max_sendable_msat".into());
         }
@@ -1009,6 +1037,12 @@ impl Config {
         }
         if self.proof.message_tag.is_empty() {
             return Err("proof.message_tag must be non-empty".into());
+        }
+        if self.donation.image_max_dimension == 0 {
+            return Err("donation.image_max_dimension must be > 0".into());
+        }
+        if self.donation.image_max_pixels == 0 {
+            return Err("donation.image_max_pixels must be > 0".into());
         }
         if self.certification.enabled {
             if self.certification.token.is_empty() {
@@ -1023,6 +1057,40 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_production(
+        &self,
+        allow_public_listen: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.boltz_webhook_url_secret.is_empty() {
+            return Err(
+                "BOLTZ_WEBHOOK_URL_SECRET must be set when BULLNYM_RUNTIME_MODE=production".into(),
+            );
+        }
+        if self.domain == "localhost" || self.domain.starts_with("localhost:") {
+            return Err("domain must not be localhost in production".into());
+        }
+        if !allow_public_listen && listen_addr_is_non_loopback(&self.listen)? {
+            return Err(
+                "listen must bind loopback in production; use 127.0.0.1 or set BULLNYM_ALLOW_PUBLIC_LISTEN=true".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn listen_addr_is_non_loopback(listen: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let addr: std::net::SocketAddr = listen
+        .parse()
+        .map_err(|e| format!("listen must be a socket address host:port: {e}"))?;
+    Ok(!addr.ip().is_loopback())
 }
 
 #[cfg(test)]

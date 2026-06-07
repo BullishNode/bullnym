@@ -6,6 +6,10 @@ use tokio::sync::Mutex;
 
 #[test]
 fn url_secret_matches_current() {
+    assert_eq!(
+        match_url_secret_pair("s3cr3t-current", "s3cr3t-current", ""),
+        UrlSecretMatch::Current
+    );
     assert!(url_secret_matches_pair(
         "s3cr3t-current",
         "s3cr3t-current",
@@ -15,6 +19,10 @@ fn url_secret_matches_current() {
 
 #[test]
 fn url_secret_matches_previous_during_overlap() {
+    assert_eq!(
+        match_url_secret_pair("s3cr3t-previous", "s3cr3t-current", "s3cr3t-previous"),
+        UrlSecretMatch::Previous
+    );
     assert!(url_secret_matches_pair(
         "s3cr3t-previous",
         "s3cr3t-current",
@@ -29,6 +37,10 @@ fn url_secret_matches_previous_during_overlap() {
 
 #[test]
 fn url_secret_rejects_wrong() {
+    assert_eq!(
+        match_url_secret_pair("nope", "s3cr3t-current", "s3cr3t-previous"),
+        UrlSecretMatch::None
+    );
     assert!(!url_secret_matches_pair(
         "nope",
         "s3cr3t-current",
