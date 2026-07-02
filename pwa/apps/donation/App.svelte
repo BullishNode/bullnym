@@ -163,7 +163,13 @@
           </div>
         </header>
 
-        <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-center gap-3 overflow-hidden sm:gap-5">
+        <!-- overflow-y-auto + my-auto (NOT justify-center + overflow-hidden):
+             when the stack is taller than the viewport, justify-center clips
+             it at BOTH ends — the amount display was getting cropped off the
+             top. my-auto centers when content fits and degrades to a normal
+             scroll when it doesn't. -->
+        <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto">
+          <div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
           <AmountDisplay amount={displayAmount} {currency} {precision} />
 
           <Keypad {precision} onInput={applyInput} />
@@ -223,6 +229,7 @@
           {/if}
 
           <BullFooter />
+          </div>
         </div>
 
         <div

@@ -117,7 +117,11 @@
         </div>
       </header>
 
-      <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-center gap-3 overflow-hidden sm:gap-5">
+      <!-- my-auto inside overflow-y-auto: centers when the stack fits the
+           viewport, scrolls (instead of clipping both ends, which
+           justify-center + overflow-hidden does) when it doesn't. -->
+      <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto">
+        <div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
         <AmountDisplay amount={displayAmount} currency={settings.currency} {precision} />
         <Keypad {precision} onInput={applyInput} />
         <textarea
@@ -131,6 +135,7 @@
           <p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
         {/if}
         <BullFooter />
+        </div>
       </div>
 
       <div
