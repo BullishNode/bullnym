@@ -25,7 +25,15 @@
   $effect(() => {
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     if (!reduceMotion) {
-      confetti({
+      // The library's default instance is created with useWorker: true; its
+      // blob: worker violates the page CSP (script-src 'self' is the
+      // worker-src fallback), silently killing the burst. Create a
+      // no-worker cannon instead — one-shot main-thread rendering is fine.
+      const fire = confetti.create(null as unknown as HTMLCanvasElement, {
+        resize: true,
+        useWorker: false,
+      })
+      fire({
         particleCount: 120,
         spread: 70,
         origin: { y: 0.6 },

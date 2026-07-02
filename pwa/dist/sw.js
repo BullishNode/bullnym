@@ -9,7 +9,7 @@
 // build always overwrites this line in dist/sw.js.
 const CACHE_VERSION = 'bullnym-shell-v1'
 const PAGES_CACHE_VERSION = 'bullnym-pages-v1'
-const PRECACHE_URLS = ["/pwa-assets/assets/SuccessScreen-DbinX6ZW.css","/pwa-assets/assets/donation-DM-vtgVh.js","/pwa-assets/assets/pos-CoFc89AO.js","/pwa-assets/assets/SuccessScreen-CDnlLtyg.js"]
+const PRECACHE_URLS = ["/pwa-assets/assets/SuccessScreen-DbinX6ZW.css","/pwa-assets/assets/donation-DK4TeOMB.js","/pwa-assets/assets/pos-DJHdV5rw.js","/pwa-assets/assets/SuccessScreen-BT2f1i1N.js"]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
