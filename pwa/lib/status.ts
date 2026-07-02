@@ -14,7 +14,13 @@
 // to detect that case (see lib/components/PaymentScreen.svelte's poll() and
 // apps/pos/screens/PayScreen.svelte's reconstruction effect) instead of
 // treating an unrecognized status as "still waiting for payment" forever.
+// Verified against src/db/invoices.rs: 'unpaid' and 'in_progress' are the
+// live pre-payment states — omitting them made PayScreen's deep-link
+// reconstruction reject every fresh invoice as "Invoice not found".
+// ('pending' kept defensively.)
 export const KNOWN_STATUSES = new Set([
+  'unpaid',
+  'in_progress',
   'pending',
   'partially_paid',
   'paid',
@@ -34,6 +40,8 @@ export function isTerminalFailed(status: string): boolean {
 
 export function statusLabel(status: string): string {
   switch (status) {
+    case 'unpaid':
+    case 'in_progress':
     case 'pending':
       return 'Waiting for payment'
     case 'partially_paid':
