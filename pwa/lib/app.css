@@ -84,6 +84,17 @@ a,
    these rules handle in-flow typography/hiding, which CAN be scoped by
    class. Base rules match nostr-pos's print block; the paper-58/80/a4
    variants are our addition (upstream is 80mm-only). */
+/* Kiosk scroll: keep content reachable when it exceeds the viewport, but
+   without desktop scrollbar chrome (which also eats ~15px of column width
+   and pushed the right-aligned amount against the edge). */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
 @media print {
   body {
     background: white;

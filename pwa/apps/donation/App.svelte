@@ -168,7 +168,7 @@
              it at BOTH ends — the amount display was getting cropped off the
              top. my-auto centers when content fits and degrades to a normal
              scroll when it doesn't. -->
-        <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto">
+        <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto scrollbar-none">
           <div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
           <AmountDisplay amount={displayAmount} {currency} {precision} />
 

@@ -120,7 +120,7 @@
       <!-- my-auto inside overflow-y-auto: centers when the stack fits the
            viewport, scrolls (instead of clipping both ends, which
            justify-center + overflow-hidden does) when it doesn't. -->
-      <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto">
+      <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto scrollbar-none">
         <div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
         <AmountDisplay amount={displayAmount} currency={settings.currency} {precision} />
         <Keypad {precision} onInput={applyInput} />
