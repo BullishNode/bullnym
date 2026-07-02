@@ -1,0 +1,114 @@
+@import 'tailwindcss';
+
+/* Faithful port of nostr-pos's design system
+   (~/apps/nostr-pos/apps/pos-pwa/src/app.css + tailwind.config.ts). Warm
+   cream light theme, Bebas Neue display font, dark variant via
+   prefers-color-scheme. The old dark-terminal / Bitcoin-orange tokens from
+   earlier milestones are gone — this is a reskin, not a layer on top. */
+
+@theme {
+  --font-display: 'Bebas Neue', ui-sans-serif, system-ui, sans-serif;
+  --tracking-display: 0.03em;
+  --radius-md: 8px;
+}
+
+@font-face {
+  font-family: 'Bebas Neue';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  /* Root-absolute /BebasNeue-Regular.woff2 silently 404s in production:
+     the server only serves dist/ under /pwa-assets/, nothing at site
+     root except /sw.js. Vite doesn't rebase root-absolute url()s against
+     `base`, so this must be hardcoded to match vite.config.ts's
+     base: '/pwa-assets/' (applies in both dev and build). */
+  src: url('/pwa-assets/BebasNeue-Regular.woff2') format('woff2');
+}
+
+:root {
+  color-scheme: light;
+  font-family: 'Aptos', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #f5f0e8;
+  color: #211f1a;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app {
+  min-height: 100dvh;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button,
+a,
+[role='button'] {
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    background: #161512;
+    color: #f8f1e6;
+  }
+}
+
+/* Receipt print layout (POS mode — apps/pos/screens/ReceiptScreen.svelte,
+   which wraps lib/components/ReceiptView.svelte). @page size/margin per
+   paper width is injected at runtime by ReceiptScreen (a standalone
+   <style> element) since @page rules can't be scoped to a body class;
+   these rules handle in-flow typography/hiding, which CAN be scoped by
+   class. Base rules match nostr-pos's print block; the paper-58/80/a4
+   variants are our addition (upstream is 80mm-only). */
+@media print {
+  body {
+    background: white;
+    color: black;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .receipt-paper {
+    box-shadow: none !important;
+    border: 0 !important;
+  }
+
+  body.paper-58 .receipt-paper,
+  body.paper-80 .receipt-paper {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0.5rem;
+  }
+
+  body.paper-a4 .receipt-paper {
+    max-width: 80mm;
+    margin: 0 auto;
+  }
+}
