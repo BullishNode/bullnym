@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
 use http_body_util::BodyExt;
@@ -14,12 +14,16 @@ use pay_service::boltz::BoltzService;
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
     ElectrumConfig, FeaturesConfig, InvoiceAccountingConfig, LimitsConfig, PricerConfig,
-    ProofConfig, RateLimitConfig, ReconcilerConfig, WorkersConfig,
+    ProofConfig, PwaConfig, RateLimitConfig, ReconcilerConfig, WorkersConfig,
 };
+use pay_service::donation_render::PwaShells;
 use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
-use pay_service::{certification, claimer, invoice, lnurl, nostr, registration, AppState};
+use pay_service::{
+    certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, registration,
+    AppState,
+};
 
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
@@ -52,6 +56,7 @@ fn test_config() -> Config {
             electrum_url: "blockstream.info:995".to_string(),
         },
         pricer: PricerConfig::default(),
+        pwa: PwaConfig::default(),
         donation: DonationConfig::default(),
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),
@@ -94,6 +99,7 @@ fn test_state(pool: PgPool) -> AppState {
         rate_limiter,
         utxo_backend: None,
         pricer,
+        pwa_shells: Arc::new(PwaShells::default()),
     }
 }
 
@@ -102,6 +108,9 @@ fn test_app(state: AppState) -> Router {
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
+        .route("/donation-page", put(donation_page::save))
+        .route("/sw.js", get(donation_render::service_worker))
+        .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route(
@@ -324,6 +333,46 @@ fn sign_invoice_list_with_keypair(
     )
 }
 
+struct DonationSaveSignFields<'a> {
+    header: &'a str,
+    description: &'a str,
+    display_currency: &'a str,
+    website: &'a str,
+    twitter: &'a str,
+    instagram: &'a str,
+    enabled: bool,
+    pos_mode: Option<bool>,
+    ct_descriptor: Option<&'a str>,
+}
+
+fn sign_donation_page_save_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    save: DonationSaveSignFields<'_>,
+) -> (String, u64) {
+    let enabled_str = if save.enabled { "1" } else { "0" };
+    let pos_mode_str = save
+        .pos_mode
+        .map(|pos_mode| if pos_mode { "1" } else { "0" });
+    let mut fields = vec![
+        save.header,
+        save.description,
+        save.display_currency,
+        save.website,
+        save.twitter,
+        save.instagram,
+        enabled_str,
+    ];
+    if let Some(pos_mode_str) = pos_mode_str {
+        fields.push(pos_mode_str);
+    }
+    if let Some(ct_descriptor) = save.ct_descriptor {
+        fields.push(ct_descriptor);
+    }
+    sign_la_action(keypair, "donation-page-save", npub, nym, &fields)
+}
+
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
@@ -379,6 +428,38 @@ async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     (status, body)
 }
 
+async fn get_json_with_headers(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, headers, body)
+}
+
+async fn put_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
 async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -399,6 +480,263 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 }
 
 // --- Registration tests ---
+
+#[tokio::test]
+async fn donation_page_upsert_round_trips_pos_mode() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "posround").await;
+
+    let row = pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "posround",
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "POS Store",
+            description: "Counter checkout",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(true),
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(row.pos_mode);
+
+    let fetched = pay_service::db::get_donation_page_by_nym(&pool, "posround")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fetched.pos_mode);
+
+    let row = pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "posround",
+            ct_descriptor: None,
+            header: "Donation Store",
+            description: "Tip jar",
+            display_currency: "CAD",
+            website: Some("https://example.com"),
+            twitter: Some("posround"),
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!row.pos_mode);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "manifestnym";
+    create_test_user(&pool, nym).await;
+
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "",
+            description: "Manifest test",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, headers, body) =
+        get_json_with_headers(&app, "/manifestnym/manifest.webmanifest").await;
+
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/manifest+json")
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=300")
+    );
+    assert_eq!(body["name"], "manifestnym");
+    assert_eq!(body["short_name"], "manifestnym");
+    assert_eq!(body["start_url"], "/manifestnym");
+    assert_eq!(body["scope"], "/");
+    assert_eq!(body["display"], "standalone");
+    assert_eq!(body["background_color"], "#0E0E0E");
+    assert_eq!(body["theme_color"], "#0E0E0E");
+    assert_eq!(body["icons"][0]["src"], "/pwa-assets/icons/icon-192.png");
+    assert_eq!(body["icons"][0]["sizes"], "192x192");
+    assert_eq!(body["icons"][0]["type"], "image/png");
+    assert_eq!(body["icons"][0]["purpose"], "any maskable");
+    assert_eq!(body["icons"][1]["src"], "/pwa-assets/icons/icon-512.png");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_returns_404_for_unknown_nym() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (status, _, body) = get_json_with_headers(&app, "/unknownnym/manifest.webmanifest").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "poslegacy";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Existing POS",
+            description: "Already counter mode",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(true),
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Legacy Save",
+            description: "Old clients do not sign pos_mode",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Legacy Save",
+            "description": "Old clients do not sign pos_mode",
+            "display_currency": "USD",
+            "enabled": true,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["pos_mode"], true);
+
+    let row = pay_service::db::get_donation_page_by_nym(&pool, nym)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.pos_mode);
+    assert_eq!(row.header, "Legacy Save");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn donation_page_save_new_payload_round_trips_pos_mode() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "posnew";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "New POS",
+            description: "New clients sign pos_mode",
+            display_currency: "USD",
+            website: "https://example.com",
+            twitter: "posnew",
+            instagram: "pos.new",
+            enabled: true,
+            pos_mode: Some(true),
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "New POS",
+            "description": "New clients sign pos_mode",
+            "display_currency": "USD",
+            "website": "https://example.com",
+            "twitter": "posnew",
+            "instagram": "pos.new",
+            "pos_mode": true,
+            "enabled": true,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["pos_mode"], true);
+
+    let row = pay_service::db::get_donation_page_by_nym(&pool, nym)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.pos_mode);
+    assert_eq!(row.website.as_deref(), Some("https://example.com"));
+
+    cleanup_db(&pool).await;
+}
 
 #[tokio::test]
 async fn register_and_resolve() {
@@ -571,7 +909,8 @@ async fn register_invalid_nym_rejected() {
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
 
-    for bad_nym in ["AB", "a", "-bad", "bad-", "has space", "has_under", "a@b"] {
+    // "a" removed: one-character nyms are valid since ef7e11b.
+    for bad_nym in ["AB", "-bad", "bad-", "has space", "has_under", "a@b"] {
         let (npub, sig, timestamp) = sign_registration(bad_nym, TEST_DESCRIPTOR);
         let (_, body) = post_json(
             &app,

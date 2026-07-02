@@ -1,0 +1,2 @@
+ALTER TABLE donation_pages
+    ADD COLUMN pos_mode BOOLEAN NOT NULL DEFAULT FALSE;

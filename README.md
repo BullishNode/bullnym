@@ -331,6 +331,9 @@ cache_ttl_secs         = 60
 request_timeout_ms     = 2000
 supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP","INR"]
 
+[pwa]
+dist_dir = "pwa/dist"
+
 [features]
 lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
 invoices          = true    # wallet-origin invoice APIs and /invoice/:id

@@ -13,14 +13,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::{Query, State};
+use axum::Json;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::PricerConfig;
+use crate::AppState;
 
-/// Currency rate result. `minor_per_btc` is in minor units of `currency`
-/// (e.g. cents for USD/CAD/EUR). To convert sats → minor:
+/// Currency rate result. `minor_per_btc` is in this server's minor units of
+/// `currency` (e.g. cents for USD/CAD/EUR, whole units for CRC/COP). To
+/// convert sats → minor:
 /// `minor = sats * minor_per_btc / 100_000_000`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RateView {
@@ -185,7 +189,9 @@ impl PricerClient {
             .ok_or_else(|| PricerError::Decode("missing result".into()))?
             .element;
 
-        if let Err(reason) = validate_rate_element(&element) {
+        let minor_per_btc = minor_per_btc_from_element(&element)?;
+
+        if let Err(reason) = validate_rate(&element.to_currency, minor_per_btc) {
             return Err(PricerError::Decode(format!(
                 "indexPrice {} for {} rejected: {}",
                 element.index_price, element.to_currency, reason
@@ -198,23 +204,49 @@ impl PricerClient {
             .unwrap_or(0);
 
         Ok(RateView {
-            currency: element.to_currency,
-            minor_per_btc: element.index_price,
-            precision: element.precision,
+            precision: currency_precision(&element.to_currency),
+            currency: normalize_currency_code(&element.to_currency),
+            minor_per_btc,
             fetched_at_unix: now_unix,
             last_known_rate: false,
         })
     }
 }
 
-fn validate_rate_element(element: &RateElement) -> Result<(), String> {
-    if element.index_price < PRICER_MIN_MINOR_PER_BTC {
+fn minor_per_btc_from_element(element: &RateElement) -> Result<i64, PricerError> {
+    let server_precision = currency_precision(&element.to_currency);
+    rescale_minor_units(element.index_price, element.precision, server_precision).ok_or_else(|| {
+        PricerError::Decode(format!(
+            "indexPrice {} for {} cannot be rescaled from precision {} to {}",
+            element.index_price, element.to_currency, element.precision, server_precision
+        ))
+    })
+}
+
+fn rescale_minor_units(value: i64, from_precision: u8, to_precision: u8) -> Option<i64> {
+    match from_precision.cmp(&to_precision) {
+        std::cmp::Ordering::Equal => Some(value),
+        std::cmp::Ordering::Less => {
+            let factor = 10_i64.checked_pow((to_precision - from_precision) as u32)?;
+            value.checked_mul(factor)
+        }
+        std::cmp::Ordering::Greater => {
+            let factor = 10_i64.checked_pow((from_precision - to_precision) as u32)?;
+            let quotient = value / factor;
+            let remainder = value % factor;
+            Some(quotient + i64::from(remainder >= factor / 2))
+        }
+    }
+}
+
+fn validate_rate(currency: &str, minor_per_btc: i64) -> Result<(), String> {
+    if minor_per_btc < PRICER_MIN_MINOR_PER_BTC {
         return Err(format!("below minimum {PRICER_MIN_MINOR_PER_BTC}"));
     }
 
-    let max = max_minor_per_btc(&element.to_currency)
+    let max = max_minor_per_btc(currency)
         .ok_or_else(|| "currency has no configured ceiling".to_string())?;
-    if element.index_price > max {
+    if minor_per_btc > max {
         return Err(format!("above currency ceiling {max}"));
     }
 
@@ -224,10 +256,11 @@ fn validate_rate_element(element: &RateElement) -> Result<(), String> {
 fn max_minor_per_btc(currency: &str) -> Option<i64> {
     match normalize_currency_code(currency).as_str() {
         // Roughly a $10M/BTC equivalent ceiling per supported currency.
-        // These are not market predictions; they catch unit/decimal/feed
-        // failures while leaving a wide operational margin.
+        // Values are always in this server's minor units per BTC; for
+        // zero-decimal currencies, the minor unit is the whole currency unit.
+        // These catch unit/decimal/feed failures while leaving a wide margin.
         "USD" | "CAD" | "EUR" => Some(1_000_000_000),
-        "CRC" => Some(500_000_000_000),
+        "CRC" => Some(5_000_000_000),
         "MXN" => Some(20_000_000_000),
         "COP" => Some(50_000_000_000),
         "INR" => Some(100_000_000_000),
@@ -248,10 +281,37 @@ pub struct SupportedCurrenciesResponse {
 }
 
 pub async fn supported_currencies(
-    axum::extract::State(state): axum::extract::State<crate::AppState>,
-) -> axum::Json<SupportedCurrenciesResponse> {
-    axum::Json(SupportedCurrenciesResponse {
+    State(state): State<AppState>,
+) -> Json<SupportedCurrenciesResponse> {
+    Json(SupportedCurrenciesResponse {
         currencies: state.pricer.supported_currencies().to_vec(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RateQuery {
+    currency: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RateResponse {
+    pub minor_per_btc: i64,
+    pub last_known_rate: bool,
+}
+
+pub async fn rate(
+    State(state): State<AppState>,
+    Query(query): Query<RateQuery>,
+) -> Json<RateResponse> {
+    let currency = normalize_currency_code(&query.currency);
+    let rate = state.pricer.get_rate(&currency).await;
+    let (minor_per_btc, last_known_rate) = match rate {
+        Some(rate) => (rate.minor_per_btc, rate.last_known_rate),
+        None => (0, false),
+    };
+    Json(RateResponse {
+        minor_per_btc,
+        last_known_rate,
     })
 }
 
@@ -261,7 +321,7 @@ pub fn normalize_currency_code(currency: &str) -> String {
 
 pub fn currency_precision(currency: &str) -> u8 {
     match normalize_currency_code(currency).as_str() {
-        "COP" => 0,
+        "COP" | "CRC" => 0,
         _ => 2,
     }
 }
@@ -328,7 +388,7 @@ struct RateElement {
     from_currency: String,
     #[serde(rename = "toCurrency")]
     to_currency: String,
-    /// Index (reference) rate in minor units of `toCurrency` per 1 BTC.
+    /// Index (reference) rate in upstream minor units of `toCurrency` per 1 BTC.
     /// Distinct from `price`: `price` carries Bull's sell-side markup
     /// while `indexPrice` is the neutral reference rate. The donation
     /// page is unauthenticated public surface; we want the rate the

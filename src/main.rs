@@ -11,6 +11,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
@@ -164,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.pricer.cache_ttl_secs,
         config.pricer.request_timeout_ms,
     );
+    let pwa_shells = Arc::new(donation_render::PwaShells::load(&config.pwa.dist_dir));
 
     let listen_addr = config.listen.clone();
     let config = Arc::new(config);
@@ -180,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: rate_limiter.clone(),
         utxo_backend,
         pricer: pricer_client,
+        pwa_shells,
     };
 
     let cancel = CancellationToken::new();
@@ -324,10 +327,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_router(state: AppState) -> Router {
     let features = state.config.features.clone();
     let invoice_sessions_enabled = features.invoices || features.payment_pages;
+    let pwa_dist_dir = state.config.pwa.dist_dir.clone();
 
     let mut router: Router<AppState> = Router::new()
-        .route("/api/v1/supported-currencies", get(pricer::supported_currencies))
+        .route(
+            "/api/v1/supported-currencies",
+            get(pricer::supported_currencies),
+        )
+        .route("/api/v1/rate", get(pricer::rate))
+        .nest_service(
+            "/pwa-assets",
+            ServeDir::new(pwa_dist_dir).precompressed_gzip(),
+        )
         .route("/robots.txt", get(invoice::robots_txt))
+        .route("/sw.js", get(donation_render::service_worker))
         .route("/qr.svg", get(qr::generate))
         // See docs/compatibility-ledger.md for webhook compatibility policy.
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
@@ -370,6 +383,7 @@ fn build_router(state: AppState) -> Router {
                 axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/donation-page/:nym", get(donation_page::get))
+            .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
             // Donation checkout now uses invoice sessions instead of the
             // removed donation callback/status endpoints.
             // Anonymous checkout invoice endpoints. The create route keeps a

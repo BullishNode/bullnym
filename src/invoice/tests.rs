@@ -362,6 +362,13 @@ fn api_tolerance_uses_configured_values() {
     assert_eq!(payment_tolerance_sat(&inv, tolerances), 42);
 }
 
+#[test]
+fn fiat_display_uses_zero_decimal_crc() {
+    assert_eq!(format_fiat_major(12_345, "CRC"), "12345 CRC");
+    assert_eq!(format_fiat_major(12_345, "COP"), "12345 COP");
+    assert_eq!(format_fiat_major(12_345, "USD"), "123.45 USD");
+}
+
 fn invoice_fixture() -> db::Invoice {
     db::Invoice {
         id: Uuid::nil(),

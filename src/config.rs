@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub pricer: PricerConfig,
     #[serde(default)]
+    pub pwa: PwaConfig,
+    #[serde(default)]
     pub donation: DonationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -299,6 +301,28 @@ fn default_pricer_supported_currencies() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+// --- PWA shell/static serving ---
+
+const DEFAULT_PWA_DIST_DIR: &str = "pwa/dist";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PwaConfig {
+    #[serde(default = "default_pwa_dist_dir")]
+    pub dist_dir: String,
+}
+
+impl Default for PwaConfig {
+    fn default() -> Self {
+        Self {
+            dist_dir: default_pwa_dist_dir(),
+        }
+    }
+}
+
+fn default_pwa_dist_dir() -> String {
+    DEFAULT_PWA_DIST_DIR.to_string()
 }
 
 // --- Donation page image pipeline ---

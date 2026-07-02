@@ -13,6 +13,7 @@ pub struct DonationPage {
     pub website: Option<String>,
     pub twitter: Option<String>,
     pub instagram: Option<String>,
+    pub pos_mode: bool,
     pub enabled: bool,
     /// Derived from `archived_at IS NOT NULL`. The full timestamp lives in
     /// the column for audit but isn't read into Rust (would require the
@@ -29,6 +30,7 @@ pub struct UpsertDonationPage<'a> {
     pub website: Option<&'a str>,
     pub twitter: Option<&'a str>,
     pub instagram: Option<&'a str>,
+    pub pos_mode: Option<bool>,
     pub enabled: bool,
 }
 
@@ -43,8 +45,8 @@ pub async fn upsert_donation_page(
     sqlx::query_as::<_, DonationPage>(
         "INSERT INTO donation_pages \
             (nym, ct_descriptor, header, description, display_currency, \
-             website, twitter, instagram, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             website, twitter, instagram, pos_mode, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, FALSE), $10) \
          ON CONFLICT (nym) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
@@ -53,12 +55,13 @@ pub async fn upsert_donation_page(
              website = EXCLUDED.website, \
              twitter = EXCLUDED.twitter, \
              instagram = EXCLUDED.instagram, \
+             pos_mode = COALESCE($9, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
              archived_at = NULL, \
              updated_at = now() \
          RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
-                   instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
+                   instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(page.nym)
     .bind(page.ct_descriptor)
@@ -68,6 +71,7 @@ pub async fn upsert_donation_page(
     .bind(page.website)
     .bind(page.twitter)
     .bind(page.instagram)
+    .bind(page.pos_mode)
     .bind(page.enabled)
     .fetch_one(pool)
     .await
@@ -85,7 +89,7 @@ pub async fn archive_donation_page(
          WHERE nym = $1 AND archived_at IS NULL \
          RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
-                   instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
+                   instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(nym)
     .fetch_optional(pool)
@@ -109,14 +113,14 @@ pub async fn update_donation_page_image_hash(
              WHERE nym = $1 \
              RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
-                       instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
+                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         "og_sha256" => {
             "UPDATE donation_pages SET og_sha256 = $2, updated_at = now() \
              WHERE nym = $1 \
              RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
-                       instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
+                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         _ => {
             return Err(sqlx::Error::Protocol(format!(
@@ -139,7 +143,7 @@ pub async fn get_donation_page_by_nym(
         "SELECT nym, header, description, avatar_sha256, og_sha256, \
                 ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
-                instagram, enabled, (archived_at IS NOT NULL) AS is_archived \
+                instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
          FROM donation_pages WHERE nym = $1",
     )
     .bind(nym)

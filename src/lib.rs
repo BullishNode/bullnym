@@ -39,4 +39,5 @@ pub struct AppState {
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub pricer: Arc<pricer::PricerClient>,
+    pub pwa_shells: Arc<donation_render::PwaShells>,
 }
