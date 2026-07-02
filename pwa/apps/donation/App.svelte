@@ -4,6 +4,17 @@
   // (AmountDisplay, Keypad, Button, PaymentScreen, SuccessScreen,
   // BullFooter) for the payer-initiated single-screen flow, matching the
   // visual language exactly.
+  //
+  // The entry screen structurally mirrors apps/pos/screens/KeypadScreen.svelte
+  // exactly (per design review): same h-[100dvh] overflow-hidden shell,
+  // same max-w-4xl outer / max-w-xl inner column widths (the narrower
+  // max-w-md this screen used before was why the Keypad rendered smaller
+  // than POS's — same component, narrower container), same gradient-pinned
+  // primary action at the bottom. Payment/success sub-screens instead
+  // mirror apps/pos/screens/PayScreen.svelte's plain scrollable
+  // min-h-screen shell, since POS keeps those as separate non-fixed-height
+  // views too (only the keypad itself is the fixed single-viewport shell).
+  import { Globe, Instagram, X } from 'lucide-svelte'
   import { config } from '$lib/config'
   import {
     createInvoice,
@@ -129,82 +140,133 @@
       ? formatFiat(paidStatus.fiat_amount_minor ?? minor, paidStatus.fiat_currency ?? currency, precision)
       : amountLabel,
   )
+  const hasSocialLinks = $derived(Boolean(config.website || config.twitter || config.instagram))
 </script>
 
-<main class="mx-auto flex min-h-[100dvh] max-w-md flex-col bg-[#f5f0e8] px-5 py-8 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
-  {#if screen === 'entry'}
-    <div class="flex flex-1 flex-col items-center gap-5">
-      <div class="flex flex-col items-center gap-2 text-center">
-        {#if config.avatar_url}
-          <img src={config.avatar_url} alt="" class="h-16 w-16 rounded-full object-cover" />
-        {/if}
-        <h1 class="font-display text-3xl uppercase tracking-display leading-none">{config.header || config.nym}</h1>
-        {#if config.description}
-          <p class="text-sm text-[#776b5a] dark:text-[#b9aa91]">{config.description}</p>
-        {/if}
-      </div>
-
-      <AmountDisplay amount={displayAmount} {currency} {precision} />
-
-      <Keypad {precision} onInput={applyInput} />
-
-      <select
-        class="min-h-12 rounded-md border border-[#d7c8b4] bg-[#fffaf0] px-3 font-bold dark:border-[#3a342a] dark:bg-[#211f1a]"
-        value={currency}
-        onchange={(e) => onCurrencyChange(e.currentTarget.value)}
-      >
-        {#each currencies as c (c.code)}
-          <option value={c.code}>{c.code}</option>
-        {/each}
-      </select>
-
-      <RateBar {precision} />
-
-      {#if errorMsg}
-        <p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
-      {/if}
-
-      <Button disabled={!canPay || creating} onclick={pay}>
-        {creating ? 'Preparing' : 'Pay'}
-      </Button>
-
-      {#if config.website || config.twitter || config.instagram}
-        <div class="mt-auto flex gap-5 text-xl">
-          {#if config.website}
-            <a href={config.website} target="_blank" rel="noopener noreferrer">🌐</a>
+{#if screen === 'entry'}
+  <main class="h-[100dvh] overflow-hidden bg-[#f5f0e8] text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
+    <div class="mx-auto flex h-[100dvh] max-w-4xl flex-col overflow-hidden">
+      <section class="flex min-h-0 flex-1 flex-col overflow-hidden px-5 py-3 sm:px-8 sm:py-5">
+        <header class="mb-3 flex shrink-0 flex-col items-center gap-2 text-center sm:mb-5">
+          {#if config.avatar_url}
+            <img src={config.avatar_url} alt="" class="h-14 w-14 rounded-full object-cover" />
           {/if}
-          {#if config.twitter}
-            <a href={`https://twitter.com/${config.twitter}`} target="_blank" rel="noopener noreferrer">𝕏</a>
+          <div>
+            <h1 class="font-display text-3xl uppercase tracking-display leading-none">
+              {config.header || config.nym}
+            </h1>
+            {#if config.description}
+              <p class="mt-0.5 text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
+                {config.description}
+              </p>
+            {/if}
+          </div>
+        </header>
+
+        <div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-center gap-3 overflow-hidden sm:gap-5">
+          <AmountDisplay amount={displayAmount} {currency} {precision} />
+
+          <Keypad {precision} onInput={applyInput} />
+
+          <select
+            class="min-h-12 shrink-0 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 font-bold outline-none focus:ring-2 focus:ring-[#B7000B] dark:border-[#3a342a] dark:bg-[#211f1a]"
+            value={currency}
+            onchange={(e) => onCurrencyChange(e.currentTarget.value)}
+          >
+            {#each currencies as c (c.code)}
+              <option value={c.code}>{c.code}</option>
+            {/each}
+          </select>
+
+          <RateBar {precision} />
+
+          {#if errorMsg}
+            <p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
           {/if}
-          {#if config.instagram}
-            <a href={`https://instagram.com/${config.instagram}`} target="_blank" rel="noopener noreferrer">📷</a>
+
+          {#if hasSocialLinks}
+            <div class="flex shrink-0 justify-center gap-2">
+              {#if config.website}
+                <a
+                  href={config.website}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Website"
+                  class="grid min-h-12 min-w-12 place-items-center rounded-md bg-[#eadfce] text-[#211f1a] dark:bg-[#2c2922] dark:text-[#fff6e8]"
+                >
+                  <Globe size={20} />
+                </a>
+              {/if}
+              {#if config.twitter}
+                <a
+                  href={`https://twitter.com/${config.twitter}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="X (Twitter)"
+                  class="grid min-h-12 min-w-12 place-items-center rounded-md bg-[#eadfce] text-[#211f1a] dark:bg-[#2c2922] dark:text-[#fff6e8]"
+                >
+                  <X size={20} />
+                </a>
+              {/if}
+              {#if config.instagram}
+                <a
+                  href={`https://instagram.com/${config.instagram}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Instagram"
+                  class="grid min-h-12 min-w-12 place-items-center rounded-md bg-[#eadfce] text-[#211f1a] dark:bg-[#2c2922] dark:text-[#fff6e8]"
+                >
+                  <Instagram size={20} />
+                </a>
+              {/if}
+            </div>
           {/if}
+
+          <BullFooter />
         </div>
-      {/if}
 
-      <BullFooter />
+        <div
+          class="mx-auto mt-2 flex w-full max-w-xl shrink-0 flex-col bg-gradient-to-t from-[#f5f0e8] from-60% to-transparent pb-[max(0.25rem,env(safe-area-inset-bottom))] pt-2 dark:from-[#161512]"
+        >
+          <Button disabled={!canPay || creating} onclick={pay}>
+            {creating ? 'Preparing' : 'Pay'}
+          </Button>
+        </div>
+      </section>
     </div>
-  {:else if screen === 'payment' && invoice}
-    <!-- PaymentScreen no longer renders its own back/cancel row (that was
-         causing a duplicated "Cancel sale" header on the POS pay screen,
-         which wraps its own header too) — each caller owns exactly one
-         header row now, matching nostr-pos's Pos.svelte. -->
-    <div class="flex w-full justify-start">
-      <button
-        type="button"
-        class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold"
-        onclick={onCancel}
-      >
-        ← Back
-      </button>
+  </main>
+{:else if screen === 'payment' && invoice}
+  <main class="min-h-screen bg-[#f5f0e8] text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
+    <div class="mx-auto grid min-h-screen max-w-4xl grid-rows-1">
+      <section class="px-5 py-5 sm:px-8">
+        <!-- PaymentScreen no longer renders its own back/cancel row (that
+             was causing a duplicated "Cancel sale" header on the POS pay
+             screen, which wraps its own header too) — each caller owns
+             exactly one header row now, matching nostr-pos's Pos.svelte. -->
+        <div class="mb-6 flex w-full justify-start">
+          <button
+            type="button"
+            class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold"
+            onclick={onCancel}
+          >
+            ← Back
+          </button>
+        </div>
+        <PaymentScreen {invoice} nym={config.nym} {amountLabel} {onPaid} {onExpired} />
+      </section>
     </div>
-    <PaymentScreen {invoice} nym={config.nym} {amountLabel} {onPaid} {onExpired} />
-  {:else if screen === 'success'}
-    <SuccessScreen
-      amountLabel={paidLabel}
-      rail={paidStatus?.paid_via ?? null}
-      actionLabel="Send another"
-      onaction={onDismissSuccess}
-    />
-  {/if}
-</main>
+  </main>
+{:else if screen === 'success'}
+  <main class="min-h-screen bg-[#f5f0e8] text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
+    <div class="mx-auto grid min-h-screen max-w-4xl grid-rows-1">
+      <section class="px-5 py-5 sm:px-8">
+        <SuccessScreen
+          amountLabel={paidLabel}
+          rail={paidStatus?.paid_via ?? null}
+          actionLabel="Send another"
+          onaction={onDismissSuccess}
+        />
+      </section>
+    </div>
+  </main>
+{/if}
