@@ -72,3 +72,32 @@ export function formatFiatAmount(amount: string | number, currency: string, prec
     return `${new Intl.NumberFormat(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)} ${currency}`
   }
 }
+
+/**
+ * Donation sat/BTC entry (review item 7): 'sat' and 'btc' are NOT ISO
+ * currency codes, so `Intl.NumberFormat({style:'currency', currency})`
+ * throws for them — formatFiatAmount above can never be used for a crypto
+ * unit. This is the dedicated crypto-format path for the entry amount
+ * string as the Keypad produces it (see lib/amount-input.ts): sat is a
+ * grouped integer, btc is echoed as typed (amount-input.ts already caps
+ * entry at 8 decimal places for a precision-8 unit) — no reformatting to a
+ * fixed 8dp, so "0.001" stays "0.001 BTC" rather than padding to
+ * "0.00100000 BTC".
+ */
+export function formatCryptoAmount(amount: string, unit: 'sat' | 'btc'): string {
+  if (unit === 'sat') {
+    return `${new Intl.NumberFormat().format(Math.trunc(Number(amount || '0')))} sat`
+  }
+  return `${amount || '0'} BTC`
+}
+
+/**
+ * Maps a donation entry amount (in the unit's own major denomination) to
+ * sats for the create-invoice request body. Mirrors
+ * templates/store_amount.html:210-215's unit branch exactly: sat rounds to
+ * the nearest whole sat (no fractional sat), btc multiplies by 1e8 then
+ * rounds.
+ */
+export function cryptoAmountSat(value: number, unit: 'sat' | 'btc'): number {
+  return unit === 'sat' ? Math.round(value) : Math.round(value * 1e8)
+}

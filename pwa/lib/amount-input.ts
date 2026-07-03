@@ -15,9 +15,19 @@
 // precision === 0. This '00' branch is the input-side half of that fix.
 
 const maxWholeDigits = 9
-const maxCentsDigits = 2
+const defaultMaxDecimalDigits = 2
 
-export function applyAmountInput(current: string, key: string): string {
+/**
+ * `maxDecimalDigits` defaults to 2 (fiat cents) for every existing caller.
+ * Added so the donation sat/BTC entry (review item 7,
+ * apps/donation/App.svelte) can pass 8 for a BTC unit — BTC amounts need up
+ * to 8 decimal places (1 sat = 0.00000001 BTC), which the old hardcoded cap
+ * of 2 made impossible to type. Sat entry never reaches the decimal branch
+ * at all (its Keypad shows '00', not '.' — see Keypad.svelte's
+ * precision-gated bottomLeft key), so this only actually changes behavior
+ * for the BTC unit.
+ */
+export function applyAmountInput(current: string, key: string, maxDecimalDigits = defaultMaxDecimalDigits): string {
   if (key === 'back') return current.slice(0, -1)
   if (key === '.') {
     if (current.includes('.')) return current
@@ -34,7 +44,7 @@ export function applyAmountInput(current: string, key: string): string {
 
   const [whole, cents] = current.split('.')
   if (cents !== undefined) {
-    if (cents.length >= maxCentsDigits) return current
+    if (cents.length >= maxDecimalDigits) return current
     return `${whole}.${cents}${key}`
   }
 

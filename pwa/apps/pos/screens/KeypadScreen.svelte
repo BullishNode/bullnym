@@ -14,7 +14,7 @@
   import { rate } from '$lib/stores/rate.svelte'
   import { settings } from '$lib/stores/settings.svelte'
   import { router } from '$lib/router.svelte'
-  import { cacheInvoice } from '$lib/stores/posInvoice'
+  import { cacheInvoice } from '$lib/stores/invoiceCache'
   import { applyAmountInput } from '$lib/amount-input'
   import Keypad from '$lib/components/Keypad.svelte'
   import AmountDisplay from '$lib/components/AmountDisplay.svelte'
@@ -65,6 +65,7 @@
         invoice: res,
         note,
         precision,
+        unit: 'fiat',
         fiatAmountMinor: minor,
         currency: settings.currency,
       })

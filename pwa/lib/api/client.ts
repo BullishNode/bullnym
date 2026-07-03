@@ -145,3 +145,16 @@ export function getInvoiceStatus(id: string): Promise<InvoiceStatus> {
 export function getSupportedCurrencies(): Promise<SupportedCurrenciesResponse> {
   return request('/api/v1/supported-currencies')
 }
+
+/**
+ * Requests (or re-requests) a fresh Lightning offer for an invoice. Used
+ * both for the initial offer (when the create response seeded lightning_pr
+ * as '', e.g. on deep-link reconstruction) and to replace an offer that
+ * expired mid-payment. On a non-payable/error invoice the server returns
+ * the LNURL error envelope, which request() already converts into a thrown
+ * ApiError — callers catch it (see PaymentScreen.svelte's throttled
+ * maybeRefreshLightning()).
+ */
+export function fetchLightningOffer(id: string): Promise<{ pr: string }> {
+  return request(`/api/v1/invoices/${id}/lightning`, { method: 'POST' })
+}
