@@ -83,6 +83,11 @@
   let currentLiquidAddress = $state<string | null>(untrack(() => invoice.liquid_address || null))
   let currentBitcoinAddress = $state<string | null>(untrack(() => invoice.bitcoin_chain_address))
   let currentBitcoinBip21 = $state<string | null>(untrack(() => invoice.bitcoin_chain_bip21))
+  // Tracked apart from currentBitcoinAddress (which merges chain + direct BTC
+  // for the QR): the chain-swap rail is payable regardless of accept_btc, so
+  // availableRails needs to know when the current bitcoin payload is a chain
+  // swap vs a direct address it must gate on accept_btc.
+  let currentBitcoinChainAddress = $state<string | null>(untrack(() => invoice.bitcoin_chain_address))
 
   const view = $derived<PayView>(latest ? derivePayView(latest) : { kind: 'waiting' })
   // Amount for payloads/Bolt Card. Deliberately NOT `?? invoice.amount_sat`
@@ -103,6 +108,7 @@
       liquidAddress: currentLiquidAddress,
       acceptBtc: latest?.accept_btc,
       bitcoinAddress: currentBitcoinAddress,
+      bitcoinChainAddress: currentBitcoinChainAddress,
     }),
   )
 
@@ -310,6 +316,9 @@
       const nextBitcoinAddress = status.bitcoin_chain_address ?? status.bitcoin_address
       if (nextBitcoinAddress && nextBitcoinAddress !== currentBitcoinAddress) {
         currentBitcoinAddress = nextBitcoinAddress
+      }
+      if (status.bitcoin_chain_address && status.bitcoin_chain_address !== currentBitcoinChainAddress) {
+        currentBitcoinChainAddress = status.bitcoin_chain_address
       }
       const nextBip21 = status.bitcoin_chain_bip21 ?? null
       if (nextBip21 !== currentBitcoinBip21) {

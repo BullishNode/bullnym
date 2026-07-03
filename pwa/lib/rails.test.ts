@@ -15,6 +15,7 @@ describe('availableRails', () => {
         liquidAddress: 'lq1...',
         acceptBtc: true,
         bitcoinAddress: 'bc1...',
+        bitcoinChainAddress: null,
       }),
     ).toEqual({ lightning: true, liquid: true, bitcoin: true })
   })
@@ -27,6 +28,7 @@ describe('availableRails', () => {
       liquidAddress: 'lq1...',
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
+      bitcoinChainAddress: null,
     })
     expect(result.liquid).toBe(false)
   })
@@ -39,6 +41,7 @@ describe('availableRails', () => {
       liquidAddress: null,
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
+      bitcoinChainAddress: null,
     })
     expect(result.liquid).toBe(false)
   })
@@ -51,6 +54,7 @@ describe('availableRails', () => {
       liquidAddress: 'lq1...',
       acceptBtc: true,
       bitcoinAddress: null,
+      bitcoinChainAddress: null,
     })
     expect(result.bitcoin).toBe(false)
   })
@@ -63,6 +67,7 @@ describe('availableRails', () => {
       liquidAddress: 'lq1...',
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
+      bitcoinChainAddress: null,
     })
     expect(result.lightning).toBe(false)
   })
@@ -75,10 +80,41 @@ describe('availableRails', () => {
       liquidAddress: 'lq1...',
       acceptBtc: undefined,
       bitcoinAddress: null,
+      bitcoinChainAddress: null,
     })
     // lightning/liquid have both "accepted" (defaulted) and a payload ->
     // available; bitcoin has no payload -> not available even though its
     // accept flag also defaults to true.
     expect(result).toEqual({ lightning: true, liquid: true, bitcoin: false })
+  })
+
+  it('chain-swap address keeps the bitcoin tab even when accept_btc=false', () => {
+    // The regression: a checkout invoice with direct BTC disabled
+    // (accept_btc=false) but a Liquid address gets a BTC->L-BTC chain-swap
+    // offer. The chain lockup address is payable and must not be gated on
+    // accept_btc, or the tab vanishes on the first poll.
+    const result = availableRails({
+      acceptLn: true,
+      lightningPr: 'lnbc1...',
+      acceptLiquid: true,
+      liquidAddress: 'lq1...',
+      acceptBtc: false,
+      bitcoinAddress: 'bc1qlockup...', // merged current address == chain address
+      bitcoinChainAddress: 'bc1qlockup...',
+    })
+    expect(result.bitcoin).toBe(true)
+  })
+
+  it('accept_btc=false with only a direct address (no chain swap) hides bitcoin', () => {
+    const result = availableRails({
+      acceptLn: true,
+      lightningPr: 'lnbc1...',
+      acceptLiquid: true,
+      liquidAddress: 'lq1...',
+      acceptBtc: false,
+      bitcoinAddress: 'bc1direct...',
+      bitcoinChainAddress: null,
+    })
+    expect(result.bitcoin).toBe(false)
   })
 })
