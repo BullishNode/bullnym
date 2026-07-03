@@ -462,7 +462,18 @@ fn build_router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(pwa_assets_vary_accept_encoding))
         .with_state(state)
+}
+
+async fn pwa_assets_vary_accept_encoding(req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    if resp.status().is_success() && path.starts_with("/pwa-assets/") {
+        resp.headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    resp
 }
 
 async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
