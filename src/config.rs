@@ -297,7 +297,7 @@ fn default_pricer_request_timeout_ms() -> u64 {
     DEFAULT_PRICER_REQUEST_TIMEOUT_MS
 }
 fn default_pricer_supported_currencies() -> Vec<String> {
-    ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"]
+    ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP"]
         .into_iter()
         .map(str::to_string)
         .collect()
