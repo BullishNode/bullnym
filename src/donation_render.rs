@@ -363,37 +363,36 @@ fn inject_pwa_shell(
         ))
 }
 
-async fn check_donation_html_rate_limit(
-    state: &AppState,
-    peer_opt: Option<ConnectInfo<SocketAddr>>,
-    headers: &HeaderMap,
-) -> Result<(), Response> {
-    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
-    if let Some(ip) = ip {
-        if !state.ip_whitelist.contains(ip) {
-            if let Err(e) = state.rate_limiter.check_donation_html_per_source(ip).await {
-                return Err(e.into_response());
-            }
-        }
-    }
-    Ok(())
+/// Which per-source bucket a public donation-surface GET bills against.
+/// Manifest fetches are kept separate from HTML so a normal page load +
+/// install-metadata fetch doesn't double-bill the scraping budget.
+enum DonationRateBucket {
+    Html,
+    Manifest,
 }
 
-async fn check_donation_manifest_rate_limit(
+async fn check_donation_rate_limit(
     state: &AppState,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: &HeaderMap,
+    bucket: DonationRateBucket,
 ) -> Result<(), Response> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
     if let Some(ip) = ip {
         if !state.ip_whitelist.contains(ip) {
-            if let Err(e) = state
-                .rate_limiter
-                .check_donation_manifest_per_source(ip)
-                .await
-            {
+            let checked = match bucket {
+                DonationRateBucket::Html => {
+                    state.rate_limiter.check_donation_html_per_source(ip).await
+                }
+                DonationRateBucket::Manifest => {
+                    state
+                        .rate_limiter
+                        .check_donation_manifest_per_source(ip)
+                        .await
+                }
+            };
+            if let Err(e) = checked {
                 return Err(e.into_response());
             }
         }
@@ -434,7 +433,9 @@ pub async fn manifest(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if let Err(resp) = check_donation_manifest_rate_limit(&state, peer_opt, &headers).await {
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Manifest).await
+    {
         return resp;
     }
 
@@ -574,7 +575,9 @@ pub async fn render_or_404(
     }
 
     // Per-source rate-limit. Volumetric scraping protection.
-    if let Err(resp) = check_donation_html_rate_limit(&state, peer_opt, &headers).await {
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Html).await
+    {
         return resp;
     }
 

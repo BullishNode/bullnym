@@ -14,7 +14,9 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // activate, the v1 pages cache is no longer in `keep` and gets deleted.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
 const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-DpsE19QE.js","/pwa-assets/assets/pos-B_YFRIjm.js","/pwa-assets/assets/PayFlow-BtqbssM-.js"]
-const PRECACHE_URL_SET = new Set(PRECACHE_URLS)
+// Synthetic cache entry recording the PREVIOUS deploy's precache list. Never
+// requested by a page (not under /pwa-assets/), so no fetch handler serves it.
+const PREV_PRECACHE_SENTINEL = '/__bullnym/prev-precache'
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -35,28 +37,46 @@ self.addEventListener('activate', (event) => {
     caches
       .keys()
       .then((keys) => Promise.all(keys.filter((k) => !keep.has(k)).map((k) => caches.delete(k))))
-      .then(() => pruneStaleHashedAssets())
+      // Prune is best-effort: a rejection (quota pressure, storage errors)
+      // must never abort clients.claim(), or open tabs stay pinned to the
+      // outdated worker until the app is force-closed.
+      .then(() => pruneStaleHashedAssets().catch(() => {}))
       .then(() => self.clients.claim()),
   )
 })
 
 async function pruneStaleHashedAssets() {
+  // An uninjected/stale sw.js ships the raw empty placeholder array, and
+  // `[].every(Boolean)` is vacuously true — without this guard a malformed
+  // deploy would pass the completeness gate and wipe the entire asset cache.
+  if (PRECACHE_URLS.length === 0) return
+
   const cache = await caches.open(CACHE_VERSION)
-  const precacheComplete = await Promise.all(PRECACHE_URLS.map((url) => cache.match(url))).then((matches) =>
-    matches.every(Boolean),
-  )
-  if (!precacheComplete) return
+  const matches = await Promise.all(PRECACHE_URLS.map((url) => cache.match(url)))
+  if (!matches.every(Boolean)) return
+
+  // Keep the current AND previous generation of hashed assets. skipWaiting()
+  // hands this SW tabs still running the previous deploy's shell, and
+  // deploy.sh replaces dist wholesale — so pruning down to only the current
+  // precache would 404 that live tab's next lazy chunk import mid-session.
+  // Two generations bounds cache growth without breaking open sessions.
+  const prev = await cache
+    .match(PREV_PRECACHE_SENTINEL)
+    .then((res) => (res ? res.json() : []))
+    .catch(() => [])
+  const keep = new Set([...PRECACHE_URLS, ...prev])
 
   const keys = await cache.keys()
   await Promise.all(
     keys.map((req) => {
       const url = new URL(req.url)
-      if (url.pathname.startsWith('/pwa-assets/assets/') && !PRECACHE_URL_SET.has(url.pathname)) {
+      if (url.pathname.startsWith('/pwa-assets/assets/') && !keep.has(url.pathname)) {
         return cache.delete(req)
       }
       return undefined
     }),
   )
+  await cache.put(PREV_PRECACHE_SENTINEL, new Response(JSON.stringify(PRECACHE_URLS)))
 }
 
 self.addEventListener('fetch', (event) => {

@@ -14,6 +14,11 @@
 # already gates these and these zones only catch volumetric noise.
 limit_req_zone $binary_remote_addr zone=donation_html:10m rate=2r/s;
 limit_req_zone $binary_remote_addr zone=donation_api:10m rate=5r/s;
+# Generous per-IP backstop for PWA statics + sw.js. These must NOT share
+# donation_html (a cold install fetches ~15 files near-simultaneously), but
+# leaving them unlimited invites volumetric disk-I/O abuse — sw.js is a
+# per-request filesystem read in Rust.
+limit_req_zone $binary_remote_addr zone=pwa_static:10m rate=30r/s;
 
 server {
     # ... existing TLS / server_name config ...
@@ -45,6 +50,7 @@ server {
     # install can fetch many hashed files in parallel. Rust is the source of
     # truth for PWA cache headers and precompressed gzip.
     location ^~ /pwa-assets/ {
+        limit_req zone=pwa_static burst=60 nodelay;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -55,6 +61,7 @@ server {
     # Root-scoped service worker. Served no-cache by Rust so byte-diff updates
     # converge terminals on the next navigation.
     location = /sw.js {
+        limit_req zone=pwa_static burst=60 nodelay;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
