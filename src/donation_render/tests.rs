@@ -1,5 +1,15 @@
 use super::*;
 
+fn injected_config_json(html: &str) -> serde_json::Value {
+    let (_, after_open) = html
+        .split_once(r#"<script id="bullnym-config" type="application/json">"#)
+        .expect("config script opens");
+    let (json, _) = after_open
+        .split_once("</script>")
+        .expect("config script closes");
+    serde_json::from_str(json).expect("config json parses")
+}
+
 #[test]
 fn slug_accepts_simple() {
     assert!(is_valid_slug("alice"));
@@ -169,6 +179,7 @@ fn pwa_shell_injects_config_and_og_placeholders() {
         instagram: None,
         minor_per_btc: 1_000_000_000,
         last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
         domain: "bullpay.ca",
     };
 
@@ -180,6 +191,11 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     .expect("injects shell");
 
     assert!(html.contains(r#"<script id="bullnym-config" type="application/json">"#));
+    let config_json = injected_config_json(&html);
+    assert_eq!(
+        config_json["liquid_btc_asset_id"],
+        "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+    );
     assert!(html.contains(r#"<link rel="manifest" href="/alice/manifest.webmanifest">"#));
     assert!(html.contains(r#""mode":"pos""#));
     assert!(html.contains(r#""avatar_url":"https://bullpay.ca/img/alice/avatar.webp""#));
@@ -208,6 +224,7 @@ fn pwa_shell_escapes_manifest_nym_attr() {
         instagram: None,
         minor_per_btc: 0,
         last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
         domain: "bullpay.ca",
     };
 
@@ -231,6 +248,7 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         instagram: None,
         minor_per_btc: 0,
         last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
         domain: "bullpay.ca",
     };
 
@@ -276,4 +294,39 @@ async fn pwa_shell_missing_file_falls_back_to_askama_path() {
     let shells = PwaShells::default();
 
     assert!(shells.shell_for(false).await.is_none());
+}
+
+#[test]
+fn pwa_shell_header_marks_donation_shells_only_when_requested() {
+    let mut resp = StatusCode::OK.into_response();
+
+    apply_security_headers(&mut resp, false);
+    assert!(!resp.headers().contains_key(PWA_SHELL_HEADER));
+
+    mark_pwa_shell_response(&mut resp, false);
+
+    assert_eq!(
+        resp.headers()
+            .get(PWA_SHELL_HEADER)
+            .expect("pwa shell header")
+            .to_str()
+            .expect("valid header value"),
+        "donation"
+    );
+}
+
+#[test]
+fn pwa_shell_header_marks_pos_shells() {
+    let mut resp = StatusCode::OK.into_response();
+
+    mark_pwa_shell_response(&mut resp, true);
+
+    assert_eq!(
+        resp.headers()
+            .get(PWA_SHELL_HEADER)
+            .expect("pwa shell header")
+            .to_str()
+            .expect("valid header value"),
+        "pos"
+    );
 }

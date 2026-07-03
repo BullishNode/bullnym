@@ -8,7 +8,11 @@
 // both entry points. This file as committed has an empty array — a real
 // build always overwrites this line in dist/sw.js.
 const CACHE_VERSION = 'bullnym-shell-v1'
-const PAGES_CACHE_VERSION = 'bullnym-pages-v1'
+// Bumped v1 -> v2 to purge any invoice/private pages the previous, overly
+// broad navigation cache may have stored (review item 8): the old SW cached
+// EVERY successful navigation, including /invoice/:id and /:nym/i/:id. On
+// activate, the v1 pages cache is no longer in `keep` and gets deleted.
+const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
 const PRECACHE_URLS = /*BULLNYM_PRECACHE_URLS*/ [] /*END_BULLNYM_PRECACHE_URLS*/
 
 self.addEventListener('install', (event) => {
@@ -53,7 +57,13 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       fetch(req)
         .then((res) => {
-          if (res.ok) {
+          // Only cache installable PWA shell navigations. The server marks
+          // exactly those responses with `x-bullnym-pwa-shell` (pos|donation)
+          // — see src/donation_render.rs. Private/one-off pages like
+          // /invoice/:id and /:nym/i/:id are served WITHOUT the header and
+          // must never be persisted offline (review item 8). Header-marker
+          // gating is robust to URL shape (no path heuristics to keep in sync).
+          if (res.ok && res.headers.get('x-bullnym-pwa-shell')) {
             const copy = res.clone()
             caches.open(PAGES_CACHE_VERSION).then((cache) => cache.put(req, copy))
           }

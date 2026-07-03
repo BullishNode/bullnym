@@ -84,6 +84,13 @@ fn npub_log_tag_truncates() {
 }
 
 #[test]
+fn invoice_html_response_does_not_mark_pwa_shell() {
+    let resp = html_response("<!doctype html><title>invoice</title>".to_string());
+
+    assert!(!resp.headers().contains_key("x-bullnym-pwa-shell"));
+}
+
+#[test]
 fn bolt11_reusable_check_uses_embedded_expiry() {
     // BOLT11 test vector timestamp is 1496314658 with default 3600s
     // expiry. The helper must reuse it before expiry and reject it

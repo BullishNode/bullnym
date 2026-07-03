@@ -81,6 +81,7 @@ struct PwaConfigView<'a> {
     instagram: Option<&'a str>,
     minor_per_btc: i64,
     last_known_rate: bool,
+    liquid_btc_asset_id: &'a str,
     domain: &'a str,
 }
 
@@ -173,7 +174,7 @@ const DONATION_CSP: &str = "default-src 'self'; \
              img-src 'self' data:; \
              script-src 'self' 'unsafe-inline'; \
              style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' wss://liquid.network; \
+             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com; \
              frame-ancestors 'none'; \
              base-uri 'none'";
 
@@ -181,9 +182,10 @@ const POS_CSP: &str = "default-src 'self'; \
              img-src 'self' data:; \
              script-src 'self' 'unsafe-inline'; \
              style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' https: wss://liquid.network; \
+             connect-src 'self' https: wss://liquid.network wss://liquid.bullbitcoin.com; \
              frame-ancestors 'none'; \
              base-uri 'none'";
+const PWA_SHELL_HEADER: &str = "x-bullnym-pwa-shell";
 
 /// Add a few defensive response headers that apply to all donation-page
 /// HTML responses.
@@ -224,6 +226,12 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=60"),
     );
+}
+
+fn mark_pwa_shell_response(resp: &mut Response, pos_mode: bool) {
+    let value = if pos_mode { "pos" } else { "donation" };
+    resp.headers_mut()
+        .insert(PWA_SHELL_HEADER, HeaderValue::from_static(value));
 }
 
 fn render_404(state: &AppState, nym: &str) -> Response {
@@ -469,12 +477,14 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
             instagram: page.instagram.as_deref(),
             minor_per_btc,
             last_known_rate,
+            liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
             domain,
         };
         let body = inject_pwa_shell(&shell, &config, og_url.as_deref())
             .unwrap_or_else(|e| format!("template render failed: {e}"));
         let mut resp = (StatusCode::OK, body).into_response();
         apply_security_headers(&mut resp, page.pos_mode);
+        mark_pwa_shell_response(&mut resp, page.pos_mode);
         return resp;
     }
 
