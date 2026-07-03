@@ -21,7 +21,9 @@
 <div
   class={`text-center text-xs ${rate.available && rate.amber ? 'text-[#a9362f] dark:text-[#e8a49e]' : 'text-[#776b5a] dark:text-[#b9aa91]'}`}
 >
-  {#if !rate.available}
+  {#if rate.loading}
+    Updating rate…
+  {:else if !rate.available}
     rate unavailable
   {:else}
     Rate: {formatRate(rate.minorPerBtc, rate.currency, precision)} (updated {ageLabel})

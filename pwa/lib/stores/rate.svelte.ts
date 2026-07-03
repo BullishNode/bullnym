@@ -15,6 +15,12 @@ const state = $state({
   minorPerBtc: config.minor_per_btc,
   fetchedAt: Date.now(),
   lastKnown: config.last_known_rate,
+  // True only during the fetch triggered by a currency switch (which zeroes
+  // minorPerBtc). Lets consumers show a same-height "updating" state instead
+  // of the taller "unavailable" block, so switching currency doesn't reflow
+  // the centered entry stack. The 60s interval refresh keeps the current
+  // rate visible and never sets this.
+  loading: false,
   // ticks so `ageMs` getters re-evaluate in templates
   now: Date.now(),
 })
@@ -31,6 +37,8 @@ async function refresh(): Promise<void> {
     }
   } catch {
     /* offline: existing rate ages out naturally */
+  } finally {
+    state.loading = false
   }
 }
 
@@ -47,7 +55,11 @@ export const rate = {
     if (c === state.currency) return
     state.currency = c
     state.minorPerBtc = 0
+    state.loading = true
     void refresh()
+  },
+  get loading(): boolean {
+    return state.loading
   },
   get minorPerBtc(): number {
     return state.minorPerBtc

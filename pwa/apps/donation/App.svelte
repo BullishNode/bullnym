@@ -202,7 +202,7 @@
             </select>
 
             <RateBar precision={ratePrecision} />
-            {#if !rate.available}
+            {#if !rate.available && !rate.loading}
               <p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
                 Rate unavailable — you can still pay in sat or BTC
               </p>
