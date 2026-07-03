@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use super::mark_user_used;
 
+pub const CLAIM_IN_FLIGHT_LEASE: &str = "2 minutes";
+
 // --- Swap status enum ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,9 +476,17 @@ pub async fn list_non_terminal_swaps_oldest_first(
 }
 
 /// Schedule an immediate retry from the reconciler. Sets
-/// `next_claim_attempt_at = NOW()` so the next sweep tick (≤30s) picks
+/// `next_claim_attempt_at = NOW()` so the next sweep tick (<=30s) picks
 /// up the row. Forward-only: terminal-state guard prevents the
 /// reconciler from "un-finishing" a row that completed concurrently.
+///
+/// A row in `claiming` may own an in-flight broadcast lease in
+/// `next_claim_attempt_at`; do not collapse a future lease back to NOW or
+/// webhook/reconciler races can generate duplicate broadcasts and false
+/// failure records. Clamp longer future backoffs to the lease horizon so
+/// stale failures are still nudged without entering the active broadcast
+/// window. If the timestamp is already due, the row is idle and can be
+/// nudged immediately.
 ///
 /// Does not change `status`. Used when the reconciler observes that
 /// Boltz still considers the swap claimable but our row hasn't been
@@ -485,11 +495,17 @@ pub async fn list_non_terminal_swaps_oldest_first(
 pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE swap_records \
-         SET next_claim_attempt_at = NOW(), updated_at = NOW() \
+         SET next_claim_attempt_at = CASE \
+                 WHEN status = 'claiming' AND next_claim_attempt_at > NOW() \
+                     THEN LEAST(next_claim_attempt_at, NOW() + $2::interval) \
+                 ELSE NOW() \
+             END, \
+             updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(id)
+    .bind(CLAIM_IN_FLIGHT_LEASE)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -500,16 +516,23 @@ pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sq
 /// immediate retry so the next sweep tick takes the script path.
 /// Single transaction for atomicity — the operator is never confused
 /// by "cooperative_refused but not scheduled" or vice versa.
+/// Preserves an active `claiming` lease the same way
+/// `schedule_immediate_claim` does.
 pub async fn schedule_script_path_retry(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE swap_records \
          SET cooperative_refused = TRUE, \
-             next_claim_attempt_at = NOW(), \
+             next_claim_attempt_at = CASE \
+                 WHEN status = 'claiming' AND next_claim_attempt_at > NOW() \
+                     THEN LEAST(next_claim_attempt_at, NOW() + $2::interval) \
+                 ELSE NOW() \
+             END, \
              updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(id)
+    .bind(CLAIM_IN_FLIGHT_LEASE)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

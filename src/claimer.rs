@@ -743,6 +743,7 @@ async fn resolve_claim_address(
 ///   4. If `claim_tx_hex` is set, deserialize it. Otherwise
 ///      `construct_claim` and persist `(claim_tx_hex, claim_txid,
 ///      claim_path)` in the same transaction. Mark status `claiming`.
+///      Set a short in-flight lease in `next_claim_attempt_at`.
 ///   5. Commit (releases the advisory lock).
 ///   6. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
 ///      I/O-bound step and we don't want to hold a DB connection.
@@ -935,15 +936,19 @@ async fn claim_swap_inner(
         constructed
     };
 
-    // Status → Claiming. Forward-only guard prevents regression from
-    // any terminal state.
+    // Status -> Claiming. The retry timestamp doubles as an in-flight
+    // lease: webhook/reconciler/background races must wait for this
+    // deadline before rebroadcasting the persisted transaction.
     sqlx::query(
         "UPDATE swap_records \
-         SET status = 'claiming', updated_at = NOW() \
+         SET status = 'claiming', \
+             next_claim_attempt_at = NOW() + $2::interval, \
+             updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(swap.id)
+    .bind(db::CLAIM_IN_FLIGHT_LEASE)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1227,11 +1232,14 @@ async fn claim_chain_swap_inner(
 
     sqlx::query(
         "UPDATE chain_swap_records \
-         SET status = 'claiming', updated_at = NOW() \
+         SET status = 'claiming', \
+             next_claim_attempt_at = NOW() + $2::interval, \
+             updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
     )
     .bind(swap.id)
+    .bind(db::CLAIM_IN_FLIGHT_LEASE)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;

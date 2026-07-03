@@ -48,7 +48,7 @@ fn boltz_confirmed_mempool_advances() {
 }
 
 #[test]
-fn boltz_mempool_already_claiming_schedules_retry() {
+fn boltz_mempool_claimable_status_schedules_retry() {
     for our in &["claiming", "claim_failed", "lockup_confirmed"] {
         let swap = fixture(our);
         assert_eq!(
