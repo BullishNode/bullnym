@@ -3,6 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte'
 import tailwindcss from '@tailwindcss/vite'
 import { resolve } from 'node:path'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { gzipSync } from 'node:zlib'
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')) as { version: string }
 
@@ -11,23 +12,45 @@ const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')
 // is a small inline plugin, not a Workbox integration — the brief
 // explicitly prefers a single self-contained sw.js over extra chunks.
 function bullnymServiceWorkerPrecache(): Plugin {
+  let distDir = resolve(__dirname, 'dist')
   return {
     name: 'bullnym-sw-precache',
     apply: 'build',
+    configResolved(config) {
+      distDir = resolve(__dirname, config.build.outDir)
+    },
     writeBundle(_options, bundle) {
       const assetUrls = Object.keys(bundle)
         .filter((fileName) => fileName.startsWith('assets/'))
         .map((fileName) => `/pwa-assets/${fileName}`)
 
-      const swPath = resolve(__dirname, 'dist/sw.js')
-      if (!existsSync(swPath)) return
+      const swPath = resolve(distDir, 'sw.js')
+      if (!existsSync(swPath)) {
+        throw new Error('dist/sw.js was not emitted; cannot inject PWA precache')
+      }
 
       const content = readFileSync(swPath, 'utf-8')
       const patched = content.replace(
         /\/\*BULLNYM_PRECACHE_URLS\*\/\s*\[\]\s*\/\*END_BULLNYM_PRECACHE_URLS\*\//,
         JSON.stringify(assetUrls),
       )
+      if (patched === content) {
+        throw new Error('PWA precache marker was not found in dist/sw.js')
+      }
       writeFileSync(swPath, patched)
+
+      const gzipPaths = [
+        ...Object.keys(bundle)
+          .filter((fileName) => fileName.startsWith('assets/'))
+          .map((fileName) => resolve(distDir, fileName)),
+        swPath,
+      ]
+      for (const path of gzipPaths) {
+        if (!existsSync(path)) {
+          throw new Error(`Cannot gzip missing build output: ${path}`)
+        }
+        writeFileSync(`${path}.gz`, gzipSync(readFileSync(path), { level: 9 }))
+      }
     },
   }
 }

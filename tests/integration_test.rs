@@ -581,13 +581,19 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
     assert_eq!(body["start_url"], "/manifestnym");
     assert_eq!(body["scope"], "/");
     assert_eq!(body["display"], "standalone");
-    assert_eq!(body["background_color"], "#0E0E0E");
-    assert_eq!(body["theme_color"], "#0E0E0E");
+    assert_eq!(body["background_color"], "#161512");
+    assert_eq!(body["theme_color"], "#161512");
+    assert_eq!(body["icons"].as_array().expect("icons array").len(), 4);
     assert_eq!(body["icons"][0]["src"], "/pwa-assets/icons/icon-192.png");
     assert_eq!(body["icons"][0]["sizes"], "192x192");
     assert_eq!(body["icons"][0]["type"], "image/png");
-    assert_eq!(body["icons"][0]["purpose"], "any maskable");
-    assert_eq!(body["icons"][1]["src"], "/pwa-assets/icons/icon-512.png");
+    assert_eq!(body["icons"][0]["purpose"], "any");
+    assert_eq!(body["icons"][1]["src"], "/pwa-assets/icons/icon-192.png");
+    assert_eq!(body["icons"][1]["purpose"], "maskable");
+    assert_eq!(body["icons"][2]["src"], "/pwa-assets/icons/icon-512.png");
+    assert_eq!(body["icons"][2]["purpose"], "any");
+    assert_eq!(body["icons"][3]["src"], "/pwa-assets/icons/icon-512.png");
+    assert_eq!(body["icons"][3]["purpose"], "maskable");
 
     cleanup_db(&pool).await;
 }

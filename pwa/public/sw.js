@@ -14,6 +14,7 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // activate, the v1 pages cache is no longer in `keep` and gets deleted.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
 const PRECACHE_URLS = /*BULLNYM_PRECACHE_URLS*/ [] /*END_BULLNYM_PRECACHE_URLS*/
+const PRECACHE_URL_SET = new Set(PRECACHE_URLS)
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -34,9 +35,29 @@ self.addEventListener('activate', (event) => {
     caches
       .keys()
       .then((keys) => Promise.all(keys.filter((k) => !keep.has(k)).map((k) => caches.delete(k))))
+      .then(() => pruneStaleHashedAssets())
       .then(() => self.clients.claim()),
   )
 })
+
+async function pruneStaleHashedAssets() {
+  const cache = await caches.open(CACHE_VERSION)
+  const precacheComplete = await Promise.all(PRECACHE_URLS.map((url) => cache.match(url))).then((matches) =>
+    matches.every(Boolean),
+  )
+  if (!precacheComplete) return
+
+  const keys = await cache.keys()
+  await Promise.all(
+    keys.map((req) => {
+      const url = new URL(req.url)
+      if (url.pathname.startsWith('/pwa-assets/assets/') && !PRECACHE_URL_SET.has(url.pathname)) {
+        return cache.delete(req)
+      }
+      return undefined
+    }),
+  )
+}
 
 self.addEventListener('fetch', (event) => {
   const req = event.request
@@ -69,7 +90,14 @@ self.addEventListener('fetch', (event) => {
           }
           return res
         })
-        .catch(() => caches.match(req).then((cached) => cached || Promise.reject(new Error('offline, no cached page')))),
+        .catch(() =>
+          // Shell query params are non-semantic in production. The old
+          // ?nym= dev-only fallback is ignored in production builds, so
+          // offline navigation can match the installed shell by path.
+          caches
+            .match(req, { ignoreSearch: true })
+            .then((cached) => cached || Promise.reject(new Error('offline, no cached page'))),
+        ),
     )
     return
   }
@@ -85,7 +113,9 @@ self.addEventListener('fetch', (event) => {
   }
 
   // App shell assets: cache-first, falling back to network and warming
-  // the cache with anything not already precached.
+  // the cache with anything not already precached. Root-level font/logo/icon
+  // assets are treated as immutable: if one ever changes, ship it under a
+  // new filename. Installed terminals won't otherwise refresh unhashed names.
   if (url.pathname.startsWith('/pwa-assets/')) {
     event.respondWith(
       caches.match(req).then((cached) => {

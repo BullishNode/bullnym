@@ -51,9 +51,11 @@ export function parseConfig(): BullnymConfig {
   if (!el?.textContent) {
     // Dev server: allow ?nym= override so `npm run dev` works against a
     // live backend without the injected block.
-    const params = new URLSearchParams(location.search)
-    const nym = params.get('nym')
-    if (nym) return { ...FALLBACK, nym, header: nym }
+    if (import.meta.env.DEV) {
+      const params = new URLSearchParams(location.search)
+      const nym = params.get('nym')
+      if (nym) return { ...FALLBACK, nym, header: nym }
+    }
     return FALLBACK
   }
   try {

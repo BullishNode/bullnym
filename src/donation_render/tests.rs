@@ -135,7 +135,13 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
     assert_eq!(manifest.name, "manifestnym");
     assert_eq!(manifest.short_name, "manifestnym");
     assert_eq!(manifest.start_url, "/manifestnym");
-    assert_eq!(manifest.icons[0].purpose, "any maskable");
+    assert_eq!(manifest.background_color, "#161512");
+    assert_eq!(manifest.theme_color, "#161512");
+    assert_eq!(manifest.icons.len(), 4);
+    assert_eq!(manifest.icons[0].purpose, "any");
+    assert_eq!(manifest.icons[1].purpose, "maskable");
+    assert_eq!(manifest.icons[2].purpose, "any");
+    assert_eq!(manifest.icons[3].purpose, "maskable");
 }
 
 #[test]

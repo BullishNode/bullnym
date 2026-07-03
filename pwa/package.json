@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "check:dist": "bash scripts/check-dist.sh",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run"
   },

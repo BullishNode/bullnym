@@ -94,7 +94,7 @@ struct WebManifest<'a> {
     display: &'static str,
     background_color: &'static str,
     theme_color: &'static str,
-    icons: [WebManifestIcon<'a>; 2],
+    icons: [WebManifestIcon<'a>; 4],
 }
 
 #[derive(Serialize)]
@@ -293,20 +293,32 @@ fn web_manifest_for_page(page: &db::DonationPage) -> WebManifest<'_> {
         start_url: format!("/{}", page.nym),
         scope: "/",
         display: "standalone",
-        background_color: "#0E0E0E",
-        theme_color: "#0E0E0E",
+        background_color: "#161512",
+        theme_color: "#161512",
         icons: [
             WebManifestIcon {
                 src: "/pwa-assets/icons/icon-192.png",
                 sizes: "192x192",
                 content_type: "image/png",
-                purpose: "any maskable",
+                purpose: "any",
+            },
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-192.png",
+                sizes: "192x192",
+                content_type: "image/png",
+                purpose: "maskable",
             },
             WebManifestIcon {
                 src: "/pwa-assets/icons/icon-512.png",
                 sizes: "512x512",
                 content_type: "image/png",
-                purpose: "any maskable",
+                purpose: "any",
+            },
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-512.png",
+                sizes: "512x512",
+                content_type: "image/png",
+                purpose: "maskable",
             },
         ],
     }
@@ -368,6 +380,27 @@ async fn check_donation_html_rate_limit(
     Ok(())
 }
 
+async fn check_donation_manifest_rate_limit(
+    state: &AppState,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
+    if let Some(ip) = ip {
+        if !state.ip_whitelist.contains(ip) {
+            if let Err(e) = state
+                .rate_limiter
+                .check_donation_manifest_per_source(ip)
+                .await
+            {
+                return Err(e.into_response());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn service_worker(State(state): State<AppState>) -> Response {
     let path = Path::new(&state.config.pwa.dist_dir).join("sw.js");
     let bytes = match tokio::fs::read(path).await {
@@ -401,7 +434,7 @@ pub async fn manifest(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if let Err(resp) = check_donation_html_rate_limit(&state, peer_opt, &headers).await {
+    if let Err(resp) = check_donation_manifest_rate_limit(&state, peer_opt, &headers).await {
         return resp;
     }
 

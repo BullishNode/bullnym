@@ -2,6 +2,10 @@
 # bullnym deploy: git pull → build → install. Run as debian on the prod VM.
 #   ./deploy.sh           full deploy (pull, cargo build, binary + PWA + migrations check, restart)
 #   ./deploy.sh --pwa     PWA-only (pull, copy dist; no build, no restart — shells are read per-request)
+# Pre-push gate: run `cd pwa && npm run check:dist`. This script deploys the
+# committed dist only; it does not rebuild the PWA on the VM. nginx changes
+# from docs/nginx-bullpay.conf.snippet are applied manually with nginx -T,
+# nginx -t, then reload.
 set -euo pipefail
 
 REPO=$HOME/src/bullnym

@@ -712,6 +712,13 @@ pub struct RateLimitConfig {
     pub donation_html_rate_limit: u32,
     #[serde(default = "default_donation_html_rate_window_secs")]
     pub donation_html_rate_window_secs: u32,
+    /// Per-source rate-limit on `GET /<nym>/manifest.webmanifest`.
+    /// Kept separate from HTML so install metadata fetches don't double-bill
+    /// normal page loads.
+    #[serde(default = "default_donation_manifest_rate_limit")]
+    pub donation_manifest_rate_limit: u32,
+    #[serde(default = "default_donation_manifest_rate_window_secs")]
+    pub donation_manifest_rate_window_secs: u32,
 
     // --- Donation page image upload ---
     /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
@@ -788,6 +795,8 @@ impl Default for RateLimitConfig {
             lightning_per_source_window_secs: default_lightning_per_source_window_secs(),
             donation_html_rate_limit: default_donation_html_rate_limit(),
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
+            donation_manifest_rate_limit: default_donation_manifest_rate_limit(),
+            donation_manifest_rate_window_secs: default_donation_manifest_rate_window_secs(),
             donation_image_uploads_per_npub_per_hour:
                 default_donation_image_uploads_per_npub_per_hour(),
             donation_image_uploads_per_source_per_min:
@@ -945,6 +954,12 @@ fn default_donation_html_rate_limit() -> u32 {
 }
 fn default_donation_html_rate_window_secs() -> u32 {
     60
+}
+fn default_donation_manifest_rate_limit() -> u32 {
+    default_donation_html_rate_limit()
+}
+fn default_donation_manifest_rate_window_secs() -> u32 {
+    default_donation_html_rate_window_secs()
 }
 /// 6/h per npub: a real user uploads avatar + OG once per setup; six is
 /// generous headroom for retries and accidental re-uploads.

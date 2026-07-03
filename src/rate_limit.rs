@@ -276,6 +276,19 @@ impl RateLimiter {
         )
     }
 
+    /// Per-source rate-limit on `GET /<nym>/manifest.webmanifest`.
+    /// Separate from donation HTML so a browser's manifest fetch doesn't
+    /// spend the page-render budget for the same user.
+    pub async fn check_donation_manifest_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("donation_manifest:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.donation_manifest_rate_limit,
+            self.cfg.donation_manifest_rate_window_secs,
+            AppError::RateLimitedSender,
+        )
+    }
+
     /// Per-npub rate-limit on `POST /donation-page/image`. A real user
     /// uploads avatar + OG once per session; six per hour is generous.
     /// Atomic Postgres path (cross-replica consistent) since uploads are

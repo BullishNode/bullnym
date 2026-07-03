@@ -1,14 +1,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
@@ -337,7 +341,9 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/rate", get(pricer::rate))
         .nest_service(
             "/pwa-assets",
-            ServeDir::new(pwa_dist_dir).precompressed_gzip(),
+            ServiceBuilder::new()
+                .layer(middleware::from_fn(pwa_assets_headers))
+                .service(ServeDir::new(pwa_dist_dir).precompressed_gzip()),
         )
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/sw.js", get(donation_render::service_worker))
@@ -457,6 +463,32 @@ fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
+    let raw_path = req.uri().path();
+    let path = raw_path
+        .strip_prefix("/pwa-assets")
+        .unwrap_or(raw_path)
+        .to_string();
+    if path.starts_with("/apps/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut resp = next.run(req).await;
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let cache_control = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    resp
 }
 
 async fn health() -> &'static str {
