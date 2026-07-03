@@ -88,7 +88,7 @@ const SAT_PER_BTC: i64 = 100_000_000;
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
 const RECIPIENT_LABEL_MAX: usize = 100;
 const INVOICE_NUMBER_MAX: usize = 50;
-const LIQUID_BTC_ASSET_ID: &str =
+pub(crate) const LIQUID_BTC_ASSET_ID: &str =
     "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
 
 // =====================================================================

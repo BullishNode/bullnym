@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use lwk_wollet::elements;
 
+use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
 use boltz_client::swaps::boltz::{
@@ -32,6 +33,8 @@ use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
 use crate::AppState;
+
+const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
 
 #[derive(Deserialize)]
 struct WebhookEnvelope {
@@ -528,7 +531,7 @@ pub enum ClaimOutcome {
 /// The previous implementation looped 3 times with 2s delays inside the
 /// webhook handler. That blocked the response to Boltz for up to ~10
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
-/// the background sweep's 30s tick — every webhook produced 4 claim
+/// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
@@ -742,6 +745,7 @@ async fn resolve_claim_address(
 ///   4. If `claim_tx_hex` is set, deserialize it. Otherwise
 ///      `construct_claim` and persist `(claim_tx_hex, claim_txid,
 ///      claim_path)` in the same transaction. Mark status `claiming`.
+///      Set a short in-flight lease in `next_claim_attempt_at`.
 ///   5. Commit (releases the advisory lock).
 ///   6. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
 ///      I/O-bound step and we don't want to hold a DB connection.
@@ -934,15 +938,19 @@ async fn claim_swap_inner(
         constructed
     };
 
-    // Status → Claiming. Forward-only guard prevents regression from
-    // any terminal state.
+    // Status -> Claiming. The retry timestamp doubles as an in-flight
+    // lease: webhook/reconciler/background races must wait for this
+    // deadline before rebroadcasting the persisted transaction.
     sqlx::query(
         "UPDATE swap_records \
-         SET status = 'claiming', updated_at = NOW() \
+         SET status = 'claiming', \
+             next_claim_attempt_at = NOW() + $2::interval, \
+             updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(swap.id)
+    .bind(db::CLAIM_IN_FLIGHT_LEASE)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1226,11 +1234,14 @@ async fn claim_chain_swap_inner(
 
     sqlx::query(
         "UPDATE chain_swap_records \
-         SET status = 'claiming', updated_at = NOW() \
+         SET status = 'claiming', \
+             next_claim_attempt_at = NOW() + $2::interval, \
+             updated_at = NOW() \
          WHERE id = $1 \
            AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
     )
     .bind(swap.id)
+    .bind(db::CLAIM_IN_FLIGHT_LEASE)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1557,8 +1568,9 @@ async fn recover_claim_from_lockup_spend(
     };
 
     let raw_spending = backend.get_raw_tx(&spending_txid).await?;
-    let spending_tx: elements::Transaction = elements::encode::deserialize(&raw_spending)
-        .map_err(|e| AppError::ClaimError(format!("decode spending tx: {e}")))?;
+    let spending_tx: boltz_elements::Transaction =
+        boltz_elements::encode::deserialize(&raw_spending)
+            .map_err(|e| AppError::ClaimError(format!("decode spending tx: {e}")))?;
     if !spending_tx_matches_claim_destination(&spending_tx, tx) {
         return Err(AppError::ClaimError(format!(
             "lockup spent by {spending_txid}, but spender does not pay the claim destination"
@@ -1569,8 +1581,8 @@ async fn recover_claim_from_lockup_spend(
 }
 
 fn spending_tx_matches_claim_destination(
-    spending_tx: &elements::Transaction,
-    claim_tx: &elements::Transaction,
+    spending_tx: &boltz_elements::Transaction,
+    claim_tx: &boltz_elements::Transaction,
 ) -> bool {
     claim_tx.output.iter().any(|claim_output| {
         !claim_output.script_pubkey.is_empty()
@@ -1594,9 +1606,9 @@ pub fn spawn_background_claimer(
         let mut first_run = true;
         // Heartbeat counter. Log liveness every N ticks so "is the
         // background claimer running?" is a grep-able question, not a
-        // process-tree archaeology one. At 30s/tick × 10 ticks, that's
+        // process-tree archaeology one. At 10s/tick x 30 ticks, that's
         // every 5 minutes — same cadence as the rate-limit GC.
-        const HEARTBEAT_EVERY_N_TICKS: u32 = 10;
+        const HEARTBEAT_EVERY_N_TICKS: u32 = 30;
         let mut tick_count: u32 = 0;
         loop {
             tick_count = tick_count.wrapping_add(1);
@@ -1606,7 +1618,7 @@ pub fn spawn_background_claimer(
                     tracing::error!("background claimer: db query failed: {e}");
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                        _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => continue,
                     }
                 }
             };
@@ -1726,7 +1738,7 @@ pub fn spawn_background_claimer(
                     tracing::info!("background claimer: shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => {}
             }
         }
     });

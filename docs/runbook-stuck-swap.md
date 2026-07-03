@@ -87,7 +87,7 @@ SET status            = 'lockup_confirmed',
 WHERE id = '<id>';
 ```
 
-The next sweep tick (≤30s) picks it up.
+The next sweep tick (<=10s) picks it up.
 
 ### 4. Variants
 

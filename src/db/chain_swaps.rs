@@ -245,9 +245,9 @@ pub async fn record_chain_swap_claim_failure(
              updated_at = NOW(), \
              next_claim_attempt_at = NOW() + ( \
                  CASE \
-                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '30 seconds' \
-                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '60 seconds' \
-                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '120 seconds' \
+                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '10 seconds' \
+                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '20 seconds' \
+                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '60 seconds' \
                      WHEN claim_attempts + 1 = 4 THEN INTERVAL '300 seconds' \
                      WHEN claim_attempts + 1 = 5 THEN INTERVAL '600 seconds' \
                      WHEN claim_attempts + 1 = 6 THEN INTERVAL '1800 seconds' \

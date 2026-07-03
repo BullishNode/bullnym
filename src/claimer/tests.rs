@@ -200,14 +200,48 @@ fn test_liquid_tx(
     }
 }
 
+fn test_boltz_liquid_tx(
+    input_outpoint: Option<boltz_elements::OutPoint>,
+    script_pubkey: boltz_elements::Script,
+) -> boltz_elements::Transaction {
+    let input = input_outpoint.map(|previous_output| boltz_elements::TxIn {
+        previous_output,
+        is_pegin: false,
+        script_sig: boltz_elements::Script::new(),
+        sequence: boltz_elements::Sequence::MAX,
+        asset_issuance: boltz_elements::AssetIssuance::default(),
+        witness: boltz_elements::TxInWitness::default(),
+    });
+
+    boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: input.into_iter().collect(),
+        output: vec![boltz_elements::TxOut {
+            asset: boltz_elements::confidential::Asset::Explicit(
+                boltz_elements::AssetId::LIQUID_BTC,
+            ),
+            value: boltz_elements::confidential::Value::Explicit(10_000),
+            nonce: boltz_elements::confidential::Nonce::Null,
+            script_pubkey,
+            witness: boltz_elements::TxOutWitness::default(),
+        }],
+    }
+}
+
 #[tokio::test]
 async fn recover_claim_from_lockup_spend_returns_discovered_spender() {
     let claim_script = elements::Script::from(vec![0x51]);
+    let boltz_claim_script = boltz_elements::Script::from(vec![0x51]);
     let lockup_tx = test_liquid_tx(None, elements::Script::new());
     let lockup_txid = lockup_tx.txid();
-    let claim_tx = test_liquid_tx(
-        Some(elements::OutPoint::new(lockup_txid, 0)),
-        claim_script.clone(),
+    let boltz_lockup_txid = lockup_txid
+        .to_string()
+        .parse()
+        .expect("lockup txid parses as boltz elements txid");
+    let claim_tx = test_boltz_liquid_tx(
+        Some(boltz_elements::OutPoint::new(boltz_lockup_txid, 0)),
+        boltz_claim_script,
     );
     let spending_tx = test_liquid_tx(Some(elements::OutPoint::new(lockup_txid, 0)), claim_script);
     let spender = spending_tx.txid().to_string();
@@ -236,9 +270,13 @@ async fn recover_claim_from_lockup_spend_returns_discovered_spender() {
 async fn recover_claim_from_lockup_spend_returns_none_when_unspent() {
     let lockup_tx = test_liquid_tx(None, elements::Script::new());
     let lockup_txid = lockup_tx.txid();
-    let claim_tx = test_liquid_tx(
-        Some(elements::OutPoint::new(lockup_txid, 0)),
-        elements::Script::from(vec![0x51]),
+    let boltz_lockup_txid = lockup_txid
+        .to_string()
+        .parse()
+        .expect("lockup txid parses as boltz elements txid");
+    let claim_tx = test_boltz_liquid_tx(
+        Some(boltz_elements::OutPoint::new(boltz_lockup_txid, 0)),
+        boltz_elements::Script::from(vec![0x51]),
     );
     let backend = Arc::new(MockUtxoBackend {
         raw_txs: HashMap::from([(lockup_txid.to_string(), serialize(&lockup_tx))]),
@@ -258,9 +296,13 @@ async fn recover_claim_from_lockup_spend_returns_none_when_unspent() {
 async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
     let lockup_tx = test_liquid_tx(None, elements::Script::new());
     let lockup_txid = lockup_tx.txid();
-    let claim_tx = test_liquid_tx(
-        Some(elements::OutPoint::new(lockup_txid, 0)),
-        elements::Script::from(vec![0x51]),
+    let boltz_lockup_txid = lockup_txid
+        .to_string()
+        .parse()
+        .expect("lockup txid parses as boltz elements txid");
+    let claim_tx = test_boltz_liquid_tx(
+        Some(boltz_elements::OutPoint::new(boltz_lockup_txid, 0)),
+        boltz_elements::Script::from(vec![0x51]),
     );
     let spending_tx = test_liquid_tx(
         Some(elements::OutPoint::new(lockup_txid, 0)),

@@ -12,10 +12,12 @@
 //! 4. Live → 200 + `store_amount.html` with embedded Pricer rate.
 
 use askama::Template;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use crate::db;
 use crate::ip_whitelist;
@@ -60,6 +62,103 @@ struct DonationArchivedTpl<'a> {
     domain: &'a str,
 }
 
+#[derive(Debug, Default)]
+pub struct PwaShells {
+    pub donation: Option<PathBuf>,
+    pub pos: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct PwaConfigView<'a> {
+    nym: &'a str,
+    mode: &'a str,
+    currency: &'a str,
+    header: &'a str,
+    description: &'a str,
+    avatar_url: Option<&'a str>,
+    website: Option<&'a str>,
+    twitter: Option<&'a str>,
+    instagram: Option<&'a str>,
+    minor_per_btc: i64,
+    last_known_rate: bool,
+    liquid_btc_asset_id: &'a str,
+    domain: &'a str,
+}
+
+#[derive(Serialize)]
+struct WebManifest<'a> {
+    name: &'a str,
+    short_name: String,
+    start_url: String,
+    scope: &'static str,
+    display: &'static str,
+    background_color: &'static str,
+    theme_color: &'static str,
+    icons: [WebManifestIcon<'a>; 4],
+}
+
+#[derive(Serialize)]
+struct WebManifestIcon<'a> {
+    src: &'a str,
+    sizes: &'a str,
+    #[serde(rename = "type")]
+    content_type: &'a str,
+    purpose: &'a str,
+}
+
+impl PwaShells {
+    pub fn load(dist_dir: impl AsRef<Path>) -> Self {
+        let dist_dir = dist_dir.as_ref();
+        let mut missing = Vec::new();
+        let donation = shell_path(dist_dir, "donation");
+        let pos = shell_path(dist_dir, "pos");
+        check_shell_exists(&donation, "donation", &mut missing);
+        check_shell_exists(&pos, "pos", &mut missing);
+        if !missing.is_empty() {
+            tracing::warn!(
+                event = "pwa_shells_missing",
+                missing = ?missing,
+                "PWA shell(s) missing at startup; falling back to Askama donation render for unreadable modes"
+            );
+        }
+        Self {
+            donation: Some(donation),
+            pos: Some(pos),
+        }
+    }
+
+    async fn shell_for(&self, pos_mode: bool) -> Option<String> {
+        let path = if pos_mode {
+            self.pos.as_ref()
+        } else {
+            self.donation.as_ref()
+        }?;
+
+        match tokio::fs::read_to_string(path).await {
+            Ok(shell) => Some(shell),
+            Err(e) => {
+                tracing::debug!(
+                    event = "pwa_shell_read_error",
+                    path = %path.display(),
+                    error = %e,
+                    "PWA shell not readable; falling back to Askama donation render"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn shell_path(dist_dir: &Path, app: &str) -> PathBuf {
+    dist_dir.join("apps").join(app).join("index.html")
+}
+
+fn check_shell_exists(path: &Path, app: &str, missing: &mut Vec<String>) {
+    if let Err(e) = std::fs::metadata(path) {
+        missing.push(format!("{app}: {} ({e})", path.display()));
+    }
+}
+
 /// Reject obviously-malicious paths. The fallback only handles a single
 /// path segment (`/alice`); axum routing already strips the leading slash
 /// when extracting `Path<String>`, but this is defense-in-depth.
@@ -71,9 +170,26 @@ fn is_valid_slug(s: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+const DONATION_CSP: &str = "default-src 'self'; \
+             img-src 'self' data:; \
+             script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; \
+             connect-src 'self' wss://liquid.network wss://liquid.bullbitcoin.com; \
+             frame-ancestors 'none'; \
+             base-uri 'none'";
+
+const POS_CSP: &str = "default-src 'self'; \
+             img-src 'self' data:; \
+             script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; \
+             connect-src 'self' https: wss://liquid.network wss://liquid.bullbitcoin.com; \
+             frame-ancestors 'none'; \
+             base-uri 'none'";
+const PWA_SHELL_HEADER: &str = "x-bullnym-pwa-shell";
+
 /// Add a few defensive response headers that apply to all donation-page
 /// HTML responses.
-fn apply_security_headers(resp: &mut Response) {
+fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -96,17 +212,12 @@ fn apply_security_headers(resp: &mut Response) {
     //   can subscribe directly to the public Esplora WebSocket for
     //   instant zero-conf Liquid payment notification. The
     //   Lightning path remains same-origin (server-side polling).
+    // - POS terminals also need arbitrary HTTPS card-service origins for
+    //   Bolt Card LNURL-withdraw (plans/pos/06-bolt-card.md). Keep
+    //   script-src pinned; only connect-src changes for live POS pages.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; \
-             img-src 'self' data:; \
-             script-src 'self' 'unsafe-inline'; \
-             style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' wss://liquid.network; \
-             frame-ancestors 'none'; \
-             base-uri 'none'",
-        ),
+        HeaderValue::from_static(if pos_mode { POS_CSP } else { DONATION_CSP }),
     );
     // 60s freshness gives a CDN/browser cache the chance to absorb a
     // viral-link burst, while keeping mutations (e.g. archive) visible
@@ -117,6 +228,12 @@ fn apply_security_headers(resp: &mut Response) {
     );
 }
 
+fn mark_pwa_shell_response(resp: &mut Response, pos_mode: bool) {
+    let value = if pos_mode { "pos" } else { "donation" };
+    resp.headers_mut()
+        .insert(PWA_SHELL_HEADER, HeaderValue::from_static(value));
+}
+
 fn render_404(state: &AppState, nym: &str) -> Response {
     let body = DonationNotFoundTpl {
         nym,
@@ -125,7 +242,7 @@ fn render_404(state: &AppState, nym: &str) -> Response {
     .render()
     .unwrap_or_else(|_| "Not found".to_string());
     let mut resp = (StatusCode::NOT_FOUND, body).into_response();
-    apply_security_headers(&mut resp);
+    apply_security_headers(&mut resp, false);
     resp
 }
 
@@ -137,7 +254,220 @@ fn render_archived(state: &AppState, nym: &str) -> Response {
     .render()
     .unwrap_or_else(|_| "Archived".to_string());
     let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp);
+    apply_security_headers(&mut resp, false);
+    resp
+}
+
+fn escape_json_for_script(json: &str) -> String {
+    json.replace('<', "\\u003c")
+}
+
+fn html_escape_attr(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn short_manifest_name(name: &str) -> String {
+    name.chars().take(12).collect()
+}
+
+fn web_manifest_for_page(page: &db::DonationPage) -> WebManifest<'_> {
+    let name = if page.header.trim().is_empty() {
+        page.nym.as_str()
+    } else {
+        page.header.as_str()
+    };
+    WebManifest {
+        name,
+        short_name: short_manifest_name(name),
+        start_url: format!("/{}", page.nym),
+        scope: "/",
+        display: "standalone",
+        background_color: "#161512",
+        theme_color: "#161512",
+        icons: [
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-192.png",
+                sizes: "192x192",
+                content_type: "image/png",
+                purpose: "any",
+            },
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-192.png",
+                sizes: "192x192",
+                content_type: "image/png",
+                purpose: "maskable",
+            },
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-512.png",
+                sizes: "512x512",
+                content_type: "image/png",
+                purpose: "any",
+            },
+            WebManifestIcon {
+                src: "/pwa-assets/icons/icon-512.png",
+                sizes: "512x512",
+                content_type: "image/png",
+                purpose: "maskable",
+            },
+        ],
+    }
+}
+
+fn og_meta_tags(header: &str, description: &str, og_url: Option<&str>) -> String {
+    let mut tags = format!(
+        r#"<meta property="og:title" content="{}">
+<meta property="og:description" content="{}">"#,
+        html_escape_attr(header),
+        html_escape_attr(description)
+    );
+    if let Some(og_url) = og_url {
+        tags.push_str(&format!(
+            r#"
+<meta property="og:image" content="{}">"#,
+            html_escape_attr(og_url)
+        ));
+    }
+    tags
+}
+
+fn inject_pwa_shell(
+    shell: &str,
+    config: &PwaConfigView<'_>,
+    og_url: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string(config)?;
+    let json = escape_json_for_script(&json);
+    let config_script =
+        format!(r#"<script id="bullnym-config" type="application/json">{json}</script>"#);
+    let manifest_link = format!(
+        r#"<link rel="manifest" href="/{}/manifest.webmanifest">"#,
+        html_escape_attr(config.nym)
+    );
+    Ok(shell
+        .replace("<!-- BULLNYM_CONFIG -->", &config_script)
+        .replace("<!-- BULLNYM_MANIFEST -->", &manifest_link)
+        .replace(
+            "<!-- BULLNYM_OG -->",
+            &og_meta_tags(config.header, config.description, og_url),
+        ))
+}
+
+/// Which per-source bucket a public donation-surface GET bills against.
+/// Manifest fetches are kept separate from HTML so a normal page load +
+/// install-metadata fetch doesn't double-bill the scraping budget.
+enum DonationRateBucket {
+    Html,
+    Manifest,
+}
+
+async fn check_donation_rate_limit(
+    state: &AppState,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+    bucket: DonationRateBucket,
+) -> Result<(), Response> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
+    if let Some(ip) = ip {
+        if !state.ip_whitelist.contains(ip) {
+            let checked = match bucket {
+                DonationRateBucket::Html => {
+                    state.rate_limiter.check_donation_html_per_source(ip).await
+                }
+                DonationRateBucket::Manifest => {
+                    state
+                        .rate_limiter
+                        .check_donation_manifest_per_source(ip)
+                        .await
+                }
+            };
+            if let Err(e) = checked {
+                return Err(e.into_response());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn service_worker(State(state): State<AppState>) -> Response {
+    let path = Path::new(&state.config.pwa.dist_dir).join("sw.js");
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(e) => {
+            tracing::error!(event = "service_worker_read_error", error = %e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    resp
+}
+
+pub async fn manifest(
+    State(state): State<AppState>,
+    AxumPath(nym): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_slug(&nym) || reserved_nyms::is_reserved(&nym) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Manifest).await
+    {
+        return resp;
+    }
+
+    let page = match db::get_donation_page_by_nym(&state.db, &nym).await {
+        Ok(Some(p)) if p.enabled && !p.is_archived => p,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(event = "manifest_db_error", nym = %nym, error = %e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    let manifest = web_manifest_for_page(&page);
+
+    let body = match serde_json::to_string(&manifest) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!(event = "manifest_serialize_error", nym = %nym, error = %e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut resp = (StatusCode::OK, body).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/manifest+json"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
     resp
 }
 
@@ -166,6 +496,32 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
 
     let supported_currencies = state.pricer.supported_currencies().to_vec();
 
+    if let Some(shell) = state.pwa_shells.shell_for(page.pos_mode).await {
+        let avatar_url_ref = avatar_url.as_deref();
+        let mode = if page.pos_mode { "pos" } else { "donation" };
+        let config = PwaConfigView {
+            nym: &page.nym,
+            mode,
+            currency: &page.display_currency,
+            header: &page.header,
+            description: &page.description,
+            avatar_url: avatar_url_ref,
+            website: page.website.as_deref(),
+            twitter: page.twitter.as_deref(),
+            instagram: page.instagram.as_deref(),
+            minor_per_btc,
+            last_known_rate,
+            liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
+            domain,
+        };
+        let body = inject_pwa_shell(&shell, &config, og_url.as_deref())
+            .unwrap_or_else(|e| format!("template render failed: {e}"));
+        let mut resp = (StatusCode::OK, body).into_response();
+        apply_security_headers(&mut resp, page.pos_mode);
+        mark_pwa_shell_response(&mut resp, page.pos_mode);
+        return resp;
+    }
+
     let body = DonationPageTpl {
         nym: &page.nym,
         header: &page.header,
@@ -185,7 +541,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     .unwrap_or_else(|e| format!("template render failed: {e}"));
 
     let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp);
+    apply_security_headers(&mut resp, page.pos_mode);
     resp
 }
 
@@ -219,14 +575,10 @@ pub async fn render_or_404(
     }
 
     // Per-source rate-limit. Volumetric scraping protection.
-    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
-    if let Some(ip) = ip {
-        if !state.ip_whitelist.contains(ip) {
-            if let Err(e) = state.rate_limiter.check_donation_html_per_source(ip).await {
-                return e.into_response();
-            }
-        }
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Html).await
+    {
+        return resp;
     }
 
     // DB lookup.

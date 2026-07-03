@@ -6,6 +6,7 @@ fn supported_currencies_are_normalized_and_deduped() {
         "usd".to_string(),
         " USD ".to_string(),
         "cop".to_string(),
+        "crc".to_string(),
         "".to_string(),
     ];
     let normalized = normalize_supported_currencies(&currencies);
@@ -14,10 +15,11 @@ fn supported_currencies_are_normalized_and_deduped() {
             .iter()
             .map(|c| c.code.as_str())
             .collect::<Vec<_>>(),
-        vec!["COP", "USD"]
+        vec!["COP", "CRC", "USD"]
     );
     assert_eq!(normalized[0].precision, 0);
-    assert_eq!(normalized[1].precision, 2);
+    assert_eq!(normalized[1].precision, 0);
+    assert_eq!(normalized[2].precision, 2);
 }
 
 #[test]
@@ -101,9 +103,16 @@ fn rate_guardrail_accepts_supported_currency_ranges() {
         precision: 0,
     };
 
-    assert!(validate_rate_element(&usd).is_ok());
-    assert!(validate_rate_element(&crc).is_ok());
-    assert!(validate_rate_element(&cop).is_ok());
+    let usd_minor = minor_per_btc_from_element(&usd).unwrap();
+    let crc_minor = minor_per_btc_from_element(&crc).unwrap();
+    let cop_minor = minor_per_btc_from_element(&cop).unwrap();
+
+    assert_eq!(usd_minor, 90_000_000);
+    assert_eq!(crc_minor, 50_000_000);
+    assert_eq!(cop_minor, 450_000_000);
+    assert!(validate_rate(&usd.to_currency, usd_minor).is_ok());
+    assert!(validate_rate(&crc.to_currency, crc_minor).is_ok());
+    assert!(validate_rate(&cop.to_currency, cop_minor).is_ok());
 }
 
 #[test]
@@ -115,7 +124,26 @@ fn rate_guardrail_rejects_non_positive_rates() {
         precision: 2,
     };
 
-    assert!(validate_rate_element(&zero).is_err());
+    let minor = minor_per_btc_from_element(&zero).unwrap();
+    assert!(validate_rate(&zero.to_currency, minor).is_err());
+}
+
+#[test]
+fn crc_rate_is_normalized_to_whole_colones() {
+    let crc = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "CRC".to_string(),
+        index_price: 5_000_000_049,
+        precision: 2,
+    };
+
+    assert_eq!(minor_per_btc_from_element(&crc).unwrap(), 50_000_000);
+
+    let rounded = RateElement {
+        index_price: 5_000_000_050,
+        ..crc
+    };
+    assert_eq!(minor_per_btc_from_element(&rounded).unwrap(), 50_000_001);
 }
 
 #[test]
@@ -129,8 +157,14 @@ fn rate_guardrail_rejects_absurd_currency_specific_rates() {
     let crc = RateElement {
         from_currency: "BTC".to_string(),
         to_currency: "CRC".to_string(),
-        index_price: 500_000_000_001,
+        index_price: 500_000_000_050,
         precision: 2,
+    };
+    let crc_major = RateElement {
+        from_currency: "BTC".to_string(),
+        to_currency: "CRC".to_string(),
+        index_price: 5_000_000_001,
+        precision: 0,
     };
     let cop = RateElement {
         from_currency: "BTC".to_string(),
@@ -139,9 +173,15 @@ fn rate_guardrail_rejects_absurd_currency_specific_rates() {
         precision: 0,
     };
 
-    assert!(validate_rate_element(&usd).is_err());
-    assert!(validate_rate_element(&crc).is_err());
-    assert!(validate_rate_element(&cop).is_err());
+    let usd_minor = minor_per_btc_from_element(&usd).unwrap();
+    let crc_minor = minor_per_btc_from_element(&crc).unwrap();
+    let crc_major_minor = minor_per_btc_from_element(&crc_major).unwrap();
+    let cop_minor = minor_per_btc_from_element(&cop).unwrap();
+
+    assert!(validate_rate(&usd.to_currency, usd_minor).is_err());
+    assert!(validate_rate(&crc.to_currency, crc_minor).is_err());
+    assert!(validate_rate(&crc_major.to_currency, crc_major_minor).is_err());
+    assert!(validate_rate(&cop.to_currency, cop_minor).is_err());
 }
 
 #[test]
@@ -153,7 +193,8 @@ fn rate_guardrail_rejects_currencies_without_explicit_ceiling() {
         precision: 2,
     };
 
-    assert!(validate_rate_element(&unknown).is_err());
+    let minor = minor_per_btc_from_element(&unknown).unwrap();
+    assert!(validate_rate(&unknown.to_currency, minor).is_err());
 }
 
 #[test]

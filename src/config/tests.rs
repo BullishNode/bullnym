@@ -117,6 +117,7 @@ fn production_base_config() -> Config {
             electrum_url: "ssl://liquid-electrum.example.com:50002".to_string(),
         },
         pricer: PricerConfig::default(),
+        pwa: PwaConfig::default(),
         donation: DonationConfig::default(),
         limits: LimitsConfig::default(),
         proof: ProofConfig::default(),

@@ -14,9 +14,27 @@
 # already gates these and these zones only catch volumetric noise.
 limit_req_zone $binary_remote_addr zone=donation_html:10m rate=2r/s;
 limit_req_zone $binary_remote_addr zone=donation_api:10m rate=5r/s;
+# Generous per-IP backstop for PWA statics + sw.js. These must NOT share
+# donation_html (a cold install fetches ~15 files near-simultaneously), but
+# leaving them unlimited invites volumetric disk-I/O abuse — sw.js is a
+# per-request filesystem read in Rust.
+limit_req_zone $binary_remote_addr zone=pwa_static:10m rate=30r/s;
 
 server {
     # ... existing TLS / server_name config ...
+
+    # TLS terminates on the upstream edge proxy (tailnet 100.64.0.2), which
+    # OVERWRITES X-Forwarded-For with the verified client IP (client-supplied
+    # XFF is discarded — spoof-tested 2026-07-03). Without realip, every
+    # limit_req zone in this file keys on the edge IP, i.e. becomes a GLOBAL
+    # throttle shared by all users, and pay-service's rightmost-XFF parsing
+    # (src/ip_whitelist.rs resolve_caller_ip) sees the edge IP too. This
+    # rewrites $remote_addr from the edge's XFF so both nginx zones and the
+    # $proxy_add_x_forwarded_for chain forwarded to Rust key on the real
+    # client. If the edge's tailnet IP changes, update set_real_ip_from —
+    # the failure mode is silent reversion to global-bucket limiting.
+    set_real_ip_from 100.64.0.2;
+    real_ip_header X-Forwarded-For;
 
     # Static donation-page images. nginx serves these directly from disk.
     location ^~ /img/ {
@@ -41,9 +59,44 @@ server {
         return 404;
     }
 
+    # PWA static assets. Do not put these in the donation_html zone: a single
+    # install can fetch many hashed files in parallel. Rust is the source of
+    # truth for PWA cache headers and precompressed gzip.
+    location ^~ /pwa-assets/ {
+        limit_req zone=pwa_static burst=60 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Root-scoped service worker. Served no-cache by Rust so byte-diff updates
+    # converge terminals on the next navigation.
+    location = /sw.js {
+        limit_req zone=pwa_static burst=60 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Web app manifests are public metadata, but lighter than full HTML page
+    # renders. The nym is the first path segment, so this needs its own regex
+    # location instead of a donation_html negative-lookahead exception.
+    location ~ ^/[a-z0-9-]+/manifest\.webmanifest$ {
+        limit_req zone=donation_api burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     # Rate-limit the donation HTML fallback (GET /<nym>).
     # Excludes explicit routes that have their own protection.
-    location ~ ^/(?!\.well-known/|register|webhook/|health|ready|version|certification/|api/|img/|donation-page|lnurlp/) {
+    location ~ ^/(?!\.well-known/|register|webhook/|health|ready|version|certification/|api/|img/|pwa-assets/|sw\.js$|donation-page|lnurlp/) {
         limit_req zone=donation_html burst=10 nodelay;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
@@ -72,13 +125,23 @@ server {
 #        # nginx will return 403 to every donation-page image request.
 #        sudo chmod 755 /opt/payservice/data/images
 #   2. Edit /etc/nginx/sites-enabled/bullpay; integrate the blocks above.
-#      The `^~ /img/` and donation_html blocks are NOT
+#      deploy.sh only does git reset --hard plus binary/dist copy; nginx
+#      config is applied manually on the VM. The `^~ /img/`, `^~ /pwa-assets/`,
+#      `= /sw.js`, manifest, and donation_html blocks are NOT
 #      drop-in appendables — they must be slotted in BEFORE any catch-all
 #      `location /` (or `proxy_pass` regex) that would shadow them. Run
 #      `nginx -T` first to inspect the existing live config and merge offline.
 #   3. nginx -t && sudo systemctl reload nginx.
 #   4. Verify:
 #        curl -I https://bullpay.ca/img/__nonexistent__/avatar.webp  → 404 from nginx
+#        curl -I https://bullpay.ca/pwa-assets/icons/icon-192.png      → Cache-Control: max-age=3600
+#        curl -H 'Accept-Encoding: gzip' -I \
+#          https://bullpay.ca/pwa-assets/assets/<hash>.js              → Content-Encoding: gzip
+#        curl -I https://bullpay.ca/pwa-assets/apps/pos/index.html     → 404
+#        curl -I https://bullpay.ca/sw.js                              → Cache-Control: no-cache
+#        curl -I https://bullpay.ca/<seeded-nym>/manifest.webmanifest  → 200 via donation_api zone
+#        seq 1 15 | xargs -n1 -P15 -I{} curl -fsS -o /dev/null \
+#          https://bullpay.ca/pwa-assets/icons/icon-192.png            → all 200
 #        curl -I https://bullpay.ca/health                            → 200 (proxied to pay-service)
 #        curl -I https://bullpay.ca/ready                             → 200 (proxied to pay-service)
 #        curl -I https://bullpay.ca/version                           → 200 (proxied to pay-service)
@@ -86,3 +149,9 @@ server {
 #        curl -I https://bullpay.ca/img/                              → 403 or 404
 #                                                                       (NEVER 200; nginx must
 #                                                                        not list directories)
+#
+# Rollback: /sw.js is served no-cache and updates on byte-diff. Redeploy
+# /opt/payservice/pwa/dist.prev with scripts/deploy.sh --pwa or equivalent;
+# terminals converge on next navigation. The service worker only prunes old
+# hashed assets after the new precache is complete, so a bad deploy cannot
+# erase the previous working shell cache.

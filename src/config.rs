@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub pricer: PricerConfig,
     #[serde(default)]
+    pub pwa: PwaConfig,
+    #[serde(default)]
     pub donation: DonationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -295,10 +297,32 @@ fn default_pricer_request_timeout_ms() -> u64 {
     DEFAULT_PRICER_REQUEST_TIMEOUT_MS
 }
 fn default_pricer_supported_currencies() -> Vec<String> {
-    ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP", "INR"]
+    ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP"]
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+// --- PWA shell/static serving ---
+
+const DEFAULT_PWA_DIST_DIR: &str = "pwa/dist";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PwaConfig {
+    #[serde(default = "default_pwa_dist_dir")]
+    pub dist_dir: String,
+}
+
+impl Default for PwaConfig {
+    fn default() -> Self {
+        Self {
+            dist_dir: default_pwa_dist_dir(),
+        }
+    }
+}
+
+fn default_pwa_dist_dir() -> String {
+    DEFAULT_PWA_DIST_DIR.to_string()
 }
 
 // --- Donation page image pipeline ---
@@ -688,6 +712,13 @@ pub struct RateLimitConfig {
     pub donation_html_rate_limit: u32,
     #[serde(default = "default_donation_html_rate_window_secs")]
     pub donation_html_rate_window_secs: u32,
+    /// Per-source rate-limit on `GET /<nym>/manifest.webmanifest`.
+    /// Kept separate from HTML so install metadata fetches don't double-bill
+    /// normal page loads.
+    #[serde(default = "default_donation_manifest_rate_limit")]
+    pub donation_manifest_rate_limit: u32,
+    #[serde(default = "default_donation_manifest_rate_window_secs")]
+    pub donation_manifest_rate_window_secs: u32,
 
     // --- Donation page image upload ---
     /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
@@ -764,6 +795,8 @@ impl Default for RateLimitConfig {
             lightning_per_source_window_secs: default_lightning_per_source_window_secs(),
             donation_html_rate_limit: default_donation_html_rate_limit(),
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
+            donation_manifest_rate_limit: default_donation_manifest_rate_limit(),
+            donation_manifest_rate_window_secs: default_donation_manifest_rate_window_secs(),
             donation_image_uploads_per_npub_per_hour:
                 default_donation_image_uploads_per_npub_per_hour(),
             donation_image_uploads_per_source_per_min:
@@ -921,6 +954,12 @@ fn default_donation_html_rate_limit() -> u32 {
 }
 fn default_donation_html_rate_window_secs() -> u32 {
     60
+}
+fn default_donation_manifest_rate_limit() -> u32 {
+    default_donation_html_rate_limit()
+}
+fn default_donation_manifest_rate_window_secs() -> u32 {
+    default_donation_html_rate_window_secs()
 }
 /// 6/h per npub: a real user uploads avatar + OG once per setup; six is
 /// generous headroom for retries and accidental re-uploads.

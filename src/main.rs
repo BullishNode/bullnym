@@ -1,16 +1,21 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use boltz_client::network::Network;
 use boltz_client::util::secrets::SwapMasterKey;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
@@ -164,6 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.pricer.cache_ttl_secs,
         config.pricer.request_timeout_ms,
     );
+    let pwa_shells = Arc::new(donation_render::PwaShells::load(&config.pwa.dist_dir));
 
     let listen_addr = config.listen.clone();
     let config = Arc::new(config);
@@ -180,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: rate_limiter.clone(),
         utxo_backend,
         pricer: pricer_client,
+        pwa_shells,
     };
 
     let cancel = CancellationToken::new();
@@ -324,10 +331,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_router(state: AppState) -> Router {
     let features = state.config.features.clone();
     let invoice_sessions_enabled = features.invoices || features.payment_pages;
+    let pwa_dist_dir = state.config.pwa.dist_dir.clone();
 
     let mut router: Router<AppState> = Router::new()
-        .route("/api/v1/supported-currencies", get(pricer::supported_currencies))
+        .route(
+            "/api/v1/supported-currencies",
+            get(pricer::supported_currencies),
+        )
+        .route("/api/v1/rate", get(pricer::rate))
+        .nest_service(
+            "/pwa-assets",
+            ServiceBuilder::new()
+                .layer(middleware::from_fn(pwa_assets_headers))
+                .service(ServeDir::new(pwa_dist_dir).precompressed_gzip()),
+        )
         .route("/robots.txt", get(invoice::robots_txt))
+        .route("/sw.js", get(donation_render::service_worker))
         .route("/qr.svg", get(qr::generate))
         // See docs/compatibility-ledger.md for webhook compatibility policy.
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
@@ -370,6 +389,7 @@ fn build_router(state: AppState) -> Router {
                 axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/donation-page/:nym", get(donation_page::get))
+            .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
             // Donation checkout now uses invoice sessions instead of the
             // removed donation callback/status endpoints.
             // Anonymous checkout invoice endpoints. The create route keeps a
@@ -442,7 +462,44 @@ fn build_router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(pwa_assets_vary_accept_encoding))
         .with_state(state)
+}
+
+async fn pwa_assets_vary_accept_encoding(req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    if resp.status().is_success() && path.starts_with("/pwa-assets/") {
+        resp.headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    resp
+}
+
+async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
+    let raw_path = req.uri().path();
+    let path = raw_path
+        .strip_prefix("/pwa-assets")
+        .unwrap_or(raw_path)
+        .to_string();
+    if path.starts_with("/apps/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut resp = next.run(req).await;
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let cache_control = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    resp
 }
 
 async fn health() -> &'static str {

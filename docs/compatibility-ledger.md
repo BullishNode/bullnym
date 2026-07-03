@@ -74,3 +74,16 @@ policy inline.
   about the nym descriptor.
 - Removal condition: every supported client supplies the page descriptor before
   enabling checkout, and legacy donation pages have been migrated or archived.
+
+## Donation Page POS Mode
+
+- Current field: `pos_mode` on signed `PUT /donation-page` requests.
+- Compatibility behavior: if omitted, the server verifies the legacy signed
+  field list without `pos_mode`, preserves the existing page mode on update,
+  and defaults to `false` on first insert.
+- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
+  before POS mode existed, so requiring the field would reject otherwise valid
+  page updates from those clients.
+- Removal condition: all supported Bull Wallet builds include `pos_mode` in
+  the signed donation-page payload, and legacy saves without it are no longer
+  accepted by the API contract.

@@ -90,7 +90,6 @@ impl BoltzService {
                     RevSwapStates::TransactionFailed,
                 ]),
             }),
-            claim_covenant: None,
         };
 
         let response: CreateReverseResponse = self

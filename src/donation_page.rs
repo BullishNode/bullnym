@@ -67,6 +67,8 @@ pub struct SaveDonationPageRequest {
     pub twitter: Option<String>,
     #[serde(default)]
     pub instagram: Option<String>,
+    #[serde(default)]
+    pub pos_mode: Option<bool>,
     pub enabled: bool,
     pub timestamp: u64,
     pub signature: String,
@@ -89,6 +91,7 @@ pub struct DonationPageView {
     pub website: Option<String>,
     pub twitter: Option<String>,
     pub instagram: Option<String>,
+    pub pos_mode: bool,
     pub enabled: bool,
     pub is_archived: bool,
     pub avatar_sha256: Option<String>,
@@ -108,6 +111,7 @@ impl DonationPageView {
             website: row.website,
             twitter: row.twitter,
             instagram: row.instagram,
+            pos_mode: row.pos_mode,
             enabled: row.enabled,
             is_archived: row.is_archived,
             avatar_sha256: row.avatar_sha256,
@@ -195,6 +199,8 @@ fn validate_lengths(
 /// (`donation_page_constants.dart::buildSavePayloadFields`).
 /// Optional fields that are absent become empty strings (NOT skipped) so the
 /// number and order of NUL separators is invariant to which fields are set.
+/// `pos_mode` is optional for shipped Bull Wallet compatibility; see
+/// `docs/compatibility-ledger.md`.
 fn save_payload_fields<'a>(
     header: &'a str,
     description: &'a str,
@@ -203,6 +209,7 @@ fn save_payload_fields<'a>(
     twitter: &'a str,
     instagram: &'a str,
     enabled_str: &'a str,
+    pos_mode_str: Option<&'a str>,
     ct_descriptor: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut fields = vec![
@@ -214,6 +221,9 @@ fn save_payload_fields<'a>(
         instagram,
         enabled_str,
     ];
+    if let Some(pos_mode_str) = pos_mode_str {
+        fields.push(pos_mode_str);
+    }
     if let Some(ct_descriptor) = ct_descriptor {
         fields.push(ct_descriptor);
     }
@@ -265,6 +275,9 @@ pub async fn save(
     let twitter = req.twitter.as_deref().unwrap_or("");
     let instagram = req.instagram.as_deref().unwrap_or("");
     let enabled_str = if req.enabled { "1" } else { "0" };
+    let pos_mode_str = req
+        .pos_mode
+        .map(|pos_mode| if pos_mode { "1" } else { "0" });
     let fields = save_payload_fields(
         &req.header,
         &req.description,
@@ -273,6 +286,7 @@ pub async fn save(
         twitter,
         instagram,
         enabled_str,
+        pos_mode_str,
         req.ct_descriptor.as_deref(),
     );
     auth::verify_la_v2(
@@ -298,6 +312,7 @@ pub async fn save(
             website: req.website.as_deref().filter(|s| !s.is_empty()),
             twitter: req.twitter.as_deref().filter(|s| !s.is_empty()),
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
+            pos_mode: req.pos_mode,
             enabled: req.enabled,
         },
     )
