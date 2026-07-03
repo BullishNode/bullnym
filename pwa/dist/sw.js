@@ -13,7 +13,7 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // EVERY successful navigation, including /invoice/:id and /:nym/i/:id. On
 // activate, the v1 pages cache is no longer in `keep` and gets deleted.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
-const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-DlExePjs.js","/pwa-assets/assets/pos-aZus3ya5.js","/pwa-assets/assets/PayFlow-Bm2rcbCV.js"]
+const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-YSyxE5O4.js","/pwa-assets/assets/pos-0mL1yrRJ.js","/pwa-assets/assets/PayFlow-DR2hQy1u.js"]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
