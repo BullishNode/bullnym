@@ -23,6 +23,19 @@ limit_req_zone $binary_remote_addr zone=pwa_static:10m rate=30r/s;
 server {
     # ... existing TLS / server_name config ...
 
+    # TLS terminates on the upstream edge proxy (tailnet 100.64.0.2), which
+    # OVERWRITES X-Forwarded-For with the verified client IP (client-supplied
+    # XFF is discarded — spoof-tested 2026-07-03). Without realip, every
+    # limit_req zone in this file keys on the edge IP, i.e. becomes a GLOBAL
+    # throttle shared by all users, and pay-service's rightmost-XFF parsing
+    # (src/ip_whitelist.rs resolve_caller_ip) sees the edge IP too. This
+    # rewrites $remote_addr from the edge's XFF so both nginx zones and the
+    # $proxy_add_x_forwarded_for chain forwarded to Rust key on the real
+    # client. If the edge's tailnet IP changes, update set_real_ip_from —
+    # the failure mode is silent reversion to global-bucket limiting.
+    set_real_ip_from 100.64.0.2;
+    real_ip_header X-Forwarded-For;
+
     # Static donation-page images. nginx serves these directly from disk.
     location ^~ /img/ {
         alias /opt/payservice/data/images/;
