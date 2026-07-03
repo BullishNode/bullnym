@@ -2447,6 +2447,180 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
 }
 
 #[tokio::test]
+async fn boltz_liquid_payout_does_not_double_count_lightning_invoice_payment() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "boltzpayout").await;
+    let invoice = insert_test_invoice(&pool, "boltzpayout", &npub, "lq1boltzpayout", 60).await;
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+    let claim_txid = "8843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e88";
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:8843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e88:0",
+            951,
+            claim_txid,
+            0,
+            "lq1boltzpayout",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    invoice::flip_invoice_on_lightning_settlement(
+        &pool,
+        Some(invoice.id),
+        1_000,
+        "boltz-payout-race",
+        claim_txid,
+        tolerances,
+    )
+    .await;
+
+    let paid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.status, "paid");
+    assert_eq!(paid.paid_via.as_deref(), Some("lightning"));
+    assert_eq!(paid.paid_amount_sat, Some(1_000));
+
+    let events: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT source, amount_sat FROM invoice_payment_events \
+         WHERE invoice_id = $1 ORDER BY source",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, vec![("lightning_boltz_reverse".to_string(), 1_000)]);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn liquid_scanner_ignores_known_boltz_settlement_txid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "boltzknown").await;
+    let invoice = insert_test_invoice(&pool, "boltzknown", &npub, "lq1boltzknown", 60).await;
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+    let claim_txid = "9843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e89";
+
+    invoice::flip_invoice_on_lightning_settlement(
+        &pool,
+        Some(invoice.id),
+        1_000,
+        "boltz-known-first",
+        claim_txid,
+        tolerances,
+    )
+    .await;
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        liquid_direct_evidence(
+            "liquid_direct:9843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e89:0",
+            951,
+            claim_txid,
+            0,
+            "lq1boltzknown",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+
+    let paid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.status, "paid");
+    assert_eq!(paid.paid_via.as_deref(), Some("lightning"));
+    assert_eq!(paid.paid_amount_sat, Some(1_000));
+
+    let event_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(event_count.0, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn boltz_settlement_does_not_prune_direct_bitcoin_payment_events() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "boltzbtcdirect").await;
+    let invoice = insert_test_btc_invoice(&pool, "boltzbtcdirect", &npub, "bc1qboltzbtcdirect")
+        .await
+        .unwrap();
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+    let txid = "a843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e8a";
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        bitcoin_direct_evidence(
+            "bitcoin_direct:a843a083f1db2d9f857f18025fbf9bf1e3b256fb0c06bebae207fa7a01218e8a:0",
+            100,
+            txid,
+            0,
+            "bc1qboltzbtcdirect",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    invoice::flip_invoice_on_lightning_settlement(
+        &pool,
+        Some(invoice.id),
+        1_000,
+        "boltz-does-not-prune-btc",
+        txid,
+        tolerances,
+    )
+    .await;
+
+    let overpaid = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(overpaid.status, "overpaid");
+    assert_eq!(overpaid.paid_via.as_deref(), Some("mixed"));
+    assert_eq!(overpaid.paid_amount_sat, Some(1_100));
+
+    let events: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT source, amount_sat FROM invoice_payment_events \
+         WHERE invoice_id = $1 ORDER BY source",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            ("bitcoin_direct".to_string(), 100),
+            ("lightning_boltz_reverse".to_string(), 1_000),
+        ]
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn bitcoin_payment_observations_do_not_count_as_paid() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

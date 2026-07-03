@@ -605,6 +605,47 @@ pub async fn record_invoice_payment(
         return Ok(0);
     }
 
+    let is_direct_liquid_payment = evidence.source == "liquid_direct";
+    let is_boltz_settlement = matches!(
+        evidence.source,
+        "lightning_boltz_reverse" | "bitcoin_boltz_chain"
+    );
+
+    if is_direct_liquid_payment {
+        let (boltz_settlement_exists,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM invoice_payment_events \
+                 WHERE invoice_id = $1 \
+                   AND txid = $2 \
+                   AND source IN ('lightning_boltz_reverse', 'bitcoin_boltz_chain') \
+             )",
+        )
+        .bind(id)
+        .bind(evidence.txid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if boltz_settlement_exists {
+            tx.commit().await?;
+            return Ok(0);
+        }
+    }
+
+    let pruned_direct_rows = if is_boltz_settlement {
+        sqlx::query(
+            "DELETE FROM invoice_payment_events \
+              WHERE invoice_id = $1 \
+                AND txid = $2 \
+                AND source = 'liquid_direct'",
+        )
+        .bind(id)
+        .bind(evidence.txid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
+
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO invoice_payment_events \
             (invoice_id, rail, source, event_key, amount_sat, txid, vout, boltz_swap_id, address) \
@@ -624,7 +665,8 @@ pub async fn record_invoice_payment(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if inserted.is_none() {
+    let inserted_event = inserted.is_some();
+    if !inserted_event && pruned_direct_rows == 0 {
         tx.commit().await?;
         return Ok(0);
     }
@@ -687,7 +729,7 @@ pub async fn record_invoice_payment(
     .await?;
 
     tx.commit().await?;
-    Ok(1)
+    Ok(u64::from(inserted_event))
 }
 
 pub async fn invoice_payment_event_exists(
