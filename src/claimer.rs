@@ -1002,7 +1002,7 @@ async fn claim_swap_inner(
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
@@ -1311,7 +1311,7 @@ async fn claim_chain_swap_inner(
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
@@ -1459,7 +1459,7 @@ async fn construct_claim_tx(
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
@@ -1527,7 +1527,7 @@ async fn construct_chain_claim_tx(
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
@@ -1577,6 +1577,20 @@ fn is_cooperative_refusal(err: &AppError) -> bool {
         || s.contains("cooperative claim disabled")
         || s.contains("cooperative signing disabled")
         || s.contains("not eligible for cooperative")
+}
+
+/// Strip the URL scheme from an electrum endpoint for boltz-client's
+/// `ElectrumLiquidClient`, which expects a bare `host:port` and re-adds the
+/// scheme itself (`build_client` does `format!("ssl://{url}")`). Our config
+/// carries the scheme (the electrum-client backend in utxo.rs wants it), so
+/// passing it through unmodified yields a doubled `ssl://ssl://host:port` that
+/// fails DNS resolution ("Name or service not known") — meaning claims never
+/// broadcast. Strip `ssl://`/`tcp://` here so both electrum clients get the
+/// form they expect.
+fn electrum_host_port(url: &str) -> &str {
+    url.strip_prefix("ssl://")
+        .or_else(|| url.strip_prefix("tcp://"))
+        .unwrap_or(url)
 }
 
 /// Hex-encode a fully-signed claim tx for storage in
