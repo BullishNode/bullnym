@@ -458,8 +458,11 @@ const DEFAULT_MESSAGE_TAG: &str = "bullpay-lnurlp-v1";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofConfig {
-    /// Minimum UTXO value the payer must prove ownership of. Sets the economic
-    /// cost floor for a single LNURL-pay callback.
+    /// Minimum L-BTC value the payer must prove for a LUD-22 proof UTXO. This
+    /// is the economic cost floor for a single Liquid LNURL-pay callback and
+    /// is ENFORCED: the callback unblinds the confidential proof output and
+    /// rejects it unless the asset is L-BTC and the value is >= this floor
+    /// (DG-7 / ISS-S-04). Not merely advisory.
     #[serde(default = "default_min_proof_value_sat")]
     pub min_proof_value_sat: u64,
     /// Domain separation tag for the signed ownership message.
