@@ -1,8 +1,26 @@
 use sqlx::PgPool;
 
+/// Surface discriminator for a donation_pages row. `payment_page` is the
+/// default (and the shape every legacy single-row nym carries); `pos` is the
+/// separate Point-of-Sale surface with its own descriptor + cursor.
+pub const KIND_PAYMENT_PAGE: &str = "payment_page";
+pub const KIND_POS: &str = "pos";
+
+/// Validate a caller-supplied surface kind. Returns the canonical value or
+/// `None` if it is not a recognized surface.
+pub fn normalize_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        KIND_PAYMENT_PAGE => Some(KIND_PAYMENT_PAGE),
+        KIND_POS => Some(KIND_POS),
+        _ => None,
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct DonationPage {
     pub nym: String,
+    /// Surface kind: `payment_page` or `pos`. A nym may own one row of each.
+    pub kind: String,
     pub ct_descriptor: Option<String>,
     pub next_addr_idx: i32,
     pub header: String,
@@ -23,6 +41,9 @@ pub struct DonationPage {
 
 pub struct UpsertDonationPage<'a> {
     pub nym: &'a str,
+    /// Surface kind for this row. Callers pass a canonical value from
+    /// `normalize_kind`; the (nym, kind) pair is the conflict target.
+    pub kind: &'a str,
     pub ct_descriptor: Option<&'a str>,
     pub header: &'a str,
     pub description: &'a str,
@@ -44,10 +65,10 @@ pub async fn upsert_donation_page(
 ) -> Result<DonationPage, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "INSERT INTO donation_pages \
-            (nym, ct_descriptor, header, description, display_currency, \
+            (nym, kind, ct_descriptor, header, description, display_currency, \
              website, twitter, instagram, pos_mode, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, FALSE), $10) \
-         ON CONFLICT (nym) DO UPDATE SET \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11) \
+         ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
              description = EXCLUDED.description, \
@@ -55,15 +76,16 @@ pub async fn upsert_donation_page(
              website = EXCLUDED.website, \
              twitter = EXCLUDED.twitter, \
              instagram = EXCLUDED.instagram, \
-             pos_mode = COALESCE($9, donation_pages.pos_mode), \
+             pos_mode = COALESCE($10, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
              archived_at = NULL, \
              updated_at = now() \
-         RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+         RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(page.nym)
+    .bind(page.kind)
     .bind(page.ct_descriptor)
     .bind(page.header)
     .bind(page.description)
@@ -83,15 +105,17 @@ pub async fn upsert_donation_page(
 pub async fn archive_donation_page(
     pool: &PgPool,
     nym: &str,
+    kind: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
-         WHERE nym = $1 AND archived_at IS NULL \
-         RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+         WHERE nym = $1 AND kind = $2 AND archived_at IS NULL \
+         RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(nym)
+    .bind(kind)
     .fetch_optional(pool)
     .await
 }
@@ -104,32 +128,34 @@ pub async fn archive_donation_page(
 pub async fn update_donation_page_image_hash(
     pool: &PgPool,
     nym: &str,
-    kind_column: &str,
+    kind: &str,
+    image_column: &str,
     new_sha256: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
-    let sql = match kind_column {
+    let sql = match image_column {
         "avatar_sha256" => {
-            "UPDATE donation_pages SET avatar_sha256 = $2, updated_at = now() \
-             WHERE nym = $1 \
-             RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+            "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
+             WHERE nym = $1 AND kind = $2 \
+             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
                        instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         "og_sha256" => {
-            "UPDATE donation_pages SET og_sha256 = $2, updated_at = now() \
-             WHERE nym = $1 \
-             RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+            "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
+             WHERE nym = $1 AND kind = $2 \
+             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
                        instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         _ => {
             return Err(sqlx::Error::Protocol(format!(
-                "invalid image kind column: {kind_column}"
+                "invalid image kind column: {image_column}"
             )))
         }
     };
     sqlx::query_as::<_, DonationPage>(sql)
         .bind(nym)
+        .bind(kind)
         .bind(new_sha256)
         .fetch_optional(pool)
         .await
@@ -138,15 +164,17 @@ pub async fn update_donation_page_image_hash(
 pub async fn get_donation_page_by_nym(
     pool: &PgPool,
     nym: &str,
+    kind: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
-        "SELECT nym, header, description, avatar_sha256, og_sha256, \
+        "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
                 ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
                 instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
-         FROM donation_pages WHERE nym = $1",
+         FROM donation_pages WHERE nym = $1 AND kind = $2",
     )
     .bind(nym)
+    .bind(kind)
     .fetch_optional(pool)
     .await
 }
@@ -156,6 +184,7 @@ pub async fn get_donation_page_by_nym(
 pub async fn allocate_next_liquid_for_donation_page<F>(
     pool: &PgPool,
     nym: &str,
+    kind: &str,
     derive_address: F,
 ) -> Result<Option<(String, i32, String)>, sqlx::Error>
 where
@@ -163,8 +192,10 @@ where
 {
     let mut tx = pool.begin().await?;
 
+    // Advisory lock is keyed per (nym, kind) so a hot Payment Page and a hot
+    // POS under the same nym advance their independent cursors concurrently.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-        .bind(format!("donation-page:{nym}"))
+        .bind(format!("donation-page:{nym}:{kind}"))
         .execute(&mut *tx)
         .await?;
 
@@ -172,11 +203,13 @@ where
         "SELECT ct_descriptor, next_addr_idx \
          FROM donation_pages \
          WHERE nym = $1 \
+           AND kind = $2 \
            AND enabled = TRUE \
            AND archived_at IS NULL \
            AND ct_descriptor IS NOT NULL",
     )
     .bind(nym)
+    .bind(kind)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -200,8 +233,9 @@ where
         .await?;
 
         if !in_use {
-            sqlx::query("UPDATE donation_pages SET next_addr_idx = $2 WHERE nym = $1")
+            sqlx::query("UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2")
                 .bind(nym)
+                .bind(kind)
                 .bind(address_index + 1)
                 .execute(&mut *tx)
                 .await?;
@@ -212,8 +246,9 @@ where
         address_index += 1;
     }
 
-    sqlx::query("UPDATE donation_pages SET next_addr_idx = $2 WHERE nym = $1")
+    sqlx::query("UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2")
         .bind(nym)
+        .bind(kind)
         .bind(address_index)
         .execute(&mut *tx)
         .await?;

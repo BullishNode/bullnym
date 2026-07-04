@@ -109,8 +109,20 @@ fn test_app(state: AppState) -> Router {
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/donation-page", put(donation_page::save))
+        .route("/donation-page/:nym", get(donation_page::get))
+        .route(
+            "/donation-page",
+            axum::routing::delete(donation_page::archive),
+        )
         .route("/sw.js", get(donation_render::service_worker))
         .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
+        .route(
+            "/:nym/pos/manifest.webmanifest",
+            get(donation_render::manifest_pos),
+        )
+        .route("/:nym/pos", get(donation_render::render_pos))
+        .route("/:nym/invoice", post(invoice::create_anonymous))
+        .route("/:nym/pos/invoice", post(invoice::create_anonymous_pos))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route(
@@ -343,6 +355,7 @@ struct DonationSaveSignFields<'a> {
     enabled: bool,
     pos_mode: Option<bool>,
     ct_descriptor: Option<&'a str>,
+    kind: Option<&'a str>,
 }
 
 fn sign_donation_page_save_with_keypair(
@@ -369,6 +382,9 @@ fn sign_donation_page_save_with_keypair(
     }
     if let Some(ct_descriptor) = save.ct_descriptor {
         fields.push(ct_descriptor);
+    }
+    if let Some(kind) = save.kind {
+        fields.push(kind);
     }
     sign_la_action(keypair, "donation-page-save", npub, nym, &fields)
 }
@@ -491,6 +507,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             header: "POS Store",
             description: "Counter checkout",
@@ -506,7 +523,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     .unwrap();
     assert!(row.pos_mode);
 
-    let fetched = pay_service::db::get_donation_page_by_nym(&pool, "posround")
+    let fetched = pay_service::db::get_donation_page_by_nym(&pool, "posround", pay_service::db::KIND_PAYMENT_PAGE)
         .await
         .unwrap()
         .unwrap();
@@ -516,6 +533,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: None,
             header: "Donation Store",
             description: "Tip jar",
@@ -546,6 +564,7 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             header: "",
             description: "Manifest test",
@@ -625,6 +644,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             header: "Existing POS",
             description: "Already counter mode",
@@ -653,6 +673,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             enabled: true,
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: None,
         },
     );
     let (status, body) = put_json(
@@ -674,7 +695,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym)
+    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
         .await
         .unwrap()
         .unwrap();
@@ -709,6 +730,7 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             enabled: true,
             pos_mode: Some(true),
             ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: None,
         },
     );
     let (status, body) = put_json(
@@ -734,12 +756,353 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym)
+    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
         .await
         .unwrap()
         .unwrap();
     assert!(row.pos_mode);
     assert_eq!(row.website.as_deref(), Some("https://example.com"));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "posco";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // Payment Page surface: kind omitted => payment_page (legacy contract).
+    let (sig, ts) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Alice Page",
+            description: "Tip jar",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: None,
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Alice Page", "description": "Tip jar", "display_currency": "USD",
+            "enabled": true, "timestamp": ts, "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["kind"], "payment_page");
+
+    // POS surface: kind='pos' with its own descriptor.
+    let (sig, ts) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Alice POS",
+            description: "Counter",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some("pos"),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Alice POS", "description": "Counter", "display_currency": "USD",
+            "enabled": true, "kind": "pos", "timestamp": ts, "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["kind"], "pos");
+    assert!(body["public_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/posco/pos"));
+
+    // Each surface resolves independently through the editor read.
+    let (status, page) = get_path(&app, "/donation-page/posco").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["kind"], "payment_page");
+    assert_eq!(page["header"], "Alice Page");
+    let (status, pos) = get_path(&app, "/donation-page/posco?kind=pos").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pos["kind"], "pos");
+    assert_eq!(pos["header"], "Alice POS");
+
+    // Two rows for one nym.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM donation_pages WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn pos_save_without_descriptor_is_rejected() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "posnodesc";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // kind='pos' with no descriptor: the POS surface owns wallet idx 103, so a
+    // save without a descriptor is rejected (KR-1) rather than settling POS
+    // receipts into the Lightning Address wallet.
+    let (sig, ts) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "No Desc POS",
+            description: "Missing wallet",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: None,
+            kind: Some("pos"),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub,
+            "header": "No Desc POS", "description": "Missing wallet", "display_currency": "USD",
+            "enabled": true, "kind": "pos", "timestamp": ts, "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "DonationPageInvalid");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn legacy_save_without_kind_writes_payment_page_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "poslegacy";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // A client that omits kind entirely (legacy byte layout) still verifies
+    // and lands in the payment_page row.
+    let (sig, ts) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Legacy",
+            description: "No kind field",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: None,
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Legacy", "description": "No kind field", "display_currency": "USD",
+            "enabled": true, "timestamp": ts, "signature": sig,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["kind"], "payment_page");
+
+    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.kind, "payment_page");
+    // No POS row was created.
+    assert!(
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_POS)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
+    // KR-1: a POS sale must settle to the POS surface's own descriptor + cursor
+    // and never burn a Lightning Address (users) index.
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "posalloc";
+    let (npub, _, _) = sign_registration(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // Distinct starting cursors: Lightning Address at 3, POS at 7.
+    sqlx::query("UPDATE users SET next_addr_idx = 3 WHERE nym = $1")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_POS,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "POS",
+            description: "Counter",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: None,
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE donation_pages SET next_addr_idx = 7 WHERE nym = $1 AND kind = 'pos'")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (address, index, descriptor) = pay_service::db::allocate_next_liquid_for_donation_page(
+        &pool,
+        nym,
+        pay_service::db::KIND_POS,
+        |d, i| {
+            pay_service::descriptor::derive_address(d, i)
+                .map_err(|e| sqlx::Error::Protocol(format!("{e}")))
+        },
+    )
+    .await
+    .unwrap()
+    .expect("pos allocation");
+
+    // Allocated from the POS cursor (7), settling to the POS descriptor.
+    assert_eq!(index, 7);
+    assert_eq!(descriptor, TEST_DESCRIPTOR);
+    assert_eq!(
+        address,
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, 7).unwrap()
+    );
+
+    // The Lightning Address cursor was untouched; the POS cursor advanced.
+    let la_idx: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(la_idx, 3, "POS allocation must not touch the LA cursor");
+    let pos_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = 'pos'")
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pos_idx, 8);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
+    // A misconfigured POS row (enabled, no descriptor) must make POS checkout
+    // hard-fail rather than fall back to the Lightning Address cursor (KR-1).
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "posnofb";
+    let (npub, _, _) = sign_registration(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET next_addr_idx = 5 WHERE nym = $1")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Save would reject a descriptor-less POS row; insert it directly to
+    // exercise the checkout branch's hard-fail.
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_POS,
+            ct_descriptor: None,
+            header: "Broken POS",
+            description: "No wallet",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: None,
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "DonationPageNotFound");
+
+    // The Lightning Address cursor was never advanced — no leak.
+    let la_idx: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(la_idx, 5);
 
     cleanup_db(&pool).await;
 }
@@ -818,9 +1181,14 @@ async fn register_without_verification_npub_has_no_nip05() {
     let (status, _) = get_path(&app, "/.well-known/lnurlp/legacyreg").await;
     assert_eq!(status, StatusCode::OK);
 
-    // No verification key supplied => no NIP-05 record => 404.
-    let (status, _) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // No verification key supplied => no NIP-05 record. The server returns the
+    // LNURL-style error envelope (HTTP 200 + status=ERROR) rather than
+    // publishing the auth key, so `names` is absent.
+    let (status, body) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "NymNotFound");
+    assert!(body.get("names").is_none());
 
     cleanup_db(&pool).await;
 }

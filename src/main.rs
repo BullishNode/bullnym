@@ -397,13 +397,25 @@ fn build_router(state: AppState) -> Router {
             )
             .route("/donation-page/:nym", get(donation_page::get))
             .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
+            .route(
+                "/:nym/pos/manifest.webmanifest",
+                get(donation_render::manifest_pos),
+            )
+            // Public POS terminal shell for the nym's POS surface (kind='pos').
+            .route("/:nym/pos", get(donation_render::render_pos))
             // Donation checkout now uses invoice sessions instead of the
             // removed donation callback/status endpoints.
             // Anonymous checkout invoice endpoints. The create route keeps a
             // tight body cap; status and offer routes are rate-limit gated.
+            // The POS surface reuses the same keyless flow, kind-scoped to the
+            // POS descriptor (idx 103) with no Lightning-Address fallback.
             .route(
                 "/:nym/invoice",
                 post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/:nym/pos/invoice",
+                post(invoice::create_anonymous_pos).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/:nym/i/:id", get(invoice::render_payment));
 
