@@ -78,6 +78,13 @@ pub struct FeaturesConfig {
     /// Donation/payment-page APIs and donation checkout invoice sessions.
     #[serde(default = "default_feature_enabled")]
     pub payment_pages: bool,
+    /// NIP-05 resolution at `/.well-known/nostr.json`. OFF by default and
+    /// independent of `lightning_address`: even with registration enabled,
+    /// the server publishes no NIP-05 records unless an operator turns this
+    /// on. Combined with opt-in `verification_npub` (ISS-S-01), this stops
+    /// the server-auth key from ever doubling as a public NIP-05 identity.
+    #[serde(default)]
+    pub nip05: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -86,6 +93,7 @@ impl Default for FeaturesConfig {
             lightning_address: default_feature_enabled(),
             invoices: default_feature_enabled(),
             payment_pages: default_feature_enabled(),
+            nip05: false,
         }
     }
 }

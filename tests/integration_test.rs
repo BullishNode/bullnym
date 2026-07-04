@@ -785,7 +785,10 @@ async fn register_and_resolve() {
 }
 
 #[tokio::test]
-async fn legacy_register_without_verification_npub_still_resolves() {
+async fn register_without_verification_npub_has_no_nip05() {
+    // NIP-05 is opt-in (ISS-S-01): a registration that omits verification_npub
+    // must NOT publish a nostr.json record. The server no longer falls back to
+    // the auth key (`npub`), so the lookup 404s rather than leaking it.
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -811,9 +814,13 @@ async fn legacy_register_without_verification_npub_still_resolves() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, body) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
+    // LNURL still resolves — only NIP-05 is opt-in.
+    let (status, _) = get_path(&app, "/.well-known/lnurlp/legacyreg").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["names"]["legacyreg"], npub);
+
+    // No verification key supplied => no NIP-05 record => 404.
+    let (status, _) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     cleanup_db(&pool).await;
 }
@@ -1613,7 +1620,7 @@ async fn registration_lifecycle_keeps_address_index_monotonic() {
         .unwrap()
         .unwrap();
     let reactivated =
-        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, &npub, 5)
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5)
             .await
             .unwrap();
     match reactivated {
@@ -3974,7 +3981,7 @@ async fn register_concurrent_does_not_exceed_cap() {
         &npub_hex,
         "filler-0",
         TEST_DESCRIPTOR,
-        &npub_hex,
+        None,
         3,
     )
     .await
@@ -3988,7 +3995,7 @@ async fn register_concurrent_does_not_exceed_cap() {
         &npub_hex,
         "filler-1",
         TEST_DESCRIPTOR,
-        &npub_hex,
+        None,
         3,
     )
     .await

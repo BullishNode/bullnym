@@ -53,15 +53,17 @@ policy inline.
 
 ## Registration Verification Npub
 
-- Current field: `verification_npub`
-- Compatibility behavior: if omitted at registration time, the server stores
-  `verification_npub = npub`.
-- Compatibility reason: older clients used one key for both Bullnym request
-  authentication and public NIP-05 verification. Current Get Paid clients can
-  keep the server-auth key separate from the key published in
-  `/.well-known/nostr.json`.
-- Removal condition: old clients that omit `verification_npub` are no longer
-  supported, and the registration contract is intentionally made strict.
+- Current field: `verification_npub` (optional).
+- Behavior: NIP-05 is opt-in. If omitted at registration time,
+  `verification_npub` is stored as NULL and `/.well-known/nostr.json` returns
+  no record for the nym. The server never falls back to the auth key (`npub`).
+- Compatibility reason: earlier server builds backfilled and reused the
+  auth key as the public NIP-05 identity when the field was omitted, which
+  collapsed the ADR-004 role separation (the signing key was published at
+  `/.well-known/nostr.json`). Migration 033 nulls those fallback-populated
+  rows. Clients that never sent `verification_npub` are unaffected — they
+  never consumed their own nostr.json.
+- Removal condition: none — opt-in is the intended long-term contract.
 
 ## Donation Page Descriptor
 

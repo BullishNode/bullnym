@@ -359,7 +359,6 @@ fn build_router(state: AppState) -> Router {
     if features.lightning_address {
         router = router
             .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
-            .route("/.well-known/nostr.json", get(nostr::nostr_json))
             .route("/lnurlp/callback/:nym", get(lnurl::callback))
             .route("/register", post(registration::register))
             .route("/register", put(registration::update_registration))
@@ -372,6 +371,14 @@ fn build_router(state: AppState) -> Router {
                 "/api/reservations/:nym",
                 get(registration::list_reservations),
             );
+    }
+
+    // NIP-05 is opt-in and gated by its own flag (default off) so the server
+    // never publishes `/.well-known/nostr.json` unless explicitly enabled.
+    // Requires registration (`lightning_address`) since it resolves nyms.
+    // See ISS-S-01 / ADR-004.
+    if features.lightning_address && features.nip05 {
+        router = router.route("/.well-known/nostr.json", get(nostr::nostr_json));
     }
 
     if features.payment_pages {

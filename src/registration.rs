@@ -165,11 +165,17 @@ pub async fn register(
     }
 
     descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
-    let verification_npub = req.verification_npub.as_deref().unwrap_or(&req.npub);
-    if !NOSTR_PUBKEY_HEX_REGEX.is_match(verification_npub) {
-        return Err(AppError::AuthError(
-            "verification_npub must be a 64-character hex public key".to_string(),
-        ));
+    // NIP-05 is opt-in: the verification key is stored only when the client
+    // deliberately supplies one. The server never falls back to the auth key
+    // (`npub`) — publishing that at `/.well-known/nostr.json` would collapse
+    // the ADR-004 role separation (see ISS-S-01). Omission => no NIP-05 record.
+    let verification_npub = req.verification_npub.as_deref();
+    if let Some(vn) = verification_npub {
+        if !NOSTR_PUBKEY_HEX_REGEX.is_match(vn) {
+            return Err(AppError::AuthError(
+                "verification_npub must be a 64-character hex public key".to_string(),
+            ));
+        }
     }
 
     // Distinct-npubs-per-IP cap, applied after the cheap input
@@ -186,8 +192,8 @@ pub async fn register(
         }
     }
 
-    let register_fields = match req.verification_npub.as_deref() {
-        Some(_) => vec![req.ct_descriptor.as_str(), verification_npub],
+    let register_fields = match verification_npub {
+        Some(vn) => vec![req.ct_descriptor.as_str(), vn],
         None => vec![req.ct_descriptor.as_str()],
     };
     auth::verify_la_v2(
