@@ -40,9 +40,15 @@ pub struct CallbackParams {
     pub outpoint: Option<String>,
     pub pubkey: Option<String>,
     pub sig: Option<String>,
-    // Forward-compat: mobile clients still send these, but the server no
-    // longer uses them. Kept in the deserialization shape so older clients
-    // don't fail with "unknown field" if they were ever to be rejected.
+    /// Blinding secret key (hex) for the confidential proof outpoint. Required
+    /// on the Liquid proof path so the server can unblind the UTXO and enforce
+    /// asset == L-BTC AND value >= `proof.min_proof_value_sat` (DG-7 /
+    /// ISS-S-04). The key belongs to the payer's own output and only unblinds
+    /// that one output.
+    pub blinding_key: Option<String>,
+    // Superseded by `blinding_key`: earlier drafts revealed the value and its
+    // blinding factors directly. Kept in the deserialization shape so clients
+    // still sending them don't fail with "unknown field".
     #[allow(dead_code)]
     pub value: Option<u64>,
     #[allow(dead_code)]
@@ -55,6 +61,7 @@ struct ProofFields {
     outpoint: String,
     pubkey: String,
     sig: String,
+    blinding_key: String,
 }
 
 impl CallbackParams {
@@ -63,6 +70,7 @@ impl CallbackParams {
             outpoint: self.outpoint.clone()?,
             pubkey: self.pubkey.clone()?,
             sig: self.sig.clone()?,
+            blinding_key: self.blinding_key.clone()?,
         })
     }
 }
@@ -294,6 +302,16 @@ async fn serve_liquid(
                 if !unspent {
                     return Err(AppError::UtxoSpent.into());
                 }
+
+                // Unblind the confidential proof output and enforce the L-BTC
+                // value floor. This makes the anti-enumeration cost real: a
+                // dust UTXO no longer satisfies the proof (DG-7 / ISS-S-04).
+                crate::utxo::assert_proof_utxo_value(
+                    txout,
+                    &proof.blinding_key,
+                    crate::invoice::LIQUID_BTC_ASSET_ID,
+                    state.config.proof.min_proof_value_sat,
+                )?;
 
                 db::allocate_outpoint_address(&state.db, nym, &proof.outpoint, &proof.pubkey)
                     .await?

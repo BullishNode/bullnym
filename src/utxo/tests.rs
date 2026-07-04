@@ -141,6 +141,99 @@ fn history_txids_rejects_malformed_shape() {
     ));
 }
 
+/// Build a confidential L-BTC output of `value` sat payable to a fresh
+/// blinding keypair, returning the output and the blinding secret key hex the
+/// payer would supply. Uses the same elements blinding primitives the wallet
+/// uses to fund outputs.
+fn confidential_lbtc_output(value: u64) -> (elements::TxOut, String) {
+    use lwk_wollet::elements;
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = secp256k1::rand::thread_rng();
+
+    // Receiver (payer) blinding keypair — its secret key unblinds the output.
+    let bsk = secp256k1::SecretKey::new(&mut rng);
+    let bpk = secp256k1::PublicKey::from_secret_key(&secp, &bsk);
+
+    let spk = elements::Script::new_v0_wpkh(&elements::WPubkeyHash::from_raw_hash(
+        hash160::Hash::hash(&[9u8; 33]),
+    ));
+    let lbtc = elements::AssetId::from_str(crate::invoice::LIQUID_BTC_ASSET_ID).unwrap();
+
+    // A spent-input secret of the same asset so the surjection proof (asset
+    // provenance) can be built; value matches so the last-output blinding
+    // balances.
+    let in_secrets = elements::TxOutSecrets::new(
+        lbtc,
+        elements::confidential::AssetBlindingFactor::new(&mut rng),
+        value,
+        elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+
+    let (txout, _abf, _vbf, _eph) = elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        value,
+        lbtc,
+        spk,
+        bpk,
+        &[in_secrets],
+        &[],
+    )
+    .expect("build confidential output");
+
+    (txout, hex::encode(bsk.secret_bytes()))
+}
+
+#[test]
+fn proof_value_passes_when_at_or_above_floor() {
+    let (txout, bk) = confidential_lbtc_output(5000);
+    let got =
+        assert_proof_utxo_value(&txout, &bk, crate::invoice::LIQUID_BTC_ASSET_ID, 1000).unwrap();
+    assert_eq!(got, 5000, "unblind recovers the true value");
+}
+
+#[test]
+fn proof_value_rejects_below_floor() {
+    // A dust output must not satisfy the anti-enumeration floor (DG-7).
+    let (txout, bk) = confidential_lbtc_output(500);
+    assert!(matches!(
+        assert_proof_utxo_value(&txout, &bk, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        Err(AppError::ProofOfFundsInvalid(_))
+    ));
+}
+
+#[test]
+fn proof_value_rejects_wrong_asset() {
+    let (txout, bk) = confidential_lbtc_output(5000);
+    let not_lbtc = "0000000000000000000000000000000000000000000000000000000000000001";
+    assert!(matches!(
+        assert_proof_utxo_value(&txout, &bk, not_lbtc, 1000),
+        Err(AppError::ProofOfFundsInvalid(_))
+    ));
+}
+
+#[test]
+fn proof_value_rejects_wrong_blinding_key() {
+    // A blinding key that does not match the output cannot rewind the
+    // rangeproof, so the value can never be forged past the floor.
+    let (txout, _bk) = confidential_lbtc_output(5000);
+    let mut rng = secp256k1::rand::thread_rng();
+    let wrong = hex::encode(secp256k1::SecretKey::new(&mut rng).secret_bytes());
+    assert!(matches!(
+        assert_proof_utxo_value(&txout, &wrong, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        Err(AppError::ProofOfFundsInvalid(_))
+    ));
+}
+
+#[test]
+fn proof_value_rejects_malformed_blinding_key() {
+    let (txout, _bk) = confidential_lbtc_output(5000);
+    assert!(matches!(
+        assert_proof_utxo_value(&txout, "notahex", crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        Err(AppError::ProofOfFundsInvalid(_))
+    ));
+}
+
 #[test]
 fn transaction_spends_exact_outpoint_only() {
     let target = elements::Txid::from_slice(&[1u8; 32]).unwrap();

@@ -73,6 +73,55 @@ pub fn script_matches_pubkey(script: &elements::Script, pubkey: &PublicKey) -> b
     script == &expected
 }
 
+// --- Confidential value/asset proof ---
+
+/// Unblind a payer-supplied confidential proof UTXO and enforce that it holds
+/// at least `min_value_sat` of L-BTC.
+///
+/// The LUD-22 proof-of-funds cost floor is only real if the server can see the
+/// UTXO's value. Liquid outputs are confidential (Pedersen value commitment +
+/// blinded asset generator), so the payer includes the output's blinding
+/// secret key. Elements' `TxOut::unblind` performs the ECDH against the
+/// output nonce and rewinds the rangeproof, recovering the true `(asset,
+/// value)` behind the commitments — the payer cannot lie about either without
+/// the rewind failing. We then require the asset to be L-BTC and the value to
+/// clear the floor (DG-7 / ISS-S-04).
+///
+/// Returns the unblinded value on success. This is verification-only crypto:
+/// no secret of ours is involved; the blinding key belongs to the payer's
+/// output and only unblinds that one output.
+pub fn assert_proof_utxo_value(
+    txout: &elements::TxOut,
+    blinding_key_hex: &str,
+    expected_asset_hex: &str,
+    min_value_sat: u64,
+) -> Result<u64, AppError> {
+    let secp = elements::secp256k1_zkp::Secp256k1::verification_only();
+    let blinding_sk = elements::secp256k1_zkp::SecretKey::from_str(blinding_key_hex)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("blinding key parse: {e}")))?;
+
+    let secrets = txout
+        .unblind(&secp, blinding_sk)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("could not unblind proof UTXO: {e}")))?;
+
+    let expected_asset = elements::AssetId::from_str(expected_asset_hex)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("expected asset id parse: {e}")))?;
+    if secrets.asset != expected_asset {
+        return Err(AppError::ProofOfFundsInvalid(
+            "proof UTXO asset is not L-BTC".into(),
+        ));
+    }
+
+    if secrets.value < min_value_sat {
+        return Err(AppError::ProofOfFundsInvalid(format!(
+            "proof UTXO value {} sat is below the {min_value_sat} sat minimum",
+            secrets.value
+        )));
+    }
+
+    Ok(secrets.value)
+}
+
 // --- Outpoint parsing ---
 
 pub struct ParsedOutpoint {
