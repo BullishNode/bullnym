@@ -26,7 +26,11 @@ enabled = true
 [proof]
 # LUD-22 proof-of-funds floor. ENFORCED: the callback unblinds the payer's
 # confidential proof UTXO (with the supplied blinding key) and rejects it
-# unless the asset is L-BTC and its value is at least this many sats.
+# unless the asset is L-BTC and its value is at least this many sats. The
+# recovered asset is rebound to the on-chain asset generator, so a UTXO that
+# commits to another asset while claiming L-BTC in its rangeproof message is
+# rejected. Only confidential outputs qualify: explicit-value/explicit-asset
+# (non-confidential) outputs are rejected by design.
 min_proof_value_sat = 1000
 
 [rate_limit]
