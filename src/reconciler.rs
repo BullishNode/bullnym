@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ReconcilerConfig;
 use crate::db::{self, ReconcilerSwap, SwapStatus};
 use crate::invoice;
+use crate::AppState;
 
 /// Spawn the reconciler background task. One task per process.
 pub fn spawn(
@@ -59,6 +60,86 @@ pub fn spawn(
             }
         }
     });
+}
+
+/// Chain-swap reconciler. The reverse `spawn` above only touches `swap_records`;
+/// chain swaps have no other polling recovery, so a dropped Boltz webhook during
+/// `pending`/`user_lock_*`/`server_lock_*` would strand the swap forever. This
+/// polls Boltz `get_swap` for every non-terminal chain swap and re-drives it
+/// through the same handler a webhook would (`claimer::handle_chain_swap_webhook`),
+/// which is idempotent. Needs `AppState` because claiming a chain swap requires
+/// electrum/boltz endpoints, the utxo backend, and accounting tolerances.
+pub fn spawn_chain(state: AppState, config: Arc<ReconcilerConfig>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let client = BoltzApiClientV2::new(state.config.boltz.api_url.clone(), None);
+        let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
+        tick.tick().await; // skip the immediate first tick (same as reverse spawn)
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("chain reconciler: shutting down");
+                    return;
+                }
+                _ = tick.tick() => {
+                    if let Err(e) = run_one_chain_tick(&state, &client, &config, &cancel).await {
+                        tracing::error!("chain reconciler tick failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn run_one_chain_tick(
+    state: &AppState,
+    client: &BoltzApiClientV2,
+    config: &ReconcilerConfig,
+    cancel: &CancellationToken,
+) -> Result<(), sqlx::Error> {
+    let stale = db::list_non_terminal_chain_swaps_oldest_first(
+        &state.db,
+        config.min_age_secs,
+        config.max_per_tick,
+    )
+    .await?;
+
+    if stale.is_empty() {
+        tracing::debug!("chain reconciler: no stale chain swaps");
+        return Ok(());
+    }
+
+    tracing::info!("chain reconciler: scanning {} stale chain swap(s)", stale.len());
+
+    for swap in &stale {
+        if cancel.is_cancelled() {
+            tracing::info!("chain reconciler: cancellation requested mid-tick; exiting early");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(config.inter_call_delay_ms)).await;
+
+        let remote = match client.get_swap(&swap.boltz_swap_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "chain reconciler: get_swap({}) failed: {e}",
+                    swap.boltz_swap_id
+                );
+                continue;
+            }
+        };
+
+        // Re-drive through the idempotent webhook handler with Boltz's current
+        // view — exactly what a delivered webhook would have done.
+        if let Err(e) = crate::claimer::handle_chain_swap_webhook(state, swap, &remote.status).await
+        {
+            tracing::error!(
+                "chain reconciler: handle failed for {}: {e}",
+                swap.boltz_swap_id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_one_tick(

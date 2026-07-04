@@ -326,6 +326,32 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
 }
 
 #[test]
+fn chain_swap_expired_is_not_terminal() {
+    // `swap.expired` is Boltz's wall-clock timer, not the on-chain lockup
+    // timeout — the server lockup stays claimable until timeoutBlockHeight.
+    // It must NOT map to terminal `Expired` (which abandoned claimable funds);
+    // it is handled in handle_chain_swap_webhook (flip cooperative_refused,
+    // keep sweepable), so the raw mapping returns None.
+    assert!(chain_swap_status_from_boltz_status("swap.expired").is_none());
+}
+
+#[test]
+fn chain_swap_status_mapping_still_advances_and_terminalizes_correctly() {
+    assert!(matches!(
+        chain_swap_status_from_boltz_status("transaction.server.confirmed"),
+        Some(ChainSwapStatus::ServerLockConfirmed)
+    ));
+    assert!(matches!(
+        chain_swap_status_from_boltz_status("transaction.refunded"),
+        Some(ChainSwapStatus::Refunded)
+    ));
+    assert!(matches!(
+        chain_swap_status_from_boltz_status("transaction.lockupFailed"),
+        Some(ChainSwapStatus::LockupFailed)
+    ));
+}
+
+#[test]
 fn electrum_host_port_strips_scheme_for_boltz_client() {
     // boltz-client re-adds ssl://; we must hand it a bare host:port.
     assert_eq!(electrum_host_port("ssl://les.bullbitcoin.com:50002"), "les.bullbitcoin.com:50002");
