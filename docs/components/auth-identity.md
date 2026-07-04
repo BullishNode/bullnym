@@ -8,7 +8,7 @@ and receive descriptors.
 | Term | Meaning |
 |---|---|
 | `npub` | Server-auth owner key. It signs Bullnym actions and owns nyms, donation pages, and wallet-origin invoices. |
-| `verification_npub` | Public NIP-05 key returned from `/.well-known/nostr.json`. If omitted at registration, it defaults to `npub`. |
+| `verification_npub` | Optional public NIP-05 key returned from `/.well-known/nostr.json` only when supplied at registration and NIP-05 is enabled. Omission publishes no NIP-05 record. |
 | `nym` | Public payment namespace. It backs `nym@domain`, `/<nym>`, and linked invoice URLs. |
 | CT descriptor | Liquid confidential descriptor used to derive fresh receive addresses. It is receive capability, not account identity. |
 

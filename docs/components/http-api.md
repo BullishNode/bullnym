@@ -9,7 +9,7 @@ live in feature modules such as `registration`, `lnurl`, `donation_page`, and
 | Method | Path | Component | Purpose |
 |---|---|---|---|
 | `GET` | `/.well-known/lnurlp/:nym` | Lightning Address | LNURL-pay metadata with callback URL, min/max sendable, and advertised payment methods. |
-| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 | Returns the public `verification_npub` for a registered nym. |
+| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 | Optional endpoint. Returns the public `verification_npub` only for nyms that supplied one and when NIP-05 is enabled. |
 | `GET` | `/lnurlp/callback/:nym` | Lightning Address | Returns either a BOLT11 Lightning invoice or a LUD-22 Liquid address. |
 
 ## Nym Lifecycle

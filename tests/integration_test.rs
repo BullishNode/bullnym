@@ -77,6 +77,10 @@ fn test_config() -> Config {
 }
 
 fn test_state(pool: PgPool) -> AppState {
+    test_state_with_config(pool, test_config())
+}
+
+fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
     let swap_master_key = SwapMasterKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         None,
@@ -88,7 +92,7 @@ fn test_state(pool: PgPool) -> AppState {
 
     AppState {
         db: pool,
-        config: Arc::new(test_config()),
+        config: Arc::new(config),
         boltz: Arc::new(BoltzService::new(
             "http://127.0.0.1:1",
             swap_master_key,
@@ -101,6 +105,12 @@ fn test_state(pool: PgPool) -> AppState {
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
     }
+}
+
+fn test_state_with_nip05(pool: PgPool) -> AppState {
+    let mut config = test_config();
+    config.features.nip05 = true;
+    test_state_with_config(pool, config)
 }
 
 fn test_app(state: AppState) -> Router {
@@ -1111,7 +1121,7 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
 async fn register_and_resolve() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state_with_nip05(pool.clone()));
 
     let (npub, sig, timestamp) = sign_registration("alice", TEST_DESCRIPTOR);
     let (status, body) = post_json(
@@ -1163,7 +1173,7 @@ async fn register_without_verification_npub_has_no_nip05() {
     let (sig, timestamp) =
         sign_la_action(&keypair, "register", &npub, "legacyreg", &[TEST_DESCRIPTOR]);
 
-    let (status, _) = post_json(
+    let (status, body) = post_json(
         &app,
         "/register",
         json!({
@@ -1176,6 +1186,7 @@ async fn register_without_verification_npub_has_no_nip05() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["nip05"], Value::Null);
 
     // LNURL still resolves — only NIP-05 is opt-in.
     let (status, _) = get_path(&app, "/.well-known/lnurlp/legacyreg").await;
@@ -1194,10 +1205,38 @@ async fn register_without_verification_npub_has_no_nip05() {
 }
 
 #[tokio::test]
-async fn register_nip05_resolves_verification_npub() {
+async fn register_response_has_null_nip05_when_feature_disabled() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
+
+    let (npub, sig, timestamp) = sign_registration("nipoff", TEST_DESCRIPTOR);
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "nipoff",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "verification_npub": npub,
+            "signature": sig,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["lightning_address"], "nipoff@test.example.com");
+    assert_eq!(body["nip05"], Value::Null);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn register_nip05_resolves_verification_npub() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state_with_nip05(pool.clone()));
 
     let secp = Secp256k1::new();
     let auth_keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());

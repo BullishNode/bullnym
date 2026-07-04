@@ -289,9 +289,10 @@ bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
 | `delete` | (none) |
 
 If `verification_npub` is supplied, it is included in the signed register
-payload and becomes the key published through NIP-05. If omitted, the server
-stores `verification_npub = npub` for legacy clients. The server verifies the
-Schnorr signature against `SHA-256(message)` and rejects timestamps outside
+payload and becomes the key published through NIP-05 when `[features].nip05`
+is enabled. If omitted, the server stores no NIP-05 verification key and never
+falls back to publishing the auth `npub`. The server verifies the Schnorr
+signature against `SHA-256(message)` and rejects timestamps outside
 `±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged,
 untimestamped) is still accepted with a deprecation warning to support older
 mobile builds; it will be removed once warning volume drops.
@@ -338,6 +339,7 @@ dist_dir = "pwa/dist"
 lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
 invoices          = true    # wallet-origin invoice APIs and /invoice/:id
 payment_pages     = true    # donation/payment-page APIs and checkout invoices
+nip05             = false   # opt-in /.well-known/nostr.json publishing
 
 [donation]
 image_root_path       = "/opt/payservice/data/images"

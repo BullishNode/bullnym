@@ -93,7 +93,10 @@ impl QuotaView {
 pub struct RegisterResponse {
     pub nym: String,
     pub lightning_address: String,
-    pub nip05: String,
+    /// Public NIP-05 identifier only when publication is actually configured:
+    /// the registration supplied `verification_npub` and `[features].nip05`
+    /// is enabled. Otherwise `null`.
+    pub nip05: Option<String>,
     /// Lifetime nym quota AFTER this register. Mobile reads this so it
     /// doesn't need a follow-up `/register/lookup` round trip.
     pub quota: QuotaView,
@@ -233,7 +236,11 @@ pub async fn register(
     }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
-    let nip05 = lightning_address.clone();
+    let nip05 = if verification_npub.is_some() && state.config.features.nip05 {
+        Some(lightning_address.clone())
+    } else {
+        None
+    };
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
 
     Ok((

@@ -63,10 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     tracing::info!(
-        "features: lightning_address={} invoices={} payment_pages={} workers={}",
+        "features: lightning_address={} invoices={} payment_pages={} nip05={} workers={}",
         config.features.lightning_address,
         config.features.invoices,
         config.features.payment_pages,
+        config.features.nip05,
         config.workers.enabled,
     );
 

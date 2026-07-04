@@ -10,6 +10,7 @@ electrum_url = "les.bullbitcoin.com:995"
 lightning_address = true
 invoices = true
 payment_pages = true
+nip05 = false
 
 [limits]
 # Match prod so simulator's amount=100000 msat works.
