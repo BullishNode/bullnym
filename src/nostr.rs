@@ -37,8 +37,15 @@ pub async fn nostr_json(
         .await?
         .ok_or_else(|| AppError::NymNotFound(query.name.clone()))?;
 
+    // NIP-05 is opt-in: a nym that never registered a dedicated verification
+    // key has no public NIP-05 record. Return 404 rather than falling back to
+    // the auth key (`npub`), which would collapse ADR-004 role separation.
+    let verification_npub = user
+        .verification_npub
+        .ok_or_else(|| AppError::NymNotFound(query.name.clone()))?;
+
     let mut names = HashMap::new();
-    names.insert(user.nym, user.verification_npub);
+    names.insert(user.nym, verification_npub);
 
     Ok(Json(Nip05Response { names }))
 }

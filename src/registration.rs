@@ -93,7 +93,10 @@ impl QuotaView {
 pub struct RegisterResponse {
     pub nym: String,
     pub lightning_address: String,
-    pub nip05: String,
+    /// Public NIP-05 identifier only when publication is actually configured:
+    /// the registration supplied `verification_npub` and `[features].nip05`
+    /// is enabled. Otherwise `null`.
+    pub nip05: Option<String>,
     /// Lifetime nym quota AFTER this register. Mobile reads this so it
     /// doesn't need a follow-up `/register/lookup` round trip.
     pub quota: QuotaView,
@@ -165,11 +168,17 @@ pub async fn register(
     }
 
     descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
-    let verification_npub = req.verification_npub.as_deref().unwrap_or(&req.npub);
-    if !NOSTR_PUBKEY_HEX_REGEX.is_match(verification_npub) {
-        return Err(AppError::AuthError(
-            "verification_npub must be a 64-character hex public key".to_string(),
-        ));
+    // NIP-05 is opt-in: the verification key is stored only when the client
+    // deliberately supplies one. The server never falls back to the auth key
+    // (`npub`) — publishing that at `/.well-known/nostr.json` would collapse
+    // the ADR-004 role separation (see ISS-S-01). Omission => no NIP-05 record.
+    let verification_npub = req.verification_npub.as_deref();
+    if let Some(vn) = verification_npub {
+        if !NOSTR_PUBKEY_HEX_REGEX.is_match(vn) {
+            return Err(AppError::AuthError(
+                "verification_npub must be a 64-character hex public key".to_string(),
+            ));
+        }
     }
 
     // Distinct-npubs-per-IP cap, applied after the cheap input
@@ -186,8 +195,8 @@ pub async fn register(
         }
     }
 
-    let register_fields = match req.verification_npub.as_deref() {
-        Some(_) => vec![req.ct_descriptor.as_str(), verification_npub],
+    let register_fields = match verification_npub {
+        Some(vn) => vec![req.ct_descriptor.as_str(), vn],
         None => vec![req.ct_descriptor.as_str()],
     };
     auth::verify_la_v2(
@@ -227,7 +236,11 @@ pub async fn register(
     }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
-    let nip05 = lightning_address.clone();
+    let nip05 = if verification_npub.is_some() && state.config.features.nip05 {
+        Some(lightning_address.clone())
+    } else {
+        None
+    };
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
 
     Ok((

@@ -32,9 +32,9 @@ machinery, and reflects the Get Paid descriptor split introduced by
 nyms and invoices.
 
 `verification_npub` is the public NIP-05 key exposed by
-`/.well-known/nostr.json`. Legacy registrations that do not provide it default
-to `npub`, but current mobile clients can keep the server-auth key and public
-verification key distinct.
+`/.well-known/nostr.json` only when it is explicitly supplied at registration
+and NIP-05 is enabled. Registrations that omit it publish no NIP-05 record;
+the server never falls back to the auth `npub`.
 
 `nym` is a public alias and route namespace owned by one `npub`.
 

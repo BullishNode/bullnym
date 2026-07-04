@@ -107,11 +107,11 @@ We considered keeping MRH (Magic Routing Hint) alongside LUD-22 as an alternativ
 
 MRH has no commitment from the sender. Anyone can hit the LNURL callback over HTTP, get an address allocated and embedded in the bolt11 routing hint, and never pay. The address counter on the recipient's CT descriptor advances anyway. With enough sustained traffic, the counter ratchets past the recipient wallet's gap limit, and gap-limit-bounded scanners (BDK, LWK by default) silently stop picking up new payments until the user does a manual full rescan. Funds aren't lost, but the receive UX breaks. The only available defense for MRH is per-source-IP throttling, which is bounded by what legitimate senders tolerate rather than by what attackers tolerate. The TTL-recycle trick we use elsewhere doesn't apply, because the address stays a valid Liquid receive address indefinitely after the bolt11 expires.
 
-LUD-22 fixes this at the protocol layer by requiring the sender to sign ownership of a Liquid UTXO worth at least 100 sats before the server hands out an address. The commitment is small but it changes everything about the attack economics. On every dimension that matters, the contrast is sharp:
+LUD-22 fixes this at the protocol layer by requiring the sender to prove ownership of a Liquid UTXO worth at least 1,000 sats before the server hands out an address. The server unblinds the confidential proof output (with the payer-supplied blinding key) to enforce the value, so the commitment is a real cost rather than an advisory one. On every dimension that matters, the contrast is sharp:
 
 | Property | MRH | LUD-22 |
 |---|---|---|
-| Cost per request to attacker | Zero (HTTP GET) | ≥ 100 sats committed on-chain |
+| Cost per request to attacker | Zero (HTTP GET) | ≥ 1,000 sats committed on-chain (value cryptographically enforced) |
 | Idempotency on repeat | None — counter advances every time | Cache hit (same outpoint and nym → same address) |
 | Recovery after attack | None — damage is cumulative | Automatic via TTL recycling |
 | Bound on damage | Unbounded over time | 3 nyms per UTXO per hour |
@@ -120,16 +120,16 @@ The cost of deprecating MRH is borne by senders that supported MRH but not LUD-2
 
 ## LUD-22 rate limiting
 
-The threat we are mitigating is descriptor-index exhaustion. Every address handed out via LUD-22 advances the recipient's CT descriptor counter. If an attacker can advance it freely, gap-limit-bounded wallets eventually stop seeing new payments. The 100-sat UTXO ownership proof required by LUD-22 is what makes a real defense possible, because every request now costs the attacker something on-chain. That single commitment gates four cascading mechanisms:
+The threat we are mitigating is descriptor-index exhaustion. Every address handed out via LUD-22 advances the recipient's CT descriptor counter. If an attacker can advance it freely, gap-limit-bounded wallets eventually stop seeing new payments. The 1,000-sat UTXO ownership proof required by LUD-22 — with the value enforced by unblinding the confidential proof output, not merely asserted by the sender — is what makes a real defense possible, because every request now costs the attacker something on-chain. That commitment gates several mechanisms:
 
 1. **Idempotent mapping.** Each `(nym, outpoint)` pair always resolves to the same address. A repeated request with the same UTXO targeting the same nym hits cache; the descriptor counter does not advance. An attacker who simply repeats requests makes no progress.
-2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour. To probe more, the attacker has to rotate UTXOs, which means real on-chain Liquid spends with real network fees and confirmation delays.
-3. **Per-pubkey volume cap.** The signing key on the proof is rate-limited to 10 requests per hour. Spreading volume across many keys forces spreading across many UTXOs, which compounds the on-chain cost.
-4. **TTL recycling.** Pending reservations release after one hour. An attacker who never pays cannot hold address allocations indefinitely; the descriptor counter is bounded by the steady-state hostage size, not by total request count over time.
+2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour (`distinct_nyms_per_outpoint`). To probe more, the attacker has to rotate UTXOs, which means real on-chain Liquid spends with real network fees and confirmation delays. This is the primary binding gate.
+3. **TTL recycling.** Pending reservations release after one hour. An attacker who never pays cannot hold address allocations indefinitely; the descriptor counter is bounded by the steady-state hostage size, not by total request count over time.
+4. **Per-pubkey volume cap.** A secondary gate keyed on the proof signing key (`per_pubkey_limit` / `per_pubkey_window_secs`). It is intended as defense-in-depth on top of the per-outpoint cap; deployments that set it high (as the shipped simulator config does) rely on the per-outpoint and per-IP gates as the effective bounds. Tighten it in production to bound per-key volume directly.
 
-Standard per-IP rate limiting applies on top of all four.
+Standard per-IP rate limiting (`per_ip_limit` / `per_ip_window_secs`) applies on top of all of these and, with the per-outpoint fan-out cap, is one of the two primary gates.
 
-The combined effect is that the cost of a sustained enumeration attack scales with the on-chain Liquid UTXO supply the attacker controls, not with their willingness to send HTTP requests. Probing 1,000 nyms in an hour requires at least 334 distinct UTXOs of at least 100 sats each, all funded on-chain — a cost that has no analogue under MRH.
+The combined effect is that the cost of a sustained enumeration attack scales with the on-chain Liquid UTXO supply the attacker controls, not with their willingness to send HTTP requests. Probing 1,000 nyms in an hour requires at least 334 distinct UTXOs of at least 1,000 sats each, all funded on-chain — a cost that has no analogue under MRH.
 
 ## Nostr nym registration with NIP05
 
@@ -197,10 +197,10 @@ updates around claim and accounting transitions.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/.well-known/lnurlp/:nym` | LUD-06 metadata (callback URL, min/max sendable, `payment_methods`) |
-| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 identity provider, returns the registered npub |
+| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 identity provider (opt-in; route enabled only when `[features] nip05` is on, default off). Returns the nym's `verification_npub` only when one was explicitly registered; a nym with no verification key resolves to no record (the server never publishes the auth key) |
 | `GET` | `/lnurlp/callback/:nym` | LNURL-pay callback. Returns a BOLT11 invoice (default Lightning rail) or a Liquid address (LUD-22 with `payment_method=L-BTC` plus a UTXO ownership proof) |
 
-Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `pubkey`, and `sig` query params. The server verifies the Schnorr signature, checks the UTXO is unspent on Liquid Electrum, confirms its value is at least `proof.min_proof_value_sat` (default 1000), and returns either the cached `(nym, outpoint)` address or a freshly allocated one from the user's CT descriptor.
+Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `pubkey`, `sig`, and `blinding_key` query params. The server verifies the ECDSA ownership signature, checks the UTXO is unspent on Liquid Electrum, and unblinds the confidential output with the supplied blinding key to confirm the asset is L-BTC and the value is at least `proof.min_proof_value_sat` (default 1000). The unblinded asset is rebound to the on-chain asset generator, so an output that commits to another asset while its rangeproof message claims L-BTC is rejected; only confidential outputs qualify (explicit-value/explicit-asset outputs are rejected by design). It then returns either the cached `(nym, outpoint)` address or a freshly allocated one from the user's CT descriptor.
 
 ### Authenticated nym lifecycle
 
@@ -289,9 +289,10 @@ bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
 | `delete` | (none) |
 
 If `verification_npub` is supplied, it is included in the signed register
-payload and becomes the key published through NIP-05. If omitted, the server
-stores `verification_npub = npub` for legacy clients. The server verifies the
-Schnorr signature against `SHA-256(message)` and rejects timestamps outside
+payload and becomes the key published through NIP-05 when `[features].nip05`
+is enabled. If omitted, the server stores no NIP-05 verification key and never
+falls back to publishing the auth `npub`. The server verifies the Schnorr
+signature against `SHA-256(message)` and rejects timestamps outside
 `±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged,
 untimestamped) is still accepted with a deprecation warning to support older
 mobile builds; it will be removed once warning volume drops.
@@ -338,6 +339,7 @@ dist_dir = "pwa/dist"
 lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
 invoices          = true    # wallet-origin invoice APIs and /invoice/:id
 payment_pages     = true    # donation/payment-page APIs and checkout invoices
+nip05             = false   # opt-in /.well-known/nostr.json publishing
 
 [donation]
 image_root_path       = "/opt/payservice/data/images"

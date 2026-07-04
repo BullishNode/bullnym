@@ -115,6 +115,7 @@ fn live_template_renders_social_preview_metadata() {
 fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
     let page = db::DonationPage {
         nym: "manifestnym".to_string(),
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
         ct_descriptor: None,
         next_addr_idx: 0,
         header: "   ".to_string(),
@@ -130,7 +131,7 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, "/manifestnym");
 
     assert_eq!(manifest.name, "manifestnym");
     assert_eq!(manifest.short_name, "manifestnym");
@@ -148,6 +149,7 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
 fn web_manifest_uses_header_for_name() {
     let page = db::DonationPage {
         nym: "alice".to_string(),
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
         ct_descriptor: None,
         next_addr_idx: 0,
         header: "Alice Coffee Counter".to_string(),
@@ -163,7 +165,7 @@ fn web_manifest_uses_header_for_name() {
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, "/alice");
 
     assert_eq!(manifest.name, "Alice Coffee Counter");
     assert_eq!(manifest.short_name, "Alice Coffee");
@@ -193,6 +195,7 @@ fn pwa_shell_injects_config_and_og_placeholders() {
         shell,
         &config,
         Some("https://bullpay.ca/img/alice/og.jpg?v=a&b"),
+        "/alice/manifest.webmanifest",
     )
     .expect("injects shell");
 
@@ -216,10 +219,13 @@ fn pwa_shell_injects_config_and_og_placeholders() {
 }
 
 #[test]
-fn pwa_shell_escapes_manifest_nym_attr() {
+fn pwa_shell_escapes_manifest_href_attr() {
+    // Defense-in-depth: the manifest href is HTML-attr-escaped before it lands
+    // in the <link>. A valid slug can't contain quotes (is_valid_slug), so the
+    // caller never passes one, but the escaping must hold regardless.
     let shell = "<!-- BULLNYM_MANIFEST -->";
     let config = PwaConfigView {
-        nym: r#"bad"name"#,
+        nym: "alice",
         mode: "donation",
         currency: "USD",
         header: "Header",
@@ -234,7 +240,8 @@ fn pwa_shell_escapes_manifest_nym_attr() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None).expect("injects shell");
+    let html = inject_pwa_shell(shell, &config, None, r#"/bad"name/manifest.webmanifest"#)
+        .expect("injects shell");
 
     assert!(html.contains(r#"<link rel="manifest" href="/bad&quot;name/manifest.webmanifest">"#));
 }
@@ -258,7 +265,8 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None).expect("injects shell");
+    let html = inject_pwa_shell(shell, &config, None, "/alice/manifest.webmanifest")
+        .expect("injects shell");
 
     assert!(html.contains(r#"\u003c/script>"#));
     assert!(!html.contains("</script><script>"));

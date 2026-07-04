@@ -365,7 +365,7 @@ async fn dispatch_webhook(
     Ok("ok")
 }
 
-async fn handle_chain_swap_webhook(
+pub(crate) async fn handle_chain_swap_webhook(
     state: &AppState,
     swap: &db::ChainSwapRecord,
     boltz_status: &str,
@@ -387,6 +387,37 @@ async fn handle_chain_swap_webhook(
             local_status = %swap.status,
             "boltz reports chain swap claimed; local claim path remains authoritative for invoice accounting"
         );
+        try_claim_chain_swap_with_retry(
+            &state.db,
+            swap,
+            &state.config.boltz.electrum_url,
+            &state.config.boltz.api_url,
+            state.config.claim.max_claim_attempts,
+            state.utxo_backend.as_ref(),
+            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+        )
+        .await;
+        return Ok(());
+    }
+
+    if boltz_status == "swap.expired" {
+        // Wall-clock swap timer expired. The on-chain server lockup is still
+        // claimable until timeoutBlockHeight, but Boltz now refuses the
+        // cooperative claim. Flip to the script path and keep the row sweepable
+        // — do NOT terminalize (that abandons claimable funds). Mirrors the
+        // reverse-swap `swap.expired` arm in dispatch_webhook.
+        tracing::warn!(
+            event = "chain_swap_expired_webhook",
+            swap_id = %swap.boltz_swap_id,
+            local_status = %swap.status,
+            "chain swap.expired received; flipping cooperative_refused for script-path claim"
+        );
+        db::mark_chain_swap_cooperative_refused(&state.db, swap.id)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        // Nudge the claimer: if the server lockup is already confirmed/claiming
+        // the script-path claim runs now; otherwise the sweep / reconciler
+        // picks it up once the lockup appears.
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
@@ -462,7 +493,11 @@ fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapSt
         "transaction.confirmed" => Some(ChainSwapStatus::UserLockConfirmed),
         "transaction.server.mempool" => Some(ChainSwapStatus::ServerLockMempool),
         "transaction.server.confirmed" => Some(ChainSwapStatus::ServerLockConfirmed),
-        "swap.expired" => Some(ChainSwapStatus::Expired),
+        // NOTE: `swap.expired` is deliberately NOT mapped to terminal `Expired`.
+        // It is the wall-clock swap timer, not the on-chain lockup timeout — the
+        // server lockup stays claimable until timeoutBlockHeight. It is handled
+        // in `handle_chain_swap_webhook` (flip cooperative_refused, keep
+        // sweepable) so we don't abandon a still-claimable lockup.
         "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
             Some(ChainSwapStatus::LockupFailed)
         }
@@ -967,7 +1002,7 @@ async fn claim_swap_inner(
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
@@ -1214,8 +1249,33 @@ async fn claim_chain_swap_inner(
         BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
             .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))?
     } else {
-        let constructed =
-            construct_chain_claim_tx(&swap, &output_address, electrum_url, boltz_url).await?;
+        // Cooperative MuSig2 claim by default; script-path (preimage) claim once
+        // `cooperative_refused` is set — by the `swap.expired` webhook or a prior
+        // runtime refusal below. One-way flag, so no cooperative/script ping-pong.
+        // Mirrors claim_swap_inner (reverse path).
+        let use_cooperative = !swap.cooperative_refused;
+        let constructed = match construct_chain_claim_tx(
+            &swap,
+            &output_address,
+            electrum_url,
+            boltz_url,
+            use_cooperative,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
+                tracing::warn!(
+                    event = "chain_swap_cooperative_refused_runtime",
+                    swap_id = %swap.boltz_swap_id,
+                    error = %e,
+                    "boltz refused cooperative chain claim; flipping cooperative_refused for next sweep"
+                );
+                let _ = db::mark_chain_swap_cooperative_refused(pool, swap.id).await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let hex = serialize_claim_tx_hex(&constructed)?;
         let txid = btc_like_txid(&constructed);
         sqlx::query(
@@ -1251,7 +1311,7 @@ async fn claim_chain_swap_inner(
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
@@ -1399,7 +1459,7 @@ async fn construct_claim_tx(
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
@@ -1425,6 +1485,7 @@ async fn construct_chain_claim_tx(
     output_address: &str,
     electrum_url: &str,
     boltz_url: &str,
+    use_cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_bytes = hex::decode(&swap.preimage_hex)
         .map_err(|e| AppError::ClaimError(format!("invalid chain preimage hex: {e}")))?;
@@ -1466,7 +1527,7 @@ async fn construct_chain_claim_tx(
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
+        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
@@ -1479,7 +1540,9 @@ async fn construct_chain_claim_tx(
         chain_client: &chain_client,
         boltz_client: &boltz_api,
         options: Some(
-            TransactionOptions::default().with_chain_claim(refund_keypair, lockup_script),
+            TransactionOptions::default()
+                .with_chain_claim(refund_keypair, lockup_script)
+                .with_cooperative(use_cooperative),
         ),
     };
 
@@ -1514,6 +1577,20 @@ fn is_cooperative_refusal(err: &AppError) -> bool {
         || s.contains("cooperative claim disabled")
         || s.contains("cooperative signing disabled")
         || s.contains("not eligible for cooperative")
+}
+
+/// Strip the URL scheme from an electrum endpoint for boltz-client's
+/// `ElectrumLiquidClient`, which expects a bare `host:port` and re-adds the
+/// scheme itself (`build_client` does `format!("ssl://{url}")`). Our config
+/// carries the scheme (the electrum-client backend in utxo.rs wants it), so
+/// passing it through unmodified yields a doubled `ssl://ssl://host:port` that
+/// fails DNS resolution ("Name or service not known") — meaning claims never
+/// broadcast. Strip `ssl://`/`tcp://` here so both electrum clients get the
+/// form they expect.
+fn electrum_host_port(url: &str) -> &str {
+    url.strip_prefix("ssl://")
+        .or_else(|| url.strip_prefix("tcp://"))
+        .unwrap_or(url)
 }
 
 /// Hex-encode a fully-signed claim tx for storage in

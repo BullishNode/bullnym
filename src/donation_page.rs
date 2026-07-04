@@ -12,7 +12,7 @@
 //! looks up the active user by npub and asserts `req.nym == user.nym`
 //! before doing any DB write.
 
-use axum::extract::{ConnectInfo, Multipart, Path, State};
+use axum::extract::{ConnectInfo, Multipart, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use regex::Regex;
@@ -70,6 +70,12 @@ pub struct SaveDonationPageRequest {
     #[serde(default)]
     pub pos_mode: Option<bool>,
     pub enabled: bool,
+    /// Surface discriminator: `payment_page` (default when omitted) or `pos`.
+    /// Optional and trailing in the signed payload so legacy clients that
+    /// omit it verify against the pre-POS byte layout. See
+    /// `docs/compatibility-ledger.md`.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -78,6 +84,11 @@ pub struct SaveDonationPageRequest {
 pub struct ArchiveDonationPageRequest {
     pub nym: String,
     pub npub: String,
+    /// Surface to archive: `payment_page` (default) or `pos`. Optional and
+    /// trailing in the signed payload; legacy clients omit it and archive the
+    /// Payment Page row.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -91,18 +102,24 @@ pub struct DonationPageView {
     pub website: Option<String>,
     pub twitter: Option<String>,
     pub instagram: Option<String>,
+    pub kind: String,
     pub pos_mode: bool,
     pub enabled: bool,
     pub is_archived: bool,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
     /// Public URL the user can share. Constructed from server domain + nym.
+    /// The POS surface lives at `/<nym>/pos`; the Payment Page at `/<nym>`.
     pub public_url: String,
 }
 
 impl DonationPageView {
     fn from_row(row: db::DonationPage, domain: &str) -> Self {
-        let public_url = format!("https://{domain}/{}", row.nym);
+        let public_url = if row.kind == db::KIND_POS {
+            format!("https://{domain}/{}/pos", row.nym)
+        } else {
+            format!("https://{domain}/{}", row.nym)
+        };
         Self {
             nym: row.nym,
             header: row.header,
@@ -111,6 +128,7 @@ impl DonationPageView {
             website: row.website,
             twitter: row.twitter,
             instagram: row.instagram,
+            kind: row.kind,
             pos_mode: row.pos_mode,
             enabled: row.enabled,
             is_archived: row.is_archived,
@@ -199,7 +217,10 @@ fn validate_lengths(
 /// (`donation_page_constants.dart::buildSavePayloadFields`).
 /// Optional fields that are absent become empty strings (NOT skipped) so the
 /// number and order of NUL separators is invariant to which fields are set.
-/// `pos_mode` is optional for shipped Bull Wallet compatibility; see
+/// `pos_mode`, `ct_descriptor`, and `kind` are optional trailing fields for
+/// shipped Bull Wallet compatibility; each is appended only when the client
+/// sent it, so a legacy client that omits them verifies against the older byte
+/// layout. `kind` is the newest field and MUST stay last. See
 /// `docs/compatibility-ledger.md`.
 fn save_payload_fields<'a>(
     header: &'a str,
@@ -211,6 +232,7 @@ fn save_payload_fields<'a>(
     enabled_str: &'a str,
     pos_mode_str: Option<&'a str>,
     ct_descriptor: Option<&'a str>,
+    kind: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut fields = vec![
         header,
@@ -226,6 +248,9 @@ fn save_payload_fields<'a>(
     }
     if let Some(ct_descriptor) = ct_descriptor {
         fields.push(ct_descriptor);
+    }
+    if let Some(kind) = kind {
+        fields.push(kind);
     }
     fields
 }
@@ -269,6 +294,29 @@ pub async fn save(
     // Cheap input validation BEFORE signature verification.
     validate_lengths(&req, &state.pricer, state.config.limits.max_descriptor_len)?;
 
+    // Resolve and enum-validate the surface kind BEFORE signature verification
+    // so the trailing signed field can never be confused with another value
+    // (KR-3). Omitted => the Payment Page surface, matching the legacy
+    // single-row contract.
+    let kind = match req.kind.as_deref() {
+        None => db::KIND_PAYMENT_PAGE,
+        Some(k) => db::normalize_kind(k).ok_or_else(|| {
+            AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
+        })?,
+    };
+
+    // A POS surface owns its own wallet (idx 103), so it MUST carry a
+    // descriptor. Without one, anonymous checkout on the POS branch has
+    // nothing to settle to; the POS branch deliberately has no
+    // Lightning-Address cursor fallback, so it would hard-fail at allocation.
+    // Reject at save time — there are no legacy POS clients to grandfather
+    // (KR-1).
+    if kind == db::KIND_POS && req.ct_descriptor.as_deref().filter(|s| !s.is_empty()).is_none() {
+        return Err(AppError::DonationPageInvalid(
+            "a POS surface requires ct_descriptor".to_string(),
+        ));
+    }
+
     // Build the signed payload and verify the Schnorr sig. The exact byte
     // sequence here MUST match the mobile's signing helper.
     let website = req.website.as_deref().unwrap_or("");
@@ -288,6 +336,7 @@ pub async fn save(
         enabled_str,
         pos_mode_str,
         req.ct_descriptor.as_deref(),
+        req.kind.as_deref(),
     );
     auth::verify_la_v2(
         ACTION_SAVE,
@@ -301,10 +350,26 @@ pub async fn save(
     // Verify the npub owns the nym AND is active.
     assert_nym_owner(&state, &req.nym, &req.npub).await?;
 
+    // Conflict rule: a nym must not end up with two POS surfaces. Reject
+    // enabling pos_mode on the Payment Page row when a separate POS row
+    // already exists (Q5). New clients use `kind` and stop sending pos_mode.
+    if kind == db::KIND_PAYMENT_PAGE
+        && req.pos_mode == Some(true)
+        && db::get_donation_page_by_nym(&state.db, &req.nym, db::KIND_POS)
+            .await?
+            .is_some()
+    {
+        return Err(AppError::DonationPageInvalid(
+            "cannot enable pos_mode on the payment page while a separate POS surface exists"
+                .to_string(),
+        ));
+    }
+
     let row = db::upsert_donation_page(
         &state.db,
         &db::UpsertDonationPage {
             nym: &req.nym,
+            kind,
             ct_descriptor: req.ct_descriptor.as_deref().filter(|s| !s.is_empty()),
             header: &req.header,
             description: &req.description,
@@ -340,18 +405,32 @@ pub async fn archive(
         }
     }
 
+    // Resolve + enum-validate kind before signature verification. Omitted =>
+    // Payment Page (legacy behavior). `kind` is the sole optional-trailing
+    // signed field for archive, so an old client that omits it verifies
+    // against the pre-POS empty field list.
+    let kind = match req.kind.as_deref() {
+        None => db::KIND_PAYMENT_PAGE,
+        Some(k) => db::normalize_kind(k).ok_or_else(|| {
+            AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
+        })?,
+    };
+    let archive_fields: Vec<&str> = match req.kind.as_deref() {
+        Some(k) => vec![k],
+        None => vec![],
+    };
     auth::verify_la_v2(
         ACTION_ARCHIVE,
         &req.npub,
         &req.nym,
-        &[],
+        &archive_fields,
         req.timestamp,
         &req.signature,
     )?;
 
     assert_nym_owner(&state, &req.nym, &req.npub).await?;
 
-    let row = db::archive_donation_page(&state.db, &req.nym)
+    let row = db::archive_donation_page(&state.db, &req.nym, kind)
         .await?
         .ok_or_else(|| {
             AppError::DonationPageNotFound(
@@ -507,8 +586,9 @@ pub async fn upload_image(
             .await?;
     }
 
-    // Donation page must already exist before image upload.
-    db::get_donation_page_by_nym(&state.db, &nym)
+    // Donation page must already exist before image upload. Images belong to
+    // the Payment Page surface (the POS terminal has no avatar/OG image).
+    db::get_donation_page_by_nym(&state.db, &nym, db::KIND_PAYMENT_PAGE)
         .await?
         .ok_or_else(|| {
             AppError::DonationPageNotFound(
@@ -549,9 +629,14 @@ pub async fn upload_image(
         ImageKind::Avatar => "avatar_sha256",
         ImageKind::Og => "og_sha256",
     };
-    let row =
-        db::update_donation_page_image_hash(&state.db, &nym, column, &processed.source_sha256)
-            .await?
+    let row = db::update_donation_page_image_hash(
+        &state.db,
+        &nym,
+        db::KIND_PAYMENT_PAGE,
+        column,
+        &processed.source_sha256,
+    )
+    .await?
             .ok_or_else(|| {
                 AppError::DonationPageNotFound("donation page disappeared mid-upload".to_string())
             })?;
@@ -575,14 +660,23 @@ async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String
         .map_err(|_| AppError::MultipartInvalid("text field not utf-8".into()))
 }
 
-/// GET /donation-page/:nym — public read of current state. Used by mobile
-/// to populate the editor before save. No auth required (data becomes
+#[derive(Deserialize)]
+pub struct GetDonationPageParams {
+    /// Surface to read: `payment_page` (default) or `pos`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// GET /donation-page/:nym?kind= — public read of current state. Used by
+/// mobile to populate the editor before save. No auth required (data becomes
 /// public when the page is rendered at `https://<domain>/<nym>` anyway).
+/// `kind` selects the surface and defaults to the Payment Page.
 pub async fn get(
     State(state): State<AppState>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(nym): Path<String>,
+    Query(params): Query<GetDonationPageParams>,
 ) -> Result<Json<DonationPageView>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
@@ -596,7 +690,14 @@ pub async fn get(
         }
     }
 
-    let row = db::get_donation_page_by_nym(&state.db, &nym)
+    let kind = match params.kind.as_deref() {
+        None => db::KIND_PAYMENT_PAGE,
+        Some(k) => db::normalize_kind(k).ok_or_else(|| {
+            AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
+        })?,
+    };
+
+    let row = db::get_donation_page_by_nym(&state.db, &nym, kind)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 

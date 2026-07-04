@@ -225,6 +225,7 @@ fn feature_flags_default_enabled() {
     assert!(cfg.lightning_address);
     assert!(cfg.invoices);
     assert!(cfg.payment_pages);
+    assert!(!cfg.nip05);
 }
 
 #[test]
@@ -234,6 +235,7 @@ fn feature_flags_parse_independently() {
         lightning_address = true
         invoices = false
         payment_pages = true
+        nip05 = true
         "#,
     )
     .unwrap();
@@ -241,6 +243,7 @@ fn feature_flags_parse_independently() {
     assert!(cfg.lightning_address);
     assert!(!cfg.invoices);
     assert!(cfg.payment_pages);
+    assert!(cfg.nip05);
 }
 
 #[test]

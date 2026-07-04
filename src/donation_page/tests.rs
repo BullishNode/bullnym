@@ -14,6 +14,7 @@ fn save_payload_fields_fixed_order() {
         "1",
         Some("0"),
         Some(TEST_DESCRIPTOR),
+        None,
     );
     assert_eq!(fields.len(), 9);
     assert_eq!(fields[0], "Alice's Coffee");
@@ -35,10 +36,43 @@ fn save_payload_fields_omit_descriptor() {
         "1",
         Some("0"),
         None,
+        None,
     );
     assert_eq!(fields.len(), 8);
     assert_eq!(fields[6], "1");
     assert_eq!(fields[7], "0");
+}
+
+#[test]
+fn save_payload_fields_kind_is_trailing_after_descriptor() {
+    // The POS surface sends kind='pos' AFTER ct_descriptor; kind is the last
+    // signed field so legacy layouts stay a prefix of the new one.
+    let fields = save_payload_fields(
+        "Alice's Coffee",
+        "Buy me a coffee!",
+        "USD",
+        "https://alice.example",
+        "alice",
+        "alice_ig",
+        "1",
+        Some("0"),
+        Some(TEST_DESCRIPTOR),
+        Some("pos"),
+    );
+    assert_eq!(fields.len(), 10);
+    assert_eq!(fields[7], "0");
+    assert_eq!(fields[8], TEST_DESCRIPTOR);
+    assert_eq!(fields[9], "pos");
+}
+
+#[test]
+fn save_payload_fields_legacy_omitting_kind_is_prefix() {
+    // A legacy client omits kind entirely: the field list is byte-identical to
+    // the pre-POS layout, so its old signature still verifies.
+    let with_kind = save_payload_fields(
+        "h", "d", "USD", "", "", "", "1", None, None, None,
+    );
+    assert_eq!(with_kind.len(), 7);
 }
 
 #[test]
@@ -53,6 +87,7 @@ fn save_payload_fields_legacy_without_pos_mode() {
         "1",
         None,
         Some(TEST_DESCRIPTOR),
+        None,
     );
     assert_eq!(fields.len(), 8);
     assert_eq!(fields[6], "1");
@@ -76,6 +111,7 @@ fn v2_save_message_byte_exact_contract() {
         "1",
         Some("0"),
         Some(TEST_DESCRIPTOR),
+        None,
     );
     let npub = "00".repeat(32);
     let timestamp: u64 = 1_700_000_000;
@@ -112,6 +148,7 @@ fn v2_save_message_legacy_without_pos_mode_byte_exact_contract() {
         "1",
         None,
         Some(TEST_DESCRIPTOR),
+        None,
     );
     let npub = "00".repeat(32);
     let timestamp: u64 = 1_700_000_000;
@@ -200,6 +237,7 @@ fn make_req() -> SaveDonationPageRequest {
         instagram: Some("alice.ig".to_string()),
         pos_mode: Some(false),
         enabled: true,
+        kind: None,
         timestamp: 0,
         signature: String::new(),
     }

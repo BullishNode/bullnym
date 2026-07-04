@@ -434,12 +434,42 @@ pub struct CreateInvoiceResponse {
     pub expires_at_unix: i64,
 }
 
+/// POST /:nym/invoice — keyless Payment Page checkout (anonymous, unsigned).
 pub async fn create_anonymous(
     State(state): State<AppState>,
     Path(nym): Path<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    create_anonymous_for_kind(state, nym, db::KIND_PAYMENT_PAGE, peer_opt, headers, req).await
+}
+
+/// POST /:nym/pos/invoice — keyless POS terminal checkout. Same anonymous
+/// flow as the Payment Page, but scoped to the nym's POS surface (idx 103):
+/// the settlement address derives from the POS descriptor, and there is NO
+/// Lightning-Address cursor fallback (KR-1) so POS receipts never leak into
+/// the Lightning Address wallet.
+pub async fn create_anonymous_pos(
+    State(state): State<AppState>,
+    Path(nym): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateAnonymousRequest>,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    create_anonymous_for_kind(state, nym, db::KIND_POS, peer_opt, headers, req).await
+}
+
+/// Shared anonymous-checkout implementation for the donation-page surfaces.
+/// `kind` selects the (nym, kind) donation_pages row whose descriptor and
+/// address cursor settle the checkout.
+async fn create_anonymous_for_kind(
+    state: AppState,
+    nym: String,
+    kind: &'static str,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    req: CreateAnonymousRequest,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
@@ -469,7 +499,7 @@ pub async fn create_anonymous(
     // Verify the store is live AND resolve the page owner's npub for the
     // canonical invoice identity. The page→user join is required because
     // donation_pages doesn't store npub directly.
-    let page = db::get_donation_page_by_nym(&state.db, &nym)
+    let page = db::get_donation_page_by_nym(&state.db, &nym, kind)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
     if !page.enabled || page.is_archived {
@@ -495,14 +525,22 @@ pub async fn create_anonymous(
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
     let (liquid_address, _liquid_index, payment_descriptor) =
-        match db::allocate_next_liquid_for_donation_page(&state.db, &nym, |ct_descriptor, idx| {
-            descriptor::derive_address(ct_descriptor, idx)
-                .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
-        })
+        match db::allocate_next_liquid_for_donation_page(
+            &state.db,
+            &nym,
+            kind,
+            |ct_descriptor, idx| {
+                descriptor::derive_address(ct_descriptor, idx)
+                    .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
+            },
+        )
         .await?
         {
             Some((address, index, descriptor)) => (address, index, descriptor),
-            None => {
+            // Legacy Payment Page rows created before the descriptor split have
+            // no page descriptor; fall back to the nym's Lightning Address
+            // descriptor/cursor so those pages keep settling.
+            None if kind == db::KIND_PAYMENT_PAGE => {
                 let (address, index) = db::allocate_next_liquid_for_active_nym(
                     &state.db,
                     &nym,
@@ -515,6 +553,11 @@ pub async fn create_anonymous(
                 .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
                 (address, index, owner.ct_descriptor.clone())
             }
+            // The POS surface must carry its own descriptor (enforced at save).
+            // If allocation failed the row is misconfigured; hard-fail rather
+            // than fall back to the Lightning Address cursor — POS receipts
+            // must never settle to the LA wallet (KR-1).
+            None => return Err(AppError::DonationPageNotFound(nym.clone())),
         };
     let liquid_blinding_key_hex =
         descriptor::derive_blinding_key_hex(&payment_descriptor, &liquid_address)?;

@@ -10,6 +10,7 @@ electrum_url = "les.bullbitcoin.com:995"
 lightning_address = true
 invoices = true
 payment_pages = true
+nip05 = false
 
 [limits]
 # Match prod so simulator's amount=100000 msat works.
@@ -23,10 +24,24 @@ liquid_url = "les.bullbitcoin.com:995"
 [workers]
 enabled = true
 
+[proof]
+# LUD-22 proof-of-funds floor. ENFORCED: the callback unblinds the payer's
+# confidential proof UTXO (with the supplied blinding key) and rejects it
+# unless the asset is L-BTC and its value is at least this many sats. The
+# recovered asset is rebound to the on-chain asset generator, so a UTXO that
+# commits to another asset while claiming L-BTC in its rangeproof message is
+# rejected. Only confidential outputs qualify: explicit-value/explicit-asset
+# (non-confidential) outputs are rejected by design.
+min_proof_value_sat = 1000
+
 [rate_limit]
 # High limits so the simulator suite can run repeatedly without budget concerns.
 per_ip_limit = 1000
 per_ip_window_secs = 60
+# LUD-22 anti-enumeration gates. The primary binding gates are the per-outpoint
+# fan-out cap (distinct_nyms_per_outpoint, 3 nyms/UTXO/hour in code) and per-IP
+# above. per_pubkey is a secondary, defense-in-depth gate; this simulator value
+# is intentionally high — tighten it in production to bound per-key volume.
 per_pubkey_limit = 1000
 per_pubkey_window_secs = 3600
 max_pending_reservations_per_nym = 5000

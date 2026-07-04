@@ -108,6 +108,7 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'users' \
                   AND column_name = 'verification_npub' \
+                  AND is_nullable = 'YES' \
             ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
@@ -120,6 +121,32 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
                   AND column_name = 'next_addr_idx' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'kind' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'donation_pages' \
+                  AND c.contype = 'p' \
+                  AND ( \
+                      SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+                  ) = ARRAY['nym', 'kind']::text[] \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name = 'cooperative_refused' \
             )",
     )
     .fetch_one(pool)

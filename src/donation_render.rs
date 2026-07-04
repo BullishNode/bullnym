@@ -281,7 +281,7 @@ fn short_manifest_name(name: &str) -> String {
     name.chars().take(12).collect()
 }
 
-fn web_manifest_for_page(page: &db::DonationPage) -> WebManifest<'_> {
+fn web_manifest_for_page<'a>(page: &'a db::DonationPage, start_path: &str) -> WebManifest<'a> {
     let name = if page.header.trim().is_empty() {
         page.nym.as_str()
     } else {
@@ -290,7 +290,7 @@ fn web_manifest_for_page(page: &db::DonationPage) -> WebManifest<'_> {
     WebManifest {
         name,
         short_name: short_manifest_name(name),
-        start_url: format!("/{}", page.nym),
+        start_url: start_path.to_string(),
         scope: "/",
         display: "standalone",
         background_color: "#161512",
@@ -345,14 +345,15 @@ fn inject_pwa_shell(
     shell: &str,
     config: &PwaConfigView<'_>,
     og_url: Option<&str>,
+    manifest_href: &str,
 ) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(config)?;
     let json = escape_json_for_script(&json);
     let config_script =
         format!(r#"<script id="bullnym-config" type="application/json">{json}</script>"#);
     let manifest_link = format!(
-        r#"<link rel="manifest" href="/{}/manifest.webmanifest">"#,
-        html_escape_attr(config.nym)
+        r#"<link rel="manifest" href="{}">"#,
+        html_escape_attr(manifest_href)
     );
     Ok(shell
         .replace("<!-- BULLNYM_CONFIG -->", &config_script)
@@ -423,23 +424,49 @@ pub async fn service_worker(State(state): State<AppState>) -> Response {
     resp
 }
 
+/// `GET /:nym/manifest.webmanifest` — Payment Page PWA manifest.
 pub async fn manifest(
     State(state): State<AppState>,
     AxumPath(nym): AxumPath<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_valid_slug(&nym) || reserved_nyms::is_reserved(&nym) {
+    let start_path = format!("/{nym}");
+    manifest_for_kind(&state, &nym, db::KIND_PAYMENT_PAGE, &start_path, peer_opt, &headers).await
+}
+
+/// `GET /:nym/pos/manifest.webmanifest` — POS terminal PWA manifest. Served
+/// even for a POS-only nym so the keyless terminal is installable and starts
+/// at `/<nym>/pos` rather than the Payment Page.
+pub async fn manifest_pos(
+    State(state): State<AppState>,
+    AxumPath(nym): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let start_path = format!("/{nym}/pos");
+    manifest_for_kind(&state, &nym, db::KIND_POS, &start_path, peer_opt, &headers).await
+}
+
+async fn manifest_for_kind(
+    state: &AppState,
+    nym: &str,
+    kind: &str,
+    start_path: &str,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Response {
+    if !is_valid_slug(nym) || reserved_nyms::is_reserved(nym) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
     if let Err(resp) =
-        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Manifest).await
+        check_donation_rate_limit(state, peer_opt, headers, DonationRateBucket::Manifest).await
     {
         return resp;
     }
 
-    let page = match db::get_donation_page_by_nym(&state.db, &nym).await {
+    let page = match db::get_donation_page_by_nym(&state.db, nym, kind).await {
         Ok(Some(p)) if p.enabled && !p.is_archived => p,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -448,7 +475,7 @@ pub async fn manifest(
         }
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, start_path);
 
     let body = match serde_json::to_string(&manifest) {
         Ok(body) => body,
@@ -471,9 +498,16 @@ pub async fn manifest(
     resp
 }
 
-async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
+/// Render a live donation surface. `base_path` is the public path the surface
+/// is served at (`/<nym>` for the Payment Page, `/<nym>/pos` for POS); it
+/// drives the PWA manifest link + start URL. The POS shell is selected when
+/// the row is the POS surface OR carries the legacy `pos_mode` toggle.
+async fn render_live(state: &AppState, page: &db::DonationPage, base_path: &str) -> Response {
     let domain = &state.config.domain;
-    let public_url = format!("https://{domain}/{}", page.nym);
+    let public_url = format!("https://{domain}{base_path}");
+    // POS shell for either the dedicated POS row or a legacy pos_mode page.
+    let is_pos = page.kind == db::KIND_POS || page.pos_mode;
+    let manifest_href = format!("{base_path}/manifest.webmanifest");
 
     // Image URLs only render after the upload pipeline stores a hash.
     let avatar_url = page
@@ -496,9 +530,9 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
 
     let supported_currencies = state.pricer.supported_currencies().to_vec();
 
-    if let Some(shell) = state.pwa_shells.shell_for(page.pos_mode).await {
+    if let Some(shell) = state.pwa_shells.shell_for(is_pos).await {
         let avatar_url_ref = avatar_url.as_deref();
-        let mode = if page.pos_mode { "pos" } else { "donation" };
+        let mode = if is_pos { "pos" } else { "donation" };
         let config = PwaConfigView {
             nym: &page.nym,
             mode,
@@ -514,11 +548,11 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
             liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
             domain,
         };
-        let body = inject_pwa_shell(&shell, &config, og_url.as_deref())
+        let body = inject_pwa_shell(&shell, &config, og_url.as_deref(), &manifest_href)
             .unwrap_or_else(|e| format!("template render failed: {e}"));
         let mut resp = (StatusCode::OK, body).into_response();
-        apply_security_headers(&mut resp, page.pos_mode);
-        mark_pwa_shell_response(&mut resp, page.pos_mode);
+        apply_security_headers(&mut resp, is_pos);
+        mark_pwa_shell_response(&mut resp, is_pos);
         return resp;
     }
 
@@ -541,7 +575,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     .unwrap_or_else(|e| format!("template render failed: {e}"));
 
     let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp, page.pos_mode);
+    apply_security_headers(&mut resp, is_pos);
     resp
 }
 
@@ -581,8 +615,9 @@ pub async fn render_or_404(
         return resp;
     }
 
-    // DB lookup.
-    let page = match db::get_donation_page_by_nym(&state.db, nym).await {
+    // DB lookup. The fallback serves the Payment Page surface only; POS has
+    // its own explicit `/<nym>/pos` route.
+    let page = match db::get_donation_page_by_nym(&state.db, nym, db::KIND_PAYMENT_PAGE).await {
         Ok(Some(p)) => p,
         Ok(None) => return render_404(&state, nym),
         Err(e) => {
@@ -601,7 +636,45 @@ pub async fn render_or_404(
         return render_404(&state, nym);
     }
 
-    render_live(&state, &page).await
+    render_live(&state, &page, &format!("/{nym}")).await
+}
+
+/// `GET /:nym/pos` — public POS terminal shell for the nym's POS surface
+/// (kind = 'pos'). Explicit route: it takes precedence over the single-segment
+/// fallback, and a POS-only nym renders here while `/<nym>` 404s.
+pub async fn render_pos(
+    State(state): State<AppState>,
+    AxumPath(nym): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_slug(&nym) || reserved_nyms::is_reserved(&nym) {
+        return render_404(&state, &nym);
+    }
+
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Html).await
+    {
+        return resp;
+    }
+
+    let page = match db::get_donation_page_by_nym(&state.db, &nym, db::KIND_POS).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return render_404(&state, &nym),
+        Err(e) => {
+            tracing::error!(event = "pos_render_db_error", nym = %nym, error = %e);
+            return render_404(&state, &nym);
+        }
+    };
+
+    if page.is_archived {
+        return render_archived(&state, &nym);
+    }
+    if !page.enabled {
+        return render_404(&state, &nym);
+    }
+
+    render_live(&state, &page, &format!("/{nym}/pos")).await
 }
 
 #[cfg(test)]

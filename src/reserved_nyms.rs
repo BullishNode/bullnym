@@ -35,6 +35,8 @@ pub const RESERVED_NYMS: &[&str] = &[
     "i",
     "invoice",
     "invoices",
+    // Blocks shadowing the POS surface routes (/<nym>/pos, /<nym>/pos/invoice).
+    "pos",
 ];
 
 pub fn is_reserved(nym: &str) -> bool {

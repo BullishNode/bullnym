@@ -63,10 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     tracing::info!(
-        "features: lightning_address={} invoices={} payment_pages={} workers={}",
+        "features: lightning_address={} invoices={} payment_pages={} nip05={} workers={}",
         config.features.lightning_address,
         config.features.invoices,
         config.features.payment_pages,
+        config.features.nip05,
         config.workers.enabled,
     );
 
@@ -216,6 +217,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.reconciler.max_per_tick,
         );
 
+        // Chain-swap reconciler: same dropped-webhook recovery as above, but for
+        // `chain_swap_records` (which the reverse reconciler does not touch).
+        // Without this a chain swap stranded by a missed webhook never recovers.
+        reconciler::spawn_chain(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+        );
+        tracing::info!("chain reconciler started (shares reconciler config)");
+
         // Periodic GC of rate-limit tables. Without this, sliding-window
         // queries get progressively slower as inactive rows accumulate.
         {
@@ -359,7 +370,6 @@ fn build_router(state: AppState) -> Router {
     if features.lightning_address {
         router = router
             .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
-            .route("/.well-known/nostr.json", get(nostr::nostr_json))
             .route("/lnurlp/callback/:nym", get(lnurl::callback))
             .route("/register", post(registration::register))
             .route("/register", put(registration::update_registration))
@@ -372,6 +382,14 @@ fn build_router(state: AppState) -> Router {
                 "/api/reservations/:nym",
                 get(registration::list_reservations),
             );
+    }
+
+    // NIP-05 is opt-in and gated by its own flag (default off) so the server
+    // never publishes `/.well-known/nostr.json` unless explicitly enabled.
+    // Requires registration (`lightning_address`) since it resolves nyms.
+    // See ISS-S-01 / ADR-004.
+    if features.lightning_address && features.nip05 {
+        router = router.route("/.well-known/nostr.json", get(nostr::nostr_json));
     }
 
     if features.payment_pages {
@@ -390,13 +408,25 @@ fn build_router(state: AppState) -> Router {
             )
             .route("/donation-page/:nym", get(donation_page::get))
             .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
+            .route(
+                "/:nym/pos/manifest.webmanifest",
+                get(donation_render::manifest_pos),
+            )
+            // Public POS terminal shell for the nym's POS surface (kind='pos').
+            .route("/:nym/pos", get(donation_render::render_pos))
             // Donation checkout now uses invoice sessions instead of the
             // removed donation callback/status endpoints.
             // Anonymous checkout invoice endpoints. The create route keeps a
             // tight body cap; status and offer routes are rate-limit gated.
+            // The POS surface reuses the same keyless flow, kind-scoped to the
+            // POS descriptor (idx 103) with no Lightning-Address fallback.
             .route(
                 "/:nym/invoice",
                 post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/:nym/pos/invoice",
+                post(invoice::create_anonymous_pos).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/:nym/i/:id", get(invoice::render_payment));
 

@@ -53,15 +53,17 @@ policy inline.
 
 ## Registration Verification Npub
 
-- Current field: `verification_npub`
-- Compatibility behavior: if omitted at registration time, the server stores
-  `verification_npub = npub`.
-- Compatibility reason: older clients used one key for both Bullnym request
-  authentication and public NIP-05 verification. Current Get Paid clients can
-  keep the server-auth key separate from the key published in
-  `/.well-known/nostr.json`.
-- Removal condition: old clients that omit `verification_npub` are no longer
-  supported, and the registration contract is intentionally made strict.
+- Current field: `verification_npub` (optional).
+- Behavior: NIP-05 is opt-in. If omitted at registration time,
+  `verification_npub` is stored as NULL and `/.well-known/nostr.json` returns
+  no record for the nym. The server never falls back to the auth key (`npub`).
+- Compatibility reason: earlier server builds backfilled and reused the
+  auth key as the public NIP-05 identity when the field was omitted, which
+  collapsed the ADR-004 role separation (the signing key was published at
+  `/.well-known/nostr.json`). Migration 033 nulls those fallback-populated
+  rows. Clients that never sent `verification_npub` are unaffected — they
+  never consumed their own nostr.json.
+- Removal condition: none — opt-in is the intended long-term contract.
 
 ## Donation Page Descriptor
 
@@ -86,4 +88,26 @@ policy inline.
   page updates from those clients.
 - Removal condition: all supported Bull Wallet builds include `pos_mode` in
   the signed donation-page payload, and legacy saves without it are no longer
+  accepted by the API contract.
+
+## Donation Page Kind (surface discriminator)
+
+- Current field: `kind` on signed `PUT /donation-page` (save) and
+  `DELETE /donation-page` (archive) requests, and as the `?kind=` query on
+  `GET /donation-page/:nym`. Accepted values: `payment_page`, `pos`.
+- Compatibility behavior (save): `kind` is an optional trailing signed field
+  appended AFTER `ct_descriptor`. If omitted, the server verifies the legacy
+  signed field list without it and writes the `payment_page` surface. `kind`
+  is enum-validated before signature verification; a `pos` save additionally
+  requires `ct_descriptor`.
+- Compatibility behavior (archive): `kind` is the sole optional trailing signed
+  field. If omitted, the legacy empty field list is verified and the
+  `payment_page` row is archived.
+- Compatibility behavior (read): `?kind=` defaults to `payment_page`.
+- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
+  and archives before the Payment Page / POS split, so requiring the field
+  would reject otherwise valid requests. Keeping `kind` trailing and optional
+  preserves those signatures (the same maneuver as `pos_mode`).
+- Removal condition: all supported Bull Wallet builds include `kind` in the
+  signed donation-page payloads, and legacy requests without it are no longer
   accepted by the API contract.

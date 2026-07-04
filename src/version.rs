@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "031_get_paid_descriptors";
+pub const EXPECTED_SCHEMA_MARKER: &str = "035_chain_swap_cooperative_refused";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {

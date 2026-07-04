@@ -73,6 +73,86 @@ pub fn script_matches_pubkey(script: &elements::Script, pubkey: &PublicKey) -> b
     script == &expected
 }
 
+// --- Confidential value/asset proof ---
+
+/// Unblind a payer-supplied confidential proof UTXO and enforce that it holds
+/// at least `min_value_sat` of L-BTC.
+///
+/// The LUD-22 proof-of-funds cost floor is only real if the server can see the
+/// UTXO's value. Liquid outputs are confidential (Pedersen value commitment +
+/// blinded asset generator), so the payer includes the output's blinding
+/// secret key. Elements' `TxOut::unblind` performs the ECDH against the
+/// output nonce and rewinds the rangeproof, recovering the `(asset, value)`
+/// carried in the rangeproof. The rewind cryptographically binds the recovered
+/// *value* to the on-chain Pedersen commitment, so the payer cannot lie about
+/// the value without the rewind failing.
+///
+/// The recovered *asset*, however, is read straight out of the rangeproof's
+/// author-chosen message and is NOT rebound to the on-chain asset generator by
+/// `unblind`. A payer who issued their own worthless Liquid token could craft a
+/// confidential output whose generator commits to that token while the
+/// rangeproof message claims asset = L-BTC; `unblind` would then report
+/// `asset == L-BTC` and pass both checks below at ~zero L-BTC cost, defeating
+/// the anti-enumeration floor (DG-7 / ISS-S-04). To close this, we reconstruct
+/// the blinded asset generator from the recovered `(asset, asset_bf)` and
+/// require it to equal the confidential asset commitment actually on the
+/// output. This also rejects explicit (non-confidential) asset outputs: a proof
+/// UTXO must be a confidential output whose generator binds to L-BTC. Only then
+/// do we require the asset to be L-BTC and the value to clear the floor.
+///
+/// Returns the unblinded value on success. This is verification-only crypto:
+/// no secret of ours is involved; the blinding key belongs to the payer's
+/// output and only unblinds that one output.
+pub fn assert_proof_utxo_value(
+    txout: &elements::TxOut,
+    blinding_key_hex: &str,
+    expected_asset_hex: &str,
+    min_value_sat: u64,
+) -> Result<u64, AppError> {
+    // `All` context: `unblind` needs verification and the asset-generator
+    // reconstruction below needs signing.
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let blinding_sk = elements::secp256k1_zkp::SecretKey::from_str(blinding_key_hex)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("blinding key parse: {e}")))?;
+
+    let secrets = txout
+        .unblind(&secp, blinding_sk)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("could not unblind proof UTXO: {e}")))?;
+
+    // Rebind the recovered asset to the on-chain asset commitment. `unblind`
+    // reports the asset from the rangeproof message without checking it
+    // reconstructs the output's generator, so reconstruct the blinded generator
+    // from the recovered `(asset, asset_bf)` and require equality with
+    // `txout.asset`. A mismatch means the message-claimed asset does not commit
+    // to the on-chain generator (the token-masquerade attack); an explicit
+    // asset output also fails here because the reconstruction is always
+    // `Asset::Confidential(..)`.
+    let rebound_asset =
+        elements::confidential::Asset::new_confidential(&secp, secrets.asset, secrets.asset_bf);
+    if txout.asset != rebound_asset {
+        return Err(AppError::ProofOfFundsInvalid(
+            "proof UTXO asset commitment does not bind to the unblinded asset".into(),
+        ));
+    }
+
+    let expected_asset = elements::AssetId::from_str(expected_asset_hex)
+        .map_err(|e| AppError::ProofOfFundsInvalid(format!("expected asset id parse: {e}")))?;
+    if secrets.asset != expected_asset {
+        return Err(AppError::ProofOfFundsInvalid(
+            "proof UTXO asset is not L-BTC".into(),
+        ));
+    }
+
+    if secrets.value < min_value_sat {
+        return Err(AppError::ProofOfFundsInvalid(format!(
+            "proof UTXO value {} sat is below the {min_value_sat} sat minimum",
+            secrets.value
+        )));
+    }
+
+    Ok(secrets.value)
+}
+
 // --- Outpoint parsing ---
 
 pub struct ParsedOutpoint {
