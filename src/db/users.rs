@@ -293,15 +293,36 @@ pub async fn update_user_descriptor(
 }
 
 pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
-    sqlx::query_as::<_, User>(
+    let mut tx = pool.begin().await?;
+    let user_opt = sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE \
          WHERE npub = $1 AND is_active = TRUE \
          RETURNING id, nym, npub, verification_npub, \
                    ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // Auto-archive donation pages tied to this nym so the public URL stops
+    // accepting payments once the user deactivates. Without this the page keeps
+    // rendering fully live while every checkout fails at get_active_user_by_nym
+    // (a working-looking page whose Pay button always errors). Same shape as
+    // purge_user / DELETE /donation-page; re-saving the page (which sets
+    // archived_at = NULL) or purging restores/finalizes it, so reactivation via
+    // re-register + page re-save brings the page back cleanly.
+    if let Some(user) = &user_opt {
+        sqlx::query(
+            "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
+             WHERE nym = $1 AND archived_at IS NULL",
+        )
+        .bind(&user.nym)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(user_opt)
 }
 
 /// Outcome of a purge attempt.
