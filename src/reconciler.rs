@@ -244,6 +244,16 @@ async fn apply_action(
             Ok(())
         }
         ScheduleImmediateClaim => {
+            // If we never saw a lockup webhook the row is still `pending`, but
+            // `get_ready_to_claim_swaps` only sweeps `lockup_mempool`/
+            // `lockup_confirmed`/`claiming`/`claim_failed` — scheduling a claim
+            // on a `pending` row is a silent no-op that recurs every tick while
+            // the (still-claimable) HTLC is abandoned. Advance to
+            // `lockup_confirmed` first so the sweep actually picks it up, the
+            // same way the mempool/confirmed arms do.
+            if swap.status == "pending" {
+                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+            }
             tracing::debug!(
                 event = "reconciler_schedule_claim",
                 swap_id = %swap.boltz_swap_id,
@@ -253,6 +263,12 @@ async fn apply_action(
             Ok(())
         }
         ScheduleScriptPathRetry => {
+            // Same `pending` no-op guard as ScheduleImmediateClaim: a swap that
+            // reached `swap.expired` while still locally `pending` is excluded
+            // by the sweep, so the script-path retry would never run.
+            if swap.status == "pending" {
+                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+            }
             tracing::warn!(
                 event = "reconciler_swap_expired",
                 swap_id = %swap.boltz_swap_id,
