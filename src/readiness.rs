@@ -108,6 +108,7 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'users' \
                   AND column_name = 'verification_npub' \
+                  AND is_nullable = 'YES' \
             ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
@@ -136,10 +137,10 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND t.relname = 'donation_pages' \
                   AND c.contype = 'p' \
                   AND ( \
-                      SELECT array_agg(a.attname ORDER BY k.ord) \
+                      SELECT array_agg(a.attname::text ORDER BY k.ord) \
                       FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
                       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-                  ) = ARRAY['nym', 'kind'] \
+                  ) = ARRAY['nym', 'kind']::text[] \
             )",
     )
     .fetch_one(pool)
