@@ -217,6 +217,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.reconciler.max_per_tick,
         );
 
+        // Chain-swap reconciler: same dropped-webhook recovery as above, but for
+        // `chain_swap_records` (which the reverse reconciler does not touch).
+        // Without this a chain swap stranded by a missed webhook never recovers.
+        reconciler::spawn_chain(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+        );
+        tracing::info!("chain reconciler started (shares reconciler config)");
+
         // Periodic GC of rate-limit tables. Without this, sliding-window
         // queries get progressively slower as inactive rows accumulate.
         {

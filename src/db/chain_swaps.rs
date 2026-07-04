@@ -107,6 +107,7 @@ pub struct ChainSwapRecord {
     pub claim_tx_hex: Option<String>,
     pub claim_attempts: i32,
     pub last_claim_error: Option<String>,
+    pub cooperative_refused: bool,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -121,7 +122,7 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
     "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
-     claim_tx_hex, claim_attempts, last_claim_error, \
+     claim_tx_hex, claim_attempts, last_claim_error, cooperative_refused, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
 
@@ -225,6 +226,52 @@ pub async fn get_ready_to_claim_chain_swaps(
            AND (next_claim_attempt_at IS NULL OR next_claim_attempt_at <= NOW()) \
          ORDER BY next_claim_attempt_at NULLS FIRST"
     ))
+    .fetch_all(pool)
+    .await
+}
+
+/// Flip `cooperative_refused` to TRUE (one-way). Set when Boltz reports
+/// `swap.expired` for a chain swap, or when a cooperative claim is refused at
+/// runtime, so the next claim attempt takes the script path. Never writes
+/// through a terminal row. Mirrors `swaps::mark_cooperative_refused`.
+pub async fn mark_chain_swap_cooperative_refused(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET cooperative_refused = TRUE, updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at
+/// `max_rows`. Drives the chain-swap reconciler: unlike the claim sweep
+/// (`get_ready_to_claim_chain_swaps`, which only covers server-lock/claiming
+/// states), this covers EVERY non-terminal state — including `pending` and
+/// `user_lock_*` — so a chain swap stranded by a dropped Boltz webhook is
+/// re-driven by polling Boltz `get_swap`. Mirrors
+/// `swaps::list_non_terminal_swaps_oldest_first`.
+pub async fn list_non_terminal_chain_swaps_oldest_first(
+    pool: &PgPool,
+    min_age_secs: u64,
+    limit: u32,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
+           AND updated_at < NOW() - ($1 || ' seconds')::interval \
+         ORDER BY updated_at ASC \
+         LIMIT $2"
+    ))
+    .bind(min_age_secs as i64)
+    .bind(limit as i64)
     .fetch_all(pool)
     .await
 }

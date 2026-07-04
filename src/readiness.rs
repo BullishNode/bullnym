@@ -141,6 +141,12 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                       FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
                       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
                   ) = ARRAY['nym', 'kind']::text[] \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name = 'cooperative_refused' \
             )",
     )
     .fetch_one(pool)
