@@ -594,19 +594,21 @@ async fn create_anonymous_for_kind(
     {
         Ok(pr) => pr,
         Err(e) => {
-            tracing::error!(
+            // Boltz's reverse-swap service can be transiently unavailable
+            // (e.g. 502 / timeout while Boltz is under load). Do NOT fail the
+            // whole checkout: a payable Liquid address is already allocated on
+            // this invoice, and the BTC chain offer below is likewise treated
+            // as best-effort. Keep the invoice and return an empty
+            // `lightning_pr`; the client requests the Lightning offer lazily
+            // via `POST /api/v1/invoices/:id/lightning` (fetch_lightning_offer)
+            // once Boltz recovers — the same path used for deep-link
+            // reconstruction. This keeps checkout working (Liquid + BTC rails)
+            // through a Boltz degradation instead of taking it down entirely.
+            tracing::warn!(
                 invoice_id = %invoice.id,
-                "eager Lightning offer creation failed; checkout invoice will not be returned: {e}",
+                "eager Lightning offer unavailable; returning checkout invoice with Liquid rail, client will fetch the LN offer lazily: {e}",
             );
-            if let Err(cleanup_err) =
-                db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
-            {
-                tracing::error!(
-                    invoice_id = %invoice.id,
-                    "failed to clean up checkout invoice after Boltz creation failure: {cleanup_err}",
-                );
-            }
-            return Err(e);
+            String::new()
         }
     };
     let bitcoin_chain_offer =
