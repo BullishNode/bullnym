@@ -1118,51 +1118,76 @@ async fn ensure_reusable_lightning_offer(
     }
 
     let lock_key = format!("invoice-lightning:{}", inv.id);
-    let mut conn = state
+    // Serialize concurrent offer creation for this invoice with a
+    // TRANSACTION-scoped advisory lock. A session-level `pg_advisory_lock` on a
+    // pooled connection leaks if the handler future is dropped (client
+    // disconnect / timeout) between lock and the manual unlock: the connection
+    // returns to the pool still holding the lock, wedging every subsequent
+    // `/lightning` request for this invoice and eventually exhausting the pool —
+    // exactly under Boltz degradation, when clients time out and retry.
+    // `pg_try_advisory_xact_lock` auto-releases on commit/rollback AND on
+    // connection drop, so cancellation cannot leak it, and it never blocks.
+    let mut tx = state
         .db
-        .acquire()
+        .begin()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
-    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1))")
         .bind(&lock_key)
-        .execute(&mut *conn)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
-
-    let result = async {
-        let latest: Option<(String, i64)> = sqlx::query_as(
-            "SELECT invoice, amount_sat FROM swap_records \
-             WHERE invoice_id = $1 \
-             ORDER BY created_at DESC \
-             LIMIT 1",
-        )
-        .bind(inv.id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-        if let Some((pr, pr_amount_sat)) = latest {
+    if !acquired {
+        // Another request is already minting an offer for this invoice. Never
+        // block on a pooled connection — return the latest still-reusable BOLT11
+        // if present, else signal the caller to retry shortly.
+        drop(tx);
+        if let Some((pr, pr_amount_sat)) =
+            db::latest_lightning_pr_for_invoice(&state.db, inv.id).await?
+        {
             if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
                 return Ok(Some(pr));
             }
         }
-        let pr =
-            create_lightning_offer(state, lightning_swap_nym(inv), amount_sat as u64, inv).await?;
-        Ok(Some(pr))
+        return Ok(None);
     }
-    .await;
 
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-        .bind(&lock_key)
-        .execute(&mut *conn)
+    // Holding the xact lock: double-check the latest offer, create only if needed.
+    let latest: Option<(String, i64)> = sqlx::query_as(
+        "SELECT invoice, amount_sat FROM swap_records \
+         WHERE invoice_id = $1 \
+         ORDER BY created_at DESC \
+         LIMIT 1",
+    )
+    .bind(inv.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?;
+    if let Some((pr, pr_amount_sat)) = latest {
+        if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
+            tx.commit()
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+            return Ok(Some(pr));
+        }
+    }
+
+    // create_lightning_offer performs its own writes on a separate pooled
+    // connection; the xact lock (held on `tx`) serializes creation and releases
+    // when `tx` is committed/rolled back below or dropped on cancellation.
+    let pr = match create_lightning_offer(state, lightning_swap_nym(inv), amount_sat as u64, inv)
         .await
     {
-        tracing::error!(
-            invoice_id = %inv.id,
-            "failed to unlock invoice lightning refresh advisory lock: {e}"
-        );
-    }
-
-    result
+        Ok(pr) => pr,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+    };
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    Ok(Some(pr))
 }
 
 /// Read-only counterpart to `ensure_reusable_lightning_offer`.
