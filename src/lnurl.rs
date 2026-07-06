@@ -40,28 +40,30 @@ pub struct CallbackParams {
     pub outpoint: Option<String>,
     pub pubkey: Option<String>,
     pub sig: Option<String>,
-    /// Blinding secret key (hex) for the confidential proof outpoint. Required
-    /// on the Liquid proof path so the server can unblind the UTXO and enforce
-    /// asset == L-BTC AND value >= `proof.min_proof_value_sat` (DG-7 /
-    /// ISS-S-04). The key belongs to the payer's own output and only unblinds
-    /// that one output.
-    pub blinding_key: Option<String>,
-    // Superseded by `blinding_key`: earlier drafts revealed the value and its
-    // blinding factors directly. Kept in the deserialization shape so clients
-    // still sending them don't fail with "unknown field".
-    #[allow(dead_code)]
+    /// LUD-22 Approach B proof-of-funds (the shipped mobile-client contract):
+    /// the payer supplies the cleartext output `value` (sat) plus the elements
+    /// value/asset blinding factors (display-order hex, i.e. `TxOutSecrets`
+    /// `to_string()`). The server rebinds them against the on-chain commitments
+    /// to enforce asset == L-BTC AND value >= `proof.min_proof_value_sat`
+    /// (DG-7 / ISS-S-04) — without unblinding.
     pub value: Option<u64>,
-    #[allow(dead_code)]
     pub value_bf: Option<String>,
-    #[allow(dead_code)]
     pub asset_bf: Option<String>,
+    /// Approach A (legacy) fields. Accepted-but-ignored for forward/backward
+    /// compat: a client still sending a `blinding_key`/`asset` must not 422.
+    #[allow(dead_code)]
+    pub blinding_key: Option<String>,
+    #[allow(dead_code)]
+    pub asset: Option<String>,
 }
 
 struct ProofFields {
     outpoint: String,
     pubkey: String,
     sig: String,
-    blinding_key: String,
+    value: u64,
+    value_bf: String,
+    asset_bf: String,
 }
 
 impl CallbackParams {
@@ -70,7 +72,9 @@ impl CallbackParams {
             outpoint: self.outpoint.clone()?,
             pubkey: self.pubkey.clone()?,
             sig: self.sig.clone()?,
-            blinding_key: self.blinding_key.clone()?,
+            value: self.value?,
+            value_bf: self.value_bf.clone()?,
+            asset_bf: self.asset_bf.clone()?,
         })
     }
 }
@@ -303,12 +307,15 @@ async fn serve_liquid(
                     return Err(AppError::UtxoSpent.into());
                 }
 
-                // Unblind the confidential proof output and enforce the L-BTC
-                // value floor. This makes the anti-enumeration cost real: a
-                // dust UTXO no longer satisfies the proof (DG-7 / ISS-S-04).
+                // Rebind the payer-supplied cleartext value + blinding factors
+                // against the on-chain commitments (LUD-22 Approach B) and
+                // enforce the L-BTC value floor. Makes the anti-enumeration cost
+                // real: a dust UTXO no longer satisfies the proof (DG-7 / ISS-S-04).
                 crate::utxo::assert_proof_utxo_value(
                     txout,
-                    &proof.blinding_key,
+                    proof.value,
+                    &proof.value_bf,
+                    &proof.asset_bf,
                     crate::invoice::LIQUID_BTC_ASSET_ID,
                     state.config.proof.min_proof_value_sat,
                 )?;
