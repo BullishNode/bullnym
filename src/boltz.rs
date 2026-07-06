@@ -43,7 +43,16 @@ impl BoltzService {
         webhook_url: Option<String>,
     ) -> Self {
         Self {
-            api: BoltzApiClientV2::new(boltz_url.to_string(), None),
+            // Bound request-path Boltz calls: Boltz normally answers in <2s, so
+            // a 10s ceiling fails fast with a clean error when Boltz hangs
+            // (e.g. degraded under load) instead of blocking past nginx's
+            // upstream timeout and surfacing a 504 to the caller. Combined with
+            // the best-effort Lightning-offer handling in invoice.rs, a Boltz
+            // outage degrades to "Liquid rail available" rather than a hang.
+            api: BoltzApiClientV2::new(
+                boltz_url.to_string(),
+                Some(std::time::Duration::from_secs(10)),
+            ),
             swap_master_key,
             webhook_url,
         }
