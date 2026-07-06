@@ -13,7 +13,7 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // EVERY successful navigation, including /invoice/:id and /:nym/i/:id. On
 // activate, the v1 pages cache is no longer in `keep` and gets deleted.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
-const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-DpsE19QE.js","/pwa-assets/assets/pos-B_YFRIjm.js","/pwa-assets/assets/PayFlow-BtqbssM-.js"]
+const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-CCMrk51A.js","/pwa-assets/assets/pos-DVZPxx2B.js","/pwa-assets/assets/PayFlow-Kq2nP-tt.js"]
 // Synthetic cache entry recording the PREVIOUS deploy's precache list. Never
 // requested by a page (not under /pwa-assets/), so no fetch handler serves it.
 const PREV_PRECACHE_SENTINEL = '/__bullnym/prev-precache'
