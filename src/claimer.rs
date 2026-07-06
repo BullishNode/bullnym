@@ -1462,7 +1462,12 @@ async fn construct_claim_tx(
         ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
-    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
+    // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
+    // during a degradation/DDoS) blocks the cooperative-claim round-trip
+    // indefinitely, which wedges the whole sweep loop and lets funded lockups
+    // drift to their timeout height — Boltz then refunds itself and the payer's
+    // money is lost. 15s covers the MuSig2 round-trip while still failing fast.
+    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
 
     let params = SwapTransactionParams {
         keys: keypair,
@@ -1530,7 +1535,12 @@ async fn construct_chain_claim_tx(
         ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
-    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), None);
+    // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
+    // during a degradation/DDoS) blocks the cooperative-claim round-trip
+    // indefinitely, which wedges the whole sweep loop and lets funded lockups
+    // drift to their timeout height — Boltz then refunds itself and the payer's
+    // money is lost. 15s covers the MuSig2 round-trip while still failing fast.
+    let boltz_api = BoltzApiClientV2::new(boltz_url.to_string(), Some(Duration::from_secs(15)));
 
     let params = SwapTransactionParams {
         keys: claim_keypair,
