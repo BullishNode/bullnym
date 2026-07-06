@@ -130,8 +130,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 export function createInvoice(
   nym: string,
   req: CreateInvoiceRequest,
+  opts: { pos?: boolean } = {},
 ): Promise<CreateInvoiceResponse> {
-  return request(`/${nym}/invoice`, {
+  // POS checkout MUST hit the POS endpoint so the receipt settles to the POS
+  // descriptor (idx 103) and never falls back to the Lightning Address wallet
+  // (KR-1 / issue #7). The Payment Page / donation surface uses `/invoice`.
+  const path = opts.pos ? `/${nym}/pos/invoice` : `/${nym}/invoice`
+  return request(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),

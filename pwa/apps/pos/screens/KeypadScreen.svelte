@@ -57,10 +57,14 @@
     creating = true
     errorMsg = null
     try {
-      const res = await createInvoice(config.nym, {
-        fiat_amount_minor: minor,
-        fiat_currency: settings.currency,
-      })
+      const res = await createInvoice(
+        config.nym,
+        {
+          fiat_amount_minor: minor,
+          fiat_currency: settings.currency,
+        },
+        { pos: true },
+      )
       cacheInvoice({
         invoice: res,
         note,
