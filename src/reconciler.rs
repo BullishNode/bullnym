@@ -41,7 +41,11 @@ pub fn spawn(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let client = BoltzApiClientV2::new(boltz_api_url, None);
+        // Bounded timeout: a hung get_swap must not freeze the reconciler loop
+        // (the only recovery for dropped webhooks / the only chain-swap poll
+        // driver). Without it, one black-holed Boltz call permanently disables
+        // recovery and in-flight swaps stay stuck.
+        let client = BoltzApiClientV2::new(boltz_api_url, Some(Duration::from_secs(10)));
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         // Skip the immediate first tick so the rest of startup completes
         // before we hammer Boltz. Same pattern as gc::run.
@@ -71,7 +75,9 @@ pub fn spawn(
 /// electrum/boltz endpoints, the utxo backend, and accounting tolerances.
 pub fn spawn_chain(state: AppState, config: Arc<ReconcilerConfig>, cancel: CancellationToken) {
     tokio::spawn(async move {
-        let client = BoltzApiClientV2::new(state.config.boltz.api_url.clone(), None);
+        // Bounded timeout (see spawn() above): a hung chain get_swap must not
+        // freeze the chain reconciler loop.
+        let client = BoltzApiClientV2::new(state.config.boltz.api_url.clone(), Some(Duration::from_secs(10)));
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         tick.tick().await; // skip the immediate first tick (same as reverse spawn)
         loop {
