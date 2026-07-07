@@ -25,6 +25,7 @@ const ALL_CHAIN_SWAP_STATUSES: &[ChainSwapStatus] = &[
     ChainSwapStatus::Expired,
     ChainSwapStatus::LockupFailed,
     ChainSwapStatus::Refunded,
+    ChainSwapStatus::RefundDue,
 ];
 
 #[test]
@@ -100,6 +101,9 @@ fn chain_swap_status_terminal() {
     assert!(!ChainSwapStatus::ServerLockConfirmed.is_terminal());
     assert!(!ChainSwapStatus::Claiming.is_terminal());
     assert!(!ChainSwapStatus::ClaimFailed.is_terminal());
+    // refund_due is the non-terminal join point of the refund waterfall — the
+    // reconciler must keep revisiting it until it drains to claimed/refunded.
+    assert!(!ChainSwapStatus::RefundDue.is_terminal());
 }
 
 #[test]

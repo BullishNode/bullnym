@@ -380,6 +380,32 @@ pub(crate) async fn handle_chain_swap_webhook(
         return Ok(());
     }
 
+    if status == ChainSwapStatus::RefundDue {
+        // Already flagged recoverable. Do NOT regress to a lifecycle state on a
+        // late/duplicate webhook, and do NOT re-alert (the reconciler re-drives
+        // this row every tick, so re-marking would spam the P1 event). The
+        // refund waterfall (Phases 3/4) + the reconciler (with Boltz get_swap
+        // truth) are what drain it. A `transaction.claimed` here means the swap
+        // actually settled after being marked (rare race) — surface it
+        // distinctly; Phase 4 must gate any refund on a Boltz not-claimed check
+        // to avoid a double payout.
+        if boltz_status == "transaction.claimed" {
+            tracing::warn!(
+                event = "chain_swap_refund_due_but_claimed",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                "chain swap is refund_due but Boltz now reports claimed; refund must be gated on Boltz not-claimed before broadcast (Phase 4)"
+            );
+        } else {
+            tracing::debug!(
+                "ignoring {} for refund_due chain swap {}",
+                boltz_status,
+                swap.boltz_swap_id
+            );
+        }
+        return Ok(());
+    }
+
     if boltz_status == "transaction.claimed" {
         tracing::info!(
             event = "chain_swap_boltz_claimed_observed",
@@ -401,11 +427,38 @@ pub(crate) async fn handle_chain_swap_webhook(
     }
 
     if boltz_status == "swap.expired" {
-        // Wall-clock swap timer expired. The on-chain server lockup is still
-        // claimable until timeoutBlockHeight, but Boltz now refuses the
-        // cooperative claim. Flip to the script path and keep the row sweepable
-        // — do NOT terminalize (that abandons claimable funds). Mirrors the
-        // reverse-swap `swap.expired` arm in dispatch_webhook.
+        if matches!(
+            status,
+            ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed
+        ) {
+            // The payer funded the BTC lockup but the swap expired before a
+            // server lockup ever existed (e.g. Boltz outage / lockup confirmed
+            // too late without a lockupFailed event). Nothing is claimable, but
+            // the payer's BTC is recoverable — route to refund_due instead of
+            // leaving a silently-stranded, alert-less zombie. Interim funded
+            // check is the local user_lock_* status (fund-safe direction; a
+            // precise Boltz get_chain_txs check is the tracked refinement).
+            tracing::warn!(
+                event = "chain_swap_refund_due",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                nym = ?swap.nym,
+                amount_sat = swap.user_lock_amount_sat,
+                lockup_address = %swap.lockup_address,
+                boltz_status,
+                "chain swap expired with a funded user lockup and no server lockup; marking refund_due (BTC recoverable, operator P1)"
+            );
+            db::mark_chain_swap_refund_due(&state.db, swap.id)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Server lockup exists (or claim in progress): still claimable until
+        // timeoutBlockHeight, but Boltz now refuses the cooperative claim. Flip
+        // to the script path and keep the row sweepable — do NOT terminalize
+        // (that abandons claimable funds). Mirrors the reverse-swap
+        // `swap.expired` arm in dispatch_webhook.
         tracing::warn!(
             event = "chain_swap_expired_webhook",
             swap_id = %swap.boltz_swap_id,

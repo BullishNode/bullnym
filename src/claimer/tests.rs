@@ -341,14 +341,18 @@ fn chain_swap_status_mapping_still_advances_and_terminalizes_correctly() {
         chain_swap_status_from_boltz_status("transaction.server.confirmed"),
         Some(ChainSwapStatus::ServerLockConfirmed)
     ));
+    // 0-conf rejection is a "wait for confirmation" signal, not a failure —
+    // it must re-sight the user lockup, never terminalize (was a live loss bug).
     assert!(matches!(
-        chain_swap_status_from_boltz_status("transaction.refunded"),
-        Some(ChainSwapStatus::Refunded)
+        chain_swap_status_from_boltz_status("transaction.zeroconf.rejected"),
+        Some(ChainSwapStatus::UserLockMempool)
     ));
-    assert!(matches!(
-        chain_swap_status_from_boltz_status("transaction.lockupFailed"),
-        Some(ChainSwapStatus::LockupFailed)
-    ));
+    // Funded-failure statuses are handled explicitly in handle_chain_swap_webhook
+    // (→ refund_due, funds recoverable), so the raw mapper returns None for them
+    // rather than terminalizing (which stranded the payer's BTC).
+    assert!(chain_swap_status_from_boltz_status("transaction.refunded").is_none());
+    assert!(chain_swap_status_from_boltz_status("transaction.lockupFailed").is_none());
+    assert!(chain_swap_status_from_boltz_status("transaction.failed").is_none());
 }
 
 #[test]

@@ -285,7 +285,7 @@ pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapR
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
          FROM chain_swap_records \
          WHERE status = 'refund_due' \
-         ORDER BY updated_at ASC"
+         ORDER BY created_at ASC"
     ))
     .fetch_all(pool)
     .await
