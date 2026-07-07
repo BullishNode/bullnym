@@ -268,7 +268,7 @@ async fn dispatch_webhook(
             try_claim_with_retry(
                 &state.db,
                 &swap,
-                &state.config.boltz.electrum_url,
+                &state.config.claim_liquid_electrum_urls(),
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
@@ -603,7 +603,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -661,7 +661,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -776,7 +776,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -814,7 +814,7 @@ fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapSt
 async fn try_claim_chain_swap_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::ChainSwapRecord,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -823,7 +823,7 @@ async fn try_claim_chain_swap_with_retry(
     match claim_chain_swap(
         pool,
         swap.id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -876,7 +876,7 @@ pub enum ClaimOutcome {
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -885,7 +885,7 @@ async fn try_claim_with_retry(
     match claim_swap(
         pool,
         swap.id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -1094,7 +1094,7 @@ async fn resolve_claim_address(
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1107,7 +1107,7 @@ async fn claim_swap(
     let result = claim_swap_inner(
         pool,
         swap_id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1165,7 +1165,7 @@ async fn claim_swap(
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
@@ -1226,7 +1226,7 @@ async fn claim_swap_inner(
         let constructed = match construct_claim_tx(
             &swap,
             &output_address,
-            electrum_url,
+            electrum_urls,
             boltz_url,
             use_cooperative,
         )
@@ -1307,8 +1307,7 @@ async fn claim_swap_inner(
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+        connect_liquid_electrum(electrum_urls)?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
     let mut txid = btc_like_txid(&claim_tx);
@@ -1427,7 +1426,7 @@ async fn claim_swap_inner(
 async fn claim_chain_swap(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1436,7 +1435,7 @@ async fn claim_chain_swap(
     let result = claim_chain_swap_inner(
         pool,
         chain_swap_id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1499,7 +1498,7 @@ async fn claim_chain_swap(
 async fn claim_chain_swap_inner(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
@@ -1562,7 +1561,7 @@ async fn claim_chain_swap_inner(
         let constructed = match construct_chain_claim_tx(
             &swap,
             &output_address,
-            electrum_url,
+            electrum_urls,
             boltz_url,
             use_cooperative,
         )
@@ -1616,8 +1615,7 @@ async fn claim_chain_swap_inner(
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+        connect_liquid_electrum(electrum_urls)?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
@@ -1731,7 +1729,7 @@ async fn claim_chain_swap_inner(
 async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1771,8 +1769,7 @@ async fn construct_claim_tx(
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+        connect_liquid_electrum(electrum_urls)?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1800,7 +1797,7 @@ async fn construct_claim_tx(
 async fn construct_chain_claim_tx(
     swap: &db::ChainSwapRecord,
     output_address: &str,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     use_cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1844,8 +1841,7 @@ async fn construct_chain_claim_tx(
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
     let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+        connect_liquid_electrum(electrum_urls)?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -2276,6 +2272,49 @@ fn electrum_host_port(url: &str) -> &str {
         .unwrap_or(url)
 }
 
+/// Connect a Liquid Electrum client for the claim/broadcast path, trying each
+/// URL until one connects — the same provider failover the UtxoBackend pool
+/// already has (#47). `ElectrumLiquidClient::new` attempts the connection, so a
+/// down endpoint fails here and we rotate to the next; the already-present
+/// `utxo_backend` tx-existence probe still rescues an on-chain-but-errored
+/// broadcast. Returns the first client that connects, or an aggregated error.
+fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
+    let mut errors: Vec<String> = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
+            Ok(c) => {
+                if i > 0 {
+                    tracing::warn!(
+                        event = "liquid_electrum_failover",
+                        endpoint = %url,
+                        "connected to failover Liquid electrum after earlier endpoint(s) failed"
+                    );
+                }
+                return Ok(c);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "liquid_electrum_failover",
+                    endpoint = %url,
+                    err = %e,
+                    "Liquid electrum connect failed; trying next endpoint"
+                );
+                errors.push(format!("{url}: {e}"));
+            }
+        }
+    }
+    tracing::error!(
+        event = "liquid_electrum_all_endpoints_failed",
+        endpoints = urls.len(),
+        "all Liquid electrum endpoints failed to connect"
+    );
+    Err(AppError::ClaimError(format!(
+        "electrum connection failed on all {} url(s): {}",
+        urls.len(),
+        errors.join(" | ")
+    )))
+}
+
 /// Hex-encode a fully-signed claim tx for storage in
 /// `swap_records.claim_tx_hex`. Mirrors the deserialize path in
 /// `BtcLikeTransaction::from_hex` so a round-trip is well-defined for
@@ -2394,7 +2433,7 @@ pub fn spawn_background_claimer(
                     match claim_swap(
                         &pool,
                         swap.id,
-                        &config.boltz.electrum_url,
+                        &config.claim_liquid_electrum_urls(),
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),
@@ -2445,7 +2484,7 @@ pub fn spawn_background_claimer(
                     match claim_chain_swap(
                         &pool,
                         swap.id,
-                        &config.boltz.electrum_url,
+                        &config.claim_liquid_electrum_urls(),
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),

@@ -69,6 +69,11 @@ struct MempoolTxStatus {
 
 pub struct BitcoinWatcher {
     cfg: BitcoinWatcherConfig,
+    /// Ordered esplora endpoints (primary + hardcoded provider failovers).
+    /// One endpoint is chosen per tick (whichever answers the tip fetch) and
+    /// used for that tick's address queries, so confirmation math never mixes
+    /// two nodes' views. See #47.
+    endpoints: Vec<String>,
     tolerances: db::InvoiceAccountingTolerances,
     http: reqwest::Client,
     pool: PgPool,
@@ -85,8 +90,10 @@ impl BitcoinWatcher {
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .build()?;
         let bucket = Arc::new(AsyncMutex::new(TokenBucket::new(cfg.rate_per_sec)));
+        let endpoints = cfg.effective_endpoints();
         Ok(Self {
             cfg,
+            endpoints,
             tolerances,
             http,
             pool,
@@ -150,10 +157,10 @@ impl BitcoinWatcher {
         // Tip is needed for confirmation-depth math. Treat a tip-fetch
         // failure as "skip this tick" — better than re-flipping rows
         // toward paid based on stale block_heights.
-        let tip = match self.fetch_tip_height().await {
-            Some(h) => h,
+        let (tip, endpoint) = match self.fetch_tip_and_endpoint().await {
+            Some(pair) => pair,
             None => {
-                tracing::warn!("bitcoin_watcher: tip-height fetch failed; skipping tick");
+                tracing::warn!("bitcoin_watcher: tip-height fetch failed on all endpoints; skipping tick");
                 return;
             }
         };
@@ -170,7 +177,7 @@ impl BitcoinWatcher {
                 );
                 return;
             }
-            self.check_invoice(&inv, tip).await;
+            self.check_invoice(&inv, tip, &endpoint).await;
         }
     }
 
@@ -198,44 +205,57 @@ impl BitcoinWatcher {
             .await
     }
 
-    async fn fetch_tip_height(&self) -> Option<u32> {
-        // `/blocks/tip/height` returns a bare integer.
-        let url = format!("{}/blocks/tip/height", self.cfg.endpoint);
-        let resp = match self.http.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("bitcoin_watcher: tip request failed: {e}");
-                return None;
+    /// Fetch the chain tip, failing over across endpoints. Returns the tip AND
+    /// the endpoint that served it, so the tick's address queries use the same
+    /// node (consistent confirmation math). `None` only if every endpoint fails.
+    async fn fetch_tip_and_endpoint(&self) -> Option<(u32, String)> {
+        for ep in &self.endpoints {
+            // `/blocks/tip/height` returns a bare integer.
+            let url = format!("{}/blocks/tip/height", ep.trim_end_matches('/'));
+            let resp = match self.http.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, status = %r.status());
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
+                    continue;
+                }
+            };
+            let body = match resp.text().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
+                    continue;
+                }
+            };
+            match body.trim().parse::<u32>() {
+                Ok(h) => return Some((h, ep.trim_end_matches('/').to_string())),
+                Err(_) => {
+                    tracing::warn!(
+                        event = "btc_esplora_failover", op = "tip", endpoint = %ep,
+                        "tip body did not parse as u32: '{}'",
+                        body.chars().take(64).collect::<String>()
+                    );
+                    continue;
+                }
             }
-        };
-        if !resp.status().is_success() {
-            tracing::warn!("bitcoin_watcher: tip request non-2xx: {}", resp.status());
-            return None;
         }
-        let body = match resp.text().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("bitcoin_watcher: tip body read failed: {e}");
-                return None;
-            }
-        };
-        match body.trim().parse::<u32>() {
-            Ok(h) => Some(h),
-            Err(_) => {
-                tracing::warn!(
-                    "bitcoin_watcher: tip body did not parse as u32: '{}'",
-                    body.chars().take(64).collect::<String>()
-                );
-                None
-            }
-        }
+        tracing::error!(
+            event = "btc_esplora_all_endpoints_failed",
+            op = "tip",
+            endpoints = self.endpoints.len(),
+            "all esplora endpoints failed the tip fetch"
+        );
+        None
     }
 
     /// Single-invoice check. On any HTTP error this is a no-op (logs and
     /// returns) — the next tick will retry. `mark_invoice_*` calls are
     /// idempotent so re-firing them on a re-poll is safe.
-    async fn check_invoice(&self, inv: &InvoiceForBtcPoll, tip: u32) {
-        let url = format!("{}/address/{}/txs", self.cfg.endpoint, inv.bitcoin_address);
+    async fn check_invoice(&self, inv: &InvoiceForBtcPoll, tip: u32, endpoint: &str) {
+        let url = format!("{}/address/{}/txs", endpoint, inv.bitcoin_address);
         let resp = match self.http.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
