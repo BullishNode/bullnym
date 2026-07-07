@@ -227,6 +227,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tracing::info!("chain reconciler started (shares reconciler config)");
 
+        // Settlement-repair: re-records invoice payment events for reverse
+        // (Lightning) swaps that reached `claimed` but whose invoice flip never
+        // completed (crash / transient failure between the claimed commit and
+        // the flip). Closes the merchant-paid-but-invoice-unpaid gap; the flip
+        // is idempotent so this is a safe no-op when the event already exists.
+        reconciler::spawn_settlement_repair(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+        );
+        tracing::info!("settlement repair started (shares reconciler config)");
+
         // Periodic GC of rate-limit tables. Without this, sliding-window
         // queries get progressively slower as inactive rows accumulate.
         {

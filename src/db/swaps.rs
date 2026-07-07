@@ -475,6 +475,43 @@ pub async fn list_non_terminal_swaps_oldest_first(
     .await
 }
 
+/// Reverse (Lightning) swaps that reached `claimed` — merchant funds are on
+/// chain — but whose invoice payment event was never recorded. This happens
+/// when the process dies (or `record_invoice_payment` transiently fails)
+/// between committing the `claimed` status and running
+/// `flip_invoice_on_lightning_settlement`: the claim succeeded but the invoice
+/// (POS receipt / payer screen / signed list) still shows unpaid, and the
+/// reconciler never revisits `claimed` (terminal) rows. The settlement-repair
+/// task re-runs the idempotent flip for these.
+///
+/// Bounded by `max_age_secs` (only recently-claimed rows) and `limit`.
+pub async fn list_claimed_swaps_missing_lightning_event(
+    pool: &PgPool,
+    max_age_secs: u64,
+    limit: u32,
+) -> Result<Vec<ReconcilerSwap>, sqlx::Error> {
+    sqlx::query_as::<_, ReconcilerSwap>(
+        "SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
+                nym, amount_sat, invoice_id \
+         FROM swap_records s \
+         WHERE s.status = 'claimed' \
+           AND s.invoice_id IS NOT NULL \
+           AND s.claim_txid IS NOT NULL \
+           AND s.updated_at > NOW() - ($1 || ' seconds')::interval \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM invoice_payment_events e \
+                  WHERE e.invoice_id = s.invoice_id \
+                    AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
+             ) \
+         ORDER BY s.updated_at ASC \
+         LIMIT $2",
+    )
+    .bind(max_age_secs as i64)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
 /// Schedule an immediate retry from the reconciler. Sets
 /// `next_claim_attempt_at = NOW()` so the next sweep tick (<=30s) picks
 /// up the row. Forward-only: terminal-state guard prevents the
