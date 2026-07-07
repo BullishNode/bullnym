@@ -189,7 +189,7 @@ impl BitcoinWatcher {
                AND bitcoin_address IS NOT NULL \
                AND created_at {cmp} NOW() - ($1 || ' seconds')::interval \
                AND expires_at > NOW() \
-             ORDER BY created_at DESC \
+             ORDER BY random() \
              LIMIT 1000",
         );
         sqlx::query_as::<_, InvoiceForBtcPoll>(&sql)
