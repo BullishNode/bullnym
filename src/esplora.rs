@@ -77,8 +77,18 @@ pub async fn broadcast(
     )))
 }
 
-/// A `sendrawtransaction`/esplora rejection body indicating the tx is already
+/// A `sendrawtransaction`/esplora rejection body indicating our tx is already
 /// in a mempool or block — an idempotent-broadcast success, not a failure.
+///
+/// IMPORTANT: this must only match "the tx WE sent is already known", never
+/// "these inputs are missing/spent". In particular `code -25`
+/// (`bad-txns-inputs-missingorspent` / `missing-inputs`) is deliberately NOT
+/// treated as success: a lagging failover node that hasn't indexed the lockup
+/// would return -25, and mis-reading that as success would mark the swap
+/// terminally `refunded`/`claimed` with a txid no node ever accepted (a phantom
+/// terminal state, unrecoverable). `-27` and the "already in ..." phrasings are
+/// safe — Core returns plain success for genuine mempool duplicates, so those
+/// only surface for txs that really are known.
 fn is_already_known(body: &str) -> bool {
     let b = body.to_lowercase();
     b.contains("already in utxo set")
@@ -87,7 +97,6 @@ fn is_already_known(body: &str) -> bool {
         || b.contains("already known")
         || b.contains("\"code\":-27")
         || b.contains("code: -27")
-        || b.contains("code\":-25") // outputs already spent (already-confirmed)
 }
 
 /// GET+decode JSON from the first `endpoints` entry that answers 2xx with a

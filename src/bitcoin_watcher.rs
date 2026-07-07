@@ -106,6 +106,7 @@ impl BitcoinWatcher {
         tracing::info!(
             event = "bitcoin_watcher_started",
             endpoint = %self.cfg.endpoint,
+            effective_endpoints = ?self.endpoints,
             active_tick_secs = self.cfg.active_tick_secs,
             idle_tick_secs = self.cfg.idle_tick_secs,
             confirmations_required = self.cfg.confirmations_required,
@@ -205,41 +206,51 @@ impl BitcoinWatcher {
             .await
     }
 
+    /// Fetch the chain tip from a single endpoint. `None` on connection error,
+    /// non-2xx, or an unparseable body. `/blocks/tip/height` returns a bare int.
+    async fn fetch_tip_from(&self, endpoint: &str) -> Option<u32> {
+        let ep = endpoint.trim_end_matches('/');
+        let url = format!("{ep}/blocks/tip/height");
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, status = %r.status());
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
+                return None;
+            }
+        };
+        let body = match resp.text().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
+                return None;
+            }
+        };
+        match body.trim().parse::<u32>() {
+            Ok(h) => Some(h),
+            Err(_) => {
+                tracing::warn!(
+                    event = "btc_esplora_failover", op = "tip", endpoint = %ep,
+                    "tip body did not parse as u32: '{}'",
+                    body.chars().take(64).collect::<String>()
+                );
+                None
+            }
+        }
+    }
+
     /// Fetch the chain tip, failing over across endpoints. Returns the tip AND
-    /// the endpoint that served it, so the tick's address queries use the same
-    /// node (consistent confirmation math). `None` only if every endpoint fails.
+    /// the endpoint that served it, so the tick's address queries can start on
+    /// the same node (consistent confirmation math). `None` only if every
+    /// endpoint fails.
     async fn fetch_tip_and_endpoint(&self) -> Option<(u32, String)> {
         for ep in &self.endpoints {
-            // `/blocks/tip/height` returns a bare integer.
-            let url = format!("{}/blocks/tip/height", ep.trim_end_matches('/'));
-            let resp = match self.http.get(&url).send().await {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, status = %r.status());
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
-                    continue;
-                }
-            };
-            let body = match resp.text().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(event = "btc_esplora_failover", op = "tip", endpoint = %ep, err = %e);
-                    continue;
-                }
-            };
-            match body.trim().parse::<u32>() {
-                Ok(h) => return Some((h, ep.trim_end_matches('/').to_string())),
-                Err(_) => {
-                    tracing::warn!(
-                        event = "btc_esplora_failover", op = "tip", endpoint = %ep,
-                        "tip body did not parse as u32: '{}'",
-                        body.chars().take(64).collect::<String>()
-                    );
-                    continue;
-                }
+            let ep = ep.trim_end_matches('/');
+            if let Some(h) = self.fetch_tip_from(ep).await {
+                return Some((h, ep.to_string()));
             }
         }
         tracing::error!(
@@ -251,65 +262,149 @@ impl BitcoinWatcher {
         None
     }
 
-    /// Single-invoice check. On any HTTP error this is a no-op (logs and
-    /// returns) — the next tick will retry. `mark_invoice_*` calls are
-    /// idempotent so re-firing them on a re-poll is safe.
+    /// Single-invoice check with endpoint failover (#47). Queries the address
+    /// txs starting on the tick's chosen endpoint (whose tip we already have,
+    /// paired for consistent confirmation math), then rotates to the other
+    /// endpoints on a connection error or an endpoint-specific non-2xx. For a
+    /// fallback endpoint the tip is re-fetched FROM THAT SAME NODE, so tip and
+    /// the accepted address response never mix two nodes' chain views. On any
+    /// terminal HTTP condition this is a no-op (logs and returns) — the next
+    /// tick will retry. `mark_invoice_*` calls are idempotent so re-firing them
+    /// on a re-poll is safe.
+    ///
+    /// Failover taxonomy:
+    ///   - 429: a per-tick backoff signal, NOT an endpoint fault — return
+    ///     (rotating would just hammer the next provider).
+    ///   - 400: a permanent bad-address (create-time validation should prevent
+    ///     it) — return; every node rejects the same malformed address.
+    ///   - 404 / 5xx / other non-2xx / connection error / decode error: an
+    ///     endpoint-specific fault (e.g. a node without an address index answers
+    ///     404, an overloaded one 5xx) — rotate to the next endpoint.
     async fn check_invoice(&self, inv: &InvoiceForBtcPoll, tip: u32, endpoint: &str) {
-        let url = format!("{}/address/{}/txs", endpoint, inv.bitcoin_address);
-        let resp = match self.http.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
+        // Failover order: the tick's chosen endpoint first (tip already known),
+        // then the remaining endpoints (tip re-fetched per node).
+        let chosen = endpoint.trim_end_matches('/');
+        let mut order: Vec<(&str, Option<u32>)> = vec![(chosen, Some(tip))];
+        for ep in &self.endpoints {
+            let ep = ep.trim_end_matches('/');
+            if ep != chosen {
+                order.push((ep, None));
+            }
+        }
+
+        let mut endpoint_errors: Vec<String> = Vec::new();
+        for (idx, (ep, known_tip)) in order.iter().enumerate() {
+            // Resolve the tip for THIS endpoint: the chosen endpoint reuses the
+            // tick's tip; a fallback fetches its own. If a fallback's tip fetch
+            // fails, skip it (we must not pair its address response with another
+            // node's tip).
+            let ep_tip = match known_tip {
+                Some(t) => *t,
+                None => match self.fetch_tip_from(ep).await {
+                    Some(t) => t,
+                    None => {
+                        endpoint_errors.push(format!("{ep}: tip fetch failed"));
+                        continue;
+                    }
+                },
+            };
+
+            let url = format!("{}/address/{}/txs", ep, inv.bitcoin_address);
+            let resp = match self.http.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "btc_esplora_failover",
+                        op = "address_txs",
+                        invoice_id = %inv.id,
+                        endpoint = %ep,
+                        "bitcoin_watcher: address-txs request failed: {e}"
+                    );
+                    endpoint_errors.push(format!("{ep}: {e}"));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 tracing::warn!(
+                    event = "bitcoin_watcher_upstream_429",
                     invoice_id = %inv.id,
-                    "bitcoin_watcher: address-txs request failed: {e}"
+                    endpoint = %ep,
+                    "bitcoin_watcher: upstream rate-limited; backing off this tick"
                 );
                 return;
             }
-        };
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            tracing::warn!(
-                event = "bitcoin_watcher_upstream_429",
-                invoice_id = %inv.id,
-                "bitcoin_watcher: upstream rate-limited; backing off this tick"
-            );
-            return;
-        }
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
-            // Bad address (rejected by validator at create-time should mean
-            // this never fires, but defense-in-depth). Don't retry.
-            tracing::error!(
-                event = "bitcoin_watcher_bad_address",
-                invoice_id = %inv.id,
-                http_status = %status,
-                "bitcoin_watcher: upstream rejected bitcoin_address"
-            );
-            return;
-        }
-        if !status.is_success() {
-            tracing::warn!(
-                invoice_id = %inv.id,
-                http_status = %status,
-                "bitcoin_watcher: address-txs non-2xx"
-            );
-            return;
-        }
-
-        let txs: Vec<MempoolTx> = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                tracing::error!(
+                    event = "bitcoin_watcher_bad_address",
                     invoice_id = %inv.id,
-                    "bitcoin_watcher: address-txs JSON decode failed: {e}"
+                    http_status = %status,
+                    endpoint = %ep,
+                    "bitcoin_watcher: upstream rejected bitcoin_address (400)"
                 );
                 return;
             }
-        };
+            if !status.is_success() {
+                // 404 / 5xx / other — endpoint-specific fault, rotate.
+                tracing::warn!(
+                    event = "btc_esplora_failover",
+                    op = "address_txs",
+                    invoice_id = %inv.id,
+                    endpoint = %ep,
+                    http_status = %status,
+                    "bitcoin_watcher: address-txs non-2xx; trying next endpoint"
+                );
+                endpoint_errors.push(format!("{ep}: {status}"));
+                continue;
+            }
 
+            let txs: Vec<MempoolTx> = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "btc_esplora_failover",
+                        op = "address_txs",
+                        invoice_id = %inv.id,
+                        endpoint = %ep,
+                        "bitcoin_watcher: address-txs JSON decode failed: {e}"
+                    );
+                    endpoint_errors.push(format!("{ep}: decode {e}"));
+                    continue;
+                }
+            };
+
+            if idx > 0 {
+                tracing::warn!(
+                    event = "btc_esplora_failover",
+                    op = "address_txs",
+                    invoice_id = %inv.id,
+                    endpoint = %ep,
+                    "bitcoin_watcher: address query served by failover endpoint"
+                );
+            }
+
+            self.process_address_txs(inv, &txs, ep_tip).await;
+            return;
+        }
+
+        tracing::warn!(
+            event = "btc_esplora_all_endpoints_failed",
+            op = "address_txs",
+            invoice_id = %inv.id,
+            "bitcoin_watcher: all esplora endpoints failed the address-txs fetch this tick: {}",
+            endpoint_errors.join(" | ")
+        );
+    }
+
+    /// Process an address-txs response: upsert observations, record confirmed
+    /// outputs, and flip the invoice to `in_progress` on a mempool sighting.
+    /// `tip` MUST come from the same node that served `txs` (consistent
+    /// confirmation math — see `check_invoice`).
+    async fn process_address_txs(&self, inv: &InvoiceForBtcPoll, txs: &[MempoolTx], tip: u32) {
         let mut saw_mempool = false;
         let mut seen_event_keys = Vec::new();
-        for tx in &txs {
+        for tx in txs {
             for observation in bitcoin_direct_observations_for_tx(
                 tx,
                 &inv.bitcoin_address,

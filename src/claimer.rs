@@ -15,7 +15,7 @@ use lwk_wollet::elements;
 use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::esplora::EsploraBitcoinClient;
-use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
+use boltz_client::network::{BitcoinChain, Chain, LiquidChain, LiquidClient};
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateChainResponse, CreateReverseResponse, Side,
 };
@@ -1306,8 +1306,7 @@ async fn claim_swap_inner(
     // dies between here and the final update, the next sweep tick re-acquires
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
-    let liquid_client =
-        connect_liquid_electrum(electrum_urls)?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
     let mut txid = btc_like_txid(&claim_tx);
@@ -1614,8 +1613,7 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    let liquid_client =
-        connect_liquid_electrum(electrum_urls)?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
@@ -1768,8 +1766,7 @@ async fn construct_claim_tx(
 
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
-    let liquid_client =
-        connect_liquid_electrum(electrum_urls)?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1840,8 +1837,7 @@ async fn construct_chain_claim_tx(
     )
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
-    let liquid_client =
-        connect_liquid_electrum(electrum_urls)?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -2172,50 +2168,94 @@ async fn build_and_broadcast_chain_refund(
     )
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
-    let bitcoin_client = EsploraBitcoinClient::new(
-        BitcoinChain::Bitcoin,
-        &state.config.bitcoin_watcher.endpoint,
-        30,
-    );
-    let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
     let boltz_api = BoltzApiClientV2::new(
         state.config.boltz.api_url.clone(),
         Some(Duration::from_secs(15)),
     );
 
-    let build = |cooperative: bool| {
-        let params = SwapTransactionParams {
-            keys: refund_keypair,
-            output_address: refund_address.to_string(),
-            // Conservative sat/vB. A too-low fee only delays the refund (RBF /
-            // re-broadcast possible); precise mempool fee estimation is a
-            // tracked refinement to validate in the staged broadcast test.
-            fee: Fee::Relative(2.0),
-            swap_id: swap.boltz_swap_id.clone(),
-            chain_client: &chain_client,
-            boltz_client: &boltz_api,
-            options: Some(TransactionOptions::default().with_cooperative(cooperative)),
-        };
-        lockup_script.construct_refund(params)
-    };
+    // Construct the refund tx, rotating across the esplora endpoints (#47).
+    // `construct_refund` fetches the lockup UTXO from the Bitcoin chain client,
+    // so a no-address-index or "up-but-broken" primary node can fail
+    // construction *before* we ever reach the (already-failover'd) broadcast.
+    // Building one client per endpoint lets a broken primary fall through to a
+    // healthy provider. Defense-in-depth: the fork's `new_refund` already falls
+    // back to Boltz for the UTXO, so a healthy primary behaves identically
+    // (endpoint[0] wins on the first cooperative attempt).
+    //
+    // The cooperative->script fallback stays INSIDE each endpoint attempt: a
+    // cooperative refusal is a Boltz answer (post-timeout / Boltz unavailable),
+    // NOT an endpoint fault, so we must not rotate the esplora on it — we drop
+    // to the script path on the SAME endpoint. We only rotate when BOTH paths
+    // fail on an endpoint (the signature of a broken/no-index node).
+    let endpoints = state.config.bitcoin_watcher.effective_endpoints();
+    let mut construct_errors: Vec<String> = Vec::new();
+    let mut refund_tx = None;
+    for (i, endpoint) in endpoints.iter().enumerate() {
+        let bitcoin_client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
+        let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
 
-    // Cooperative first (pre-timeout, cheapest). If Boltz refuses the partial
-    // sig (post-timeout, or Boltz unavailable), fall back to the script path —
-    // the network rejects a premature script-path spend, so this is safe.
-    let refund_tx = match build(true).await {
-        Ok(tx) => tx,
-        Err(coop_err) => {
-            tracing::warn!(
-                event = "chain_swap_refund_cooperative_failed",
-                swap_id = %swap.boltz_swap_id,
-                error = %coop_err,
-                "cooperative refund construction failed; attempting unilateral script path"
-            );
-            build(false)
-                .await
-                .map_err(|e| AppError::ClaimError(format!("construct_chain_refund failed: {e}")))?
+        let build = |cooperative: bool| {
+            let params = SwapTransactionParams {
+                keys: refund_keypair,
+                output_address: refund_address.to_string(),
+                // Conservative sat/vB. A too-low fee only delays the refund (RBF
+                // / re-broadcast possible); precise mempool fee estimation is a
+                // tracked refinement to validate in the staged broadcast test.
+                fee: Fee::Relative(2.0),
+                swap_id: swap.boltz_swap_id.clone(),
+                chain_client: &chain_client,
+                boltz_client: &boltz_api,
+                options: Some(TransactionOptions::default().with_cooperative(cooperative)),
+            };
+            lockup_script.construct_refund(params)
+        };
+
+        // Cooperative first (pre-timeout, cheapest).
+        match build(true).await {
+            Ok(tx) => {
+                refund_tx = Some(tx);
+                break;
+            }
+            Err(coop_err) => {
+                tracing::warn!(
+                    event = "chain_swap_refund_cooperative_failed",
+                    swap_id = %swap.boltz_swap_id,
+                    endpoint = %endpoint,
+                    error = %coop_err,
+                    "cooperative refund construction failed; attempting unilateral script path on same endpoint"
+                );
+                // Script path on the SAME endpoint — the network rejects a
+                // premature script-path spend, so this is safe.
+                match build(false).await {
+                    Ok(tx) => {
+                        refund_tx = Some(tx);
+                        break;
+                    }
+                    Err(script_err) => {
+                        // Both paths failed here — likely an endpoint fault
+                        // (no address index / up-but-broken). Rotate.
+                        if i + 1 < endpoints.len() {
+                            tracing::warn!(
+                                event = "chain_swap_refund_construct_failover",
+                                swap_id = %swap.boltz_swap_id,
+                                endpoint = %endpoint,
+                                "refund construction failed on this esplora endpoint; rotating to next"
+                            );
+                        }
+                        construct_errors
+                            .push(format!("{endpoint}: coop={coop_err}; script={script_err}"));
+                    }
+                }
+            }
         }
-    };
+    }
+    let refund_tx = refund_tx.ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "construct_chain_refund failed on all {} esplora endpoint(s): {}",
+            endpoints.len(),
+            construct_errors.join(" | ")
+        ))
+    })?;
 
     // Broadcast with esplora endpoint failover (issue #47): a single broken or
     // down node must not block the refund. `broadcast` tries each endpoint until
@@ -2273,35 +2313,52 @@ fn electrum_host_port(url: &str) -> &str {
 }
 
 /// Connect a Liquid Electrum client for the claim/broadcast path, trying each
-/// URL until one connects — the same provider failover the UtxoBackend pool
-/// already has (#47). `ElectrumLiquidClient::new` attempts the connection, so a
-/// down endpoint fails here and we rotate to the next; the already-present
-/// `utxo_backend` tx-existence probe still rescues an on-chain-but-errored
-/// broadcast. Returns the first client that connects, or an aggregated error.
-fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
+/// URL until one connects AND answers a cheap probe — the same provider
+/// failover the UtxoBackend pool already has (#47). `ElectrumLiquidClient::new`
+/// attempts the connection, so a DOWN endpoint fails here and we rotate. An
+/// "up-but-broken" backend (TCP accepts, requests error) would otherwise be
+/// returned healthy and pin every retry to it; a post-connect `get_genesis_hash`
+/// probe (a single `blockchain.block.header` at height 0) catches that and
+/// rotates too. The already-present `utxo_backend` tx-existence probe still
+/// rescues an on-chain-but-errored broadcast. Returns the first client that
+/// connects and validates, or an aggregated error.
+async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
     let mut errors: Vec<String> = Vec::new();
     for (i, url) in urls.iter().enumerate() {
-        match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
-            Ok(c) => {
-                if i > 0 {
+        let client =
+            match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
+                Ok(c) => c,
+                Err(e) => {
                     tracing::warn!(
                         event = "liquid_electrum_failover",
                         endpoint = %url,
-                        "connected to failover Liquid electrum after earlier endpoint(s) failed"
+                        err = %e,
+                        "Liquid electrum connect failed; trying next endpoint"
                     );
+                    errors.push(format!("{url}: connect: {e}"));
+                    continue;
                 }
-                return Ok(c);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event = "liquid_electrum_failover",
-                    endpoint = %url,
-                    err = %e,
-                    "Liquid electrum connect failed; trying next endpoint"
-                );
-                errors.push(format!("{url}: {e}"));
-            }
+            };
+        // Post-connect validation: a genesis-header fetch is cheap and
+        // deterministic; an up-but-broken node errors here and we rotate.
+        if let Err(e) = client.get_genesis_hash().await {
+            tracing::warn!(
+                event = "liquid_electrum_failover",
+                endpoint = %url,
+                err = %e,
+                "Liquid electrum connected but failed validation probe; trying next endpoint"
+            );
+            errors.push(format!("{url}: probe: {e}"));
+            continue;
         }
+        if i > 0 {
+            tracing::warn!(
+                event = "liquid_electrum_failover",
+                endpoint = %url,
+                "connected to failover Liquid electrum after earlier endpoint(s) failed"
+            );
+        }
+        return Ok(client);
     }
     tracing::error!(
         event = "liquid_electrum_all_endpoints_failed",
