@@ -1037,6 +1037,134 @@ pub async fn status(
 }
 
 // =====================================================================
+// POST /api/v1/invoices/:id/refund — customer self-claim BTC refund (Phase 4)
+// =====================================================================
+
+#[derive(Deserialize)]
+pub struct ChainRefundRequest {
+    /// Customer's BTC (mainnet) address to receive the refunded lockup.
+    pub refund_address: String,
+}
+
+#[derive(Serialize)]
+pub struct ChainRefundResponse {
+    /// Always "refunded" on success (the swap reached terminal `refunded`).
+    pub status: String,
+    /// The broadcast refund transaction id.
+    pub refund_txid: String,
+}
+
+/// Validate a customer refund address: non-empty and a valid Bitcoin *mainnet*
+/// address. Rejecting early yields a clean, coded error before any state write;
+/// `construct_refund` re-validates network as a backstop.
+fn validate_btc_refund_address(addr: &str) -> Result<(), AppError> {
+    use std::str::FromStr;
+    if addr.is_empty() {
+        return Err(AppError::RefundAddressInvalid("empty address".into()));
+    }
+    let parsed = boltz_client::bitcoin::Address::from_str(addr)
+        .map_err(|e| AppError::RefundAddressInvalid(format!("parse failed: {e}")))?;
+    if !parsed.is_valid_for_network(boltz_client::bitcoin::Network::Bitcoin) {
+        return Err(AppError::RefundAddressInvalid(
+            "address is not valid on Bitcoin mainnet".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Customer self-claim refund: submit a BTC address for an invoice whose
+/// on-chain BTC payment failed (a `refund_due` chain swap) and get the refund
+/// broadcast. Auth is by knowledge of the invoice id (same as `status`);
+/// G13 residual race is ratified by the first-write-wins immutable refund
+/// address (a bystander who knows the public URL cannot redirect a committed
+/// refund). Idempotent: a retried request after success returns the same txid.
+pub async fn request_chain_refund(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<ChainRefundRequest>,
+) -> Result<Json<ChainRefundResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
+    let is_whitelisted = ip
+        .map(|ip| state.ip_whitelist.contains(ip))
+        .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::InvoiceStatus,
+        peer,
+        &headers,
+        "chain_refund",
+        Some(&id_str),
+    );
+    if !is_whitelisted && !is_certification_allowed {
+        if let Some(ip) = ip {
+            state.rate_limiter.check_invoice_status_per_source(ip).await?;
+        }
+    }
+
+    let id = parse_invoice_id(&id_str)?;
+    let refund_address = req.refund_address.trim().to_string();
+    validate_btc_refund_address(&refund_address)?;
+
+    // Idempotent success: a completed refund for this invoice + same address.
+    if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
+        match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
+            (Some(existing), Some(txid)) if existing == refund_address => {
+                return Ok(Json(ChainRefundResponse {
+                    status: "refunded".into(),
+                    refund_txid: txid.to_string(),
+                }));
+            }
+            _ => {
+                return Err(AppError::RefundNotAvailable(
+                    "invoice already refunded (to a different address)".into(),
+                ));
+            }
+        }
+    }
+
+    let swap = db::find_refund_due_chain_swap_for_invoice(&state.db, id)
+        .await?
+        .ok_or_else(|| {
+            AppError::RefundNotAvailable(format!("no refundable chain swap for invoice {id}"))
+        })?;
+
+    // First-write-wins: commit the address before any broadcast (G14).
+    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &refund_address).await?;
+    if rows == 0 {
+        // Address already set, or the swap left `refund_due`. Disambiguate.
+        let cur = db::get_chain_swap_by_id(&state.db, swap.id)
+            .await?
+            .ok_or_else(|| AppError::RefundNotAvailable("chain swap not found".into()))?;
+        match cur.refund_address.as_deref() {
+            Some(existing) if existing == refund_address => { /* idempotent: proceed */ }
+            Some(_) => {
+                return Err(AppError::RefundNotAvailable(
+                    "a different refund address was already submitted for this payment".into(),
+                ));
+            }
+            None => {
+                return Err(AppError::RefundNotAvailable(
+                    "this payment is no longer refundable".into(),
+                ));
+            }
+        }
+    }
+
+    // Re-read the address-populated row and execute the refund under the lock.
+    let swap = db::get_chain_swap_by_id(&state.db, swap.id)
+        .await?
+        .ok_or_else(|| AppError::RefundNotAvailable("chain swap not found".into()))?;
+    let txid = crate::claimer::execute_chain_swap_refund(&state, &swap).await?;
+    Ok(Json(ChainRefundResponse {
+        status: "refunded".into(),
+        refund_txid: txid,
+    }))
+}
+
+// =====================================================================
 // POST /api/v1/invoices/:id/lightning — lazy create / re-fetch the offer
 // =====================================================================
 

@@ -25,12 +25,21 @@ pub enum ChainSwapStatus {
     /// failure, later drained by renegotiation (→ settle/`Claimed`) or customer
     /// self-claim (→ `Refunded`). Must never be terminalized to a dead state.
     RefundDue,
+    /// Customer self-claim refund in flight (Phase 4). Set atomically from
+    /// `RefundDue` under the per-swap advisory lock BEFORE the BTC refund tx is
+    /// broadcast, and EXCLUDED from every claim path — this is the double-payout
+    /// guard (G12): the L-BTC claim and the BTC refund spend different UTXOs on
+    /// different chains and could otherwise both confirm. NON-TERMINAL: on
+    /// broadcast failure it reverts to `RefundDue` (retryable); on success it
+    /// advances to `Refunded`.
+    Refunding,
 }
 
 impl ChainSwapStatus {
     pub fn is_terminal(self) -> bool {
-        // `RefundDue` is deliberately NOT terminal — the reconciler must keep
-        // revisiting it so the waterfall can drain it.
+        // `RefundDue` and `Refunding` are deliberately NOT terminal — the
+        // reconciler must keep revisiting them so the waterfall can drain them
+        // (and a failed refund broadcast can revert `Refunding` → `RefundDue`).
         matches!(
             self,
             Self::Claimed | Self::ClaimStuck | Self::Expired | Self::LockupFailed | Self::Refunded
@@ -54,6 +63,7 @@ impl fmt::Display for ChainSwapStatus {
             Self::LockupFailed => "lockup_failed",
             Self::Refunded => "refunded",
             Self::RefundDue => "refund_due",
+            Self::Refunding => "refunding",
         })
     }
 }
@@ -76,6 +86,7 @@ impl FromStr for ChainSwapStatus {
             "lockup_failed" => Ok(Self::LockupFailed),
             "refunded" => Ok(Self::Refunded),
             "refund_due" => Ok(Self::RefundDue),
+            "refunding" => Ok(Self::Refunding),
             other => Err(format!("unknown chain swap status: {other}")),
         }
     }
@@ -120,6 +131,11 @@ pub struct ChainSwapRecord {
     /// Server-lockup amount Boltz accepted after a Phase 3 quote renegotiation
     /// (get_quote/accept_quote), or NULL when the swap was never renegotiated.
     pub renegotiated_server_lock_amount_sat: Option<i64>,
+    /// Customer-supplied BTC refund address (Phase 4), first-write-wins and
+    /// immutable once set. NULL until the customer submits one.
+    pub refund_address: Option<String>,
+    /// Broadcast customer-refund transaction id (Phase 4), NULL until refunded.
+    pub refund_txid: Option<String>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -146,7 +162,7 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
      claim_tx_hex, claim_attempts, last_claim_error, cooperative_refused, \
-     renegotiated_server_lock_amount_sat, \
+     renegotiated_server_lock_amount_sat, refund_address, refund_txid, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
 
@@ -368,6 +384,129 @@ pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapR
     ))
     .fetch_all(pool)
     .await
+}
+
+/// The `refund_due` chain swap for an invoice, if any (Phase 4). Used by the
+/// customer self-claim endpoint to locate the swap whose BTC is refundable.
+/// There is at most one refundable chain swap per invoice in practice; newest
+/// first for determinism.
+pub async fn find_refund_due_chain_swap_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE invoice_id = $1 AND status = 'refund_due' \
+         ORDER BY created_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The already-`refunded` chain swap for an invoice, if any (Phase 4). Lets the
+/// self-claim endpoint short-circuit a retried request idempotently — returning
+/// the recorded `refund_txid` instead of erroring because the swap is no longer
+/// `refund_due`.
+pub async fn get_refunded_chain_swap_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE invoice_id = $1 AND status = 'refunded' \
+         ORDER BY updated_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Records the customer's BTC refund address, FIRST-WRITE-WINS and immutable
+/// (G13/G14): the UPDATE only fires when `refund_address IS NULL` and the swap
+/// is still `refund_due`, so a bystander who knows the public invoice URL cannot
+/// overwrite an address already committed. Returns rows affected (1 = this call
+/// set it; 0 = already set, or the swap is no longer `refund_due`). The caller
+/// distinguishes "already set to the same address" (idempotent success) from
+/// "set to a different address" (reject) by reading the row.
+pub async fn set_chain_swap_refund_address(
+    pool: &PgPool,
+    id: Uuid,
+    refund_address: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET refund_address = $2, updated_at = NOW() \
+         WHERE id = $1 AND refund_address IS NULL AND status = 'refund_due'",
+    )
+    .bind(id)
+    .bind(refund_address)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Atomically transitions `refund_due` -> `refunding` (Phase 4 G12 double-payout
+/// guard). Only fires from `refund_due` with a refund address already committed;
+/// `refunding` is excluded from every claim path, so once this succeeds no claim
+/// can start. Runs inside the caller's advisory-locked transaction. Returns rows
+/// affected (1 = we own the refund; 0 = not `refund_due`, or no address).
+pub async fn mark_chain_swap_refunding<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'refunding', updated_at = NOW() \
+         WHERE id = $1 AND status = 'refund_due' AND refund_address IS NOT NULL",
+    )
+    .bind(id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Terminal success: `refunding` -> `refunded`, recording the broadcast txid.
+/// Guarded to `refunding` so it cannot terminalize a swap that reverted or was
+/// never in flight. Returns rows affected.
+pub async fn mark_chain_swap_refunded(
+    pool: &PgPool,
+    id: Uuid,
+    refund_txid: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'refunded', refund_txid = $2, updated_at = NOW() \
+         WHERE id = $1 AND status = 'refunding'",
+    )
+    .bind(id)
+    .bind(refund_txid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Reverts `refunding` -> `refund_due` on a broadcast failure so the refund
+/// stays recoverable (retryable by a later customer attempt or the reconciler)
+/// rather than stranding funds in a non-draining state. Guarded to `refunding`.
+/// Returns rows affected.
+pub async fn revert_chain_swap_refunding_to_due(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'refund_due', updated_at = NOW() \
+         WHERE id = $1 AND status = 'refunding'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at

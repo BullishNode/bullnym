@@ -25,6 +25,13 @@ pub enum AppError {
     /// invoice's owning nym. Same wire copy in both cases — never reveal
     /// existence cross-nym.
     InvoiceNotFound(String),
+    /// Customer-submitted BTC refund address is malformed or on the wrong
+    /// network (Phase 4 self-claim). Inner string is operator-facing.
+    RefundAddressInvalid(String),
+    /// No refundable (`refund_due`) chain swap for this invoice, the swap is no
+    /// longer refundable, or the refund address was already committed to a
+    /// different value (first-write-wins). Inner string is operator-facing.
+    RefundNotAvailable(String),
     /// Image upload rejected (magic-byte sniff fail, decode error, etc.).
     /// Inner string is operator-facing.
     ImageInvalid(String),
@@ -159,6 +166,8 @@ impl AppError {
             | Self::UtxoSpent
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
+            | Self::RefundAddressInvalid(_)
+            | Self::RefundNotAvailable(_)
             | Self::BitcoinAddressAlreadyUsed
             | Self::LiquidAddressAlreadyUsed => ErrorClass::Identity,
 
@@ -188,6 +197,8 @@ impl AppError {
             Self::DonationPageInvalid(_) => "DonationPageInvalid",
             Self::DonationPageNotFound(_) => "DonationPageNotFound",
             Self::InvoiceNotFound(_) => "InvoiceNotFound",
+            Self::RefundAddressInvalid(_) => "RefundAddressInvalid",
+            Self::RefundNotAvailable(_) => "RefundNotAvailable",
             Self::ImageInvalid(_) => "ImageInvalid",
             Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
             Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
@@ -241,6 +252,8 @@ impl std::fmt::Display for AppError {
             Self::DonationPageInvalid(reason) => write!(f, "donation page invalid: {reason}"),
             Self::DonationPageNotFound(nym) => write!(f, "no donation page for {nym}"),
             Self::InvoiceNotFound(id) => write!(f, "invoice not found: {id}"),
+            Self::RefundAddressInvalid(reason) => write!(f, "refund address invalid: {reason}"),
+            Self::RefundNotAvailable(reason) => write!(f, "refund not available: {reason}"),
             Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
             Self::ImageDimensionsTooLarge { max } => {
                 write!(f, "image dimensions exceed {max}px cap")
@@ -310,6 +323,8 @@ impl IntoResponse for AppError {
             AppError::DonationPageInvalid(reason) => format!("Donation page rejected: {reason}."),
             AppError::DonationPageNotFound(_) => "No donation page exists for this name.".into(),
             AppError::InvoiceNotFound(_) => "Invoice not found.".into(),
+            AppError::RefundAddressInvalid(_) => "This is not a valid Bitcoin address for the correct network. Check the address and try again.".into(),
+            AppError::RefundNotAvailable(_) => "This payment cannot be refunded to a Bitcoin address. Either it has no recoverable on-chain payment, or a refund address was already submitted.".into(),
             AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
             AppError::ImageDimensionsTooLarge { max } => format!(
                 "Image dimensions are too large. Maximum {max}×{max} pixels."
