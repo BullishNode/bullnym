@@ -462,13 +462,17 @@ fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/invoices/:id/liquid",
                 post(invoice::fetch_liquid_offer),
-            )
-            .route(
-                // Phase 4 customer self-claim BTC refund. Small body (a single
-                // address); bound a misbehaving client.
+            );
+
+        // Phase 4 customer self-claim BTC refund — gated behind its own
+        // default-off flag (signs/broadcasts real BTC; not production-grade yet).
+        if features.chain_refund_self_claim {
+            router = router.route(
+                // Small body (a single address); bound a misbehaving client.
                 "/api/v1/invoices/:id/refund",
                 post(invoice::request_chain_refund).layer(DefaultBodyLimit::max(1024)),
             );
+        }
     }
 
     if features.invoices {

@@ -1108,28 +1108,34 @@ pub async fn request_chain_refund(
     let refund_address = req.refund_address.trim().to_string();
     validate_btc_refund_address(&refund_address)?;
 
-    // Idempotent success: a completed refund for this invoice + same address.
-    if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
-        match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
-            (Some(existing), Some(txid)) if existing == refund_address => {
-                return Ok(Json(ChainRefundResponse {
-                    status: "refunded".into(),
-                    refund_txid: txid.to_string(),
-                }));
+    // Locate the refundable (`refund_due`) swap FIRST — an invoice may have an
+    // already-refunded swap AND a distinct still-refundable one; checking the
+    // refunded short-circuit first would wrongly hide the latter. Only when
+    // there is no `refund_due` swap do we fall back to the idempotent
+    // already-refunded reply (a retried request after success).
+    let swap = match db::find_refund_due_chain_swap_for_invoice(&state.db, id).await? {
+        Some(s) => s,
+        None => {
+            if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
+                match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
+                    (Some(existing), Some(txid)) if existing == refund_address => {
+                        return Ok(Json(ChainRefundResponse {
+                            status: "refunded".into(),
+                            refund_txid: txid.to_string(),
+                        }));
+                    }
+                    _ => {
+                        return Err(AppError::RefundNotAvailable(
+                            "invoice already refunded (to a different address)".into(),
+                        ));
+                    }
+                }
             }
-            _ => {
-                return Err(AppError::RefundNotAvailable(
-                    "invoice already refunded (to a different address)".into(),
-                ));
-            }
+            return Err(AppError::RefundNotAvailable(format!(
+                "no refundable chain swap for invoice {id}"
+            )));
         }
-    }
-
-    let swap = db::find_refund_due_chain_swap_for_invoice(&state.db, id)
-        .await?
-        .ok_or_else(|| {
-            AppError::RefundNotAvailable(format!("no refundable chain swap for invoice {id}"))
-        })?;
+    };
 
     // First-write-wins: commit the address before any broadcast (G14).
     let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &refund_address).await?;

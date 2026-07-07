@@ -268,7 +268,7 @@ pub async fn update_chain_swap_status(
         "UPDATE chain_swap_records \
          SET status = $2, claim_txid = COALESCE($3, claim_txid), updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refunding')",
     )
     .bind(id)
     .bind(status.to_string())
@@ -304,7 +304,7 @@ pub async fn mark_chain_swap_cooperative_refused(
         "UPDATE chain_swap_records \
          SET cooperative_refused = TRUE, updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refunding')",
     )
     .bind(id)
     .execute(pool)
@@ -323,7 +323,7 @@ pub async fn mark_chain_swap_refund_due(pool: &PgPool, id: Uuid) -> Result<u64, 
         "UPDATE chain_swap_records \
          SET status = 'refund_due', updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refunding')",
     )
     .bind(id)
     .execute(pool)
@@ -364,7 +364,7 @@ pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
          WHERE id = $1 \
            AND renegotiated_server_lock_amount_sat IS NULL \
            AND status NOT IN \
-               ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refund_due')",
+               ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refund_due', 'refunding')",
     )
     .bind(id)
     .bind(renegotiated_server_lock_amount_sat)
@@ -460,9 +460,17 @@ pub async fn mark_chain_swap_refunding<'e, E: sqlx::PgExecutor<'e>>(
     id: Uuid,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
+        // `claim_txid IS NULL` is the G12 double-payout guard: a swap can reach
+        // `refund_due` from `claiming`/`claim_failed` while our L-BTC claim tx is
+        // still unconfirmed in the mempool (preimage already public). Refunding
+        // the BTC lockup then would pay the customer AND let the merchant's claim
+        // confirm — a genuine double payout. If we ever constructed/broadcast a
+        // claim, refuse the refund and let the claim path win.
         "UPDATE chain_swap_records \
          SET status = 'refunding', updated_at = NOW() \
-         WHERE id = $1 AND status = 'refund_due' AND refund_address IS NOT NULL",
+         WHERE id = $1 AND status = 'refund_due' \
+           AND refund_address IS NOT NULL \
+           AND claim_txid IS NULL AND claim_tx_hex IS NULL",
     )
     .bind(id)
     .execute(executor)
@@ -507,6 +515,34 @@ pub async fn revert_chain_swap_refunding_to_due(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Reconciler backstop for STUCK `refunding` rows (Phase 4). The refund executor
+/// runs inline in the request handler; if the customer's connection drops (or
+/// the process restarts) after the `refund_due` -> `refunding` flip but before
+/// completion, the row is stranded in `refunding` — invisible to the operator
+/// `refund_due` surface and rejected by the endpoint as "already in progress".
+/// This reverts any `refunding` row untouched for `min_age_secs` back to
+/// `refund_due` so a later customer/reconciler attempt retries it. Safe: a
+/// re-broadcast spends the same lockup UTXO to the same immutable address, so at
+/// most one refund tx ever confirms. `min_age_secs` must comfortably exceed a
+/// normal broadcast round-trip so an ACTIVE refund is never reverted. Returns
+/// the ids reverted (for alerting).
+pub async fn revert_stale_refunding_chain_swaps(
+    pool: &PgPool,
+    min_age_secs: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "UPDATE chain_swap_records \
+         SET status = 'refund_due', updated_at = NOW() \
+         WHERE status = 'refunding' \
+           AND updated_at < NOW() - make_interval(secs => $1) \
+         RETURNING id",
+    )
+    .bind(min_age_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at

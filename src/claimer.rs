@@ -463,10 +463,14 @@ async fn try_renegotiate_chain_swap(
     if current_status.is_terminal() {
         return Ok(false);
     }
-    if current_status == ChainSwapStatus::RefundDue {
-        // Already an operator-visible refund case (e.g. a `swap.expired` funded
-        // handler or Phase 4 self-claim owns it). Do NOT resurrect it to a live
-        // state; leave the waterfall where it is.
+    if matches!(
+        current_status,
+        ChainSwapStatus::RefundDue | ChainSwapStatus::Refunding
+    ) {
+        // Already an operator-visible refund case (`refund_due`) or a customer
+        // self-claim refund in flight (`refunding`). Do NOT resurrect it to a
+        // live state or accept a quote against a swap whose BTC is being
+        // refunded; leave the waterfall where it is.
         return Ok(true);
     }
 
@@ -1962,6 +1966,25 @@ pub(crate) async fn execute_chain_swap_refund(
             "chain swap not refundable (status {current_status})"
         )));
     }
+    // G12 (B3): never refund a swap for which an L-BTC claim tx was ever
+    // constructed or broadcast — the claim (merchant paid) and the refund
+    // (customer paid) spend different UTXOs and could both confirm. A row can
+    // reach `refund_due` from `claiming`/`claim_failed` with an unconfirmed
+    // claim still in the Liquid mempool; let the claim path win. (The
+    // `mark_chain_swap_refunding` UPDATE also enforces this; the explicit check
+    // gives a clear operator signal.)
+    if current.claim_txid.is_some() || current.claim_tx_hex.is_some() {
+        tracing::error!(
+            event = "chain_swap_refund_blocked_claim_in_flight",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            claim_txid = ?current.claim_txid,
+            "refund blocked: an L-BTC claim tx exists for this swap; refusing to refund to avoid a double payout (operator P1)"
+        );
+        return Err(AppError::ClaimError(
+            "refund blocked: a claim is already in progress for this payment".to_string(),
+        ));
+    }
     let rows = db::mark_chain_swap_refunding(&mut *tx, swap.id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1986,16 +2009,31 @@ pub(crate) async fn execute_chain_swap_refund(
     // stays recoverable (never stranded in `refunding`).
     match build_and_broadcast_chain_refund(state, &current, &refund_address).await {
         Ok(txid) => {
-            db::mark_chain_swap_refunded(&state.db, swap.id, &txid)
+            let recorded = db::mark_chain_swap_refunded(&state.db, swap.id, &txid)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
-            tracing::warn!(
-                event = "chain_swap_refunded",
-                swap_id = %swap.boltz_swap_id,
-                invoice_id = %swap.invoice_id,
-                refund_txid = %txid,
-                "customer self-claim refund broadcast; refunding -> refunded (operator P2)"
-            );
+            if recorded != 1 {
+                // We broadcast a refund but the row was NOT in `refunding` when
+                // we tried to record it — a concurrent writer (e.g. a reconciler
+                // acting on a stale snapshot) moved it out from under us. The BTC
+                // IS refunded on-chain; the DB now disagrees. Loud P1 so an
+                // operator reconciles against the broadcast txid.
+                tracing::error!(
+                    event = "chain_swap_refund_broadcast_not_recorded",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    refund_txid = %txid,
+                    "refund broadcast but status was not `refunding` at record time; reconcile the swap against this txid (operator P1)"
+                );
+            } else {
+                tracing::warn!(
+                    event = "chain_swap_refunded",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    refund_txid = %txid,
+                    "customer self-claim refund broadcast; refunding -> refunded (operator P2)"
+                );
+            }
             Ok(txid)
         }
         Err(e) => {

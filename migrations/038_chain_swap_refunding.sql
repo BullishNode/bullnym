@@ -12,7 +12,7 @@
 --   * `refund_address` — the customer-supplied BTC address, FIRST-WRITE-WINS and
 --     immutable once set (G13/G14): persisted before any broadcast so a
 --     bystander who knows the public invoice URL cannot redirect an
---     in-flight/ё completed refund.
+--     in-flight or completed refund.
 --   * `refund_txid` — the broadcast refund transaction id, for operator
 --     forensics and idempotent re-broadcast.
 -- On success the swap flips `refunding` -> `refunded` (terminal) with the txid;
