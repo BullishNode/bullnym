@@ -1874,9 +1874,10 @@ async fn construct_chain_claim_tx(
         .map_err(|e| AppError::ClaimError(format!("construct_chain_claim failed: {e}")))
 }
 
-/// Phase 4 customer self-claim refund executor. Drains a `refund_due` chain swap
-/// by refunding the payer's BTC lockup to their submitted address. Returns the
-/// broadcast refund txid on success.
+/// Phase 4 merchant-recovery executor (#44). Drains a `refund_due` chain swap
+/// by refunding the payer's BTC lockup to the destination address committed on
+/// the swap (supplied by the merchant via the signed `/recover` endpoint).
+/// Returns the broadcast refund txid on success.
 ///
 /// Money-safety design:
 ///   * **G12 (double-payout):** we first verify Boltz has NOT claimed the swap

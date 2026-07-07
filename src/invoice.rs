@@ -63,6 +63,7 @@ use crate::AppState;
 pub const ACTION_CREATE: &str = "invoice-create";
 pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
+pub const ACTION_RECOVER: &str = "invoice-recover";
 
 /// Hard upper bound and default for wallet-origin invoice expiry (7 days).
 /// Clients may omit `expires_at_unix`; the server then uses this default.
@@ -1037,54 +1038,65 @@ pub async fn status(
 }
 
 // =====================================================================
-// POST /api/v1/invoices/:id/refund — customer self-claim BTC refund (Phase 4)
+// POST /api/v1/:nym/invoices/:id/recover — merchant-authenticated
+// chain-swap recovery (#44). The recipient/merchant recovers the payer's
+// stuck BTC lockup to their own address; the payer is made whole out-of-band
+// at the POS. Schnorr-signed by the invoice-owning nym (reuses the
+// `cancel_linked` auth chain). Linked-only: only nym invoices ever create a
+// chain swap (`create_bitcoin_chain_offer` requires `liquid_address`).
 // =====================================================================
 
 #[derive(Deserialize)]
-pub struct ChainRefundRequest {
-    /// Customer's BTC (mainnet) address to receive the refunded lockup.
-    pub refund_address: String,
+pub struct RecoverRequest {
+    pub npub: String,
+    pub timestamp: u64,
+    pub signature: String,
+    /// Merchant's BTC (mainnet) address to receive the recovered lockup. Part
+    /// of the signed payload, so it cannot be tampered in transit.
+    pub btc_address: String,
 }
 
 #[derive(Serialize)]
-pub struct ChainRefundResponse {
-    /// Always "refunded" on success (the swap reached terminal `refunded`).
+pub struct RecoverResponse {
+    /// Always "recovered" on success (the swap reached terminal `refunded`).
     pub status: String,
-    /// The broadcast refund transaction id.
-    pub refund_txid: String,
+    /// The broadcast recovery transaction id.
+    pub txid: String,
 }
 
-/// Validate a customer refund address: non-empty and a valid Bitcoin *mainnet*
-/// address. Rejecting early yields a clean, coded error before any state write;
-/// `construct_refund` re-validates network as a backstop.
+/// Validate a merchant recovery address: non-empty and a valid Bitcoin
+/// *mainnet* address. Rejecting early yields a clean, coded error before any
+/// state write; `construct_refund` re-validates network as a backstop.
 fn validate_btc_refund_address(addr: &str) -> Result<(), AppError> {
     use std::str::FromStr;
     if addr.is_empty() {
-        return Err(AppError::RefundAddressInvalid("empty address".into()));
+        return Err(AppError::RecoveryAddressInvalid("empty address".into()));
     }
     let parsed = boltz_client::bitcoin::Address::from_str(addr)
-        .map_err(|e| AppError::RefundAddressInvalid(format!("parse failed: {e}")))?;
+        .map_err(|e| AppError::RecoveryAddressInvalid(format!("parse failed: {e}")))?;
     if !parsed.is_valid_for_network(boltz_client::bitcoin::Network::Bitcoin) {
-        return Err(AppError::RefundAddressInvalid(
+        return Err(AppError::RecoveryAddressInvalid(
             "address is not valid on Bitcoin mainnet".into(),
         ));
     }
     Ok(())
 }
 
-/// Customer self-claim refund: submit a BTC address for an invoice whose
-/// on-chain BTC payment failed (a `refund_due` chain swap) and get the refund
-/// broadcast. Auth is by knowledge of the invoice id (same as `status`);
-/// G13 residual race is ratified by the first-write-wins immutable refund
-/// address (a bystander who knows the public URL cannot redirect a committed
-/// refund). Idempotent: a retried request after success returns the same txid.
-pub async fn request_chain_refund(
+/// Merchant-authenticated chain-swap recovery. The invoice-owning merchant
+/// signs `(invoice_id, btc_address, timestamp)` with their nym key; bullnym
+/// verifies the signature + ownership (exactly like `cancel_linked`), then
+/// refunds the stuck BTC lockup to the signed `btc_address`. Because only the
+/// nym owner holds the key, a bystander who knows the public invoice URL cannot
+/// call this (closes G13). The destination is immutable first-write-wins and is
+/// inside the signed payload, so it cannot be redirected. Idempotent: a retried
+/// request after success returns the same txid.
+pub async fn recover_chain_swap(
     State(state): State<AppState>,
-    Path(id_str): Path<String>,
+    Path((nym, id_str)): Path<(String, String)>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    Json(req): Json<ChainRefundRequest>,
-) -> Result<Json<ChainRefundResponse>, AppError> {
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
     let is_whitelisted = ip
@@ -1092,81 +1104,133 @@ pub async fn request_chain_refund(
         .unwrap_or(false);
     let is_certification_allowed = certification::allows_scope(
         &state,
-        CertificationScope::InvoiceStatus,
+        CertificationScope::MetadataLookup,
         peer,
         &headers,
-        "chain_refund",
-        Some(&id_str),
+        "signed_invoice_recover",
+        Some(&req.npub),
     );
     if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
-            state.rate_limiter.check_invoice_status_per_source(ip).await?;
+            state.rate_limiter.check_metadata_per_ip(ip).await?;
         }
     }
 
     let id = parse_invoice_id(&id_str)?;
-    let refund_address = req.refund_address.trim().to_string();
-    validate_btc_refund_address(&refund_address)?;
 
-    // Locate the refundable (`refund_due`) swap FIRST — an invoice may have an
-    // already-refunded swap AND a distinct still-refundable one; checking the
-    // refunded short-circuit first would wrongly hide the latter. Only when
+    // Verify the merchant's signature over (invoice_id, btc_address). The
+    // btc_address is used RAW (not trimmed) so the verified bytes equal the
+    // stored bytes; a whitespace-padded address fails validation below anyway.
+    let fields = recover_payload_fields(&id_str, &req.btc_address);
+    auth::verify_la_v2(
+        ACTION_RECOVER,
+        &req.npub,
+        &nym,
+        &fields,
+        req.timestamp,
+        &req.signature,
+    )?;
+    assert_nym_owner(&state, &nym, &req.npub).await?;
+
+    // Ownership defense-in-depth (mirrors cancel): the signing npub must own the
+    // invoice and the path nym must match — same wire copy in both cases so we
+    // never leak cross-nym existence.
+    let inv = db::get_invoice_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+    if inv.npub_owner != req.npub {
+        return Err(AppError::InvoiceNotFound(id_str));
+    }
+    if inv.nym_owner.as_deref() != Some(nym.as_str()) {
+        return Err(AppError::InvoiceNotFound(id_str));
+    }
+
+    validate_btc_refund_address(&req.btc_address)?;
+
+    // Locate the recoverable (`refund_due`) swap FIRST — an invoice may have an
+    // already-recovered swap AND a distinct still-recoverable one; checking the
+    // recovered short-circuit first would wrongly hide the latter. Only when
     // there is no `refund_due` swap do we fall back to the idempotent
-    // already-refunded reply (a retried request after success).
+    // already-recovered reply (a retried request after success).
     let swap = match db::find_refund_due_chain_swap_for_invoice(&state.db, id).await? {
         Some(s) => s,
         None => {
             if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
                 match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
-                    (Some(existing), Some(txid)) if existing == refund_address => {
-                        return Ok(Json(ChainRefundResponse {
-                            status: "refunded".into(),
-                            refund_txid: txid.to_string(),
+                    (Some(existing), Some(txid)) if existing == req.btc_address => {
+                        return Ok(Json(RecoverResponse {
+                            status: "recovered".into(),
+                            txid: txid.to_string(),
                         }));
                     }
                     _ => {
-                        return Err(AppError::RefundNotAvailable(
-                            "invoice already refunded (to a different address)".into(),
+                        return Err(AppError::RecoveryNotAvailable(
+                            "invoice already recovered (to a different address)".into(),
                         ));
                     }
                 }
             }
-            return Err(AppError::RefundNotAvailable(format!(
-                "no refundable chain swap for invoice {id}"
+            return Err(AppError::RecoveryNotAvailable(format!(
+                "no recoverable chain swap for invoice {id}"
             )));
         }
     };
 
-    // First-write-wins: commit the address before any broadcast (G14).
-    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &refund_address).await?;
+    // Defense-in-depth: the swap's recorded nym must match the authenticated
+    // nym. (Chain swaps are created with the checkout nym; this should always
+    // hold once the invoice ownership checks above pass.)
+    if swap.nym.as_deref() != Some(nym.as_str()) {
+        tracing::error!(
+            event = "chain_swap_recover_nym_mismatch",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %id,
+            swap_nym = ?swap.nym,
+            auth_nym = %nym,
+            "recovery blocked: chain swap nym does not match the authenticated nym (operator P1)"
+        );
+        return Err(AppError::RecoveryNotAvailable(
+            "this payment is not recoverable by this account".into(),
+        ));
+    }
+
+    // First-write-wins: commit the destination before any broadcast (G14).
+    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &req.btc_address).await?;
     if rows == 0 {
         // Address already set, or the swap left `refund_due`. Disambiguate.
         let cur = db::get_chain_swap_by_id(&state.db, swap.id)
             .await?
-            .ok_or_else(|| AppError::RefundNotAvailable("chain swap not found".into()))?;
+            .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
         match cur.refund_address.as_deref() {
-            Some(existing) if existing == refund_address => { /* idempotent: proceed */ }
+            Some(existing) if existing == req.btc_address => { /* idempotent: proceed */ }
             Some(_) => {
-                return Err(AppError::RefundNotAvailable(
-                    "a different refund address was already submitted for this payment".into(),
+                return Err(AppError::RecoveryNotAvailable(
+                    "a different recovery address was already committed for this payment".into(),
                 ));
             }
             None => {
-                return Err(AppError::RefundNotAvailable(
-                    "this payment is no longer refundable".into(),
+                return Err(AppError::RecoveryNotAvailable(
+                    "this payment is no longer recoverable".into(),
                 ));
             }
         }
     }
 
-    // Re-read the address-populated row and execute the refund under the lock.
+    tracing::info!(
+        event = "chain_swap_recover_requested",
+        invoice_id = %id,
+        nym = %nym,
+        npub_tag = npub_log_tag(&req.npub),
+        "merchant chain-swap recovery authorized"
+    );
+
+    // Re-read the address-populated row and execute the recovery under the lock.
     let swap = db::get_chain_swap_by_id(&state.db, swap.id)
         .await?
-        .ok_or_else(|| AppError::RefundNotAvailable("chain swap not found".into()))?;
+        .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
     let txid = crate::claimer::execute_chain_swap_refund(&state, &swap).await?;
-    Ok(Json(ChainRefundResponse {
-        status: "refunded".into(),
-        refund_txid: txid,
+    Ok(Json(RecoverResponse {
+        status: "recovered".into(),
+        txid,
     }))
 }
 
@@ -1705,6 +1769,14 @@ fn create_payload_fields<'a>(
 
 fn cancel_payload_fields(invoice_id: &str) -> [&str; 1] {
     [invoice_id]
+}
+
+/// 2 fields in fixed order. The byte sequence is the wire contract — the
+/// mobile `core/nostr/bullpay_la_v2_signing.dart` recover signer MUST produce
+/// the same order: `[invoice_id, btc_address]`. `btc_address` is the raw
+/// request string (not trimmed) so the verified bytes equal the stored bytes.
+fn recover_payload_fields<'a>(invoice_id: &'a str, btc_address: &'a str) -> [&'a str; 2] {
+    [invoice_id, btc_address]
 }
 
 fn list_payload_fields<'a>(

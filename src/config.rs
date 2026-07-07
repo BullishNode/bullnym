@@ -85,14 +85,13 @@ pub struct FeaturesConfig {
     /// the server-auth key from ever doubling as a public NIP-05 identity.
     #[serde(default)]
     pub nip05: bool,
-    /// Customer self-claim BTC refund endpoint (`POST /api/v1/invoices/:id/refund`,
-    /// BTC refund waterfall Phase 4). OFF by default: it signs and broadcasts
-    /// real BTC, and its bystander-address-race mitigation (G13) is not yet
-    /// production-grade. Must stay off in prod until a staged broadcast test and
-    /// payer-binding review are complete — the flag exists so deploying the
-    /// branch cannot silently expose the endpoint.
+    /// Merchant-authenticated chain-swap recovery endpoint
+    /// (`POST /api/v1/:nym/invoices/:id/recover`, BTC refund waterfall Phase 4).
+    /// OFF by default: it signs and broadcasts real BTC. Must stay off in prod
+    /// until the staged real-broadcast test passes — the flag exists so
+    /// deploying the branch cannot silently expose the endpoint.
     #[serde(default)]
-    pub chain_refund_self_claim: bool,
+    pub chain_swap_merchant_recovery: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -102,7 +101,7 @@ impl Default for FeaturesConfig {
             invoices: default_feature_enabled(),
             payment_pages: default_feature_enabled(),
             nip05: false,
-            chain_refund_self_claim: false,
+            chain_swap_merchant_recovery: false,
         }
     }
 }

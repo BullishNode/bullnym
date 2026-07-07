@@ -62,10 +62,39 @@ fn list_payload_field_order() {
 }
 
 #[test]
+fn recover_payload_field_order() {
+    let f = recover_payload_fields("00000000-0000-0000-0000-000000000001", "bc1qexample");
+    assert_eq!(
+        f,
+        ["00000000-0000-0000-0000-000000000001", "bc1qexample"],
+        "recover field order changed — mobile MUST update in lockstep"
+    );
+}
+
+#[test]
 fn action_constants_distinct() {
     assert_ne!(ACTION_CREATE, ACTION_CANCEL);
     assert_ne!(ACTION_CREATE, ACTION_LIST);
     assert_ne!(ACTION_CANCEL, ACTION_LIST);
+    assert_ne!(ACTION_RECOVER, ACTION_CREATE);
+    assert_ne!(ACTION_RECOVER, ACTION_CANCEL);
+    assert_ne!(ACTION_RECOVER, ACTION_LIST);
+}
+
+#[test]
+fn recovery_address_validation() {
+    // Mainnet addresses accepted (P2WPKH + P2TR).
+    assert!(validate_btc_refund_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_ok());
+    assert!(validate_btc_refund_address(
+        "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+    )
+    .is_ok());
+    // Rejected: empty, testnet, and a Liquid address.
+    assert!(validate_btc_refund_address("").is_err());
+    assert!(validate_btc_refund_address("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").is_err());
+    assert!(validate_btc_refund_address("lq1qqexample").is_err());
+    // Whitespace-padded fails (we sign/store the raw string, no trim).
+    assert!(validate_btc_refund_address(" bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 ").is_err());
 }
 
 #[test]

@@ -463,16 +463,6 @@ fn build_router(state: AppState) -> Router {
                 "/api/v1/invoices/:id/liquid",
                 post(invoice::fetch_liquid_offer),
             );
-
-        // Phase 4 customer self-claim BTC refund — gated behind its own
-        // default-off flag (signs/broadcasts real BTC; not production-grade yet).
-        if features.chain_refund_self_claim {
-            router = router.route(
-                // Small body (a single address); bound a misbehaving client.
-                "/api/v1/invoices/:id/refund",
-                post(invoice::request_chain_refund).layer(DefaultBodyLimit::max(1024)),
-            );
-        }
     }
 
     if features.invoices {
@@ -502,6 +492,18 @@ fn build_router(state: AppState) -> Router {
             // are applied via `invoice::html_response`; the parent fallback's
             // donation_render path is bypassed via explicit registration.
             .route("/invoice/:id", get(invoice::render_unlinked_payment));
+
+        // Merchant-authenticated chain-swap recovery (#44). Schnorr-signed by
+        // the invoice-owning nym; linked-only (only nym invoices ever create a
+        // chain swap). Gated behind its own default-off flag — it signs and
+        // broadcasts real BTC and stays off until the staged broadcast test.
+        if features.chain_swap_merchant_recovery {
+            router = router.route(
+                "/api/v1/:nym/invoices/:id/recover",
+                post(invoice::recover_chain_swap).layer(DefaultBodyLimit::max(1024)),
+            );
+        }
+    }
     }
 
     let router = if features.payment_pages {
