@@ -431,6 +431,36 @@ pub(crate) async fn handle_chain_swap_webhook(
         return Ok(());
     }
 
+    if matches!(
+        boltz_status,
+        "transaction.lockupFailed" | "transaction.failed" | "transaction.refunded"
+    ) {
+        // Funded lockup on a failed/refunded chain swap → the payer's BTC is
+        // recoverable, so route to `refund_due` (non-terminal) instead of
+        // terminalizing and stranding it. `transaction.lockupFailed` is funded
+        // by definition (amount mismatch); `transaction.refunded` means Boltz
+        // refunded its OWN server lockup — the payer's BTC is still locked and
+        // refundable by us (previously mis-terminalized as done). A precise
+        // funded/unfunded split via Boltz `get_chain_txs` is a tracked
+        // refinement to keep genuinely-unfunded swaps out of the list; erring
+        // toward `refund_due` here is the fund-safe direction. The refund
+        // waterfall (renegotiation / customer self-claim) drains this state.
+        tracing::warn!(
+            event = "chain_swap_refund_due",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            nym = ?swap.nym,
+            amount_sat = swap.user_lock_amount_sat,
+            lockup_address = %swap.lockup_address,
+            boltz_status,
+            "chain swap funded lockup failed/refunded; marking refund_due (BTC recoverable, operator P1)"
+        );
+        db::mark_chain_swap_refund_due(&state.db, swap.id)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        return Ok(());
+    }
+
     let Some(next) = chain_swap_status_from_boltz_status(boltz_status) else {
         tracing::debug!(
             "ignoring chain-swap webhook status: {} for {}",
@@ -498,10 +528,14 @@ fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapSt
         // server lockup stays claimable until timeoutBlockHeight. It is handled
         // in `handle_chain_swap_webhook` (flip cooperative_refused, keep
         // sweepable) so we don't abandon a still-claimable lockup.
-        "transaction.zeroconf.rejected" | "transaction.lockupFailed" | "transaction.failed" => {
-            Some(ChainSwapStatus::LockupFailed)
-        }
-        "transaction.refunded" => Some(ChainSwapStatus::Refunded),
+        // 0-conf rejection is NOT a failure: Boltz just wants a confirmation
+        // before proceeding, then the swap continues normally. Treat it as a
+        // (re)sighting of the user lockup in the mempool — previously this was
+        // terminalized as `lockup_failed`, killing a payment that would settle.
+        "transaction.zeroconf.rejected" => Some(ChainSwapStatus::UserLockMempool),
+        // `transaction.lockupFailed` / `transaction.failed` / `transaction.refunded`
+        // are handled explicitly in `handle_chain_swap_webhook` (→ `refund_due`,
+        // funds recoverable) and never reach here.
         _ => None,
     }
 }

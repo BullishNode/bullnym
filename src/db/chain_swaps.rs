@@ -20,10 +20,17 @@ pub enum ChainSwapStatus {
     Expired,
     LockupFailed,
     Refunded,
+    /// Funded lockup on a failed/expired swap whose BTC is still recoverable.
+    /// NON-TERMINAL and the join point of the refund waterfall: set on funded
+    /// failure, later drained by renegotiation (→ settle/`Claimed`) or customer
+    /// self-claim (→ `Refunded`). Must never be terminalized to a dead state.
+    RefundDue,
 }
 
 impl ChainSwapStatus {
     pub fn is_terminal(self) -> bool {
+        // `RefundDue` is deliberately NOT terminal — the reconciler must keep
+        // revisiting it so the waterfall can drain it.
         matches!(
             self,
             Self::Claimed | Self::ClaimStuck | Self::Expired | Self::LockupFailed | Self::Refunded
@@ -46,6 +53,7 @@ impl fmt::Display for ChainSwapStatus {
             Self::Expired => "expired",
             Self::LockupFailed => "lockup_failed",
             Self::Refunded => "refunded",
+            Self::RefundDue => "refund_due",
         })
     }
 }
@@ -67,6 +75,7 @@ impl FromStr for ChainSwapStatus {
             "expired" => Ok(Self::Expired),
             "lockup_failed" => Ok(Self::LockupFailed),
             "refunded" => Ok(Self::Refunded),
+            "refund_due" => Ok(Self::RefundDue),
             other => Err(format!("unknown chain swap status: {other}")),
         }
     }
@@ -248,6 +257,38 @@ pub async fn mark_chain_swap_cooperative_refused(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Mark a funded-but-failed/expired chain swap `refund_due` (non-terminal) so
+/// its BTC is recoverable rather than silently terminalized. Guarded against
+/// terminal rows; NOT guarded against `refund_due` itself so this is
+/// idempotent. `refund_due` is not in the terminal NOT-IN set, so a later
+/// `update_chain_swap_status` can still advance it to `claimed` (renegotiation)
+/// or `refunded` (self-claim) — that is the join point of the refund waterfall.
+pub async fn mark_chain_swap_refund_due(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'refund_due', updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Chain swaps currently in `refund_due`, oldest first. Backs the operator
+/// surface listing stranded-but-recoverable lockups.
+pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE status = 'refund_due' \
+         ORDER BY updated_at ASC"
+    ))
+    .fetch_all(pool)
+    .await
 }
 
 /// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at

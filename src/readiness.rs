@@ -147,6 +147,11 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'chain_swap_records' \
                   AND column_name = 'cooperative_refused' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint \
+                WHERE conname = 'chain_swap_records_status_check' \
+                  AND pg_get_constraintdef(oid) LIKE '%refund_due%' \
             )",
     )
     .fetch_one(pool)
