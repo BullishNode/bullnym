@@ -1895,6 +1895,65 @@ async fn construct_chain_claim_tx(
 /// The refund tx is constructed and broadcast OUTSIDE the advisory lock (the
 /// `refunding` state, not the lock, is what fences claims), mirroring the claim
 /// path where broadcast is the slow, retry-safe step.
+/// Returns true if the chain-swap USER lockup transaction is CONFIRMED on-chain.
+///
+/// The confirmation is checked by TXID, not by address: the deployment's esplora
+/// runs without an address/script-hash index (address endpoints error), but
+/// txid + block endpoints work. So we ask Boltz for the lockup funding txid
+/// (`/swap/chain/{id}/transactions` -> userLock.transaction.id) and then query
+/// the esplora `/tx/{txid}/status`. Best-effort: on any error returns false
+/// (defer the refund) — refusing to refund is the fund-safe direction.
+async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // 1) lockup funding txid from Boltz
+    #[derive(serde::Deserialize)]
+    struct LockTx {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct UserLock {
+        transaction: LockTx,
+    }
+    #[derive(serde::Deserialize)]
+    struct ChainTxs {
+        #[serde(rename = "userLock")]
+        user_lock: UserLock,
+    }
+    let txs_url = format!(
+        "{}/swap/chain/{}/transactions",
+        boltz_url.trim_end_matches('/'),
+        swap_id
+    );
+    let txid = match client.get(&txs_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<ChainTxs>().await {
+            Ok(c) => c.user_lock.transaction.id,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+
+    // 2) confirmation from the esplora (txid-based; no address index needed)
+    #[derive(serde::Deserialize)]
+    struct TxStatus {
+        confirmed: bool,
+    }
+    let status_url = format!("{}/tx/{}/status", esplora.trim_end_matches('/'), txid);
+    match client.get(&status_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<TxStatus>().await {
+            Ok(s) => s.confirmed,
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
 pub(crate) async fn execute_chain_swap_refund(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -1929,6 +1988,33 @@ pub(crate) async fn execute_chain_swap_refund(
                 "refund pre-check get_swap failed: {e}"
             )));
         }
+    }
+
+    // Lockup-confirmation gate: never attempt a refund on an UNCONFIRMED lockup.
+    // Boltz emits `transaction.lockupFailed` on 0-conf detection of an underpaid
+    // lockup, so `refund_due` is reached before the lockup mines. Refunding then
+    // fails: Boltz won't co-sign a cooperative refund of an unconfirmed lockup,
+    // and the script-path fallback is non-final pre-timeout — either way
+    // `sendrawtransaction` rejects it. Defer until the lockup has >=1 conf; the
+    // caller (endpoint poll / reconciler) retries and it self-heals. This avoids
+    // the wasted `refunding`->revert churn and the confusing broadcast errors.
+    if !chain_lockup_confirmed(
+        &state.config.boltz.api_url,
+        &state.config.bitcoin_watcher.endpoint,
+        &swap.boltz_swap_id,
+    )
+    .await
+    {
+        tracing::info!(
+            event = "chain_swap_recover_deferred_unconfirmed_lockup",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            lockup_address = %swap.lockup_address,
+            "recovery deferred: BTC lockup not yet confirmed; retry after confirmation"
+        );
+        return Err(AppError::RecoveryNotAvailable(
+            "recovery deferred: BTC lockup not yet confirmed".to_string(),
+        ));
     }
 
     // Atomically claim the refund: refund_due -> refunding under the advisory
