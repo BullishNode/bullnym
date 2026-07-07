@@ -365,6 +365,121 @@ async fn dispatch_webhook(
     Ok("ok")
 }
 
+/// Phase 3 refund waterfall — attempt to renegotiate a mis-funded chain swap
+/// (Boltz `transaction.lockupFailed`) to the amount the payer actually locked,
+/// via Boltz get_quote/accept_quote, so it settles automatically instead of
+/// requiring a manual/self-claim refund.
+///
+/// Returns `Ok(true)` when the swap is (or was already) renegotiated / owned by
+/// another concurrent waterfall step — the caller must NOT flag `refund_due`.
+/// Returns `Ok(false)` when Boltz declines the quote (no longer renegotiable) or
+/// the row was terminalized concurrently — the caller falls through to
+/// `refund_due`. `Err` is a transport/DB failure; the caller also falls through
+/// to `refund_due` (fund-safe).
+///
+/// Serialized against the claim / customer-self-claim (Phase 4) paths via the
+/// shared `chain-claim:<id>` advisory lock, so a renegotiation cannot interleave
+/// with a concurrent claim of the same swap.
+async fn try_renegotiate_chain_swap(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+) -> Result<bool, AppError> {
+    // Idempotency for a re-delivered `lockupFailed` webhook: the swap is already
+    // renegotiated and settling — do nothing and do NOT re-refund.
+    if swap.renegotiated_server_lock_amount_sat.is_some() {
+        return Ok(true);
+    }
+
+    // Step 1: read-only quote (no lock). An error here means Boltz will not
+    // renegotiate this swap (too close to expiry, refund sig exists, …).
+    let quote_amount = match state.boltz.get_chain_swap_quote(&swap.boltz_swap_id).await {
+        Ok(amount) => amount,
+        Err(e) => {
+            tracing::debug!(
+                "chain swap {} get_quote declined: {}",
+                swap.boltz_swap_id,
+                e
+            );
+            return Ok(false);
+        }
+    };
+    // A zero/absent quote is nonsensical — treat as not renegotiable rather than
+    // accepting a settlement that credits the merchant nothing.
+    if quote_amount == 0 {
+        tracing::warn!(
+            event = "chain_swap_renegotiation_zero_quote",
+            swap_id = %swap.boltz_swap_id,
+            "boltz returned a zero renegotiation quote; treating as not renegotiable"
+        );
+        return Ok(false);
+    }
+
+    // Steps 2-3 under the shared per-swap advisory lock so a concurrent claim
+    // cannot interleave. accept_quote is a network call held inside the locked
+    // transaction — acceptable for this rare failure path in exchange for strict
+    // serialization. NOTE: a crash in the window between Boltz accepting the
+    // quote and this transaction committing would leave the DB without the
+    // renegotiated amount, so a later settle would credit the stale original
+    // server-lock; reconciling the credited amount from Boltz `get_swap` at
+    // settle time is a tracked robustness follow-up.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    let lock_key = format!("chain-claim:{}", swap.id);
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+    if !got_lock {
+        // Another waterfall step (claim / self-claim / concurrent renegotiation)
+        // owns this swap — let it decide the outcome; do not refund here.
+        tracing::debug!("renegotiate: lock held for {}, skipping", swap.boltz_swap_id);
+        return Ok(true);
+    }
+
+    // Re-read under the lock: bail if another path already renegotiated or
+    // terminalized the swap between the quote and acquiring the lock.
+    let current = db::get_chain_swap_by_id(&mut *tx, swap.id)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {}", swap.id)))?;
+    if current.renegotiated_server_lock_amount_sat.is_some() {
+        return Ok(true);
+    }
+    let current_status = current.parsed_status().map_err(AppError::DbError)?;
+    if current_status.is_terminal() {
+        return Ok(false);
+    }
+
+    // Accept the quote, then persist — both inside the locked transaction.
+    state
+        .boltz
+        .accept_chain_swap_quote(&swap.boltz_swap_id, quote_amount)
+        .await?;
+    let rows = db::mark_chain_swap_renegotiated(&mut *tx, swap.id, quote_amount as i64)
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    if rows == 1 {
+        tracing::warn!(
+            event = "chain_swap_renegotiated",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            original_server_lock_sat = swap.server_lock_amount_sat,
+            renegotiated_server_lock_sat = quote_amount,
+            "chain swap renegotiated to actual locked amount; settling normally (merchant credited the renegotiated amount, operator P2)"
+        );
+    }
+    Ok(true)
+}
+
 pub(crate) async fn handle_chain_swap_webhook(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -482,6 +597,37 @@ pub(crate) async fn handle_chain_swap_webhook(
         )
         .await;
         return Ok(());
+    }
+
+    if boltz_status == "transaction.lockupFailed" {
+        // Phase 3 refund waterfall — step 1: `transaction.lockupFailed` means
+        // the payer under- or over-paid the BTC lockup. Before flagging the
+        // funds `refund_due` (a manual/self-claim recovery), try to renegotiate
+        // the swap to the amount actually locked (Boltz get_quote/accept_quote)
+        // so it still settles automatically and the merchant is credited the
+        // renegotiated amount. If Boltz declines (no longer renegotiable — too
+        // close to expiry, or a refund signature already exists) or the attempt
+        // errors, we fall through to the `refund_due` marking below (fund-safe).
+        match try_renegotiate_chain_swap(state, swap).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                tracing::info!(
+                    event = "chain_swap_renegotiation_declined",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    "chain swap not renegotiable; falling through to refund_due"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "chain_swap_renegotiation_error",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    error = %e,
+                    "chain swap renegotiation attempt errored; falling through to refund_due"
+                );
+            }
+        }
     }
 
     if matches!(
@@ -1482,7 +1628,10 @@ async fn claim_chain_swap_inner(
         // which equals the invoice under payer-pays gross-up pricing. Crediting
         // user_lock_amount_sat would over-credit by the swap overhead (and trip
         // the overpaid tolerance) now that the payer's amount is grossed up.
-        swap.server_lock_amount_sat,
+        // After a Phase 3 renegotiation the settled server lockup is the
+        // renegotiated amount, so credit that (effective_* falls back to the
+        // original server_lock when the swap was never renegotiated).
+        swap.effective_server_lock_amount_sat(),
         &swap.boltz_swap_id,
         &txid,
         tolerances,

@@ -224,4 +224,33 @@ impl BoltzService {
             boltz_response: response,
         })
     }
+
+    /// Phase 3 refund-waterfall step 1: ask Boltz for the server-lockup amount
+    /// it will settle a mis-funded chain swap at, given the amount actually
+    /// locked. Boltz returns an error when the swap is no longer renegotiable
+    /// (too close to expiry, or a refund signature already exists) — the caller
+    /// treats that as "not renegotiable" and falls through to `refund_due`.
+    pub async fn get_chain_swap_quote(&self, swap_id: &str) -> Result<u64, AppError> {
+        let quote = self
+            .api
+            .get_quote(swap_id)
+            .await
+            .map_err(|e| AppError::BoltzError(format!("chain swap get_quote failed: {e}")))?;
+        Ok(quote.amount)
+    }
+
+    /// Phase 3 refund-waterfall step 2: accept a quote returned by
+    /// [`Self::get_chain_swap_quote`] so Boltz proceeds to create its server
+    /// lockup and the swap settles at `amount_sat`.
+    pub async fn accept_chain_swap_quote(
+        &self,
+        swap_id: &str,
+        amount_sat: u64,
+    ) -> Result<(), AppError> {
+        self.api
+            .accept_quote(swap_id, amount_sat)
+            .await
+            .map_err(|e| AppError::BoltzError(format!("chain swap accept_quote failed: {e}")))?;
+        Ok(())
+    }
 }

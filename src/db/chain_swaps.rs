@@ -117,6 +117,9 @@ pub struct ChainSwapRecord {
     pub claim_attempts: i32,
     pub last_claim_error: Option<String>,
     pub cooperative_refused: bool,
+    /// Server-lockup amount Boltz accepted after a Phase 3 quote renegotiation
+    /// (get_quote/accept_quote), or NULL when the swap was never renegotiated.
+    pub renegotiated_server_lock_amount_sat: Option<i64>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -125,6 +128,17 @@ impl ChainSwapRecord {
     pub fn parsed_status(&self) -> Result<ChainSwapStatus, String> {
         self.status.parse()
     }
+
+    /// Amount to credit the merchant for this swap: the renegotiated
+    /// server-lockup amount if the swap was renegotiated (Phase 3), otherwise
+    /// the original server-lockup amount (= invoice under gross-up pricing).
+    /// After a renegotiation the on-chain L-BTC actually claimed to the
+    /// merchant is the renegotiated amount, so crediting the stale original
+    /// would over- or under-credit the invoice.
+    pub fn effective_server_lock_amount_sat(&self) -> i64 {
+        self.renegotiated_server_lock_amount_sat
+            .unwrap_or(self.server_lock_amount_sat)
+    }
 }
 
 const CHAIN_SWAP_RECORD_COLUMNS: &str =
@@ -132,6 +146,7 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
      claim_tx_hex, claim_attempts, last_claim_error, cooperative_refused, \
+     renegotiated_server_lock_amount_sat, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
 
@@ -279,6 +294,36 @@ pub async fn mark_chain_swap_refund_due(pool: &PgPool, id: Uuid) -> Result<u64, 
     )
     .bind(id)
     .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Records a successful Phase 3 quote renegotiation: persists the server-lockup
+/// amount Boltz accepted and returns the swap to a live lifecycle state
+/// (`user_lock_confirmed`) so the normal claim path drives it to settlement as
+/// Boltz creates its (renegotiated) server lockup. Guarded to be idempotent —
+/// only the first renegotiation on a still-live, not-yet-renegotiated row takes
+/// effect (a re-delivered `lockupFailed` webhook is a no-op), and it never
+/// resurrects a terminal swap. Returns rows affected (1 = applied, 0 = a
+/// concurrent/duplicate call already handled it or the row is terminal).
+pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+    renegotiated_server_lock_amount_sat: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'user_lock_confirmed', \
+             renegotiated_server_lock_amount_sat = $2, \
+             renegotiated_at = NOW(), \
+             updated_at = NOW() \
+         WHERE id = $1 \
+           AND renegotiated_server_lock_amount_sat IS NULL \
+           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+    )
+    .bind(id)
+    .bind(renegotiated_server_lock_amount_sat)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }
