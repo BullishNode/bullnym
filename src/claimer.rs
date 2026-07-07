@@ -1895,26 +1895,15 @@ async fn construct_chain_claim_tx(
 /// The refund tx is constructed and broadcast OUTSIDE the advisory lock (the
 /// `refunding` state, not the lock, is what fences claims), mirroring the claim
 /// path where broadcast is the slow, retry-safe step.
-/// Returns true if the chain-swap lockup address has at least one CONFIRMED
-/// funding transaction, per the esplora endpoint the bitcoin watcher already
-/// uses. Best-effort: on any query error returns false (defer the refund) —
-/// refusing to refund is the fund-safe direction. See the confirmation gate in
-/// `execute_chain_swap_refund` for why an unconfirmed lockup must not be
-/// refunded.
-async fn chain_lockup_confirmed(endpoint: &str, lockup_address: &str) -> bool {
-    #[derive(serde::Deserialize)]
-    struct TxStatus {
-        confirmed: bool,
-    }
-    #[derive(serde::Deserialize)]
-    struct Tx {
-        status: TxStatus,
-    }
-    let url = format!(
-        "{}/address/{}/txs",
-        endpoint.trim_end_matches('/'),
-        lockup_address
-    );
+/// Returns true if the chain-swap USER lockup transaction is CONFIRMED on-chain.
+///
+/// The confirmation is checked by TXID, not by address: the deployment's esplora
+/// runs without an address/script-hash index (address endpoints error), but
+/// txid + block endpoints work. So we ask Boltz for the lockup funding txid
+/// (`/swap/chain/{id}/transactions` -> userLock.transaction.id) and then query
+/// the esplora `/tx/{txid}/status`. Best-effort: on any error returns false
+/// (defer the refund) — refusing to refund is the fund-safe direction.
+async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -1922,13 +1911,46 @@ async fn chain_lockup_confirmed(endpoint: &str, lockup_address: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let resp = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
+
+    // 1) lockup funding txid from Boltz
+    #[derive(serde::Deserialize)]
+    struct LockTx {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct UserLock {
+        transaction: LockTx,
+    }
+    #[derive(serde::Deserialize)]
+    struct ChainTxs {
+        #[serde(rename = "userLock")]
+        user_lock: UserLock,
+    }
+    let txs_url = format!(
+        "{}/swap/chain/{}/transactions",
+        boltz_url.trim_end_matches('/'),
+        swap_id
+    );
+    let txid = match client.get(&txs_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<ChainTxs>().await {
+            Ok(c) => c.user_lock.transaction.id,
+            Err(_) => return false,
+        },
         _ => return false,
     };
-    match resp.json::<Vec<Tx>>().await {
-        Ok(txs) => txs.iter().any(|t| t.status.confirmed),
-        Err(_) => false,
+
+    // 2) confirmation from the esplora (txid-based; no address index needed)
+    #[derive(serde::Deserialize)]
+    struct TxStatus {
+        confirmed: bool,
+    }
+    let status_url = format!("{}/tx/{}/status", esplora.trim_end_matches('/'), txid);
+    match client.get(&status_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<TxStatus>().await {
+            Ok(s) => s.confirmed,
+            Err(_) => false,
+        },
+        _ => false,
     }
 }
 
@@ -1976,7 +1998,13 @@ pub(crate) async fn execute_chain_swap_refund(
     // `sendrawtransaction` rejects it. Defer until the lockup has >=1 conf; the
     // caller (endpoint poll / reconciler) retries and it self-heals. This avoids
     // the wasted `refunding`->revert churn and the confusing broadcast errors.
-    if !chain_lockup_confirmed(&state.config.bitcoin_watcher.endpoint, &swap.lockup_address).await {
+    if !chain_lockup_confirmed(
+        &state.config.boltz.api_url,
+        &state.config.bitcoin_watcher.endpoint,
+        &swap.boltz_swap_id,
+    )
+    .await
+    {
         tracing::info!(
             event = "chain_swap_recover_deferred_unconfirmed_lockup",
             swap_id = %swap.boltz_swap_id,
