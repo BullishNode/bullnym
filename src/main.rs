@@ -494,6 +494,25 @@ fn build_router(state: AppState) -> Router {
             .route("/invoice/:id", get(invoice::render_unlinked_payment));
     }
 
+    // Merchant-authenticated chain-swap recovery (#44). Schnorr-signed by the
+    // invoice-owning nym; linked-only (only nym invoices ever create a chain
+    // swap). Gated SOLELY behind its own default-off flag — it signs and
+    // broadcasts real BTC and stays off until the staged broadcast test. Kept
+    // out of the `features.invoices` block: chain swaps are born under
+    // `payment_pages` (checkout), so tying the recover route to `invoices`
+    // could leave swaps in `refund_due` with the route silently absent.
+    if features.chain_swap_merchant_recovery {
+        if !features.payment_pages {
+            tracing::warn!(
+                "chain_swap_merchant_recovery is ON but payment_pages is OFF — no chain swaps are created, so nothing will ever be recoverable"
+            );
+        }
+        router = router.route(
+            "/api/v1/:nym/invoices/:id/recover",
+            post(invoice::recover_chain_swap).layer(DefaultBodyLimit::max(1024)),
+        );
+    }
+
     let router = if features.payment_pages {
         router.fallback(donation_render::render_or_404)
     } else {

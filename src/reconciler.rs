@@ -177,6 +177,26 @@ async fn run_one_chain_tick(
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
+    // Phase 4 backstop: recover chain swaps stranded in `refunding` (customer
+    // disconnected or the process restarted mid-refund). Revert them to
+    // `refund_due` so a retry can complete; a re-broadcast is UTXO-conflict-safe
+    // (same lockup UTXO, same immutable address). The age floor (10× the swap
+    // reconciler min-age, min 10 min) keeps an actively-broadcasting refund from
+    // being reverted out from under itself.
+    let refunding_stale_secs = (config.min_age_secs as i64).saturating_mul(10).max(600);
+    match db::revert_stale_refunding_chain_swaps(&state.db, refunding_stale_secs).await {
+        Ok(reverted) if !reverted.is_empty() => {
+            tracing::error!(
+                event = "chain_swap_refunding_stuck_reverted",
+                count = reverted.len(),
+                ids = ?reverted,
+                "reverted stuck `refunding` chain swap(s) to `refund_due` for retry (operator P1 — verify no refund tx confirmed before re-refunding)"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("chain reconciler: revert_stale_refunding failed: {e}"),
+    }
+
     let stale = db::list_non_terminal_chain_swaps_oldest_first(
         &state.db,
         config.min_age_secs,

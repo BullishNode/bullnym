@@ -63,6 +63,7 @@ use crate::AppState;
 pub const ACTION_CREATE: &str = "invoice-create";
 pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
+pub const ACTION_RECOVER: &str = "invoice-recover";
 
 /// Hard upper bound and default for wallet-origin invoice expiry (7 days).
 /// Clients may omit `expires_at_unix`; the server then uses this default.
@@ -1037,6 +1038,221 @@ pub async fn status(
 }
 
 // =====================================================================
+// POST /api/v1/:nym/invoices/:id/recover — merchant-authenticated
+// chain-swap recovery (#44). The recipient/merchant recovers the payer's
+// stuck BTC lockup to their own address; the payer is made whole out-of-band
+// at the POS. Schnorr-signed by the invoice-owning nym (reuses the
+// `cancel_linked` auth chain). Linked-only: only nym invoices ever create a
+// chain swap (`create_bitcoin_chain_offer` requires `liquid_address`).
+// =====================================================================
+
+#[derive(Deserialize)]
+pub struct RecoverRequest {
+    pub npub: String,
+    pub timestamp: u64,
+    pub signature: String,
+    /// Merchant's BTC (mainnet) address to receive the recovered lockup. Part
+    /// of the signed payload, so it cannot be tampered in transit.
+    pub btc_address: String,
+}
+
+#[derive(Serialize)]
+pub struct RecoverResponse {
+    /// Always "recovered" on success (the swap reached terminal `refunded`).
+    pub status: String,
+    /// The broadcast recovery transaction id.
+    pub txid: String,
+}
+
+/// Validate a merchant recovery address: non-empty and a valid Bitcoin
+/// *mainnet* address. Rejecting early yields a clean, coded error before any
+/// state write; `construct_refund` re-validates network as a backstop.
+fn validate_btc_refund_address(addr: &str) -> Result<(), AppError> {
+    use std::str::FromStr;
+    if addr.is_empty() {
+        return Err(AppError::RecoveryAddressInvalid("empty address".into()));
+    }
+    let parsed = boltz_client::bitcoin::Address::from_str(addr)
+        .map_err(|e| AppError::RecoveryAddressInvalid(format!("parse failed: {e}")))?;
+    if !parsed.is_valid_for_network(boltz_client::bitcoin::Network::Bitcoin) {
+        return Err(AppError::RecoveryAddressInvalid(
+            "address is not valid on Bitcoin mainnet".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Merchant-authenticated chain-swap recovery. The invoice-owning merchant
+/// signs `(invoice_id, btc_address, timestamp)` with their nym key; bullnym
+/// verifies the signature + ownership (exactly like `cancel_linked`), then
+/// refunds the stuck BTC lockup to the signed `btc_address`. Because only the
+/// nym owner holds the key, a bystander who knows the public invoice URL cannot
+/// call this (closes G13). The destination is immutable first-write-wins and is
+/// inside the signed payload, so it cannot be redirected. Idempotent: a retried
+/// request after success returns the same txid.
+pub async fn recover_chain_swap(
+    State(state): State<AppState>,
+    Path((nym, id_str)): Path<(String, String)>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<RecoverResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
+    let is_whitelisted = ip
+        .map(|ip| state.ip_whitelist.contains(ip))
+        .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::MetadataLookup,
+        peer,
+        &headers,
+        "signed_invoice_recover",
+        Some(&req.npub),
+    );
+    if !is_whitelisted && !is_certification_allowed {
+        if let Some(ip) = ip {
+            state.rate_limiter.check_metadata_per_ip(ip).await?;
+        }
+    }
+
+    let id = parse_invoice_id(&id_str)?;
+
+    // Verify the merchant's signature over (invoice_id, btc_address). The
+    // btc_address is used RAW (not trimmed) so the verified bytes equal the
+    // stored bytes; a whitespace-padded address fails validation below anyway.
+    let fields = recover_payload_fields(&id_str, &req.btc_address);
+    auth::verify_la_v2(
+        ACTION_RECOVER,
+        &req.npub,
+        &nym,
+        &fields,
+        req.timestamp,
+        &req.signature,
+    )?;
+    assert_nym_owner(&state, &nym, &req.npub).await?;
+
+    // Ownership defense-in-depth (mirrors cancel): the signing npub must own the
+    // invoice and the path nym must match — same wire copy in both cases so we
+    // never leak cross-nym existence.
+    let inv = db::get_invoice_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+    if inv.npub_owner != req.npub {
+        return Err(AppError::InvoiceNotFound(id_str));
+    }
+    if inv.nym_owner.as_deref() != Some(nym.as_str()) {
+        return Err(AppError::InvoiceNotFound(id_str));
+    }
+
+    validate_btc_refund_address(&req.btc_address)?;
+
+    // Locate the recoverable (`refund_due`) swap FIRST — an invoice may have an
+    // already-recovered swap AND a distinct still-recoverable one; checking the
+    // recovered short-circuit first would wrongly hide the latter. Only when
+    // there is no `refund_due` swap do we fall back to the idempotent
+    // already-recovered reply (a retried request after success).
+    let swap = match db::find_refund_due_chain_swap_for_invoice(&state.db, id).await? {
+        Some(s) => s,
+        None => {
+            if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
+                // Defense-in-depth: the recorded swap must belong to this nym
+                // (mirrors the refund_due path). Ownership already gated above.
+                if done.nym.as_deref() != Some(nym.as_str()) {
+                    return Err(AppError::RecoveryNotAvailable(
+                        "this payment is not recoverable by this account".into(),
+                    ));
+                }
+                match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
+                    (Some(existing), Some(txid)) if existing == req.btc_address => {
+                        return Ok(Json(RecoverResponse {
+                            status: "recovered".into(),
+                            txid: txid.to_string(),
+                        }));
+                    }
+                    _ => {
+                        return Err(AppError::RecoveryNotAvailable(
+                            "invoice already recovered (to a different address)".into(),
+                        ));
+                    }
+                }
+            }
+            // Distinguish "a recovery is mid-flight" from "nothing to recover"
+            // so a merchant retrying after a client timeout isn't told the funds
+            // never existed.
+            if db::get_refunding_chain_swap_for_invoice(&state.db, id)
+                .await?
+                .is_some()
+            {
+                return Err(AppError::RecoveryInProgress(format!(
+                    "recovery already in flight for invoice {id}"
+                )));
+            }
+            return Err(AppError::RecoveryNotAvailable(format!(
+                "no recoverable chain swap for invoice {id}"
+            )));
+        }
+    };
+
+    // Defense-in-depth: the swap's recorded nym must match the authenticated
+    // nym. (Chain swaps are created with the checkout nym; this should always
+    // hold once the invoice ownership checks above pass.)
+    if swap.nym.as_deref() != Some(nym.as_str()) {
+        tracing::error!(
+            event = "chain_swap_recover_nym_mismatch",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %id,
+            swap_nym = ?swap.nym,
+            auth_nym = %nym,
+            "recovery blocked: chain swap nym does not match the authenticated nym (operator P1)"
+        );
+        return Err(AppError::RecoveryNotAvailable(
+            "this payment is not recoverable by this account".into(),
+        ));
+    }
+
+    // First-write-wins: commit the destination before any broadcast (G14).
+    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &req.btc_address).await?;
+    if rows == 0 {
+        // Address already set, or the swap left `refund_due`. Disambiguate.
+        let cur = db::get_chain_swap_by_id(&state.db, swap.id)
+            .await?
+            .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
+        match cur.refund_address.as_deref() {
+            Some(existing) if existing == req.btc_address => { /* idempotent: proceed */ }
+            Some(_) => {
+                return Err(AppError::RecoveryNotAvailable(
+                    "a different recovery address was already committed for this payment".into(),
+                ));
+            }
+            None => {
+                return Err(AppError::RecoveryNotAvailable(
+                    "this payment is no longer recoverable".into(),
+                ));
+            }
+        }
+    }
+
+    tracing::info!(
+        event = "chain_swap_recover_requested",
+        invoice_id = %id,
+        nym = %nym,
+        npub_tag = npub_log_tag(&req.npub),
+        "merchant chain-swap recovery authorized"
+    );
+
+    // Re-read the address-populated row and execute the recovery under the lock.
+    let swap = db::get_chain_swap_by_id(&state.db, swap.id)
+        .await?
+        .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
+    let txid = crate::claimer::execute_chain_swap_refund(&state, &swap).await?;
+    Ok(Json(RecoverResponse {
+        status: "recovered".into(),
+        txid,
+    }))
+}
+
+// =====================================================================
 // POST /api/v1/invoices/:id/lightning — lazy create / re-fetch the offer
 // =====================================================================
 
@@ -1415,6 +1631,25 @@ async fn create_bitcoin_chain_offer(
         return Ok(None);
     }
 
+    // Recovery invariant (SF1, #44): a chain swap MUST belong to a nym-owned
+    // invoice, because the only API path to recover its stuck BTC — the signed
+    // `/api/v1/:nym/invoices/:id/recover` endpoint — is keyed on the owning nym
+    // (`swap.nym` + `invoice.nym_owner`). A swap created without a nym would be
+    // permanently API-unrecoverable if it ever reached `refund_due`. Today all
+    // chain offers are created from nym-owned checkout, so this only guards a
+    // future caller (e.g. a lazy wallet-invoice chain offer) from silently
+    // minting unrecoverable swaps. Refuse to create the offer instead.
+    if swap_nym.is_none() || invoice.nym_owner.is_none() {
+        tracing::error!(
+            event = "chain_swap_offer_without_nym_refused",
+            invoice_id = %invoice.id,
+            has_swap_nym = swap_nym.is_some(),
+            has_nym_owner = invoice.nym_owner.is_some(),
+            "refusing to create a chain-swap offer without an owning nym — its BTC would be unrecoverable via the merchant recovery endpoint (operator P1)"
+        );
+        return Ok(None);
+    }
+
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("chain claim key allocation failed: {e}")))?;
@@ -1571,6 +1806,14 @@ fn create_payload_fields<'a>(
 
 fn cancel_payload_fields(invoice_id: &str) -> [&str; 1] {
     [invoice_id]
+}
+
+/// 2 fields in fixed order. The byte sequence is the wire contract — the
+/// mobile `core/nostr/bullpay_la_v2_signing.dart` recover signer MUST produce
+/// the same order: `[invoice_id, btc_address]`. `btc_address` is the raw
+/// request string (not trimmed) so the verified bytes equal the stored bytes.
+fn recover_payload_fields<'a>(invoice_id: &'a str, btc_address: &'a str) -> [&'a str; 2] {
+    [invoice_id, btc_address]
 }
 
 fn list_payload_fields<'a>(
