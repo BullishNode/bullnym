@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod descriptor;
 pub mod donation_page;
+pub mod esplora;
 pub mod donation_render;
 pub mod error;
 pub mod gc;

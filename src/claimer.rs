@@ -1903,15 +1903,7 @@ async fn construct_chain_claim_tx(
 /// (`/swap/chain/{id}/transactions` -> userLock.transaction.id) and then query
 /// the esplora `/tx/{txid}/status`. Best-effort: on any error returns false
 /// (defer the refund) — refusing to refund is the fund-safe direction.
-async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
+async fn chain_lockup_confirmed(boltz_url: &str, esploras: &[String], swap_id: &str) -> bool {
     // 1) lockup funding txid from Boltz
     #[derive(serde::Deserialize)]
     struct LockTx {
@@ -1926,6 +1918,13 @@ async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -
         #[serde(rename = "userLock")]
         user_lock: UserLock,
     }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
     let txs_url = format!(
         "{}/swap/chain/{}/transactions",
         boltz_url.trim_end_matches('/'),
@@ -1939,19 +1938,16 @@ async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -
         _ => return false,
     };
 
-    // 2) confirmation from the esplora (txid-based; no address index needed)
+    // 2) confirmation from the esplora, txid-based (no address index needed),
+    // failing over across all configured endpoints.
     #[derive(serde::Deserialize)]
     struct TxStatus {
         confirmed: bool,
     }
-    let status_url = format!("{}/tx/{}/status", esplora.trim_end_matches('/'), txid);
-    match client.get(&status_url).send().await {
-        Ok(r) if r.status().is_success() => match r.json::<TxStatus>().await {
-            Ok(s) => s.confirmed,
-            Err(_) => false,
-        },
-        _ => false,
-    }
+    crate::esplora::get_json::<TxStatus>(esploras, &format!("tx/{txid}/status"))
+        .await
+        .map(|s| s.confirmed)
+        .unwrap_or(false)
 }
 
 pub(crate) async fn execute_chain_swap_refund(
@@ -2000,7 +1996,7 @@ pub(crate) async fn execute_chain_swap_refund(
     // the wasted `refunding`->revert churn and the confusing broadcast errors.
     if !chain_lockup_confirmed(
         &state.config.boltz.api_url,
-        &state.config.bitcoin_watcher.endpoint,
+        &state.config.bitcoin_watcher.effective_endpoints(),
         &swap.boltz_swap_id,
     )
     .await
@@ -2225,11 +2221,18 @@ async fn build_and_broadcast_chain_refund(
         }
     };
 
-    let txid = chain_client
-        .broadcast_tx(&refund_tx)
-        .await
-        .map_err(|e| AppError::ClaimError(format!("refund broadcast failed: {e}")))?;
-    Ok(txid.to_string())
+    // Broadcast with esplora endpoint failover (issue #47): a single broken or
+    // down node must not block the refund. `broadcast` tries each endpoint until
+    // one accepts (or reports the tx already known), so we survive the kind of
+    // "up-but-broken" esplora that blocked recovery before the failover existed.
+    let refund_hex = serialize_claim_tx_hex(&refund_tx)?;
+    let expected_txid = btc_like_txid(&refund_tx);
+    crate::esplora::broadcast(
+        &state.config.bitcoin_watcher.effective_endpoints(),
+        &refund_hex,
+        &expected_txid,
+    )
+    .await
 }
 
 /// Heuristic classifier for cooperative-claim refusals from Boltz.
