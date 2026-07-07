@@ -312,7 +312,15 @@ impl ElectrumClient {
 
         let mut chosen: Option<(electrum_client::Client, usize)> = None;
         for (i, url) in urls.iter().enumerate() {
-            match electrum_client::Client::new(url) {
+            // Bounded socket timeout: a stalled-but-connected Electrum peer must
+            // not hang the op indefinitely behind the ConnState mutex (which
+            // would stall LUD-22 proof callbacks and the payment watcher).
+            // URL failover only fires on errors, so without this a hang never
+            // fails over.
+            match electrum_client::Client::from_config(
+                url,
+                electrum_client::Config::builder().timeout(Some(10)).build(),
+            ) {
                 Ok(c) => {
                     tracing::info!("electrum eager-connected: {}", url);
                     chosen = Some((c, i));
@@ -373,7 +381,10 @@ where
             // Try to connect, walking through the URL ring once.
             for _ in 0..urls.len() {
                 let url = urls[guard.url_idx].clone();
-                match electrum_client::Client::new(&url) {
+                match electrum_client::Client::from_config(
+                    &url,
+                    electrum_client::Config::builder().timeout(Some(10)).build(),
+                ) {
                     Ok(c) => {
                         tracing::info!("electrum reconnected: {}", url);
                         guard.client = Some(c);
