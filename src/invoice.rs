@@ -1156,6 +1156,13 @@ pub async fn recover_chain_swap(
         Some(s) => s,
         None => {
             if let Some(done) = db::get_refunded_chain_swap_for_invoice(&state.db, id).await? {
+                // Defense-in-depth: the recorded swap must belong to this nym
+                // (mirrors the refund_due path). Ownership already gated above.
+                if done.nym.as_deref() != Some(nym.as_str()) {
+                    return Err(AppError::RecoveryNotAvailable(
+                        "this payment is not recoverable by this account".into(),
+                    ));
+                }
                 match (done.refund_address.as_deref(), done.refund_txid.as_deref()) {
                     (Some(existing), Some(txid)) if existing == req.btc_address => {
                         return Ok(Json(RecoverResponse {
@@ -1169,6 +1176,17 @@ pub async fn recover_chain_swap(
                         ));
                     }
                 }
+            }
+            // Distinguish "a recovery is mid-flight" from "nothing to recover"
+            // so a merchant retrying after a client timeout isn't told the funds
+            // never existed.
+            if db::get_refunding_chain_swap_for_invoice(&state.db, id)
+                .await?
+                .is_some()
+            {
+                return Err(AppError::RecoveryInProgress(format!(
+                    "recovery already in flight for invoice {id}"
+                )));
             }
             return Err(AppError::RecoveryNotAvailable(format!(
                 "no recoverable chain swap for invoice {id}"
@@ -1610,6 +1628,25 @@ async fn create_bitcoin_chain_offer(
     invoice: &db::Invoice,
 ) -> Result<Option<BitcoinChainOffer>, AppError> {
     if invoice.liquid_address.is_none() {
+        return Ok(None);
+    }
+
+    // Recovery invariant (SF1, #44): a chain swap MUST belong to a nym-owned
+    // invoice, because the only API path to recover its stuck BTC — the signed
+    // `/api/v1/:nym/invoices/:id/recover` endpoint — is keyed on the owning nym
+    // (`swap.nym` + `invoice.nym_owner`). A swap created without a nym would be
+    // permanently API-unrecoverable if it ever reached `refund_due`. Today all
+    // chain offers are created from nym-owned checkout, so this only guards a
+    // future caller (e.g. a lazy wallet-invoice chain offer) from silently
+    // minting unrecoverable swaps. Refuse to create the offer instead.
+    if swap_nym.is_none() || invoice.nym_owner.is_none() {
+        tracing::error!(
+            event = "chain_swap_offer_without_nym_refused",
+            invoice_id = %invoice.id,
+            has_swap_nym = swap_nym.is_some(),
+            has_nym_owner = invoice.nym_owner.is_some(),
+            "refusing to create a chain-swap offer without an owning nym — its BTC would be unrecoverable via the merchant recovery endpoint (operator P1)"
+        );
         return Ok(None);
     }
 

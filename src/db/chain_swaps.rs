@@ -426,6 +426,26 @@ pub async fn get_refunded_chain_swap_for_invoice(
     .await
 }
 
+/// The in-flight (`refunding`) chain swap for an invoice, if any (Phase 4).
+/// Lets the recovery endpoint return a distinct "recovery in progress" signal
+/// (rather than "not available") when a merchant retries during the broadcast
+/// window or while a stuck row awaits the reconciler backstop.
+pub async fn get_refunding_chain_swap_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records \
+         WHERE invoice_id = $1 AND status = 'refunding' \
+         ORDER BY updated_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Records the customer's BTC refund address, FIRST-WRITE-WINS and immutable
 /// (G13/G14): the UPDATE only fires when `refund_address IS NULL` and the swap
 /// is still `refund_due`, so a bystander who knows the public invoice URL cannot
