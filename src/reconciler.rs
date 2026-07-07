@@ -96,6 +96,81 @@ pub fn spawn_chain(state: AppState, config: Arc<ReconcilerConfig>, cancel: Cance
     });
 }
 
+/// Settlement-repair task. Re-records invoice payment events for reverse
+/// (Lightning) swaps that reached `claimed` — merchant funds are on chain —
+/// but whose invoice flip never completed: the process died, or
+/// `record_invoice_payment` transiently failed, between committing the
+/// `claimed` status (`claimer.rs`) and running
+/// `flip_invoice_on_lightning_settlement` (whose error is only logged). Without
+/// this the merchant is paid while the invoice shows unpaid, and the reconciler
+/// never revisits terminal `claimed` rows. The flip is idempotent (dedup by
+/// event_key), so re-running is a safe no-op once the event exists.
+pub fn spawn_settlement_repair(
+    state: AppState,
+    config: Arc<ReconcilerConfig>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("settlement repair: shutting down");
+                    return;
+                }
+                _ = tick.tick() => {
+                    if let Err(e) = run_settlement_repair_tick(&state, &config).await {
+                        tracing::error!("settlement repair tick failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn run_settlement_repair_tick(
+    state: &AppState,
+    config: &ReconcilerConfig,
+) -> Result<(), sqlx::Error> {
+    // Only recently-claimed rows: a stuck flip is repaired within a tick or
+    // two, after which the event exists and the row drops out of the query.
+    // The window covers the maximum invoice lifetime.
+    const REPAIR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+    let stuck = db::list_claimed_swaps_missing_lightning_event(
+        &state.db,
+        REPAIR_MAX_AGE_SECS,
+        config.max_per_tick,
+    )
+    .await?;
+    if stuck.is_empty() {
+        return Ok(());
+    }
+    let tolerances = db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting);
+    for swap in &stuck {
+        let (Some(invoice_id), Some(claim_txid)) = (swap.invoice_id, swap.claim_txid.as_deref())
+        else {
+            continue;
+        };
+        tracing::warn!(
+            event = "settlement_repair",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %invoice_id,
+            "re-recording missing invoice payment event for a claimed Lightning swap"
+        );
+        crate::invoice::flip_invoice_on_lightning_settlement(
+            &state.db,
+            Some(invoice_id),
+            swap.amount_sat,
+            &swap.boltz_swap_id,
+            claim_txid,
+            tolerances,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 async fn run_one_chain_tick(
     state: &AppState,
     client: &BoltzApiClientV2,
