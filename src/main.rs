@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to stale TCP connections and rotates through `liquid_urls` on failure;
     // even if no URL is reachable at startup it constructs successfully and
     // reconnects lazily on the first PF request.
-    let electrum_urls = config.electrum.urls();
+    let electrum_urls = config.electrum.urls_with_builtin_failover();
     tracing::info!(
         "liquid electrum backend configured with {} url(s): {}",
         electrum_urls.len(),

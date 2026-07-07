@@ -15,7 +15,7 @@ use lwk_wollet::elements;
 use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::esplora::EsploraBitcoinClient;
-use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
+use boltz_client::network::{BitcoinChain, Chain, LiquidChain, LiquidClient};
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateChainResponse, CreateReverseResponse, Side,
 };
@@ -268,7 +268,7 @@ async fn dispatch_webhook(
             try_claim_with_retry(
                 &state.db,
                 &swap,
-                &state.config.boltz.electrum_url,
+                &state.config.claim_liquid_electrum_urls(),
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
@@ -603,7 +603,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -661,7 +661,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -776,7 +776,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.boltz.electrum_url,
+            &state.config.claim_liquid_electrum_urls(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -814,7 +814,7 @@ fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapSt
 async fn try_claim_chain_swap_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::ChainSwapRecord,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -823,7 +823,7 @@ async fn try_claim_chain_swap_with_retry(
     match claim_chain_swap(
         pool,
         swap.id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -876,7 +876,7 @@ pub enum ClaimOutcome {
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -885,7 +885,7 @@ async fn try_claim_with_retry(
     match claim_swap(
         pool,
         swap.id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -1094,7 +1094,7 @@ async fn resolve_claim_address(
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1107,7 +1107,7 @@ async fn claim_swap(
     let result = claim_swap_inner(
         pool,
         swap_id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1165,7 +1165,7 @@ async fn claim_swap(
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
@@ -1226,7 +1226,7 @@ async fn claim_swap_inner(
         let constructed = match construct_claim_tx(
             &swap,
             &output_address,
-            electrum_url,
+            electrum_urls,
             boltz_url,
             use_cooperative,
         )
@@ -1306,9 +1306,7 @@ async fn claim_swap_inner(
     // dies between here and the final update, the next sweep tick re-acquires
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
-    let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
     let mut txid = btc_like_txid(&claim_tx);
@@ -1427,7 +1425,7 @@ async fn claim_swap_inner(
 async fn claim_chain_swap(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1436,7 +1434,7 @@ async fn claim_chain_swap(
     let result = claim_chain_swap_inner(
         pool,
         chain_swap_id,
-        electrum_url,
+        electrum_urls,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1499,7 +1497,7 @@ async fn claim_chain_swap(
 async fn claim_chain_swap_inner(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
@@ -1562,7 +1560,7 @@ async fn claim_chain_swap_inner(
         let constructed = match construct_chain_claim_tx(
             &swap,
             &output_address,
-            electrum_url,
+            electrum_urls,
             boltz_url,
             use_cooperative,
         )
@@ -1615,9 +1613,7 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
@@ -1731,7 +1727,7 @@ async fn claim_chain_swap_inner(
 async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1770,9 +1766,7 @@ async fn construct_claim_tx(
 
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
-    let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1800,7 +1794,7 @@ async fn construct_claim_tx(
 async fn construct_chain_claim_tx(
     swap: &db::ChainSwapRecord,
     output_address: &str,
-    electrum_url: &str,
+    electrum_urls: &[String],
     boltz_url: &str,
     use_cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1843,9 +1837,7 @@ async fn construct_chain_claim_tx(
     )
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
-    let liquid_client =
-        ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(electrum_url), true, true, 30)
-            .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
+    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1903,15 +1895,7 @@ async fn construct_chain_claim_tx(
 /// (`/swap/chain/{id}/transactions` -> userLock.transaction.id) and then query
 /// the esplora `/tx/{txid}/status`. Best-effort: on any error returns false
 /// (defer the refund) — refusing to refund is the fund-safe direction.
-async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
+async fn chain_lockup_confirmed(boltz_url: &str, esploras: &[String], swap_id: &str) -> bool {
     // 1) lockup funding txid from Boltz
     #[derive(serde::Deserialize)]
     struct LockTx {
@@ -1926,6 +1910,13 @@ async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -
         #[serde(rename = "userLock")]
         user_lock: UserLock,
     }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
     let txs_url = format!(
         "{}/swap/chain/{}/transactions",
         boltz_url.trim_end_matches('/'),
@@ -1939,19 +1930,16 @@ async fn chain_lockup_confirmed(boltz_url: &str, esplora: &str, swap_id: &str) -
         _ => return false,
     };
 
-    // 2) confirmation from the esplora (txid-based; no address index needed)
+    // 2) confirmation from the esplora, txid-based (no address index needed),
+    // failing over across all configured endpoints.
     #[derive(serde::Deserialize)]
     struct TxStatus {
         confirmed: bool,
     }
-    let status_url = format!("{}/tx/{}/status", esplora.trim_end_matches('/'), txid);
-    match client.get(&status_url).send().await {
-        Ok(r) if r.status().is_success() => match r.json::<TxStatus>().await {
-            Ok(s) => s.confirmed,
-            Err(_) => false,
-        },
-        _ => false,
-    }
+    crate::esplora::get_json::<TxStatus>(esploras, &format!("tx/{txid}/status"))
+        .await
+        .map(|s| s.confirmed)
+        .unwrap_or(false)
 }
 
 pub(crate) async fn execute_chain_swap_refund(
@@ -2000,7 +1988,7 @@ pub(crate) async fn execute_chain_swap_refund(
     // the wasted `refunding`->revert churn and the confusing broadcast errors.
     if !chain_lockup_confirmed(
         &state.config.boltz.api_url,
-        &state.config.bitcoin_watcher.endpoint,
+        &state.config.bitcoin_watcher.effective_endpoints(),
         &swap.boltz_swap_id,
     )
     .await
@@ -2180,56 +2168,107 @@ async fn build_and_broadcast_chain_refund(
     )
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
-    let bitcoin_client = EsploraBitcoinClient::new(
-        BitcoinChain::Bitcoin,
-        &state.config.bitcoin_watcher.endpoint,
-        30,
-    );
-    let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
     let boltz_api = BoltzApiClientV2::new(
         state.config.boltz.api_url.clone(),
         Some(Duration::from_secs(15)),
     );
 
-    let build = |cooperative: bool| {
-        let params = SwapTransactionParams {
-            keys: refund_keypair,
-            output_address: refund_address.to_string(),
-            // Conservative sat/vB. A too-low fee only delays the refund (RBF /
-            // re-broadcast possible); precise mempool fee estimation is a
-            // tracked refinement to validate in the staged broadcast test.
-            fee: Fee::Relative(2.0),
-            swap_id: swap.boltz_swap_id.clone(),
-            chain_client: &chain_client,
-            boltz_client: &boltz_api,
-            options: Some(TransactionOptions::default().with_cooperative(cooperative)),
+    // Construct the refund tx, rotating across the esplora endpoints (#47).
+    // `construct_refund` fetches the lockup UTXO from the Bitcoin chain client,
+    // so a no-address-index or "up-but-broken" primary node can fail
+    // construction *before* we ever reach the (already-failover'd) broadcast.
+    // Building one client per endpoint lets a broken primary fall through to a
+    // healthy provider. Defense-in-depth: the fork's `new_refund` already falls
+    // back to Boltz for the UTXO, so a healthy primary behaves identically
+    // (endpoint[0] wins on the first cooperative attempt).
+    //
+    // The cooperative->script fallback stays INSIDE each endpoint attempt: a
+    // cooperative refusal is a Boltz answer (post-timeout / Boltz unavailable),
+    // NOT an endpoint fault, so we must not rotate the esplora on it — we drop
+    // to the script path on the SAME endpoint. We only rotate when BOTH paths
+    // fail on an endpoint (the signature of a broken/no-index node).
+    let endpoints = state.config.bitcoin_watcher.effective_endpoints();
+    let mut construct_errors: Vec<String> = Vec::new();
+    let mut refund_tx = None;
+    for (i, endpoint) in endpoints.iter().enumerate() {
+        let bitcoin_client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
+        let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
+
+        let build = |cooperative: bool| {
+            let params = SwapTransactionParams {
+                keys: refund_keypair,
+                output_address: refund_address.to_string(),
+                // Conservative sat/vB. A too-low fee only delays the refund (RBF
+                // / re-broadcast possible); precise mempool fee estimation is a
+                // tracked refinement to validate in the staged broadcast test.
+                fee: Fee::Relative(2.0),
+                swap_id: swap.boltz_swap_id.clone(),
+                chain_client: &chain_client,
+                boltz_client: &boltz_api,
+                options: Some(TransactionOptions::default().with_cooperative(cooperative)),
+            };
+            lockup_script.construct_refund(params)
         };
-        lockup_script.construct_refund(params)
-    };
 
-    // Cooperative first (pre-timeout, cheapest). If Boltz refuses the partial
-    // sig (post-timeout, or Boltz unavailable), fall back to the script path —
-    // the network rejects a premature script-path spend, so this is safe.
-    let refund_tx = match build(true).await {
-        Ok(tx) => tx,
-        Err(coop_err) => {
-            tracing::warn!(
-                event = "chain_swap_refund_cooperative_failed",
-                swap_id = %swap.boltz_swap_id,
-                error = %coop_err,
-                "cooperative refund construction failed; attempting unilateral script path"
-            );
-            build(false)
-                .await
-                .map_err(|e| AppError::ClaimError(format!("construct_chain_refund failed: {e}")))?
+        // Cooperative first (pre-timeout, cheapest).
+        match build(true).await {
+            Ok(tx) => {
+                refund_tx = Some(tx);
+                break;
+            }
+            Err(coop_err) => {
+                tracing::warn!(
+                    event = "chain_swap_refund_cooperative_failed",
+                    swap_id = %swap.boltz_swap_id,
+                    endpoint = %endpoint,
+                    error = %coop_err,
+                    "cooperative refund construction failed; attempting unilateral script path on same endpoint"
+                );
+                // Script path on the SAME endpoint — the network rejects a
+                // premature script-path spend, so this is safe.
+                match build(false).await {
+                    Ok(tx) => {
+                        refund_tx = Some(tx);
+                        break;
+                    }
+                    Err(script_err) => {
+                        // Both paths failed here — likely an endpoint fault
+                        // (no address index / up-but-broken). Rotate.
+                        if i + 1 < endpoints.len() {
+                            tracing::warn!(
+                                event = "chain_swap_refund_construct_failover",
+                                swap_id = %swap.boltz_swap_id,
+                                endpoint = %endpoint,
+                                "refund construction failed on this esplora endpoint; rotating to next"
+                            );
+                        }
+                        construct_errors
+                            .push(format!("{endpoint}: coop={coop_err}; script={script_err}"));
+                    }
+                }
+            }
         }
-    };
+    }
+    let refund_tx = refund_tx.ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "construct_chain_refund failed on all {} esplora endpoint(s): {}",
+            endpoints.len(),
+            construct_errors.join(" | ")
+        ))
+    })?;
 
-    let txid = chain_client
-        .broadcast_tx(&refund_tx)
-        .await
-        .map_err(|e| AppError::ClaimError(format!("refund broadcast failed: {e}")))?;
-    Ok(txid.to_string())
+    // Broadcast with esplora endpoint failover (issue #47): a single broken or
+    // down node must not block the refund. `broadcast` tries each endpoint until
+    // one accepts (or reports the tx already known), so we survive the kind of
+    // "up-but-broken" esplora that blocked recovery before the failover existed.
+    let refund_hex = serialize_claim_tx_hex(&refund_tx)?;
+    let expected_txid = btc_like_txid(&refund_tx);
+    crate::esplora::broadcast(
+        &state.config.bitcoin_watcher.effective_endpoints(),
+        &refund_hex,
+        &expected_txid,
+    )
+    .await
 }
 
 /// Heuristic classifier for cooperative-claim refusals from Boltz.
@@ -2271,6 +2310,66 @@ fn electrum_host_port(url: &str) -> &str {
     url.strip_prefix("ssl://")
         .or_else(|| url.strip_prefix("tcp://"))
         .unwrap_or(url)
+}
+
+/// Connect a Liquid Electrum client for the claim/broadcast path, trying each
+/// URL until one connects AND answers a cheap probe — the same provider
+/// failover the UtxoBackend pool already has (#47). `ElectrumLiquidClient::new`
+/// attempts the connection, so a DOWN endpoint fails here and we rotate. An
+/// "up-but-broken" backend (TCP accepts, requests error) would otherwise be
+/// returned healthy and pin every retry to it; a post-connect `get_genesis_hash`
+/// probe (a single `blockchain.block.header` at height 0) catches that and
+/// rotates too. The already-present `utxo_backend` tx-existence probe still
+/// rescues an on-chain-but-errored broadcast. Returns the first client that
+/// connects and validates, or an aggregated error.
+async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
+    let mut errors: Vec<String> = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        let client =
+            match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "liquid_electrum_failover",
+                        endpoint = %url,
+                        err = %e,
+                        "Liquid electrum connect failed; trying next endpoint"
+                    );
+                    errors.push(format!("{url}: connect: {e}"));
+                    continue;
+                }
+            };
+        // Post-connect validation: a genesis-header fetch is cheap and
+        // deterministic; an up-but-broken node errors here and we rotate.
+        if let Err(e) = client.get_genesis_hash().await {
+            tracing::warn!(
+                event = "liquid_electrum_failover",
+                endpoint = %url,
+                err = %e,
+                "Liquid electrum connected but failed validation probe; trying next endpoint"
+            );
+            errors.push(format!("{url}: probe: {e}"));
+            continue;
+        }
+        if i > 0 {
+            tracing::warn!(
+                event = "liquid_electrum_failover",
+                endpoint = %url,
+                "connected to failover Liquid electrum after earlier endpoint(s) failed"
+            );
+        }
+        return Ok(client);
+    }
+    tracing::error!(
+        event = "liquid_electrum_all_endpoints_failed",
+        endpoints = urls.len(),
+        "all Liquid electrum endpoints failed to connect"
+    );
+    Err(AppError::ClaimError(format!(
+        "electrum connection failed on all {} url(s): {}",
+        urls.len(),
+        errors.join(" | ")
+    )))
 }
 
 /// Hex-encode a fully-signed claim tx for storage in
@@ -2391,7 +2490,7 @@ pub fn spawn_background_claimer(
                     match claim_swap(
                         &pool,
                         swap.id,
-                        &config.boltz.electrum_url,
+                        &config.claim_liquid_electrum_urls(),
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),
@@ -2442,7 +2541,7 @@ pub fn spawn_background_claimer(
                     match claim_chain_swap(
                         &pool,
                         swap.id,
-                        &config.boltz.electrum_url,
+                        &config.claim_liquid_electrum_urls(),
                         &config.boltz.api_url,
                         config.claim.max_claim_attempts,
                         utxo_backend.as_ref(),

@@ -520,6 +520,11 @@ pub struct BitcoinWatcherConfig {
     /// boundary; rate limits there are ours to set.
     #[serde(default = "default_btc_watcher_endpoint")]
     pub endpoint: String,
+    /// Extra esplora endpoints appended after `endpoint` as ordered failovers.
+    /// The two hardcoded providers (Bull Bitcoin + Blockstream) are always
+    /// appended after these, so leaving this empty still yields failover.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
     /// Active-tier poll period for "fresh" invoices (created within
     /// `active_window_secs`).
     #[serde(default = "default_btc_watcher_active_tick_secs")]
@@ -543,11 +548,38 @@ pub struct BitcoinWatcherConfig {
     pub request_timeout_ms: u64,
 }
 
+/// Hardcoded Bitcoin esplora failover providers (Bull Bitcoin, Blockstream),
+/// appended after the configured endpoint(s). mempool.space-shape REST; values
+/// from the bullbitcoin-mobile wallet defaults.
+pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] =
+    ["https://mempool.bullbitcoin.com/api", "https://mempool.space/api"];
+
+impl BitcoinWatcherConfig {
+    /// Ordered, deduplicated esplora endpoint list: configured `endpoint`
+    /// first (primary), then any extra `endpoints`, then the two hardcoded
+    /// provider failovers. Trailing slashes trimmed. Never empty. Behaviour is
+    /// unchanged while the primary is healthy — the rest are only tried on error.
+    pub fn effective_endpoints(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let configured = std::iter::once(self.endpoint.as_str())
+            .chain(self.endpoints.iter().map(String::as_str))
+            .chain(BUILTIN_BTC_ESPLORA_ENDPOINTS);
+        for u in configured {
+            let n = u.trim_end_matches('/').to_string();
+            if !n.is_empty() && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
+    }
+}
+
 impl Default for BitcoinWatcherConfig {
     fn default() -> Self {
         Self {
             enabled: default_btc_watcher_enabled(),
             endpoint: default_btc_watcher_endpoint(),
+            endpoints: Vec::new(),
             active_tick_secs: default_btc_watcher_active_tick_secs(),
             idle_tick_secs: default_btc_watcher_idle_tick_secs(),
             active_window_secs: default_btc_watcher_active_window_secs(),
@@ -1063,7 +1095,30 @@ impl ElectrumConfig {
         }
         out
     }
+
+    /// `urls()` plus the two hardcoded provider failovers (Bull Bitcoin +
+    /// Blockstream), deduplicated. This is what the Electrum pool is actually
+    /// built from: configured URLs stay first (primary); the built-ins are pure
+    /// additive redundancy, so a single-URL deployment gains failover with no
+    /// behaviour change while its primary is healthy. `urls()` itself is left
+    /// as the "what the operator configured" view (unchanged).
+    pub fn urls_with_builtin_failover(&self) -> Vec<String> {
+        let mut out = self.urls();
+        for u in BUILTIN_LIQUID_ELECTRUM_URLS {
+            let n = u.to_string();
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
+    }
 }
+
+/// Hardcoded Liquid Electrum failover providers (Bull Bitcoin, Blockstream).
+/// Values from the bullbitcoin-mobile wallet defaults (`les` first — it has
+/// been the more reliable of the two).
+pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] =
+    ["ssl://les.bullbitcoin.com:995", "ssl://blockstream.info:995"];
 
 /// Add a default `ssl://` prefix to URLs that lack a scheme. Logs a warning
 /// so operators can fix their configs.
@@ -1104,6 +1159,29 @@ fn default_max_descriptor_len() -> usize {
 }
 
 impl Config {
+    /// Ordered, deduplicated Liquid Electrum URL list for the CLAIM path
+    /// (chain-swap + reverse-swap claim construction/broadcast). The legacy
+    /// single `boltz.electrum_url` stays the primary; the `[electrum]` pool
+    /// (which now ends with the hardcoded Bull Bitcoin + Blockstream failovers)
+    /// follows. Deduped on the normalized `ssl://` form. Behaviour is unchanged
+    /// while the primary is healthy — the rest are only tried on error.
+    pub fn claim_liquid_electrum_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let primary = normalize_electrum_url(&self.boltz.electrum_url);
+        if !self.boltz.electrum_url.is_empty() {
+            out.push(primary);
+        }
+        for u in self.electrum.urls_with_builtin_failover() {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+        if out.is_empty() {
+            out.push(default_liquid_electrum_url());
+        }
+        out
+    }
+
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&content)?;
