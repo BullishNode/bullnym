@@ -252,3 +252,59 @@ fn workers_default_enabled() {
 
     assert!(cfg.enabled);
 }
+
+#[test]
+fn electrum_urls_with_builtin_failover_appends_and_dedups() {
+    let cfg = ElectrumConfig {
+        liquid_url: Some("ssl://les.bullbitcoin.com:995".to_string()),
+        liquid_urls: vec![],
+        cache_ttl_secs: 0,
+        cache_max_entries: 0,
+    };
+    assert_eq!(
+        cfg.urls_with_builtin_failover(),
+        vec![
+            "ssl://les.bullbitcoin.com:995".to_string(),
+            "ssl://blockstream.info:995".to_string(),
+        ]
+    );
+    let cfg2 = ElectrumConfig {
+        liquid_url: Some("ssl://my-node:50002".to_string()),
+        liquid_urls: vec![],
+        cache_ttl_secs: 0,
+        cache_max_entries: 0,
+    };
+    assert_eq!(
+        cfg2.urls_with_builtin_failover(),
+        vec![
+            "ssl://my-node:50002".to_string(),
+            "ssl://les.bullbitcoin.com:995".to_string(),
+            "ssl://blockstream.info:995".to_string(),
+        ]
+    );
+    assert_eq!(cfg2.urls(), vec!["ssl://my-node:50002".to_string()]);
+}
+
+#[test]
+fn btc_effective_endpoints_primary_first_deduped() {
+    let cfg = BitcoinWatcherConfig::default();
+    assert_eq!(
+        cfg.effective_endpoints(),
+        vec![
+            "https://mempool.bullbitcoin.com/api".to_string(),
+            "https://mempool.space/api".to_string(),
+        ]
+    );
+    let cfg2 = BitcoinWatcherConfig {
+        endpoint: "http://172.16.0.8/api/".to_string(),
+        ..BitcoinWatcherConfig::default()
+    };
+    assert_eq!(
+        cfg2.effective_endpoints(),
+        vec![
+            "http://172.16.0.8/api".to_string(),
+            "https://mempool.bullbitcoin.com/api".to_string(),
+            "https://mempool.space/api".to_string(),
+        ]
+    );
+}

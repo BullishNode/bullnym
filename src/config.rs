@@ -579,6 +579,7 @@ impl Default for BitcoinWatcherConfig {
         Self {
             enabled: default_btc_watcher_enabled(),
             endpoint: default_btc_watcher_endpoint(),
+            endpoints: Vec::new(),
             active_tick_secs: default_btc_watcher_active_tick_secs(),
             idle_tick_secs: default_btc_watcher_idle_tick_secs(),
             active_window_secs: default_btc_watcher_active_window_secs(),
@@ -1089,26 +1090,33 @@ impl ElectrumConfig {
                 out.push(n);
             }
         }
-        // Always append the two hardcoded provider failovers (Bull Bitcoin +
-        // Blockstream), deduplicated. Configured URLs stay first (primary); the
-        // built-ins are pure additive redundancy — a single-URL deployment
-        // gains failover with no behaviour change while its primary is healthy.
+        if out.is_empty() {
+            out.push(default_liquid_electrum_url());
+        }
+        out
+    }
+
+    /// `urls()` plus the two hardcoded provider failovers (Bull Bitcoin +
+    /// Blockstream), deduplicated. This is what the Electrum pool is actually
+    /// built from: configured URLs stay first (primary); the built-ins are pure
+    /// additive redundancy, so a single-URL deployment gains failover with no
+    /// behaviour change while its primary is healthy. `urls()` itself is left
+    /// as the "what the operator configured" view (unchanged).
+    pub fn urls_with_builtin_failover(&self) -> Vec<String> {
+        let mut out = self.urls();
         for u in BUILTIN_LIQUID_ELECTRUM_URLS {
             let n = u.to_string();
             if !out.contains(&n) {
                 out.push(n);
             }
         }
-        if out.is_empty() {
-            out.push(default_liquid_electrum_url());
-        }
         out
     }
 }
 
-/// Hardcoded Liquid Electrum failover providers (Bull Bitcoin, Blockstream),
-/// appended after any configured URLs. Values from the bullbitcoin-mobile
-/// wallet defaults (`les` first — it has been the more reliable of the two).
+/// Hardcoded Liquid Electrum failover providers (Bull Bitcoin, Blockstream).
+/// Values from the bullbitcoin-mobile wallet defaults (`les` first — it has
+/// been the more reliable of the two).
 pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] =
     ["ssl://les.bullbitcoin.com:995", "ssl://blockstream.info:995"];
 
@@ -1163,7 +1171,7 @@ impl Config {
         if !self.boltz.electrum_url.is_empty() {
             out.push(primary);
         }
-        for u in self.electrum.urls() {
+        for u in self.electrum.urls_with_builtin_failover() {
             if !out.contains(&u) {
                 out.push(u);
             }
