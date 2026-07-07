@@ -201,6 +201,23 @@ pub async fn get_chain_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Same as [`get_chain_swap_by_id`] but takes a `FOR UPDATE` row lock, so a
+/// read-modify-write inside a transaction serializes against concurrent
+/// `update_chain_swap_status` writers (which run lock-free on the pool). Used by
+/// the Phase 3 renegotiation path to re-read the row under the advisory lock
+/// before persisting the renegotiated amount.
+pub async fn get_chain_swap_by_id_for_update<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+}
+
 pub async fn latest_payable_chain_swap_for_invoice(
     pool: &PgPool,
     invoice_id: Uuid,
@@ -312,14 +329,26 @@ pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
     renegotiated_server_lock_amount_sat: i64,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
+        // Persist the renegotiated amount UNCONDITIONALLY as long as the swap is
+        // still live and not already renegotiated — crediting reads this, so it
+        // must be recorded even if a concurrent `transaction.server.mempool`
+        // webhook has already advanced the status past the funded lockup states.
+        // The status nudge back to `user_lock_confirmed` is therefore CASE-gated:
+        // only applied when still in a pre-server-lock funded state, so we never
+        // REGRESS a more-advanced lifecycle state (the race SHOULD-FIX 3 flags).
+        // `refund_due` is excluded from the guard so a late/duplicate
+        // `lockupFailed` cannot resurrect an operator-visible refund case.
         "UPDATE chain_swap_records \
-         SET status = 'user_lock_confirmed', \
-             renegotiated_server_lock_amount_sat = $2, \
+         SET renegotiated_server_lock_amount_sat = $2, \
              renegotiated_at = NOW(), \
+             status = CASE \
+                 WHEN status IN ('user_lock_mempool', 'user_lock_confirmed') \
+                 THEN 'user_lock_confirmed' ELSE status END, \
              updated_at = NOW() \
          WHERE id = $1 \
            AND renegotiated_server_lock_amount_sat IS NULL \
-           AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck')",
+           AND status NOT IN \
+               ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refund_due')",
     )
     .bind(id)
     .bind(renegotiated_server_lock_amount_sat)

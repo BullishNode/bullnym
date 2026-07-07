@@ -403,16 +403,21 @@ async fn try_renegotiate_chain_swap(
             return Ok(false);
         }
     };
-    // A zero/absent quote is nonsensical — treat as not renegotiable rather than
-    // accepting a settlement that credits the merchant nothing.
-    if quote_amount == 0 {
-        tracing::warn!(
-            event = "chain_swap_renegotiation_zero_quote",
-            swap_id = %swap.boltz_swap_id,
-            "boltz returned a zero renegotiation quote; treating as not renegotiable"
-        );
-        return Ok(false);
-    }
+    // A zero/absent or absurd (non-i64) quote is nonsensical — treat as not
+    // renegotiable rather than accepting a settlement that credits the merchant
+    // nothing (or wraps negative on the `as i64` cast).
+    let quote_amount_i64 = match i64::try_from(quote_amount) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            tracing::warn!(
+                event = "chain_swap_renegotiation_bad_quote",
+                swap_id = %swap.boltz_swap_id,
+                quote_amount,
+                "boltz returned a zero/absurd renegotiation quote; treating as not renegotiable"
+            );
+            return Ok(false);
+        }
+    };
 
     // Steps 2-3 under the shared per-swap advisory lock so a concurrent claim
     // cannot interleave. accept_quote is a network call held inside the locked
@@ -441,9 +446,12 @@ async fn try_renegotiate_chain_swap(
         return Ok(true);
     }
 
-    // Re-read under the lock: bail if another path already renegotiated or
-    // terminalized the swap between the quote and acquiring the lock.
-    let current = db::get_chain_swap_by_id(&mut *tx, swap.id)
+    // Re-read under the advisory lock WITH a row lock (FOR UPDATE) so this
+    // read-modify-write serializes against the lock-free `update_chain_swap_status`
+    // webhook writers as well as the claim path. Bail if another path already
+    // renegotiated, terminalized, or flagged the swap `refund_due` between the
+    // quote and acquiring the lock.
+    let current = db::get_chain_swap_by_id_for_update(&mut *tx, swap.id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {}", swap.id)))?;
@@ -454,13 +462,35 @@ async fn try_renegotiate_chain_swap(
     if current_status.is_terminal() {
         return Ok(false);
     }
+    if current_status == ChainSwapStatus::RefundDue {
+        // Already an operator-visible refund case (e.g. a `swap.expired` funded
+        // handler or Phase 4 self-claim owns it). Do NOT resurrect it to a live
+        // state; leave the waterfall where it is.
+        return Ok(true);
+    }
 
-    // Accept the quote, then persist — both inside the locked transaction.
-    state
+    // Accept the quote, then persist — both inside the locked transaction. On an
+    // accept failure we do NOT fall through to `refund_due`: the failure may be
+    // an ambiguous transport error AFTER Boltz already accepted (it is now
+    // settling), so flagging `refund_due` would corrupt the operator surface and
+    // risk a double-refund. Leaving the swap live is fund-safe — it either
+    // settles (crediting the amount reconciled at claim time) or, if Boltz truly
+    // rejected, expires into the `swap.expired`+funded → `refund_due` backstop.
+    if let Err(e) = state
         .boltz
         .accept_chain_swap_quote(&swap.boltz_swap_id, quote_amount)
-        .await?;
-    let rows = db::mark_chain_swap_renegotiated(&mut *tx, swap.id, quote_amount as i64)
+        .await
+    {
+        tracing::warn!(
+            event = "chain_swap_renegotiation_accept_failed",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            error = %e,
+            "boltz accept_quote failed (ambiguous — Boltz may have accepted); leaving swap live for reconciler/expiry backstop, NOT flagging refund_due (operator P1)"
+        );
+        return Ok(true);
+    }
+    let rows = db::mark_chain_swap_renegotiated(&mut *tx, swap.id, quote_amount_i64)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
     tx.commit()
@@ -475,6 +505,19 @@ async fn try_renegotiate_chain_swap(
             original_server_lock_sat = swap.server_lock_amount_sat,
             renegotiated_server_lock_sat = quote_amount,
             "chain swap renegotiated to actual locked amount; settling normally (merchant credited the renegotiated amount, operator P2)"
+        );
+    } else {
+        // accept_quote succeeded but the guarded UPDATE recorded 0 rows — the
+        // renegotiated amount is NOT persisted (row was concurrently
+        // terminalized/refund_due, or already renegotiated). Same money-safety
+        // class as the crash window: a later settle could credit the stale
+        // original. Loud so operators can reconcile against Boltz `get_swap`.
+        tracing::error!(
+            event = "chain_swap_renegotiation_accepted_not_recorded",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            renegotiated_server_lock_sat = quote_amount,
+            "boltz accepted the renegotiation quote but no row was updated; reconcile credited amount against Boltz get_swap before trusting settlement (operator P1)"
         );
     }
     Ok(true)
