@@ -1391,7 +1391,11 @@ async fn claim_chain_swap_inner(
     invoice::flip_invoice_on_bitcoin_boltz_settlement(
         pool,
         Some(swap.invoice_id),
-        swap.user_lock_amount_sat,
+        // Credit the SERVER lockup (the L-BTC actually claimed to the merchant),
+        // which equals the invoice under payer-pays gross-up pricing. Crediting
+        // user_lock_amount_sat would over-credit by the swap overhead (and trip
+        // the overpaid tolerance) now that the payer's amount is grossed up.
+        swap.server_lock_amount_sat,
         &swap.boltz_swap_id,
         &txid,
         tolerances,

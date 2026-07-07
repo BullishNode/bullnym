@@ -183,10 +183,15 @@ pub async fn latest_payable_chain_swap_for_invoice(
     amount_sat: i64,
 ) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        // Match on server_lock_amount_sat (the L-BTC settled to the merchant,
+        // = the invoice/remaining amount) NOT user_lock_amount_sat: under
+        // payer-pays gross-up pricing the user lockup is grossed up above the
+        // invoice, so matching user_lock would never find the swap and the BTC
+        // rail would silently vanish from the payment page + status API.
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
          WHERE invoice_id = $1 \
            AND status = 'pending' \
-           AND user_lock_amount_sat = $2 \
+           AND server_lock_amount_sat = $2 \
          ORDER BY created_at DESC \
          LIMIT 1"
     ))

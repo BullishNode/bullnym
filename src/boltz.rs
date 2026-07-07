@@ -148,8 +148,17 @@ impl BoltzService {
             preimage_hash: preimage.sha256,
             claim_public_key: Some(claim_public_key),
             refund_public_key: Some(refund_public_key),
-            user_lock_amount: Some(amount_sat),
-            server_lock_amount: None,
+            // Payer-pays pricing: pin the SERVER lockup (the L-BTC we claim to
+            // the merchant) to the invoice amount, and let Boltz gross UP the
+            // user's BTC `expectedAmount` to cover the swap overhead. The
+            // merchant therefore always nets the invoice; the payer bears the
+            // rail cost they chose. (Previously user_lock=invoice, so Boltz
+            // deducted the swap fee from the swap and the merchant under-netted.)
+            // The response's claim_details.amount = invoice = server_lock_amount_sat
+            // (what we credit), and lockup_details.amount = grossed-up payer
+            // amount = user_lock_amount_sat.
+            user_lock_amount: None,
+            server_lock_amount: Some(amount_sat),
             pair_hash: None,
             referral_id: None,
             webhook: self.webhook_url.as_ref().map(|url| Webhook {
