@@ -266,6 +266,16 @@ pub async fn list_invoices_by_npub(
 /// `LIMIT 1000` so a runaway invoice pipeline can't blow the watcher's
 /// per-tick budget; the next tick re-queries.
 ///
+/// Order is `random()`, NOT `created_at ASC`: with oldest-first, once the open
+/// set exceeds `LIMIT 1000` the scan was pinned to the oldest (typically
+/// abandoned) invoices and never reached newer ones — a freshly-created invoice
+/// being paid right now would be permanently starved. Randomizing gives every
+/// open invoice an equal per-tick scan probability, so no invoice is ever
+/// permanently skipped. This is the minimal correct fix; a bounded round-robin
+/// (a `last_scanned_at` watermark, giving a hard coverage bound + an SLO metric)
+/// is the upgrade if production metrics show the probabilistic tail is too slow
+/// at scale — see issue #28.
+///
 /// Returned shape: `(invoice_id, liquid_address, amount_sat)`.
 pub async fn list_unpaid_invoices_with_liquid_address(
     pool: &PgPool,
@@ -279,7 +289,7 @@ pub async fn list_unpaid_invoices_with_liquid_address(
            AND liquid_address IS NOT NULL \
            AND liquid_blinding_key_hex IS NOT NULL \
            AND expires_at > NOW() \
-         ORDER BY created_at ASC \
+         ORDER BY random() \
          LIMIT 1000",
     )
     .fetch_all(pool)
