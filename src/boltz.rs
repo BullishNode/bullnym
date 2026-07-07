@@ -148,8 +148,17 @@ impl BoltzService {
             preimage_hash: preimage.sha256,
             claim_public_key: Some(claim_public_key),
             refund_public_key: Some(refund_public_key),
-            user_lock_amount: Some(amount_sat),
-            server_lock_amount: None,
+            // Payer-pays pricing: pin the SERVER lockup (the L-BTC we claim to
+            // the merchant) to the invoice amount, and let Boltz gross UP the
+            // user's BTC `expectedAmount` to cover the swap overhead. The
+            // merchant therefore always nets the invoice; the payer bears the
+            // rail cost they chose. (Previously user_lock=invoice, so Boltz
+            // deducted the swap fee from the swap and the merchant under-netted.)
+            // The response's claim_details.amount = invoice = server_lock_amount_sat
+            // (what we credit), and lockup_details.amount = grossed-up payer
+            // amount = user_lock_amount_sat.
+            user_lock_amount: None,
+            server_lock_amount: Some(amount_sat),
             pair_hash: None,
             referral_id: None,
             webhook: self.webhook_url.as_ref().map(|url| Webhook {
@@ -185,6 +194,23 @@ impl BoltzService {
                 Chain::Liquid(LiquidChain::Liquid),
             )
             .map_err(|e| AppError::BoltzError(format!("invalid chain swap response: {e}")))?;
+
+        // Money-safety invariant: we pin the SERVER lockup to the invoice amount,
+        // so Boltz MUST echo claim_details.amount == amount_sat. `validate()`
+        // only checks scripts/addresses, never amounts. If Boltz mis-prices, the
+        // fork drifts, or a compromised endpoint returns a different server-lock
+        // amount, we would silently credit the merchant the wrong number — so
+        // fail creation instead (the caller omits the BTC offer gracefully;
+        // LN/Liquid rails are unaffected). The merchant physically receives
+        // server_lock minus our own Liquid claim-tx fee (~11-20 sats), a
+        // merchant-side network cost within the Liquid accounting tolerance and
+        // consistent with the Lightning rail — accepted, not grossed up further.
+        if response.claim_details.amount != amount_sat {
+            return Err(AppError::BoltzError(format!(
+                "chain swap server-lock amount mismatch: requested {amount_sat}, Boltz returned claim_details.amount {}",
+                response.claim_details.amount
+            )));
+        }
 
         Ok(ChainSwapResult {
             swap_id: response.id.clone(),
