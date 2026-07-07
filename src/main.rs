@@ -504,7 +504,6 @@ fn build_router(state: AppState) -> Router {
             );
         }
     }
-    }
 
     let router = if features.payment_pages {
         router.fallback(donation_render::render_or_404)
