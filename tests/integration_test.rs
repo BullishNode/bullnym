@@ -3885,9 +3885,11 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
             nym: Some("chainswaprec"),
             boltz_swap_id: "chain-swap-rec-1",
             lockup_address: "bc1qchainswaplockup",
-            lockup_bip21: Some("bitcoin:bc1qchainswaplockup?amount=0.00001000"),
-            user_lock_amount_sat: 1_000,
-            server_lock_amount_sat: 990,
+            // Payer-pays gross-up: server lockup (claimed to merchant) = invoice
+            // (1000); user lockup (what the payer sends) is grossed up (1010).
+            lockup_bip21: Some("bitcoin:bc1qchainswaplockup?amount=0.00001010"),
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
             preimage_hex: "11".repeat(32).as_str(),
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
@@ -3910,7 +3912,7 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     assert_eq!(latest.boltz_swap_id, "chain-swap-rec-1");
     assert_eq!(
         latest.lockup_bip21.as_deref(),
-        Some("bitcoin:bc1qchainswaplockup?amount=0.00001000")
+        Some("bitcoin:bc1qchainswaplockup?amount=0.00001010")
     );
     let wrong_amount =
         pay_service::db::latest_payable_chain_swap_for_invoice(&pool, invoice.id, 999)
