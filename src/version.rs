@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "038_chain_swap_refunding";
+pub const EXPECTED_SCHEMA_MARKER: &str = "039_reconciler_round_robin";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {
