@@ -32,7 +32,7 @@ Mobile feature boundaries:
 Server boundaries:
 
 - Bullnym stores identity, descriptors, invoices, swaps, payment observations,
-  donation pages, and rate-limit state.
+  public surface rows, and rate-limit state.
 - Bullnym derives server-side receive addresses only from descriptors supplied
   by the mobile wallet.
 - Bullnym does not own the user's seed, wallet manifest, local wallet inventory,

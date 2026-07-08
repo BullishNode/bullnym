@@ -7,11 +7,11 @@ Lightning, Liquid, Bitcoin, and Boltz settlement flows.
 
 | Rail | Products | Payer sends | Recipient receives | Settlement destination |
 |---|---|---|---|---|
-| Lightning via Boltz reverse swap | Lightning Address, Donation Pages, Invoices | BOLT11 payment | LBTC after MuSig2 claim | Descriptor-derived or wallet-supplied Liquid address. |
+| Lightning via Boltz reverse swap | Lightning Address, Payment Pages, POS, Invoices | BOLT11 payment | LBTC after MuSig2 claim | Descriptor-derived or wallet-supplied Liquid address. |
 | LUD-22 Liquid shortcut | Lightning Address | Direct LBTC | LBTC | Fresh nym descriptor address gated by UTXO proof. |
-| Direct Liquid | Donation Pages, Invoices | Direct LBTC | LBTC | Page descriptor address or wallet-supplied Liquid address. |
+| Direct Liquid | Payment Pages, POS, Invoices | Direct LBTC | LBTC | Surface descriptor address or wallet-supplied Liquid address. |
 | Direct Bitcoin | Invoices | Bitcoin on-chain | BTC | Wallet-supplied Bitcoin address. |
-| Bitcoin-to-Liquid chain swap | Donation Pages | Bitcoin on-chain to Boltz lockup | LBTC | Page descriptor address. |
+| Bitcoin-to-Liquid chain swap | Payment Pages, POS | Bitcoin on-chain to Boltz lockup | LBTC | Surface descriptor address. |
 
 ## Lightning Reverse Swaps
 
@@ -20,7 +20,7 @@ Boltz locks LBTC, and Bullnym cooperatively claims to the recipient settlement
 address. Accounting records `lightning_boltz_reverse:<swap_id>` only after the
 recipient-side claim succeeds or is recoverably proven.
 
-Donation-page and wallet-origin invoice pages use
+Payment Page, POS, and wallet-origin invoice pages use
 `POST /api/v1/invoices/:id/lightning` to create or refresh the current offer.
 Status polling reports the offer state but should not be treated as the primary
 swap-creation path.
@@ -28,13 +28,13 @@ swap-creation path.
 ## Direct Liquid
 
 Direct Liquid payments are watched through Liquid Electrum, not the Bitcoin
-mempool API. Donation-page checkout uses a page descriptor address when
-present; wallet-origin invoices use a Liquid address and blinding key supplied
-by mobile at creation time.
+mempool API. Public checkout uses the selected surface descriptor address;
+wallet-origin invoices use a Liquid address and blinding key supplied by
+mobile at creation time.
 
-For donation pages, the direct Liquid address is allocated when the checkout
-invoice is created. Rendering `GET /:nym` does not allocate an address; a
-later Liquid-specific status poll or page refresh does not allocate a second
+For Payment Pages and POS, the direct Liquid address is allocated when the
+checkout invoice is created. Rendering `GET /:nym` or `GET /:nym/pos` does not
+allocate an address; status polling or page refresh does not allocate a second
 address.
 
 Liquid accounting uses idempotent event keys:
@@ -59,8 +59,8 @@ bitcoin_direct:<txid>:<vout>
 
 ## Bitcoin-to-Liquid Chain Swaps
 
-Donation pages can offer Bitcoin payment through Boltz chain swaps. The payer
-sends BTC to a Boltz lockup address; Bullnym claims LBTC to the checkout
+Payment Pages and POS can offer Bitcoin payment through Boltz chain swaps. The
+payer sends BTC to a Boltz lockup address; Bullnym claims LBTC to the checkout
 session's Liquid address. This rail is distinct from direct Bitcoin invoices
 and must not be used as proof that direct Bitcoin invoice watching works.
 

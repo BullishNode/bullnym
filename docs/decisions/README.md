@@ -23,7 +23,7 @@ Sources used for this repository:
 - [004 Nostr Identity Role Separation](004-nostr-identity-role-separation.md)
 - [005 Bullnym Mobile Protocol Contract](005-bullnym-mobile-protocol-contract.md)
 - [006 Payment Rails and Settlement](006-payment-rails-and-settlement.md)
-- [007 Donation Page Allocation and Rate Limits](007-donation-page-allocation-and-rate-limits.md)
+- [007 Public Checkout Allocation and Rate Limits](007-donation-page-allocation-and-rate-limits.md)
 - [008 BTCPay and SamRock Pairing](008-btcpay-and-samrock-pairing.md)
 
 ## Status Terms

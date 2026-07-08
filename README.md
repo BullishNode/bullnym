@@ -1,35 +1,38 @@
 # bullnym
 
 bullnym is BULL Bitcoin's payment processing backend. It started as a
-Lightning Address server for the BULL wallet and now exposes three product
+Lightning Address server for the BULL wallet and now exposes four product
 surfaces backed by the same non-custodial Liquid settlement model:
 
 1. **Lightning Address** — a public `nym@domain` LNURL-pay endpoint. Standard
    senders receive a BOLT11 invoice backed by a Boltz reverse swap; LUD-22
    senders can receive a direct Liquid address after proving UTXO ownership.
-2. **Donation Pages** — public pages at `https://<domain>/<nym>` where a payer
+2. **Payment Pages** — public pages at `https://<domain>/<nym>` where a payer
    enters an amount and receives a payment page with Lightning, Liquid, and
    Bitcoin payment instructions.
-3. **Invoices** — recipient-created receivables with signed mobile APIs,
+3. **POS** — public terminals at `https://<domain>/<nym>/pos` with their own
+   descriptor, cursor, installable PWA shell, local history, and receipts.
+4. **Invoices** — recipient-created receivables with signed mobile APIs,
    public payment URLs, fixed-sat or fiat-priced amounts, invoice listing,
    cancellation, and payment-status accounting.
 
 The account identity is the Nostr `npub`. A **nym** is an optional public
-payment namespace owned by that `npub`: Lightning Addresses and Donation Pages
-are attached to a nym. Lightning Address uses the nym's Liquid confidential
-descriptor. Donation Pages can use an independent Get Paid descriptor with its
-own address cursor, falling back to the nym descriptor for legacy pages.
+payment namespace owned by that `npub`: Lightning Address, Payment Page, and
+POS are attached to a nym. Lightning Address uses the nym's Liquid confidential
+descriptor. Payment Page and POS use separate Get Paid descriptors and address
+cursors; only legacy Payment Pages can fall back to the nym descriptor.
 Invoices can be linked to a nym for routing and presentation, but they do not
-have to be. Wallet-origin invoices use recipient-supplied Bitcoin and/or
-Liquid addresses instead of requiring the server to store a descriptor.
+have to be. Wallet-origin invoices use recipient-supplied Bitcoin and/or Liquid
+addresses instead of requiring the server to store a descriptor.
 
 ## Product model
 
 | Product | Who creates it | Public URL | Payment rails | Settlement destination |
 |---|---|---|---|---|
 | Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Fresh address from the active nym CT descriptor |
-| Donation Page | Recipient configures a page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the donation-page CT descriptor, with legacy fallback to the active nym CT descriptor |
-| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from Donation Pages use the page-derived Liquid address |
+| Payment Page | Recipient configures a public page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the Payment Page CT descriptor, with legacy fallback to the active nym CT descriptor |
+| POS | Recipient configures a terminal for a nym | `/:nym/pos` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the POS CT descriptor; no Lightning Address fallback |
+| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from public surfaces use the selected surface Liquid address |
 
 Payment sessions use fixed-sat accounting. Fiat-denominated invoices convert
 the requested fiat amount to sats at creation/rate-lock time and store the
@@ -148,8 +151,8 @@ The Bullnym server supports NIP05 registration. This allows users to optionally 
 
 ## Architecture
 
-bullnym is a Rust/Axum HTTP server with a Postgres backend, server-rendered
-payment pages, signed mobile APIs, and stateful integrations with Liquid
+bullnym is a Rust/Axum HTTP server with a Postgres backend, public PWA payment
+surfaces, signed mobile APIs, and stateful integrations with Liquid
 Electrum, Boltz, the Bull pricer, and a Bitcoin mempool API.
 
 ```
@@ -157,12 +160,15 @@ HTTP layer (Axum)
 ├── /.well-known/lnurlp/:nym          Lightning Address metadata
 ├── /lnurlp/callback/:nym             LNURL-pay callback (Lightning + LUD-22)
 ├── /register {POST,PUT,DELETE}       Nym lifecycle, Schnorr-authenticated
-├── /donation-page {PUT,DELETE}       Signed donation-page management
-├── /donation-page/:nym               Public donation-page JSON state
-├── /:nym                             Server-rendered donation page (fallback)
-├── /:nym/invoice                     Anonymous checkout invoice creation
+├── /donation-page {PUT,DELETE}       Signed Payment Page/POS management
+├── /donation-page/:nym               Public surface JSON state
+├── /:nym                             Payment Page PWA shell
+├── /:nym/pos                         POS PWA shell
+├── /:nym/invoice                     Payment Page checkout invoice creation
+├── /:nym/pos/invoice                 POS checkout invoice creation
 ├── /:nym/i/:id                       Linked invoice/payment page
 ├── /invoice/:id                      Unlinked invoice/payment page
+├── /sw.js, /pwa-assets/*             PWA service worker and assets
 ├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
 ├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
 ├── /health                           Liveness probe
@@ -178,11 +184,11 @@ Background tasks (spawned in main, cancelled on SIGINT)
 └── in-memory rate-limit sweep        Evicts idle per-IP buckets from process memory
 
 Stateful dependencies
-├── PostgreSQL                        Nyms, donation pages, invoices, swaps, payment events
+├── PostgreSQL                        Nyms, payment surfaces, invoices, swaps, payment events
 ├── Boltz API v2                      Reverse swaps, chain swaps, MuSig2 cooperative claims
 ├── Liquid Electrum                   LUD-22 proof checks, Liquid deposit polling
 ├── Bitcoin mempool API               Direct BTC invoice detection
-└── Bull pricer                       Fiat-to-sat conversion for donation pages and invoices
+└── Bull pricer                       Fiat-to-sat conversion for public checkout and invoices
 ```
 
 The server is stateless across processes; durable state lives in Postgres.
@@ -214,25 +220,27 @@ Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `
 
 All write operations require a BIP-340 Schnorr signature over a domain-tagged payload (see Authentication).
 
-### Donation pages
+### Payment Page and POS surfaces
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/donation-page` | Create or update the public page for a nym |
-| `DELETE` | `/donation-page` | Soft-archive the page; the nym remains reserved |
-| `POST` | `/donation-page/image` | Upload avatar or OpenGraph image; server normalizes to WebP |
-| `GET` | `/donation-page/:nym` | Public JSON state used by mobile |
-| `GET` | `/:nym` | Server-rendered public donation page |
-| `POST` | `/:nym/invoice` | Anonymous payer creates a checkout invoice from the page amount |
+| `PUT` | `/donation-page` | Create or update a Payment Page or POS surface |
+| `DELETE` | `/donation-page` | Soft-archive a surface; the nym remains reserved |
+| `POST` | `/donation-page/image` | Upload Payment Page avatar or OpenGraph image; server normalizes to WebP |
+| `GET` | `/donation-page/:nym?kind=...` | Public JSON state used by mobile |
+| `GET` | `/:nym` | Payment Page PWA shell |
+| `GET` | `/:nym/pos` | POS PWA shell |
+| `POST` | `/:nym/invoice` | Anonymous payer creates a Payment Page checkout invoice |
+| `POST` | `/:nym/pos/invoice` | Cashier creates a POS checkout invoice |
 | `GET` | `/:nym/i/:id` | Public payment page for the checkout invoice |
 
-Donation-page management is signed by the same Nostr/BIP-340 identity that owns
-the nym. Current clients include a page-specific `ct_descriptor`; legacy saves
-without it preserve any existing page descriptor and checkout falls back to the
-nym descriptor only when no page descriptor exists. Runtime payments are
-represented as `origin = 'checkout'` invoice rows, so the donation flow shares
-invoice status, payment-event accounting, Lightning offer refresh, Liquid
-address detection, and Bitcoin chain-swap settlement machinery.
+Surface management is signed by the same Nostr/BIP-340 identity that owns the
+nym. `kind = "payment_page"` serves `/:nym`; `kind = "pos"` serves
+`/:nym/pos`. Payment Page can use a legacy fallback to the nym descriptor; POS
+requires its own descriptor. Runtime payments are `origin = 'checkout'`
+invoice rows, so both surfaces share invoice status, payment-event accounting,
+Lightning offer refresh, Liquid address detection, and Bitcoin chain-swap
+settlement machinery.
 
 ### Invoices
 
@@ -254,8 +262,8 @@ cancellable while unpaid, and may be linked to a nym or shared through the
 unlinked `/invoice/:id` route. They carry explicit recipient-supplied Bitcoin
 and/or Liquid settlement addresses; the server does not need a stored wallet
 descriptor to create or settle them. Checkout-origin invoices are payer-created
-from a donation page, inherit the donation page's descriptor-derived Liquid
-settlement address, and have a shorter outer expiry.
+from a public checkout surface, inherit that surface's descriptor-derived
+Liquid settlement address, and have a shorter outer expiry.
 
 ### Webhook
 
@@ -330,7 +338,7 @@ electrum_url = "blockstream.info:995"  # Boltz client's transitive Electrum dep
 url                    = "https://api.bullbitcoin.com/public/price"
 cache_ttl_secs         = 60
 request_timeout_ms     = 2000
-supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP","INR"]
+supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP"]
 
 [pwa]
 dist_dir = "pwa/dist"
@@ -411,11 +419,11 @@ Postgres is the single source of truth. All migrations are plain SQL under `migr
 Major tables:
 
 - **`users`** — one row per nym. Holds the server-auth `npub`, public `verification_npub`, Lightning Address `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, and `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
-- **`donation_pages`** — one row per nym. Stores the Get Paid page descriptor and independent address cursor, public page copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Deletion is soft so a removed page can render a stable archived response.
-- **`invoices`** — unified payment-session table for donation-page checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
+- **`donation_pages`** — one row per `(nym, kind)` public surface. `kind` is `payment_page` or `pos`. Stores the surface descriptor and independent address cursor, public copy, display currency, social links, image hashes, enabled/archive state, and timestamps.
+- **`invoices`** — unified payment-session table for public checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
 - **`invoice_payment_events`** — idempotent accounting evidence keyed by rail-specific event keys such as `liquid_direct:<txid>:<vout>`, `bitcoin_direct:<txid>:<vout>`, or `lightning_boltz_reverse:<swap_id>`.
-- **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to a donation-page or invoice payment session. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
-- **`chain_swap_records`** — one row per BTC-to-LBTC Boltz chain swap used by donation-page checkout flows. Tracks lockup address, claim address, Boltz status, invoice association, and claim lifecycle.
+- **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to public checkout or wallet-origin invoice payment. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
+- **`chain_swap_records`** — one row per BTC-to-LBTC Boltz chain swap used by public checkout flows. Tracks lockup address, claim address, Boltz status, invoice association, and claim lifecycle.
 - **`outpoint_addresses`** — LUD-22 `(nym, outpoint) → address_index` cache. UNIQUE constraint enforces the idempotent-mapping defense.
 - **`nym_access_events`** — sliding-window counters for the distinct-nyms-per-IP and distinct-nyms-per-outpoint caps.
 - **`processed_webhook_events`** — webhook idempotency guard.
@@ -434,7 +442,7 @@ Background tasks are spawned in `main` and shut down through a shared
   This catches missed webhooks and state-machine surprises without waiting for
   manual operator intervention.
 - **`chain_watcher::run`** — polls Liquid Electrum. It verifies direct Liquid
-  invoice payments, detects donation-page checkout payments, releases unfunded
+  invoice payments, detects public checkout payments, releases unfunded
   LUD-22 reservations after TTL, and uses separate rate buckets so callbacks
   cannot starve settlement detection.
 - **`bitcoin_watcher::run`** — polls the configured mempool API for
@@ -500,13 +508,13 @@ endpoints. Use it when the behavior depends on live rails or infrastructure
 outside the Rust process:
 
 - BDK-origin Bitcoin sends to wallet-created invoices.
-- LWK-origin Liquid sends to wallet-created invoices and donation checkout
+- LWK-origin Liquid sends to wallet-created invoices and public checkout
   invoices.
 - Boltz reverse swaps for Lightning offers that settle to Liquid.
-- Boltz chain swaps for Bitcoin donation-page checkout.
+- Boltz chain swaps for Bitcoin public checkout.
 - Invoice accounting, payment-event idempotency, watcher behavior, and public
   status polling.
-- Donation-page checkout rendering, offer creation, and address allocation
+- Public checkout rendering, offer creation, and address allocation
   safety.
 
 The VM should not be treated as a mobile test environment. It does not run the
@@ -522,7 +530,7 @@ against the target branch. The important contract is narrow:
 
 - Mobile derives the expected signing keys, descriptors, and recipient
   addresses.
-- Mobile signs the exact Bullnym payloads for nym, donation-page, and invoice
+- Mobile signs the exact Bullnym payloads for nym, surface, and invoice
   actions.
 - Bullnym accepts those requests, persists the descriptor or supplied
   destinations, and returns the documented response shapes.

@@ -1,16 +1,15 @@
 # Bullnym Payment Architecture
 
-This document is the implementation contract for the Donation Page and
-Invoices rearchitecture. It keeps Lightning Address stable, makes Boltz a
-first-class subsystem, separates product semantics from shared payment rail
-machinery, and reflects the Get Paid descriptor split introduced by
-`031_get_paid_descriptors`.
+This document is the payment contract for Lightning Address, Payment Page,
+POS, and wallet-origin invoices. It keeps product semantics separate from the
+shared rail machinery: invoices, payment events, watchers, Boltz swaps, and
+settlement state.
 
 ## Goals
 
 - Preserve the existing Lightning Address product behavior.
-- Make Donation Page a payer-created checkout flow with Lightning, Liquid,
-  and Bitcoin-via-Boltz payment instructions.
+- Make Payment Page and POS payer-created checkout flows with Lightning,
+  Liquid, and Bitcoin-via-Boltz payment instructions.
 - Make Invoices merchant-created receivables with strict accounting.
 - Use fixed-sat accounting for every payment session. Fiat amounts are
   converted once at creation and stored as metadata.
@@ -23,7 +22,8 @@ machinery, and reflects the Get Paid descriptor split introduced by
 | Product | Payment methods | Settlement destination | Notes |
 |---|---|---|---|
 | Lightning Address | Lightning via Boltz reverse swap; Liquid via LUD-22 | Derived from the active nym CT descriptor | Mostly unchanged. No invoice partial/under/over semantics. |
-| Donation Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the donation-page CT descriptor when present, otherwise the active nym CT descriptor for legacy pages | Payer enters amount. Public page defaults to Lightning and exposes Liquid immediately. Bitcoin chain swap is Donation Page only. |
+| Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the Payment Page CT descriptor when present, otherwise the active nym CT descriptor for legacy pages | Payer enters amount at `/:nym`. |
+| POS | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the POS CT descriptor | Cashier enters amount at `/:nym/pos`. POS has no Lightning Address fallback. |
 | Invoices | Lightning via Boltz reverse swap; Liquid direct; Bitcoin direct | Merchant supplied Liquid/BTC addresses | Merchant receivable. No BTC-to-LBTC Boltz chain swap in v1 invoices. |
 
 ## Identity Model
@@ -39,37 +39,34 @@ the server never falls back to the auth `npub`.
 `nym` is a public alias and route namespace owned by one `npub`.
 
 An active nym has one Lightning Address CT descriptor in `users.ct_descriptor`
-(mobile path 75). Donation pages can have an independent Get Paid CT
-descriptor in `donation_pages.ct_descriptor` (mobile path 76) with its own
-`donation_pages.next_addr_idx` cursor. Legacy donation pages without a page
-descriptor fall back to the nym descriptor.
+(mobile path 75). Public checkout surfaces have independent Get Paid CT
+descriptors in `donation_pages.ct_descriptor`: Payment Page uses mobile path
+102 and POS uses mobile path 103. Each `(nym, kind)` row has its own
+`donation_pages.next_addr_idx` cursor. Legacy Payment Pages without a page
+descriptor fall back to the nym descriptor; POS does not.
 
 Nym lifecycle invariants:
 
 - Active nym: owned by one `npub`, has one Lightning Address CT descriptor,
   payable.
-- Deactivated nym: not payable for new Lightning Address or Donation Page
-  sessions; existing sessions and swaps must still settle.
+- Deactivated nym: not payable for new Lightning Address, Payment Page, or
+  POS sessions; existing sessions and swaps must still settle.
 - Purged nym: reserved but not payable; descriptor material is scrubbed.
 
 CT descriptors are not account identities. They are receive capabilities.
 Payment sessions should store their concrete settlement destination rather than
-implicitly resolving through a mutable nym or donation page at settlement time.
+implicitly resolving through a mutable nym or surface row at settlement time.
 
 ## Payment Sessions
 
 A payment session is a finite-lived attempt to collect a fixed sat amount
 through one or more payment instructions.
 
-The current implementation may use the `invoices` table as the backing table
-for both Donation Page checkout sessions and merchant invoices:
+The `invoices` table backs both public checkout sessions and merchant
+invoices:
 
-- `origin = 'checkout'`: Donation Page payment session.
+- `origin = 'checkout'`: Payment Page or POS checkout session.
 - `origin = 'wallet'`: merchant invoice.
-
-Long-term, this can be split into explicit `payment_sessions`,
-`payment_events`, and `invoices` tables. Do not do that split until the rail
-semantics are stable.
 
 Conceptual session fields:
 
@@ -86,10 +83,11 @@ Conceptual session fields:
 - expiry
 - cumulative paid amount
 
-Donation Page checkout no longer uses the legacy
+Public checkout no longer uses the legacy
 `/lnurlp/donate-callback/:nym` and `/lnurlp/donate-status/:nym` endpoints.
-The public page creates an invoice session with `POST /<nym>/invoice`, renders
-`/<nym>/i/<invoice_id>`, and polls `/api/v1/invoices/<invoice_id>/status`.
+The Payment Page creates an invoice session with `POST /<nym>/invoice`; POS
+uses `POST /<nym>/pos/invoice`. Both poll
+`/api/v1/invoices/<invoice_id>/status`.
 The old cookie-pinned Liquid allocation table was dropped by migration 019;
 new checkout sessions reserve concrete payment addresses through the invoice
 payment-address ledger.
@@ -103,10 +101,11 @@ Lightning Address:
 - Lightning claims and Liquid receive addresses are derived from the nym CT
   descriptor.
 
-Donation Page:
+Public checkout surfaces:
 
-- The session derives a Liquid address from the donation-page CT descriptor
+- Payment Page derives a Liquid address from the Payment Page CT descriptor
   when present, otherwise from the active nym CT descriptor for legacy pages.
+- POS derives a Liquid address from the POS CT descriptor and has no fallback.
 - Lightning reverse swaps claim to that session Liquid address.
 - Direct Liquid pays that session Liquid address.
 - BTC-to-LBTC chain swaps claim to that session Liquid address.
@@ -130,7 +129,7 @@ Instruction kinds:
 - `bitcoin_direct`: payer pays a merchant Bitcoin address directly. Invoices
   only.
 - `bitcoin_boltz_chain`: payer pays a Boltz Bitcoin lockup address, merchant
-  receives LBTC through a Boltz chain swap. Donation Page only.
+  receives LBTC through a Boltz chain swap. Payment Page and POS only.
 
 Do not expose two ambiguous "Bitcoin" options on invoices. For invoices,
 Bitcoin means merchant-supplied direct BTC settlement.
@@ -146,13 +145,13 @@ Fiat-denominated sessions resolve fiat to sats once at creation:
 - store original fiat amount and currency
 - store `rate_minor_per_btc`
 - store computed `amount_sat`
-- do not refresh or float the invoice rate in this MVP
+- do not refresh or float the invoice rate after creation
 
 `pricing_mode` is `sat_fixed` for sat-denominated sessions and `fiat_fixed`
 for fiat-denominated sessions whose BTC rate was locked at creation.
 
-Future exchange-backed settlement can add a new settlement mode. Direct Bitcoin
-merchant receive flows do not need floating fiat rates.
+Exchange-backed settlement would require a separate settlement mode. Direct
+Bitcoin merchant receive flows do not need floating fiat rates.
 
 ## Payment Events
 
@@ -222,8 +221,8 @@ Payment status is the product/accounting state of the session.
 - `expired`: the session expired with no counted payments.
 - `cancelled`: merchant cancelled before payment evidence.
 
-Donation Page can present simpler copy, but it should not discard the underlying
-accounting state.
+Payment Page and POS can present simpler copy, but they should not discard the
+underlying accounting state.
 
 Lightning Address does not expose invoice payment statuses.
 
@@ -268,7 +267,8 @@ Boltz reverse swaps are the Lightning instruction type.
 Applies to:
 
 - Lightning Address
-- Donation Page
+- Payment Page
+- POS
 - Invoices
 
 Lifecycle mapping:
@@ -296,7 +296,7 @@ Session expiry and BOLT11 expiry are separate clocks.
 
 Rules:
 
-- Create the initial reverse swap when a Donation Page session or
+- Create the initial reverse swap when a public checkout session or
   Lightning-enabled invoice is created.
 - Reuse a BOLT11 only when it matches the current remaining amount and is not
   close to expiry.
@@ -316,16 +316,15 @@ latest-swap lookup and swap creation.
 
 ## Boltz Chain Swaps
 
-BTC-to-LBTC chain swaps are Donation Page only.
+BTC-to-LBTC chain swaps are for Payment Page and POS checkout only.
 
 They are not part of Lightning Address and not part of merchant invoices.
 
-Donation Page behavior:
+Public checkout behavior:
 
 - expose the Bitcoin instruction only if the remaining amount is above Boltz
   minimum and below Boltz maximum for BTC-to-LBTC
-- use the session Liquid address derived from the donation-page CT descriptor
-  as the LBTC destination, with legacy fallback to the nym CT descriptor
+- use the session Liquid address as the LBTC destination
 - single-flight chain swap creation per session and remaining amount
 - do not create a new chain swap after session expiry
 
@@ -346,11 +345,10 @@ systems.
 
 ## Direct Liquid
 
-Donation Page:
+Public checkout surfaces:
 
-- server derives the Liquid address and blinding key from the donation-page CT
-  descriptor when present, otherwise from the nym CT descriptor for legacy
-  pages.
+- server derives the Liquid address and blinding key from the selected surface
+  descriptor; legacy Payment Pages may fall back to the nym descriptor.
 
 Invoices:
 
@@ -389,9 +387,9 @@ Lightning Address:
 - deactivation stops new payment instructions
 - existing swaps must still settle
 
-Donation Page:
+Payment Page and POS:
 
-- archiving a page stops new sessions
+- archiving the surface stops new sessions
 - existing sessions expire naturally
 - no separate user-facing cancellation required initially
 
@@ -407,7 +405,8 @@ Invoices:
 Tests should be product-oriented and rail-oriented:
 
 - Lightning Address regression
-- Donation Page checkout
+- Payment Page checkout
+- POS checkout
 - Merchant Invoices
 - BTC direct watcher
 - Liquid exact accounting
@@ -418,7 +417,7 @@ Tests should be product-oriented and rail-oriented:
 
 Use the bullnym-test VM for deployed server/payment-rail certification:
 BDK-origin Bitcoin sends, LWK-origin Liquid sends, Boltz reverse swaps,
-Boltz chain swaps, invoice accounting, donation-page checkout, and address
+Boltz chain swaps, invoice accounting, public checkout, and address
 allocation. Do not treat a VM pass as mobile validation. Mobile-owned behavior
 belongs in the Bull Bitcoin mobile repository: deterministic key/path
 derivation, signed payload generation, local storage, Flutter flows, and
@@ -441,27 +440,4 @@ Minimum scenario coverage:
 - reverse swap duplicate webhook
 - reverse swap missed webhook reconciled
 - claim stuck does not mark merchant settled
-- chain swap only exposed for Donation Page and within Boltz limits
-
-## Historical Phasing
-
-The original implementation sequence was:
-
-1. Architecture freeze.
-2. Event accounting foundation.
-3. Direct Bitcoin watcher correctness.
-4. Direct Liquid exact accounting.
-5. Boltz reverse swap lifecycle and refresh.
-6. Donation Page Lightning + Liquid.
-7. Merchant Invoices.
-8. Donation Page BTC-to-LBTC Boltz chain swaps.
-9. Full certification pass.
-
-Each phase requires implementation, focused tests, bullnym-tests updates when
-external behavior changes, VM validation when relevant, code review,
-architecture review, and an explicit go/no-go before continuing.
-
-Current work should no longer assume the earlier "later phase" wording. The
-active compatibility question is whether the deployed server, the
-bullnym-test VM, and the target mobile branch all agree on the descriptor split
-and signed API contract.
+- chain swap only exposed for Payment Page/POS and within Boltz limits

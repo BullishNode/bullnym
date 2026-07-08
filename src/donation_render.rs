@@ -213,8 +213,8 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     //   instant zero-conf Liquid payment notification. The
     //   Lightning path remains same-origin (server-side polling).
     // - POS terminals also need arbitrary HTTPS card-service origins for
-    //   Bolt Card LNURL-withdraw (plans/pos/06-bolt-card.md). Keep
-    //   script-src pinned; only connect-src changes for live POS pages.
+    //   Bolt Card LNURL-withdraw. Keep script-src pinned; only connect-src
+    //   changes for live POS pages.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(if pos_mode { POS_CSP } else { DONATION_CSP }),

@@ -1,57 +1,55 @@
-# Donation Pages
+# Payment Pages
 
-Donation Pages are public Get Paid pages at `https://<domain>/<nym>`. A payer
-enters an amount and receives a payment page with Lightning, Liquid, and
-Bitcoin payment instructions.
+Payment Pages are public Get Paid pages at `https://<domain>/<nym>`. A payer
+enters an amount and receives Lightning, Liquid, and eligible Bitcoin payment
+instructions.
 
-## Page Ownership
+The backing table is still named `donation_pages`. The current surface kind is
+`payment_page`.
 
-A donation page belongs to a nym and is managed by the same `npub` that owns
-the nym. Management actions are signed with `donation-page-*` actions.
+## Ownership
 
-The page stores:
+A Payment Page belongs to a nym and is managed by the same `npub` that owns the
+nym. Management actions use:
 
-- display text and links
-- display currency
-- enabled/archive state
-- avatar and OpenGraph image hashes
-- optional Get Paid CT descriptor
-- independent address cursor for page checkout
+- `donation-page-save`
+- `donation-page-archive`
+- `donation-page-image`
+
+The row stores display text, display currency, links, enabled/archive state,
+image hashes, an optional Liquid CT descriptor, and an independent address
+cursor.
 
 ## Descriptor Use
 
-Current clients should save a page-specific `ct_descriptor`. Checkout derives
-the session Liquid address from this descriptor and advances
+Current clients save a Payment Page `ct_descriptor`. Checkout derives the
+session Liquid address from this descriptor and advances
 `donation_pages.next_addr_idx`.
 
-Legacy pages without a page descriptor fall back to the nym Lightning Address
-descriptor and cursor.
+Legacy Payment Pages without a descriptor fall back to the nym's Lightning
+Address descriptor and cursor. POS does not have this fallback.
 
-Opening or rendering the donation page does not allocate a Liquid address and
-does not advance the descriptor cursor. Allocation happens when the payer
-submits an amount and creates a checkout invoice with `POST /:nym/invoice`.
-That checkout invoice gets one Liquid settlement address up front because all
-customer-facing rails settle to the same Liquid destination:
+Rendering `GET /:nym` does not allocate a Liquid address. Allocation happens
+when the payer creates a checkout invoice with `POST /:nym/invoice`.
 
-- Lightning reverse swaps claim to it.
+Each checkout invoice gets one Liquid settlement address. All Payment Page
+rails settle to that address:
+
+- Lightning reverse swaps claim LBTC to it.
 - Direct Liquid pays it.
 - Bitcoin chain swaps claim LBTC to it.
 
-The current implementation does not wait for a later Liquid-specific click
-before deriving that checkout settlement address. The anti-abuse boundary for
-this cursor is therefore checkout-invoice creation rate limiting, not donation
-page HTML rendering.
-
-## Checkout Flow
+## Flow
 
 1. Payer opens `GET /:nym`.
-2. The rendered page fetches fiat rate data if needed.
+2. Server returns the Payment Page PWA shell with injected config.
 3. Payer submits an amount to `POST /:nym/invoice`.
-4. Bullnym allocates one Liquid settlement address and creates an
-   `origin = 'checkout'` invoice.
-5. Bullnym renders `GET /:nym/i/:id`.
-6. The payment page exposes Lightning, Liquid, and eligible Bitcoin options.
-7. The page polls `/api/v1/invoices/:id/status`.
+4. Bullnym creates an `origin = 'checkout'` invoice and allocates one Liquid
+   settlement address.
+5. The PWA navigates to `/#/pay/:id` and polls
+   `/api/v1/invoices/:id/status`.
+
+The public payment page for a linked checkout remains `GET /:nym/i/:id`.
 
 ## Payment Rails
 
@@ -59,18 +57,18 @@ page HTML rendering.
 |---|---|---|
 | Lightning | BOLT11 offer | LBTC claimed from Boltz reverse swap to the checkout Liquid address. |
 | Liquid | Liquid address | Direct LBTC to the checkout Liquid address. |
-| Bitcoin | Boltz lockup address | LBTC claimed from chain swap to the checkout Liquid address. |
+| Bitcoin | Boltz BTC lockup address | LBTC claimed from the chain swap to the checkout Liquid address. |
 
-Donation-page Bitcoin is a BTC-to-LBTC chain swap. It is not the same as
-direct Bitcoin invoices.
+Payment Page Bitcoin is a BTC-to-LBTC Boltz chain swap. It is not direct
+Bitcoin invoice settlement.
 
 ## Images
 
-`POST /donation-page/image` accepts signed multipart uploads for avatar and
-OpenGraph images. The server normalizes images to WebP and stores hashes on
-the page row. nginx can serve normalized files directly from disk.
+`POST /donation-page/image` uploads Payment Page avatar and OpenGraph images.
+The server normalizes images to WebP and stores hashes on the Payment Page row.
+POS currently has no separate image upload path.
 
 ## Archiving
 
-Archiving disables new page sessions but does not mutate existing checkout
-invoices. Existing sessions expire or settle according to invoice rules.
+Archiving disables new Payment Page sessions. Existing checkout invoices keep
+their stored settlement addresses and expire or settle under invoice rules.

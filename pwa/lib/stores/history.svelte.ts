@@ -1,5 +1,5 @@
-// POS transaction history — plain localStorage, keyed per nym. No IndexedDB,
-// no encryption, matches plans/pos/04-pos-mode.md's local-only history store.
+// POS transaction history: plain localStorage, keyed per nym. It is local UI
+// state, not the accounting source of truth.
 
 import { localStore } from '$lib/stores/local.svelte'
 import { config } from '$lib/config'

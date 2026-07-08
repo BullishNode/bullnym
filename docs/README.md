@@ -9,9 +9,11 @@ so it does not get confused with the product contract.
 - [Architecture](architecture.md): system boundary, runtime shape, module
   layout, request flow, payment flow, reliability model, and config boundary.
 - [HTTP API](components/http-api.md): public routes, signed routes, webhooks,
-  and health/provenance endpoints.
+  request fields, response fields, signing order, and error envelopes.
 - [Authentication and Identity](components/auth-identity.md): `npub`,
   `verification_npub`, signed payloads, nyms, and reservation rules.
+- [PWA Runtime](components/pwa-runtime.md): Svelte entry points, injected
+  config, service-worker caching, and proxy requirements.
 - [Payment Rails](components/payment-rails.md): Lightning via Boltz reverse
   swaps, direct Liquid, direct Bitcoin, and Bitcoin-to-Liquid chain swaps.
 - [Data Model](components/data-model.md): tables, ownership, descriptor
@@ -23,8 +25,10 @@ so it does not get confused with the product contract.
 
 - [Lightning Address](features/lightning-address.md): LNURL metadata,
   callback behavior, LUD-22 Liquid shortcut, and descriptor allocation.
-- [Donation Pages](features/donation-pages.md): page management, public
-  checkout, page descriptors, images, and payment-page behavior.
+- [Payment Pages](features/donation-pages.md): Payment Page management,
+  public checkout, descriptors, images, and PWA behavior.
+- [POS](features/pos.md): POS terminal routes, descriptor isolation, local
+  history, offline shell behavior, and payment rails.
 - [Invoices](features/invoices.md): wallet-created receivables, linked and
   unlinked routes, payment status, cancellation, and direct-address
   settlement.

@@ -112,8 +112,8 @@
     }),
   )
 
-  // Bolt Card is POS-only (plans/pos/06-bolt-card.md) and Android
-  // Chrome-only. Gated defensively on config.mode too, in addition to the
+  // Bolt Card is POS-only and Android Chrome-only. Gated defensively on
+  // config.mode too, in addition to the
   // NDEFReader + settings toggle checks, so it can never leak into the
   // donation shell even if this shared component is reused elsewhere.
   const hasBoltCard = $derived(

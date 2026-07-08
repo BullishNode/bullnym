@@ -26,7 +26,8 @@ automatic restore creates no Get Paid fallback wallets.
 Get Paid Advanced manual recovery is the explicit fallback. It recreates only:
 
 - `75 + liquid` Lightning Address;
-- `76 + liquid` Payment Page;
+- `102 + liquid` Payment Page;
+- `103 + liquid` POS;
 - `77 + liquid` BTCPay;
 - `77 + bitcoin` BTCPay.
 

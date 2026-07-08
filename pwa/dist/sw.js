@@ -1,17 +1,14 @@
-// bullnym service worker. Served at ROOT scope (GET /sw.js — see the
-// backend contract in plans/pos/08-implementation-sequence.md Milestone 6)
-// so it can control /<nym> pages. Kept intentionally small: one file, no
-// Workbox, no build tool runtime baked in.
+// bullnym service worker. Served at ROOT scope (GET /sw.js) so it can control
+// /<nym> and /<nym>/pos pages. Kept intentionally small: one file, no Workbox,
+// no build tool runtime baked in.
 //
 // PRECACHE_URLS is injected at build time by vite.config.ts's writeBundle
 // hook, which lists every hashed /pwa-assets/assets/* file emitted for
 // both entry points. This file as committed has an empty array — a real
 // build always overwrites this line in dist/sw.js.
 const CACHE_VERSION = 'bullnym-shell-v1'
-// Bumped v1 -> v2 to purge any invoice/private pages the previous, overly
-// broad navigation cache may have stored (review item 8): the old SW cached
-// EVERY successful navigation, including /invoice/:id and /:nym/i/:id. On
-// activate, the v1 pages cache is no longer in `keep` and gets deleted.
+// Bumped v1 -> v2 to purge invoice/private pages cached by older builds.
+// Only responses marked with x-bullnym-pwa-shell are cached now.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
 const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-Cq65mcrJ.css","/pwa-assets/assets/donation-CCMrk51A.js","/pwa-assets/assets/pos-DVZPxx2B.js","/pwa-assets/assets/PayFlow-Kq2nP-tt.js"]
 // Synthetic cache entry recording the PREVIOUS deploy's precache list. Never
@@ -102,8 +99,8 @@ self.addEventListener('fetch', (event) => {
           // exactly those responses with `x-bullnym-pwa-shell` (pos|donation)
           // — see src/donation_render.rs. Private/one-off pages like
           // /invoice/:id and /:nym/i/:id are served WITHOUT the header and
-          // must never be persisted offline (review item 8). Header-marker
-          // gating is robust to URL shape (no path heuristics to keep in sync).
+          // must never be persisted offline. Header-marker gating is robust
+          // to URL shape (no path heuristics to keep in sync).
           if (res.ok && res.headers.get('x-bullnym-pwa-shell')) {
             const copy = res.clone()
             caches.open(PAGES_CACHE_VERSION).then((cache) => cache.put(req, copy))

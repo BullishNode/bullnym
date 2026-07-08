@@ -32,7 +32,7 @@ HTTP clients
 Axum router
   |
   +-- LNURL / NIP-05 / registration handlers
-  +-- donation-page handlers and render fallback
+  +-- public surface handlers and render fallback
   +-- invoice handlers and public payment pages
   +-- Boltz webhook handler
   |
@@ -61,8 +61,8 @@ Background workers
 | `registration.rs` | Nym create/update/delete and lookup. |
 | `lnurl.rs` | LNURL metadata and callback, including LUD-22 Liquid address negotiation. |
 | `nostr.rs` | NIP-05 public key lookup. |
-| `donation_page.rs` | Signed donation-page management and image upload. |
-| `donation_render.rs` | Public page rendering and fallback route handling. |
+| `donation_page.rs` | Signed Payment Page/POS management and image upload. |
+| `donation_render.rs` | Payment Page and POS shell rendering. |
 | `invoice.rs` | Checkout creation, signed wallet-origin invoices, status, offers, cancel, list, and render. |
 | `claimer.rs` | Boltz webhook handling and cooperative claim execution. |
 | `reconciler.rs` | Polls Boltz to repair missed webhook state. |
@@ -85,10 +85,10 @@ For signed client actions:
 6. The database write uses constraints and idempotent keys where needed.
 7. The response returns the stable client contract.
 
-For public payment pages:
+For public checkout surfaces:
 
-1. The server renders the donation page or invoice page. Donation-page render
-   does not allocate a Liquid address.
+1. The server renders the Payment Page, POS shell, or invoice page. Rendering
+   a shell does not allocate a Liquid address.
 2. The payer creates a checkout invoice or refreshes payment instructions.
    Checkout invoice creation allocates one Liquid settlement address; status
    polling and page rendering do not.
@@ -107,8 +107,8 @@ Lightning payments use Boltz reverse swaps:
 
 Direct Liquid payments:
 
-1. Bullnym exposes a Liquid address. Donation-page checkout addresses are
-   allocated at checkout invoice creation, not at page render time.
+1. Bullnym exposes a Liquid address. Public checkout addresses are allocated at
+   checkout invoice creation, not at shell render time.
 2. The payer broadcasts a Liquid transaction.
 3. The Liquid watcher detects the matching output through Liquid Electrum
    scripthash history and raw transaction fetches.
@@ -121,28 +121,31 @@ Direct Bitcoin invoices:
    records observations while confirmations are pending.
 3. Bullnym records accounting once the configured confirmation threshold is met.
 
-Donation-page Bitcoin checkout:
+Public Bitcoin checkout:
 
 1. Bullnym creates a Boltz BTC-to-LBTC chain swap.
 2. The payer sends BTC to the lockup address.
-3. Bullnym claims LBTC to the donation-page settlement address.
+3. Bullnym claims LBTC to the checkout settlement address.
 4. Bullnym records accounting after recipient-side LBTC settlement.
 
 ## Descriptor Architecture
 
-Bullnym has two descriptor-backed receive domains:
+Bullnym has descriptor-backed receive domains:
 
 - Lightning Address descriptor: `users.ct_descriptor`, cursor
   `users.next_addr_idx`.
-- Donation Page descriptor: `donation_pages.ct_descriptor`, cursor
+- Payment Page descriptor: `donation_pages.ct_descriptor` where
+  `kind = 'payment_page'`, cursor `donation_pages.next_addr_idx`.
+- POS descriptor: `donation_pages.ct_descriptor` where `kind = 'pos'`, cursor
   `donation_pages.next_addr_idx`.
 
-The split prevents Get Paid page receives from consuming the Lightning Address
-wallet path. Legacy donation pages without a page descriptor fall back to the
-nym descriptor until migrated.
+The split prevents public checkout receives from consuming the Lightning
+Address wallet path. Legacy Payment Pages without a page descriptor fall back
+to the nym descriptor until migrated. POS does not fall back.
 
-Donation-page cursor advancement is tied to checkout invoice creation. A
-plain `GET /:nym` render and invoice status polling are non-allocating reads.
+Surface cursor advancement is tied to checkout invoice creation. Plain
+`GET /:nym`, `GET /:nym/pos`, and invoice status polling are non-allocating
+reads.
 
 Wallet-origin invoices do not use server-stored descriptors. Mobile supplies
 concrete settlement addresses for those invoices.

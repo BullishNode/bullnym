@@ -29,17 +29,22 @@ database.
 The bullnym-test VM is a deployed server/payment-rail harness. It is for:
 
 - BDK-origin Bitcoin sends to direct Bitcoin invoices
-- LWK-origin Liquid sends to direct Liquid invoices and donation checkout
+- LWK-origin Liquid sends to direct Liquid invoices and public checkout
 - Jungle or other Lightning sends to Boltz reverse-swap offers
-- Boltz chain swaps for donation-page Bitcoin checkout
+- Boltz chain swaps for Payment Page and POS Bitcoin checkout
 - Liquid Electrum watcher behavior, Bitcoin mempool-API watcher behavior,
   invoice accounting, and status polling
-- donation-page checkout and address allocation
+- public checkout and address allocation
 
-For donation pages, test page render and checkout creation separately:
+For public checkout surfaces, test shell render and checkout creation
+separately:
 
 - `GET /:nym` should not allocate a Liquid address or advance the page cursor.
+- `GET /:nym/pos` should not allocate a Liquid address or advance the POS
+  cursor.
 - `POST /:nym/invoice` should allocate exactly one checkout settlement address.
+- `POST /:nym/pos/invoice` should allocate exactly one POS checkout settlement
+  address.
 - Status polling and payment-page refresh should not allocate additional
   descriptor addresses.
 

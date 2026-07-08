@@ -9,10 +9,10 @@ and public payment URLs.
 |---|---|---|---|
 | Linked wallet invoice | `wallet` | Recipient mobile client | `/:nym/i/:id` |
 | Unlinked wallet invoice | `wallet` | Recipient mobile client | `/invoice/:id` |
-| Donation checkout invoice | `checkout` | Anonymous payer from a donation page | `/:nym/i/:id` |
+| Checkout invoice | `checkout` | Anonymous payer/cashier from Payment Page or POS | `/:nym/i/:id` |
 
 Wallet-origin invoices use recipient-supplied settlement addresses. Checkout
-invoices use the donation-page settlement address derived by the server.
+invoices use the selected surface settlement address derived by the server.
 
 ## Creation
 

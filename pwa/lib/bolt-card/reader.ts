@@ -1,6 +1,5 @@
-// Bolt Card (Web NFC, Android Chrome only) — LNURL-withdraw flow per
-// plans/pos/06-bolt-card.md. No new dependency: bech32 decoding is
-// self-contained in ./bech32.ts.
+// Bolt Card (Web NFC, Android Chrome only). No new dependency: bech32 decoding
+// is self-contained in ./bech32.ts.
 
 import { decodeBech32ToString } from './bech32'
 
