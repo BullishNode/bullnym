@@ -513,6 +513,22 @@ fn build_router(state: AppState) -> Router {
         );
     }
 
+    // Signed, npub-keyed detection of stuck (recoverable) chain swaps. Read-only
+    // and ALWAYS-ON — deliberately NOT gated by `chain_swap_merchant_recovery`
+    // (that flag guards the dangerous broadcast path only): merchants must be
+    // able to SEE stranded funds before the recover action is enabled. The
+    // response carries `recovery_enabled` so the server drives the "Recover now"
+    // vs "Contact support" UI. Guarded by `invoices || payment_pages` for the
+    // same reason as the recover route: chain swaps are born under checkout
+    // (`payment_pages`), so a merchant could have a `refund_due` swap even on a
+    // deployment with `invoices` off — the detection route must not be absent.
+    if features.invoices || features.payment_pages {
+        router = router.route(
+            "/api/v1/invoices/recoverable",
+            get(invoice::list_recoverable_signed),
+        );
+    }
+
     let router = if features.payment_pages {
         router.fallback(donation_render::render_or_404)
     } else {
@@ -522,7 +538,17 @@ fn build_router(state: AppState) -> Router {
     router
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        // Signature-auth API (no cookies/ambient credentials), so CORS is not
+        // itself a security boundary here — but `permissive()` echoes any
+        // attacker-requested header via `Access-Control-Allow-Headers: *`
+        // (SEC-09). Keep origin/methods open for the public read+create API,
+        // but bound request headers to what the JSON API actually uses.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers([axum::http::header::CONTENT_TYPE]),
+        )
         .layer(middleware::from_fn(pwa_assets_vary_accept_encoding))
         .with_state(state)
 }
