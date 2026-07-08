@@ -582,13 +582,34 @@ pub async fn list_non_terminal_chain_swaps_oldest_first(
          FROM chain_swap_records \
          WHERE status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
            AND updated_at < NOW() - ($1 || ' seconds')::interval \
-         ORDER BY updated_at ASC \
+         ORDER BY (status IN ('user_lock_mempool', 'user_lock_confirmed', \
+                              'server_lock_mempool', 'server_lock_confirmed', \
+                              'claiming', 'claim_failed', 'refund_due', 'refunding')) DESC, \
+                  last_reconciled_at ASC NULLS FIRST \
          LIMIT $2"
     ))
     .bind(min_age_secs as i64)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
+}
+
+/// Stamp `last_reconciled_at = NOW()` on a batch of chain swaps at tick start,
+/// on the whole fetched batch, BEFORE the per-swap loop. Mirrors
+/// `swaps::mark_swaps_reconciled` — see that fn for why the batch is stamped
+/// up-front rather than per-row after processing.
+pub async fn mark_chain_swaps_reconciled(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE chain_swap_records SET last_reconciled_at = NOW() WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn record_chain_swap_claim_failure(

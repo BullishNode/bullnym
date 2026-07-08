@@ -466,13 +466,33 @@ pub async fn list_non_terminal_swaps_oldest_first(
          FROM swap_records \
          WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
            AND updated_at < NOW() - ($1 || ' seconds')::interval \
-         ORDER BY updated_at ASC \
+         ORDER BY (status IN ('lockup_mempool', 'lockup_confirmed', 'claiming', 'claim_failed') \
+                   OR cooperative_refused) DESC, \
+                  last_reconciled_at ASC NULLS FIRST \
          LIMIT $2",
     )
     .bind(min_age_secs as i64)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
+}
+
+/// Stamp `last_reconciled_at = NOW()` on a batch of swaps. Called once at the
+/// start of every reconciler tick, on the whole fetched batch, BEFORE the
+/// per-swap loop. Stamping up-front (rather than per-row after processing) is
+/// deliberate: a tick that crashes mid-loop must not leave the batch with a
+/// stale `last_reconciled_at` and re-pin it as "oldest" forever — the round-
+/// robin ordering (see `list_non_terminal_swaps_oldest_first`) then rotates
+/// past this batch on the next tick regardless of how the tick ended.
+pub async fn mark_swaps_reconciled(pool: &PgPool, ids: &[Uuid]) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE swap_records SET last_reconciled_at = NOW() WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Reverse (Lightning) swaps that reached `claimed` — merchant funds are on
