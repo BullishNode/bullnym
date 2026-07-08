@@ -27,6 +27,11 @@ pub struct GcConfig {
     pub tick_secs: u64,
     pub retention_secs: u64,
     pub checkout_partial_terminal_grace_secs: u64,
+    /// Post-expiry grace window (seconds): GC withholds expiry until
+    /// `expires_at + payment_grace_secs`, so a payment confirming just after
+    /// expiry is still credited (the expiry-cliff fix). Mirrors
+    /// `InvoiceAccountingConfig::payment_grace_secs`.
+    pub payment_grace_secs: u64,
     /// TTL for unfulfilled `outpoint_addresses` rows. Rows that the chain
     /// watcher hasn't observed paid within this window are recycled. 1h is
     /// enough for any real payer to land their tx; longer just lets
@@ -40,6 +45,7 @@ impl Default for GcConfig {
             tick_secs: 600,         // 10 min
             retention_secs: 86_400, // 24 h — well past the longest 1h window
             checkout_partial_terminal_grace_secs: 900,
+            payment_grace_secs: 3_600, // 1 h
             outpoint_pending_ttl_secs: 3_600, // 1 h
         }
     }
@@ -61,7 +67,8 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
                 let removed_na = prune_nym_access_events(&pool, cfg.retention_secs).await;
                 let removed_oa =
                     prune_outpoint_addresses(&pool, cfg.outpoint_pending_ttl_secs).await;
-                let removed_iv = expire_invoices_past_deadline(&pool).await;
+                let removed_iv =
+                    expire_invoices_past_deadline(&pool, cfg.payment_grace_secs).await;
                 let terminalized_partials =
                     terminalize_stale_checkout_partial_invoices(
                         &pool,
@@ -115,10 +122,12 @@ async fn prune_nym_access_events(pool: &PgPool, retention_secs: u64) -> u64 {
     }
 }
 
-/// Flip unpaid invoices past `expires_at` to 'expired'. Set-based idempotent
-/// UPDATE: re-runs are safe, and settled rows are excluded by the predicate.
-async fn expire_invoices_past_deadline(pool: &PgPool) -> u64 {
-    match db::expire_invoices_past_deadline(pool).await {
+/// Flip unpaid invoices past `expires_at + payment_grace_secs` to 'expired'.
+/// Set-based idempotent UPDATE: re-runs are safe, and settled rows are excluded
+/// by the predicate. The grace window keeps a late-confirming payment
+/// creditable instead of expiring it out from under the watcher.
+async fn expire_invoices_past_deadline(pool: &PgPool, payment_grace_secs: u64) -> u64 {
+    match db::expire_invoices_past_deadline(pool, payment_grace_secs).await {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("rate-limit GC: expire_invoices_past_deadline failed: {e}");
