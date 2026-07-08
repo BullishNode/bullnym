@@ -34,6 +34,9 @@ pub struct BoltzService {
     api: BoltzApiClientV2,
     swap_master_key: SwapMasterKey,
     webhook_url: Option<String>,
+    /// Fast-fails user-facing swap creation during a Boltz outage instead of
+    /// letting every call stall to the client timeout. See issue #31.
+    breaker: crate::boltz_breaker::BoltzBreaker,
 }
 
 impl BoltzService {
@@ -55,6 +58,7 @@ impl BoltzService {
             ),
             swap_master_key,
             webhook_url,
+            breaker: crate::boltz_breaker::BoltzBreaker::default(),
         }
     }
 
@@ -65,6 +69,11 @@ impl BoltzService {
         description: Option<&str>,
         description_hash: Option<&str>,
     ) -> Result<SwapResult, AppError> {
+        if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
+            return Err(AppError::BoltzError(
+                "boltz temporarily unavailable (circuit breaker open)".to_string(),
+            ));
+        }
         let keypair = self
             .swap_master_key
             .derive_swapkey(swap_key_index)
@@ -102,11 +111,20 @@ impl BoltzService {
             claim_covenant: None,
         };
 
-        let response: CreateReverseResponse = self
-            .api
-            .post_reverse_req(request)
-            .await
-            .map_err(|e| AppError::BoltzError(format!("{e}")))?;
+        let response: CreateReverseResponse = {
+            let result = self
+                .api
+                .post_reverse_req(request)
+                .await
+                .map_err(|e| AppError::BoltzError(format!("{e}")));
+            self.breaker.record(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::boltz_breaker::is_transport_failure),
+            );
+            result?
+        };
 
         let invoice = response
             .invoice
@@ -129,6 +147,11 @@ impl BoltzService {
         refund_key_index: u64,
         amount_sat: u64,
     ) -> Result<ChainSwapResult, AppError> {
+        if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
+            return Err(AppError::BoltzError(
+                "boltz temporarily unavailable (circuit breaker open)".to_string(),
+            ));
+        }
         let claim_keypair = self
             .swap_master_key
             .derive_swapkey(claim_key_index)
@@ -180,11 +203,20 @@ impl BoltzService {
             }),
         };
 
-        let response: CreateChainResponse = self
-            .api
-            .post_chain_req(request)
-            .await
-            .map_err(|e| AppError::BoltzError(format!("{e}")))?;
+        let response: CreateChainResponse = {
+            let result = self
+                .api
+                .post_chain_req(request)
+                .await
+                .map_err(|e| AppError::BoltzError(format!("{e}")));
+            self.breaker.record(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::boltz_breaker::is_transport_failure),
+            );
+            result?
+        };
 
         response
             .validate(
