@@ -209,6 +209,10 @@ async fn run_one_chain_tick(
         return Ok(());
     }
 
+    // Round-robin: stamp the whole batch up-front (see mark_chain_swaps_reconciled).
+    let ids: Vec<uuid::Uuid> = stale.iter().map(|s| s.id).collect();
+    db::mark_chain_swaps_reconciled(&state.db, &ids).await?;
+
     tracing::info!("chain reconciler: scanning {} stale chain swap(s)", stale.len());
 
     for swap in &stale {
@@ -257,6 +261,11 @@ async fn run_one_tick(
         tracing::debug!("reconciler: no stale swaps");
         return Ok(());
     }
+
+    // Round-robin: stamp the whole batch up-front so the next tick rotates past
+    // it (see mark_swaps_reconciled). Must precede the per-swap loop.
+    let ids: Vec<uuid::Uuid> = stale.iter().map(|s| s.id).collect();
+    db::mark_swaps_reconciled(pool, &ids).await?;
 
     tracing::info!("reconciler: scanning {} stale swap(s)", stale.len());
 
