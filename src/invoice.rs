@@ -541,7 +541,20 @@ async fn create_anonymous_for_kind(
             // Legacy Payment Page rows created before the descriptor split have
             // no page descriptor; fall back to the nym's Lightning Address
             // descriptor/cursor so those pages keep settling.
+            //
+            // Defense-in-depth (KR-1): only for a nym with NO POS surface. A
+            // nym that also runs POS lives in the descriptor-split world, so a
+            // Payment Page checkout with a missing page descriptor is a
+            // misconfiguration, not a legacy row — refuse rather than silently
+            // settle it to the shared Lightning Address cursor and risk mixing
+            // the POS and LA rails.
             None if kind == db::KIND_PAYMENT_PAGE => {
+                if db::get_donation_page_by_nym(&state.db, &nym, db::KIND_POS)
+                    .await?
+                    .is_some()
+                {
+                    return Err(AppError::DonationPageNotFound(nym.clone()));
+                }
                 let (address, index) = db::allocate_next_liquid_for_active_nym(
                     &state.db,
                     &nym,
