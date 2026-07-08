@@ -174,7 +174,12 @@ async fn poll_invoice_addresses(
     cancel: &CancellationToken,
     tier: &'static str,
 ) {
-    let invoices = match db::list_unpaid_invoices_with_liquid_address(pool).await {
+    let invoices = match db::list_unpaid_invoices_with_liquid_address(
+        pool,
+        tolerances.payment_grace_secs,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("chain_watcher: list invoice addresses failed: {e}");

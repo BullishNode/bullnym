@@ -196,12 +196,13 @@ impl BitcoinWatcher {
                AND accept_btc = TRUE \
                AND bitcoin_address IS NOT NULL \
                AND created_at {cmp} NOW() - ($1 || ' seconds')::interval \
-               AND expires_at > NOW() \
+               AND expires_at + ($2 || ' seconds')::interval > NOW() \
              ORDER BY random() \
              LIMIT 1000",
         );
         sqlx::query_as::<_, InvoiceForBtcPoll>(&sql)
             .bind(self.cfg.active_window_secs)
+            .bind(self.tolerances.payment_grace_secs as i64)
             .fetch_all(&self.pool)
             .await
     }

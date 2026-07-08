@@ -247,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 checkout_partial_terminal_grace_secs: config
                     .invoice_accounting
                     .checkout_partial_terminal_grace_secs,
+                payment_grace_secs: config.invoice_accounting.payment_grace_secs,
                 ..gc::GcConfig::default()
             };
             let cancel_gc = cancel.clone();

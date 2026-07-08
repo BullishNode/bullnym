@@ -393,6 +393,7 @@ fn api_tolerance_uses_configured_values() {
         btc_sat: 900,
         liquid_sat: 42,
         lightning_sat: 3,
+        payment_grace_secs: 3600,
     };
 
     assert_eq!(payment_tolerance_sat(&inv, tolerances), 42);

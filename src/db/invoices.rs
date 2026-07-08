@@ -279,6 +279,7 @@ pub async fn list_invoices_by_npub(
 /// Returned shape: `(invoice_id, liquid_address, amount_sat)`.
 pub async fn list_unpaid_invoices_with_liquid_address(
     pool: &PgPool,
+    payment_grace_secs: u64,
 ) -> Result<Vec<(Uuid, String, i64, String)>, sqlx::Error> {
     sqlx::query_as::<_, (Uuid, String, i64, String)>(
         "SELECT id, liquid_address, GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0), liquid_blinding_key_hex \
@@ -288,10 +289,11 @@ pub async fn list_unpaid_invoices_with_liquid_address(
            AND accept_liquid = TRUE \
            AND liquid_address IS NOT NULL \
            AND liquid_blinding_key_hex IS NOT NULL \
-           AND expires_at > NOW() \
+           AND expires_at + ($1 || ' seconds')::interval > NOW() \
          ORDER BY random() \
          LIMIT 1000",
     )
+    .bind(payment_grace_secs as i64)
     .fetch_all(pool)
     .await
 }
@@ -301,6 +303,11 @@ pub struct InvoiceAccountingTolerances {
     pub btc_sat: i64,
     pub liquid_sat: i64,
     pub lightning_sat: i64,
+    /// Not a tolerance: the post-expiry grace window (seconds) the watchers
+    /// keep polling an invoice for. Carried in this bundle because it is the
+    /// invoice-accounting config already threaded to both chain watchers; see
+    /// `InvoiceAccountingConfig::payment_grace_secs`.
+    pub payment_grace_secs: u64,
 }
 
 impl Default for InvoiceAccountingTolerances {
@@ -309,6 +316,7 @@ impl Default for InvoiceAccountingTolerances {
             btc_sat: 300,
             liquid_sat: 60,
             lightning_sat: 1,
+            payment_grace_secs: 3600,
         }
     }
 }
@@ -319,6 +327,7 @@ impl From<&crate::config::InvoiceAccountingConfig> for InvoiceAccountingToleranc
             btc_sat: cfg.btc_shortfall_tolerance_sat,
             liquid_sat: cfg.liquid_shortfall_tolerance_sat,
             lightning_sat: cfg.lightning_shortfall_tolerance_sat,
+            payment_grace_secs: cfg.payment_grace_secs,
         }
     }
 }
@@ -911,14 +920,19 @@ pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<(u64, String), sq
 /// outer expiry we want the row out of the active corpus regardless of
 /// its mempool stage. Backed by the partial index
 /// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
-pub async fn expire_invoices_past_deadline(pool: &PgPool) -> Result<u64, sqlx::Error> {
+pub async fn expire_invoices_past_deadline(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE invoices SET status = CASE \
             WHEN status = 'partially_paid' THEN 'underpaid' \
             ELSE 'expired' \
          END \
-         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') AND expires_at < NOW()",
+         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') \
+           AND expires_at < NOW() - ($1 || ' seconds')::interval",
     )
+    .bind(payment_grace_secs as i64)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

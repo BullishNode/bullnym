@@ -64,6 +64,7 @@ const DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT: i64 = 300;
 const DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT: i64 = 60;
 const DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT: i64 = 1;
 const DEFAULT_CHECKOUT_PARTIAL_TERMINAL_GRACE_SECS: u64 = 900;
+const DEFAULT_PAYMENT_GRACE_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeaturesConfig {
@@ -141,6 +142,13 @@ pub struct InvoiceAccountingConfig {
     pub lightning_shortfall_tolerance_sat: i64,
     #[serde(default = "default_checkout_partial_terminal_grace_secs")]
     pub checkout_partial_terminal_grace_secs: u64,
+    /// Grace window (seconds) added AFTER `expires_at` during which the
+    /// watchers keep polling an invoice and GC withholds expiry, so a payment
+    /// broadcast just before expiry that confirms just after is still credited
+    /// (the expiry-cliff fix). Must comfortably exceed one on-chain block
+    /// interval. Default 3600 covers the vast majority of single-block waits.
+    #[serde(default = "default_payment_grace_secs")]
+    pub payment_grace_secs: u64,
 }
 
 impl Default for InvoiceAccountingConfig {
@@ -150,6 +158,7 @@ impl Default for InvoiceAccountingConfig {
             liquid_shortfall_tolerance_sat: DEFAULT_LIQUID_SHORTFALL_TOLERANCE_SAT,
             lightning_shortfall_tolerance_sat: DEFAULT_LIGHTNING_SHORTFALL_TOLERANCE_SAT,
             checkout_partial_terminal_grace_secs: DEFAULT_CHECKOUT_PARTIAL_TERMINAL_GRACE_SECS,
+            payment_grace_secs: DEFAULT_PAYMENT_GRACE_SECS,
         }
     }
 }
@@ -165,6 +174,9 @@ fn default_lightning_shortfall_tolerance_sat() -> i64 {
 }
 fn default_checkout_partial_terminal_grace_secs() -> u64 {
     DEFAULT_CHECKOUT_PARTIAL_TERMINAL_GRACE_SECS
+}
+fn default_payment_grace_secs() -> u64 {
+    DEFAULT_PAYMENT_GRACE_SECS
 }
 
 #[derive(Debug, Clone, Deserialize)]
