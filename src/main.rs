@@ -513,22 +513,6 @@ fn build_router(state: AppState) -> Router {
         );
     }
 
-    // Signed, npub-keyed detection of stuck (recoverable) chain swaps. Read-only
-    // and ALWAYS-ON — deliberately NOT gated by `chain_swap_merchant_recovery`
-    // (that flag guards the dangerous broadcast path only): merchants must be
-    // able to SEE stranded funds before the recover action is enabled. The
-    // response carries `recovery_enabled` so the server drives the "Recover now"
-    // vs "Contact support" UI. Guarded by `invoices || payment_pages` for the
-    // same reason as the recover route: chain swaps are born under checkout
-    // (`payment_pages`), so a merchant could have a `refund_due` swap even on a
-    // deployment with `invoices` off — the detection route must not be absent.
-    if features.invoices || features.payment_pages {
-        router = router.route(
-            "/api/v1/invoices/recoverable",
-            get(invoice::list_recoverable_signed),
-        );
-    }
-
     let router = if features.payment_pages {
         router.fallback(donation_render::render_or_404)
     } else {
