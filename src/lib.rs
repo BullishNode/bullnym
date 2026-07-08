@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bitcoin_watcher;
 pub mod boltz;
+pub mod boltz_breaker;
 pub mod certification;
 pub mod chain_watcher;
 pub mod claimer;
