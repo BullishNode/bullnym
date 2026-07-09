@@ -49,6 +49,9 @@ so it does not get confused with the product contract.
   semantics and rail accounting model.
 - [Compatibility Ledger](compatibility-ledger.md): compatibility behavior that
   remains intentionally supported.
+- [Alias Slugs — Client Integration](alias-slugs-client-integration.md):
+  merchant-chosen `/a/<slug>` surfaces (issue #57) — the signed save field, the
+  request/response contract, and the nym-scrubbing a client relies on.
 - [LUD-22 Currency Negotiation](lud-22-currency-negotiation.md): protocol
   extension notes.
 - [LUD-22 vs MRH](lud-22-vs-mrh-research.md): rationale for not using Magic
