@@ -104,10 +104,11 @@ describe('isTerminalView / showsRails', () => {
     }
   })
 
-  it('showsRails is true only for waiting/in_progress/partially_paid', () => {
+  it('showsRails is true only for waiting/partially_paid (detected hides the QR)', () => {
     expect(showsRails({ kind: 'waiting' })).toBe(true)
-    expect(showsRails({ kind: 'in_progress' })).toBe(true)
     expect(showsRails({ kind: 'partially_paid' })).toBe(true)
+    // Once a payment is detected we show "Payment received", not the QR.
+    expect(showsRails({ kind: 'in_progress' })).toBe(false)
     expect(showsRails({ kind: 'settling' })).toBe(false)
     expect(showsRails({ kind: 'needs_review' })).toBe(false)
     expect(showsRails({ kind: 'paid' })).toBe(false)
@@ -115,8 +116,8 @@ describe('isTerminalView / showsRails', () => {
 })
 
 describe('payViewLabel', () => {
-  it('in_progress reads "Payment detected…", NOT "Waiting for payment" (review item 4)', () => {
-    expect(payViewLabel({ kind: 'in_progress' }, null)).toBe('Payment detected…')
+  it('in_progress reads "Payment received" (success on detection), NOT "Waiting for payment"', () => {
+    expect(payViewLabel({ kind: 'in_progress' }, null)).toBe('Payment received')
     expect(payViewLabel({ kind: 'waiting' }, null)).toBe('Waiting for payment')
   })
 
@@ -124,8 +125,10 @@ describe('payViewLabel', () => {
     expect(payViewLabel({ kind: 'partially_paid' }, 1234)).toBe('Partially paid — 1,234 sat due')
   })
 
-  it('settling / needs_review / refunded have distinct labels', () => {
-    expect(payViewLabel({ kind: 'settling' }, null)).toBe('Payment detected — confirming settlement')
+  it('settling shows success; needs_review / refunded stay distinct incidents', () => {
+    // Detection (settling) renders as success — the "Settlement is in progress"
+    // disclaimer is shown by the panel, not the label.
+    expect(payViewLabel({ kind: 'settling' }, null)).toBe('Payment received')
     expect(payViewLabel({ kind: 'needs_review' }, null)).toBe('Payment needs review')
     expect(payViewLabel({ kind: 'refunded' }, null)).toBe('Settlement failed')
   })
