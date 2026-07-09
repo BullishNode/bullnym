@@ -128,15 +128,16 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function createInvoice(
-  nym: string,
+  invoiceBase: string,
   req: CreateInvoiceRequest,
-  opts: { pos?: boolean } = {},
 ): Promise<CreateInvoiceResponse> {
-  // POS checkout MUST hit the POS endpoint so the receipt settles to the POS
-  // descriptor (idx 103) and never falls back to the Lightning Address wallet
-  // (KR-1 / issue #7). The Payment Page / donation surface uses `/invoice`.
-  const path = opts.pos ? `/${nym}/pos/invoice` : `/${nym}/invoice`
-  return request(path, {
+  // `invoiceBase` already encodes the surface: `/<nym>` (Payment Page),
+  // `/<nym>/pos` (POS), or `/a/<slug>` (alias). The server resolves the
+  // settlement descriptor from it, so POS receipts settle to the POS
+  // descriptor (idx 103) and never fall back to the Lightning Address wallet
+  // (KR-1 / issue #7). Alias pages stay nym-free because the base carries the
+  // slug, not the nym.
+  return request(`${invoiceBase}/invoice`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),

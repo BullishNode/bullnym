@@ -7,8 +7,8 @@ import { config } from '$lib/config'
 
 export type PaperSize = '58mm' | '80mm' | 'a4'
 
-const currencyStore = localStore<string | null>(`bullnym:settings:${config.nym}:currency`, null)
-const boltCardStore = localStore<boolean>(`bullnym:settings:${config.nym}:boltcard`, true)
+const currencyStore = localStore<string | null>(`bullnym:settings:${config.page_key}:currency`, null)
+const boltCardStore = localStore<boolean>(`bullnym:settings:${config.page_key}:boltcard`, true)
 // Deliberately NOT nym-scoped: ReceiptScreen.svelte already reads this exact
 // key directly from localStorage (predates this store).
 const paperSizeStore = localStore<PaperSize>('bullnym:paper-size', '80mm')

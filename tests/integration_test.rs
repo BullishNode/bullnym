@@ -527,6 +527,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -553,6 +554,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -584,6 +586,7 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -664,6 +667,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -1013,6 +1017,7 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -1096,6 +1101,7 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -1977,6 +1983,7 @@ async fn insert_test_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
+            public_slug: None,
             npub_owner: npub,
             origin: "checkout",
             fiat_amount_minor: None,
@@ -2147,6 +2154,7 @@ async fn insert_test_btc_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
+            public_slug: None,
             npub_owner: npub,
             origin: "wallet",
             fiat_amount_minor: None,
@@ -2564,6 +2572,7 @@ async fn invoice_insert_rejects_reused_liquid_address() {
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("liqreuse"),
+            public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
             fiat_amount_minor: None,
@@ -3282,6 +3291,7 @@ async fn stale_wallet_partial_stays_payable() {
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("walletpartial"),
+            public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
             fiat_amount_minor: None,

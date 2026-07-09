@@ -136,7 +136,7 @@
     <p class="py-20 text-center">Receipt not found.</p>
   {:else}
     <ReceiptView
-      merchantName={config.header || config.nym}
+      merchantName={config.header || config.page_key}
       posName={config.description || config.domain}
       receiptNumber={receiptNo}
       {dateLabel}

@@ -155,8 +155,9 @@
 <body>
     <main>
         {# Header: linked invoices show the merchant's nym; unlinked
-           invoices (wallet-only) show a generic "Pay invoice" header. #}
-        {% if is_unlinked %}
+           invoices (wallet-only) and alias-path renders (hide_owner) show a
+           generic "Pay invoice" header so the nym is never revealed. #}
+        {% if is_unlinked || hide_owner %}
             <h1>Pay invoice</h1>
         {% else %}
             <h1>Pay <span class="nym">{{ nym }}</span></h1>

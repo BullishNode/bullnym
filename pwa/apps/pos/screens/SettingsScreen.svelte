@@ -31,14 +31,14 @@
   let pinSetupError = $state<string | null>(null)
 
   function checkGate() {
-    const remaining = lockoutRemainingMs(config.nym)
+    const remaining = lockoutRemainingMs(config.page_key)
     if (remaining > 0) {
       lockoutMs = remaining
       gate = 'locked'
       startLockoutTimer()
       return
     }
-    if (!hasPin(config.nym)) {
+    if (!hasPin(config.page_key)) {
       gate = 'set-prompt'
       return
     }
@@ -48,10 +48,10 @@
   function startLockoutTimer() {
     if (lockoutTimer) clearInterval(lockoutTimer)
     lockoutTimer = setInterval(() => {
-      lockoutMs = lockoutRemainingMs(config.nym)
+      lockoutMs = lockoutRemainingMs(config.page_key)
       if (lockoutMs <= 0) {
         clearInterval(lockoutTimer)
-        gate = hasPin(config.nym) ? 'challenge' : 'set-prompt'
+        gate = hasPin(config.page_key) ? 'challenge' : 'set-prompt'
       }
     }, 1000)
   }
@@ -72,15 +72,15 @@
     if (d === '.' || pinInput.length >= 4) return
     pinInput += d
     if (pinInput.length === 4) {
-      const ok = await verifyPin(config.nym, pinInput)
+      const ok = await verifyPin(config.page_key, pinInput)
       if (ok) {
-        clearAttempts(config.nym)
+        clearAttempts(config.page_key)
         gate = 'unlocked'
       } else {
-        recordFailedAttempt(config.nym)
+        recordFailedAttempt(config.page_key)
         pinError = 'Incorrect PIN'
         pinInput = ''
-        const remaining = lockoutRemainingMs(config.nym)
+        const remaining = lockoutRemainingMs(config.page_key)
         if (remaining > 0) {
           lockoutMs = remaining
           gate = 'locked'
@@ -114,7 +114,7 @@
       newPinConfirm += d
       if (newPinConfirm.length === 4) {
         if (newPin === newPinConfirm) {
-          await setPin(config.nym, newPin)
+          await setPin(config.page_key, newPin)
           settingPin = false
           gate = 'unlocked'
         } else {
@@ -257,7 +257,7 @@
           </div>
           <div class="flex items-center justify-between gap-5">
             <dt class="text-[#776b5a] dark:text-[#b9aa91]">Nym</dt>
-            <dd class="font-bold">{config.nym}</dd>
+            <dd class="font-bold">{config.page_key}</dd>
           </div>
           <div class="flex items-center justify-between gap-5">
             <dt class="text-[#776b5a] dark:text-[#b9aa91]">Domain</dt>
@@ -308,7 +308,7 @@
       </div>
 
       <div class="mt-5">
-        {#if hasPin(config.nym)}
+        {#if hasPin(config.page_key)}
           <Button variant="secondary" onclick={beginPinSetup}>Change PIN</Button>
         {:else}
           <Button variant="secondary" onclick={beginPinSetup}>Set a PIN</Button>

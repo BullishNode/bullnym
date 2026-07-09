@@ -281,7 +281,7 @@
           {@render terminalPanel('×', 'err', 'Not found', 'This invoice could not be found.', 'Try Again')}
         {/if}
       {:else}
-        <PaymentScreen bind:this={paymentScreen} invoice={loaded.invoice} nym={config.nym} {amountLabel} onTerminal={handleTerminal} />
+        <PaymentScreen bind:this={paymentScreen} invoice={loaded.invoice} nym={config.page_key} {amountLabel} onTerminal={handleTerminal} />
       {/if}
     </section>
   </div>

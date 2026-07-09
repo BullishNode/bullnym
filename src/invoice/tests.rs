@@ -137,12 +137,17 @@ fn invoice_public_url_builds_linked_and_unlinked_urls() {
     let id = Uuid::nil();
 
     assert_eq!(
-        invoice_public_url("bullpay.ca", Some("alice"), id),
+        invoice_public_url("bullpay.ca", Some("alice"), None, id),
         "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000"
     );
     assert_eq!(
-        invoice_public_url("bullpay.ca", None, id),
+        invoice_public_url("bullpay.ca", None, None, id),
         "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000"
+    );
+    // An alias slug wins over the nym, so the public URL is nym-free.
+    assert_eq!(
+        invoice_public_url("bullpay.ca", Some("alice"), Some("alices-shop"), id),
+        "https://bullpay.ca/a/alices-shop/i/00000000-0000-0000-0000-000000000000"
     );
 }
 
@@ -161,6 +166,7 @@ fn max_bullpay_invoice_url_fits_boltz_description_limit() {
     let url = invoice_public_url(
         "bullpay.ca",
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        None,
         Uuid::nil(),
     );
 
@@ -217,6 +223,7 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
+        hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "partially_paid",
@@ -250,6 +257,7 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
+        hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -283,6 +291,7 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
+        hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -320,6 +329,7 @@ fn template_liquid_uri_pins_lbtc_asset() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
+        hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -354,6 +364,7 @@ fn invoice_template_escapes_user_text_and_js_literals() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
+        hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
@@ -384,6 +395,50 @@ fn invoice_template_escapes_user_text_and_js_literals() {
 }
 
 #[test]
+fn hide_owner_suppresses_nym_in_rendered_header() {
+    let base = InvoicePaymentTpl {
+        nym: "secretnym",
+        is_unlinked: false,
+        hide_owner: false,
+        invoice_id: Uuid::nil().to_string(),
+        domain: "bullpay.ca",
+        status: "unpaid",
+        settlement_status: "none",
+        amount_sat: 10_000,
+        remaining_amount_sat: 10_000,
+        fiat_display: None,
+        public_description: None,
+        recipient_name: None,
+        invoice_number: None,
+        accept_btc: false,
+        accept_ln: true,
+        accept_liquid: false,
+        bitcoin_chain_address: None,
+        bitcoin_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+        liquid_address_js: js_string_literal(None).unwrap(),
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+    };
+
+    // Nym path: the header names the merchant.
+    let shown = base.render().expect("template renders");
+    assert!(shown.contains("secretnym"));
+    assert!(shown.contains("Pay <span"));
+
+    // Alias path (hide_owner): generic header, nym scrubbed everywhere.
+    let hidden = InvoicePaymentTpl {
+        nym: "",
+        hide_owner: true,
+        ..base
+    }
+    .render()
+    .expect("template renders");
+    assert!(hidden.contains("Pay invoice"));
+    assert!(!hidden.contains("secretnym"));
+}
+
+#[test]
 fn api_tolerance_uses_configured_values() {
     let mut inv = invoice_fixture();
     inv.accept_btc = false;
@@ -410,6 +465,7 @@ fn invoice_fixture() -> db::Invoice {
     db::Invoice {
         id: Uuid::nil(),
         nym_owner: Some("alice".to_string()),
+        public_slug: None,
         npub_owner: "npub".to_string(),
         origin: "wallet".to_string(),
         fiat_amount_minor: None,

@@ -4,7 +4,18 @@
 // PWA knows its nym without an API round-trip.
 
 export interface BullnymConfig {
+  /// Merchant nym. Present on nym-path pages; empty on alias pages (the
+  /// server omits it so the alias page never carries the nym). Prefer
+  /// `page_key` for storage keys and `invoice_base` for URL construction.
   nym: string
+  /// Public base path the client appends `/invoice` and `/i/<id>` to:
+  /// `/<nym>`, `/<nym>/pos`, or `/a/<slug>`. The client no longer composes
+  /// this from the nym, so alias pages stay nym-free.
+  invoice_base: string
+  /// Stable namespace key for client-side storage (settings, history, PIN).
+  /// Equals the nym on nym pages (no key migration for installed PWAs) and
+  /// the slug on alias pages.
+  page_key: string
   mode: 'donation' | 'pos'
   currency: string
   header: string
@@ -26,6 +37,8 @@ export interface BullnymConfig {
 
 const FALLBACK: BullnymConfig = {
   nym: '',
+  invoice_base: '',
+  page_key: '',
   mode: 'donation',
   currency: 'USD',
   header: '',
@@ -45,6 +58,17 @@ const FALLBACK: BullnymConfig = {
   liquid_btc_asset_id: '6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d',
 }
 
+// Back-compat: a stale cached shell served by an older backend sends `nym`
+// and `mode` but no `invoice_base`/`page_key`. Derive them from the nym so
+// those installs (and dev/tests) keep working; a fresh server always supplies
+// both explicitly, which wins.
+function withDerivedRouting(c: BullnymConfig): BullnymConfig {
+  const invoice_base =
+    c.invoice_base || (c.nym ? (c.mode === 'pos' ? `/${c.nym}/pos` : `/${c.nym}`) : '')
+  const page_key = c.page_key || c.nym
+  return { ...c, invoice_base, page_key }
+}
+
 export function parseConfig(): BullnymConfig {
   if (typeof document === 'undefined') return FALLBACK
   const el = document.getElementById('bullnym-config')
@@ -54,12 +78,12 @@ export function parseConfig(): BullnymConfig {
     if (import.meta.env.DEV) {
       const params = new URLSearchParams(location.search)
       const nym = params.get('nym')
-      if (nym) return { ...FALLBACK, nym, header: nym }
+      if (nym) return withDerivedRouting({ ...FALLBACK, nym, header: nym })
     }
     return FALLBACK
   }
   try {
-    return { ...FALLBACK, ...JSON.parse(el.textContent) }
+    return withDerivedRouting({ ...FALLBACK, ...JSON.parse(el.textContent) })
   } catch {
     return FALLBACK
   }

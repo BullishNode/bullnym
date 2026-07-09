@@ -81,7 +81,7 @@ fn security_headers_allow_https_connects_for_pos_csp() {
 fn live_template_renders_social_preview_metadata() {
     let og_url = "https://bullpay.ca/img/alice/og.jpg?v=abcd";
     let tpl = DonationPageTpl {
-        nym: "alice",
+        invoice_base: "/alice".to_string(),
         header: "Alice Store",
         description: "Fresh coffee",
         public_url: "https://bullpay.ca/alice".to_string(),
@@ -122,6 +122,7 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         description: "Description".to_string(),
         avatar_sha256: None,
         og_sha256: None,
+        alias: None,
         display_currency: "USD".to_string(),
         website: None,
         twitter: None,
@@ -131,7 +132,7 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page, "/manifestnym");
+    let manifest = web_manifest_for_page(&page, "/manifestnym", "manifestnym");
 
     assert_eq!(manifest.name, "manifestnym");
     assert_eq!(manifest.short_name, "manifestnym");
@@ -156,6 +157,7 @@ fn web_manifest_uses_header_for_name() {
         description: "Description".to_string(),
         avatar_sha256: None,
         og_sha256: None,
+        alias: None,
         display_currency: "USD".to_string(),
         website: None,
         twitter: None,
@@ -165,7 +167,7 @@ fn web_manifest_uses_header_for_name() {
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page, "/alice");
+    let manifest = web_manifest_for_page(&page, "/alice", "alice");
 
     assert_eq!(manifest.name, "Alice Coffee Counter");
     assert_eq!(manifest.short_name, "Alice Coffee");
@@ -176,7 +178,9 @@ fn web_manifest_uses_header_for_name() {
 fn pwa_shell_injects_config_and_og_placeholders() {
     let shell = r#"<!doctype html><head><!-- BULLNYM_OG --><!-- BULLNYM_MANIFEST --></head><body><!-- BULLNYM_CONFIG --></body>"#;
     let config = PwaConfigView {
-        nym: "alice",
+        nym: Some("alice"),
+        invoice_base: "/alice/pos",
+        page_key: "alice",
         mode: "pos",
         currency: "USD",
         header: "Alice & Sons",
@@ -225,7 +229,9 @@ fn pwa_shell_escapes_manifest_href_attr() {
     // caller never passes one, but the escaping must hold regardless.
     let shell = "<!-- BULLNYM_MANIFEST -->";
     let config = PwaConfigView {
-        nym: "alice",
+        nym: Some("alice"),
+        invoice_base: "/alice",
+        page_key: "alice",
         mode: "donation",
         currency: "USD",
         header: "Header",
@@ -250,7 +256,9 @@ fn pwa_shell_escapes_manifest_href_attr() {
 fn pwa_shell_escapes_script_breakout_in_json() {
     let shell = "<!-- BULLNYM_CONFIG --><!-- BULLNYM_OG -->";
     let config = PwaConfigView {
-        nym: "alice",
+        nym: Some("alice"),
+        invoice_base: "/alice",
+        page_key: "alice",
         mode: "donation",
         currency: "USD",
         header: "</script><script>alert(1)</script>",
@@ -343,4 +351,96 @@ fn pwa_shell_header_marks_pos_shells() {
             .expect("valid header value"),
         "pos"
     );
+}
+
+// --- Alias nym-scrubbing ---
+
+#[test]
+fn alias_config_omits_nym_and_carries_invoice_base() {
+    let shell = "<!-- BULLNYM_CONFIG -->";
+    let config = PwaConfigView {
+        nym: None,
+        invoice_base: "/a/alices-shop",
+        page_key: "alices-shop",
+        mode: "donation",
+        currency: "USD",
+        header: "Alice's Shop",
+        description: "Fresh coffee",
+        // Alias image URLs are content-addressed (no nym in the path).
+        avatar_url: Some("https://bullpay.ca/img/_h/deadbeef.webp"),
+        website: None,
+        twitter: None,
+        instagram: None,
+        minor_per_btc: 0,
+        last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
+        domain: "bullpay.ca",
+    };
+    let html = inject_pwa_shell(shell, &config, None, "/a/alices-shop/manifest.webmanifest")
+        .expect("injects shell");
+    let json = injected_config_json(&html);
+    assert!(
+        json.get("nym").is_none(),
+        "alias config must not carry the nym key"
+    );
+    assert_eq!(json["invoice_base"], "/a/alices-shop");
+    assert_eq!(json["page_key"], "alices-shop");
+    assert_eq!(json["avatar_url"], "https://bullpay.ca/img/_h/deadbeef.webp");
+}
+
+#[test]
+fn nym_config_still_carries_nym_and_invoice_base() {
+    // Regression: nym pages keep sending `nym` (installed-PWA back-compat).
+    let shell = "<!-- BULLNYM_CONFIG -->";
+    let config = PwaConfigView {
+        nym: Some("alice"),
+        invoice_base: "/alice",
+        page_key: "alice",
+        mode: "donation",
+        currency: "USD",
+        header: "Alice",
+        description: "d",
+        avatar_url: None,
+        website: None,
+        twitter: None,
+        instagram: None,
+        minor_per_btc: 0,
+        last_known_rate: false,
+        liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
+        domain: "bullpay.ca",
+    };
+    let html = inject_pwa_shell(shell, &config, None, "/alice/manifest.webmanifest")
+        .expect("injects shell");
+    let json = injected_config_json(&html);
+    assert_eq!(json["nym"], "alice");
+    assert_eq!(json["invoice_base"], "/alice");
+    assert_eq!(json["page_key"], "alice");
+}
+
+#[test]
+fn web_manifest_fallback_uses_provided_name_not_nym() {
+    // With a blank header the manifest name falls back to the caller-provided
+    // name (the slug on alias pages), never the nym.
+    let page = db::DonationPage {
+        nym: "secretnym".to_string(),
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
+        ct_descriptor: None,
+        next_addr_idx: 0,
+        header: "   ".to_string(),
+        description: "d".to_string(),
+        avatar_sha256: None,
+        og_sha256: None,
+        alias: Some("alices-shop".to_string()),
+        display_currency: "USD".to_string(),
+        website: None,
+        twitter: None,
+        instagram: None,
+        pos_mode: false,
+        enabled: true,
+        is_archived: false,
+    };
+    let manifest = web_manifest_for_page(&page, "/a/alices-shop", "alices-shop");
+    assert_eq!(manifest.name, "alices-shop");
+    assert_eq!(manifest.start_url, "/a/alices-shop");
+    assert_ne!(manifest.name, "secretnym");
 }

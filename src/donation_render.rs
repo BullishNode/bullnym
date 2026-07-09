@@ -25,10 +25,22 @@ use crate::pricer::CurrencyView;
 use crate::reserved_nyms;
 use crate::AppState;
 
+/// How a live surface is being published — decides whether the nym may appear
+/// in the served page. `Nym` is the classic nym path (`/<nym>` or
+/// `/<nym>/pos`); `Alias` is the nym-free `/a/<slug>` path, where the nym is
+/// scrubbed from HTML, config, image URLs, and manifest.
+enum PublicBase<'a> {
+    Nym { nym: &'a str, base_path: &'a str },
+    Alias { slug: &'a str },
+}
+
 #[derive(Template)]
 #[template(path = "store_amount.html")]
 struct DonationPageTpl<'a> {
-    nym: &'a str,
+    /// Public base path the page's client-side JS appends `/invoice` and
+    /// `/i/<id>` to. `/<nym>` (or `/<nym>/pos`) on nym pages, `/a/<slug>` on
+    /// alias pages — so the alias page never embeds the nym.
+    invoice_base: String,
     header: &'a str,
     description: &'a str,
     public_url: String,
@@ -70,7 +82,18 @@ pub struct PwaShells {
 
 #[derive(Serialize)]
 struct PwaConfigView<'a> {
-    nym: &'a str,
+    /// Present on nym pages (installed-PWA back-compat); omitted entirely on
+    /// alias pages so the served config never carries the nym.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nym: Option<&'a str>,
+    /// Public base path the client appends `/invoice` to. `/<nym>`,
+    /// `/<nym>/pos`, or `/a/<slug>` — the client no longer composes this from
+    /// the nym, so alias pages stay nym-free.
+    invoice_base: &'a str,
+    /// Stable namespace key for client-side storage (settings, history, PIN).
+    /// Equals the nym on nym pages (no migration for installed PWAs) and the
+    /// slug on alias pages.
+    page_key: &'a str,
     mode: &'a str,
     currency: &'a str,
     header: &'a str,
@@ -281,9 +304,13 @@ fn short_manifest_name(name: &str) -> String {
     name.chars().take(12).collect()
 }
 
-fn web_manifest_for_page<'a>(page: &'a db::DonationPage, start_path: &str) -> WebManifest<'a> {
+fn web_manifest_for_page<'a>(
+    page: &'a db::DonationPage,
+    start_path: &str,
+    fallback_name: &'a str,
+) -> WebManifest<'a> {
     let name = if page.header.trim().is_empty() {
-        page.nym.as_str()
+        fallback_name
     } else {
         page.header.as_str()
     };
@@ -475,7 +502,7 @@ async fn manifest_for_kind(
         }
     };
 
-    let manifest = web_manifest_for_page(&page, start_path);
+    let manifest = web_manifest_for_page(&page, start_path, nym);
 
     let body = match serde_json::to_string(&manifest) {
         Ok(body) => body,
@@ -498,26 +525,105 @@ async fn manifest_for_kind(
     resp
 }
 
-/// Render a live donation surface. `base_path` is the public path the surface
-/// is served at (`/<nym>` for the Payment Page, `/<nym>/pos` for POS); it
-/// drives the PWA manifest link + start URL. The POS shell is selected when
-/// the row is the POS surface OR carries the legacy `pos_mode` toggle.
-async fn render_live(state: &AppState, page: &db::DonationPage, base_path: &str) -> Response {
+/// `GET /a/:slug/manifest.webmanifest` — PWA manifest for an alias surface.
+/// Resolves the slug to its `(nym, kind)` row and serves a manifest whose name
+/// and start_url reference the slug, never the nym.
+pub async fn manifest_alias(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_slug(&slug) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Manifest).await
+    {
+        return resp;
+    }
+
+    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
+        Ok(Some(p)) if p.enabled && !p.is_archived => p,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(event = "manifest_alias_db_error", slug = %slug, error = %e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    let start_path = format!("/a/{slug}");
+    let manifest = web_manifest_for_page(&page, &start_path, &slug);
+
+    let body = match serde_json::to_string(&manifest) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!(event = "manifest_alias_serialize_error", slug = %slug, error = %e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut resp = (StatusCode::OK, body).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/manifest+json"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    resp
+}
+
+/// Render a live donation surface. `base` decides both the public path the
+/// surface is served at (which drives the PWA manifest link + start URL) and
+/// whether the nym is allowed to appear in the served page:
+/// - `PublicBase::Nym` → served at `/<nym>` (Payment Page) or `/<nym>/pos`;
+///   the nym appears in config/images (installed-PWA back-compat).
+/// - `PublicBase::Alias` → served at `/a/<slug>`; the nym is scrubbed from the
+///   embedded config, image URLs (served by content hash), and manifest.
+///
+/// The POS shell is selected when the row is the POS surface OR carries the
+/// legacy `pos_mode` toggle.
+async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase<'_>) -> Response {
     let domain = &state.config.domain;
+
+    // Derive the public path, the client-storage key, the (optional) nym for
+    // the embedded config, and the image URLs — all in one place so the
+    // nym-scrub is total for the alias branch. Image URLs only render after
+    // the upload pipeline has stored a hash. Alias pages address images by
+    // content hash (`/img/_h/<sha>.<ext>`) so no nym leaks; the `_h`
+    // directory can never collide with a nym (underscore is not URL-legal).
+    let (base_path, page_key, config_nym, avatar_url, og_url) = match base {
+        PublicBase::Nym { nym, base_path } => (
+            base_path.to_string(),
+            nym.to_string(),
+            Some(nym.to_string()),
+            page.avatar_sha256
+                .as_ref()
+                .map(|_| format!("https://{domain}/img/{nym}/avatar.webp")),
+            page.og_sha256
+                .as_ref()
+                .map(|hash| format!("https://{domain}/img/{nym}/og.jpg?v={hash}")),
+        ),
+        PublicBase::Alias { slug } => (
+            format!("/a/{slug}"),
+            slug.to_string(),
+            None,
+            page.avatar_sha256
+                .as_ref()
+                .map(|hash| format!("https://{domain}/img/_h/{hash}.webp")),
+            page.og_sha256
+                .as_ref()
+                .map(|hash| format!("https://{domain}/img/_h/{hash}.jpg")),
+        ),
+    };
     let public_url = format!("https://{domain}{base_path}");
     // POS shell for either the dedicated POS row or a legacy pos_mode page.
     let is_pos = page.kind == db::KIND_POS || page.pos_mode;
     let manifest_href = format!("{base_path}/manifest.webmanifest");
-
-    // Image URLs only render after the upload pipeline stores a hash.
-    let avatar_url = page
-        .avatar_sha256
-        .as_ref()
-        .map(|_| format!("https://{domain}/img/{}/avatar.webp", page.nym));
-    let og_url = page
-        .og_sha256
-        .as_ref()
-        .map(|hash| format!("https://{domain}/img/{}/og.jpg?v={hash}", page.nym));
 
     // Fetch the fiat rate. None ⇒ embed minor_per_btc=0 and the JS hides
     // fiat conversion + disables the Donate button. The page still
@@ -534,7 +640,9 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base_path: &str)
         let avatar_url_ref = avatar_url.as_deref();
         let mode = if is_pos { "pos" } else { "donation" };
         let config = PwaConfigView {
-            nym: &page.nym,
+            nym: config_nym.as_deref(),
+            invoice_base: &base_path,
+            page_key: &page_key,
             mode,
             currency: &page.display_currency,
             header: &page.header,
@@ -557,7 +665,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base_path: &str)
     }
 
     let body = DonationPageTpl {
-        nym: &page.nym,
+        invoice_base: base_path,
         header: &page.header,
         description: &page.description,
         public_url,
@@ -636,7 +744,8 @@ pub async fn render_or_404(
         return render_404(&state, nym);
     }
 
-    render_live(&state, &page, &format!("/{nym}")).await
+    let base_path = format!("/{nym}");
+    render_live(&state, &page, PublicBase::Nym { nym, base_path: &base_path }).await
 }
 
 /// `GET /:nym/pos` — public POS terminal shell for the nym's POS surface
@@ -674,7 +783,47 @@ pub async fn render_pos(
         return render_404(&state, &nym);
     }
 
-    render_live(&state, &page, &format!("/{nym}/pos")).await
+    let base_path = format!("/{nym}/pos");
+    render_live(&state, &page, PublicBase::Nym { nym: &nym, base_path: &base_path }).await
+}
+
+/// `GET /a/:slug` — public donation surface served under a merchant-chosen
+/// alias slug, decoupled from the nym. Resolves the slug to its `(nym, kind)`
+/// row and renders the Payment Page or POS surface accordingly, with the nym
+/// scrubbed from the served page (see `render_live` / `PublicBase::Alias`).
+pub async fn render_alias(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_slug(&slug) {
+        return render_404(&state, &slug);
+    }
+
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Html).await
+    {
+        return resp;
+    }
+
+    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return render_404(&state, &slug),
+        Err(e) => {
+            tracing::error!(event = "alias_render_db_error", slug = %slug, error = %e);
+            return render_404(&state, &slug);
+        }
+    };
+
+    if page.is_archived {
+        return render_archived(&state, &slug);
+    }
+    if !page.enabled {
+        return render_404(&state, &slug);
+    }
+
+    render_live(&state, &page, PublicBase::Alias { slug: &slug }).await
 }
 
 #[cfg(test)]

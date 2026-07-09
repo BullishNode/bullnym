@@ -441,7 +441,24 @@ fn build_router(state: AppState) -> Router {
                 "/:nym/pos/invoice",
                 post(invoice::create_anonymous_pos).layer(DefaultBodyLimit::max(1024)),
             )
-            .route("/:nym/i/:id", get(invoice::render_payment));
+            .route("/:nym/i/:id", get(invoice::render_payment))
+            // Alias surfaces served at `/a/<slug>`, decoupled from the nym.
+            // The literal `/a` first segment out-prioritises the `/:nym/...`
+            // param routes, and the two-segment shape can never be claimed by
+            // the single-segment donation-page fallback. One invoice route
+            // serves both the alias Payment Page and POS (kind resolved from
+            // the row); status/offer polling stays on the id-only
+            // `/api/v1/invoices/:id/...` routes.
+            .route("/a/:slug", get(donation_render::render_alias))
+            .route(
+                "/a/:slug/manifest.webmanifest",
+                get(donation_render::manifest_alias),
+            )
+            .route(
+                "/a/:slug/invoice",
+                post(invoice::create_anonymous_alias).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
 
         // Donation-page image upload needs a 2 MiB body cap, well above the
         // 64 KiB global. Layers are per-router in axum 0.7+ — putting the

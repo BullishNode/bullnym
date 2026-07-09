@@ -107,7 +107,7 @@
     errorMsg = null
     try {
       const res = await createInvoice(
-        config.nym,
+        config.invoice_base,
         unit === 'fiat' ? { fiat_amount_minor: fiatMinor, fiat_currency: currency } : { amount_sat: cryptoSat },
       )
       cacheInvoice({
@@ -168,7 +168,7 @@
           {/if}
           <div>
             <h1 class="font-display text-3xl uppercase tracking-display leading-none">
-              {config.header || config.nym}
+              {config.header || config.page_key}
             </h1>
             {#if config.description}
               <p class="mt-0.5 text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
