@@ -433,11 +433,21 @@
 
             function formatCountdown(targetUnix, label) {
                 const now = Math.floor(Date.now() / 1000);
-                const remaining = targetUnix - now;
+                let remaining = targetUnix - now;
                 if (remaining <= 0) return `${label} elapsed`;
+                const d = Math.floor(remaining / 86400);
+                remaining %= 86400;
+                const h = Math.floor(remaining / 3600);
+                remaining %= 3600;
                 const m = Math.floor(remaining / 60);
-                const s = remaining % 60;
-                return `${label} in ${m}:${String(s).padStart(2, '0')}`;
+                // Days, hours, minutes — human-readable for the multi-day
+                // checkout/donation/PoS expiry (a raw M:SS countdown reads as a
+                // meaningless five-digit minute count over a 7-day window).
+                const parts = [];
+                if (d > 0) parts.push(`${d}d`);
+                if (d > 0 || h > 0) parts.push(`${h}h`);
+                parts.push(`${m}m`);
+                return `${label} in ${parts.join(' ')}`;
             }
 
             function refreshCountdown() {
