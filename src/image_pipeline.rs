@@ -215,6 +215,23 @@ pub fn image_path(root: &str, nym: &str, kind: ImageKind) -> PathBuf {
         .join(format!("{}.{}", kind.as_str(), ext))
 }
 
+/// Content-addressed path for a donation-page image, served at
+/// `/img/_h/<sha256>.<ext>`. The `_h` directory name contains an underscore,
+/// which `NYM_REGEX` forbids, so it can never collide with a nym directory
+/// (`/img/<nym>/...`). Alias pages reference images by this hash-keyed URL so
+/// the served HTML never carries the nym. `sha256_hex` is the source image
+/// hash the DB stores (`avatar_sha256` / `og_sha256`); the file at this path
+/// holds the same processed bytes as the nym-keyed path.
+pub fn image_hash_path(root: &str, sha256_hex: &str, kind: ImageKind) -> PathBuf {
+    let ext = match kind {
+        ImageKind::Avatar => "webp",
+        ImageKind::Og => "jpg",
+    };
+    Path::new(root)
+        .join("_h")
+        .join(format!("{sha256_hex}.{ext}"))
+}
+
 /// Atomic write: write to `<final>.tmp.<uuid>`, fsync, rename to `<final>`.
 /// Creates the parent dir on first write for the nym. Synchronous — the
 /// caller wraps in `tokio::task::spawn_blocking`.

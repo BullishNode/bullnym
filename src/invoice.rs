@@ -461,6 +461,29 @@ pub async fn create_anonymous_pos(
     create_anonymous_for_kind(state, nym, db::KIND_POS, peer_opt, headers, req).await
 }
 
+/// POST /a/:slug/invoice — keyless checkout for an alias surface. Resolves the
+/// slug to its `(nym, kind)` row and runs the same anonymous flow as the
+/// nym-path routes, kind-scoped to the resolved surface — so one route serves
+/// both the alias Payment Page and the alias POS without exposing the nym.
+pub async fn create_anonymous_alias(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateAnonymousRequest>,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    let page = db::get_donation_page_by_alias(&state.db, &slug)
+        .await?
+        .ok_or_else(|| AppError::DonationPageNotFound(slug.clone()))?;
+    if !page.enabled || page.is_archived {
+        return Err(AppError::DonationPageNotFound(slug));
+    }
+    // Recover the &'static kind for the shared implementation. The row's kind
+    // is always a canonical value, so this never fails in practice.
+    let kind = db::normalize_kind(&page.kind).ok_or_else(|| AppError::DonationPageNotFound(slug))?;
+    create_anonymous_for_kind(state, page.nym, kind, peer_opt, headers, req).await
+}
+
 /// Shared anonymous-checkout implementation for the donation-page surfaces.
 /// `kind` selects the (nym, kind) donation_pages row whose descriptor and
 /// address cursor settle the checkout.
@@ -754,6 +777,12 @@ struct InvoicePaymentTpl<'a> {
     /// True when nym_owner is None — page is reached via /invoice/<id>
     /// rather than /<nym>/i/<id>. Drives header copy and URL templating.
     is_unlinked: bool,
+    /// True when the invoice is rendered under a nym-free alias path
+    /// (`/a/<slug>/i/<id>`). The invoice is still nym-linked internally, but
+    /// the served page must not reveal the nym, so the header renders the same
+    /// generic branch as `is_unlinked`. Distinct concept from `is_unlinked`
+    /// (which means "no owner at all").
+    hide_owner: bool,
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
@@ -822,7 +851,9 @@ pub async fn render_payment(
         return Err(AppError::InvoiceNotFound(id_str));
     }
 
-    Ok(html_response(render_invoice_template(&state, &inv).await?))
+    Ok(html_response(
+        render_invoice_template(&state, &inv, false).await?,
+    ))
 }
 
 // =====================================================================
@@ -841,10 +872,49 @@ pub async fn render_unlinked_payment(
     // The unlinked render path serves both nym-linked AND nym-NULL invoices
     // (the wallet may always share via /invoice/<id> regardless of linkage).
     // Distinct handlers for the two paths only affect URL parsing.
-    Ok(html_response(render_invoice_template(&state, &inv).await?))
+    Ok(html_response(
+        render_invoice_template(&state, &inv, false).await?,
+    ))
 }
 
-async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
+// =====================================================================
+// GET /a/<slug>/i/<id> — render a checkout invoice under its alias path
+// =====================================================================
+
+/// Render an invoice created via an alias surface. Resolves the slug to its
+/// owning nym, confirms the invoice belongs to that nym (same anti-enumeration
+/// posture as `render_payment`), and renders with the nym scrubbed from the
+/// page (`hide_owner = true`).
+pub async fn render_payment_alias(
+    State(state): State<AppState>,
+    Path((slug, id_str)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let page = db::get_donation_page_by_alias(&state.db, &slug)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+
+    let id = parse_invoice_id(&id_str)?;
+    let inv = db::get_invoice_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+
+    // The invoice must belong to the nym that owns this alias. Mismatch (or a
+    // cross-alias lookup) returns the same wire copy as a missing id — never
+    // reveal existence, and never leak the nym.
+    if inv.nym_owner.as_deref() != Some(page.nym.as_str()) {
+        return Err(AppError::InvoiceNotFound(id_str));
+    }
+
+    Ok(html_response(
+        render_invoice_template(&state, &inv, true).await?,
+    ))
+}
+
+async fn render_invoice_template(
+    state: &AppState,
+    inv: &db::Invoice,
+    hide_owner: bool,
+) -> Result<String, AppError> {
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
@@ -855,7 +925,13 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
     } else {
         None
     };
-    let nym = inv.nym_owner.as_deref().unwrap_or("");
+    // Suppress the nym in the served page when rendering under an alias path,
+    // even though the invoice is nym-linked internally.
+    let nym = if hide_owner {
+        ""
+    } else {
+        inv.nym_owner.as_deref().unwrap_or("")
+    };
     let is_unlinked = inv.nym_owner.is_none();
     let bitcoin_chain_address = bitcoin_chain_offer
         .as_ref()
@@ -866,6 +942,7 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
     let tpl = InvoicePaymentTpl {
         nym,
         is_unlinked,
+        hide_owner,
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,

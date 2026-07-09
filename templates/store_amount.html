@@ -119,7 +119,7 @@
 <body>
     <main>
         <header>
-            {% match avatar_url %}{% when Some with (url) %}<img class="avatar" src="{{ url }}" alt="{{ nym }}">{% when None %}{% endmatch %}
+            {% match avatar_url %}{% when Some with (url) %}<img class="avatar" src="{{ url }}" alt="{{ header }}">{% when None %}{% endmatch %}
             <h1>{{ header }}</h1>
             <p class="description">{{ description }}</p>
             <div class="social">
@@ -158,12 +158,14 @@
     </main>
 
     <script>
-        // Phase B step 9: amount-entry stub. Submits to POST /<nym>/invoice
-        // and navigates to /<nym>/i/<id>. Server-side rate-limit gate
-        // (5/min per source) caps creation rate; the page does no
-        // client-side throttling beyond the disabled-button guard.
+        // Phase B step 9: amount-entry stub. Submits to POST <base>/invoice
+        // and navigates to <base>/i/<id>, where <base> is the surface's public
+        // path (`/<nym>`, `/<nym>/pos`, or `/a/<slug>`) — so an alias page
+        // never embeds the nym. Server-side rate-limit gate (5/min per source)
+        // caps creation rate; the page does no client-side throttling beyond
+        // the disabled-button guard.
         (function () {
-            const NYM = "{{ nym }}";
+            const BASE = "{{ invoice_base }}";
             const DEFAULT_CURRENCY = "{{ display_currency }}";
             const SAT_PER_BTC = 100000000;
             // Per-currency precision (minor units per major). Mirrors what
@@ -226,7 +228,7 @@
                     return;
                 }
                 try {
-                    const res = await fetch(`/${NYM}/invoice`, {
+                    const res = await fetch(`${BASE}/invoice`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(body),
@@ -237,7 +239,7 @@
                         btn.disabled = false;
                         return;
                     }
-                    window.location.href = `/${NYM}/i/${data.invoice_id}`;
+                    window.location.href = `${BASE}/i/${data.invoice_id}`;
                 } catch (e) {
                     err.textContent = 'network error — try again';
                     btn.disabled = false;

@@ -448,7 +448,57 @@ pub async fn save(
     )
     .await?;
 
+    // If an alias was just claimed, make sure the content-addressed image
+    // copies exist so `/a/<alias>` can serve avatar/OG without the nym in the
+    // URL. New uploads already dual-write; this backfills images uploaded
+    // before that shipped. Best-effort and non-fatal.
+    if matches!(alias_update, Some(Some(_))) {
+        backfill_alias_image_hashes(&state, &row).await;
+    }
+
     Ok(Json(DonationPageView::from_row(row, &state.config.domain)))
+}
+
+/// Best-effort: ensure the content-addressed (`/img/_h/<sha>.<ext>`) copies of
+/// a page's avatar/OG images exist, copying from the nym-keyed path when
+/// missing. Called when a merchant claims an alias so pre-existing images
+/// become servable on the nym-free alias page. Failures are logged, never
+/// propagated — a missing image just doesn't render.
+async fn backfill_alias_image_hashes(state: &AppState, row: &db::DonationPage) {
+    let items: Vec<(String, ImageKind)> = [
+        row.avatar_sha256
+            .as_ref()
+            .map(|h| (h.clone(), ImageKind::Avatar)),
+        row.og_sha256.as_ref().map(|h| (h.clone(), ImageKind::Og)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if items.is_empty() {
+        return;
+    }
+    let root = state.config.donation.image_root_path.clone();
+    let nym = row.nym.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        for (sha, kind) in items {
+            let hash_path = image_pipeline::image_hash_path(&root, &sha, kind);
+            if hash_path.exists() {
+                continue;
+            }
+            let nym_path = image_pipeline::image_path(&root, &nym, kind);
+            match std::fs::read(&nym_path) {
+                Ok(bytes) => {
+                    if let Err(e) = image_pipeline::atomic_write(&hash_path, &bytes) {
+                        tracing::warn!(event = "alias_image_backfill_write_failed", error = %e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(event = "alias_image_backfill_read_failed", error = %e);
+                }
+            }
+        }
+    })
+    .await;
 }
 
 /// DELETE /donation-page — soft-archive. The row is preserved.
@@ -675,12 +725,21 @@ pub async fn upload_image(
         og_height: state.config.donation.og_height,
     };
     let path = image_pipeline::image_path(&state.config.donation.image_root_path, &nym, kind);
+    let image_root = state.config.donation.image_root_path.clone();
     let processed = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         let p = image_pipeline::process(&file_bytes, kind, &pipeline_cfg)?;
         image_pipeline::atomic_write(&path, &p.bytes).map_err(|e| {
             tracing::error!(event = "image_atomic_write_failed", error = %e);
             AppError::ImageInvalid("could not persist image".into())
         })?;
+        // Content-addressed copy so an alias page can serve this image at
+        // /img/_h/<sha>.<ext> without leaking the nym in the URL. Best-effort:
+        // the nym path is already durable, so a failure here doesn't fail the
+        // upload — the alias-claim backfill and the next upload both retry.
+        let hash_path = image_pipeline::image_hash_path(&image_root, &p.source_sha256, kind);
+        if let Err(e) = image_pipeline::atomic_write(&hash_path, &p.bytes) {
+            tracing::warn!(event = "image_hash_write_failed", error = %e);
+        }
         Ok(p)
     })
     .await
