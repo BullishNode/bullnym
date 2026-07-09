@@ -89,6 +89,10 @@ pub enum AppError {
     /// already assigned to an invoice. Address reuse makes chain payment
     /// attribution ambiguous, so it is rejected at create time.
     LiquidAddressAlreadyUsed,
+    /// A merchant tried to claim a donation-page alias slug that is already in
+    /// use by another surface. Aliases are globally unique; returned as HTTP
+    /// 409 so the client prompts for a different slug.
+    AliasTaken,
 
     // --- Capacity / rate-limit ---
     /// One source (IP, pubkey, etc.) is making too many requests.
@@ -174,7 +178,8 @@ impl AppError {
             | Self::RecoveryNotAvailable(_)
             | Self::RecoveryInProgress(_)
             | Self::BitcoinAddressAlreadyUsed
-            | Self::LiquidAddressAlreadyUsed => ErrorClass::Identity,
+            | Self::LiquidAddressAlreadyUsed
+            | Self::AliasTaken => ErrorClass::Identity,
 
             Self::RateLimitedSender
             | Self::RateLimitedRecipient
@@ -223,6 +228,7 @@ impl AppError {
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
+            Self::AliasTaken => "AliasTaken",
 
             Self::RateLimitedSender => "RateLimitedSender",
             Self::RateLimitedRecipient => "RateLimitedRecipient",
@@ -289,6 +295,7 @@ impl std::fmt::Display for AppError {
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
+            Self::AliasTaken => write!(f, "alias already taken"),
 
             Self::RateLimitedSender => write!(f, "rate limited (sender)"),
             Self::RateLimitedRecipient => write!(f, "rate limited (recipient)"),
@@ -367,6 +374,9 @@ impl IntoResponse for AppError {
             AppError::LiquidAddressAlreadyUsed => {
                 "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
+            AppError::AliasTaken => {
+                "This link name is already taken. Choose a different one.".into()
+            }
 
             AppError::RateLimitedSender => "Request rate limit exceeded for this source. Retry later.".into(),
             AppError::RateLimitedRecipient => "This Lightning Address has reached its request rate limit on the server. Retry later.".into(),
@@ -414,9 +424,9 @@ impl IntoResponse for AppError {
         // endpoints for consistency. Auth: 401. Hard ceiling: 503.
         let status = match &self {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
-            AppError::BitcoinAddressAlreadyUsed | AppError::LiquidAddressAlreadyUsed => {
-                StatusCode::CONFLICT
-            }
+            AppError::BitcoinAddressAlreadyUsed
+            | AppError::LiquidAddressAlreadyUsed
+            | AppError::AliasTaken => StatusCode::CONFLICT,
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::OK,
         };
@@ -462,6 +472,11 @@ impl From<sqlx::Error> for AppError {
             }
             if db_err.constraint() == Some("invoice_payment_addresses_liquid_address_key") {
                 return AppError::LiquidAddressAlreadyUsed;
+            }
+            // Two merchants raced to claim the same donation-page alias slug;
+            // the partial unique index is the arbiter and the loser lands here.
+            if db_err.constraint() == Some("donation_pages_alias_uidx") {
+                return AppError::AliasTaken;
             }
         }
         AppError::DbError(e.to_string())

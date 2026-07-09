@@ -28,6 +28,7 @@ use crate::error::AppError;
 use crate::image_pipeline::{self, ImageKind, PipelineConfig};
 use crate::ip_whitelist;
 use crate::pricer::{normalize_currency_code, PricerClient};
+use crate::reserved_nyms;
 use crate::AppState;
 
 // --- Action names ---
@@ -49,6 +50,16 @@ static TWITTER_HANDLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_]{1,50}$").unwrap());
 static INSTAGRAM_HANDLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._]{1,50}$").unwrap());
+
+/// Alias slug charset — mirrors NYM_REGEX (`registration.rs`): 1-32 chars,
+/// lowercase letters, digits, and interior hyphens, with no leading or
+/// trailing hyphen. Kept in sync with that rule so aliases and nyms share the
+/// same URL-safe shape. Underscore is intentionally excluded (which is also
+/// what keeps `payment_page` from ever validating as an alias — see the
+/// signed-field confusion guard).
+static ALIAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap()
+});
 
 // --- Request / response wire types ---
 
@@ -76,6 +87,14 @@ pub struct SaveDonationPageRequest {
     /// `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Merchant-chosen public URL slug for this surface, served at
+    /// `/a/<alias>`, decoupled from the nym. Optional and the NEWEST trailing
+    /// field in the signed payload (after `kind`), so any client that omits it
+    /// verifies against the older byte layout. Tri-state: absent leaves the
+    /// stored alias unchanged, `""` clears it, a non-empty value claims it.
+    /// See `docs/compatibility-ledger.md`.
+    #[serde(default)]
+    pub alias: Option<String>,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -108,17 +127,22 @@ pub struct DonationPageView {
     pub is_archived: bool,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
-    /// Public URL the user can share. Constructed from server domain + nym.
-    /// The POS surface lives at `/<nym>/pos`; the Payment Page at `/<nym>`.
+    /// Merchant-chosen alias slug for this surface, if one is claimed. `None`
+    /// means the surface is only reachable via its nym path.
+    pub alias: Option<String>,
+    /// Public URL the user can share. When an alias is set this is the
+    /// nym-free `/a/<alias>` link (the whole point of the feature); otherwise
+    /// it falls back to the nym path — `/<nym>/pos` for POS, `/<nym>` for the
+    /// Payment Page.
     pub public_url: String,
 }
 
 impl DonationPageView {
     fn from_row(row: db::DonationPage, domain: &str) -> Self {
-        let public_url = if row.kind == db::KIND_POS {
-            format!("https://{domain}/{}/pos", row.nym)
-        } else {
-            format!("https://{domain}/{}", row.nym)
+        let public_url = match row.alias.as_deref() {
+            Some(alias) => format!("https://{domain}/a/{alias}"),
+            None if row.kind == db::KIND_POS => format!("https://{domain}/{}/pos", row.nym),
+            None => format!("https://{domain}/{}", row.nym),
         };
         Self {
             nym: row.nym,
@@ -134,6 +158,7 @@ impl DonationPageView {
             is_archived: row.is_archived,
             avatar_sha256: row.avatar_sha256,
             og_sha256: row.og_sha256,
+            alias: row.alias,
             public_url,
         }
     }
@@ -219,11 +244,13 @@ fn validate_lengths(
 /// (`donation_page_constants.dart::buildSavePayloadFields`).
 /// Optional fields that are absent become empty strings (NOT skipped) so the
 /// number and order of NUL separators is invariant to which fields are set.
-/// `pos_mode`, `ct_descriptor`, and `kind` are optional trailing fields for
-/// shipped Bull Wallet compatibility; each is appended only when the client
-/// sent it, so a legacy client that omits them verifies against the older byte
-/// layout. `kind` is the newest field and MUST stay last. See
-/// `docs/compatibility-ledger.md`.
+/// `pos_mode`, `ct_descriptor`, `kind`, and `alias` are optional trailing
+/// fields for shipped Bull Wallet compatibility; each is appended only when the
+/// client sent it, so a legacy client that omits them verifies against the
+/// older byte layout. `alias` is the newest field and MUST stay last (after
+/// `kind`). Its validated value domain is kept disjoint from the other
+/// trailing fields (see the save handler) so a captured legacy message can
+/// never be replayed as an alias claim. See `docs/compatibility-ledger.md`.
 fn save_payload_fields<'a>(
     header: &'a str,
     description: &'a str,
@@ -235,6 +262,7 @@ fn save_payload_fields<'a>(
     pos_mode_str: Option<&'a str>,
     ct_descriptor: Option<&'a str>,
     kind: Option<&'a str>,
+    alias: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut fields = vec![
         header,
@@ -253,6 +281,9 @@ fn save_payload_fields<'a>(
     }
     if let Some(kind) = kind {
         fields.push(kind);
+    }
+    if let Some(alias) = alias {
+        fields.push(alias);
     }
     fields
 }
@@ -307,6 +338,36 @@ pub async fn save(
         })?,
     };
 
+    // Validate the alias slug BEFORE signature verification, alongside `kind`,
+    // so the newest trailing signed field's value domain is provably disjoint
+    // from the other optional trailing fields — pos_mode {"0","1"}, kind
+    // {"pos","payment_page"}, and ct_descriptor (parenthesised) — and a
+    // captured legacy message can't be replayed as an alias claim (KR-3).
+    // Charset excludes "payment_page" (underscore) and descriptors; the
+    // reserved-alias blocklist rejects "0"/"1"/"pos" and brand names.
+    //
+    // Tri-state for the upsert: absent leaves the stored alias unchanged,
+    // `Some("")` clears it, a validated non-empty value claims it.
+    let alias_update: Option<Option<&str>> = match req.alias.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(s) => {
+            if !ALIAS_REGEX.is_match(s) {
+                return Err(AppError::DonationPageInvalid(
+                    "alias must be 1-32 chars: lowercase letters, digits, and hyphens, \
+                     with no leading or trailing hyphen"
+                        .to_string(),
+                ));
+            }
+            if reserved_nyms::is_reserved_alias(s) {
+                return Err(AppError::DonationPageInvalid(
+                    "this link name is reserved; choose another".to_string(),
+                ));
+            }
+            Some(Some(s))
+        }
+    };
+
     // A POS surface owns its own wallet (idx 103), so it MUST carry a
     // descriptor. Without one, anonymous checkout on the POS branch has
     // nothing to settle to; the POS branch deliberately has no
@@ -339,6 +400,7 @@ pub async fn save(
         pos_mode_str,
         req.ct_descriptor.as_deref(),
         req.kind.as_deref(),
+        req.alias.as_deref(),
     );
     auth::verify_la_v2(
         ACTION_SAVE,
@@ -381,6 +443,7 @@ pub async fn save(
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
             pos_mode: req.pos_mode,
             enabled: req.enabled,
+            alias: alias_update,
         },
     )
     .await?;

@@ -27,6 +27,11 @@ pub struct DonationPage {
     pub description: String,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
+    /// Merchant-chosen public URL slug for this surface, served at
+    /// `/a/<alias>`. Decoupled from `nym` so the public link need not leak the
+    /// Lightning-Address name. Globally unique when present; `None` means the
+    /// surface is only reachable via its nym path.
+    pub alias: Option<String>,
     pub display_currency: String,
     pub website: Option<String>,
     pub twitter: Option<String>,
@@ -53,6 +58,11 @@ pub struct UpsertDonationPage<'a> {
     pub instagram: Option<&'a str>,
     pub pos_mode: Option<bool>,
     pub enabled: bool,
+    /// Tri-state alias update: `None` leaves the stored alias unchanged,
+    /// `Some(None)` clears it, `Some(Some(s))` claims/changes it. The partial
+    /// unique index is the race arbiter — a colliding claim surfaces as a
+    /// unique-violation the handler maps to `AppError::AliasTaken`.
+    pub alias: Option<Option<&'a str>>,
 }
 
 /// Insert-or-update a donation page row. Mobile sends the full page config on
@@ -63,11 +73,19 @@ pub async fn upsert_donation_page(
     pool: &PgPool,
     page: &UpsertDonationPage<'_>,
 ) -> Result<DonationPage, sqlx::Error> {
+    // Tri-state alias: $12 = "alias present in this save" (write it),
+    // $13 = the value (NULL clears). When absent the stored alias is left
+    // untouched on both the insert and update path.
+    let (alias_present, alias_value) = match page.alias {
+        None => (false, None),
+        Some(v) => (true, v),
+    };
     sqlx::query_as::<_, DonationPage>(
         "INSERT INTO donation_pages \
             (nym, kind, ct_descriptor, header, description, display_currency, \
-             website, twitter, instagram, pos_mode, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11) \
+             website, twitter, instagram, pos_mode, enabled, alias) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, \
+                 CASE WHEN $12 THEN $13 END) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
@@ -78,10 +96,11 @@ pub async fn upsert_donation_page(
              instagram = EXCLUDED.instagram, \
              pos_mode = COALESCE($10, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
+             alias = CASE WHEN $12 THEN $13 ELSE donation_pages.alias END, \
              archived_at = NULL, \
              updated_at = now() \
          RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                   display_currency, website, twitter, \
+                   alias, display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(page.nym)
@@ -95,6 +114,8 @@ pub async fn upsert_donation_page(
     .bind(page.instagram)
     .bind(page.pos_mode)
     .bind(page.enabled)
+    .bind(alias_present)
+    .bind(alias_value)
     .fetch_one(pool)
     .await
 }
@@ -111,7 +132,7 @@ pub async fn archive_donation_page(
         "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
          WHERE nym = $1 AND kind = $2 AND archived_at IS NULL \
          RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                   display_currency, website, twitter, \
+                   alias, display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(nym)
@@ -137,14 +158,14 @@ pub async fn update_donation_page_image_hash(
             "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
              WHERE nym = $1 AND kind = $2 \
              RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       display_currency, website, twitter, \
+                       alias, display_currency, website, twitter, \
                        instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         "og_sha256" => {
             "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
              WHERE nym = $1 AND kind = $2 \
              RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       display_currency, website, twitter, \
+                       alias, display_currency, website, twitter, \
                        instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         _ => {
@@ -168,13 +189,33 @@ pub async fn get_donation_page_by_nym(
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
-                ct_descriptor, next_addr_idx, \
+                alias, ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
                 instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
          FROM donation_pages WHERE nym = $1 AND kind = $2",
     )
     .bind(nym)
     .bind(kind)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Resolve a public alias slug to its donation-page row. The alias is globally
+/// unique (partial unique index), so this returns at most one row regardless
+/// of nym or kind. Used by the `/a/<alias>` routes; the caller decides how to
+/// treat archived/disabled rows.
+pub async fn get_donation_page_by_alias(
+    pool: &PgPool,
+    alias: &str,
+) -> Result<Option<DonationPage>, sqlx::Error> {
+    sqlx::query_as::<_, DonationPage>(
+        "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
+                alias, ct_descriptor, next_addr_idx, \
+                display_currency, website, twitter, \
+                instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
+         FROM donation_pages WHERE alias = $1",
+    )
+    .bind(alias)
     .fetch_optional(pool)
     .await
 }

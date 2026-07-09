@@ -111,3 +111,29 @@ policy inline.
 - Removal condition: all supported Bull Wallet builds include `kind` in the
   signed donation-page payloads, and legacy requests without it are no longer
   accepted by the API contract.
+
+## Donation Page Alias (public URL slug)
+
+- Current field: `alias` on signed `PUT /donation-page` (save) requests. A
+  merchant-chosen slug served at `/a/<alias>`, decoupled from the nym.
+- Compatibility behavior: `alias` is the NEWEST optional trailing signed field,
+  appended AFTER `kind` (order: `pos_mode?`, `ct_descriptor?`, `kind?`,
+  `alias?`). Any client that omits it verifies against the older byte layout,
+  which stays a strict prefix of the new one, so shipped Bull Wallet signatures
+  keep verifying. Tri-state: absent leaves the stored alias unchanged, `""`
+  clears it, a non-empty value claims it (409 `AliasTaken` on collision).
+- Confusion guard (load-bearing): `alias` is validated BEFORE signature
+  verification and its value domain is kept provably disjoint from the other
+  optional trailing fields, so a captured legacy message whose sole trailing
+  signed field was `pos_mode`/`ct_descriptor`/`kind` can never be byte-identical
+  to a new alias-claiming message. Specifically: the alias charset
+  (`[a-z0-9-]`, no leading/trailing hyphen) excludes `payment_page` (underscore)
+  and CT descriptors (parentheses/commas), and the reserved-alias blocklist
+  rejects `0`/`1` (the `pos_mode` domain) and `pos` (a `kind` value). See
+  `reserved_nyms::is_reserved_alias` and `donation_page::save`.
+- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
+  before aliases existed; keeping `alias` trailing and optional preserves those
+  signatures (the same maneuver as `pos_mode` and `kind`).
+- Removal condition: all supported Bull Wallet builds include `alias` in the
+  signed donation-page payload, and legacy requests without it are no longer
+  accepted by the API contract.

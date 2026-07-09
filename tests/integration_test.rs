@@ -527,6 +527,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -553,6 +554,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -584,6 +586,7 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -664,6 +667,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -1013,6 +1017,7 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            alias: None,
         },
     )
     .await
@@ -1096,6 +1101,7 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            alias: None,
         },
     )
     .await
