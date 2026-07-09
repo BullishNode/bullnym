@@ -45,7 +45,7 @@ describe('request() error-envelope detection', () => {
   it('throws ApiError(429, ...) for RateLimited* codes, surfaced via isRateLimited', async () => {
     mockFetchOnce(200, { status: 'ERROR', code: 'RateLimitedSender', reason: 'rate limited (sender)' })
     try {
-      await createInvoice('alice', { amount_sat: 1000 })
+      await createInvoice('/alice', { amount_sat: 1000 })
       expect.unreachable('expected createInvoice to reject')
     } catch (err) {
       expect(err).toBeInstanceOf(ApiError)
@@ -62,7 +62,7 @@ describe('request() error-envelope detection', () => {
       code: 'ProofOfFundsRequired',
       reason: 'computed amount 17 sat below minimum 100 sat',
     })
-    await expect(createInvoice('alice', { amount_sat: 17 })).rejects.toMatchObject({
+    await expect(createInvoice('/alice', { amount_sat: 17 })).rejects.toMatchObject({
       status: 400,
       code: 'ProofOfFundsRequired',
       message: 'computed amount 17 sat below minimum 100 sat',
@@ -78,12 +78,28 @@ describe('request() error-envelope detection', () => {
       bitcoin_chain_bip21: null,
       expires_at_unix: 1234567890,
     })
-    const res = await createInvoice('alice', { amount_sat: 1000 })
+    const res = await createInvoice('/alice', { amount_sat: 1000 })
     expect(res.invoice_id).toBe('real-id')
   })
 
   it('still throws for a real non-2xx status (unchanged behavior)', async () => {
     mockFetchOnce(401, 'unauthorized')
     await expect(getInvoiceStatus('x')).rejects.toMatchObject({ status: 401 })
+  })
+
+  it('POSTs to <invoice_base>/invoice, so an alias base stays nym-free', async () => {
+    mockFetchOnce(200, {
+      invoice_id: 'id',
+      lightning_pr: '',
+      liquid_address: '',
+      bitcoin_chain_address: null,
+      bitcoin_chain_bip21: null,
+      expires_at_unix: 0,
+    })
+    await createInvoice('/a/alices-shop', { amount_sat: 1000 })
+    expect(fetch).toHaveBeenCalledWith(
+      '/a/alices-shop/invoice',
+      expect.objectContaining({ method: 'POST' }),
+    )
   })
 })

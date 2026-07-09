@@ -57,14 +57,10 @@
     creating = true
     errorMsg = null
     try {
-      const res = await createInvoice(
-        config.nym,
-        {
-          fiat_amount_minor: minor,
-          fiat_currency: settings.currency,
-        },
-        { pos: true },
-      )
+      const res = await createInvoice(config.invoice_base, {
+        fiat_amount_minor: minor,
+        fiat_currency: settings.currency,
+      })
       cacheInvoice({
         invoice: res,
         note,
@@ -97,7 +93,7 @@
     <section class="flex min-h-0 flex-1 flex-col overflow-hidden px-5 py-3 sm:px-8 sm:py-5">
       <header class="mb-3 flex shrink-0 items-center justify-between gap-4 sm:mb-5">
         <div>
-          <h1 class="font-display text-3xl uppercase tracking-display leading-none">{config.header || config.nym}</h1>
+          <h1 class="font-display text-3xl uppercase tracking-display leading-none">{config.header || config.page_key}</h1>
           {#if config.description}
             <p class="mt-0.5 text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
               {config.description}

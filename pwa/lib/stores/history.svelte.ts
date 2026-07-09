@@ -19,7 +19,7 @@ export interface HistoryRecord {
 
 const MAX_RECORDS = 200
 
-const store = localStore<HistoryRecord[]>(`bullnym:history:${config.nym}`, [])
+const store = localStore<HistoryRecord[]>(`bullnym:history:${config.page_key}`, [])
 
 export const history = {
   get records(): HistoryRecord[] {

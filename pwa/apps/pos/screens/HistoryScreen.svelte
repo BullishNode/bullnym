@@ -25,7 +25,7 @@
     <div class="mb-5">
       <h1 class="font-display text-4xl uppercase tracking-display leading-none">Recent transactions</h1>
       <p class="mt-1 text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
-        {config.header || config.nym}
+        {config.header || config.page_key}
       </p>
     </div>
 
