@@ -443,7 +443,7 @@ pub async fn create_anonymous(
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
-    create_anonymous_for_kind(state, nym, db::KIND_PAYMENT_PAGE, peer_opt, headers, req).await
+    create_anonymous_for_kind(state, nym, db::KIND_PAYMENT_PAGE, None, peer_opt, headers, req).await
 }
 
 /// POST /:nym/pos/invoice — keyless POS terminal checkout. Same anonymous
@@ -458,7 +458,7 @@ pub async fn create_anonymous_pos(
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
-    create_anonymous_for_kind(state, nym, db::KIND_POS, peer_opt, headers, req).await
+    create_anonymous_for_kind(state, nym, db::KIND_POS, None, peer_opt, headers, req).await
 }
 
 /// POST /a/:slug/invoice — keyless checkout for an alias surface. Resolves the
@@ -480,8 +480,9 @@ pub async fn create_anonymous_alias(
     }
     // Recover the &'static kind for the shared implementation. The row's kind
     // is always a canonical value, so this never fails in practice.
-    let kind = db::normalize_kind(&page.kind).ok_or_else(|| AppError::DonationPageNotFound(slug))?;
-    create_anonymous_for_kind(state, page.nym, kind, peer_opt, headers, req).await
+    let kind = db::normalize_kind(&page.kind)
+        .ok_or_else(|| AppError::DonationPageNotFound(slug.clone()))?;
+    create_anonymous_for_kind(state, page.nym, kind, Some(slug), peer_opt, headers, req).await
 }
 
 /// Shared anonymous-checkout implementation for the donation-page surfaces.
@@ -491,6 +492,10 @@ async fn create_anonymous_for_kind(
     state: AppState,
     nym: String,
     kind: &'static str,
+    // When the checkout came in via `/a/<slug>/invoice`, the slug is recorded
+    // on the invoice so its public URL (bolt11 description, BIP21 message)
+    // stays nym-free. `None` for the nym-path routes.
+    public_slug: Option<String>,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     req: CreateAnonymousRequest,
@@ -588,6 +593,7 @@ async fn create_anonymous_for_kind(
 
     let new_invoice = db::NewInvoice {
         nym_owner: Some(&nym),
+        public_slug: public_slug.as_deref(),
         npub_owner: &owner.npub,
         origin: "checkout",
         fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),
@@ -1566,10 +1572,21 @@ fn lightning_swap_nym(invoice: &db::Invoice) -> Option<&str> {
     invoice.nym_owner.as_deref()
 }
 
-fn invoice_public_url(domain: &str, nym_owner: Option<&str>, invoice_id: Uuid) -> String {
-    match nym_owner {
-        Some(nym) => format!("https://{domain}/{nym}/i/{invoice_id}"),
-        None => format!("https://{domain}/invoice/{invoice_id}"),
+/// The invoice's public-facing URL, embedded in payment payloads (bolt11
+/// description, BIP21 `message=`). An invoice created under an alias uses the
+/// nym-free `/a/<slug>/i/<id>` form so the nym never reaches the payer; a
+/// nym-path checkout uses `/<nym>/i/<id>`; a wallet-only invoice uses the
+/// nym-less `/invoice/<id>`.
+fn invoice_public_url(
+    domain: &str,
+    nym_owner: Option<&str>,
+    public_slug: Option<&str>,
+    invoice_id: Uuid,
+) -> String {
+    match (public_slug, nym_owner) {
+        (Some(slug), _) => format!("https://{domain}/a/{slug}/i/{invoice_id}"),
+        (None, Some(nym)) => format!("https://{domain}/{nym}/i/{invoice_id}"),
+        (None, None) => format!("https://{domain}/invoice/{invoice_id}"),
     }
 }
 
@@ -1643,6 +1660,7 @@ async fn create_lightning_offer(
     let public_url = invoice_public_url(
         &state.config.domain,
         invoice.nym_owner.as_deref(),
+        invoice.public_slug.as_deref(),
         invoice.id,
     );
     let boltz_description = boltz_invoice_description_for_url(&public_url);
@@ -1741,6 +1759,7 @@ async fn create_bitcoin_chain_offer(
     let public_url = invoice_public_url(
         &state.config.domain,
         invoice.nym_owner.as_deref(),
+        invoice.public_slug.as_deref(),
         invoice.id,
     );
     let lockup_bip21 = result
@@ -2139,6 +2158,7 @@ async fn create_invoice_inner(
 
     let new_invoice = db::NewInvoice {
         nym_owner: linked_nym.as_deref(),
+        public_slug: None,
         npub_owner: &req.npub,
         origin: "wallet",
         fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),

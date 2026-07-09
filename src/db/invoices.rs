@@ -23,6 +23,11 @@ pub struct Invoice {
     pub id: Uuid,
     /// Merchant payment-page nym; NULL for unlinked (wallet-only) invoices.
     pub nym_owner: Option<String>,
+    /// Alias slug the invoice was created under (via `/a/<slug>/invoice`), if
+    /// any. When set, the invoice's public-facing URL (bolt11 description,
+    /// BIP21 message) is `/a/<slug>/i/<id>` instead of the nym path, so the
+    /// nym never appears in the payment payload the payer sees.
+    pub public_slug: Option<String>,
     /// Canonical recipient identity (hex x-only Schnorr pubkey). Always set.
     pub npub_owner: String,
     pub origin: String,
@@ -61,7 +66,7 @@ pub struct Invoice {
 /// (mirrors the SwapRecord pattern). FromRow matches by alias name, so
 /// the order is cosmetic.
 const INVOICE_COLUMNS: &str =
-    "id, nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+    "id, nym_owner, public_slug, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
      rate_minor_per_btc, memo, recipient_label, \
      bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      public_description, invoice_number, \
@@ -77,6 +82,10 @@ const INVOICE_COLUMNS: &str =
 pub struct NewInvoice<'a> {
     /// Merchant payment-page nym, or `None` for unlinked (wallet-only) invoices.
     pub nym_owner: Option<&'a str>,
+    /// Alias slug the invoice is created under (`/a/<slug>/invoice`), or `None`
+    /// for nym-path and wallet-origin invoices. Drives the nym-free public URL
+    /// embedded in payment payloads.
+    pub public_slug: Option<&'a str>,
     /// Canonical recipient identity (hex x-only Schnorr pubkey). Required.
     pub npub_owner: &'a str,
     /// 'checkout' or 'wallet'. Caller validates against the enum upstream.
@@ -140,12 +149,12 @@ pub async fn insert_invoice(
              public_description, invoice_number, \
              accept_btc, accept_ln, accept_liquid, \
              bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
-             expires_at) \
+             public_slug, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  NOW() + ($8 || ' seconds')::interval, $9, $10, \
                  $11, $12, $13, $14, $15, $16, $17, \
                  CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
-                 NOW() + ($19 || ' seconds')::interval) \
+                 $20, NOW() + ($19 || ' seconds')::interval) \
          RETURNING {INVOICE_COLUMNS}"
     ))
     .bind(invoice.nym_owner)
@@ -167,6 +176,7 @@ pub async fn insert_invoice(
     .bind(invoice.liquid_address)
     .bind(invoice.liquid_blinding_key_hex)
     .bind(invoice.expires_in_secs)
+    .bind(invoice.public_slug)
     .fetch_one(&mut *tx)
     .await?;
 

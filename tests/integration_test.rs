@@ -1983,6 +1983,7 @@ async fn insert_test_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
+            public_slug: None,
             npub_owner: npub,
             origin: "checkout",
             fiat_amount_minor: None,
@@ -2153,6 +2154,7 @@ async fn insert_test_btc_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
+            public_slug: None,
             npub_owner: npub,
             origin: "wallet",
             fiat_amount_minor: None,
@@ -2570,6 +2572,7 @@ async fn invoice_insert_rejects_reused_liquid_address() {
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("liqreuse"),
+            public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
             fiat_amount_minor: None,
@@ -3288,6 +3291,7 @@ async fn stale_wallet_partial_stays_payable() {
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("walletpartial"),
+            public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
             fiat_amount_minor: None,

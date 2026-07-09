@@ -137,12 +137,17 @@ fn invoice_public_url_builds_linked_and_unlinked_urls() {
     let id = Uuid::nil();
 
     assert_eq!(
-        invoice_public_url("bullpay.ca", Some("alice"), id),
+        invoice_public_url("bullpay.ca", Some("alice"), None, id),
         "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000"
     );
     assert_eq!(
-        invoice_public_url("bullpay.ca", None, id),
+        invoice_public_url("bullpay.ca", None, None, id),
         "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000"
+    );
+    // An alias slug wins over the nym, so the public URL is nym-free.
+    assert_eq!(
+        invoice_public_url("bullpay.ca", Some("alice"), Some("alices-shop"), id),
+        "https://bullpay.ca/a/alices-shop/i/00000000-0000-0000-0000-000000000000"
     );
 }
 
@@ -161,6 +166,7 @@ fn max_bullpay_invoice_url_fits_boltz_description_limit() {
     let url = invoice_public_url(
         "bullpay.ca",
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        None,
         Uuid::nil(),
     );
 
@@ -458,6 +464,7 @@ fn invoice_fixture() -> db::Invoice {
     db::Invoice {
         id: Uuid::nil(),
         nym_owner: Some("alice".to_string()),
+        public_slug: None,
         npub_owner: "npub".to_string(),
         origin: "wallet".to_string(),
         fiat_amount_minor: None,
