@@ -151,9 +151,11 @@ fn validate_lengths(
             "header must be 1..={MAX_HEADER_LEN} chars"
         )));
     }
-    if req.description.is_empty() || req.description.len() > MAX_DESCRIPTION_LEN {
+    // description is OPTIONAL for both payment pages and POS — an empty
+    // description is allowed; only the upper bound is enforced when one is set.
+    if req.description.len() > MAX_DESCRIPTION_LEN {
         return Err(AppError::DonationPageInvalid(format!(
-            "description must be 1..={MAX_DESCRIPTION_LEN} chars"
+            "description must be at most {MAX_DESCRIPTION_LEN} chars"
         )));
     }
     let normalized_currency = normalize_currency_code(&req.display_currency);
