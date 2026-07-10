@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "041_invoices_public_slug";
+pub const EXPECTED_SCHEMA_MARKER: &str = "043_claim_stuck_slow_recovery";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {

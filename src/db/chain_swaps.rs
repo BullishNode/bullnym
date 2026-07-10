@@ -667,6 +667,57 @@ pub async fn record_chain_swap_claim_failure(
     Ok(outcome)
 }
 
+/// Funded chain swaps stranded in `claim_stuck` whose slow-recovery backoff is
+/// due (issue #63). Bounded + oldest-first; returns `(id, boltz_swap_id,
+/// slow_attempts)`. Mirror of `swaps::list_claim_stuck_swaps_for_slow_retry`.
+pub async fn list_claim_stuck_chain_swaps_for_slow_retry(
+    pool: &PgPool,
+    limit: u32,
+) -> Result<Vec<(Uuid, String, i32)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, String, i32)>(
+        "SELECT id, boltz_swap_id, slow_attempts \
+         FROM chain_swap_records \
+         WHERE status = 'claim_stuck' \
+           AND (next_slow_attempt_at IS NULL OR next_slow_attempt_at <= NOW()) \
+         ORDER BY next_slow_attempt_at NULLS FIRST \
+         LIMIT $1",
+    )
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
+/// Revive a `claim_stuck` chain swap into the normal claim sweep for exactly one
+/// more attempt (status → `claim_failed`, which `get_ready_to_claim_chain_swaps`
+/// selects; `claim_attempts → max-1`; due now) and schedule the next slow
+/// revival with capped backoff. Guarded on `status='claim_stuck'`. The retry's
+/// own outspend-probe recovery handles an already-spent lockup, so this never
+/// blindly rebuilds. Returns rows affected (0 or 1). Mirror of
+/// `swaps::revive_claim_stuck_swap_for_slow_retry`.
+pub async fn revive_claim_stuck_chain_swap_for_slow_retry(
+    pool: &PgPool,
+    id: Uuid,
+    max_attempts: i32,
+    backoff_secs: u64,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'claim_failed', \
+             claim_attempts = GREATEST(0, $2 - 1), \
+             next_claim_attempt_at = NOW(), \
+             slow_attempts = slow_attempts + 1, \
+             next_slow_attempt_at = NOW() + (($3 || ' seconds')::interval) * (0.8 + 0.4 * random()), \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'claim_stuck'",
+    )
+    .bind(id)
+    .bind(max_attempts)
+    .bind(backoff_secs as i64)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn clear_chain_swap_claim_failure_state(
     pool: &PgPool,
     id: Uuid,

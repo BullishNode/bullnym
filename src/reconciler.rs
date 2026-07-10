@@ -129,6 +129,93 @@ pub fn spawn_settlement_repair(
     });
 }
 
+/// Slow-recovery task (issue #63). Funded swaps that exhaust the fast claim
+/// retry budget land in `claim_stuck`, which every claim-sweep query excludes —
+/// so a claimable output stranded by a transient outage (backend down, fee
+/// mismatch, cooperative claim unavailable, deploy bug) would be abandoned even
+/// after health returns. This revives such rows back into the normal claim
+/// sweep on a long, persisted, capped backoff. It does NOT claim or probe the
+/// chain itself — it hands the row to the battle-tested claim path (which does
+/// the cooperative→script fallback and outspend-probe recovery on an
+/// already-spent lockup). Runs at a much slower cadence than the main
+/// reconciler and is bounded per tick, so it can never starve normal claiming
+/// or hot-loop.
+pub fn spawn_slow_recovery(state: AppState, config: Arc<ReconcilerConfig>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(config.slow_recovery_interval_secs));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("slow recovery: shutting down");
+                    return;
+                }
+                _ = tick.tick() => {
+                    if let Err(e) = run_slow_recovery_tick(&state, &config).await {
+                        tracing::error!("slow recovery tick failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Next slow-recovery backoff: `base * 2^slow_attempts`, capped, saturating.
+/// Pure so it is unit-tested without a DB.
+fn slow_recovery_backoff_secs(slow_attempts: i32, base_secs: u64, cap_secs: u64) -> u64 {
+    let exp = slow_attempts.clamp(0, 16) as u32;
+    base_secs
+        .saturating_mul(2u64.saturating_pow(exp))
+        .min(cap_secs)
+}
+
+async fn run_slow_recovery_tick(
+    state: &AppState,
+    config: &ReconcilerConfig,
+) -> Result<(), sqlx::Error> {
+    let limit = config.slow_recovery_max_per_tick;
+    let max_attempts = state.config.claim.max_claim_attempts;
+    let base = config.slow_recovery_backoff_base_secs;
+    let cap = config.slow_recovery_backoff_cap_secs;
+
+    // Reverse rail.
+    let reverse = db::list_claim_stuck_swaps_for_slow_retry(&state.db, limit).await?;
+    for (id, boltz_swap_id, slow_attempts) in &reverse {
+        let backoff = slow_recovery_backoff_secs(*slow_attempts, base, cap);
+        let revived =
+            db::revive_claim_stuck_swap_for_slow_retry(&state.db, *id, max_attempts, backoff).await?;
+        if revived == 1 {
+            tracing::warn!(
+                event = "slow_recovery_revived",
+                rail = "lightning_boltz_reverse",
+                swap_id = %boltz_swap_id,
+                slow_attempt = slow_attempts + 1,
+                "reviving funded claim_stuck reverse swap into the claim sweep"
+            );
+        }
+    }
+
+    // Chain rail.
+    let chain = db::list_claim_stuck_chain_swaps_for_slow_retry(&state.db, limit).await?;
+    for (id, boltz_swap_id, slow_attempts) in &chain {
+        let backoff = slow_recovery_backoff_secs(*slow_attempts, base, cap);
+        let revived =
+            db::revive_claim_stuck_chain_swap_for_slow_retry(&state.db, *id, max_attempts, backoff)
+                .await?;
+        if revived == 1 {
+            tracing::warn!(
+                event = "slow_recovery_revived",
+                rail = "bitcoin_boltz_chain",
+                swap_id = %boltz_swap_id,
+                slow_attempt = slow_attempts + 1,
+                "reviving funded claim_stuck chain swap into the claim sweep"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_settlement_repair_tick(
     state: &AppState,
     config: &ReconcilerConfig,

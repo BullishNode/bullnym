@@ -239,6 +239,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tracing::info!("settlement repair started (shares reconciler config)");
 
+        // Slow recovery: revives funded `claim_stuck` swaps back into the claim
+        // sweep on a long capped backoff so a transient-outage-stranded output
+        // isn't abandoned once the retry budget is spent (issue #63).
+        reconciler::spawn_slow_recovery(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+        );
+        tracing::info!("slow recovery started (shares reconciler config)");
+
         // Periodic GC of rate-limit tables. Without this, sliding-window
         // queries get progressively slower as inactive rows accumulate.
         {

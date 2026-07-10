@@ -182,6 +182,18 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'invoices' \
                   AND column_name = 'public_slug' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'swap_records' \
+                  AND column_name = 'next_slow_attempt_at' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name = 'next_slow_attempt_at' \
             )",
     )
     .fetch_one(pool)
