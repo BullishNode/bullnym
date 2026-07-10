@@ -89,13 +89,20 @@ pub async fn next_swap_key_index(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(row.0 as u64)
 }
 
-/// Current high-water mark of `swap_key_seq` without consuming a value.
-/// Compared against the maximum persisted index at startup to detect a
-/// database restore that rewound the sequence. See migration 044.
-pub async fn swap_key_seq_last_value(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as("SELECT last_value FROM swap_key_seq")
-        .fetch_one(pool)
-        .await?;
+/// The value the NEXT `nextval('swap_key_seq')` will return, without consuming
+/// it. Requires `is_called`: once a value has been issued, `last_value` is that
+/// issued value (so `last_value == MAX(persisted index)` is the normal steady
+/// state, not a rollback) and the next issue is `last_value + 1`; before any
+/// issue, `last_value` itself is next. Compared against the maximum persisted
+/// index at startup to detect a database restore that rewound the sequence.
+/// See migration 044.
+pub async fn swap_key_seq_next_value(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END \
+         FROM swap_key_seq",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(row.0)
 }
 

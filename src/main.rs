@@ -196,14 +196,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(true) => tracing::error!(
             event = "swap_key_sequence_rollback",
             fingerprint = %swap_key_root_fingerprint,
-            "swap_key_seq is at or behind an already-issued index — the key \
-             sequence may have been rewound by a database restore. New swaps \
-             would reuse existing key material. Investigate before accepting \
-             new payments; restore the correct backup or advance swap_key_seq."
+            "swap_key_seq would next issue an index that is already persisted \
+             on a swap — the key sequence may have been rewound by a database \
+             restore. New swaps would reuse existing key material. Investigate \
+             before accepting new payments; restore the correct backup or \
+             advance swap_key_seq past the highest persisted index."
         ),
         Ok(false) => tracing::info!(
             event = "swap_key_sequence_ok",
-            "swap key sequence high-water mark is ahead of all persisted indices"
+            "swap key sequence is ahead of all persisted indices"
         ),
         Err(e) => tracing::warn!(
             event = "swap_key_sequence_check_skipped",
