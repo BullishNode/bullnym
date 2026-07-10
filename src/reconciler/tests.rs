@@ -162,3 +162,18 @@ fn unknown_boltz_status_is_noop() {
         ReconcilerAction::Noop
     );
 }
+
+#[test]
+fn slow_recovery_backoff_grows_and_caps() {
+    let base = 3600;
+    let cap = 86_400;
+    // Doubles per slow_attempt.
+    assert_eq!(super::slow_recovery_backoff_secs(0, base, cap), 3600);
+    assert_eq!(super::slow_recovery_backoff_secs(1, base, cap), 7200);
+    assert_eq!(super::slow_recovery_backoff_secs(2, base, cap), 14_400);
+    // Caps (2^5 * 3600 = 115200 > 86400).
+    assert_eq!(super::slow_recovery_backoff_secs(5, base, cap), cap);
+    assert_eq!(super::slow_recovery_backoff_secs(50, base, cap), cap);
+    // Never panics on large / negative-ish inputs (clamped).
+    assert_eq!(super::slow_recovery_backoff_secs(-1, base, cap), 3600);
+}
