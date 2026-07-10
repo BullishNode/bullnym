@@ -478,6 +478,17 @@ impl From<sqlx::Error> for AppError {
             if db_err.constraint() == Some("donation_pages_alias_uidx") {
                 return AppError::AliasTaken;
             }
+            // A second reverse swap tried to persist an already-used Boltz swap
+            // id (issue #69). Boltz ids are unique, so this is an integrity
+            // incident (retry/concurrency/import defect), never a normal path.
+            // Fail closed with a distinctive message; DbError logs at error
+            // level in `into_response`, so it is alertable. The caller never
+            // reaches BOLT11 exposure because the insert is rejected first.
+            if db_err.constraint() == Some("swap_records_boltz_swap_id_key") {
+                return AppError::DbError(
+                    "reverse swap boltz_swap_id collision (unique violation)".to_string(),
+                );
+            }
         }
         AppError::DbError(e.to_string())
     }

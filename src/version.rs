@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "041_invoices_public_slug";
+pub const EXPECTED_SCHEMA_MARKER: &str = "042_reverse_boltz_swap_id_unique";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {
