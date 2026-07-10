@@ -462,6 +462,22 @@ impl UtxoBackend for ElectrumClient {
             other => AppError::ElectrumError(format!("transaction_get_raw: {other}")),
         })?;
 
+        // Verify the backend returned bytes for the transaction we asked for
+        // BEFORE caching or returning them (#66). A backend/proxy/cache/failover
+        // bug can hand back valid bytes for a different txid; using those would
+        // corrupt outpoint selection, script verification, claim construction,
+        // and recovery evidence. A mismatch must never be cached.
+        if let Err(e) = verify_liquid_raw_tx(txid_hex, &bytes) {
+            tracing::error!(
+                event = "raw_tx_integrity_mismatch",
+                backend = "liquid_electrum",
+                requested_txid = %txid_hex,
+                error = %e,
+                "backend returned a raw tx failing txid verification; rejecting (failover retries on the next call)"
+            );
+            return Err(e);
+        }
+
         {
             let mut cache = self.cache.lock().await;
             cache.insert(txid_hex.to_string(), bytes.clone(), self.cache_max);
@@ -617,6 +633,24 @@ fn history_txids(history: &serde_json::Value) -> Result<Vec<String>, AppError> {
                 })
         })
         .collect()
+}
+
+/// Decode raw Liquid transaction bytes and confirm they are the transaction
+/// that was requested by recomputing the canonical txid (#66). Returns an
+/// error on malformed bytes or a txid mismatch; the caller rejects (never
+/// caches) the response. Kept as a free function so it is unit-testable and so
+/// every `get_raw_tx` response is verified at one choke point.
+fn verify_liquid_raw_tx(requested_txid_hex: &str, bytes: &[u8]) -> Result<(), AppError> {
+    let tx: elements::Transaction = elements::encode::deserialize(bytes)
+        .map_err(|e| AppError::ElectrumError(format!("raw tx decode failed: {e}")))?;
+    let actual = tx.txid().to_string();
+    if actual.eq_ignore_ascii_case(requested_txid_hex) {
+        Ok(())
+    } else {
+        Err(AppError::ElectrumError(format!(
+            "raw tx txid mismatch: requested {requested_txid_hex}, backend returned {actual}"
+        )))
+    }
 }
 
 fn transaction_spends_outpoint(tx: &elements::Transaction, txid_hex: &str, vout: u32) -> bool {
