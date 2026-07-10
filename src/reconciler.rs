@@ -224,16 +224,15 @@ async fn run_settlement_repair_tick(
     // two, after which the event exists and the row drops out of the query.
     // The window covers the maximum invoice lifetime.
     const REPAIR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+    let tolerances = db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting);
+
+    // --- Lightning (reverse) rail ---
     let stuck = db::list_claimed_swaps_missing_lightning_event(
         &state.db,
         REPAIR_MAX_AGE_SECS,
         config.max_per_tick,
     )
     .await?;
-    if stuck.is_empty() {
-        return Ok(());
-    }
-    let tolerances = db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting);
     for swap in &stuck {
         let (Some(invoice_id), Some(claim_txid)) = (swap.invoice_id, swap.claim_txid.as_deref())
         else {
@@ -241,6 +240,7 @@ async fn run_settlement_repair_tick(
         };
         tracing::warn!(
             event = "settlement_repair",
+            rail = "lightning_boltz_reverse",
             swap_id = %swap.boltz_swap_id,
             invoice_id = %invoice_id,
             "re-recording missing invoice payment event for a claimed Lightning swap"
@@ -249,6 +249,48 @@ async fn run_settlement_repair_tick(
             &state.db,
             Some(invoice_id),
             swap.amount_sat,
+            &swap.boltz_swap_id,
+            claim_txid,
+            tolerances,
+        )
+        .await;
+    }
+
+    // --- Bitcoin (chain) rail (issue #61) ---
+    // Same crash-consistency gap: a chain swap can reach terminal `claimed`
+    // (merchant L-BTC on chain) without its `bitcoin_boltz_chain` payment event.
+    // Reuse the same idempotent event key and the same settlement flip, so a
+    // repaired invoice lands in the identical state as an uninterrupted claim,
+    // and a replay is a no-op (ON CONFLICT on the UNIQUE event_key).
+    let chain_stuck = db::list_claimed_chain_swaps_missing_payment_event(
+        &state.db,
+        REPAIR_MAX_AGE_SECS,
+        config.max_per_tick,
+    )
+    .await?;
+    for swap in &chain_stuck {
+        // The query requires a persisted claim txid; a terminal status alone is
+        // never fabricated into a payment. Guard defensively and alert instead.
+        let Some(claim_txid) = swap.claim_txid.as_deref() else {
+            tracing::error!(
+                event = "settlement_repair_irreconcilable",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                "claimed chain swap missing claim_txid; not fabricating a payment"
+            );
+            continue;
+        };
+        tracing::warn!(
+            event = "settlement_repair",
+            rail = "bitcoin_boltz_chain",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            "re-recording missing invoice payment event for a claimed chain swap"
+        );
+        crate::invoice::flip_invoice_on_bitcoin_boltz_settlement(
+            &state.db,
+            Some(swap.invoice_id),
+            swap.effective_server_lock_amount_sat(),
             &swap.boltz_swap_id,
             claim_txid,
             tolerances,

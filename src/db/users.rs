@@ -358,13 +358,31 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
         return Ok(PurgeOutcome::NotFound);
     };
 
-    let in_flight: i64 = sqlx::query_scalar(
+    // Reverse-swap obligations. `claim_stuck` (not in the excluded set) also
+    // blocks purge — a stuck claim is still a live obligation.
+    let reverse_in_flight: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM swap_records \
          WHERE nym = $1 AND status NOT IN ('claimed', 'expired')",
     )
     .bind(&user.nym)
     .fetch_one(&mut *tx)
     .await?;
+    // Chain-swap obligations (issue #67): recovery and accounting depend on
+    // retaining the owning merchant record until every chain swap is
+    // economically final. Non-final = everything except claimed/refunded/
+    // expired/lockup_failed, so claim_stuck, refund_due, and refunding (funded,
+    // recoverable, or refund-in-flight) all block purge. The FOR UPDATE on the
+    // user row above serializes this against swap creation that resolves the
+    // owner through the same row.
+    let chain_in_flight: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chain_swap_records \
+         WHERE nym = $1 \
+           AND status NOT IN ('claimed', 'refunded', 'expired', 'lockup_failed')",
+    )
+    .bind(&user.nym)
+    .fetch_one(&mut *tx)
+    .await?;
+    let in_flight = reverse_in_flight + chain_in_flight;
     if in_flight > 0 {
         tx.rollback().await?;
         return Ok(PurgeOutcome::InFlightSwaps(in_flight as usize));

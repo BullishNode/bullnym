@@ -337,3 +337,40 @@ fn transaction_spends_exact_outpoint_only() {
     assert!(!transaction_spends_outpoint(&tx, &target.to_string(), 8));
     assert!(!transaction_spends_outpoint(&tx, &other.to_string(), 7));
 }
+
+#[test]
+fn verify_liquid_raw_tx_accepts_matching_and_rejects_mismatch_or_malformed() {
+    // A minimal but valid Liquid transaction; serialize it and confirm the
+    // verify helper accepts its own txid, rejects a different requested txid,
+    // and rejects malformed bytes (#66).
+    let tx = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: vec![elements::TxIn {
+            previous_output: elements::OutPoint::new(
+                elements::Txid::from_slice(&[9u8; 32]).unwrap(),
+                0,
+            ),
+            is_pegin: false,
+            script_sig: elements::Script::new(),
+            sequence: elements::Sequence::MAX,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness::default(),
+        }],
+        output: vec![],
+    };
+    let bytes = elements::encode::serialize(&tx);
+    let txid = tx.txid().to_string();
+
+    // Correct txid (and mixed case) verifies.
+    assert!(super::verify_liquid_raw_tx(&txid, &bytes).is_ok());
+    assert!(super::verify_liquid_raw_tx(&txid.to_uppercase(), &bytes).is_ok());
+
+    // Valid bytes returned for a DIFFERENT requested txid is rejected.
+    let other = elements::Txid::from_slice(&[7u8; 32]).unwrap().to_string();
+    assert!(super::verify_liquid_raw_tx(&other, &bytes).is_err());
+
+    // Malformed bytes are rejected before any downstream use.
+    assert!(super::verify_liquid_raw_tx(&txid, &[0xde, 0xad, 0xbe, 0xef]).is_err());
+    assert!(super::verify_liquid_raw_tx(&txid, &[]).is_err());
+}
