@@ -24,4 +24,22 @@ check_clean_worktree() {
 check_clean_worktree "bullnym" "$repo_root"
 check_clean_worktree "boltz-client path dependency" "$repo_root/../boltz/boltz-rust"
 
-echo "release preflight passed: bullnym and boltz-client dependency are clean"
+# Verify the boltz-client checkout matches the release-manifest.toml pin
+# (issue #70). build.rs enforces the same thing during `--release` builds;
+# this gives operators the answer without waiting for a compile.
+manifest="$repo_root/release-manifest.toml"
+expected_commit="$(sed -n 's/^commit = "\(.*\)"/\1/p' "$manifest")"
+actual_commit="$(git -C "$repo_root/../boltz/boltz-rust" rev-parse HEAD)"
+if [[ "$actual_commit" != "$expected_commit" ]]; then
+    echo "release preflight failed: boltz-client is at $actual_commit," >&2
+    echo "release-manifest.toml pins $expected_commit" >&2
+    exit 1
+fi
+origin_id="$(git -C "$repo_root/../boltz/boltz-rust" remote get-url origin \
+    | sed -E 's#.*(github.com[:/][^/]+/[^/. ]+).*#\1#' | tr : /)"
+if ! grep -qF "$origin_id" "$manifest"; then
+    echo "release preflight failed: boltz-client origin $origin_id is not in release-manifest.toml allowed_remotes" >&2
+    exit 1
+fi
+
+echo "release preflight passed: worktrees clean, boltz-client pinned at $expected_commit"

@@ -1,0 +1,23 @@
+# Release provenance manifest (issue #70).
+#
+# bullnym consumes boltz-client as a sibling path dependency, so a bullnym
+# commit does not by itself identify the swap-construction code in a build.
+# This manifest pins the exact revision a release artifact must be built
+# against; build.rs enforces it for `--release` builds and embeds the actual
+# revision in the binary either way.
+#
+# To upgrade the fork: land the boltz-rust change, then update `commit` here
+# in the same bullnym PR. The pin lives in version control precisely so the
+# upgrade is reviewable.
+
+[boltz_client]
+# Path of the expected checkout, relative to this repository root
+# (must match the path dependency in Cargo.toml).
+path = "../boltz/boltz-rust"
+# Exact commit a release build must be built against.
+commit = "c20511854bbd996a74f914fa0327d4601b5d4f62"
+# Accepted `origin` remotes — the fork exists under two org mirrors.
+allowed_remotes = [
+    "github.com/BullishNode/boltz-rust",
+    "github.com/SatoshiPortal/boltz-rust",
+]

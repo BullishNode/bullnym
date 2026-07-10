@@ -36,8 +36,14 @@ echo "NOTE: migrations are applied manually and deliberately:"
 echo "  PGPASSWORD=\$(cat ~/.pgpass_payservice) psql -h 127.0.0.1 -U payservice -d payservice -f migrations/NNN_*.sql"
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'
 
+./scripts/release-preflight.sh
+
 export CARGO_BUILD_JOBS=2
 cargo build --release
+
+# Record the artifact digest for release provenance (issue #70). Pair it with
+# the "build provenance" startup log line to identify exactly what is running.
+sha256sum "$REPO/target/release/pay-service" | sed 's/^/artifact sha256: /'
 
 sudo install -o payservice -g payservice -m 755 "$REPO/target/release/pay-service" "$APP/pay-service.new"
 sudo mv "$APP/pay-service.new" "$APP/pay-service"

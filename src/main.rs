@@ -46,6 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Build provenance (issue #70): operator-only record of exactly what this
+    // artifact was built from, including the swap-constructing boltz-client
+    // fork. `pin` is "verified" only when build.rs matched release-manifest.toml.
+    tracing::info!(
+        commit = option_env!("BULLNYM_BUILD_COMMIT").unwrap_or("unknown"),
+        dirty = option_env!("BULLNYM_BUILD_DIRTY").unwrap_or("unknown"),
+        profile = option_env!("BULLNYM_BUILD_PROFILE").unwrap_or("unknown"),
+        boltz_client_commit = option_env!("BOLTZ_CLIENT_COMMIT").unwrap_or("unknown"),
+        boltz_client_dirty = option_env!("BOLTZ_CLIENT_DIRTY").unwrap_or("unknown"),
+        pin = option_env!("BOLTZ_CLIENT_PIN").unwrap_or("unknown"),
+        schema_marker = version::EXPECTED_SCHEMA_MARKER,
+        "build provenance"
+    );
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
