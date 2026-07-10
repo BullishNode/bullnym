@@ -39,6 +39,7 @@
   /** Either a real fiat ISO code, or the synthetic 'sat'/'btc' units (never sent to the rate store — see onCurrencyChange). */
   let currency = $state(config.currency)
   let amount = $state('')
+  let message = $state('')
   let errorMsg = $state<string | null>(null)
   let creating = $state(false)
 
@@ -106,18 +107,20 @@
     creating = true
     errorMsg = null
     try {
-      const res = await createInvoice(
-        config.invoice_base,
-        unit === 'fiat' ? { fiat_amount_minor: fiatMinor, fiat_currency: currency } : { amount_sat: cryptoSat },
-      )
+      const trimmedMessage = message.trim()
+      const res = await createInvoice(config.invoice_base, {
+        ...(unit === 'fiat' ? { fiat_amount_minor: fiatMinor, fiat_currency: currency } : { amount_sat: cryptoSat }),
+        note: trimmedMessage || undefined,
+      })
       cacheInvoice({
         invoice: res,
-        note: '',
+        note: trimmedMessage,
         precision,
         unit,
         ...(unit === 'fiat' ? { fiatAmountMinor: fiatMinor, currency } : { amountSat: cryptoSat }),
       })
       amount = ''
+      message = ''
       router.go(`/pay/${res.invoice_id}`)
     } catch (e) {
       if (e instanceof ApiError) {
@@ -207,6 +210,17 @@
                 Rate unavailable — you can still pay in sat or BTC
               </p>
             {/if}
+
+            <label class="flex shrink-0 flex-col gap-1.5">
+              <span class="text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">Leave a message</span>
+              <textarea
+                class="min-h-12 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 py-3 text-base outline-none focus:ring-2 focus:ring-[#B7000B] dark:border-[#3a342a] dark:bg-[#211f1a]"
+                bind:value={message}
+                placeholder="Add a message for the recipient (optional)"
+                maxlength="280"
+                rows="1"
+              ></textarea>
+            </label>
 
             {#if errorMsg}
               <p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
