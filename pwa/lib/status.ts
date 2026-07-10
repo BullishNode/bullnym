@@ -147,9 +147,11 @@ export function isTerminalView(v: PayView): boolean {
   )
 }
 
-/** True for the three "live, rails-visible" views — QR/tab bar renders. */
+/** True for the "live, rails-visible" views — QR/tab bar renders. Once a
+ * payment is detected (in_progress / settling) we stop showing the QR and
+ * render the "Payment received" panel instead. */
 export function showsRails(v: PayView): boolean {
-  return v.kind === 'waiting' || v.kind === 'in_progress' || v.kind === 'partially_paid'
+  return v.kind === 'waiting' || v.kind === 'partially_paid'
 }
 
 export function payViewLabel(v: PayView, remainingAmountSat: number | null): string {
@@ -157,13 +159,13 @@ export function payViewLabel(v: PayView, remainingAmountSat: number | null): str
     case 'waiting':
       return 'Waiting for payment'
     case 'in_progress':
-      return 'Payment detected…'
+      return 'Payment received'
     case 'partially_paid':
       return remainingAmountSat != null
         ? `Partially paid — ${new Intl.NumberFormat().format(remainingAmountSat)} sat due`
         : 'Partially paid'
     case 'settling':
-      return 'Payment detected — confirming settlement'
+      return 'Payment received'
     case 'needs_review':
       return 'Payment needs review'
     case 'refunded':
@@ -184,6 +186,9 @@ export function payViewTone(v: PayView): string {
   switch (v.kind) {
     case 'paid':
     case 'overpaid':
+    // Payment detected renders as success (green) with a settlement note.
+    case 'in_progress':
+    case 'settling':
       return 'text-[#14522d] dark:text-[#8bc8a4]'
     case 'underpaid':
     case 'needs_review':

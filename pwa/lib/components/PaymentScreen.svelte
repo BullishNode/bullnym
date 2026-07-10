@@ -509,14 +509,19 @@
         class={`grid h-16 w-16 place-items-center rounded-full text-3xl ${
           view.kind === 'needs_review'
             ? 'bg-[#fff0c7] text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]'
-            : 'bg-[#e2edf5] text-[#1e4e73] dark:bg-[#213142] dark:text-[#9fc6e3]'
+            : 'bg-[#d9f3df] text-[#14522d] dark:bg-[#1f3d2a] dark:text-[#8bc8a4]'
         }`}
       >
-        {view.kind === 'needs_review' ? '!' : '…'}
+        {view.kind === 'needs_review' ? '!' : '✓'}
       </div>
+      {#if view.kind !== 'needs_review'}
+        <p class="font-display text-5xl tabular-nums tracking-display leading-none text-[#211f1a] dark:text-[#fff6e8]">
+          {amountLabel}
+        </p>
+      {/if}
       <p class={`text-lg font-semibold ${payViewTone(view)}`}>{payViewLabel(view, remainingAmountSat)}</p>
       <p class="text-sm text-[#776b5a] dark:text-[#b9aa91]">
-        {view.kind === 'needs_review' ? 'Settlement is delayed. The operator has been alerted.' : 'Confirming settlement.'}
+        {view.kind === 'needs_review' ? 'Settlement is delayed. The operator has been alerted.' : 'Settlement is in progress'}
       </p>
     </div>
   {/if}

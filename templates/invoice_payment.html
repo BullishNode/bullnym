@@ -232,9 +232,10 @@
                 <div class="countdown" id="countdown">…</div>
             {% else if status == "in_progress" || settlement_status == "pending" %}
                 <div class="terminal-block">
-                    <div class="terminal-icon status-unpaid">…</div>
-                    <div class="status-line status-unpaid">Payment detected</div>
-                    <div class="meta">Confirming settlement.</div>
+                    <div class="terminal-icon status-paid">✓</div>
+                    <div class="status-line status-paid">Payment received</div>
+                    <div class="amount">{{ amount_sat }} sat</div>
+                    <div class="meta">Settlement is in progress</div>
                 </div>
             {% else if settlement_status == "claim_stuck" %}
                 <div class="terminal-block">
@@ -497,11 +498,21 @@
                 `;
             }
 
-            function renderInProgressState() {
-                root.dataset.status = 'in_progress';
-                if (statusLine) {
-                    statusLine.textContent = 'Payment detected…';
-                }
+            function renderReceivedState() {
+                // Payment detected (mempool sighting or settlement claim in
+                // flight). Show success immediately with a small settlement
+                // disclaimer; polling continues so a later terminal state
+                // (paid / underpaid / a settlement incident) still lands.
+                if (root.dataset.status === 'received') return;
+                root.dataset.status = 'received';
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon status-paid">✓</div>
+                        <div class="status-line status-paid">Payment received</div>
+                        <div class="amount">${targetAmountSat} sat</div>
+                        <div class="meta">Settlement is in progress</div>
+                    </div>
+                `;
             }
 
             function renderPartiallyPaidState() {
@@ -509,17 +520,6 @@
                 if (statusLine) {
                     statusLine.textContent = 'Partially paid — remaining amount due';
                 }
-            }
-
-            function renderPendingSettlementState() {
-                root.dataset.status = 'in_progress';
-                root.innerHTML = `
-                    <div class="terminal-block">
-                        <div class="terminal-icon status-unpaid">…</div>
-                        <div class="status-line status-unpaid">Payment detected</div>
-                        <div class="meta">Confirming settlement.</div>
-                    </div>
-                `;
             }
 
             function renderSettlementIncidentState(kind) {
@@ -553,7 +553,7 @@
                         return;
                     }
                     if (data.settlement_status === 'pending') {
-                        renderPendingSettlementState();
+                        renderReceivedState();
                         return;
                     }
                     if (data.settlement_status === 'claim_stuck' || data.settlement_status === 'refunded') {
@@ -561,9 +561,8 @@
                         return;
                     }
                     if (data.status === 'in_progress') {
-                        if (root.dataset.status !== 'in_progress') {
-                            renderInProgressState();
-                        }
+                        renderReceivedState();
+                        return;
                     }
                     if (data.status === 'partially_paid') {
                         if (root.dataset.status !== 'partially_paid') {
