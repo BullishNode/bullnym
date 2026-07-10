@@ -25,8 +25,8 @@ LUD-22 protects descriptor cursors with:
 - minimum UTXO value
 - `(nym, outpoint)` idempotency
 - per-outpoint fan-out caps
-- per-pubkey caps
-- pending reservation TTL recycling
+- optional per-pubkey cap (disabled by default)
+- pending reservation TTL cleanup
 
 These controls make address allocation costly to abuse and prevent repeated
 requests for the same outpoint from advancing the cursor.
