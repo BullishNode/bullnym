@@ -405,6 +405,8 @@ pub(crate) async fn create_lightning_swap(
             boltz_response_json: &boltz_response_json,
             // LNURL Lightning Address path is invoice-less by design.
             invoice_id: None,
+            key_index: Some(swap_key_index as i64),
+            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
         },
     )
     .await

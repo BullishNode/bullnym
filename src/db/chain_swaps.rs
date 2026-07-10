@@ -104,6 +104,12 @@ pub struct NewChainSwapRecord<'a> {
     pub claim_key_hex: &'a str,
     pub refund_key_hex: &'a str,
     pub boltz_response_json: &'a str,
+    /// Derivation indices of the claim/refund keys from `swap_key_seq`, and the
+    /// seed fingerprint they are relative to, recorded so a rewound sequence
+    /// after a DB restore is detectable. See migration 044.
+    pub claim_key_index: Option<i64>,
+    pub refund_key_index: Option<i64>,
+    pub root_fingerprint: Option<&'a str>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -166,6 +172,29 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
 
+/// Highest claim- or refund-key index persisted for `fingerprint` across chain
+/// swaps. `None` when no derivation metadata has been recorded yet. Paired with
+/// [`super::max_persisted_reverse_key_index`] to bound the rollback check across
+/// both swap tables. See migration 044.
+pub async fn max_persisted_chain_key_index(
+    pool: &PgPool,
+    fingerprint: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT MAX(idx) FROM ( \
+             SELECT claim_key_index AS idx FROM chain_swap_records \
+                 WHERE root_fingerprint = $1 AND claim_key_index IS NOT NULL \
+             UNION ALL \
+             SELECT refund_key_index AS idx FROM chain_swap_records \
+                 WHERE root_fingerprint = $1 AND refund_key_index IS NOT NULL \
+         ) AS indices",
+    )
+    .bind(fingerprint)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 pub async fn record_chain_swap(
     pool: &PgPool,
     swap: &NewChainSwapRecord<'_>,
@@ -174,8 +203,9 @@ pub async fn record_chain_swap(
         "INSERT INTO chain_swap_records \
              (invoice_id, nym, boltz_swap_id, from_chain, to_chain, lockup_address, lockup_bip21, \
               user_lock_amount_sat, server_lock_amount_sat, preimage_hex, claim_key_hex, \
-              refund_key_hex, boltz_response_json) \
-         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11) \
+              refund_key_hex, boltz_response_json, claim_key_index, refund_key_index, \
+              root_fingerprint) \
+         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
     ))
     .bind(swap.invoice_id)
@@ -189,6 +219,9 @@ pub async fn record_chain_swap(
     .bind(swap.claim_key_hex)
     .bind(swap.refund_key_hex)
     .bind(swap.boltz_response_json)
+    .bind(swap.claim_key_index)
+    .bind(swap.refund_key_index)
+    .bind(swap.root_fingerprint)
     .fetch_one(pool)
     .await
 }

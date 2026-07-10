@@ -7,6 +7,7 @@ pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
 pub mod db;
+pub mod derivation_guard;
 pub mod descriptor;
 pub mod donation_page;
 pub mod esplora;
@@ -42,4 +43,8 @@ pub struct AppState {
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
+    /// Fingerprint of the swap-key master seed (see [`derivation_guard`] and
+    /// migration 044). Persisted with each new swap so a rewound key sequence
+    /// is detectable on the next startup.
+    pub swap_key_root_fingerprint: Arc<String>,
 }

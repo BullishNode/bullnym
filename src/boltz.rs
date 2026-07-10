@@ -62,6 +62,23 @@ impl BoltzService {
         }
     }
 
+    /// Stable, non-secret identifier of the master seed behind this service's
+    /// swap keys: first 8 bytes of SHA-256 over the pubkey derived at the
+    /// reserved index 0, hex-encoded. Real swaps allocate from `swap_key_seq`
+    /// (START WITH 100), so index 0 is never used to sign and only serves as a
+    /// deterministic seed fingerprint. Persisted alongside each swap so a
+    /// database restore that rewinds the key sequence can be detected. See
+    /// migration 044.
+    pub fn derivation_root_fingerprint(&self) -> Result<String, AppError> {
+        use sha2::{Digest, Sha256};
+        let keypair = self
+            .swap_master_key
+            .derive_swapkey(0)
+            .map_err(|e| AppError::BoltzError(format!("fingerprint derivation failed: {e}")))?;
+        let digest = Sha256::digest(keypair.public_key().serialize());
+        Ok(hex::encode(&digest[..8]))
+    }
+
     pub async fn create_reverse_swap(
         &self,
         swap_key_index: u64,
@@ -284,5 +301,43 @@ impl BoltzService {
             .await
             .map_err(|e| AppError::BoltzError(format!("chain swap accept_quote failed: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boltz_client::network::Network;
+
+    const TEST_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn test_service(mnemonic: &str) -> BoltzService {
+        let key = SwapMasterKey::from_mnemonic(mnemonic, None, Network::Mainnet).unwrap();
+        BoltzService::new("http://127.0.0.1:1", key, None)
+    }
+
+    #[test]
+    fn root_fingerprint_is_deterministic_and_stable() {
+        let svc = test_service(TEST_MNEMONIC);
+        let fp = svc.derivation_root_fingerprint().unwrap();
+        // 8 bytes -> 16 lowercase hex chars.
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // Same seed -> same fingerprint across calls.
+        assert_eq!(fp, svc.derivation_root_fingerprint().unwrap());
+        // Same seed via a fresh service -> same fingerprint.
+        assert_eq!(fp, test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap());
+    }
+
+    #[test]
+    fn root_fingerprint_differs_across_seeds() {
+        let a = test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap();
+        let b = test_service(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .derivation_root_fingerprint()
+        .unwrap();
+        assert_ne!(a, b);
     }
 }

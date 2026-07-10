@@ -19,7 +19,8 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, donation_page,
+    bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, derivation_guard,
+    donation_page,
     donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
     reconciler, registration,
     utxo::{self, UtxoBackend},
@@ -178,6 +179,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let whitelist = Arc::new(whitelist);
     let certification_allowlist = Arc::new(certification_allowlist);
 
+    // Fingerprint of the swap-key seed, persisted with every new swap so a
+    // rewound key sequence (e.g. an older DB backup restored over live data) is
+    // detectable. Compute it once at startup and check for a rewind. The check
+    // is best-effort: a failure (including migration 044 not yet applied) logs
+    // and continues — readiness gating already blocks traffic until the schema
+    // marker is present. See derivation_guard and migration 044.
+    let swap_key_root_fingerprint = boltz
+        .derivation_root_fingerprint()
+        .map_err(|e| format!("swap key fingerprint derivation failed: {e}"))?;
+    tracing::info!(
+        fingerprint = %swap_key_root_fingerprint,
+        "swap key derivation fingerprint computed"
+    );
+    match derivation_guard::check_rollback(&pool, &swap_key_root_fingerprint).await {
+        Ok(true) => tracing::error!(
+            event = "swap_key_sequence_rollback",
+            fingerprint = %swap_key_root_fingerprint,
+            "swap_key_seq is at or behind an already-issued index — the key \
+             sequence may have been rewound by a database restore. New swaps \
+             would reuse existing key material. Investigate before accepting \
+             new payments; restore the correct backup or advance swap_key_seq."
+        ),
+        Ok(false) => tracing::info!(
+            event = "swap_key_sequence_ok",
+            "swap key sequence high-water mark is ahead of all persisted indices"
+        ),
+        Err(e) => tracing::warn!(
+            event = "swap_key_sequence_check_skipped",
+            error = %e,
+            "swap-key rollback check could not run (schema may predate migration \
+             044); continuing without the check"
+        ),
+    }
+    let swap_key_root_fingerprint = Arc::new(swap_key_root_fingerprint);
+
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
@@ -188,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_backend,
         pricer: pricer_client,
         pwa_shells,
+        swap_key_root_fingerprint,
     };
 
     let cancel = CancellationToken::new();
