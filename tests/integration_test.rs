@@ -1490,6 +1490,8 @@ async fn webhook_skips_terminal_swaps() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: None,
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1554,6 +1556,9 @@ async fn webhook_advances_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_WEBHOOK_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1608,6 +1613,9 @@ async fn webhook_skips_terminal_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_TERMINAL_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -2733,7 +2741,7 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     .await
     .unwrap();
 
-    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool)
+    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 0)
         .await
         .unwrap();
     assert_eq!(expired_count, 2);
@@ -2773,6 +2781,7 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
         btc_sat: 300,
         liquid_sat: 60,
         lightning_sat: 1,
+        payment_grace_secs: 0,
     };
 
     let rows = pay_service::db::record_invoice_payment(
@@ -3388,7 +3397,7 @@ async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
         .await
         .unwrap();
 
-    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     assert!(candidates
@@ -3722,6 +3731,8 @@ async fn invoice_only_lightning_swap_does_not_require_nym() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3812,7 +3823,7 @@ async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
     let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
     let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
 
-    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     let invoice_ids: std::collections::HashSet<_> =
@@ -3844,6 +3855,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3866,6 +3879,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "dd".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3905,6 +3920,9 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chain-swap-rec-1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3973,6 +3991,9 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainretry-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4032,6 +4053,9 @@ async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainfail-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4089,6 +4113,8 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await

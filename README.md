@@ -501,6 +501,12 @@ database with the migrations applied. They are appropriate for route-level
 ownership checks, cross-npub isolation, persistence behavior, and status
 responses that need real SQL constraints.
 
+The self-contained way to run them is `./scripts/test-db.sh`: it starts a
+throwaway Postgres in Docker, applies every migration to an empty database
+(verifying the migration chain itself), and runs the suite. The suite must run
+single-threaded (the script does this): each test resets the shared database,
+so parallel execution makes tests destroy each other's fixtures.
+
 ### bullnym-test VM
 
 The bullnym-test VM is an external server/payment harness for deployed Bullnym
