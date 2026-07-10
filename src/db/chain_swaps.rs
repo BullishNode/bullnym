@@ -375,6 +375,43 @@ pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
 
 /// Chain swaps currently in `refund_due`, oldest first. Backs the operator
 /// surface listing stranded-but-recoverable lockups.
+/// Chain swaps that reached terminal `claimed` (merchant funds are on chain)
+/// with a persisted claim txid, but whose `bitcoin_boltz_chain` invoice payment
+/// event is missing — the crash-consistency gap in issue #61. The mirror of
+/// `list_claimed_swaps_missing_lightning_event` for the chain rail: a crash or
+/// error between marking `claimed` and recording the payment event leaves the
+/// merchant paid while the invoice looks unpaid, and `claimed` is terminal so
+/// normal reconciliation no longer selects the row.
+///
+/// Requires a persisted `claim_txid` — a terminal status alone is NOT treated
+/// as proof of payment (a row without claim evidence is surfaced as an
+/// integrity incident by the caller, never fabricated into a payment).
+/// Bounded + oldest-first so repair cannot monopolize the reconciler.
+pub async fn list_claimed_chain_swaps_missing_payment_event(
+    pool: &PgPool,
+    max_age_secs: u64,
+    limit: u32,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records c \
+         WHERE c.status = 'claimed' \
+           AND c.claim_txid IS NOT NULL \
+           AND c.updated_at > NOW() - ($1 || ' seconds')::interval \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM invoice_payment_events e \
+                  WHERE e.invoice_id = c.invoice_id \
+                    AND e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
+             ) \
+         ORDER BY c.updated_at ASC \
+         LIMIT $2"
+    ))
+    .bind(max_age_secs as i64)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
