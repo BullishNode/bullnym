@@ -221,6 +221,12 @@ const DEFAULT_RECONCILER_INTERVAL_SECS: u64 = 90;
 const DEFAULT_RECONCILER_MIN_AGE_SECS: u64 = 60;
 const DEFAULT_RECONCILER_MAX_PER_TICK: u32 = 200;
 const DEFAULT_RECONCILER_INTER_CALL_DELAY_MS: u64 = 50;
+// Slow-recovery sweep (issue #63): revives funded `claim_stuck` rows on a long,
+// capped backoff so a post-retry-budget outage doesn't abandon claimable funds.
+const DEFAULT_SLOW_RECOVERY_INTERVAL_SECS: u64 = 1800;
+const DEFAULT_SLOW_RECOVERY_MAX_PER_TICK: u32 = 25;
+const DEFAULT_SLOW_RECOVERY_BACKOFF_BASE_SECS: u64 = 3600;
+const DEFAULT_SLOW_RECOVERY_BACKOFF_CAP_SECS: u64 = 86400;
 
 /// Reconciler task config. The reconciler periodically polls Boltz's
 /// `GET /swap/{id}` for every non-terminal `swap_records` row and
@@ -248,6 +254,20 @@ pub struct ReconcilerConfig {
     /// well below any reasonable rate limit.
     #[serde(default = "default_reconciler_inter_call_delay_ms")]
     pub inter_call_delay_ms: u64,
+    /// Slow-recovery sweep cadence (issue #63). Much slower than the main tick:
+    /// this revives funded `claim_stuck` rows, which by definition already
+    /// exhausted the fast retry budget.
+    #[serde(default = "default_slow_recovery_interval_secs")]
+    pub slow_recovery_interval_secs: u64,
+    /// Cap per slow-recovery tick.
+    #[serde(default = "default_slow_recovery_max_per_tick")]
+    pub slow_recovery_max_per_tick: u32,
+    /// Backoff base: the nth revival of a row waits ~base * 2^(n-1), jittered.
+    #[serde(default = "default_slow_recovery_backoff_base_secs")]
+    pub slow_recovery_backoff_base_secs: u64,
+    /// Backoff ceiling so a long-outage row still gets retried ~daily.
+    #[serde(default = "default_slow_recovery_backoff_cap_secs")]
+    pub slow_recovery_backoff_cap_secs: u64,
 }
 
 impl Default for ReconcilerConfig {
@@ -257,6 +277,10 @@ impl Default for ReconcilerConfig {
             min_age_secs: DEFAULT_RECONCILER_MIN_AGE_SECS,
             max_per_tick: DEFAULT_RECONCILER_MAX_PER_TICK,
             inter_call_delay_ms: DEFAULT_RECONCILER_INTER_CALL_DELAY_MS,
+            slow_recovery_interval_secs: DEFAULT_SLOW_RECOVERY_INTERVAL_SECS,
+            slow_recovery_max_per_tick: DEFAULT_SLOW_RECOVERY_MAX_PER_TICK,
+            slow_recovery_backoff_base_secs: DEFAULT_SLOW_RECOVERY_BACKOFF_BASE_SECS,
+            slow_recovery_backoff_cap_secs: DEFAULT_SLOW_RECOVERY_BACKOFF_CAP_SECS,
         }
     }
 }
@@ -272,6 +296,18 @@ fn default_reconciler_max_per_tick() -> u32 {
 }
 fn default_reconciler_inter_call_delay_ms() -> u64 {
     DEFAULT_RECONCILER_INTER_CALL_DELAY_MS
+}
+fn default_slow_recovery_interval_secs() -> u64 {
+    DEFAULT_SLOW_RECOVERY_INTERVAL_SECS
+}
+fn default_slow_recovery_max_per_tick() -> u32 {
+    DEFAULT_SLOW_RECOVERY_MAX_PER_TICK
+}
+fn default_slow_recovery_backoff_base_secs() -> u64 {
+    DEFAULT_SLOW_RECOVERY_BACKOFF_BASE_SECS
+}
+fn default_slow_recovery_backoff_cap_secs() -> u64 {
+    DEFAULT_SLOW_RECOVERY_BACKOFF_CAP_SECS
 }
 
 // --- Pricer config ---

@@ -408,6 +408,43 @@ pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
 
 /// Chain swaps currently in `refund_due`, oldest first. Backs the operator
 /// surface listing stranded-but-recoverable lockups.
+/// Chain swaps that reached terminal `claimed` (merchant funds are on chain)
+/// with a persisted claim txid, but whose `bitcoin_boltz_chain` invoice payment
+/// event is missing — the crash-consistency gap in issue #61. The mirror of
+/// `list_claimed_swaps_missing_lightning_event` for the chain rail: a crash or
+/// error between marking `claimed` and recording the payment event leaves the
+/// merchant paid while the invoice looks unpaid, and `claimed` is terminal so
+/// normal reconciliation no longer selects the row.
+///
+/// Requires a persisted `claim_txid` — a terminal status alone is NOT treated
+/// as proof of payment (a row without claim evidence is surfaced as an
+/// integrity incident by the caller, never fabricated into a payment).
+/// Bounded + oldest-first so repair cannot monopolize the reconciler.
+pub async fn list_claimed_chain_swaps_missing_payment_event(
+    pool: &PgPool,
+    max_age_secs: u64,
+    limit: u32,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records c \
+         WHERE c.status = 'claimed' \
+           AND c.claim_txid IS NOT NULL \
+           AND c.updated_at > NOW() - ($1 || ' seconds')::interval \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM invoice_payment_events e \
+                  WHERE e.invoice_id = c.invoice_id \
+                    AND e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
+             ) \
+         ORDER BY c.updated_at ASC \
+         LIMIT $2"
+    ))
+    .bind(max_age_secs as i64)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
@@ -698,6 +735,57 @@ pub async fn record_chain_swap_claim_failure(
 
     tx.commit().await?;
     Ok(outcome)
+}
+
+/// Funded chain swaps stranded in `claim_stuck` whose slow-recovery backoff is
+/// due (issue #63). Bounded + oldest-first; returns `(id, boltz_swap_id,
+/// slow_attempts)`. Mirror of `swaps::list_claim_stuck_swaps_for_slow_retry`.
+pub async fn list_claim_stuck_chain_swaps_for_slow_retry(
+    pool: &PgPool,
+    limit: u32,
+) -> Result<Vec<(Uuid, String, i32)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, String, i32)>(
+        "SELECT id, boltz_swap_id, slow_attempts \
+         FROM chain_swap_records \
+         WHERE status = 'claim_stuck' \
+           AND (next_slow_attempt_at IS NULL OR next_slow_attempt_at <= NOW()) \
+         ORDER BY next_slow_attempt_at NULLS FIRST \
+         LIMIT $1",
+    )
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
+/// Revive a `claim_stuck` chain swap into the normal claim sweep for exactly one
+/// more attempt (status → `claim_failed`, which `get_ready_to_claim_chain_swaps`
+/// selects; `claim_attempts → max-1`; due now) and schedule the next slow
+/// revival with capped backoff. Guarded on `status='claim_stuck'`. The retry's
+/// own outspend-probe recovery handles an already-spent lockup, so this never
+/// blindly rebuilds. Returns rows affected (0 or 1). Mirror of
+/// `swaps::revive_claim_stuck_swap_for_slow_retry`.
+pub async fn revive_claim_stuck_chain_swap_for_slow_retry(
+    pool: &PgPool,
+    id: Uuid,
+    max_attempts: i32,
+    backoff_secs: u64,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'claim_failed', \
+             claim_attempts = GREATEST(0, $2 - 1), \
+             next_claim_attempt_at = NOW(), \
+             slow_attempts = slow_attempts + 1, \
+             next_slow_attempt_at = NOW() + (($3 || ' seconds')::interval) * (0.8 + 0.4 * random()), \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'claim_stuck'",
+    )
+    .bind(id)
+    .bind(max_attempts)
+    .bind(backoff_secs as i64)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 pub async fn clear_chain_swap_claim_failure_state(

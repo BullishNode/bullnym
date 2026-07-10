@@ -456,6 +456,61 @@ pub async fn record_claim_failure(
     Ok(outcome)
 }
 
+/// Funded reverse swaps stranded in `claim_stuck` whose slow-recovery backoff is
+/// due (issue #63). Bounded + oldest-first. Returns `(id, boltz_swap_id,
+/// slow_attempts)` so the caller can compute the next backoff. `claim_stuck` is
+/// reached only for a funded lockup (the retry budget ran out mid-claim), so
+/// these are exactly the rows whose output may still be claimable.
+pub async fn list_claim_stuck_swaps_for_slow_retry(
+    pool: &PgPool,
+    limit: u32,
+) -> Result<Vec<(Uuid, String, i32)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, String, i32)>(
+        "SELECT id, boltz_swap_id, slow_attempts \
+         FROM swap_records \
+         WHERE status = 'claim_stuck' \
+           AND (next_slow_attempt_at IS NULL OR next_slow_attempt_at <= NOW()) \
+         ORDER BY next_slow_attempt_at NULLS FIRST \
+         LIMIT $1",
+    )
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
+/// Revive a `claim_stuck` reverse swap into the normal claim sweep for exactly
+/// one more attempt — `status → 'claim_failed'` (a status the sweep selects),
+/// `claim_attempts → max_attempts - 1` (so a single failure re-sticks it, no
+/// burst), due immediately — and schedule the next slow revival with the
+/// caller-computed capped backoff. Guarded on `status='claim_stuck'` so a
+/// concurrent transition (or a claim that already succeeded) wins. Reviving to
+/// `claim_failed` delegates the chain-state check to the claim path itself: on
+/// the retry, an already-spent lockup is caught by the existing outspend-probe
+/// recovery rather than blindly rebuilt. Returns rows affected (0 or 1).
+pub async fn revive_claim_stuck_swap_for_slow_retry(
+    pool: &PgPool,
+    id: Uuid,
+    max_attempts: i32,
+    backoff_secs: u64,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE swap_records \
+         SET status = 'claim_failed', \
+             claim_attempts = GREATEST(0, $2 - 1), \
+             next_claim_attempt_at = NOW(), \
+             slow_attempts = slow_attempts + 1, \
+             next_slow_attempt_at = NOW() + (($3 || ' seconds')::interval) * (0.8 + 0.4 * random()), \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'claim_stuck'",
+    )
+    .bind(id)
+    .bind(max_attempts)
+    .bind(backoff_secs as i64)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Compact projection of a `swap_records` row used by the reconciler
 /// to decide its next action. The reconciler does not need full
 /// SwapRecord (no preimage, no boltz_response_json) — keeping the
