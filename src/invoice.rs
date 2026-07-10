@@ -423,7 +423,18 @@ pub struct CreateAnonymousRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
+    /// Optional free-text note attached to the invoice as its private `memo`:
+    /// the PoS merchant's own description, or a donor's "leave a message".
+    /// Stored server-side and returned ONLY on the signed invoice list
+    /// (`GET /api/v1/invoices` verified by the owning nym's key) — never on the
+    /// public status/render paths.
+    #[serde(default)]
+    pub note: Option<String>,
 }
+
+/// `memo` column cap (migration 019: `length(memo) <= 280`). Validated here so
+/// an over-long note returns a clean error instead of a DB constraint failure.
+const MAX_INVOICE_NOTE_LEN: usize = 280;
 
 #[derive(Serialize)]
 pub struct CreateInvoiceResponse {
@@ -525,6 +536,18 @@ async fn create_anonymous_for_kind(
 
     let (amount_sat, fiat) = parse_create_request(&req, &state).await?;
 
+    // Optional note → invoice `memo` (private; merchant-only via the signed
+    // list). Trim to treat whitespace-only as absent, and reject over-long
+    // notes before the insert hits the column CHECK.
+    let note = req.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(note) = note {
+        if note.len() > MAX_INVOICE_NOTE_LEN {
+            return Err(AppError::InvalidAmount(format!(
+                "note too long (max {MAX_INVOICE_NOTE_LEN} chars)"
+            )));
+        }
+    }
+
     // Verify the store is live AND resolve the page owner's npub for the
     // canonical invoice identity. The page→user join is required because
     // donation_pages doesn't store npub directly.
@@ -601,7 +624,7 @@ async fn create_anonymous_for_kind(
         amount_sat,
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
         rate_lock_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
-        memo: None,
+        memo: note,
         recipient_label: None,
         public_description: None,
         invoice_number: None,
@@ -2153,6 +2176,9 @@ async fn create_invoice_inner(
         amount_sat: req.amount_sat,
         fiat_amount_minor: req.fiat_amount_minor,
         fiat_currency: req.fiat_currency.clone(),
+        // Only used for amount parsing here; the signed path sets memo via its
+        // own request fields, not this anonymous shape.
+        note: None,
     };
     let (amount_sat, fiat) = parse_create_request(&anon_shape, state).await?;
 
@@ -2366,6 +2392,10 @@ pub struct InvoiceListItem {
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     pub public_description: Option<String>,
+    /// Private note attached at checkout (PoS description / donor message).
+    /// Returned only on this signed, npub-verified list — never on the public
+    /// status or render paths.
+    pub memo: Option<String>,
     #[serde(rename = "recipient_name")]
     pub recipient_label: Option<String>,
     pub invoice_number: Option<String>,
@@ -2495,6 +2525,7 @@ pub async fn list_signed(
                 fiat_amount_minor: inv.fiat_amount_minor,
                 fiat_currency: inv.fiat_currency,
                 public_description: inv.public_description,
+                memo: inv.memo,
                 recipient_label: inv.recipient_label,
                 invoice_number: inv.invoice_number,
                 accept_btc: inv.accept_btc,

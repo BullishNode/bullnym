@@ -18,6 +18,9 @@ export interface CreateInvoiceRequest {
   amount_sat?: number
   fiat_amount_minor?: number
   fiat_currency?: string
+  /** Optional free-text note stored as the invoice's private memo (PoS
+   * description / donor message). Returned only on the signed invoice list. */
+  note?: string
 }
 
 /** Response of POST /<nym>/invoice (invoice.rs CreateInvoiceResponse). */

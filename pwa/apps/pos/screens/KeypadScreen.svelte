@@ -60,6 +60,7 @@
       const res = await createInvoice(config.invoice_base, {
         fiat_amount_minor: minor,
         fiat_currency: settings.currency,
+        note: note.trim() || undefined,
       })
       cacheInvoice({
         invoice: res,
@@ -125,12 +126,16 @@
         <div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
         <AmountDisplay amount={displayAmount} currency={settings.currency} {precision} />
         <Keypad {precision} onInput={applyInput} />
-        <textarea
-          class="min-h-12 shrink-0 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 py-3 text-base outline-none focus:ring-2 focus:ring-[#B7000B] dark:border-[#3a342a] dark:bg-[#211f1a]"
-          bind:value={note}
-          placeholder="Add note"
-          rows="1"
-        ></textarea>
+        <label class="flex shrink-0 flex-col gap-1.5">
+          <span class="text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">Description</span>
+          <textarea
+            class="min-h-12 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 py-3 text-base outline-none focus:ring-2 focus:ring-[#B7000B] dark:border-[#3a342a] dark:bg-[#211f1a]"
+            bind:value={note}
+            placeholder="Add a description for this sale"
+            maxlength="280"
+            rows="1"
+          ></textarea>
+        </label>
         <RateBar {precision} />
         {#if errorMsg}
           <p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
