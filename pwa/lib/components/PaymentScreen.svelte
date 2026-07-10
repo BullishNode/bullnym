@@ -514,6 +514,11 @@
       >
         {view.kind === 'needs_review' ? '!' : '✓'}
       </div>
+      {#if view.kind !== 'needs_review'}
+        <p class="font-display text-5xl tabular-nums tracking-display leading-none text-[#211f1a] dark:text-[#fff6e8]">
+          {amountLabel}
+        </p>
+      {/if}
       <p class={`text-lg font-semibold ${payViewTone(view)}`}>{payViewLabel(view, remainingAmountSat)}</p>
       <p class="text-sm text-[#776b5a] dark:text-[#b9aa91]">
         {view.kind === 'needs_review' ? 'Settlement is delayed. The operator has been alerted.' : 'Settlement is in progress'}
