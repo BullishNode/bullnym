@@ -1,8 +1,10 @@
 # HTTP API
 
-This is the wire contract for clients. Route registration lives in
-`src/main.rs`; request and response structs live in the handler modules named
-below.
+This is a compact route and component map. The canonical, endpoint-by-endpoint
+client wire contract is the [Complete API Reference](../api-reference.md),
+including exact signing encodings, validation limits, response variants, and
+integration implications. Route registration lives in `src/main.rs`; request
+and response structs live in the handler modules named below.
 
 ## Conventions
 
@@ -15,8 +17,7 @@ Most failures return an LNURL-style error envelope, often with HTTP `200`:
 {
   "status": "ERROR",
   "code": "InvoiceNotFound",
-  "reason": "Invoice not found.",
-  "details": {}
+  "reason": "Invoice not found."
 }
 ```
 
@@ -25,8 +26,12 @@ status is successful. The main non-200 cases are:
 
 | HTTP status | Cases |
 |---|---|
+| `400`, `415`, `422` | Axum query/JSON extraction failures; not a Bullnym error envelope. |
 | `401` | Signature/authentication failure. |
-| `409` | Wallet-origin Bitcoin or Liquid address reuse. |
+| `404`, `405` | Missing route or unsupported method; response may be HTML/plain text. |
+| `409` | Wallet-origin Bitcoin/Liquid address reuse or alias collision. |
+| `410` | Deprecated Liquid offer route. |
+| `413` | Request body exceeds the route/global limit. |
 | `503` | Hard service capacity or configured unavailable state. |
 
 Signed requests use:
@@ -79,7 +84,7 @@ failed
 
 | Field | Required | Notes |
 |---|---|---|
-| `amount` | yes | Millisats. |
+| `amount` | yes | Millisats, within metadata limits and divisible by 1,000. |
 | `comment` | no | Optional LNURL comment. |
 | `payment_method` | no | `L-BTC` selects LUD-22 Liquid. |
 | `outpoint`, `pubkey`, `sig`, `value`, `value_bf`, `asset_bf` | for LUD-22 | Approach B proof-of-funds fields. |
@@ -132,7 +137,6 @@ The `donation_pages` table stores two surface kinds:
 |---|---|---|---|
 | `PUT` | `/donation-page` | `donation-page-save` | Create or update one surface. |
 | `DELETE` | `/donation-page` | `donation-page-archive` | Archive one surface. |
-| `POST` | `/donation-page/image` | `donation-page-image`, multipart | Upload Payment Page avatar or OpenGraph image. |
 | `GET` | `/donation-page/:nym?kind=payment_page\|pos` | public, rate-limited | Read surface state for clients. |
 
 `PUT /donation-page` body:
@@ -145,7 +149,8 @@ The `donation_pages` table stores two surface kinds:
 | `enabled` | Public route serves only enabled, non-archived rows. |
 | `ct_descriptor` | Required for `kind = "pos"`. Optional for legacy Payment Pages. |
 | `pos_mode` | Legacy optional-trailing flag. New clients use `kind`. |
-| `kind` | Optional-trailing field: `payment_page` default or `pos`. Must stay last in the signed field list. |
+| `kind` | Optional-trailing field: `payment_page` default or `pos`. Sent after `ct_descriptor` when present. |
+| `alias` | Newest optional-trailing field. Omit to preserve, send `""` to clear, or send a globally unique slug. Must be last when present. |
 
 Save signing field order after `nym_or_empty`:
 
@@ -160,10 +165,8 @@ enabled
 [pos_mode if sent]
 [ct_descriptor if sent]
 [kind if sent]
+[alias if sent]
 ```
-
-`POST /donation-page/image` updates the Payment Page row. POS currently has no
-separate image upload route.
 
 ### Public PWA Routes
 
@@ -173,6 +176,8 @@ separate image upload route.
 | `GET` | `/:nym/manifest.webmanifest` | Payment Page manifest. |
 | `GET` | `/:nym/pos` | POS terminal PWA shell. |
 | `GET` | `/:nym/pos/manifest.webmanifest` | POS manifest. |
+| `GET` | `/a/:slug` | Alias-selected Payment Page or POS shell. |
+| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected surface manifest. |
 | `GET` | `/sw.js` | Root-scoped service worker. |
 | `GET` | `/pwa-assets/*` | Built PWA assets. |
 
@@ -186,7 +191,9 @@ worker uses that header to avoid caching invoice pages.
 |---|---|---|---|
 | `POST` | `/:nym/invoice` | Payment Page | `invoice::create_anonymous` |
 | `POST` | `/:nym/pos/invoice` | POS | `invoice::create_anonymous_pos` |
+| `POST` | `/a/:slug/invoice` | Alias-selected Payment Page or POS | `invoice::create_anonymous_alias` |
 | `GET` | `/:nym/i/:id` | Linked checkout or linked wallet invoice | `invoice::render_payment` |
+| `GET` | `/a/:slug/i/:id` | Alias-linked checkout invoice | `invoice::render_payment_alias` |
 
 Request body must provide exactly one amount form:
 
@@ -214,7 +221,9 @@ Response:
 ```
 
 `bitcoin_chain_address` and `bitcoin_chain_bip21` are nullable. They represent
-BTC-to-LBTC Boltz chain swaps, not direct Bitcoin settlement.
+BTC-to-LBTC Boltz chain swaps, not direct Bitcoin settlement. `lightning_pr`
+can be an empty string when eager Boltz offer creation fails; use
+`POST /api/v1/invoices/:id/lightning` to obtain it later.
 
 ## Wallet-Origin Invoices
 
@@ -225,7 +234,7 @@ BTC-to-LBTC Boltz chain swaps, not direct Bitcoin settlement.
 | `GET` | `/api/v1/invoices?npub=...&timestamp=...&signature=...&page=...&pageSize=...` | `invoice-list` | List linked and unlinked invoices. |
 | `DELETE` | `/api/v1/:nym/invoices/:id` | `invoice-cancel` | Cancel a linked unpaid invoice. |
 | `DELETE` | `/api/v1/invoices/:id` | `invoice-cancel` with empty nym | Cancel an unlinked unpaid invoice. |
-| `GET` | `/invoice/:id` | public | Render an unlinked payment page. |
+| `GET` | `/invoice/:id` | public | Generic UUID route; renders linked or unlinked invoices. |
 
 Create body:
 
@@ -236,7 +245,8 @@ Create body:
 | `public_description`, `recipient_name`, `invoice_number` | Optional public metadata. |
 | `accept_btc`, `accept_ln`, `accept_liquid` | Accepted direct/payment rails. |
 | `bitcoin_address` | Required when direct Bitcoin is accepted. Must be unique. |
-| `liquid_address`, `liquid_blinding_key_hex` | Required when direct Liquid or Lightning is accepted. Address must be unique. |
+| `liquid_address` | Required when direct Liquid or Lightning is accepted. Must be unique. |
+| `liquid_blinding_key_hex` | Required only for direct Liquid (`accept_liquid = true`), and must match the confidential address. |
 | `expires_at_unix` | Optional explicit expiry. |
 
 Create signing field order:
@@ -256,6 +266,9 @@ liquid_address
 liquid_blinding_key_hex
 expires_at_unix
 ```
+
+The three acceptance booleans are signed as `true` or `false`. This differs
+from Payment Page/POS surface booleans, which use `1` or `0`.
 
 Create response:
 
@@ -290,10 +303,10 @@ Status response:
   "fiat_amount_minor": null,
   "fiat_currency": null,
   "remaining_amount_sat": 10000,
-  "payment_tolerance_sat": 60,
+  "payment_tolerance_sat": 1,
   "rate_minor_per_btc": null,
-  "rate_locks_until_unix": 1760000000,
-  "expires_at_unix": 1760000000,
+  "rate_locks_until_unix": 1760003600,
+  "expires_at_unix": 1760003600,
   "paid_via": null,
   "paid_at_unix": null,
   "paid_amount_sat": null,
@@ -316,7 +329,13 @@ configured confirmation threshold.
 
 | Method | Path | Action/Auth | Notes |
 |---|---|---|---|
+| `GET` | `/api/v1/invoices/recoverable?npub=...&timestamp=...&signature=...` | `invoice-recovery-list` | List the npub's chain swaps in `refund_due`/`refunding`/`refunded`, one row per swap, with the committed `refund_address`/`refund_txid` echo and a `recovery_enabled` flag. Always-on (registered under `invoices` or `payment_pages`); not gated by the recovery flag. Zero signed payload fields; the nym slot is empty. |
 | `POST` | `/api/v1/:nym/invoices/:id/recover` | `invoice-recover` | Recover a `refund_due` BTC lockup to a merchant-supplied Bitcoin address. Feature-gated by `features.chain_swap_merchant_recovery`. |
+
+Detection is the only client path that exposes recovery state; the public
+`GET /api/v1/invoices/:id/status` endpoint deliberately never carries it. The
+detection response schema and reconciliation semantics live in the
+[Complete API Reference](../api-reference.md) §9.
 
 Request:
 

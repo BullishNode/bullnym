@@ -8,7 +8,7 @@ Lightning, Liquid, Bitcoin, and Boltz settlement flows.
 | Rail | Products | Payer sends | Recipient receives | Settlement destination |
 |---|---|---|---|---|
 | Lightning via Boltz reverse swap | Lightning Address, Payment Pages, POS, Invoices | BOLT11 payment | LBTC after MuSig2 claim | Descriptor-derived or wallet-supplied Liquid address. |
-| LUD-22 Liquid shortcut | Lightning Address | Direct LBTC | LBTC | Fresh nym descriptor address gated by UTXO proof. |
+| LUD-22 Liquid shortcut | Lightning Address | Direct LBTC | LBTC | Current nym descriptor index gated by UTXO proof; unpaid reservations can share the address until payment advances the cursor. |
 | Direct Liquid | Payment Pages, POS, Invoices | Direct LBTC | LBTC | Surface descriptor address or wallet-supplied Liquid address. |
 | Direct Bitcoin | Invoices | Bitcoin on-chain | BTC | Wallet-supplied Bitcoin address. |
 | Bitcoin-to-Liquid chain swap | Payment Pages, POS | Bitcoin on-chain to Boltz lockup | LBTC | Surface descriptor address. |

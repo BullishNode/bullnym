@@ -34,7 +34,6 @@ or linked/unlinked invoice scopes.
 | `delete` | `npub` | Deactivate the current nym. |
 | `donation-page-save` | `npub` | Surface fields, display currency, links, optional `pos_mode`, optional `ct_descriptor`, optional `kind`. |
 | `donation-page-archive` | `npub` | Archive a surface. Optional `kind` defaults to `payment_page`. |
-| `donation-page-image` | `npub` | `nym`, image kind, normalized image hash. Applies to the Payment Page row. |
 | `invoice-create` | `npub` | Amount, accepted rails, recipient-supplied addresses, metadata, expiry. |
 | `invoice-cancel` | `npub` | Invoice id. |
 | `invoice-list` | `npub` | List filters and pagination. |

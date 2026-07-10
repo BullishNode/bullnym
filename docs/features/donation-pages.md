@@ -14,11 +14,10 @@ nym. Management actions use:
 
 - `donation-page-save`
 - `donation-page-archive`
-- `donation-page-image`
 
 The row stores display text, display currency, links, enabled/archive state,
-image hashes, an optional Liquid CT descriptor, and an independent address
-cursor.
+legacy image hashes, an optional Liquid CT descriptor, and an independent
+address cursor.
 
 ## Descriptor Use
 
@@ -61,12 +60,6 @@ The public payment page for a linked checkout remains `GET /:nym/i/:id`.
 
 Payment Page Bitcoin is a BTC-to-LBTC Boltz chain swap. It is not direct
 Bitcoin invoice settlement.
-
-## Images
-
-`POST /donation-page/image` uploads Payment Page avatar and OpenGraph images.
-The server normalizes images to WebP and stores hashes on the Payment Page row.
-POS currently has no separate image upload path.
 
 ## Archiving
 
