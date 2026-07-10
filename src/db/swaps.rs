@@ -89,6 +89,41 @@ pub async fn next_swap_key_index(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(row.0 as u64)
 }
 
+/// The value the NEXT `nextval('swap_key_seq')` will return, without consuming
+/// it. Requires `is_called`: once a value has been issued, `last_value` is that
+/// issued value (so `last_value == MAX(persisted index)` is the normal steady
+/// state, not a rollback) and the next issue is `last_value + 1`; before any
+/// issue, `last_value` itself is next. Compared against the maximum persisted
+/// index at startup to detect a database restore that rewound the sequence.
+/// See migration 044.
+pub async fn swap_key_seq_next_value(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END \
+         FROM swap_key_seq",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Highest swap-key index persisted for `fingerprint` across reverse swaps.
+/// `None` when this deployment has recorded no derivation metadata yet (fresh
+/// install or pre-migration rows only), which the rollback check treats as
+/// safe. See migration 044.
+pub async fn max_persisted_reverse_key_index(
+    pool: &PgPool,
+    fingerprint: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT MAX(key_index) FROM swap_records \
+         WHERE root_fingerprint = $1 AND key_index IS NOT NULL",
+    )
+    .bind(fingerprint)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 pub async fn allocate_address_index(pool: &PgPool, nym: &str) -> Result<Option<i32>, sqlx::Error> {
     let row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
@@ -117,6 +152,11 @@ pub struct NewSwapRecord<'a> {
     /// The claimer records an invoice payment event through this id only
     /// after merchant-side claim success.
     pub invoice_id: Option<Uuid>,
+    /// Derivation index of the swap key from `swap_key_seq`, recorded so a
+    /// rewound sequence after a DB restore is detectable. See migration 044.
+    pub key_index: Option<i64>,
+    /// Seed fingerprint that `key_index` is relative to. See migration 044.
+    pub root_fingerprint: Option<&'a str>,
 }
 
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
@@ -124,8 +164,9 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
-          preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10)",
+          preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id, \
+          key_index, root_fingerprint) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12)",
     )
     .bind(swap.nym)
     .bind(swap.boltz_swap_id)
@@ -137,6 +178,8 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     .bind(swap.claim_key_hex)
     .bind(swap.boltz_response_json)
     .bind(swap.invoice_id)
+    .bind(swap.key_index)
+    .bind(swap.root_fingerprint)
     .execute(&mut *tx)
     .await?;
     if let Some(nym) = swap.nym {

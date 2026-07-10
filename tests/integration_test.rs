@@ -104,6 +104,7 @@ fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
         utxo_backend: None,
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
+        swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
     }
 }
 

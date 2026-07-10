@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "043_claim_stuck_slow_recovery";
+pub const EXPECTED_SCHEMA_MARKER: &str = "044_swap_derivation_metadata";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {

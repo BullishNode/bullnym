@@ -1732,6 +1732,8 @@ async fn create_lightning_offer(
             claim_key_hex: &claim_key_hex,
             boltz_response_json: &boltz_response_json,
             invoice_id: Some(invoice.id),
+            key_index: Some(swap_key_index as i64),
+            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
         },
     )
     .await
@@ -1824,6 +1826,9 @@ async fn create_bitcoin_chain_offer(
             claim_key_hex: &claim_key_hex,
             refund_key_hex: &refund_key_hex,
             boltz_response_json: &boltz_response_json,
+            claim_key_index: Some(claim_key_index as i64),
+            refund_key_index: Some(refund_key_index as i64),
+            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
         },
     )
     .await
