@@ -1,6 +1,7 @@
 /target
 /target2
 .env
+config.toml
 *.sqlite
 .agents/
 .codex/

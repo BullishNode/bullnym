@@ -2,7 +2,7 @@
 
 ## Workflow
 
-1. Read `AGENTS.md`, the architecture overview, trust model, and relevant ADRs.
+1. Read the architecture overview, trust model, and relevant ADRs.
 2. Keep changes within the owning module and preserve signed API compatibility.
 3. Use an RFC for cross-product behavior, migrations with recovery impact, or
    changes to payment trust boundaries.

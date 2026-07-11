@@ -83,6 +83,7 @@ fn match_url_secret_pair(presented: &str, current: &str, previous: &str) -> UrlS
     }
 }
 
+#[cfg(test)]
 fn url_secret_matches_pair(presented: &str, current: &str, previous: &str) -> bool {
     match_url_secret_pair(presented, current, previous) != UrlSecretMatch::None
 }
@@ -132,7 +133,7 @@ pub async fn webhook_with_secret(
 }
 
 /// Compatibility webhook entrypoint: `/webhook/boltz`.
-/// See docs/compatibility-ledger.md for removal policy.
+/// See docs/reference/compatibility.md for removal policy.
 ///
 /// **First-time secret rollout (operational note).** The webhook URL is
 /// captured Boltz-side at swap-creation time. Setting the secret on a
@@ -443,7 +444,10 @@ async fn try_renegotiate_chain_swap(
     if !got_lock {
         // Another waterfall step (claim / self-claim / concurrent renegotiation)
         // owns this swap — let it decide the outcome; do not refund here.
-        tracing::debug!("renegotiate: lock held for {}, skipping", swap.boltz_swap_id);
+        tracing::debug!(
+            "renegotiate: lock held for {}, skipping",
+            swap.boltz_swap_id
+        );
         return Ok(true);
     }
 
@@ -2115,7 +2119,8 @@ pub(crate) async fn execute_chain_swap_refund(
             // Revert to refund_due so a later attempt / reconciler can retry.
             // Re-broadcast is conflict-safe: any second refund tx spends the
             // same lockup UTXO, so at most one confirms.
-            if let Err(revert_err) = db::revert_chain_swap_refunding_to_due(&state.db, swap.id).await
+            if let Err(revert_err) =
+                db::revert_chain_swap_refunding_to_due(&state.db, swap.id).await
             {
                 tracing::error!(
                     event = "chain_swap_refund_revert_failed",
@@ -2325,20 +2330,25 @@ fn electrum_host_port(url: &str) -> &str {
 async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
     let mut errors: Vec<String> = Vec::new();
     for (i, url) in urls.iter().enumerate() {
-        let client =
-            match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        event = "liquid_electrum_failover",
-                        endpoint = %url,
-                        err = %e,
-                        "Liquid electrum connect failed; trying next endpoint"
-                    );
-                    errors.push(format!("{url}: connect: {e}"));
-                    continue;
-                }
-            };
+        let client = match ElectrumLiquidClient::new(
+            LiquidChain::Liquid,
+            electrum_host_port(url),
+            true,
+            true,
+            30,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    event = "liquid_electrum_failover",
+                    endpoint = %url,
+                    err = %e,
+                    "Liquid electrum connect failed; trying next endpoint"
+                );
+                errors.push(format!("{url}: connect: {e}"));
+                continue;
+            }
+        };
         // Post-connect validation: a genesis-header fetch is cheap and
         // deterministic; an up-but-broken node errors here and we rotate.
         if let Err(e) = client.get_genesis_hash().await {

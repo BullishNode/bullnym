@@ -115,11 +115,12 @@ Invoices:
 - Direct BTC pays a merchant-supplied Bitcoin address.
 - Direct Liquid pays a merchant-supplied Liquid address.
 - Lightning reverse swaps claim to the merchant-supplied Liquid address.
-- Invoices do not expose BTC-to-LBTC Boltz chain swaps in this phase.
+- Invoices do not expose BTC-to-LBTC Boltz chain swaps.
 
 ## Payment Instructions
 
-The product surface should think in payment instructions, not raw rails.
+The API and product surfaces expose payment instructions rather than raw rail
+internals.
 
 Instruction kinds:
 
@@ -150,8 +151,7 @@ Fiat-denominated sessions resolve fiat to sats once at creation:
 `pricing_mode` is `sat_fixed` for sat-denominated sessions and `fiat_fixed`
 for fiat-denominated sessions whose BTC rate was locked at creation.
 
-Exchange-backed settlement would require a separate settlement mode. Direct
-Bitcoin merchant receive flows do not need floating fiat rates.
+Direct Bitcoin merchant receive flows do not use floating fiat rates.
 
 ## Payment Events
 
@@ -248,22 +248,21 @@ These implementation boundaries must not be described as stronger finality.
 
 ## Tolerance Policy
 
-Shortfall tolerance must be configurable and wired into all accounting paths.
+Shortfall tolerances are configured per rail and applied by invoice accounting.
 
-Initial defaults:
+Defaults:
 
 - BTC direct: 300 sats
 - Liquid direct: 60 sats
 - Lightning Boltz reverse: 1 sat
-- Bitcoin Boltz chain: 300 sats unless a tighter Boltz-delivered amount can be
-  proven
+- Bitcoin Boltz chain: 300 sats
 
 Tiny underpayments within tolerance become `paid`. Overpayments remain
 `overpaid` for auditability.
 
-If mixed rails are used, apply the tolerance of the event that crosses the
-threshold. If implementation starts with a simpler invoice-level tolerance, it
-must be documented and tested.
+For mixed-rail payments, accounting applies the tolerance of the credited event
+that crosses the threshold. Once an invoice is `paid` or `overpaid`, a later
+event with a tighter tolerance cannot regress it to a partial state.
 
 ## Boltz Reverse Swaps
 
@@ -301,7 +300,7 @@ a reliability improvement rather than current behavior.
 
 Session expiry and BOLT11 expiry are separate clocks.
 
-Rules:
+Current rules:
 
 - Create the initial reverse swap when a public checkout session or
   Lightning-enabled invoice is created.
@@ -311,15 +310,13 @@ Rules:
   changed.
 - Never create a replacement after session expiry.
 - Never extend session expiry because of Boltz.
-- Refresh must be single-flight per session and instruction kind.
-
-Preferred API shape:
-
-- `POST /api/v1/invoices/:id/lightning` may create or refresh.
-- `GET /api/v1/invoices/:id/status` should avoid side effects when possible.
-
-If status-side refresh is retained, it must hold a per-session lock around
-latest-swap lookup and swap creation.
+- `POST /api/v1/invoices/:id/lightning` creates or refreshes the offer.
+- `GET /api/v1/invoices/:id/status` is read-only and returns a BOLT11 only when
+  the latest offer still matches the remaining amount and is reusable.
+- Offer creation uses a transaction-scoped PostgreSQL advisory lock and checks
+  again inside the lock, preventing concurrent requests from creating duplicate
+  swaps. A request that loses the non-blocking lock returns a reusable offer if
+  one appeared; otherwise the caller retries.
 
 ## Boltz Chain Swaps
 
@@ -371,14 +368,13 @@ usage clear.
 The current watcher credits a matching output returned by Liquid Electrum
 scripthash history, including mempool history. It does not maintain a
 confirmation observation state comparable to direct Bitcoin. Clients and
-operators must therefore treat direct Liquid credit as pre-confirmation state
-until a future confirmation policy is implemented.
+operators must therefore treat direct Liquid credit as pre-confirmation state.
 
 ## Direct Bitcoin
 
 Direct Bitcoin is Invoices only.
 
-Requirements:
+Current behavior:
 
 - merchant supplies the Bitcoin address
 - watcher processes every matching output
@@ -400,18 +396,17 @@ Payment Page and POS:
 
 - archiving the surface stops new sessions
 - existing sessions expire naturally
-- no separate user-facing cancellation required initially
+- there is no separate checkout-cancellation endpoint
 
 Invoices:
 
 - merchant can cancel only while `unpaid`
-- do not cancel `partially_paid`
-- safest initial rule: do not cancel once `in_progress`
+- `partially_paid` and `in_progress` invoices cannot be cancelled
 - terminal statuses are not cancellable
 
 ## Testing Contract
 
-Tests should be product-oriented and rail-oriented:
+The verification suite is organized across these product and rail boundaries:
 
 - Lightning Address regression
 - Payment Page checkout

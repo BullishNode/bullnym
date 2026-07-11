@@ -165,7 +165,14 @@ fn confidential_lbtc_output(value: u64) -> (elements::TxOut, String, String) {
     );
 
     let (txout, abf, vbf, _eph) = elements::TxOut::new_last_confidential(
-        &mut rng, &secp, value, lbtc, spk, bpk, &[in_secrets], &[],
+        &mut rng,
+        &secp,
+        value,
+        lbtc,
+        spk,
+        bpk,
+        &[in_secrets],
+        &[],
     )
     .expect("build confidential output");
 
@@ -178,7 +185,9 @@ fn confidential_lbtc_output(value: u64) -> (elements::TxOut, String, String) {
 /// equal the token generator, so the proof is rejected (no unblinding needed).
 fn asset_masquerade_output(value: u64) -> (elements::TxOut, String, String) {
     use lwk_wollet::elements;
-    use lwk_wollet::elements::confidential::{Asset, AssetBlindingFactor, Value, ValueBlindingFactor};
+    use lwk_wollet::elements::confidential::{
+        Asset, AssetBlindingFactor, Value, ValueBlindingFactor,
+    };
     use lwk_wollet::elements::secp256k1_zkp::Generator;
 
     let secp = elements::secp256k1_zkp::Secp256k1::new();
@@ -234,9 +243,15 @@ fn rand_abf() -> String {
 #[test]
 fn proof_value_passes_when_at_or_above_floor() {
     let (txout, vbf, abf) = confidential_lbtc_output(5000);
-    let got =
-        assert_proof_utxo_value(&txout, 5000, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000)
-            .unwrap();
+    let got = assert_proof_utxo_value(
+        &txout,
+        5000,
+        &vbf,
+        &abf,
+        crate::invoice::LIQUID_BTC_ASSET_ID,
+        1000,
+    )
+    .unwrap();
     assert_eq!(got, 5000, "rebind confirms the committed value");
 }
 
@@ -244,7 +259,14 @@ fn proof_value_passes_when_at_or_above_floor() {
 fn proof_value_rejects_below_floor() {
     let (txout, vbf, abf) = confidential_lbtc_output(500);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 500, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            500,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -263,7 +285,14 @@ fn proof_value_rejects_wrong_asset() {
 fn proof_value_rejects_asset_masquerade() {
     let (txout, vbf, abf) = asset_masquerade_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_)),
     ));
 }
@@ -272,7 +301,14 @@ fn proof_value_rejects_asset_masquerade() {
 fn proof_value_rejects_explicit_asset() {
     let txout = explicit_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &rand_vbf(), &rand_abf(), crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &rand_vbf(),
+            &rand_abf(),
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_)),
     ));
 }
@@ -283,7 +319,14 @@ fn proof_value_rejects_forged_value() {
     // on-chain Pedersen commitment.
     let (txout, vbf, abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 999_999, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            999_999,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -292,7 +335,14 @@ fn proof_value_rejects_forged_value() {
 fn proof_value_rejects_wrong_value_bf() {
     let (txout, _vbf, abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &rand_vbf(), &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &rand_vbf(),
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -301,7 +351,14 @@ fn proof_value_rejects_wrong_value_bf() {
 fn proof_value_rejects_wrong_asset_bf() {
     let (txout, vbf, _abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, &rand_abf(), crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            &rand_abf(),
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -310,7 +367,14 @@ fn proof_value_rejects_wrong_asset_bf() {
 fn proof_value_rejects_malformed_factor() {
     let (txout, vbf, _abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, "notahex", crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            "notahex",
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }

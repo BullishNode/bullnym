@@ -459,7 +459,15 @@ pub async fn manifest(
     headers: HeaderMap,
 ) -> Response {
     let start_path = format!("/{nym}");
-    manifest_for_kind(&state, &nym, db::KIND_PAYMENT_PAGE, &start_path, peer_opt, &headers).await
+    manifest_for_kind(
+        &state,
+        &nym,
+        db::KIND_PAYMENT_PAGE,
+        &start_path,
+        peer_opt,
+        &headers,
+    )
+    .await
 }
 
 /// `GET /:nym/pos/manifest.webmanifest` — POS terminal PWA manifest. Served
@@ -745,7 +753,15 @@ pub async fn render_or_404(
     }
 
     let base_path = format!("/{nym}");
-    render_live(&state, &page, PublicBase::Nym { nym, base_path: &base_path }).await
+    render_live(
+        &state,
+        &page,
+        PublicBase::Nym {
+            nym,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 /// `GET /:nym/pos` — public POS terminal shell for the nym's POS surface
@@ -784,7 +800,15 @@ pub async fn render_pos(
     }
 
     let base_path = format!("/{nym}/pos");
-    render_live(&state, &page, PublicBase::Nym { nym: &nym, base_path: &base_path }).await
+    render_live(
+        &state,
+        &page,
+        PublicBase::Nym {
+            nym: &nym,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 /// `GET /a/:slug` — public donation surface served under a merchant-chosen

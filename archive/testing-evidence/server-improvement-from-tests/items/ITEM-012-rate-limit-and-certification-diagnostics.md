@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-012: Rate-Limit And Certification Diagnostics
 
 Backlog reference: `ISSUE-017`
@@ -53,7 +55,7 @@ Record the closure as diagnostic/preflight completion. Keep production limiter s
 
 - Files changed:
   - `docs/product-surface-coverage.md`
-  - `docs/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
   - this item dossier
 - Behavioral change: none in this item.
 

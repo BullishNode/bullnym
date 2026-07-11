@@ -60,6 +60,7 @@ Prerequisites:
 
 - Rust toolchain
 - PostgreSQL
+- `sqlx-cli` with PostgreSQL support
 - Node.js/npm when changing the PWA
 - a sibling `../boltz/boltz-rust` checkout matching the pinned project revision
 
@@ -67,13 +68,14 @@ Prerequisites:
 export DATABASE_URL=postgres://postgres:postgres@localhost/bullnym
 export SWAP_MNEMONIC="twelve word development mnemonic ..."
 
+cp config.example.toml config.toml
 sqlx migrate run
 cargo test --lib
 cargo run
 ```
 
-The server listens on `0.0.0.0:8080` by default. Copy and review `config.toml`
-for non-secret runtime settings. Production secrets belong in the environment.
+The example listens on `127.0.0.1:8080`. `config.toml` is ignored local runtime
+state; production secrets belong in the environment or a secret manager.
 
 For PWA changes:
 
@@ -108,9 +110,14 @@ and is not part of the current product contract.
 cargo test --lib
 cargo test --tests --no-run
 scripts/check-docs.sh
-./release-preflight.sh
+scripts/release-preflight.sh
 ```
 
 DB-backed integration tests require `TEST_DATABASE_URL` and a migrated test
 database. Deployed payment-rail certification and mobile compatibility are
 separate verification layers; see [Contributing](CONTRIBUTING.md).
+
+## License
+
+Bullnym is available under the [MIT License](LICENSE). Copyright 2026 Bull
+Bitcoin.

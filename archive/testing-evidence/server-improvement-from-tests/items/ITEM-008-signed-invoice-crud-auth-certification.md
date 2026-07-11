@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-008: Signed Invoice CRUD/Auth Certification
 
 Backlog reference: `ISSUE-011`
@@ -70,8 +72,8 @@ Proceed with focused route-level tests. Do not broaden into live settlement, rat
 
 - Files changed:
   - `tests/integration_test.rs`
-  - `docs/server-improvement-from-tests/items/ITEM-008-signed-invoice-crud-auth-certification.md`
-  - `docs/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/items/ITEM-008-signed-invoice-crud-auth-certification.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
   - `docs/product-surface-coverage.md`
 - Behavioral change: none in production code.
 - Migration/backfill: none.

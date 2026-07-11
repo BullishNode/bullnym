@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 06 Improvement Backlog
 
 This is the combined Bullnym server backlog from the evidence review. It includes both fixes and optimizations.

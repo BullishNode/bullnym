@@ -141,7 +141,8 @@ policy inline.
 ## Legacy Payment Page media hashes
 
 - Current fields: `avatar_sha256` and `og_sha256` in Payment Page responses and
-  their backing database columns/configuration.
+  their backing database columns. Existing files can still render, and assigning
+  an alias can copy an existing file to its content-addressed legacy path.
 - Compatibility behavior: existing values may be returned as read-only data.
   Bullnym does not accept image uploads and new clients must not depend on these
   fields being populated.

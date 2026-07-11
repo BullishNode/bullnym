@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-010: Invoice State-Machine Edges
 
 Backlog reference: `ISSUE-014`
@@ -59,7 +61,7 @@ Add the terminal paid cancel regression test. Avoid broad state-machine refactor
 - Files changed:
   - `tests/integration_test.rs`
   - `docs/product-surface-coverage.md`
-  - `docs/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
   - this item dossier
 - Behavioral change: none.
 - Migration/backfill: none.

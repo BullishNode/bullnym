@@ -77,7 +77,10 @@ pub fn spawn_chain(state: AppState, config: Arc<ReconcilerConfig>, cancel: Cance
     tokio::spawn(async move {
         // Bounded timeout (see spawn() above): a hung chain get_swap must not
         // freeze the chain reconciler loop.
-        let client = BoltzApiClientV2::new(state.config.boltz.api_url.clone(), Some(Duration::from_secs(10)));
+        let client = BoltzApiClientV2::new(
+            state.config.boltz.api_url.clone(),
+            Some(Duration::from_secs(10)),
+        );
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         tick.tick().await; // skip the immediate first tick (same as reverse spawn)
         loop {
@@ -140,7 +143,11 @@ pub fn spawn_settlement_repair(
 /// already-spent lockup). Runs at a much slower cadence than the main
 /// reconciler and is bounded per tick, so it can never starve normal claiming
 /// or hot-loop.
-pub fn spawn_slow_recovery(state: AppState, config: Arc<ReconcilerConfig>, cancel: CancellationToken) {
+pub fn spawn_slow_recovery(
+    state: AppState,
+    config: Arc<ReconcilerConfig>,
+    cancel: CancellationToken,
+) {
     tokio::spawn(async move {
         let mut tick =
             tokio::time::interval(Duration::from_secs(config.slow_recovery_interval_secs));
@@ -184,7 +191,8 @@ async fn run_slow_recovery_tick(
     for (id, boltz_swap_id, slow_attempts) in &reverse {
         let backoff = slow_recovery_backoff_secs(*slow_attempts, base, cap);
         let revived =
-            db::revive_claim_stuck_swap_for_slow_retry(&state.db, *id, max_attempts, backoff).await?;
+            db::revive_claim_stuck_swap_for_slow_retry(&state.db, *id, max_attempts, backoff)
+                .await?;
         if revived == 1 {
             tracing::warn!(
                 event = "slow_recovery_revived",
@@ -342,7 +350,10 @@ async fn run_one_chain_tick(
     let ids: Vec<uuid::Uuid> = stale.iter().map(|s| s.id).collect();
     db::mark_chain_swaps_reconciled(&state.db, &ids).await?;
 
-    tracing::info!("chain reconciler: scanning {} stale chain swap(s)", stale.len());
+    tracing::info!(
+        "chain reconciler: scanning {} stale chain swap(s)",
+        stale.len()
+    );
 
     for swap in &stale {
         if cancel.is_cancelled() {

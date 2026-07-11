@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-006: Registration, NIP-05, And Lookup Consistency
 
 Backlog reference: `ISSUE-003` / `OPT-008`

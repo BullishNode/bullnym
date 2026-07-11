@@ -535,10 +535,14 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     .unwrap();
     assert!(row.pos_mode);
 
-    let fetched = pay_service::db::get_donation_page_by_nym(&pool, "posround", pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let fetched = pay_service::db::get_donation_page_by_nym(
+        &pool,
+        "posround",
+        pay_service::db::KIND_PAYMENT_PAGE,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(fetched.pos_mode);
 
     let row = pay_service::db::upsert_donation_page(
@@ -710,10 +714,11 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert!(row.pos_mode);
     assert_eq!(row.header, "Legacy Save");
 
@@ -771,10 +776,11 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert!(row.pos_mode);
     assert_eq!(row.website.as_deref(), Some("https://example.com"));
 
@@ -853,10 +859,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["kind"], "pos");
-    assert!(body["public_url"]
-        .as_str()
-        .unwrap()
-        .ends_with("/posco/pos"));
+    assert!(body["public_url"].as_str().unwrap().ends_with("/posco/pos"));
 
     // Each surface resolves independently through the editor read.
     let (status, page) = get_path(&app, "/donation-page/posco").await;
@@ -970,10 +973,11 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["kind"], "payment_page");
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(row.kind, "payment_page");
     // No POS row was created.
     assert!(
@@ -1057,12 +1061,13 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
         .await
         .unwrap();
     assert_eq!(la_idx, 3, "POS allocation must not touch the LA cursor");
-    let pos_idx: i32 =
-        sqlx::query_scalar("SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = 'pos'")
-            .bind(nym)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let pos_idx: i32 = sqlx::query_scalar(
+        "SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = 'pos'",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(pos_idx, 8);
 
     cleanup_db(&pool).await;
@@ -1108,7 +1113,8 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
     .await
     .unwrap();
 
-    let (status, body) = post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
+    let (status, body) =
+        post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "DonationPageNotFound");
@@ -1490,6 +1496,8 @@ async fn webhook_skips_terminal_swaps() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: None,
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1554,6 +1562,9 @@ async fn webhook_advances_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_WEBHOOK_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1608,6 +1619,9 @@ async fn webhook_skips_terminal_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_TERMINAL_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -2733,7 +2747,7 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     .await
     .unwrap();
 
-    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool)
+    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 3_600)
         .await
         .unwrap();
     assert_eq!(expired_count, 2);
@@ -2773,6 +2787,7 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
         btc_sat: 300,
         liquid_sat: 60,
         lightning_sat: 1,
+        payment_grace_secs: 3_600,
     };
 
     let rows = pay_service::db::record_invoice_payment(
@@ -3388,7 +3403,7 @@ async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
         .await
         .unwrap();
 
-    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 3_600)
         .await
         .unwrap();
     assert!(candidates
@@ -3722,6 +3737,8 @@ async fn invoice_only_lightning_swap_does_not_require_nym() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3812,7 +3829,7 @@ async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
     let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
     let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
 
-    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 3_600)
         .await
         .unwrap();
     let invoice_ids: std::collections::HashSet<_> =
@@ -3844,6 +3861,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3866,6 +3885,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "dd".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3905,6 +3926,9 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chain-swap-rec-1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3973,6 +3997,9 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainretry-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4032,6 +4059,9 @@ async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainfail-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4089,6 +4119,8 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4396,30 +4428,16 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-0",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, None, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
         .execute(&pool)
         .await
         .unwrap();
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-1",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, None, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
         .execute(&pool)
         .await

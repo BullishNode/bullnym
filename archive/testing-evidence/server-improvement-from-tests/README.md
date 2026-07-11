@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # Bullnym Server Improvement From Test Evidence
 
 Date: 2026-05-19

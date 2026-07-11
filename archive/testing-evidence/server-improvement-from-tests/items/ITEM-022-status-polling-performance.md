@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-022: Status Polling Performance
 
 Backlog reference: `OPT-005`

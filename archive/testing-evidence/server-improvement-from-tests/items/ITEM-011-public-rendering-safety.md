@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-011: Public Rendering Safety
 
 Backlog reference: `ISSUE-016`
@@ -55,7 +57,7 @@ Add the focused unit regression test. Avoid template rewrites without a confirme
 - Files changed:
   - `src/invoice/tests.rs`
   - `docs/product-surface-coverage.md`
-  - `docs/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
   - this item dossier
 - Behavioral change: none.
 

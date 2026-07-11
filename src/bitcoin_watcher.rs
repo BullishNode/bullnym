@@ -161,7 +161,9 @@ impl BitcoinWatcher {
         let (tip, endpoint) = match self.fetch_tip_and_endpoint().await {
             Some(pair) => pair,
             None => {
-                tracing::warn!("bitcoin_watcher: tip-height fetch failed on all endpoints; skipping tick");
+                tracing::warn!(
+                    "bitcoin_watcher: tip-height fetch failed on all endpoints; skipping tick"
+                );
                 return;
             }
         };

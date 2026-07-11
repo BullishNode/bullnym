@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-021: Maintainability Extraction
 
 Backlog reference: `ISSUE-021`

@@ -3,6 +3,7 @@
 - [Configuration](configuration.md)
 - [Deployment](deployment.md)
 - [Monitoring](monitoring.md)
+- [Releases](releases.md)
 - [Swap recovery runbook](runbooks/stuck-swaps.md)
 - [nginx example](nginx.conf.example)
 

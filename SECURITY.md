@@ -2,9 +2,7 @@
 
 Do not open a public issue for a vulnerability that could expose payment
 metadata, descriptors, swap keys, recovery material, authentication secrets, or
-create a path to fund loss. Report it privately to the repository maintainers
-through GitHub's private vulnerability reporting when enabled, or through the
-private security contact published by BULL Bitcoin.
+create a path to fund loss. Use [Bullnym private vulnerability reporting](https://github.com/BullishNode/bullnym/security/advisories/new).
 
 Include affected revision, deployment assumptions, reproduction steps, impact,
 and whether funds or secrets may currently be at risk. Do not move real funds,

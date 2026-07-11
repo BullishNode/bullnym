@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-005: Scoped Certification Allowlist
 
 Backlog reference: `ISSUE-008` / `ISSUE-005` / `OPT-014`

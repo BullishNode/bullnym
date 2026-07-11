@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-017: Operator Controls And Journey Views
 
 Backlog reference: `ISSUE-007` / `OPT-007`

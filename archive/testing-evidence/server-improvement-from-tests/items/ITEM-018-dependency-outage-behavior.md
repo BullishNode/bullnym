@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-018: Dependency Outage Behavior
 
 Backlog reference: `ISSUE-018` / `OPT-011`

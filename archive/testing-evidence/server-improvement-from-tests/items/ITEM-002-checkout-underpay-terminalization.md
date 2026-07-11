@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-002: Checkout Underpay Terminalization
 
 Backlog reference: `ISSUE-001` / `OPT-001` / `OPT-006`

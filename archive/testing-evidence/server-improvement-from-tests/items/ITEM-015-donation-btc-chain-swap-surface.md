@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-015: Donation BTC Chain-Swap Surface
 
 Backlog reference: `ISSUE-013`

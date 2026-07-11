@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 09 Expanded Issue And Optimization Inventory
 
 The first server issue list was too narrow. It captured the obvious high-signal failures, but it did not fully account for whole Bullnym server surfaces that were skipped or contaminated in broad ARS. This expanded inventory separates confirmed issues from unknown-risk surfaces and optimization opportunities.

@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-003: BTC Unconfirmed Payment Status
 
 Backlog reference: `ISSUE-002` / `OPT-002`
@@ -24,7 +26,7 @@ Status: closed
   - `src/invoice.rs`
   - `migrations/024_invoice_payment_events.sql`
   - `migrations/028_invoice_payment_event_evidence.sql`
-  - `docs/payment-architecture.md`
+  - `docs/architecture/payment-lifecycle.md`
 
 ## Observed Behavior
 
@@ -94,7 +96,7 @@ The failing run does not prove whether the server watcher saw the Bitcoin transa
   - `src/bitcoin_watcher.rs`
   - `src/invoice.rs`
   - `src/version.rs`
-  - `docs/payment-architecture.md`
+  - `docs/architecture/payment-lifecycle.md`
   - this item file
 - Schema/API compatibility:
   - Additive migration.
@@ -167,7 +169,7 @@ Accepted. The revised plan is:
   - `src/bitcoin_watcher.rs`
   - `src/invoice.rs`
   - `src/version.rs`
-  - `docs/payment-architecture.md`
+  - `docs/architecture/payment-lifecycle.md`
   - `tests/integration_test.rs`
 - Behavioral change:
   - Direct BTC watcher persists non-accounting observations for mempool, below-threshold confirmed, and counted outputs.

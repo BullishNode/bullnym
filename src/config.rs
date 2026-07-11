@@ -49,7 +49,7 @@ pub struct Config {
     /// constant time.
     ///
     /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. See
-    /// docs/compatibility-ledger.md for fallback and rotation policy.
+    /// docs/reference/compatibility.md for fallback and rotation policy.
     #[serde(skip)]
     pub boltz_webhook_url_secret: String,
     /// Optional previous URL secret. Accepted in addition to
@@ -389,85 +389,29 @@ fn default_pwa_dist_dir() -> String {
     DEFAULT_PWA_DIST_DIR.to_string()
 }
 
-// --- Donation page image pipeline ---
+// --- Legacy Payment Page media ---
 
 const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
-const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
-const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 5_000;
-const DEFAULT_DONATION_IMAGE_MAX_PIXELS: u64 = 12_000_000;
-const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
-const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
-const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DonationConfig {
-    /// Filesystem root for image storage. The handler writes to
-    /// `<image_root_path>/<nym>/<kind>.webp`. nginx serves this directly
-    /// at `location ^~ /img/`. The directory must be writable by the
-    /// pay-service user and readable by nginx.
+    /// Filesystem root containing media created by versions that supported
+    /// uploads. Current code only copies existing nym-keyed files to their
+    /// content-addressed alias path; it does not accept new media.
     #[serde(default = "default_donation_image_root")]
     pub image_root_path: String,
-    /// Hard cap on incoming image bytes. Enforced via per-route
-    /// `DefaultBodyLimit` BEFORE the multipart parser runs — bytes never
-    /// enter memory beyond this.
-    #[serde(default = "default_donation_image_max_bytes")]
-    pub image_max_bytes: usize,
-    /// Reject images whose decoded dimensions exceed this in either
-    /// axis. Image-bomb defense: read the header dimensions first
-    /// (cheap), reject before allocating the full pixel buffer. The
-    /// default is intentionally below large-camera panoramas because decode
-    /// memory grows with pixels, not upload bytes.
-    #[serde(default = "default_donation_image_max_dimension")]
-    pub image_max_dimension: u32,
-    /// Reject images whose decoded pixel area exceeds this value before
-    /// allocating the full pixel buffer.
-    #[serde(default = "default_donation_image_max_pixels")]
-    pub image_max_pixels: u64,
-    /// Output size for resized avatar (square).
-    #[serde(default = "default_donation_avatar_size")]
-    pub avatar_size: u32,
-    /// Output size for resized OG image (1200×630 is the Twitter/Facebook
-    /// summary_large_image standard).
-    #[serde(default = "default_donation_og_width")]
-    pub og_width: u32,
-    #[serde(default = "default_donation_og_height")]
-    pub og_height: u32,
 }
 
 impl Default for DonationConfig {
     fn default() -> Self {
         Self {
             image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
-            image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
-            image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
-            image_max_pixels: DEFAULT_DONATION_IMAGE_MAX_PIXELS,
-            avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
-            og_width: DEFAULT_DONATION_OG_WIDTH,
-            og_height: DEFAULT_DONATION_OG_HEIGHT,
         }
     }
 }
 
 fn default_donation_image_root() -> String {
     DEFAULT_DONATION_IMAGE_ROOT.to_string()
-}
-fn default_donation_image_max_bytes() -> usize {
-    DEFAULT_DONATION_IMAGE_MAX_BYTES
-}
-fn default_donation_image_max_dimension() -> u32 {
-    DEFAULT_DONATION_IMAGE_MAX_DIMENSION
-}
-fn default_donation_image_max_pixels() -> u64 {
-    DEFAULT_DONATION_IMAGE_MAX_PIXELS
-}
-fn default_donation_avatar_size() -> u32 {
-    DEFAULT_DONATION_AVATAR_SIZE
-}
-fn default_donation_og_width() -> u32 {
-    DEFAULT_DONATION_OG_WIDTH
-}
-fn default_donation_og_height() -> u32 {
-    DEFAULT_DONATION_OG_HEIGHT
 }
 
 const DEFAULT_POOL_SIZE: u32 = 10;
@@ -599,8 +543,10 @@ pub struct BitcoinWatcherConfig {
 /// Hardcoded Bitcoin esplora failover providers (Bull Bitcoin, Blockstream),
 /// appended after the configured endpoint(s). mempool.space-shape REST; values
 /// from the bullbitcoin-mobile wallet defaults.
-pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] =
-    ["https://mempool.bullbitcoin.com/api", "https://mempool.space/api"];
+pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] = [
+    "https://mempool.bullbitcoin.com/api",
+    "https://mempool.space/api",
+];
 
 impl BitcoinWatcherConfig {
     /// Ordered, deduplicated esplora endpoint list: configured `endpoint`
@@ -819,18 +765,6 @@ pub struct RateLimitConfig {
     #[serde(default = "default_donation_manifest_rate_window_secs")]
     pub donation_manifest_rate_window_secs: u32,
 
-    // --- Donation page image upload ---
-    /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
-    /// because a real user uploads avatar + OG once per session, not
-    /// many times per hour.
-    #[serde(default = "default_donation_image_uploads_per_npub_per_hour")]
-    pub donation_image_uploads_per_npub_per_hour: u32,
-    /// Per-source upload rate-limit. Defense-in-depth against IP-rotated
-    /// abuse — stops one IP from uploading to many npubs in quick
-    /// succession.
-    #[serde(default = "default_donation_image_uploads_per_source_per_min")]
-    pub donation_image_uploads_per_source_per_min: u32,
-
     /// Per-source rate-limit on public invoice status polling.
     #[serde(
         default = "default_invoice_status_per_source_per_min",
@@ -896,10 +830,6 @@ impl Default for RateLimitConfig {
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
             donation_manifest_rate_limit: default_donation_manifest_rate_limit(),
             donation_manifest_rate_window_secs: default_donation_manifest_rate_window_secs(),
-            donation_image_uploads_per_npub_per_hour:
-                default_donation_image_uploads_per_npub_per_hour(),
-            donation_image_uploads_per_source_per_min:
-                default_donation_image_uploads_per_source_per_min(),
             invoice_status_per_source_per_min: default_invoice_status_per_source_per_min(),
             invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
             invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
@@ -1060,15 +990,6 @@ fn default_donation_manifest_rate_limit() -> u32 {
 fn default_donation_manifest_rate_window_secs() -> u32 {
     default_donation_html_rate_window_secs()
 }
-/// 6/h per npub: a real user uploads avatar + OG once per setup; six is
-/// generous headroom for retries and accidental re-uploads.
-fn default_donation_image_uploads_per_npub_per_hour() -> u32 {
-    6
-}
-/// 3/min per source: defense-in-depth against IP-rotated abuse.
-fn default_donation_image_uploads_per_source_per_min() -> u32 {
-    3
-}
 /// 60/min: invoice payment pages poll status during an active session.
 fn default_invoice_status_per_source_per_min() -> u32 {
     60
@@ -1165,8 +1086,10 @@ impl ElectrumConfig {
 /// Hardcoded Liquid Electrum failover providers (Bull Bitcoin, Blockstream).
 /// Values from the bullbitcoin-mobile wallet defaults (`les` first — it has
 /// been the more reliable of the two).
-pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] =
-    ["ssl://les.bullbitcoin.com:995", "ssl://blockstream.info:995"];
+pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] = [
+    "ssl://les.bullbitcoin.com:995",
+    "ssl://blockstream.info:995",
+];
 
 /// Add a default `ssl://` prefix to URLs that lack a scheme. Logs a warning
 /// so operators can fix their configs.
@@ -1238,7 +1161,7 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         config.swap_mnemonic = std::env::var("SWAP_MNEMONIC")
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
-        // See docs/compatibility-ledger.md for the env-var fallback.
+        // See docs/reference/compatibility.md for the env-var fallback.
         config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
             .or_else(|_| std::env::var("BOLTZ_WEBHOOK_SECRET"))
             .unwrap_or_default();
@@ -1275,12 +1198,6 @@ impl Config {
         }
         if self.proof.message_tag.is_empty() {
             return Err("proof.message_tag must be non-empty".into());
-        }
-        if self.donation.image_max_dimension == 0 {
-            return Err("donation.image_max_dimension must be > 0".into());
-        }
-        if self.donation.image_max_pixels == 0 {
-            return Err("donation.image_max_pixels must be > 0".into());
         }
         if self.certification.enabled {
             if self.certification.token.is_empty() {

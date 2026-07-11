@@ -327,12 +327,19 @@ mod tests {
         // Same seed -> same fingerprint across calls.
         assert_eq!(fp, svc.derivation_root_fingerprint().unwrap());
         // Same seed via a fresh service -> same fingerprint.
-        assert_eq!(fp, test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap());
+        assert_eq!(
+            fp,
+            test_service(TEST_MNEMONIC)
+                .derivation_root_fingerprint()
+                .unwrap()
+        );
     }
 
     #[test]
     fn root_fingerprint_differs_across_seeds() {
-        let a = test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap();
+        let a = test_service(TEST_MNEMONIC)
+            .derivation_root_fingerprint()
+            .unwrap();
         let b = test_service(
             "legal winner thank year wave sausage worth useful legal winner thank yellow",
         )

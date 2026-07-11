@@ -385,7 +385,10 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
     );
     assert_eq!(json["invoice_base"], "/a/alices-shop");
     assert_eq!(json["page_key"], "alices-shop");
-    assert_eq!(json["avatar_url"], "https://bullpay.ca/img/_h/deadbeef.webp");
+    assert_eq!(
+        json["avatar_url"],
+        "https://bullpay.ca/img/_h/deadbeef.webp"
+    );
 }
 
 #[test]

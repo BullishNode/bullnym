@@ -67,8 +67,8 @@ pub struct UpsertDonationPage<'a> {
 
 /// Insert-or-update a donation page row. Mobile sends the full page config on
 /// every save (PUT semantics). Update path clears `archived_at` so a re-save
-/// after archive un-archives. Image hashes (`avatar_sha256`, `og_sha256`) are
-/// owned by `POST /donation-page/image`.
+/// after archive un-archives. Legacy media hashes (`avatar_sha256`,
+/// `og_sha256`) are preserved and never modified by current write APIs.
 pub async fn upsert_donation_page(
     pool: &PgPool,
     page: &UpsertDonationPage<'_>,
@@ -139,47 +139,6 @@ pub async fn archive_donation_page(
     .bind(kind)
     .fetch_optional(pool)
     .await
-}
-
-/// Update the avatar or og image hash for a nym's donation page. Used by
-/// `POST /donation-page/image` after the resized WebP has been atomically
-/// written to disk. `kind_column` is one of `"avatar_sha256"` or
-/// `"og_sha256"`; the allowlist is repeated here because SQL identifiers
-/// cannot be parameterized.
-pub async fn update_donation_page_image_hash(
-    pool: &PgPool,
-    nym: &str,
-    kind: &str,
-    image_column: &str,
-    new_sha256: &str,
-) -> Result<Option<DonationPage>, sqlx::Error> {
-    let sql = match image_column {
-        "avatar_sha256" => {
-            "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
-        }
-        "og_sha256" => {
-            "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
-        }
-        _ => {
-            return Err(sqlx::Error::Protocol(format!(
-                "invalid image kind column: {image_column}"
-            )))
-        }
-    };
-    sqlx::query_as::<_, DonationPage>(sql)
-        .bind(nym)
-        .bind(kind)
-        .bind(new_sha256)
-        .fetch_optional(pool)
-        .await
 }
 
 pub async fn get_donation_page_by_nym(
@@ -274,12 +233,14 @@ where
         .await?;
 
         if !in_use {
-            sqlx::query("UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2")
-                .bind(nym)
-                .bind(kind)
-                .bind(address_index + 1)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2",
+            )
+            .bind(nym)
+            .bind(kind)
+            .bind(address_index + 1)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(Some((address, address_index, ct_descriptor)));
         }

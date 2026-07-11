@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 05 Server Optimizations
 
 Optimizations are first-class findings. They include paths that already work but can be made faster, cheaper, safer, simpler, easier to operate, or easier to reason about.

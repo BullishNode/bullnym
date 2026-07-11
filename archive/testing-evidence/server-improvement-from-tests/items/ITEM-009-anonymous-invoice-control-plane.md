@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-009: Anonymous Invoice Control-Plane
 
 Backlog reference: `ISSUE-012`
@@ -64,7 +66,7 @@ Use inserted invoice rows for deterministic render/status certification. Leave l
 - Files changed:
   - `tests/integration_test.rs`
   - `docs/product-surface-coverage.md`
-  - `docs/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
   - this item dossier
 - Behavioral change: none.
 - Migration/backfill: none.

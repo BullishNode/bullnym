@@ -36,23 +36,6 @@ pub enum AppError {
     /// from `RecoveryNotAvailable` so a retry after a client timeout is not
     /// mistaken for "the funds never existed". Inner string is operator-facing.
     RecoveryInProgress(String),
-    /// Image upload rejected (magic-byte sniff fail, decode error, etc.).
-    /// Inner string is operator-facing.
-    ImageInvalid(String),
-    /// Multipart form was malformed: missing required field, oversize text
-    /// field, etc. Distinct from `ImageInvalid` so the wire copy doesn't
-    /// blame the user's image when the form was actually wrong.
-    MultipartInvalid(String),
-    /// Decoded image dimensions exceeded `image_max_dimension`. Image-
-    /// bomb defense — the full pixel buffer was never allocated.
-    ImageDimensionsTooLarge {
-        max: u32,
-    },
-    /// Decoded image area exceeded `image_max_pixels`. Image-bomb defense
-    /// paired with the per-axis cap.
-    ImagePixelsTooLarge {
-        max_pixels: u64,
-    },
     /// The caller's wallet already has an active address.
     KeyAlreadyRegistered {
         nym: String,
@@ -161,10 +144,6 @@ impl AppError {
             | Self::DonationPageInvalid(_)
             | Self::DonationPageNotFound(_)
             | Self::InvoiceNotFound(_)
-            | Self::ImageInvalid(_)
-            | Self::ImageDimensionsTooLarge { .. }
-            | Self::ImagePixelsTooLarge { .. }
-            | Self::MultipartInvalid(_)
             | Self::KeyAlreadyRegistered { .. }
             | Self::NymQuotaExceeded { .. }
             | Self::InvalidDescriptor(_)
@@ -210,10 +189,6 @@ impl AppError {
             Self::RecoveryAddressInvalid(_) => "RecoveryAddressInvalid",
             Self::RecoveryNotAvailable(_) => "RecoveryNotAvailable",
             Self::RecoveryInProgress(_) => "RecoveryInProgress",
-            Self::ImageInvalid(_) => "ImageInvalid",
-            Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
-            Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
-            Self::MultipartInvalid(_) => "MultipartInvalid",
             Self::KeyAlreadyRegistered { .. } => "KeyAlreadyRegistered",
             Self::NymQuotaExceeded { .. } => "NymQuotaExceeded",
             Self::InvalidDescriptor(_) => "InvalidDescriptor",
@@ -267,14 +242,6 @@ impl std::fmt::Display for AppError {
             Self::RecoveryAddressInvalid(reason) => write!(f, "recovery address invalid: {reason}"),
             Self::RecoveryNotAvailable(reason) => write!(f, "recovery not available: {reason}"),
             Self::RecoveryInProgress(reason) => write!(f, "recovery in progress: {reason}"),
-            Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
-            Self::ImageDimensionsTooLarge { max } => {
-                write!(f, "image dimensions exceed {max}px cap")
-            }
-            Self::ImagePixelsTooLarge { max_pixels } => {
-                write!(f, "image pixel area exceeds {max_pixels} pixel cap")
-            }
-            Self::MultipartInvalid(reason) => write!(f, "multipart invalid: {reason}"),
             Self::KeyAlreadyRegistered { nym, domain } => {
                 write!(f, "key already has active address: {nym}@{domain}")
             }
@@ -340,14 +307,6 @@ impl IntoResponse for AppError {
             AppError::RecoveryAddressInvalid(_) => "This is not a valid Bitcoin address for the correct network. Check the address and try again.".into(),
             AppError::RecoveryNotAvailable(_) => "This payment has no recoverable on-chain funds, or a recovery was already completed to a different address.".into(),
             AppError::RecoveryInProgress(_) => "A recovery is already in progress for this payment. Check back shortly.".into(),
-            AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
-            AppError::ImageDimensionsTooLarge { max } => format!(
-                "Image dimensions are too large. Maximum {max}×{max} pixels."
-            ),
-            AppError::ImagePixelsTooLarge { max_pixels } => format!(
-                "Image dimensions are too large. Maximum {max_pixels} total pixels."
-            ),
-            AppError::MultipartInvalid(_) => "Upload form was malformed. Retry from the app.".into(),
             AppError::KeyAlreadyRegistered { nym, domain } => format!(
                 "This wallet already has an active Lightning Address: {nym}@{domain}. \
                  Deactivate it before registering a different name."

@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-020: Error Taxonomy
 
 Backlog reference: `ISSUE-020` / `OPT-010`

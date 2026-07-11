@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # Bullnym Product Surface Coverage
 
 This is Bullnym server's coverage ledger. It records what the current evidence proves, what remains unknown, what is blocked by missing preconditions, and what historical evidence is invalid for product correctness. Its purpose is coverage accounting and rerun avoidance; it is not a new product claim.
@@ -11,7 +13,7 @@ wallet derivation, app storage, or device UI behavior.
 
 Evidence rules:
 
-- Scenario outcomes come from the test-evidence docs under `docs/server-improvement-from-tests/`.
+- Scenario outcomes come from the test-evidence docs under `archive/testing-evidence/server-improvement-from-tests/`.
 - Server ownership and routes may be sourced from `src/main.rs` route registration and handler module names.
 - If neither evidence docs nor route registration identify ownership clearly, mark ownership as unknown.
 - Skipped, blocked, contaminated, or setup-gated surfaces are unassessed. They are not failed unless a specific valid failed scenario is cited.

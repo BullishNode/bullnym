@@ -358,8 +358,14 @@ fn chain_swap_status_mapping_still_advances_and_terminalizes_correctly() {
 #[test]
 fn electrum_host_port_strips_scheme_for_boltz_client() {
     // boltz-client re-adds ssl://; we must hand it a bare host:port.
-    assert_eq!(electrum_host_port("ssl://les.bullbitcoin.com:50002"), "les.bullbitcoin.com:50002");
-    assert_eq!(electrum_host_port("ssl://172.16.0.15:50002"), "172.16.0.15:50002");
+    assert_eq!(
+        electrum_host_port("ssl://les.bullbitcoin.com:50002"),
+        "les.bullbitcoin.com:50002"
+    );
+    assert_eq!(
+        electrum_host_port("ssl://172.16.0.15:50002"),
+        "172.16.0.15:50002"
+    );
     assert_eq!(electrum_host_port("tcp://host:50001"), "host:50001");
     // Already bare — unchanged.
     assert_eq!(electrum_host_port("host:50002"), "host:50002");

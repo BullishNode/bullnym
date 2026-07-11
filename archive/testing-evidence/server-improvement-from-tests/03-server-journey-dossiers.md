@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 03 Server Journey Dossiers
 
 These dossiers reconstruct what Bullnym server appeared to do in the meaningful evidence clusters. They are intentionally focused on server behavior, not on test-suite mechanics.

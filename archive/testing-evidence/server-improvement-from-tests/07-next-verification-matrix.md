@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 07 Next Verification Matrix
 
 The next test run should verify server changes, not repeat known-good evidence.

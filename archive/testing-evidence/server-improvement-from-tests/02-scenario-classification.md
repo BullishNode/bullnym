@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 02 Scenario Classification
 
 This file classifies the recorded scenario results by server relevance.

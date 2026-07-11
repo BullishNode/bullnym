@@ -20,9 +20,8 @@ use tower_http::trace::TraceLayer;
 
 use pay_service::{
     bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page,
-    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
-    reconciler, registration,
+    donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr,
+    rate_limit, readiness, reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -85,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boltz does not HMAC-sign webhook deliveries; the only viable
     // authenticator is the URL itself. Compatibility details live in
-    // docs/compatibility-ledger.md.
+    // docs/reference/compatibility.md.
     let webhook_url = if config.boltz_webhook_url_secret.is_empty() {
         tracing::warn!(
             "BOLTZ_WEBHOOK_URL_SECRET unset — registering unauthenticated webhook URL (DEV ONLY)"
@@ -420,7 +419,7 @@ fn build_router(state: AppState) -> Router {
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/sw.js", get(donation_render::service_worker))
         .route("/qr.svg", get(qr::generate))
-        // See docs/compatibility-ledger.md for webhook compatibility policy.
+        // See docs/reference/compatibility.md for webhook compatibility policy.
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
@@ -507,7 +506,6 @@ fn build_router(state: AppState) -> Router {
                 post(invoice::create_anonymous_alias).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
-
     }
 
     if invoice_sessions_enabled {

@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 04 Server Issues
 
 This file lists server issues and candidate issues identified from test evidence. It does not include pure test-suite defects except where Bullnym server needs an operational feature to support certification safely.

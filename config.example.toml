@@ -1,0 +1,26 @@
+# Development example. Production operators must review every default and use
+# environment variables or a secret manager for credentials and key material.
+domain = "localhost:8080"
+listen = "127.0.0.1:8080"
+pool_size = 5
+
+[boltz]
+api_url = "https://api.boltz.exchange/v2"
+electrum_url = "les.bullbitcoin.com:995"
+
+[electrum]
+liquid_url = "les.bullbitcoin.com:995"
+
+[features]
+lightning_address = true
+invoices = true
+payment_pages = true
+nip05 = false
+
+[workers]
+enabled = true
+
+# Media uploads are not supported. This path is read only except for copying
+# existing legacy files to content-addressed paths when an alias is assigned.
+[donation]
+image_root_path = "/opt/payservice/data/images"

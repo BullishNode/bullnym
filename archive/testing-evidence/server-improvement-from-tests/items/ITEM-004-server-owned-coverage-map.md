@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-004: Server-Owned Coverage Map
 
 Backlog reference: `OPT-015`
@@ -25,11 +27,11 @@ Status: closed
 - Relevant code:
   - `src/main.rs` route map.
   - `src/version.rs`.
-  - `docs/server-improvement-from-tests/01-evidence-index.md`.
-  - `docs/server-improvement-from-tests/02-scenario-classification.md`.
-  - `docs/server-improvement-from-tests/06-improvement-backlog.md`.
-  - `docs/server-improvement-from-tests/07-next-verification-matrix.md`.
-  - `docs/server-improvement-from-tests/09-expanded-issue-and-optimization-inventory.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/01-evidence-index.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/02-scenario-classification.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/06-improvement-backlog.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/07-next-verification-matrix.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/09-expanded-issue-and-optimization-inventory.md`.
 
 ## Observed Behavior
 
@@ -86,7 +88,7 @@ The smallest useful server improvement is a repo-owned coverage document. It sho
   - Add this item dossier.
 - Files likely touched:
   - `docs/product-surface-coverage.md`.
-  - `docs/server-improvement-from-tests/items/ITEM-004-server-owned-coverage-map.md`.
+  - `archive/testing-evidence/server-improvement-from-tests/items/ITEM-004-server-owned-coverage-map.md`.
 - Schema/API compatibility:
   - None.
 - Risks:
@@ -124,11 +126,11 @@ The smallest useful server improvement is a repo-owned coverage document. It sho
 
 - Files changed:
   - `docs/product-surface-coverage.md`
-  - `docs/server-improvement-from-tests/items/ITEM-004-server-owned-coverage-map.md`
-  - `docs/server-improvement-from-tests/README.md`
-  - `docs/server-improvement-from-tests/06-improvement-backlog.md`
-  - `docs/server-improvement-from-tests/07-next-verification-matrix.md`
-  - `docs/server-improvement-from-tests/09-expanded-issue-and-optimization-inventory.md`
+  - `archive/testing-evidence/server-improvement-from-tests/items/ITEM-004-server-owned-coverage-map.md`
+  - `archive/testing-evidence/server-improvement-from-tests/README.md`
+  - `archive/testing-evidence/server-improvement-from-tests/06-improvement-backlog.md`
+  - `archive/testing-evidence/server-improvement-from-tests/07-next-verification-matrix.md`
+  - `archive/testing-evidence/server-improvement-from-tests/09-expanded-issue-and-optimization-inventory.md`
 - Behavioral change:
   - None.
 - Migration/backfill:

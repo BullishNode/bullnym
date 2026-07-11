@@ -445,7 +445,9 @@ pub async fn list_claimed_chain_swaps_missing_payment_event(
     .await
 }
 
-pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+pub async fn list_refund_due_chain_swaps(
+    pool: &PgPool,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
          FROM chain_swap_records \
@@ -668,10 +670,7 @@ pub async fn list_non_terminal_chain_swaps_oldest_first(
 /// on the whole fetched batch, BEFORE the per-swap loop. Mirrors
 /// `swaps::mark_swaps_reconciled` — see that fn for why the batch is stamped
 /// up-front rather than per-row after processing.
-pub async fn mark_chain_swaps_reconciled(
-    pool: &PgPool,
-    ids: &[Uuid],
-) -> Result<(), sqlx::Error> {
+pub async fn mark_chain_swaps_reconciled(pool: &PgPool, ids: &[Uuid]) -> Result<(), sqlx::Error> {
     if ids.is_empty() {
         return Ok(());
     }

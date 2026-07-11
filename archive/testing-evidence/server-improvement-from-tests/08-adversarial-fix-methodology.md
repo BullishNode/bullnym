@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 08 Adversarial Fix Methodology
 
 This is the required method for turning each Bullnym server issue or optimization into a reviewed implementation. The goal is server improvement with evidence, not test-suite churn.
@@ -32,7 +34,7 @@ Each backlog item uses these roles. A single person can operate the process, but
 
 Each issue or optimization gets one file under:
 
-`docs/server-improvement-from-tests/items/`
+`archive/testing-evidence/server-improvement-from-tests/items/`
 
 Filename:
 

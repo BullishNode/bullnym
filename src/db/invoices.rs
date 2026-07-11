@@ -1117,22 +1117,34 @@ mod status_tests {
 
     #[test]
     fn within_tolerance_is_paid() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 99_750, 300, false), "paid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 99_750, 300, false),
+            "paid"
+        );
     }
 
     #[test]
     fn overpaid_when_exceeding_amount() {
-        assert_eq!(resolve_invoice_status("paid", AMT, 100_500, 60, false), "overpaid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 100_500, 60, false),
+            "overpaid"
+        );
     }
 
     #[test]
     fn partial_when_short_beyond_tolerance() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 90_000, 300, false), "partially_paid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 90_000, 300, false),
+            "partially_paid"
+        );
     }
 
     #[test]
     fn expired_short_is_underpaid() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 90_000, 300, true), "underpaid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 90_000, 300, true),
+            "underpaid"
+        );
     }
 
     // The R2 regression: a settled invoice must not un-pay when a later event
@@ -1141,24 +1153,36 @@ mod status_tests {
     // Pre-fix this recomputed to partially_paid; post-fix it stays paid.
     #[test]
     fn settled_paid_does_not_regress_on_tighter_rail() {
-        assert_eq!(resolve_invoice_status("paid", AMT, 99_900, 60, false), "paid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 99_900, 60, false),
+            "paid"
+        );
     }
 
     #[test]
     fn settled_overpaid_does_not_regress() {
         // A cross-rail prune lowered the sum back under amount, recompute would
         // be partially_paid, but an overpaid invoice stays settled.
-        assert_eq!(resolve_invoice_status("overpaid", AMT, 99_000, 60, false), "overpaid");
+        assert_eq!(
+            resolve_invoice_status("overpaid", AMT, 99_000, 60, false),
+            "overpaid"
+        );
     }
 
     #[test]
     fn settled_paid_stays_paid_even_when_expired() {
         // Expiry must not un-settle an already-paid invoice.
-        assert_eq!(resolve_invoice_status("paid", AMT, 99_900, 60, true), "paid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 99_900, 60, true),
+            "paid"
+        );
     }
 
     #[test]
     fn underpaid_stays_underpaid_when_still_short() {
-        assert_eq!(resolve_invoice_status("underpaid", AMT, 95_000, 300, false), "underpaid");
+        assert_eq!(
+            resolve_invoice_status("underpaid", AMT, 95_000, 300, false),
+            "underpaid"
+        );
     }
 }

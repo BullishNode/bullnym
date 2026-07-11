@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-001: Build And Version Provenance
 
 Backlog reference: `ISSUE-006` / `OPT-003`

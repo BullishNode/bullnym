@@ -2,9 +2,11 @@
 name = "pay-service"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/BullishNode/bullnym"
 
 [dependencies]
-axum = { version = "0.7", features = ["multipart"] }
+axum = "0.7"
 tokio = { version = "1", features = ["full", "signal"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "migrate", "json"] }
 lwk_wollet = "0.14.0"
@@ -39,8 +41,6 @@ dashmap = "6"
 askama = "0.12"
 askama_axum = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# Donation-page image pipeline: decode jpg/png/webp, resize, and re-encode.
-image = "0.25"
 # Server-side QR code generation for the donation-page payment view.
 # Default features off — we only need the SVG renderer.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

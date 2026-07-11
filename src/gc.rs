@@ -45,7 +45,7 @@ impl Default for GcConfig {
             tick_secs: 600,         // 10 min
             retention_secs: 86_400, // 24 h — well past the longest 1h window
             checkout_partial_terminal_grace_secs: 900,
-            payment_grace_secs: 3_600, // 1 h
+            payment_grace_secs: 3_600,        // 1 h
             outpoint_pending_ttl_secs: 3_600, // 1 h
         }
     }

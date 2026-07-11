@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # 01 Evidence Index
 
 This is a factual index of recorded test runs used for the server improvement review.

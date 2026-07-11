@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Bullnym
+        uses: actions/checkout@v4
+        with:
+          path: bullnym
+
+      - name: Check out pinned boltz-client dependency
+        uses: actions/checkout@v4
+        with:
+          repository: BullishNode/boltz-rust
+          ref: c20511854bbd996a74f914fa0327d4601b5d4f62
+          path: boltz/boltz-rust
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bullnym
+
+      - name: Check documentation
+        working-directory: bullnym
+        run: scripts/check-docs.sh
+
+      - name: Check formatting
+        working-directory: bullnym
+        run: cargo fmt --check
+
+      - name: Run library tests
+        working-directory: bullnym
+        run: cargo test --lib
+
+      - name: Compile integration tests
+        working-directory: bullnym
+        run: cargo test --tests --no-run

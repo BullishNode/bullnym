@@ -1,3 +1,5 @@
+> **Archived: testing evidence.** Retained for historical verification context; current code and maintained documentation are authoritative.
+
 # ITEM-007: Liquid Callback Lookup And Last-Unused Semantics
 
 Backlog reference: `ISSUE-004` / `OPT-008`
