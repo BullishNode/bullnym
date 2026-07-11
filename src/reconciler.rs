@@ -186,38 +186,45 @@ async fn run_slow_recovery_tick(
     let base = config.slow_recovery_backoff_base_secs;
     let cap = config.slow_recovery_backoff_cap_secs;
 
-    // Reverse rail.
     let reverse = db::list_claim_stuck_swaps_for_slow_retry(&state.db, limit).await?;
-    for (id, boltz_swap_id, slow_attempts) in &reverse {
-        let backoff = slow_recovery_backoff_secs(*slow_attempts, base, cap);
-        let revived =
-            db::revive_claim_stuck_swap_for_slow_retry(&state.db, *id, max_attempts, backoff)
-                .await?;
-        if revived == 1 {
-            tracing::warn!(
-                event = "slow_recovery_revived",
-                rail = "lightning_boltz_reverse",
-                swap_id = %boltz_swap_id,
-                slow_attempt = slow_attempts + 1,
-                "reviving funded claim_stuck reverse swap into the claim sweep"
-            );
-        }
-    }
-
-    // Chain rail.
     let chain = db::list_claim_stuck_chain_swaps_for_slow_retry(&state.db, limit).await?;
-    for (id, boltz_swap_id, slow_attempts) in &chain {
-        let backoff = slow_recovery_backoff_secs(*slow_attempts, base, cap);
-        let revived =
-            db::revive_claim_stuck_chain_swap_for_slow_retry(&state.db, *id, max_attempts, backoff)
-                .await?;
+    let mut reverse = reverse.into_iter();
+    let mut chain = chain.into_iter();
+    let mut prefer_reverse = true;
+
+    // `slow_recovery_max_per_tick` is one combined budget. Alternate rails
+    // while both have work, then let the non-empty rail consume the remainder.
+    for _ in 0..limit {
+        let candidate = if prefer_reverse {
+            reverse
+                .next()
+                .map(|row| ("lightning_boltz_reverse", row))
+                .or_else(|| chain.next().map(|row| ("bitcoin_boltz_chain", row)))
+        } else {
+            chain
+                .next()
+                .map(|row| ("bitcoin_boltz_chain", row))
+                .or_else(|| reverse.next().map(|row| ("lightning_boltz_reverse", row)))
+        };
+        let Some((rail, (id, boltz_swap_id, slow_attempts))) = candidate else {
+            break;
+        };
+        prefer_reverse = !prefer_reverse;
+
+        let backoff = slow_recovery_backoff_secs(slow_attempts, base, cap);
+        let revived = if rail == "lightning_boltz_reverse" {
+            db::revive_claim_stuck_swap_for_slow_retry(&state.db, id, max_attempts, backoff).await?
+        } else {
+            db::revive_claim_stuck_chain_swap_for_slow_retry(&state.db, id, max_attempts, backoff)
+                .await?
+        };
         if revived == 1 {
             tracing::warn!(
                 event = "slow_recovery_revived",
-                rail = "bitcoin_boltz_chain",
+                rail,
                 swap_id = %boltz_swap_id,
                 slow_attempt = slow_attempts + 1,
-                "reviving funded claim_stuck chain swap into the claim sweep"
+                "reviving funded claim_stuck swap into the claim sweep"
             );
         }
     }

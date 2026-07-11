@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub domain: String,
     pub listen: String,
@@ -67,6 +68,7 @@ const DEFAULT_CHECKOUT_PARTIAL_TERMINAL_GRACE_SECS: u64 = 900;
 const DEFAULT_PAYMENT_GRACE_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeaturesConfig {
     /// Lightning Address and registration APIs:
     /// `/.well-known/lnurlp`, `/.well-known/nostr.json`, `/lnurlp/callback`,
@@ -112,6 +114,7 @@ fn default_feature_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkersConfig {
     /// When false, the HTTP server starts without background workers.
     /// Use this for standby/web-only instances so failover does not
@@ -133,6 +136,7 @@ fn default_workers_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvoiceAccountingConfig {
     #[serde(default = "default_btc_shortfall_tolerance_sat")]
     pub btc_shortfall_tolerance_sat: i64,
@@ -180,6 +184,7 @@ fn default_payment_grace_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoltzConfig {
     pub api_url: String,
     pub electrum_url: String,
@@ -190,6 +195,7 @@ pub struct BoltzConfig {
 const DEFAULT_MAX_CLAIM_ATTEMPTS: i32 = 30;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimConfig {
     /// After this many failed claim attempts, the row transitions to
     /// `claim_stuck` and leaves the fast background sweep. The slow-recovery
@@ -234,6 +240,7 @@ const DEFAULT_SLOW_RECOVERY_BACKOFF_CAP_SECS: u64 = 86400;
 /// webhooks (Boltz abandons after 5 retries × 60s = ~5 min) and
 /// state-machine surprises.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcilerConfig {
     /// Tick cadence. 90s by default — chosen so a dropped webhook is
     /// caught within ~1.5 min of Boltz abandoning delivery, well inside
@@ -317,6 +324,7 @@ const DEFAULT_PRICER_CACHE_TTL_SECS: u64 = 60;
 const DEFAULT_PRICER_REQUEST_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PricerConfig {
     /// JSON-RPC endpoint for the bullbitcoin API-Pricer. Donation pages
     /// fetch `getRate` per `display_currency` to embed a fiat conversion
@@ -372,6 +380,7 @@ fn default_pricer_supported_currencies() -> Vec<String> {
 const DEFAULT_PWA_DIST_DIR: &str = "pwa/dist";
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PwaConfig {
     #[serde(default = "default_pwa_dist_dir")]
     pub dist_dir: String,
@@ -394,6 +403,7 @@ fn default_pwa_dist_dir() -> String {
 const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DonationConfig {
     /// Filesystem root containing media created by versions that supported
     /// uploads. Current code only copies existing nym-keyed files to their
@@ -420,6 +430,7 @@ const DEFAULT_MAX_SENDABLE_MSAT: u64 = 25_000_000_000;
 const DEFAULT_MAX_DESCRIPTOR_LEN: usize = 1000;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     #[serde(default = "default_min_sendable")]
     pub min_sendable_msat: u64,
@@ -457,6 +468,7 @@ const DEFAULT_MIN_PROOF_VALUE_SAT: u64 = 1000;
 const DEFAULT_MESSAGE_TAG: &str = "bullpay-lnurlp-v1";
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofConfig {
     /// Minimum L-BTC value the payer must prove for a LUD-22 proof UTXO. This
     /// is the economic cost floor for a single Liquid LNURL-pay callback and
@@ -501,6 +513,7 @@ const DEFAULT_BTC_WATCHER_RATE_PER_SEC: u32 = 5;
 const DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BitcoinWatcherConfig {
     /// When false, the watcher is not spawned at all. Useful in dev
     /// environments without outbound network or when the operator wants
@@ -612,6 +625,7 @@ fn default_btc_watcher_request_timeout_ms() -> u64 {
 // --- Rate limit config ---
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// IPs / CIDR ranges that bypass ALL rate limits and proof requirements.
     #[serde(default)]
@@ -685,12 +699,17 @@ pub struct RateLimitConfig {
     pub max_active_users: u32,
 
     // --- Metadata + lookup gates ---
-    /// Per-IP rate-limit on `GET /.well-known/lnurlp/:nym` and
-    /// `GET /.well-known/nostr.json`. 0 disables.
-    #[serde(default = "default_metadata_rate_limit")]
-    pub metadata_rate_limit: u32,
-    #[serde(default = "default_metadata_rate_window_secs")]
-    pub metadata_rate_window_secs: u32,
+    /// General cheap per-source API gate used before signature verification or
+    /// database-heavy reads. Covers metadata, Payment Page management, and
+    /// signed invoice management. 0 disables. The metadata aliases are tracked
+    /// in docs/reference/compatibility.md.
+    #[serde(default = "default_api_rate_limit", alias = "metadata_rate_limit")]
+    pub api_rate_limit: u32,
+    #[serde(
+        default = "default_api_rate_window_secs",
+        alias = "metadata_rate_window_secs"
+    )]
+    pub api_rate_window_secs: u32,
 
     /// Distinct nyms a single IP can probe across the metadata endpoints
     /// per window. Bounds enumeration even when the per-IP rate is unhit
@@ -810,8 +829,8 @@ impl Default for RateLimitConfig {
             register_distinct_npubs_per_ip_window_secs:
                 default_register_distinct_npubs_per_ip_window_secs(),
             max_active_users: default_max_active_users(),
-            metadata_rate_limit: default_metadata_rate_limit(),
-            metadata_rate_window_secs: default_metadata_rate_window_secs(),
+            api_rate_limit: default_api_rate_limit(),
+            api_rate_window_secs: default_api_rate_window_secs(),
             metadata_distinct_nyms_per_ip_limit: default_metadata_distinct_nyms_per_ip(),
             metadata_distinct_nyms_per_ip_window_secs:
                 default_metadata_distinct_nyms_per_ip_window_secs(),
@@ -838,6 +857,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CertificationConfig {
     /// Scoped certification mode for deterministic production/staging
     /// assessment. Separate from `rate_limit.ip_whitelist`: a certification
@@ -922,10 +942,10 @@ fn default_register_distinct_npubs_per_ip_window_secs() -> u32 {
 fn default_max_active_users() -> u32 {
     10_000
 }
-fn default_metadata_rate_limit() -> u32 {
+fn default_api_rate_limit() -> u32 {
     30
 }
-fn default_metadata_rate_window_secs() -> u32 {
+fn default_api_rate_window_secs() -> u32 {
     60
 }
 // LUD-06 requires a metadata fetch per payment, so a small office paying
@@ -1010,6 +1030,7 @@ fn default_invoice_create_per_npub_per_hour() -> u32 {
 // --- Electrum / tx cache config ---
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ElectrumConfig {
     /// Single Liquid Electrum server URL (deprecated; use `liquid_urls`).
     /// Kept for backwards-compat with existing deployed configs.
@@ -1190,6 +1211,18 @@ impl Config {
     }
 
     fn validate_common(&self) -> Result<(), Box<dyn std::error::Error>> {
+        validate_domain(&self.domain)?;
+        listen_addr_is_non_loopback(&self.listen)?;
+        if self.pool_size == 0 {
+            return Err("pool_size must be > 0".into());
+        }
+        validate_http_url("boltz.api_url", &self.boltz.api_url)?;
+        validate_electrum_url("boltz.electrum_url", &self.boltz.electrum_url)?;
+        validate_webhook_secret("BOLTZ_WEBHOOK_URL_SECRET", &self.boltz_webhook_url_secret)?;
+        validate_webhook_secret(
+            "BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS",
+            &self.boltz_webhook_url_secret_previous,
+        )?;
         if self.limits.min_sendable_msat > self.limits.max_sendable_msat {
             return Err("min_sendable_msat must be <= max_sendable_msat".into());
         }
@@ -1199,6 +1232,109 @@ impl Config {
         if self.proof.message_tag.is_empty() {
             return Err("proof.message_tag must be non-empty".into());
         }
+        if self.proof.min_proof_value_sat == 0 {
+            return Err("proof.min_proof_value_sat must be > 0".into());
+        }
+        if self.limits.max_descriptor_len == 0 {
+            return Err("limits.max_descriptor_len must be > 0".into());
+        }
+        if self.limits.max_lifetime_nyms_per_npub <= 0 {
+            return Err("limits.max_lifetime_nyms_per_npub must be > 0".into());
+        }
+        if self.invoice_accounting.btc_shortfall_tolerance_sat < 0
+            || self.invoice_accounting.liquid_shortfall_tolerance_sat < 0
+            || self.invoice_accounting.lightning_shortfall_tolerance_sat < 0
+        {
+            return Err("invoice shortfall tolerances must be >= 0".into());
+        }
+        if self.claim.max_claim_attempts <= 0 {
+            return Err("claim.max_claim_attempts must be > 0".into());
+        }
+        require_positive("reconciler.interval_secs", self.reconciler.interval_secs)?;
+        require_positive(
+            "reconciler.slow_recovery_interval_secs",
+            self.reconciler.slow_recovery_interval_secs,
+        )?;
+        require_positive_u32("reconciler.max_per_tick", self.reconciler.max_per_tick)?;
+        require_positive_u32(
+            "reconciler.slow_recovery_max_per_tick",
+            self.reconciler.slow_recovery_max_per_tick,
+        )?;
+        require_positive(
+            "reconciler.slow_recovery_backoff_base_secs",
+            self.reconciler.slow_recovery_backoff_base_secs,
+        )?;
+        require_positive(
+            "reconciler.slow_recovery_backoff_cap_secs",
+            self.reconciler.slow_recovery_backoff_cap_secs,
+        )?;
+        if self.reconciler.slow_recovery_backoff_base_secs
+            > self.reconciler.slow_recovery_backoff_cap_secs
+        {
+            return Err("reconciler slow-recovery backoff base must be <= cap".into());
+        }
+        validate_http_url("pricer.url", &self.pricer.url)?;
+        require_positive("pricer.request_timeout_ms", self.pricer.request_timeout_ms)?;
+        if self.pwa.dist_dir.trim().is_empty() {
+            return Err("pwa.dist_dir must be non-empty".into());
+        }
+        require_positive(
+            "bitcoin_watcher.active_tick_secs",
+            self.bitcoin_watcher.active_tick_secs,
+        )?;
+        require_positive(
+            "bitcoin_watcher.idle_tick_secs",
+            self.bitcoin_watcher.idle_tick_secs,
+        )?;
+        if self.bitcoin_watcher.active_window_secs < 0 {
+            return Err("bitcoin_watcher.active_window_secs must be >= 0".into());
+        }
+        validate_http_url("bitcoin_watcher.endpoint", &self.bitcoin_watcher.endpoint)?;
+        for endpoint in &self.bitcoin_watcher.endpoints {
+            validate_http_url("bitcoin_watcher.endpoints entry", endpoint)?;
+        }
+        require_positive_u32(
+            "bitcoin_watcher.confirmations_required",
+            self.bitcoin_watcher.confirmations_required,
+        )?;
+        require_positive_u32(
+            "bitcoin_watcher.rate_per_sec",
+            self.bitcoin_watcher.rate_per_sec,
+        )?;
+        require_positive(
+            "bitcoin_watcher.request_timeout_ms",
+            self.bitcoin_watcher.request_timeout_ms,
+        )?;
+        if self.electrum.cache_max_entries == 0 {
+            return Err("electrum.cache_max_entries must be > 0".into());
+        }
+        if let Some(endpoint) = &self.electrum.liquid_url {
+            validate_electrum_url("electrum.liquid_url", endpoint)?;
+        }
+        for endpoint in &self.electrum.liquid_urls {
+            validate_electrum_url("electrum.liquid_urls entry", endpoint)?;
+        }
+        require_positive_u32(
+            "rate_limit.max_pending_reservations_per_nym",
+            self.rate_limit.max_pending_reservations_per_nym,
+        )?;
+        require_positive_u32(
+            "rate_limit.global_electrum_rate_per_sec",
+            self.rate_limit.global_electrum_rate_per_sec,
+        )?;
+        require_positive_u32(
+            "rate_limit.chain_watcher_electrum_rate_per_sec",
+            self.rate_limit.chain_watcher_electrum_rate_per_sec,
+        )?;
+        require_positive_u32(
+            "rate_limit.chain_watcher_active_user_tick_secs",
+            self.rate_limit.chain_watcher_active_user_tick_secs,
+        )?;
+        require_positive_u32(
+            "rate_limit.chain_watcher_idle_user_tick_secs",
+            self.rate_limit.chain_watcher_idle_user_tick_secs,
+        )?;
+        validate_rate_limit_windows(&self.rate_limit)?;
         if self.certification.enabled {
             if self.certification.token.is_empty() {
                 return Err("certification.token must be non-empty when enabled".into());
@@ -1222,8 +1358,14 @@ impl Config {
                 "BOLTZ_WEBHOOK_URL_SECRET must be set when BULLNYM_RUNTIME_MODE=production".into(),
             );
         }
-        if self.domain == "localhost" || self.domain.starts_with("localhost:") {
-            return Err("domain must not be localhost in production".into());
+        let domain_url = reqwest::Url::parse(&format!("https://{}", self.domain))?;
+        let host = domain_url.host_str().unwrap_or_default();
+        let loopback_ip = host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+        if host.eq_ignore_ascii_case("localhost") || loopback_ip {
+            return Err("domain must not be localhost or a loopback IP in production".into());
         }
         if !allow_public_listen && listen_addr_is_non_loopback(&self.listen)? {
             return Err(
@@ -1232,6 +1374,196 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn require_positive(name: &str, value: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if value == 0 {
+        return Err(format!("{name} must be > 0").into());
+    }
+    Ok(())
+}
+
+fn validate_http_url(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed =
+        reqwest::Url::parse(value).map_err(|error| format!("{name} is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(format!("{name} must be an http(s) URL with a host").into());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!("{name} must not contain credentials, a query, or a fragment").into());
+    }
+    Ok(())
+}
+
+fn validate_electrum_url(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must be non-empty").into());
+    }
+    let candidate = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("ssl://{value}")
+    };
+    let parsed =
+        reqwest::Url::parse(&candidate).map_err(|error| format!("{name} is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "ssl" | "tcp")
+        || parsed.host().is_none()
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err(format!("{name} must be ssl://host:port or tcp://host:port").into());
+    }
+    Ok(())
+}
+
+fn validate_domain(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.contains("://")
+        || value.contains('/')
+    {
+        return Err("domain must be a non-empty host[:port] without a scheme or path".into());
+    }
+    let parsed = reqwest::Url::parse(&format!("https://{value}"))
+        .map_err(|error| format!("domain is invalid: {error}"))?;
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("domain must be a host[:port]".into());
+    }
+    Ok(())
+}
+
+fn validate_webhook_secret(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'?' | b'#' | b'%'))
+    {
+        return Err(format!("{name} must be one URL path segment without escapes").into());
+    }
+    Ok(())
+}
+
+fn require_positive_u32(name: &str, value: u32) -> Result<(), Box<dyn std::error::Error>> {
+    require_positive(name, u64::from(value))
+}
+
+fn validate_limit_window(
+    limit_name: &str,
+    limit: u32,
+    window_name: &str,
+    window_secs: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if limit > 0 && window_secs == 0 {
+        return Err(format!("{window_name} must be > 0 when {limit_name} is enabled").into());
+    }
+    Ok(())
+}
+
+fn validate_rate_limit_windows(cfg: &RateLimitConfig) -> Result<(), Box<dyn std::error::Error>> {
+    for (limit_name, limit, window_name, window) in [
+        (
+            "rate_limit.per_ip_limit",
+            cfg.per_ip_limit,
+            "rate_limit.per_ip_window_secs",
+            cfg.per_ip_window_secs,
+        ),
+        (
+            "rate_limit.per_pubkey_limit",
+            cfg.per_pubkey_limit,
+            "rate_limit.per_pubkey_window_secs",
+            cfg.per_pubkey_window_secs,
+        ),
+        (
+            "rate_limit.distinct_nyms_per_ip_limit",
+            cfg.distinct_nyms_per_ip_limit,
+            "rate_limit.distinct_nyms_window_secs",
+            cfg.distinct_nyms_window_secs,
+        ),
+        (
+            "rate_limit.distinct_nyms_per_ipv6_56_limit",
+            cfg.distinct_nyms_per_ipv6_56_limit,
+            "rate_limit.distinct_nyms_window_secs",
+            cfg.distinct_nyms_window_secs,
+        ),
+        (
+            "rate_limit.distinct_nyms_per_outpoint_limit",
+            cfg.distinct_nyms_per_outpoint_limit,
+            "rate_limit.distinct_nyms_window_secs",
+            cfg.distinct_nyms_window_secs,
+        ),
+        (
+            "rate_limit.register_rate_limit",
+            cfg.register_rate_limit,
+            "rate_limit.register_rate_window_secs",
+            cfg.register_rate_window_secs,
+        ),
+        (
+            "rate_limit.register_distinct_npubs_per_ip_limit",
+            cfg.register_distinct_npubs_per_ip_limit,
+            "rate_limit.register_distinct_npubs_per_ip_window_secs",
+            cfg.register_distinct_npubs_per_ip_window_secs,
+        ),
+        (
+            "rate_limit.api_rate_limit",
+            cfg.api_rate_limit,
+            "rate_limit.api_rate_window_secs",
+            cfg.api_rate_window_secs,
+        ),
+        (
+            "rate_limit.metadata_distinct_nyms_per_ip_limit",
+            cfg.metadata_distinct_nyms_per_ip_limit,
+            "rate_limit.metadata_distinct_nyms_per_ip_window_secs",
+            cfg.metadata_distinct_nyms_per_ip_window_secs,
+        ),
+        (
+            "rate_limit.lookup_distinct_npubs_per_ip_limit",
+            cfg.lookup_distinct_npubs_per_ip_limit,
+            "rate_limit.lookup_distinct_npubs_per_ip_window_secs",
+            cfg.lookup_distinct_npubs_per_ip_window_secs,
+        ),
+        (
+            "rate_limit.webhook_rate_limit",
+            cfg.webhook_rate_limit,
+            "rate_limit.webhook_rate_window_secs",
+            cfg.webhook_rate_window_secs,
+        ),
+        (
+            "rate_limit.lightning_per_source_limit",
+            cfg.lightning_per_source_limit,
+            "rate_limit.lightning_per_source_window_secs",
+            cfg.lightning_per_source_window_secs,
+        ),
+        (
+            "rate_limit.donation_html_rate_limit",
+            cfg.donation_html_rate_limit,
+            "rate_limit.donation_html_rate_window_secs",
+            cfg.donation_html_rate_window_secs,
+        ),
+        (
+            "rate_limit.donation_manifest_rate_limit",
+            cfg.donation_manifest_rate_limit,
+            "rate_limit.donation_manifest_rate_window_secs",
+            cfg.donation_manifest_rate_window_secs,
+        ),
+    ] {
+        validate_limit_window(limit_name, limit, window_name, window)?;
+    }
+    Ok(())
 }
 
 fn env_flag_enabled(value: &str) -> bool {

@@ -80,7 +80,7 @@ active_tick_secs = 30
 idle_tick_secs = 300
 active_window_secs = 3600
 confirmations_required = 1
-# Token-bucket rates use a minimum of 1; zero does not disable them.
+# Safety-critical token-bucket rates must be greater than zero.
 rate_per_sec = 5
 request_timeout_ms = 10000
 
@@ -114,7 +114,7 @@ max_pending_reservations_per_nym = 50000
 recycle_pending_older_than_days = 30
 lightning_rate_per_minute = 0
 
-# Liquid Electrum token buckets. Zero is coerced to 1, not disabled.
+# Liquid Electrum token buckets. Startup rejects zero values.
 global_electrum_rate_per_sec = 50
 chain_watcher_electrum_rate_per_sec = 50
 
@@ -126,8 +126,8 @@ register_distinct_npubs_per_ip_window_secs = 3600
 max_active_users = 10000
 
 # Public metadata and lookup enumeration.
-metadata_rate_limit = 30
-metadata_rate_window_secs = 60
+api_rate_limit = 30
+api_rate_window_secs = 60
 metadata_distinct_nyms_per_ip_limit = 10
 metadata_distinct_nyms_per_ip_window_secs = 3600
 lookup_distinct_npubs_per_ip_limit = 5

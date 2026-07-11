@@ -314,10 +314,10 @@ pub async fn save(
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
 
-    // Per-IP metadata rate-limit (cheap pre-validation gate).
+    // General per-source API rate limit (cheap pre-validation gate).
     if !is_whitelisted {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 
@@ -521,7 +521,7 @@ pub async fn archive(
 
     if !is_whitelisted {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 
@@ -587,7 +587,7 @@ pub async fn get(
 
     if !is_whitelisted {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 

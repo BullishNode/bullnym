@@ -42,7 +42,7 @@ pub async fn count_active_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// commit past it. Returns the post-insert count.
 ///
 /// Advisory-lock keyspace: keys are `hashtext(<bucket>)` where bucket is
-/// `register:ip:...`, `meta:ip:...`, `nym:...`, etc. The registration flow
+/// `register:ip:...`, `api:ip:...`, `nym:...`, etc. The registration flow
 /// (`register_user_atomic`) keys on `hashtext(<npub-hex>)`. Bucket strings
 /// and raw npub hex live in disjoint string spaces, and rate-limit gates
 /// run before `register_user_atomic` is called (never inside its tx), so

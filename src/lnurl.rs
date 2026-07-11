@@ -116,7 +116,7 @@ fn requests_method(payment_method: Option<&str>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve caller IP and apply the per-IP metadata rate-limit + (when a nym
+/// Resolve caller IP and apply the general per-source API rate limit + (when a nym
 /// is being queried) the distinct-nyms-per-IP cap. Whitelisted callers
 /// bypass. Shared by `metadata` and `nostr::nostr_json`.
 pub(crate) async fn gate_metadata_per_ip(
@@ -145,7 +145,7 @@ pub(crate) async fn gate_metadata_per_ip(
     ) {
         return Ok(());
     }
-    state.rate_limiter.check_metadata_per_ip(ip).await?;
+    state.rate_limiter.check_api_per_ip(ip).await?;
     if let Some(n) = nym {
         state
             .rate_limiter

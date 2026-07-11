@@ -37,7 +37,14 @@ while IFS=$'\t' read -r struct field; do
                     key="$field"
                     section=""
                     ;;
-                *) continue ;;
+                boltz|pricer|pwa|donation|limits|proof|features|rate_limit|certification|electrum|claim|reconciler|bitcoin_watcher|workers|invoice_accounting|database_url|swap_mnemonic|boltz_webhook_url_secret|boltz_webhook_url_secret_previous)
+                    continue
+                    ;;
+                *)
+                    printf 'scripts/check-config-docs.sh: unmapped root configuration field `%s`\n' "$field" >&2
+                    status=1
+                    continue
+                    ;;
             esac
             ;;
         FeaturesConfig) section=features ;;
@@ -55,7 +62,11 @@ while IFS=$'\t' read -r struct field; do
         RateLimitConfig) section=rate_limit ;;
         CertificationConfig) section=certification ;;
         ElectrumConfig) section=electrum ;;
-        *) continue ;;
+        *)
+            printf 'scripts/check-config-docs.sh: unmapped configuration struct `%s`\n' "$struct" >&2
+            status=1
+            continue
+            ;;
     esac
 
     if [[ "$struct" != Config ]]; then
@@ -83,16 +94,13 @@ done < <(
     ' src/config.rs
 )
 
-environment_keys=(
-    DATABASE_URL
-    SWAP_MNEMONIC
-    BOLTZ_WEBHOOK_URL_SECRET
-    BOLTZ_WEBHOOK_SECRET
-    BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS
-    BULLNYM_RUNTIME_MODE
-    BULLNYM_ALLOW_PUBLIC_LISTEN
-    RUST_LOG
+mapfile -t environment_keys < <(
+    perl -ne 'while (/std::env::var\("([A-Z][A-Z0-9_]*)"\)/g) { print "$1\n" }' src/*.rs \
+        | sort -u
 )
+# tracing_subscriber reads RUST_LOG internally rather than through an explicit
+# std::env::var call in this repository.
+environment_keys+=(RUST_LOG)
 
 for key in "${environment_keys[@]}"; do
     if ! rg -Fq "\`$key\`" "$reference"; then

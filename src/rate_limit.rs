@@ -179,34 +179,16 @@ impl RateLimiter {
         .await
     }
 
-    /// Hard ceiling on the number of active users. Returns
-    /// `AppError::ServiceUnavailable` (HTTP 503) once the cap is reached.
-    /// 0 disables the check.
-    pub async fn check_max_active_users(&self) -> Result<(), AppError> {
-        if self.cfg.max_active_users == 0 {
-            return Ok(());
-        }
-        let active = db::count_active_users(&self.pool).await?;
-        if active as u32 >= self.cfg.max_active_users {
-            return Err(AppError::ServiceUnavailable(format!(
-                "active user ceiling reached ({} >= {})",
-                active, self.cfg.max_active_users
-            )));
-        }
-        Ok(())
-    }
+    // --- General API + metadata enumeration gates ---
 
-    // --- Metadata + lookup gates ---
-
-    /// Per-IP rate-limit for `GET /.well-known/lnurlp/:nym` and
-    /// `GET /.well-known/nostr.json`. Closes R-enum: enumeration of the
-    /// nym registry by hammering metadata endpoints from one IP.
-    pub async fn check_metadata_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
-        let bucket = format!("meta:{}", source_key(ip));
+    /// Cheap process-local source gate shared by public metadata, Payment Page
+    /// management, and signed invoice-management operations.
+    pub async fn check_api_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("api:{}", source_key(ip));
         self.inmem_sliding_check(
             &bucket,
-            self.cfg.metadata_rate_limit,
-            self.cfg.metadata_rate_window_secs,
+            self.cfg.api_rate_limit,
+            self.cfg.api_rate_window_secs,
             AppError::RateLimitedSender,
         )
     }

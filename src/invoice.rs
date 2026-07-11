@@ -1240,7 +1240,7 @@ pub async fn recover_chain_swap(
     );
     if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 
@@ -2052,7 +2052,7 @@ async fn create_invoice_inner(
     // verify so a forged npub cannot grief a legitimate user's bucket.
     if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 
@@ -2333,7 +2333,7 @@ async fn cancel_invoice_inner(
 
     if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 
@@ -2469,7 +2469,7 @@ pub async fn list_signed(
 
     if !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
-            state.rate_limiter.check_metadata_per_ip(ip).await?;
+            state.rate_limiter.check_api_per_ip(ip).await?;
         }
     }
 

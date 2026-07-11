@@ -28,7 +28,10 @@ use pay_service::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    // Development convenience without dotenvy's implicit parent-directory
+    // search. Production supervisors should inject the process environment;
+    // an unrelated ancestor `.env` must never silently configure Bullnym.
+    dotenvy::from_path(".env").ok();
 
     // rustls 0.23 panics if more than one CryptoProvider feature is linked
     // and no process-level default is selected. Both aws-lc-rs and ring come
@@ -228,6 +231,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
+
+    // Every HTTP process owns its in-memory rate-limit buckets, so every
+    // process must sweep them. This is deliberately outside `workers.enabled`:
+    // a separate worker instance can maintain shared PostgreSQL state but
+    // cannot reclaim memory in a web-only process.
+    {
+        let rl = rate_limiter.clone();
+        let cancel_sweep = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel_sweep.cancelled() => return,
+                    _ = tick.tick() => {
+                        let evicted = rl.sweep_inmemory(std::time::Duration::from_secs(7200));
+                        if evicted > 0 {
+                            tracing::info!("rate-limit in-mem sweep: evicted {} idle entries", evicted);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     if config.workers.enabled {
         tracing::info!("background workers enabled");
         claimer::spawn_background_claimer(
@@ -302,29 +330,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gc::run(pool, cancel_gc, gc_cfg).await;
             });
             tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
-        }
-
-        // Periodic in-memory sweep for the per-IP / register / metadata
-        // sliding-window counters. Without this, one-shot bursts of unique
-        // IPs would leave entries behind forever.
-        {
-            let rl = rate_limiter.clone();
-            let cancel_sweep = cancel.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = cancel_sweep.cancelled() => return,
-                        _ = tick.tick() => {
-                            let evicted = rl.sweep_inmemory(std::time::Duration::from_secs(7200));
-                            if evicted > 0 {
-                                tracing::info!("rate-limit in-mem sweep: evicted {} idle entries", evicted);
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         if let Some(backend) = state.utxo_backend.clone() {

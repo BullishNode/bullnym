@@ -7,6 +7,13 @@ fn checked_example_config_parses_and_validates() {
 }
 
 #[test]
+fn unknown_config_fields_are_rejected() {
+    let err = toml::from_str::<RateLimitConfig>("metadata_rate_limt = 30").unwrap_err();
+
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
 fn electrum_urls_legacy_single_field_only() {
     let cfg = ElectrumConfig {
         liquid_url: Some("a.example:50001".to_string()),
@@ -103,6 +110,15 @@ fn rate_limit_invoice_status_accepts_legacy_key() {
     let cfg: RateLimitConfig = toml::from_str("donation_status_per_source_per_min = 43").unwrap();
 
     assert_eq!(cfg.invoice_status_per_source_per_min, 43);
+}
+
+#[test]
+fn rate_limit_api_accepts_legacy_metadata_keys() {
+    let cfg: RateLimitConfig =
+        toml::from_str("metadata_rate_limit = 17\nmetadata_rate_window_secs = 91").unwrap();
+
+    assert_eq!(cfg.api_rate_limit, 17);
+    assert_eq!(cfg.api_rate_window_secs, 91);
 }
 
 fn production_base_config() -> Config {
@@ -202,6 +218,69 @@ fn non_production_allows_dev_webhook_and_public_listen() {
     cfg.boltz_webhook_url_secret.clear();
 
     cfg.validate_for_runtime("development", false).unwrap();
+}
+
+#[test]
+fn common_validation_rejects_zero_worker_intervals() {
+    let mut cfg = production_base_config();
+    cfg.reconciler.interval_secs = 0;
+
+    let err = cfg.validate_for_runtime("development", false).unwrap_err();
+
+    assert!(err.to_string().contains("reconciler.interval_secs"));
+}
+
+#[test]
+fn common_validation_rejects_negative_tolerances() {
+    let mut cfg = production_base_config();
+    cfg.invoice_accounting.btc_shortfall_tolerance_sat = -1;
+
+    let err = cfg.validate_for_runtime("development", false).unwrap_err();
+
+    assert!(err.to_string().contains("shortfall tolerances"));
+}
+
+#[test]
+fn common_validation_rejects_zero_safety_budgets() {
+    let mut cfg = production_base_config();
+    cfg.rate_limit.global_electrum_rate_per_sec = 0;
+
+    let err = cfg.validate_for_runtime("development", false).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("rate_limit.global_electrum_rate_per_sec"));
+}
+
+#[test]
+fn common_validation_rejects_malformed_external_endpoints() {
+    let mut cfg = production_base_config();
+    cfg.boltz.electrum_url = "https://not-electrum.example.com".to_string();
+
+    let err = cfg.validate_for_runtime("development", false).unwrap_err();
+
+    assert!(err.to_string().contains("boltz.electrum_url"));
+}
+
+#[test]
+fn production_rejects_loopback_ip_domain() {
+    let mut cfg = production_base_config();
+    cfg.domain = "127.0.0.1:8080".to_string();
+
+    let err = cfg.validate_for_runtime("production", false).unwrap_err();
+
+    assert!(err.to_string().contains("loopback IP"));
+}
+
+#[test]
+fn enabled_rate_limit_requires_a_nonzero_window() {
+    let mut cfg = production_base_config();
+    cfg.rate_limit.api_rate_limit = 1;
+    cfg.rate_limit.api_rate_window_secs = 0;
+
+    let err = cfg.validate_for_runtime("development", false).unwrap_err();
+
+    assert!(err.to_string().contains("rate_limit.api_rate_window_secs"));
 }
 
 #[test]

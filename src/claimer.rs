@@ -36,6 +36,8 @@ use crate::utxo::UtxoBackend;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+const REFUND_PERSIST_ATTEMPTS: usize = 3;
+const REFUND_PERSIST_RETRY_DELAY_MS: u64 = 250;
 
 #[derive(Deserialize)]
 struct WebhookEnvelope {
@@ -2088,31 +2090,24 @@ pub(crate) async fn execute_chain_swap_refund(
     // stays recoverable (never stranded in `refunding`).
     match build_and_broadcast_chain_refund(state, &current, &refund_address).await {
         Ok(txid) => {
-            let recorded = db::mark_chain_swap_refunded(&state.db, swap.id, &txid)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
-            if recorded != 1 {
-                // We broadcast a refund but the row was NOT in `refunding` when
-                // we tried to record it — a concurrent writer (e.g. a reconciler
-                // acting on a stale snapshot) moved it out from under us. The BTC
-                // IS refunded on-chain; the DB now disagrees. Loud P1 so an
-                // operator reconciles against the broadcast txid.
-                tracing::error!(
-                    event = "chain_swap_refund_broadcast_not_recorded",
-                    swap_id = %swap.boltz_swap_id,
-                    invoice_id = %swap.invoice_id,
-                    refund_txid = %txid,
-                    "refund broadcast but status was not `refunding` at record time; reconcile the swap against this txid (operator P1)"
-                );
-            } else {
-                tracing::warn!(
-                    event = "chain_swap_refunded",
-                    swap_id = %swap.boltz_swap_id,
-                    invoice_id = %swap.invoice_id,
-                    refund_txid = %txid,
-                    "customer self-claim refund broadcast; refunding -> refunded (operator P2)"
-                );
-            }
+            // Emit durable operational evidence before the DB write. A process
+            // crash or database outage after broadcast must still leave the
+            // exact txid visible for reconciliation.
+            tracing::warn!(
+                event = "chain_swap_refund_broadcast",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                refund_txid = %txid,
+                "customer refund transaction broadcast; persisting terminal state"
+            );
+            persist_chain_swap_refund(&state.db, swap, &txid).await?;
+            tracing::warn!(
+                event = "chain_swap_refunded",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                refund_txid = %txid,
+                "customer self-claim refund broadcast and recorded (operator P2)"
+            );
             Ok(txid)
         }
         Err(e) => {
@@ -2139,6 +2134,70 @@ pub(crate) async fn execute_chain_swap_refund(
             Err(e)
         }
     }
+}
+
+async fn persist_chain_swap_refund(
+    pool: &sqlx::PgPool,
+    swap: &db::ChainSwapRecord,
+    txid: &str,
+) -> Result<(), AppError> {
+    let mut last_db_error = None;
+    for attempt in 1..=REFUND_PERSIST_ATTEMPTS {
+        match db::mark_chain_swap_refunded(pool, swap.id, txid).await {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                let current = db::get_chain_swap_by_id(pool, swap.id)
+                    .await
+                    .map_err(|e| AppError::DbError(e.to_string()))?
+                    .ok_or_else(|| {
+                        AppError::ClaimError(format!(
+                            "refund {txid} broadcast but chain swap {} disappeared",
+                            swap.id
+                        ))
+                    })?;
+                if current.status == ChainSwapStatus::Refunded.to_string()
+                    && current.refund_txid.as_deref() == Some(txid)
+                {
+                    return Ok(());
+                }
+                tracing::error!(
+                    event = "chain_swap_refund_broadcast_not_recorded",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    refund_txid = %txid,
+                    current_status = %current.status,
+                    current_refund_txid = ?current.refund_txid,
+                    "refund broadcast but terminal state could not be recorded (operator P1)"
+                );
+                return Err(AppError::ClaimError(format!(
+                    "refund {txid} was broadcast but terminal state could not be recorded"
+                )));
+            }
+            Err(error) => {
+                tracing::error!(
+                    event = "chain_swap_refund_persist_retry",
+                    swap_id = %swap.boltz_swap_id,
+                    invoice_id = %swap.invoice_id,
+                    refund_txid = %txid,
+                    attempt,
+                    max_attempts = REFUND_PERSIST_ATTEMPTS,
+                    error = %error,
+                    "refund broadcast persistence failed; retrying"
+                );
+                last_db_error = Some(error);
+                if attempt < REFUND_PERSIST_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(REFUND_PERSIST_RETRY_DELAY_MS)).await;
+                }
+            }
+        }
+    }
+
+    Err(AppError::DbError(format!(
+        "refund {txid} was broadcast but could not be persisted after {REFUND_PERSIST_ATTEMPTS} attempts: {}",
+        last_db_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown database error".to_string())
+    )))
 }
 
 /// Constructs and broadcasts the BTC refund transaction spending the payer's

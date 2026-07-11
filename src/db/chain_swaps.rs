@@ -570,9 +570,13 @@ pub async fn mark_chain_swap_refunding<'e, E: sqlx::PgExecutor<'e>>(
     Ok(result.rows_affected())
 }
 
-/// Terminal success: `refunding` -> `refunded`, recording the broadcast txid.
-/// Guarded to `refunding` so it cannot terminalize a swap that reverted or was
-/// never in flight. Returns rows affected.
+/// Terminal success: record the broadcast txid and move the swap to `refunded`.
+///
+/// The normal source state is `refunding`. `refund_due` is also accepted to
+/// close the race with the stale-refund backstop: that task may revert an old
+/// `refunding` row while its broadcast is still completing. The immutable
+/// destination and absence of claim evidence remain mandatory, so this cannot
+/// overwrite a merchant claim or redirect a refund. Returns rows affected.
 pub async fn mark_chain_swap_refunded(
     pool: &PgPool,
     id: Uuid,
@@ -581,7 +585,11 @@ pub async fn mark_chain_swap_refunded(
     let result = sqlx::query(
         "UPDATE chain_swap_records \
          SET status = 'refunded', refund_txid = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = 'refunding'",
+         WHERE id = $1 \
+           AND status IN ('refunding', 'refund_due') \
+           AND refund_address IS NOT NULL \
+           AND claim_txid IS NULL AND claim_tx_hex IS NULL \
+           AND (refund_txid IS NULL OR refund_txid = $2)",
     )
     .bind(id)
     .bind(refund_txid)

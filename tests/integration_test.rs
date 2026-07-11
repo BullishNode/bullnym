@@ -2049,7 +2049,7 @@ async fn registration_lifecycle_keeps_address_index_monotonic() {
         .unwrap()
         .unwrap();
     let reactivated =
-        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5)
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5, 0)
             .await
             .unwrap();
     match reactivated {
@@ -3977,6 +3977,88 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
 }
 
 #[tokio::test]
+async fn refund_broadcast_recording_survives_stale_revert_and_rejects_claim_evidence() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "refundpersist").await;
+    let invoice = insert_test_invoice(&pool, "refundpersist", &npub, "lq1refundpersist", 60).await;
+
+    let row = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some("refundpersist"),
+            boltz_swap_id: "refund-persist-swap",
+            lockup_address: "bc1qrefundpersistlockup",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"refund-persist-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::mark_chain_swap_refund_due(&pool, row.id)
+        .await
+        .unwrap();
+    pay_service::db::set_chain_swap_refund_address(&pool, row.id, "bc1qrefunddestination")
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(
+        pay_service::db::mark_chain_swap_refunding(&mut *tx, row.id)
+            .await
+            .unwrap(),
+        1
+    );
+    tx.commit().await.unwrap();
+
+    // Simulate the reconciler's stale-refund backstop racing the completed
+    // broadcast before its txid is persisted.
+    sqlx::query("UPDATE chain_swap_records SET status = 'refund_due' WHERE id = $1")
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pay_service::db::mark_chain_swap_refunded(&pool, row.id, "refund-txid")
+            .await
+            .unwrap(),
+        1
+    );
+    let recorded = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorded.status, "refunded");
+    assert_eq!(recorded.refund_txid.as_deref(), Some("refund-txid"));
+
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'refund_due', refund_txid = NULL, claim_txid = 'merchant-claim' \
+         WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::mark_chain_swap_refunded(&pool, row.id, "unsafe-refund-txid")
+            .await
+            .unwrap(),
+        0
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -4428,16 +4510,32 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, None, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-0",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        0,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
         .execute(&pool)
         .await
         .unwrap();
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, None, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-1",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        0,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
         .execute(&pool)
         .await
@@ -4512,6 +4610,54 @@ async fn register_concurrent_does_not_exceed_cap() {
         .await
         .unwrap();
     assert_eq!(count, 3, "lifetime cap must hold under contention");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn concurrent_registrations_respect_global_active_user_ceiling() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let npub_a = "41".repeat(32);
+    let npub_b = "42".repeat(32);
+    let register_a = pay_service::db::register_user_atomic(
+        &pool,
+        &npub_a,
+        "active-cap-a",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        1,
+    );
+    let register_b = pay_service::db::register_user_atomic(
+        &pool,
+        &npub_b,
+        "active-cap-b",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        1,
+    );
+    let (outcome_a, outcome_b) = tokio::join!(register_a, register_b);
+    let outcomes = [outcome_a.unwrap(), outcome_b.unwrap()];
+    let created = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, pay_service::db::RegisterOutcome::Created(_)))
+        .count();
+    let capacity_rejected = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                pay_service::db::RegisterOutcome::ActiveUserCapacityReached { .. }
+            )
+        })
+        .count();
+
+    assert_eq!(created, 1);
+    assert_eq!(capacity_rejected, 1);
+    assert_eq!(pay_service::db::count_active_users(&pool).await.unwrap(), 1);
 
     cleanup_db(&pool).await;
 }

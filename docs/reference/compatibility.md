@@ -42,6 +42,15 @@ policy inline.
   donation-era key.
 - Removal condition: deployed configs have migrated to the current key.
 
+## General API Rate-Limit Keys
+
+- Current keys: `api_rate_limit`, `api_rate_window_secs`.
+- Compatibility keys: `metadata_rate_limit`, `metadata_rate_window_secs`.
+- Compatibility reason: the limiter has always covered Payment Page and signed
+  invoice management in addition to metadata, so the current name reflects its
+  actual shared scope while deployed TOML continues to parse.
+- Removal condition: deployed configs have migrated to the current keys.
+
 ## Registration Lookup Quota Fields
 
 - Current field: `quota`

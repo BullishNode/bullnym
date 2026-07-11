@@ -141,6 +141,9 @@ pub enum RegisterOutcome {
     /// `AppError::NymQuotaExceeded`. Carries `used` so the error envelope
     /// can ship the same `quota` object the mobile sees on lookup.
     QuotaExceeded { used: i64, cap: i64 },
+    /// Activating this registration would exceed the configured global active
+    /// user ceiling. The check and activation are serialized across npubs.
+    ActiveUserCapacityReached { active: i64, cap: i64 },
 }
 
 /// Atomic register flow. Serializes concurrent registers from the same npub
@@ -150,7 +153,7 @@ pub enum RegisterOutcome {
 /// Advisory-lock keyspace audit (Kumulynja PLAN-3): the rate-limit code in
 /// `record_and_count_rate_limit_atomic` and `record_and_count_distinct_nyms_atomic`
 /// also uses `pg_advisory_xact_lock`, but keys on `hashtext(<bucket-string>)`
-/// where the bucket is `register:ip:...`, `meta:ip:...`, etc. — never `npub`
+/// where the bucket is `register:ip:...`, `api:ip:...`, etc. — never `npub`
 /// raw. Bucket strings and raw npub hex live in disjoint string spaces, so
 /// hashtext collisions are vanishingly improbable, and no single tx ever
 /// holds both a registration lock and a rate-limit lock (the rate-limit gates
@@ -161,10 +164,19 @@ pub async fn register_user_atomic(
     nym: &str,
     ct_descriptor: &str,
     verification_npub: Option<&str>,
-    cap: i64,
+    lifetime_cap: i64,
+    max_active_users: i64,
 ) -> Result<RegisterOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
+    // Lock ordering is global-cap first, npub second for every registration.
+    // This serializes the active count with activation/insertion across
+    // different identities and makes the configured ceiling exact.
+    if max_active_users > 0 {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('bullnym:active-user-cap')::bigint)")
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(npub)
         .execute(&mut *tx)
@@ -196,6 +208,10 @@ pub async fn register_user_atomic(
     .await?;
 
     if let Some(prior) = prior_inactive.as_ref().filter(|u| u.nym == nym) {
+        if let Some(outcome) = active_user_capacity_outcome(&mut tx, max_active_users).await? {
+            tx.rollback().await?;
+            return Ok(outcome);
+        }
         // Reactivate same nym. Keep next_addr_idx monotonic: historical
         // invoices/reservations may still hold addresses from this descriptor,
         // and rewinding can collide with the global single-use address index.
@@ -226,9 +242,17 @@ pub async fn register_user_atomic(
         .bind(npub)
         .fetch_one(&mut *tx)
         .await?;
-    if used >= cap {
+    if used >= lifetime_cap {
         tx.rollback().await?;
-        return Ok(RegisterOutcome::QuotaExceeded { used, cap });
+        return Ok(RegisterOutcome::QuotaExceeded {
+            used,
+            cap: lifetime_cap,
+        });
+    }
+
+    if let Some(outcome) = active_user_capacity_outcome(&mut tx, max_active_users).await? {
+        tx.rollback().await?;
+        return Ok(outcome);
     }
 
     let user = sqlx::query_as::<_, User>(
@@ -244,6 +268,25 @@ pub async fn register_user_atomic(
     .await?;
     tx.commit().await?;
     Ok(RegisterOutcome::Created(user))
+}
+
+async fn active_user_capacity_outcome(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    max_active_users: i64,
+) -> Result<Option<RegisterOutcome>, sqlx::Error> {
+    if max_active_users <= 0 {
+        return Ok(None);
+    }
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
+        .fetch_one(&mut **tx)
+        .await?;
+    if active >= max_active_users {
+        return Ok(Some(RegisterOutcome::ActiveUserCapacityReached {
+            active,
+            cap: max_active_users,
+        }));
+    }
+    Ok(None)
 }
 
 pub async fn create_user(

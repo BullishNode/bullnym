@@ -22,17 +22,17 @@ endpoint settings. A small set of environment variables is loaded afterward
 and overrides the corresponding in-memory fields. There are no general
 `BULLNYM_*` environment overrides for TOML keys.
 
-Unknown TOML keys are currently ignored by Serde. A misspelled key can
-therefore leave the default active without failing startup. Compare deployed
-configuration against this reference and inspect startup logs after every
-change.
+Before parsing TOML, Bullnym loads `./.env` from the process working directory
+when that file exists. It does not search parent directories, and values already
+present in the process environment take precedence. Unknown TOML keys are
+rejected, so misspelled and retired settings fail startup.
 
 ## Environment variables
 
 | Variable | Required/default | Purpose and implications |
 |---|---|---|
 | `DATABASE_URL` | Required | PostgreSQL connection string. The database is the durable state boundary for invoices, descriptors, swap secrets, retry state, and recovery evidence. Pointing at the wrong database can cause address-index rollback or loss of recovery visibility. |
-| `SWAP_MNEMONIC` | Required | Seed used to derive swap-specific keys. Back it up independently but consistently with PostgreSQL. Restoring the database without the matching mnemonic can make unsettled swaps unrecoverable; restoring an old database can also rewind derivation indices, which startup guardrails attempt to detect. |
+| `SWAP_MNEMONIC` | Required | Seed used to derive keys for new swaps and identify their derivation lineage. Existing swap preimages and claim/refund keys are persisted in PostgreSQL for recovery. Back up the mnemonic for continuity and controlled restoration; replacing it changes the key lineage for subsequently created swaps. |
 | `BOLTZ_WEBHOOK_URL_SECRET` | Optional outside production; required when `BULLNYM_RUNTIME_MODE=production` | Current secret embedded in newly registered Boltz webhook URLs. It authenticates webhook paths because Boltz does not send an HMAC header. Treat it as a credential and prevent proxy/log disclosure. |
 | `BOLTZ_WEBHOOK_SECRET` | Deprecated fallback | Used only when `BOLTZ_WEBHOOK_URL_SECRET` is absent. Keep only during migration to the current name. |
 | `BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS` | Empty | Previous webhook URL secret accepted during rotation. Existing swaps keep their original callback URL. Remove it after the longest live-swap overlap and verify old swaps are terminal. |
@@ -82,7 +82,7 @@ state. Do not use them as a substitute for draining in-flight payments.
 
 | Key | Default | Effect |
 |---|---:|---|
-| `workers.enabled` | `true` | Starts claim sweeps, reverse/chain reconcilers, settlement repair, slow recovery, Liquid and Bitcoin watchers, and GC. With `false`, HTTP routes remain active but automatic settlement and recovery do not run in that process. |
+| `workers.enabled` | `true` | Starts claim sweeps, reverse/chain reconcilers, settlement repair, slow recovery, Liquid and Bitcoin watchers, and database GC. With `false`, HTTP routes and their process-local rate-limit cleanup remain active, but automatic settlement and recovery do not run in that process. |
 
 Use `false` only for an intentionally web-only/standby instance when another
 healthy instance owns worker execution. A deployment with payment routes active
@@ -92,15 +92,15 @@ and no workers can detect or create obligations that it does not settle.
 
 | Key | Default | Effect and tradeoff |
 |---|---:|---|
-| `invoice_accounting.btc_shortfall_tolerance_sat` | `300` | Direct-Bitcoin and checkout chain-swap shortfalls up to this amount can satisfy an invoice. Higher values reduce underpayment friction but increase merchant loss per invoice. |
-| `invoice_accounting.liquid_shortfall_tolerance_sat` | `60` | Direct-Liquid shortfall tolerance. Direct Liquid is currently credited from Electrum history before confirmation, independently of this amount tolerance. |
-| `invoice_accounting.lightning_shortfall_tolerance_sat` | `1` | Reverse-swap/Lightning shortfall tolerance. Keep tight because the swap amount is server-negotiated. |
+| `invoice_accounting.btc_shortfall_tolerance_sat` | `300` | Maximum Direct-Bitcoin and checkout chain-swap shortfall. The effective tolerance is the smaller of this value and 1% of the invoice amount, with a one-sat minimum. |
+| `invoice_accounting.liquid_shortfall_tolerance_sat` | `60` | Maximum Direct-Liquid shortfall, subject to the same 1% ceiling. Direct Liquid is currently credited from Electrum history before confirmation. |
+| `invoice_accounting.lightning_shortfall_tolerance_sat` | `1` | Maximum reverse-swap/Lightning shortfall, subject to the same 1% ceiling. Keep tight because the swap amount is server-negotiated. |
 | `invoice_accounting.checkout_partial_terminal_grace_secs` | `900` | After a checkout partial payment, GC waits this long before terminalizing the remaining shortfall. Longer values leave the checkout payable longer; shorter values close it sooner. |
 | `invoice_accounting.payment_grace_secs` | `3600` | Watchers continue observing and GC withholds expiry for this many seconds after `expires_at`, allowing a payment broadcast near expiry to confirm and count. Set comfortably above the expected on-chain confirmation delay. |
 
-Tolerance values are signed integers and are not range-validated at startup.
-Use non-negative values. Changing tolerances changes accounting decisions for
-newly processed events; it does not rewrite existing payment events.
+Tolerance values must be non-negative or startup fails. Changing tolerances
+changes accounting decisions for newly processed events; it does not rewrite
+existing payment events.
 
 ## Claim retry policy
 
@@ -122,10 +122,10 @@ chain-swap reconciliation, and settlement repair.
 |---|---:|---|
 | `reconciler.interval_secs` | `90` | Main reconciliation and settlement-repair tick. Lower values recover missed webhooks faster but increase provider and database load. Must be greater than zero; Tokio rejects a zero interval. |
 | `reconciler.min_age_secs` | `60` | Excludes newer rows from normal reconciliation to avoid racing fresh webhook processing. A higher value delays dropped-webhook recovery. |
-| `reconciler.max_per_tick` | `200` | Maximum rows processed per reconciler tick. Backlogs drain oldest/priority rows over multiple ticks. Zero disables useful work without disabling the task. |
+| `reconciler.max_per_tick` | `200` | Maximum rows processed per reconciler tick. Backlogs drain oldest/priority rows over multiple ticks. Must be greater than zero. |
 | `reconciler.inter_call_delay_ms` | `50` | Delay between provider calls within a tick. Increase to reduce request rate; `0` removes the delay. |
 | `reconciler.slow_recovery_interval_secs` | `1800` | How often funded `claim_stuck` rows are considered for revival. Must be greater than zero. |
-| `reconciler.slow_recovery_max_per_tick` | `25` | Maximum reverse and chain rows selected per slow-recovery tick. Zero prevents revival work. |
+| `reconciler.slow_recovery_max_per_tick` | `25` | Combined maximum across reverse and chain rows per slow-recovery tick. Bullnym alternates rails while both have work. Must be greater than zero. |
 | `reconciler.slow_recovery_backoff_base_secs` | `3600` | Base delay for successive slow-recovery revivals, with jitter. |
 | `reconciler.slow_recovery_backoff_cap_secs` | `86400` | Maximum delay between slow-recovery revivals. Keep greater than or equal to the base for intuitive behavior. |
 
@@ -138,7 +138,7 @@ capacity. Monitor oldest unreconciled age before increasing either delay.
 |---|---|---|
 | `pricer.url` | `https://api.bullbitcoin.com/public/price` | JSON-RPC pricing endpoint. Fiat invoice creation and public conversion depend on it. |
 | `pricer.cache_ttl_secs` | `60` | In-memory last-good rate lifetime before refresh. Larger values improve availability and reduce upstream load but allow staler quotes. `0` forces refresh on every use. |
-| `pricer.request_timeout_ms` | `2000` | HTTP timeout. On error, Bullnym uses a cached last-good value when available. Very small/zero values can make pricing unusable. |
+| `pricer.request_timeout_ms` | `2000` | HTTP timeout. On error, Bullnym uses a cached last-good value when available. Must be greater than zero. |
 | `pricer.supported_currencies` | `USD, CAD, EUR, CRC, MXN, ARS, COP` | Currency allowlist exposed to clients and accepted before an upstream call. Codes are normalized and deduplicated at client construction; each currency must also pass a configured safety ceiling in code. |
 
 Removing a currency prevents new invoices in that currency but does not change
@@ -166,15 +166,16 @@ point it at a writable or sensitive tree.
 | `limits.min_sendable_msat` | `100000` (100 sat) | LNURL minimum payment amount. Must be non-zero and no greater than the maximum. |
 | `limits.max_sendable_msat` | `25000000000` (25,000,000 sat) | LNURL maximum payment amount. Also bounds payment exposure offered through Lightning Address. |
 | `limits.max_descriptor_len` | `1000` | Maximum accepted descriptor string length before parsing. This is a resource/abuse bound, not descriptor-policy validation. |
-| `limits.max_lifetime_nyms_per_npub` | `3` | Lifetime nym-registration quota per authentication key. Inactive nyms still count because names stay reserved. Raising it expands namespace-squatting capacity; lowering it does not remove existing rows. |
+| `limits.max_lifetime_nyms_per_npub` | `3` | Lifetime nym-registration quota per authentication key. Must be greater than zero. Inactive nyms still count because names stay reserved. Raising it expands namespace-squatting capacity; lowering it does not remove existing rows. |
 
-Only the min/max relationship and non-zero minimum are startup-validated.
+The minimum/maximum relationship, descriptor length, and lifetime quota are
+startup-validated.
 
 ## LUD-22 proof policy
 
 | Key | Default | Effect and tradeoff |
 |---|---|---|
-| `proof.min_proof_value_sat` | `1000` | Minimum value of the confidential L-BTC UTXO used to authorize a direct-Liquid LNURL callback. Raising it increases the payer capital requirement and anti-abuse cost. |
+| `proof.min_proof_value_sat` | `1000` | Minimum value of the confidential L-BTC UTXO used to authorize a direct-Liquid LNURL callback. Must be greater than zero. Raising it increases the payer capital requirement and anti-abuse cost. |
 | `proof.message_tag` | `bullpay-lnurlp-v1` | Domain-separation tag included in ownership signatures. Must be non-empty. Changing it breaks verification for clients signing the previous tag until they update. |
 
 The broad `rate_limit.ip_whitelist` bypasses the proof requirement as well as
@@ -190,10 +191,10 @@ invariants.
 | `bitcoin_watcher.endpoints` | `[]` | Additional ordered failovers after the primary. Bull Bitcoin and mempool.space built-ins are always appended and deduplicated, so this list cannot remove those built-ins. |
 | `bitcoin_watcher.active_tick_secs` | `30` | Poll interval for invoices newer than `active_window_secs`. Must be greater than zero. |
 | `bitcoin_watcher.idle_tick_secs` | `300` | Poll interval for older payable invoices. Must be greater than zero. |
-| `bitcoin_watcher.active_window_secs` | `3600` | Age threshold separating active and idle invoices. Negative values are accepted but make normal invoices idle immediately; use a non-negative value. |
-| `bitcoin_watcher.confirmations_required` | `1` | Confirmation depth before a direct-Bitcoin output creates an accounting event. Unconfirmed outputs remain observations even when this is `0`; use at least `1` for clear policy. |
-| `bitcoin_watcher.rate_per_sec` | `5` | In-process token-bucket capacity/refill for Esplora calls. `0` is coerced to `1`, not disabled. This is per Bullnym process. |
-| `bitcoin_watcher.request_timeout_ms` | `10000` | Timeout for each Esplora request. The watcher rotates endpoints or skips work after errors. Use a positive value below the relevant polling interval. |
+| `bitcoin_watcher.active_window_secs` | `3600` | Age threshold separating active and idle invoices. Must be non-negative. |
+| `bitcoin_watcher.confirmations_required` | `1` | Confirmation depth before a direct-Bitcoin output creates an accounting event. Must be greater than zero; unconfirmed outputs remain observations. |
+| `bitcoin_watcher.rate_per_sec` | `5` | In-process token-bucket capacity/refill for Esplora calls. Must be greater than zero. This is per Bullnym process. |
+| `bitcoin_watcher.request_timeout_ms` | `10000` | Timeout for each Esplora request. Must be greater than zero. The watcher rotates endpoints or skips work after errors. |
 
 One endpoint supplies the tip and address data for a given tick so confirmation
 math does not mix chain views. Built-in third-party failover has privacy and
@@ -206,7 +207,7 @@ availability implications because it discloses watched addresses when used.
 | `electrum.liquid_url` | Unset | Deprecated single endpoint. When present it is tried before `liquid_urls`. Keep only for deployed-config compatibility. |
 | `electrum.liquid_urls` | `['ssl://blockstream.info:995']` | Ordered Liquid Electrum endpoints for LUD-22 proof checks and the Liquid watcher. Bare hosts are normalized to `ssl://`. |
 | `electrum.cache_ttl_secs` | `3600` | Lifetime of cached raw transaction bytes used by UTXO verification. `0` makes entries immediately stale. |
-| `electrum.cache_max_entries` | `10000` | Approximate in-memory transaction-cache bound. The implementation retains at least one entry even when set to `0`; use a positive value. |
+| `electrum.cache_max_entries` | `10000` | Approximate in-memory transaction-cache bound. Must be greater than zero. |
 
 Bullnym appends `ssl://les.bullbitcoin.com:995` and
 `ssl://blockstream.info:995` as built-in failovers. Claim operations try
@@ -232,22 +233,22 @@ limits are consistent across replicas. Token buckets are also per process.
 | `rate_limit.distinct_nyms_per_ipv6_56_limit` | `3` | Distinct targets per aggregated IPv6 /56. Tighter because a /56 normally represents one subscriber. |
 | `rate_limit.distinct_nyms_per_outpoint_limit` | `3` | Distinct targets authorized by the same proof outpoint. Prevents one UTXO from exhausting many descriptor cursors. |
 | `rate_limit.distinct_nyms_window_secs` | `3600` | Shared window for the three distinct-target checks. |
-| `rate_limit.max_pending_reservations_per_nym` | `50000` | Hard count of unfulfilled LUD-22 reservations for one nym. Unlike most limits, `0` blocks all new reservations rather than disabling the check. |
+| `rate_limit.max_pending_reservations_per_nym` | `50000` | Hard count of unfulfilled LUD-22 reservations for one nym. Must be greater than zero. |
 | `rate_limit.recycle_pending_older_than_days` | `30` | **Accepted but currently unused.** Changing it has no runtime effect; pending-reservation cleanup uses other GC policy. Retained for configuration compatibility. |
 | `rate_limit.lightning_rate_per_minute` | `0` | **Legacy/no active caller.** The old per-nym Lightning limiter is not invoked; source-based Lightning limits replaced it. Retained for compatibility. |
-| `rate_limit.global_electrum_rate_per_sec` | `50` | Process-local token bucket for user-facing Liquid Electrum calls. `0` is coerced to `1`, not disabled. |
+| `rate_limit.global_electrum_rate_per_sec` | `50` | Positive process-local token bucket for user-facing Liquid Electrum calls. Zero is rejected. |
 | `rate_limit.register_rate_limit` | `5` | Registration/lookup requests per source per `register_rate_window_secs`, before signature verification. Process-local. |
 | `rate_limit.register_rate_window_secs` | `60` | Window for `register_rate_limit`. |
 | `rate_limit.register_distinct_npubs_per_ip_limit` | `3` | Distinct registration identities per source. PostgreSQL-backed. |
 | `rate_limit.register_distinct_npubs_per_ip_window_secs` | `3600` | Window for the distinct registration-identity cap. |
 | `rate_limit.max_active_users` | `10000` | Hard global active-user ceiling checked before registration. `0` disables it. Set an alert before expected growth reaches the ceiling. |
-| `rate_limit.metadata_rate_limit` | `30` | LNURL/NIP-05 metadata requests per source per `metadata_rate_window_secs`. Process-local. |
-| `rate_limit.metadata_rate_window_secs` | `60` | Window for metadata request volume. |
+| `rate_limit.api_rate_limit` | `30` | General process-local source gate shared by LNURL/NIP-05 metadata, Payment Page management, and signed invoice create/list/cancel/recovery operations. Legacy key `metadata_rate_limit` is accepted. |
+| `rate_limit.api_rate_window_secs` | `60` | Window for `api_rate_limit`. Legacy key `metadata_rate_window_secs` is accepted. |
 | `rate_limit.metadata_distinct_nyms_per_ip_limit` | `10` | Distinct metadata nyms queried per source. PostgreSQL-backed. |
 | `rate_limit.metadata_distinct_nyms_per_ip_window_secs` | `3600` | Window for metadata enumeration control. |
 | `rate_limit.lookup_distinct_npubs_per_ip_limit` | `5` | Distinct authentication keys queried through registration lookup per source. PostgreSQL-backed. |
 | `rate_limit.lookup_distinct_npubs_per_ip_window_secs` | `3600` | Window for lookup enumeration control. |
-| `rate_limit.chain_watcher_electrum_rate_per_sec` | `50` | Separate process-local token bucket for the Liquid watcher so public callbacks cannot starve it. `0` becomes `1`. |
+| `rate_limit.chain_watcher_electrum_rate_per_sec` | `50` | Positive process-local token bucket for the Liquid watcher so public callbacks cannot starve it. Zero is rejected. |
 | `rate_limit.chain_watcher_active_user_tick_secs` | `30` | Liquid watcher cadence for nyms with a recent callback. Must be greater than zero. |
 | `rate_limit.chain_watcher_idle_user_tick_secs` | `600` | Liquid watcher cadence for other nyms. Must be greater than zero. |
 | `rate_limit.chain_watcher_active_window_secs` | `86400` | A nym is active when its last callback is within this many seconds. |
@@ -287,22 +288,36 @@ Call `/certification/preflight?scopes=...` before a test run.
 
 Startup always rejects:
 
+- unknown TOML keys, missing required sections, or malformed field types;
+- an empty or schemed/path-containing `domain`, an invalid `listen` socket, or
+  `pool_size == 0`;
+- malformed Boltz, pricer, Bitcoin HTTP endpoints or unsupported Electrum URL
+  schemes;
+- webhook secrets that cannot be represented as one URL path segment;
 - `limits.min_sendable_msat == 0`;
 - `limits.min_sendable_msat > limits.max_sendable_msat`;
+- zero descriptor/lifetime/proof safety limits or negative shortfall
+  tolerances;
+- zero worker intervals, recovery batch sizes, request timeouts, confirmation
+  requirements, or Electrum token buckets;
+- a slow-recovery backoff base greater than its cap;
+- an enabled count-based rate limit with a zero window;
 - an empty `proof.message_tag`;
 - enabled certification with an empty token, source allowlist, or scopes;
-- malformed certification IP/CIDR entries or scope names.
+- malformed whitelist/certification IP/CIDR entries or certification scope
+  names.
 
 When `BULLNYM_RUNTIME_MODE=production`, startup additionally rejects:
 
 - a missing current webhook URL secret;
-- `domain` equal to `localhost` or beginning with `localhost:`;
+- `domain` resolving syntactically to `localhost` or a loopback IP address;
 - a non-loopback `listen` address unless public listening is explicitly
   allowed.
 
-Many numeric fields have no startup range validation. In particular, zero
-Tokio intervals can panic their worker after startup. Use the positive values
-shown in the example unless a field explicitly documents zero semantics.
+Worker intervals, recovery budgets, request timeouts, token buckets, and other
+money-safety bounds documented as positive are rejected when set to zero.
+Count-based rate limits retain their documented zero-disable semantics, but an
+enabled limit must have a non-zero window.
 
 ## Production procedure
 
@@ -311,7 +326,8 @@ shown in the example unless a field explicitly documents zero semantics.
    and a loopback `listen` address.
 3. Review all external endpoints, built-in failover disclosure, confirmation
    policy, accounting tolerances, and recovery gating.
-4. Confirm the database and swap mnemonic are a matched, restorable pair.
+4. Confirm the database is restorable and the swap mnemonic is backed up for
+   derivation continuity.
 5. Protect the TOML file if certification contains a token.
 6. Restart Bullnym and require `/health`, `/ready`, and `/version` to pass.
 7. Confirm startup logs show every expected worker and the intended endpoint
