@@ -1,66 +1,49 @@
-# Bullnym Documentation
+# Bullnym documentation
 
-This directory documents the current Bullnym system by component and product
-feature. Historical test-review material lives under `archive/testing-evidence`
-so it does not get confused with the product contract.
+These documents describe the maintained Bullnym server. Proposed work belongs
+in [RFCs](rfcs/README.md); completed, superseded, and abandoned material belongs
+in the [archive](../archive/README.md).
 
-## Components
+## Start here
 
-- [Architecture](architecture.md): system boundary, runtime shape, module
-  layout, request flow, payment flow, reliability model, and config boundary.
-- [HTTP API](components/http-api.md): public routes, signed routes, webhooks,
-  request fields, response fields, signing order, and error envelopes.
-- [Authentication and Identity](components/auth-identity.md): `npub`,
-  `verification_npub`, signed payloads, nyms, and reservation rules.
-- [PWA Runtime](components/pwa-runtime.md): Svelte entry points, injected
-  config, service-worker caching, and proxy requirements.
-- [Payment Rails](components/payment-rails.md): Lightning via Boltz reverse
-  swaps, direct Liquid, direct Bitcoin, and Bitcoin-to-Liquid chain swaps.
-- [Data Model](components/data-model.md): tables, ownership, descriptor
-  cursors, invoices, swaps, payment events, and observations.
-- [Background Workers](components/background-workers.md): claimer, reconciler,
-  Liquid watcher, Bitcoin watcher, GC, and rate-limit sweeps.
+- [Architecture overview](architecture/overview.md)
+- [Trust model](architecture/trust-model.md)
+- [Payment lifecycle](architecture/payment-lifecycle.md)
+- [API reference](api/README.md)
+- [Operations](operations/README.md)
+- [Compatibility ledger](reference/compatibility.md)
+- [Glossary](reference/glossary.md)
 
-## Features
+## Architecture
 
-- [Lightning Address](features/lightning-address.md): LNURL metadata,
-  callback behavior, LUD-22 Liquid shortcut, and descriptor allocation.
-- [Payment Pages](features/donation-pages.md): Payment Page management,
-  public checkout, descriptors, images, and PWA behavior.
-- [POS](features/pos.md): POS terminal routes, descriptor isolation, local
-  history, offline shell behavior, and payment rails.
-- [Invoices](features/invoices.md): wallet-created receivables, linked and
-  unlinked routes, payment status, cancellation, and direct-address
-  settlement.
-- [Rate Limits and Certification](features/rate-limits-certification.md):
-  abuse controls, scoped certification, and test harness boundaries.
-- [Testing Boundaries](features/testing.md): what local tests, bullnym-test,
-  and mobile validation each prove.
+- [Overview](architecture/overview.md)
+- [Trust model](architecture/trust-model.md)
+- [Payment lifecycle](architecture/payment-lifecycle.md)
+- [Data and workers](architecture/data-and-workers.md)
+- [Identity and authentication](architecture/identity-and-auth.md)
+- [Abuse controls and readiness](architecture/abuse-and-readiness.md)
+- [PWA runtime](architecture/pwa.md)
 
-## Decisions
+## Products and protocols
 
-- [Decision Repository](decisions/README.md): cross-repository architecture and
-  product decisions for Bullnym, Bull Bitcoin Mobile, Get Paid, deterministic
-  wallets, Nostr roles, and payment rails.
+- [Lightning Address](products/lightning-address.md)
+- [Payment Pages](products/payment-pages.md)
+- [POS](products/pos.md)
+- [Invoices](products/invoices.md)
+- [LUD-22 Liquid negotiation](protocols/lud-22.md)
 
-## Reference
+## Engineering records
 
-- [Complete API Reference](api-reference.md): endpoint-by-endpoint client
-  contract, authentication bytes, request and response options, error handling,
-  retries, payment semantics, and the security/privacy implications of each
-  integration choice.
-- [Payment Architecture](payment-architecture.md): cross-product payment
-  semantics and rail accounting model.
-- [Compatibility Ledger](compatibility-ledger.md): compatibility behavior that
-  remains intentionally supported.
-- [Alias Slugs — Client Integration](alias-slugs-client-integration.md):
-  merchant-chosen `/a/<slug>` surfaces (issue #57) — the signed save field, the
-  request/response contract, and the nym-scrubbing a client relies on.
-- [LUD-22 Liquid Payment Negotiation](lud-22-currency-negotiation.md): exact
-  callback fields, ownership proof, commitment verification, responses, and
-  fallback semantics implemented by Bullnym.
-- [LUD-22 vs MRH](lud-22-vs-mrh-research.md): rationale for not using Magic
-  Routing Hint as the on-chain shortcut.
-- [Stuck Swap Runbook](runbook-stuck-swap.md): operator recovery reference.
-- [nginx snippet](nginx-bullpay.conf.snippet): reverse-proxy reference for
-  donation-page images and route rate limits.
+- [Architecture decisions](adr/README.md)
+- [RFCs](rfcs/README.md)
+- [Operations](operations/README.md)
+- [Reference](reference/README.md)
+
+## Documentation policy
+
+Maintained documentation states current behavior and links to source where a
+claim is subtle. ADRs record accepted decisions. RFCs describe work that has
+not necessarily shipped. Archived files are historical evidence only and must
+carry a lifecycle label.
+
+Run `scripts/check-docs.sh` before submitting documentation changes.

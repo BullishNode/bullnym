@@ -192,8 +192,8 @@ const DEFAULT_MAX_CLAIM_ATTEMPTS: i32 = 30;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaimConfig {
     /// After this many failed claim attempts, the row transitions to
-    /// `claim_stuck` and is excluded from the background sweep until an
-    /// operator runs the stuck-swap rescue runbook.
+    /// `claim_stuck` and leaves the fast background sweep. The slow-recovery
+    /// worker continues retrying funded rows on a longer capped backoff.
     ///
     /// Default 30 ≈ 24h of trying with the documented backoff
     /// (30s, 60s, 120s, 300s, 600s, 1800s, 3600s cap). Plenty for any
