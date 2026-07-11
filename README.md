@@ -1,595 +1,119 @@
-# bullnym
+# Bullnym
 
-bullnym is BULL Bitcoin's payment processing backend. It started as a
-Lightning Address server for the BULL wallet and now exposes four product
-surfaces backed by the same non-custodial Liquid settlement model:
+Bullnym is BULL Bitcoin's non-custodial payment coordination backend. It gives
+merchant wallets public payment identities and checkout surfaces while settling
+successful payments to wallet-controlled Bitcoin or Liquid destinations.
 
-1. **Lightning Address** — a public `nym@domain` LNURL-pay endpoint. Standard
-   senders receive a BOLT11 invoice backed by a Boltz reverse swap; LUD-22
-   senders can receive a direct Liquid address after proving UTXO ownership.
-2. **Payment Pages** — public pages at `https://<domain>/<nym>` or
-   `https://<domain>/a/<alias>` where a payer enters an amount and receives a
-   payment page with Lightning, Liquid, and Bitcoin payment instructions.
-3. **POS** — public terminals at `https://<domain>/<nym>/pos` or
-   `https://<domain>/a/<alias>/pos` with their own descriptor, cursor,
-   installable PWA shell, local history, and receipts.
-4. **Invoices** — recipient-created receivables with signed mobile APIs,
-   public payment URLs, fixed-sat or fiat-priced amounts, invoice listing,
-   cancellation, and payment-status accounting.
+Bullnym is a Rust/Axum service with Postgres persistence, Svelte payment/POS
+PWAs, Boltz swap integration, Liquid Electrum observation, and Bitcoin mempool
+observation.
 
-The account identity is the Nostr `npub`. A **nym** is an optional public
-payment namespace owned by that `npub`: Lightning Address, Payment Page, and
-POS are attached to a nym. Lightning Address uses the nym's Liquid confidential
-descriptor. Payment Page and POS use separate Get Paid descriptors and address
-cursors; only legacy Payment Pages can fall back to the nym descriptor. Each
-`npub` may also claim one optional lifetime alias shared by Payment Page and
-POS. If no alias is active, both surfaces use their nym routes.
-Invoices can be linked to a nym for routing and presentation, but they do not
-have to be. Wallet-origin invoices use recipient-supplied Bitcoin and/or Liquid
-addresses instead of requiring the server to store a descriptor.
+## Products
 
-## Product model
+| Product | Public surface | Payer options | Merchant settlement |
+|---|---|---|---|
+| Lightning Address | `nym@domain` | Lightning; LUD-22 direct Liquid | Dedicated Lightning Address Liquid wallet |
+| Payment Page | `/:nym` or `/a/:alias` | Lightning, Liquid, Bitcoin through Boltz | Dedicated Payment Page Liquid wallet |
+| POS | `/:nym/pos` or `/a/:alias/pos` | Lightning, Liquid, Bitcoin through Boltz | Dedicated POS Liquid wallet |
+| Invoices | `/:nym/i/:id` or `/invoice/:id` | Merchant-selected Lightning, Liquid, and direct Bitcoin | Invoice-specific wallet destinations |
 
-| Product | Who creates it | Public URL | Payment rails | Settlement destination |
-|---|---|---|---|---|
-| Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Active nym CT descriptor; Lightning allocates at claim, while unpaid LUD-22 reservations can share the current index until payment advances it |
-| Payment Page | Recipient configures a public page for a nym | `/:nym` or `/a/:alias`, plus their invoice paths | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the Payment Page CT descriptor, with legacy fallback to the active nym CT descriptor |
-| POS | Recipient configures a terminal for a nym | `/:nym/pos` or `/a/:alias/pos` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the POS CT descriptor; no Lightning Address fallback |
-| Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from public surfaces use the selected surface Liquid address |
+The Nostr authentication public key owns server resources. A `nym` is a public
+payment namespace and Lightning Address local part. Each owner may claim one
+lifetime nym and one optional lifetime alias shared by Payment Page and POS.
+Without an active alias, both surfaces fall back to their nym routes without
+creating a synthetic alias claim. Merchant clients use dedicated deterministic
+wallets and descriptors so Bullnym payment activity is separated from the
+merchant's primary wallets.
 
-Payment sessions use fixed-sat accounting. Fiat-denominated invoices convert
-the requested fiat amount to sats at creation/rate-lock time and store the
-rate metadata for auditability. Accounting comes from idempotent payment
-events, not from trusting one webhook or one status flip.
+## Trust model
 
-For component and feature documentation, start with [docs/README.md](docs/README.md).
+Bullnym is designed as non-custodial payment coordination software, not as a
+service that accepts and transmits customer funds. Bullnym does not receive
+payments into a Bullnym-owned account, maintain customer balances, pool funds,
+or hold the merchant wallet's spending keys. Payers send directly over
+Lightning or to Bitcoin or Liquid on-chain outputs, and successful settlement
+pays an address controlled by the merchant's wallet.
 
-## Why Lightning Address needed a server
+For Boltz-backed payments, Bullnym creates and monitors the swap and uses
+swap-specific key material to claim or recover funds to the configured merchant
+destination. Users must therefore trust Bullnym to execute the swap correctly,
+even though Bullnym does not take possession of customer funds for later
+remittance from its own custody. These architectural properties are the
+technical basis for treating Bullnym as payment coordination infrastructure
+rather than a custodial money transmission service.
 
-The original problem Bullnym solved is that the BULL wallet relies on an
-atomic-swap server (Boltz) to allow users to receive Lightning Network
-payments, so the wallet cannot offer Lightning Address (LNURL-PAY) by itself.
+See [Trust Model](docs/architecture/trust-model.md) for the complete authority
+and failure boundaries.
 
-This is a significant UX downside compared to custodial Lightning wallets and
-other graduated wallets such as Spark-enabled wallets.
+## Repository
 
-The LNURL-compatible service has three main functions:
-
-1. It receives and stores Liquid confidential descriptors for the user
-   (recipient).
-2. It generates and assigns a Lightning Address associated with that descriptor.
-3. It creates a reverse submarine swap on behalf of the user when a sender
-   calls the LNURL endpoints and requests a BOLT11 invoice for that address.
-
-That Lightning Address is called a "nym".
-
-## Risks and tradeoffs. Is it custodial?
-
-There are typically 2 risks associated with a custodial Lightning address server:
-
-- **Risk to the user:** the server can steal funds and censor payments
-- **Risk to the operator:** illegally operating a money transmission service without a license
-
-The Bullnym system is interesting in that it is technically non-custodial: at no point in time does it actually handle user funds or facilitate a payment. All it does is calling the Boltz API and providing a Liquid network address. This eliminates the legal risk to the operator.
-
-However, because the swap is constructed by the server and not the user, the server could maliciously create a swap with another Liquid address that doesn't actually belong to the recipient. In effect, the server could steal funds from the user. The end result is that the end user still has to trust that the server operates honestly, but as long as the server operates honestly, the swap remains non-custodial. So it's an interesting situation of non-custodial but still trusted.
-
-## Privacy: special purpose wallet and autosweep
-
-The other major risk to the user is that the user has to send his Liquid wallet descriptor to the server, so that the server derives a new Liquid address for every payment. The alternative is to have a single Liquid address. Having a single liquid address allows any blockchain observer to track a user's payment. Confidential transactions on the Liquid network hide amounts from on-chain observers, but address reuse is still a major privacy downside. Providing a descriptor to the server, to avoid address reuse, provides a considerable privacy improvement at the chainanalysis level but allows the server to effectively see all the transactions done to and from that wallet. The server does have the blinding key. It's part of the CT descriptor and is needed to derive confidential addresses. So it can see the amounts of every transaction received via the Lightning Address, but not other transactions on the user's main wallet.
-
-The solution to this problem chosen by the client is to generate a single purpose Liquid wallet in the BULL application which is only used to receive payments via the Bullnym server. The "main" or "default" Liquid network wallet is therefore not compromised.
-
-In order to provide a simple user experience, this "single purpose" liquid network wallet is derived deterministically via BIP85 so that it can be recovered from the same mnemonic backup as the default wallets. We call this the Lightning Address wallet. In addition, an auto-sweep function is added so that any payment received in the Lightning Address wallet is automatically sent to the default Liquid wallet (the Instant Payments wallet). The default user experience completely hides the existence of the Lightning Address wallet, not visible on the home page, so that the user never needs to interact with it at all. The drawback to autosweep is that it adds ~19 sats to every payment received, because of the extra Liquid network transaction. At current Bitcoin price (~80,000 USD) this is ~$0.015 and is an acceptable tradeoff.
-
-## Nostr-based authentication
-
-When registering a nym with the Bullnym server, the BULL app derives a nostr keypair using BIP85 and uses it to sign a registration message with the Bullnym server. This allows the user to authenticate itself with the Bullnym server to manage his nym. The main actions a user can perform are:
-
-- **Deactivating a nym:** this prevents senders from sending payments to the Lightning address (enforced by the server).
-- **Changing a descriptor associated to a nym:** in case the user migrates wallets but wants to keep the same nym.
-- **Reactivating a nym:** a deactivated identity can reactivate its original
-  lifetime nym, but cannot replace it with a different nym.
-
-Why nostr? Nostr is not required for this authentication protocol, various other protocols built on BIP85 could have been used. However, there are other features that nostr enables such as sending and receiving messages and publishing the nym on the nostr relay network for discoverability. The better question is therefore "why not nostr?" and there doesn't seem to be any downside to using nostr for authentication.
-
-## LUD-22 and compatibility
-
-The Bullnym server is compatible with any LNURL-enabled sender wallet. During development, we noticed: a BULL wallet user sending a Lightning network payment to a recipient that is using Bullnym for its Lightning address, there is a massive inefficiency: the sender will be creating a submarine swap from Liquid to Lightning, and paying the receiver's reverse submarine swap from Lightning to Liquid. Not only do both the sender and the receiver end up paying Boltz's swap fees, but these 2 swaps generate 4 Liquid network transactions and pay those network fees!
-
-This is a known problem for any sender that sends funds over lightning network to a recipient where both are using the Boltz api integration. To solve this problem, Boltz created an innovative mechanism called the "magic routing hint" (MRH) where Boltz will embed the recipient's Liquid address in the bolt11 routing hint, so that a sender whose wallet is MRH-aware, when decoding the bolt11, will know to "skip" paying the bolt11 and simply extract the Liquid address from the routing hint and pay that directly. Exactly what we want to achieve. There are 4 major issues with this:
-
-1. The magic routing hint is added by the Boltz server, at their leisure. If Boltz decides to remove this feature, there is nothing that the Bullnym server operator can do.
-2. The Bullnym server can be extended to support various other forms of payment, such as Silent Payment addresses, Ark addresses, Spark addresses, etc. While there is nothing preventing Boltz from extending MRH to support these alternative methods, this is outside of the Bullnym server's control.
-3. The main threat here is enumeration attacks, where any sender can repeatedly call the LNURL endpoint. More on this in the rate limiting section. The Bullnym server operator may want to implement his own rate limiting that is stricter than Boltz's.
-4. MRH only works with wallets that implement the Boltz software libraries.
-
-Bullnym introduces LUD-22, which allows the sender to specify to a LNURL server that he is able and willing to send funds over the Liquid network (or any other network). LNURL servers which implement the Bullnym model will then return a Liquid address instead of the bolt11 reverse submarine swap. This can be extended to Silent Payments, Ark addresses, Spark addresses, etc.
-
-The result of LUD-22 is that it creates a single "nym" service which is compatible with existing LNURL-enabled wallets, but which also allows wallets to register other available payment methods that bypass the classic bolt11 response if the sender and recipient are both on a compatible alternative payment protocol. This achieves something similar to Samourai Wallet's "paynym server" system, but it is compatible with LNURL, supports Silent Payments, supports the Liquid Network, and can be extended to support practically any Bitcoin payment protocol.
-
-## Why LUD-22, not MRH
-
-We considered keeping MRH (Magic Routing Hint) alongside LUD-22 as an alternative on-chain shortcut and decided against it. The deciding factor is enumeration-attack resistance.
-
-MRH has no commitment from the sender. Anyone can hit the LNURL callback over HTTP, get an address allocated and embedded in the bolt11 routing hint, and never pay. The address counter on the recipient's CT descriptor advances anyway. With enough sustained traffic, the counter ratchets past the recipient wallet's gap limit, and gap-limit-bounded scanners (BDK, LWK by default) silently stop picking up new payments until the user does a manual full rescan. Funds aren't lost, but the receive UX breaks. The only available defense for MRH is per-source-IP throttling, which is bounded by what legitimate senders tolerate rather than by what attackers tolerate. Deleting stale instruction state, as the LUD-22 GC does for unfulfilled reservations, cannot make an MRH address safe to reuse because it remains a valid Liquid receive address after the BOLT11 expires.
-
-LUD-22 fixes this at the protocol layer by requiring the sender to prove ownership of a Liquid UTXO worth at least 1,000 sats before the server hands out an address. The payer supplies the clear value plus its value and asset blinding factors; the server reconstructs and checks both confidential commitments against the on-chain output. This makes the commitment a real cost rather than an advisory one without sending the output's blinding private key. On every dimension that matters, the contrast is sharp:
-
-| Property | MRH | LUD-22 |
-|---|---|---|
-| Cost per request to attacker | Zero (HTTP GET) | ≥ 1,000 sats committed on-chain (value cryptographically enforced) |
-| Idempotency on repeat | None — counter advances every time | Cache hit (same outpoint and nym → same descriptor index while the descriptor is unchanged) |
-| Recovery after attack | None — damage is cumulative | Unfulfilled reservation rows removed by GC |
-| Bound on damage | Unbounded cursor advancement | Unpaid requests do not advance the cursor; one UTXO can target at most 3 nyms/hour by default |
-
-The cost of deprecating MRH is borne by senders that supported MRH but not LUD-22 (mainly Aqua and other Boltz-library wallets). For those senders, payments now route through the standard reverse-swap path: roughly 580 extra sats of Boltz fees on a 100,000-sat payment, plus a few extra Liquid network transactions. The remediation is for those wallets to adopt LUD-22, at which point the on-chain shortcut is restored with a structurally cost-bounded defense profile, at the documented cost of revealing the proof UTXO and its value to Bullnym.
-
-## LUD-22 rate limiting
-
-The threat we are mitigating is descriptor-index exhaustion and unbounded pending-reservation state. LUD-22 reservations use the recipient's current descriptor index without advancing it; the chain watcher advances the cursor only after it observes payment. The 1,000-sat UTXO ownership proof — with the supplied clear value and blinding factors rebound to the on-chain confidential commitments — makes broader enumeration and backend abuse costly as well. That commitment gates several mechanisms:
-
-1. **Idempotent mapping and deferred advancement.** Each `(nym, outpoint)` pair caches one descriptor index. Repeated and distinct unpaid reservations reuse the current index rather than advancing the descriptor counter. Only an observed payment advances the cursor. Replacing the recipient descriptor can change the address derived at a cached index, so descriptor rotation must be coordinated separately.
-2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour (`distinct_nyms_per_outpoint`). To probe more, the attacker must control additional funded UTXOs or rotate them through real on-chain Liquid spends with real network fees and backend visibility delays. This is the primary binding gate.
-3. **TTL cleanup.** Unfulfilled reservation rows are deleted after one hour. An attacker who never pays cannot hold pending-reservation state indefinitely. Cleanup does not rewind the descriptor cursor; unpaid reservations did not advance it.
-4. **Optional per-pubkey volume cap.** A secondary gate keyed on the proof signing key (`per_pubkey_limit` / `per_pubkey_window_secs`). It is disabled by default and can be enabled as defense-in-depth on top of the per-outpoint and per-source gates.
-
-Standard per-IP rate limiting (`per_ip_limit` / `per_ip_window_secs`) applies on top of all of these and, with the per-outpoint fan-out cap, is one of the two primary gates.
-
-The combined effect is that the cost of a sustained enumeration attack scales with the on-chain Liquid UTXO supply the attacker controls, not with their willingness to send HTTP requests. Probing 1,000 nyms in an hour requires at least 334 distinct UTXOs of at least 1,000 sats each, all funded on-chain — a cost that has no analogue under MRH.
-
-## Nostr nym registration with NIP05
-
-The Bullnym server supports NIP05 registration. This allows users to optionally register their nym and Lightning address on the nostr relay network. This allows for discoverability (find contacts via the Nostr network) and opens up interesting possibilities such as NIP57 (zaps). Honestly, I am not sure that this adds any value because the nostr keypair generated is not associated to the user's identity and therefore doesn't let nostr users find the payment details of their contacts. It may also have downsides (discoverability introduces ddos vectors). And it does not provide redundancy because if the Bullnym server goes offline, users will not be able to obtain payment details from recipients via nostr because the NIP05 info just points to the Bullnym server. However, given that BULL plans to eventually publish Silent Payment addresses on nostr, this is a neat proof of concept and a useful place to surface issues like how to deactivate payment instructions.
-
-## Public-name reservations
-
-- Each Nostr identity can claim one lifetime nym and one optional lifetime
-  alias. The alias belongs to the identity and is shared by Payment Page and
-  POS.
-- Nyms and aliases share one namespace for new claims. Deactivating either
-  name never releases it; the original owner can reactivate the same name, but
-  nobody can rename, delete, or take it over.
-- Existing deployments may contain historical multi-nym or multi-alias states.
-  The public-name migration preserves those reservations and marks them as
-  grandfathered instead of silently releasing a payment identifier.
-
----
-
-# Technical reference
-
-## Architecture
-
-bullnym is a Rust/Axum HTTP server with a Postgres backend, public PWA payment
-surfaces, signed mobile APIs, and stateful integrations with Liquid
-Electrum, Boltz, the Bull pricer, and a Bitcoin mempool API.
-
-```
-HTTP layer (Axum)
-├── /.well-known/lnurlp/:nym          Lightning Address metadata
-├── /lnurlp/callback/:nym             LNURL-pay callback (Lightning + LUD-22)
-├── /register {POST,PUT,DELETE}       Nym lifecycle, Schnorr-authenticated
-├── /donation-page {PUT,DELETE}       Signed Payment Page/POS management
-├── /donation-page/:nym               Public surface JSON state
-├── /:nym                             Payment Page PWA shell
-├── /:nym/pos                         POS PWA shell
-├── /:nym/invoice                     Payment Page checkout invoice creation
-├── /:nym/pos/invoice                 POS checkout invoice creation
-├── /a/:alias                         Alias-selected Payment Page PWA shell
-├── /a/:alias/pos                     Alias-selected POS PWA shell
-├── /a/:alias[/pos]/invoice           Alias-selected checkout invoice creation
-├── /:nym/i/:id                       Linked invoice/payment page
-├── /invoice/:id                      Generic linked/unlinked invoice page
-├── /sw.js, /pwa-assets/*             PWA service worker and assets
-├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
-├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
-├── /health                           Liveness probe
-├── /ready                            DB/schema readiness probe
-└── /version                          Build provenance for deploy/test preflight
-
-Background tasks (spawned in main, cancelled on SIGINT)
-├── claimer                           Boltz webhook drain + MuSig2 cooperative claims
-├── reconciler                        Polls Boltz for non-terminal swaps after missed webhooks
-├── chain_watcher                     Liquid Electrum deposit detection + funded-index advancement
-├── bitcoin_watcher                   Bitcoin direct invoice detection
-├── rate-limit GC                     Prunes counters/reservations and terminalizes expired invoices
-└── in-memory rate-limit sweep        Evicts idle per-IP buckets from process memory
-
-Stateful dependencies
-├── PostgreSQL                        Nyms, payment surfaces, invoices, swaps, payment events
-├── Boltz API v2                      Reverse swaps, chain swaps, MuSig2 cooperative claims
-├── Liquid Electrum                   LUD-22 proof checks, Liquid deposit polling
-├── Bitcoin mempool API               Direct BTC invoice detection
-└── Bull pricer                       Fiat-to-sat conversion for public checkout and invoices
+```text
+src/          Rust service
+migrations/   PostgreSQL migrations
+pwa/          Payment Page and POS PWA source and checked build output
+templates/    Server-rendered fallback and invoice templates
+tests/        Server integration tests
+docs/         Maintained architecture, API, product, and operations docs
+archive/      Historical plans, research, and test evidence
 ```
 
-The server is stateless across processes; durable state lives in Postgres.
-Restart-safety is provided by startup scans, the Boltz reconciler, unique
-indexes, idempotent payment-event keys, and compare-and-set style status
-updates around claim and accounting transitions.
+## Local development
 
-## HTTP API
+Prerequisites:
 
-### Public LNURL endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/.well-known/lnurlp/:nym` | LUD-06 metadata (callback URL, min/max sendable, `payment_methods`) |
-| `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 identity provider (opt-in; route enabled only when `[features] nip05` is on, default off). Returns the nym's `verification_npub` only when one was explicitly registered; a nym with no verification key resolves to no record (the server never publishes the auth key) |
-| `GET` | `/lnurlp/callback/:nym` | LNURL-pay callback. Returns a BOLT11 invoice (default Lightning rail) or a Liquid address (LUD-22 with `payment_method=L-BTC` plus a UTXO ownership proof) |
-
-Wallets that support LUD-22 send `payment_method=L-BTC` with `outpoint`, `pubkey`, `sig`, `value`, `value_bf`, and `asset_bf`. The server verifies the DER-ECDSA ownership signature, checks the UTXO is unspent through Liquid Electrum, and reconstructs the confidential asset and value commitments to enforce L-BTC and `proof.min_proof_value_sat` (default 1000). Explicit-value or explicit-asset outputs are rejected. It then returns an address derived at either the cached `(nym, outpoint)` index or the nym's current descriptor index. Multiple unpaid reservations can share that current address; the chain watcher advances the cursor only after observing payment. See [the implemented LUD-22 contract](docs/lud-22-currency-negotiation.md).
-
-### Authenticated nym lifecycle
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/register` | Create a new nym |
-| `PUT` | `/register` | Update CT descriptor on an existing nym |
-| `DELETE` | `/register` | Deactivate a nym |
-| `GET` | `/register/lookup?npub=...` | List nyms registered to an npub (rate-limited per IP, distinct-npubs cap) |
-| `GET` | `/api/reservations/:nym?...` | List the nym's pending LUD-22 reservations |
-
-All write operations require a BIP-340 Schnorr signature over a domain-tagged payload (see Authentication).
-
-### Payment Page and POS surfaces
-
-| Method | Path | Purpose |
-|---|---|---|
-| `PUT` | `/donation-page` | Create or update a Payment Page or POS surface |
-| `DELETE` | `/donation-page` | Soft-archive a surface; the nym remains reserved |
-| `GET` | `/donation-page/:nym?kind=...` | Public JSON state used by mobile |
-| `GET` | `/:nym` | Payment Page PWA shell |
-| `GET` | `/:nym/pos` | POS PWA shell |
-| `GET` | `/a/:alias` | Payment Page PWA shell selected by the owner's alias |
-| `GET` | `/a/:alias/pos` | POS PWA shell selected by the same alias |
-| `POST` | `/:nym/invoice` | Anonymous payer creates a Payment Page checkout invoice |
-| `POST` | `/:nym/pos/invoice` | Cashier creates a POS checkout invoice |
-| `POST` | `/a/:alias/invoice` | Anonymous payer creates an alias-selected Payment Page invoice |
-| `POST` | `/a/:alias/pos/invoice` | Cashier creates an alias-selected POS invoice |
-| `GET` | `/:nym/i/:id`, `/:nym/pos/i/:id`, `/a/:alias/i/:id`, `/a/:alias/pos/i/:id` | Public payment page for a checkout invoice; POS-prefixed forms support shell-relative navigation |
-
-Surface management is signed by the same Nostr/BIP-340 identity that owns the
-nym. `kind = "payment_page"` serves `/:nym`; `kind = "pos"` serves
-`/:nym/pos`. Payment Page can use a legacy fallback to the nym descriptor; POS
-requires its own descriptor. One optional alias belongs to the owning `npub`,
-so the same alias selects Payment Page at `/a/:alias` and POS at
-`/a/:alias/pos`; without an active alias, the nym URLs remain canonical.
-Runtime payments are `origin = 'checkout'`
-invoice rows, so both surfaces share invoice status, payment-event accounting,
-Lightning offer refresh, Liquid address detection, and Bitcoin chain-swap
-settlement machinery.
-
-### Invoices
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/:nym/invoices` | Signed creation of a nym-linked wallet invoice |
-| `POST` | `/api/v1/invoices` | Signed creation of an unlinked wallet invoice |
-| `DELETE` | `/api/v1/:nym/invoices/:id` | Signed cancellation of a linked invoice |
-| `DELETE` | `/api/v1/invoices/:id` | Signed cancellation of an unlinked invoice |
-| `GET` | `/api/v1/invoices?npub=...` | Signed list endpoint for mobile dashboard state |
-| `GET` | `/invoice/:id` | Generic public page for linked or unlinked invoices |
-| `GET` | `/api/v1/invoices/:id/status` | Public payment status for polling payment pages |
-| `POST` | `/api/v1/invoices/:id/lightning` | Create or refresh the current BOLT11 offer |
-| `POST` | `/api/v1/invoices/:id/liquid` | Deprecated; returns `410 Gone` because wallet-origin Liquid addresses are supplied at invoice creation |
-| `GET` | `/api/v1/supported-currencies` | Fiat currencies accepted by server-side pricing |
-
-Wallet-origin invoices are `origin = 'wallet'`. They are recipient-created,
-cancellable while unpaid, and may be linked to a nym or shared through the
-unlinked `/invoice/:id` route. They carry explicit recipient-supplied Bitcoin
-and/or Liquid settlement addresses; the server does not need a stored wallet
-descriptor to create or settle them. Checkout-origin invoices are payer-created
-from a public checkout surface, inherit that surface's descriptor-derived
-Liquid settlement address, and have a shorter outer expiry.
-
-### Webhook
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/webhook/boltz/:secret` | Boltz reverse-swap and chain-swap notifications, authenticated by URL-path secret |
-| `POST` | `/webhook/boltz` | Legacy unauthenticated route for development only; production refuses it when a secret is configured |
-
-Boltz does not sign webhook deliveries. New swaps therefore register a webhook
-URL containing `BOLTZ_WEBHOOK_URL_SECRET`; the handler compares the path segment
-in constant time. `BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS` can be accepted during a
-rotation overlap window.
-
-## Authentication
-
-### Schnorr signing
-
-Mobile clients sign domain-tagged byte strings with the BIP-340 Schnorr key
-derived from BIP85 (the same Nostr keypair used for registration).
-
-Lightning Address registration uses the v1 payload:
-
-```
-bullpay-la-v1\x00<action>\x00<npub_hex>\x00(<field>\x00)*<timestamp>
-```
-
-| Action | Payload fields |
-|---|---|
-| `register` | `nym`, `ct_descriptor`, optional `verification_npub` |
-| `update` | `ct_descriptor` |
-| `delete` | (none) |
-
-If `verification_npub` is supplied, it is included in the signed register
-payload and becomes the key published through NIP-05 when `[features].nip05`
-is enabled. If omitted, the server stores no NIP-05 verification key and never
-falls back to publishing the auth `npub`. The server verifies the Schnorr
-signature against `SHA-256(message)` and rejects timestamps outside
-`±300 s` (mobile clocks drift more than desktop). A pre-v1 format (untagged,
-untimestamped) is still accepted with a deprecation warning to support older
-mobile builds; it will be removed once warning volume drops.
-
-Donation pages and invoices use the same key material with product-specific
-actions such as `donation-page-save`, `donation-page-archive`,
-`invoice-create`, `invoice-cancel`, and `invoice-list`.
-Their payloads are domain-separated so a signature for one product action
-cannot be replayed as another.
-
-### IP whitelist
-
-`rate_limit.ip_whitelist` accepts CIDR ranges. Whitelisted callers bypass all rate limits and the LUD-22 proof-of-funds check. Used for known partners and the simulator suite. Parsing is fail-closed: a typo in a CIDR aborts startup loudly.
-
-### Certification allowlist
-
-`[certification]` is separate from `rate_limit.ip_whitelist`. It is for scoped test/certification windows and requires an allowed source, `X-Bullnym-Certification-Token`, and an explicit scope. It does not bypass LUD-22 proof-of-funds, pending-reservation caps, Electrum buckets, webhook caps, or the active-user ceiling.
-
-Use `/certification/preflight?scopes=registration_setup,metadata_lookup,invoice_create,invoice_status,live_money_offer` before broad ARS. If `ready` is false, stop before moving money.
-
-## Configuration
-
-`config.toml` has the operational knobs; secrets and connection strings come from the environment.
-
-```toml
-domain    = "pay.example.com"   # Public hostname; used in LUD-06 metadata + identifiers
-listen    = "127.0.0.1:8080"    # Bind address (loopback when behind nginx)
-pool_size = 10                  # Postgres connection pool
-
-[boltz]
-api_url      = "https://api.boltz.exchange/v2"
-electrum_url = "blockstream.info:995"  # Boltz client's transitive Electrum dep
-
-[pricer]
-url                    = "https://api.bullbitcoin.com/public/price"
-cache_ttl_secs         = 60
-request_timeout_ms     = 2000
-supported_currencies   = ["USD","CAD","EUR","CRC","MXN","ARS","COP"]
-
-[pwa]
-dist_dir = "pwa/dist"
-
-[features]
-lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
-invoices          = true    # wallet-origin invoice APIs and /invoice/:id
-payment_pages     = true    # donation/payment-page APIs and checkout invoices
-nip05             = false   # opt-in /.well-known/nostr.json publishing
-
-[limits]
-min_sendable_msat          = 100_000          # 100 sats
-max_sendable_msat          = 25_000_000_000   # 25 M sats
-max_descriptor_len         = 1000
-
-[proof]
-min_proof_value_sat = 1000                    # LUD-22 UTXO ownership floor
-message_tag         = "bullpay-lnurlp-v1"
-
-[certification]
-enabled = false
-source_allowlist = []                         # CIDRs/IPs allowed to request scoped bypasses
-token = ""                                    # Sent as X-Bullnym-Certification-Token
-scopes = []                                   # registration_setup, metadata_lookup, invoice_create, invoice_status, live_money_offer
-
-[electrum]
-liquid_urls       = ["les.bullbitcoin.com:995"]  # First reachable wins; rotates on transport failure
-cache_ttl_secs    = 3600
-cache_max_entries = 10_000
-
-[bitcoin_watcher]
-enabled                  = true
-endpoint                 = "https://mempool.bullbitcoin.com/api"
-confirmations_required  = 1
-
-[workers]
-enabled = true                              # Set false for standby/web-only instances
-
-[invoice_accounting]
-btc_shortfall_tolerance_sat       = 300
-liquid_shortfall_tolerance_sat    = 60
-lightning_shortfall_tolerance_sat = 1
-
-[rate_limit]
-trust_forwarded_for = true                    # Set true behind a known reverse proxy
-ip_whitelist        = []                      # CIDRs that bypass all gates
-# ...numerous tunables, organized by feature group with comments in src/config.rs...
-```
-
-The `[rate_limit]` table has many tunables, organized by feature group with comments explaining the threat each one closes (registration flood, nym-list discovery, chain-watcher starvation, webhook bomb, etc.). Defaults are conservative; production overrides live in the deployed `config.toml`.
-
-### Environment variables
-
-| Variable | Required | Purpose |
-|---|---|---|
-| `DATABASE_URL` | yes | Postgres DSN, e.g. `postgres://payservice:...@localhost/payservice` |
-| `SWAP_MNEMONIC` | yes | 12-word BIP39 mnemonic for the Boltz `SwapMasterKey` (preimage and claim-key derivation) |
-| `BOLTZ_WEBHOOK_URL_SECRET` | recommended | URL-path secret registered with Boltz as `/webhook/boltz/:secret`. Empty disables auth (dev only); production must set it. |
-| `BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS` | no | Previous URL-path secret accepted during rotation overlap. |
-| `BOLTZ_WEBHOOK_SECRET` | no | Backwards-compatible alias for `BOLTZ_WEBHOOK_URL_SECRET`. |
-
-`.env` at the project root is read at startup via `dotenvy`.
-
-## Database
-
-Postgres is the single source of truth. All migrations are plain SQL under `migrations/`, applied **manually** via `psql`; the binary does not run `sqlx::migrate!()` in-process to avoid surprise schema changes on restart.
-
-Major tables:
-
-- **`public_name_owners`** — one durable owner row per server-auth `npub`.
-- **`public_names`** — authoritative lifetime nym and alias reservations,
-  including active/deactivated state and explicit grandfathering of historical
-  states. New claims enforce one nym and one alias per owner in a shared
-  namespace.
-- **`users`** — one row per nym. Holds the server-auth `npub`, public `verification_npub`, Lightning Address `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, and `has_been_used`. Active identity lookups are joined to the corresponding public-name reservation.
-- **`donation_pages`** — one row per `(nym, kind)` public surface. `kind` is `payment_page` or `pos`. Stores the surface descriptor and independent address cursor, public copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Aliases are resolved through `public_names`, not stored per surface.
-- **`invoices`** — unified payment-session table for public checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
-- **`invoice_payment_events`** — idempotent accounting evidence keyed by rail-specific event keys such as `liquid_direct:<txid>:<vout>`, `bitcoin_direct:<txid>:<vout>`, or `lightning_boltz_reverse:<swap_id>`.
-- **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to public checkout or wallet-origin invoice payment. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
-- **`chain_swap_records`** — one row per BTC-to-LBTC Boltz chain swap used by public checkout flows. Tracks lockup address, claim address, Boltz status, invoice association, and claim lifecycle.
-- **`outpoint_addresses`** — LUD-22 `(nym, outpoint) → address_index` cache. UNIQUE constraint enforces the idempotent-mapping defense.
-- **`nym_access_events`** — sliding-window counters for the distinct-nyms-per-IP and distinct-nyms-per-outpoint caps.
-- **`processed_webhook_events`** — webhook idempotency guard.
-- **Rate-limit counter tables** — per-IP, per-pubkey, register and metadata sliding windows. Pruned every 10 min by the GC task.
-
-For an existing database, apply `045_public_names_preflight.sql` first and
-inspect `public_name_migration_alias_choices`. Resolve every row with multiple
-historical aliases by selecting the alias that should remain active, or select
-`NULL` to leave all of that owner's aliases inactive. Then apply
-`046_public_names.sql`. Both migrations are transactional, and migration 046
-fails closed while any choice remains unresolved or the alias set has changed
-since preflight. Quiesce registration and surface writes between the two
-migrations. The database cannot discover names that were already hard-deleted,
-so operators must also compare backups or deployment records and restore any
-such reservations before migration 046.
-
-## Background tasks
-
-Background tasks are spawned in `main` and shut down through a shared
-`CancellationToken` on `SIGINT`.
-
-- **`claimer::spawn_background_claimer`** — drains Boltz webhooks and claimable
-  swaps. On lockup detection it drives MuSig2 cooperative claims to the
-  invoice or nym settlement address, records payment events, and marks
-  exhausted retry budgets as `claim_stuck`.
-- **`reconciler::run`** — periodically polls Boltz for non-terminal swaps.
-  This catches missed webhooks and state-machine surprises without waiting for
-  manual operator intervention.
-- **`chain_watcher::run`** — polls Liquid Electrum. It verifies direct Liquid
-  invoice payments, detects public checkout payments, releases unfunded
-  LUD-22 reservations after TTL, and uses separate rate buckets so callbacks
-  cannot starve settlement detection.
-- **`bitcoin_watcher::run`** — polls the configured mempool API for
-  wallet-origin direct Bitcoin invoice outputs and records idempotent payment
-  events once the configured confirmation policy is met.
-- **`gc::run`** — prunes rate-limit and access-event rows. Without this,
-  sliding-window queries grow O(N).
-- **In-memory rate-limit sweep** — evicts idle per-IP buckets from process
-  memory and bounds RSS under unique-IP bursts.
-
-## Building and running locally
+- Rust toolchain
+- PostgreSQL
+- Node.js/npm when changing the PWA
+- a sibling `../boltz/boltz-rust` checkout matching the pinned project revision
 
 ```bash
-# Postgres
-sudo -u postgres psql -c "CREATE USER payservice WITH PASSWORD 'devpass';"
-sudo -u postgres psql -c "CREATE DATABASE payservice OWNER payservice;"
-for m in migrations/*.sql; do
-    sudo -u postgres psql -d payservice -f "$m"
-done
+export DATABASE_URL=postgres://postgres:postgres@localhost/bullnym
+export SWAP_MNEMONIC="twelve word development mnemonic ..."
 
-# Env
-cat > .env <<'EOF'
-DATABASE_URL=postgres://payservice:devpass@localhost/payservice
-SWAP_MNEMONIC=<12-word BIP39 mnemonic>
-BOLTZ_WEBHOOK_URL_SECRET=<unguessable URL token>
-EOF
-
-# Build + run
-cargo run --release
-# → listening on 0.0.0.0:8080
-curl -fsS http://localhost:8080/health   # → "ok"
-curl -fsS http://localhost:8080/ready    # → DB/schema readiness JSON
-curl -fsS http://localhost:8080/version  # → build provenance JSON
+sqlx migrate run
+cargo test --lib
+cargo run
 ```
 
-`Cargo.toml` references `boltz-client` via a path dependency to a sibling checkout of `SatoshiPortal/boltz-rust`. Clone it as `../boltz/boltz-rust` relative to this repo, or adjust the path.
+The server listens on `0.0.0.0:8080` by default. Copy and review `config.toml`
+for non-secret runtime settings. Production secrets belong in the environment.
 
-## Testing
+For PWA changes:
 
-Use the smallest test layer that proves the behavior being changed.
+```bash
+cd pwa
+npm ci
+npm test
+npm run build
+npm run check:dist
+```
 
-### Local server tests
+`pwa/dist` is checked in because the current Rust deployment consumes prebuilt
+assets. `pwa/scripts/check-dist.sh` verifies that it matches a clean build.
 
-Local Rust tests are the first line for server-owned behavior: request
-validation, auth message construction, invoice state transitions, config
-parsing, accounting helpers, route wiring, and compile-time coverage of the
-DB-backed integration suite.
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [API reference](docs/api/README.md)
+- [Architecture](docs/architecture/overview.md)
+- [Products](docs/products/)
+- [Operations](docs/operations/)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+
+Implementation proposals live under [RFCs](docs/rfcs/README.md). Completed,
+superseded, and abandoned work is retained under [archive](archive/README.md)
+and is not part of the current product contract.
+
+## Verification
 
 ```bash
 cargo test --lib
 cargo test --tests --no-run
+scripts/check-docs.sh
+./release-preflight.sh
 ```
 
-DB-backed integration tests require `TEST_DATABASE_URL` and an initialized test
-database with the migrations applied. They are appropriate for route-level
-ownership checks, cross-npub isolation, persistence behavior, and status
-responses that need real SQL constraints.
-
-### bullnym-test VM
-
-The bullnym-test VM is an external server/payment harness for deployed Bullnym
-endpoints. Use it when the behavior depends on live rails or infrastructure
-outside the Rust process:
-
-- BDK-origin Bitcoin sends to wallet-created invoices.
-- LWK-origin Liquid sends to wallet-created invoices and public checkout
-  invoices.
-- Boltz reverse swaps for Lightning offers that settle to Liquid.
-- Boltz chain swaps for Bitcoin public checkout.
-- Invoice accounting, payment-event idempotency, watcher behavior, and public
-  status polling.
-- Public checkout rendering, offer creation, and address allocation
-  safety.
-
-The VM should not be treated as a mobile test environment. It does not run the
-Bull Bitcoin app, Flutter tests, emulator/device flows, mobile wallet
-derivation, local mobile storage, or app UI. A VM pass proves that the deployed
-server and payment rails handled the scenario; it does not prove that a mobile
-branch generated the same payloads or presented the flow correctly.
-
-### Mobile compatibility
-
-Mobile compatibility must be validated in the Bull Bitcoin mobile repository
-against the target branch. The important contract is narrow:
-
-- Mobile derives the expected signing keys, descriptors, and recipient
-  addresses.
-- Mobile signs the exact Bullnym payloads for nym, surface, and invoice
-  actions.
-- Bullnym accepts those requests, persists the descriptor or supplied
-  destinations, and returns the documented response shapes.
-- Payment rails settle to the destinations supplied by mobile, not to
-  server-owned wallet material.
-
-Use mobile unit/widget tests, static analysis, and emulator or device flows for
-app-owned behavior. Use bullnym-test only after the API contract is known to be
-compatible and the remaining question is whether a deployed server/payment-rail
-scenario works end to end.
-
-## Release preflight
-
-Bullnym currently uses a local `boltz-client` path dependency at
-`../boltz/boltz-rust`. Before cutting or deploying a production artifact, verify
-that both worktrees are clean:
-
-```bash
-scripts/release-preflight.sh
-```
-
-The check intentionally fails on uncommitted Bullnym or Boltz changes. A
-production binary must be traceable to committed source revisions.
-
-## Dependencies
-
-| Crate | Purpose |
-|---|---|
-| [axum](https://github.com/tokio-rs/axum) 0.7 | HTTP server |
-| [tokio](https://github.com/tokio-rs/tokio) 1 | Async runtime, signal handling |
-| [sqlx](https://github.com/launchbadge/sqlx) 0.8 | Postgres with compile-time-checked queries |
-| [lwk_wollet](https://github.com/Blockstream/lwk) 0.14 | Liquid CT descriptor parsing, address derivation |
-| [boltz-client](https://github.com/SatoshiPortal/boltz-rust) | Boltz API v2, MuSig2 cooperative claims |
-| [secp256k1](https://github.com/rust-bitcoin/rust-secp256k1) 0.29 | BIP-340 Schnorr verification |
-| [electrum-client](https://github.com/bitcoindevkit/rust-electrum-client) 0.21 | Liquid Electrum (UTXO verification, mempool / chain polling) |
-| [tower-http](https://github.com/tower-rs/tower-http) | TraceLayer, CORS, body-size limit |
-| [rustls](https://github.com/rustls/rustls) 0.23 | TLS via `aws-lc-rs` |
-| [dashmap](https://github.com/xacrimon/dashmap) 6 | Lock-free in-memory rate-limit buckets |
+DB-backed integration tests require `TEST_DATABASE_URL` and a migrated test
+database. Deployed payment-rail certification and mobile compatibility are
+separate verification layers; see [Contributing](CONTRIBUTING.md).

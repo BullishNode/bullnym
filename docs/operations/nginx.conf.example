@@ -1,0 +1,61 @@
+# Example Bullnym reverse-proxy fragments. Merge these into the existing TLS
+# server after inspecting `nginx -T`; this is not a complete virtual host.
+
+limit_req_zone $binary_remote_addr zone=bullnym_html:10m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=bullnym_api:10m rate=5r/s;
+limit_req_zone $binary_remote_addr zone=bullnym_static:10m rate=30r/s;
+
+server {
+    # Trust only the actual edge proxy. It must overwrite client-supplied XFF.
+    set_real_ip_from 100.64.0.2;
+    real_ip_header X-Forwarded-For;
+
+    location ^~ /pwa-assets/ {
+        limit_req zone=bullnym_static burst=60 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /sw.js {
+        limit_req zone=bullnym_static burst=60 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location ~ ^/[a-z0-9-]+/manifest\.webmanifest$ {
+        limit_req zone=bullnym_api burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location ~ ^/(?!\.well-known/|register|webhook/|health|ready|version|certification/|api/|pwa-assets/|sw\.js$|donation-page|lnurlp/) {
+        limit_req zone=bullnym_html burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# Validate with `nginx -t`, then verify /health, /ready, /version, /sw.js,
+# /pwa-assets/, a manifest route, a Payment Page, and a POS route. Bullnym no
+# longer accepts image uploads, so this example intentionally has no media
+# write or image-serving location.

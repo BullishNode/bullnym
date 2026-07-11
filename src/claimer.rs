@@ -132,7 +132,7 @@ pub async fn webhook_with_secret(
 }
 
 /// Compatibility webhook entrypoint: `/webhook/boltz`.
-/// See docs/compatibility-ledger.md for removal policy.
+/// See docs/reference/compatibility.md for removal policy.
 ///
 /// **First-time secret rollout (operational note).** The webhook URL is
 /// captured Boltz-side at swap-creation time. Setting the secret on a

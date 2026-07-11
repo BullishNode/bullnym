@@ -399,7 +399,7 @@ pub struct LookupResponse {
     /// All inactive nyms for this npub, most-recent first.
     pub previous_nyms: Vec<db::PreviousNym>,
     /// Compatibility field. New clients MUST read `quota.used`; see
-    /// docs/compatibility-ledger.md for removal policy.
+    /// docs/reference/compatibility.md for removal policy.
     pub lifetime_nyms_used: i64,
     /// Compatibility field. New clients MUST read `quota.cap`.
     pub lifetime_nyms_cap: i64,

@@ -1866,7 +1866,7 @@ async fn create_bitcoin_chain_offer(
 // POST /api/v1/invoices/:id/liquid — DEPRECATED (returns 410 Gone)
 //
 // Wallet-origin invoices supply the Liquid address at create time. See
-// docs/compatibility-ledger.md for this route's removal policy.
+// docs/reference/compatibility.md for this route's removal policy.
 // =====================================================================
 
 pub async fn fetch_liquid_offer(

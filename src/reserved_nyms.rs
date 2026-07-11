@@ -54,7 +54,7 @@ pub fn is_reserved(nym: &str) -> bool {
 ///   let a captured legacy save message (whose sole trailing signed field was
 ///   `pos_mode`) be byte-identical to a new alias-claiming message. Blocking
 ///   them keeps the alias value domain disjoint from `pos_mode`. See
-///   `donation_page.rs` and `docs/compatibility-ledger.md`.
+///   `donation_page.rs` and `docs/reference/compatibility.md`.
 /// - Brand/impersonation names, to stop a merchant publishing a link that
 ///   looks first-party.
 ///

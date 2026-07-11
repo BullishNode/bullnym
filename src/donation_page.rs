@@ -84,7 +84,7 @@ pub struct SaveDonationPageRequest {
     /// Surface discriminator: `payment_page` (default when omitted) or `pos`.
     /// Optional and trailing in the signed payload so legacy clients that
     /// omit it verify against the pre-POS byte layout. See
-    /// `docs/compatibility-ledger.md`.
+    /// `docs/reference/compatibility.md`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Owner-level public URL slug shared by Payment Page and POS, served at
@@ -93,7 +93,7 @@ pub struct SaveDonationPageRequest {
     /// verifies against the older byte layout. Tri-state: absent leaves the
     /// owner's alias unchanged, `""` deactivates it, and a non-empty value
     /// claims or reactivates its lifetime reservation.
-    /// See `docs/compatibility-ledger.md`.
+    /// See `docs/reference/compatibility.md`.
     #[serde(default)]
     pub alias: Option<String>,
     pub timestamp: u64,
@@ -256,7 +256,7 @@ fn validate_lengths(
 /// older byte layout. `alias` is the newest field and MUST stay last (after
 /// `kind`). Its validated value domain is kept disjoint from the other
 /// trailing fields (see the save handler) so a captured legacy message can
-/// never be replayed as an alias claim. See `docs/compatibility-ledger.md`.
+/// never be replayed as an alias claim. See `docs/reference/compatibility.md`.
 fn save_payload_fields<'a>(
     header: &'a str,
     description: &'a str,
