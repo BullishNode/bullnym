@@ -155,11 +155,15 @@ SELECT
     alias_claims.name,
     alias_claims.owner_npub,
     'alias'::public_name_kind,
+    -- IS NOT DISTINCT FROM: an operator choice of active_alias = NULL keeps
+    -- every alias inactive; plain equality would yield NULL and violate the
+    -- NOT NULL constraint on active when the owner is still active.
     users.is_active
-        AND choices.active_alias = alias_claims.name,
+        AND choices.active_alias IS NOT DISTINCT FROM alias_claims.name,
     alias_claims.claimed_at,
     CASE
-        WHEN users.is_active AND choices.active_alias = alias_claims.name
+        WHEN users.is_active
+            AND choices.active_alias IS NOT DISTINCT FROM alias_claims.name
             THEN NULL
         ELSE now()
     END,
