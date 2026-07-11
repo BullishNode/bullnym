@@ -21,8 +21,8 @@ feature error.
 | `features.nip05` plus `lightning_address` | `/.well-known/nostr.json` |
 | `features.payment_pages` | surface CRUD, Payment Page/POS/alias pages and anonymous checkout |
 | `features.invoices` | signed wallet-invoice create/list/cancel and `/invoice/:id` |
-| `invoices` or `payment_pages` | invoice status and Lightning/Liquid offer routes; recoverable-swaps detection (`GET /api/v1/invoices/recoverable`) |
-| `features.chain_swap_merchant_recovery` | merchant BTC refund recovery **action**; default off. Detection stays available regardless and reports this flag as `recovery_enabled`. |
+| `invoices` or `payment_pages` | invoice status and Lightning/Liquid offer routes |
+| `features.chain_swap_merchant_recovery` | per-invoice merchant BTC recovery action; default off. No bulk recovery-discovery route is currently registered. |
 
 Always use `GET /version` during deployment/certification to identify the
 build. Do not infer feature availability only from the crate version; probe the
@@ -86,4 +86,3 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 
 Use `code` for program logic and localization. `reason` is user-facing text and
 may evolve.
-

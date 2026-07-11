@@ -1,26 +1,163 @@
-# Development example. Production operators must review every default and use
-# environment variables or a secret manager for credentials and key material.
+# Complete development example. All values are loaded once at startup.
+# Production operators must review docs/operations/configuration.md and keep
+# DATABASE_URL, SWAP_MNEMONIC, and webhook secrets in the environment.
+
+# Public host[:port], without a URL scheme or path.
 domain = "localhost:8080"
+# Prefer loopback behind a TLS-terminating reverse proxy.
 listen = "127.0.0.1:8080"
-pool_size = 5
+pool_size = 10
 
 [boltz]
 api_url = "https://api.boltz.exchange/v2"
-electrum_url = "les.bullbitcoin.com:995"
-
-[electrum]
-liquid_url = "les.bullbitcoin.com:995"
+# Primary Liquid Electrum endpoint for swap claims.
+electrum_url = "ssl://les.bullbitcoin.com:995"
 
 [features]
 lightning_address = true
 invoices = true
 payment_pages = true
 nip05 = false
+# Broadcasts real Bitcoin recovery transactions when enabled.
+chain_swap_merchant_recovery = false
 
 [workers]
+# False leaves HTTP active but disables claiming, reconciliation, watchers, and GC.
 enabled = true
 
-# Media uploads are not supported. This path is read only except for copying
-# existing legacy files to content-addressed paths when an alias is assigned.
+[invoice_accounting]
+btc_shortfall_tolerance_sat = 300
+liquid_shortfall_tolerance_sat = 60
+lightning_shortfall_tolerance_sat = 1
+checkout_partial_terminal_grace_secs = 900
+payment_grace_secs = 3600
+
+[claim]
+max_claim_attempts = 30
+
+[reconciler]
+interval_secs = 90
+min_age_secs = 60
+max_per_tick = 200
+inter_call_delay_ms = 50
+slow_recovery_interval_secs = 1800
+slow_recovery_max_per_tick = 25
+slow_recovery_backoff_base_secs = 3600
+slow_recovery_backoff_cap_secs = 86400
+
+[pricer]
+url = "https://api.bullbitcoin.com/public/price"
+cache_ttl_secs = 60
+request_timeout_ms = 2000
+supported_currencies = ["USD", "CAD", "EUR", "CRC", "MXN", "ARS", "COP"]
+
+[pwa]
+# Relative paths resolve from the process working directory.
+dist_dir = "pwa/dist"
+
 [donation]
+# Read-only compatibility for media created by older Bullnym versions, except
+# for copying an existing file to a content-addressed path for an alias.
 image_root_path = "/opt/payservice/data/images"
+
+[limits]
+min_sendable_msat = 100000
+max_sendable_msat = 25000000000
+max_descriptor_len = 1000
+max_lifetime_nyms_per_npub = 3
+
+[proof]
+min_proof_value_sat = 1000
+# Changing this requires matching client signing support.
+message_tag = "bullpay-lnurlp-v1"
+
+[bitcoin_watcher]
+enabled = true
+endpoint = "https://mempool.bullbitcoin.com/api"
+# Additional failovers. Bull Bitcoin and mempool.space are appended in code.
+endpoints = []
+active_tick_secs = 30
+idle_tick_secs = 300
+active_window_secs = 3600
+confirmations_required = 1
+# Token-bucket rates use a minimum of 1; zero does not disable them.
+rate_per_sec = 5
+request_timeout_ms = 10000
+
+[electrum]
+# Deprecated single-endpoint compatibility form:
+# liquid_url = "ssl://les.bullbitcoin.com:995"
+liquid_urls = ["ssl://les.bullbitcoin.com:995", "ssl://blockstream.info:995"]
+cache_ttl_secs = 3600
+cache_max_entries = 10000
+
+[rate_limit]
+# This bypasses all rate limits and the LUD-22 proof requirement.
+ip_whitelist = []
+# Enable only behind a proxy that overwrites client-supplied X-Forwarded-For.
+trust_forwarded_for = false
+
+# LUD-22 callback volume and proof identity.
+per_ip_limit = 60
+per_ip_window_secs = 60
+per_pubkey_limit = 0
+per_pubkey_window_secs = 3600
+
+# Descriptor-allocation/enumeration controls.
+distinct_nyms_per_ip_limit = 5
+distinct_nyms_per_ipv6_56_limit = 3
+distinct_nyms_per_outpoint_limit = 3
+distinct_nyms_window_secs = 3600
+max_pending_reservations_per_nym = 50000
+
+# Deprecated compatibility fields with no current runtime effect.
+recycle_pending_older_than_days = 30
+lightning_rate_per_minute = 0
+
+# Liquid Electrum token buckets. Zero is coerced to 1, not disabled.
+global_electrum_rate_per_sec = 50
+chain_watcher_electrum_rate_per_sec = 50
+
+# Registration and service capacity.
+register_rate_limit = 5
+register_rate_window_secs = 60
+register_distinct_npubs_per_ip_limit = 3
+register_distinct_npubs_per_ip_window_secs = 3600
+max_active_users = 10000
+
+# Public metadata and lookup enumeration.
+metadata_rate_limit = 30
+metadata_rate_window_secs = 60
+metadata_distinct_nyms_per_ip_limit = 10
+metadata_distinct_nyms_per_ip_window_secs = 3600
+lookup_distinct_npubs_per_ip_limit = 5
+lookup_distinct_npubs_per_ip_window_secs = 3600
+
+# Liquid watcher scheduling.
+chain_watcher_active_user_tick_secs = 30
+chain_watcher_idle_user_tick_secs = 600
+chain_watcher_active_window_secs = 86400
+
+# Webhook and Lightning operation limits.
+webhook_rate_limit = 10
+webhook_rate_window_secs = 60
+lightning_per_source_limit = 30
+lightning_per_source_window_secs = 3600
+
+# Payment Page/POS and invoice HTTP limits.
+donation_html_rate_limit = 60
+donation_html_rate_window_secs = 60
+donation_manifest_rate_limit = 60
+donation_manifest_rate_window_secs = 60
+invoice_status_per_source_per_min = 60
+invoice_create_per_source_per_min = 5
+invoice_create_per_npub_per_hour = 100
+
+[certification]
+# When enabled, token, source_allowlist, and scopes must all be non-empty.
+enabled = false
+source_allowlist = []
+token = ""
+# registration_setup, metadata_lookup, invoice_create, invoice_status,
+# live_money_offer
+scopes = []

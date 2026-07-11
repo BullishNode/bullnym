@@ -39,7 +39,6 @@ unlinked invoice operations it is the empty string.
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
 | recover chain swap | `invoice-recover` | `invoice_id`, `btc_address` |
-| list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 
 Invoice optionals always occupy their fixed signing position as `""`. Amounts
 and timestamps use decimal strings. This distinction from the surface API's
@@ -56,4 +55,3 @@ reactivation, cancellation, same-address completed recovery, and most reads are
 safe to retry. Invoice creation can create another receivable if the first
 response was lost; clients should reconcile through the signed list endpoint
 before creating a replacement.
-

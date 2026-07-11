@@ -5,6 +5,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 status=0
 
+scripts/check-config-docs.sh || status=1
+
 required_paths=(
     LICENSE
     README.md

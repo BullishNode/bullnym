@@ -11,6 +11,7 @@ in the [archive](../archive/README.md).
 - [Payment lifecycle](architecture/payment-lifecycle.md)
 - [API reference](api/README.md)
 - [Operations](operations/README.md)
+- [Configuration reference](operations/configuration.md)
 - [Compatibility ledger](reference/compatibility.md)
 - [Glossary](reference/glossary.md)
 

@@ -1,6 +1,12 @@
 use super::*;
 
 #[test]
+fn checked_example_config_parses_and_validates() {
+    let cfg: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
+    cfg.validate_for_runtime("development", false).unwrap();
+}
+
+#[test]
 fn electrum_urls_legacy_single_field_only() {
     let cfg = ElectrumConfig {
         liquid_url: Some("a.example:50001".to_string()),

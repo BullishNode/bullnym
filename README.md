@@ -97,6 +97,7 @@ assets. `pwa/scripts/check-dist.sh` verifies that it matches a clean build.
 - [Architecture](docs/architecture/overview.md)
 - [Products](docs/products/)
 - [Operations](docs/operations/)
+- [Configuration reference](docs/operations/configuration.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 
