@@ -144,6 +144,10 @@ fn test_app(state: AppState) -> Router {
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
         .route("/api/v1/invoices", get(invoice::list_signed))
         .route(
+            "/api/v1/invoices/recoverable",
+            get(invoice::list_recoverable_signed),
+        )
+        .route(
             "/api/v1/:nym/invoices/:id",
             axum::routing::delete(invoice::cancel_linked),
         )
@@ -354,6 +358,11 @@ fn sign_invoice_list_with_keypair(
         "",
         &[&page, &page_size, status],
     )
+}
+
+// Recoverable-swaps detection list: npub-keyed, empty nym, ZERO payload fields.
+fn sign_invoice_recovery_list_with_keypair(keypair: &Keypair, npub: &str) -> (String, u64) {
+    sign_la_action(keypair, "invoice-recovery-list", npub, "", &[])
 }
 
 struct DonationSaveSignFields<'a> {
@@ -1480,6 +1489,8 @@ async fn webhook_skips_terminal_swaps() {
     pay_service::db::record_swap(
         &pool,
         &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
             nym: Some("webhookuser"),
             boltz_swap_id: "FAKE_CLAIMED",
             address: Some("lq1qqtest"),
@@ -1543,6 +1554,9 @@ async fn webhook_advances_chain_swap_records() {
     pay_service::db::record_chain_swap(
         &pool,
         &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some("chainwebhook"),
             boltz_swap_id: "CHAIN_WEBHOOK_1",
@@ -1597,6 +1611,9 @@ async fn webhook_skips_terminal_chain_swap_records() {
     let row = pay_service::db::record_chain_swap(
         &pool,
         &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some("chainterminal"),
             boltz_swap_id: "CHAIN_TERMINAL_1",
@@ -2733,7 +2750,7 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     .await
     .unwrap();
 
-    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool)
+    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 0)
         .await
         .unwrap();
     assert_eq!(expired_count, 2);
@@ -2770,6 +2787,7 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
     let npub = create_test_user(&pool, "eventacct").await;
     let invoice = insert_test_invoice(&pool, "eventacct", &npub, "lq1eventacct", 60).await;
     let tolerances = pay_service::db::InvoiceAccountingTolerances {
+        payment_grace_secs: 0,
         btc_sat: 300,
         liquid_sat: 60,
         lightning_sat: 1,
@@ -3388,7 +3406,7 @@ async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
         .await
         .unwrap();
 
-    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     assert!(candidates
@@ -3712,6 +3730,8 @@ async fn invoice_only_lightning_swap_does_not_require_nym() {
     pay_service::db::record_swap(
         &pool,
         &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
             nym: None,
             boltz_swap_id: "invoiceonly-swap",
             address: None,
@@ -3812,7 +3832,7 @@ async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
     let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
     let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
 
-    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     let invoice_ids: std::collections::HashSet<_> =
@@ -3834,6 +3854,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     pay_service::db::record_swap(
         &pool,
         &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
             nym: Some("latestpr"),
             boltz_swap_id: "latestpr-old",
             address: Some("lq1latestold"),
@@ -3856,6 +3878,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     pay_service::db::record_swap(
         &pool,
         &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
             nym: Some("latestpr"),
             boltz_swap_id: "latestpr-new",
             address: Some("lq1latestnew"),
@@ -3892,6 +3916,9 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     let row = pay_service::db::record_chain_swap(
         &pool,
         &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some("chainswaprec"),
             boltz_swap_id: "chain-swap-rec-1",
@@ -3962,6 +3989,9 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
     let row = pay_service::db::record_chain_swap(
         &pool,
         &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some("chainretry"),
             boltz_swap_id: "chainretry-swap",
@@ -4021,6 +4051,9 @@ async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
     let row = pay_service::db::record_chain_swap(
         &pool,
         &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some("chainfail"),
             boltz_swap_id: "chainfail-swap",
@@ -4079,6 +4112,8 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
     pay_service::db::record_swap(
         &pool,
         &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
             nym: Some("claimretry"),
             boltz_swap_id: "claimretry-swap",
             address: Some("lq1claimretryaddr"),
@@ -4494,6 +4529,473 @@ async fn register_concurrent_does_not_exceed_cap() {
         .await
         .unwrap();
     assert_eq!(count, 3, "lifetime cap must hold under contention");
+
+    cleanup_db(&pool).await;
+}
+
+// =====================================================================
+// GET /api/v1/invoices/recoverable — signed stuck-swap detection.
+// =====================================================================
+
+/// Seed a merchant + checkout invoice + one chain swap, returning
+/// (npub, keypair, invoice, swap_row). The swap starts `pending`.
+async fn seed_merchant_invoice_swap(
+    pool: &PgPool,
+    nym: &str,
+    boltz_swap_id: &str,
+    lockup_address: &str,
+    user_lock_amount_sat: i64,
+    server_lock_amount_sat: i64,
+) -> (String, Keypair, pay_service::db::Invoice, pay_service::db::ChainSwapRecord) {
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(pool, nym, &npub, &format!("lq1{nym}"), 3_600).await;
+    let swap = pay_service::db::record_chain_swap(
+        pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id,
+            lockup_address,
+            lockup_bip21: Some(&format!("bitcoin:{lockup_address}?amount=0.00001010")),
+            user_lock_amount_sat,
+            server_lock_amount_sat,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"seed\"}",
+        },
+    )
+    .await
+    .unwrap();
+    (npub, keypair, invoice, swap)
+}
+
+#[tokio::test]
+async fn recoverable_list_shows_refund_due_swap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, keypair, invoice, swap) =
+        seed_merchant_invoice_swap(&pool, "recdue", "recdue-1", "bc1qrecduelockup", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+
+    let (sig, timestamp) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (status, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={timestamp}&signature={sig}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["recovery_enabled"], false, "flag defaults OFF");
+    assert_eq!(body["count"], 1, "body: {body}");
+    assert_eq!(body["has_more"], false);
+    let item = &body["items"][0];
+    assert_eq!(item["recovery_status"], "refund_due");
+    assert_eq!(item["nym"], "recdue");
+    assert_eq!(item["invoice_id"], invoice.id.to_string());
+    assert_eq!(item["user_lock_amount_sat"], 1_010);
+    assert_eq!(item["server_lock_amount_sat"], 1_000);
+    assert_eq!(item["lockup_address"], "bc1qrecduelockup");
+    assert!(item["refund_address"].is_null());
+    assert!(item["refund_txid"].is_null());
+    assert_eq!(item["invoice"]["amount_sat"], 1_000);
+    assert_eq!(item["invoice"]["status"], "unpaid");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_is_npub_scoped() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (a_npub, a_keypair, _, a_swap) =
+        seed_merchant_invoice_swap(&pool, "recscopea", "recscopea-1", "bc1qreca", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, a_swap.id)
+        .await
+        .unwrap();
+    let (b_npub, b_keypair, _, _) =
+        seed_merchant_invoice_swap(&pool, "recscopeb", "recscopeb-1", "bc1qrecb", 1_010, 1_000)
+            .await;
+
+    // B sees none of A's stuck funds.
+    let (sig, timestamp) = sign_invoice_recovery_list_with_keypair(&b_keypair, &b_npub);
+    let (status, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={b_npub}&timestamp={timestamp}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["count"], 0, "npub-scoped: B must not see A's swap");
+
+    // Signing A's npub with B's key is a forgery → 401.
+    let (forged_sig, forged_ts) = sign_invoice_recovery_list_with_keypair(&b_keypair, &a_npub);
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices/recoverable?npub={a_npub}&timestamp={forged_ts}&signature={forged_sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "AuthError");
+    let _ = a_keypair;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_returns_committed_address_and_txid() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, keypair, _, swap) =
+        seed_merchant_invoice_swap(&pool, "recrecon", "recrecon-1", "bc1qrecon", 1_010, 1_000)
+            .await;
+    let committed = "bc1qcommittedrefunddestination00000000000";
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+    pay_service::db::set_chain_swap_refund_address(&pool, swap.id, committed)
+        .await
+        .unwrap();
+
+    // refund_due, address committed, no txid yet.
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "refund_due");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert!(body["items"][0]["refund_txid"].is_null());
+
+    // refunding: address present, still no txid.
+    pay_service::db::mark_chain_swap_refunding(&pool, swap.id)
+        .await
+        .unwrap();
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "refunding");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert!(body["items"][0]["refund_txid"].is_null());
+
+    // refunded: terminal, txid present (the reinstall reconciliation payload).
+    let txid = "aa".repeat(32);
+    pay_service::db::mark_chain_swap_refunded(&pool, swap.id, &txid)
+        .await
+        .unwrap();
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "refunded");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert_eq!(body["items"][0]["refund_txid"], txid);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_orders_and_uses_effective_amount() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    // A refunded swap (created first) + a refund_due swap with a renegotiated
+    // server-lock amount. refund_due must sort ahead of refunded, and the
+    // renegotiated amount must win.
+    let (npub, keypair, _, done_swap) =
+        seed_merchant_invoice_swap(&pool, "recorder", "recorder-done", "bc1qdone", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, done_swap.id)
+        .await
+        .unwrap();
+    pay_service::db::set_chain_swap_refund_address(&pool, done_swap.id, "bc1qdonedest0000000000000000000000000")
+        .await
+        .unwrap();
+    pay_service::db::mark_chain_swap_refunding(&pool, done_swap.id)
+        .await
+        .unwrap();
+    pay_service::db::mark_chain_swap_refunded(&pool, done_swap.id, &"bb".repeat(32))
+        .await
+        .unwrap();
+
+    let invoice2 = insert_test_invoice(&pool, "recorder", &npub, "lq1recorder2", 3_600).await;
+    let due_swap = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice2.id,
+            nym: Some("recorder"),
+            boltz_swap_id: "recorder-due",
+            lockup_address: "bc1qduelock",
+            lockup_bip21: None,
+            user_lock_amount_sat: 2_020,
+            server_lock_amount_sat: 2_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"recorder-due\"}",
+        },
+    )
+    .await
+    .unwrap();
+    // Phase-3 renegotiation: the merchant-credit amount changed to 1900.
+    sqlx::query("UPDATE chain_swap_records SET renegotiated_server_lock_amount_sat = 1900 WHERE id = $1")
+        .bind(due_swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pay_service::db::mark_chain_swap_refund_due(&pool, due_swap.id)
+        .await
+        .unwrap();
+
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (status, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["count"], 2, "body: {body}");
+    assert_eq!(body["items"][0]["recovery_status"], "refund_due", "refund_due sorts first");
+    assert_eq!(
+        body["items"][0]["server_lock_amount_sat"], 1_900,
+        "renegotiated (effective) amount must win over the stale original"
+    );
+    assert_eq!(body["items"][1]["recovery_status"], "refunded");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn public_status_never_leaks_recovery_state() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (_, _, invoice, swap) =
+        seed_merchant_invoice_swap(&pool, "recleak", "recleak-1", "bc1qleaklock", 1_010, 1_000)
+            .await;
+    let canary = "bc1qLEAKCANARYrefunddestination0000000000";
+
+    let public = ["refund_due", "refunding", "refunded", "refund_address", "refund_txid", canary];
+    let allowed_settlement = ["none", "pending", "settled", "claim_stuck", "refunded", "failed"];
+
+    // Drive: refund_due (+committed address) → refunding → refunded, asserting
+    // the anonymous status endpoint leaks none of it at each stage.
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+    pay_service::db::set_chain_swap_refund_address(&pool, swap.id, canary)
+        .await
+        .unwrap();
+
+    for stage in ["refund_due", "refunding", "refunded"] {
+        if stage == "refunding" {
+            pay_service::db::mark_chain_swap_refunding(&pool, swap.id)
+                .await
+                .unwrap();
+        }
+        if stage == "refunded" {
+            pay_service::db::mark_chain_swap_refunded(&pool, swap.id, &"cc".repeat(32))
+                .await
+                .unwrap();
+        }
+
+        let (status, body) = get_path(
+            &app,
+            &format!("/api/v1/invoices/{}/status", invoice.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stage {stage}: body {body}");
+        let raw = body.to_string();
+        for needle in public {
+            assert!(
+                !raw.contains(needle),
+                "stage {stage}: public status leaked '{needle}' — body: {raw}"
+            );
+        }
+        assert!(
+            body["bitcoin_chain_address"].is_null(),
+            "stage {stage}: a recovering swap is not a payable offer"
+        );
+        assert!(body["bitcoin_chain_bip21"].is_null(), "stage {stage}");
+        let ss = body["settlement_status"].as_str().unwrap_or("");
+        assert!(
+            allowed_settlement.contains(&ss),
+            "stage {stage}: settlement_status '{ss}' outside the public enum"
+        );
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_auth_negative() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, keypair, _, swap) =
+        seed_merchant_invoice_swap(&pool, "recauth", "recauth-1", "bc1qauthlock", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+
+    // Garbage signature.
+    let ts = auth_timestamp();
+    let (status, _) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature=deadbeef"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "garbage signature");
+
+    // Stale timestamp (well outside the freshness window).
+    let stale_ts = auth_timestamp() - 3_600;
+    let stale_sig = sign_la_action_with_timestamp(&keypair, "invoice-recovery-list", &npub, "", &[], stale_ts);
+    let (status, _) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={stale_ts}&signature={stale_sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "stale timestamp");
+
+    // Tampered payload: signature covers a non-empty field the server does not
+    // expect (it verifies over zero fields) → mismatch → 401.
+    let (tampered_sig, tampered_ts) =
+        sign_la_action(&keypair, "invoice-recovery-list", &npub, "", &["injected"]);
+    let (status, _) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices/recoverable?npub={npub}&timestamp={tampered_ts}&signature={tampered_sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "tampered payload fields");
+
+    // Unsigned / missing query params → 4xx (deserialization rejects).
+    let (status, _) = get_path(&app, "/api/v1/invoices/recoverable").await;
+    assert!(status.is_client_error(), "unsigned request must be rejected");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_reports_recovery_enabled_flag() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, keypair, _, swap) =
+        seed_merchant_invoice_swap(&pool, "recflag", "recflag-1", "bc1qflaglock", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+
+    // Flag OFF (default): items still returned, recovery_enabled false.
+    let app_off = test_app(test_state(pool.clone()));
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (status, body) = get_path(
+        &app_off,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recovery_enabled"], false);
+    assert_eq!(body["count"], 1, "detection is always-on regardless of the flag");
+
+    // Flag ON: recovery_enabled true.
+    let mut config = test_config();
+    config.features.chain_swap_merchant_recovery = true;
+    let app_on = test_app(test_state_with_config(pool.clone(), config));
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (status, body) = get_path(
+        &app_on,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recovery_enabled"], true);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recoverable_list_skips_nymless_swap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    // Good swap (has nym) + a legacy NULL-nym swap on a second invoice of the
+    // same merchant. The NULL-nym row is unusable (no recover URL) and must be
+    // silently skipped while the good one is still returned.
+    let (npub, keypair, _, good_swap) =
+        seed_merchant_invoice_swap(&pool, "recnymless", "recnymless-good", "bc1qgood", 1_010, 1_000)
+            .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, good_swap.id)
+        .await
+        .unwrap();
+
+    let invoice2 = insert_test_invoice(&pool, "recnymless", &npub, "lq1recnymless2", 3_600).await;
+    let bad_swap = pay_service::db::record_chain_swap(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice2.id,
+            nym: Some("recnymless"),
+            boltz_swap_id: "recnymless-bad",
+            lockup_address: "bc1qbad",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"recnymless-bad\"}",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::mark_chain_swap_refund_due(&pool, bad_swap.id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chain_swap_records SET nym = NULL WHERE id = $1")
+        .bind(bad_swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (status, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["count"], 1, "NULL-nym swap must be skipped: {body}");
+    assert_eq!(body["items"][0]["nym"], "recnymless");
+    assert_eq!(body["items"][0]["lockup_address"], "bc1qgood");
 
     cleanup_db(&pool).await;
 }
