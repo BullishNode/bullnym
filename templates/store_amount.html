@@ -160,8 +160,8 @@
     <script>
         // Phase B step 9: amount-entry stub. Submits to POST <base>/invoice
         // and navigates to <base>/i/<id>, where <base> is the surface's public
-        // path (`/<nym>`, `/<nym>/pos`, or `/a/<slug>`) — so an alias page
-        // never embeds the nym. Server-side rate-limit gate (5/min per source)
+        // path (`/<nym>`, `/<nym>/pos`, `/a/<slug>`, or `/a/<slug>/pos`) — so
+        // an alias page never embeds the nym. Server-side rate-limit gate (5/min per source)
         // caps creation rate; the page does no client-side throttling beyond
         // the disabled-button guard.
         (function () {

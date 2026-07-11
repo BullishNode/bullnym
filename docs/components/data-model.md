@@ -7,6 +7,8 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 
 | Table | Ownership | Purpose |
 |---|---|---|
+| `public_name_owners` | Stable wallet identity | One durable row per owner `npub`; remains independent of active nym state. |
+| `public_names` | Public namespace | Permanent typed nym/alias reservations, active state, claim timestamps, and grandfathering markers. New claims enforce one nym and one alias per npub across a shared namespace. |
 | `users` | Nym lifecycle | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, nym status, and Lightning Address cursor. |
 | `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, display currency, links, image hashes, descriptor, address cursor, and archive state. |
 | `invoices` | Payment sessions | Stores donation checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
@@ -33,6 +35,13 @@ own descriptor.
 
 Wallet-origin invoices store concrete addresses and do not advance either
 descriptor cursor.
+
+## Public Name Resolution
+
+`donation_pages` does not own aliases. Both `(nym, payment_page)` and
+`(nym, pos)` resolve the active alias from the owning npub's `public_names`
+claim. If no alias is active, link generation uses the nym without inserting a
+synthetic alias. Deactivated claims remain in `public_names` permanently.
 
 ## Invoice Origins
 

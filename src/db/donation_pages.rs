@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 
 /// Surface discriminator for a donation_pages row. `payment_page` is the
 /// default (and the shape every legacy single-row nym carries); `pos` is the
@@ -27,11 +27,15 @@ pub struct DonationPage {
     pub description: String,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
-    /// Merchant-chosen public URL slug for this surface, served at
-    /// `/a/<alias>`. Decoupled from `nym` so the public link need not leak the
-    /// Lightning-Address name. Globally unique when present; `None` means the
-    /// surface is only reachable via its nym path.
+    /// Owner-level public URL slug shared by Payment Page and POS. It serves
+    /// `/a/<alias>` and `/a/<alias>/pos`, decoupled from `nym` so the public
+    /// link need not leak the Lightning-Address name. `None` means the owner
+    /// currently has no active alias and this surface uses its nym path.
     pub alias: Option<String>,
+    /// True when this row was resolved through an active alias claim. Alias
+    /// lookups also return inactive reservations so old links can render a
+    /// non-payable page without releasing ownership.
+    pub alias_active: bool,
     pub display_currency: String,
     pub website: Option<String>,
     pub twitter: Option<String>,
@@ -58,11 +62,24 @@ pub struct UpsertDonationPage<'a> {
     pub instagram: Option<&'a str>,
     pub pos_mode: Option<bool>,
     pub enabled: bool,
-    /// Tri-state alias update: `None` leaves the stored alias unchanged,
-    /// `Some(None)` clears it, `Some(Some(s))` claims/changes it. The partial
-    /// unique index is the race arbiter — a colliding claim surfaces as a
-    /// unique-violation the handler maps to `AppError::AliasTaken`.
+    /// Tri-state alias update: `None` leaves the owner's alias unchanged,
+    /// `Some(None)` deactivates it, and `Some(Some(s))` claims or reactivates a
+    /// lifetime reservation. The alias is not stored on this surface row.
     pub alias: Option<Option<&'a str>>,
+}
+
+#[derive(Debug)]
+pub enum UpsertDonationPageError {
+    Database(sqlx::Error),
+    NameTaken,
+    AliasAlreadyAssigned,
+    OwnerInactive,
+}
+
+impl From<sqlx::Error> for UpsertDonationPageError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
 }
 
 /// Insert-or-update a donation page row. Mobile sends the full page config on
@@ -72,20 +89,66 @@ pub struct UpsertDonationPage<'a> {
 pub async fn upsert_donation_page(
     pool: &PgPool,
     page: &UpsertDonationPage<'_>,
-) -> Result<DonationPage, sqlx::Error> {
-    // Tri-state alias: $12 = "alias present in this save" (write it),
-    // $13 = the value (NULL clears). When absent the stored alias is left
-    // untouched on both the insert and update path.
-    let (alias_present, alias_value) = match page.alias {
-        None => (false, None),
-        Some(v) => (true, v),
+) -> Result<DonationPage, UpsertDonationPageError> {
+    let mut tx = pool.begin().await?;
+    let owner_npub: String = sqlx::query_scalar("SELECT npub FROM users WHERE nym = $1")
+        .bind(page.nym)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&owner_npub)
+        .execute(&mut *tx)
+        .await?;
+
+    let owner_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM users \
+             WHERE nym = $1 AND npub = $2 AND is_active = TRUE \
+         )",
+    )
+    .bind(page.nym)
+    .bind(&owner_npub)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !owner_active {
+        tx.rollback().await?;
+        return Err(UpsertDonationPageError::OwnerInactive);
+    }
+
+    let alias_outcome = match super::apply_alias_update(&mut tx, &owner_npub, page.alias).await {
+        Ok(outcome) => outcome,
+        Err(error)
+            if super::public_name_constraint_is(&error, "public_names_shared_namespace_key")
+                || super::public_name_constraint_is(&error, "public_names_name_kind_key") =>
+        {
+            tx.rollback().await?;
+            return Err(UpsertDonationPageError::NameTaken);
+        }
+        Err(error)
+            if super::public_name_constraint_is(&error, "public_names_owner_kind_lifetime_key") =>
+        {
+            tx.rollback().await?;
+            return Err(UpsertDonationPageError::AliasAlreadyAssigned);
+        }
+        Err(error) => return Err(error.into()),
     };
-    sqlx::query_as::<_, DonationPage>(
+    match alias_outcome {
+        super::AliasUpdateOutcome::NameTaken => {
+            tx.rollback().await?;
+            return Err(UpsertDonationPageError::NameTaken);
+        }
+        super::AliasUpdateOutcome::AlreadyAssigned => {
+            tx.rollback().await?;
+            return Err(UpsertDonationPageError::AliasAlreadyAssigned);
+        }
+        super::AliasUpdateOutcome::Unchanged | super::AliasUpdateOutcome::Updated => {}
+    }
+
+    sqlx::query(
         "INSERT INTO donation_pages \
             (nym, kind, ct_descriptor, header, description, display_currency, \
-             website, twitter, instagram, pos_mode, enabled, alias) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, \
-                 CASE WHEN $12 THEN $13 END) \
+             website, twitter, instagram, pos_mode, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
@@ -96,12 +159,8 @@ pub async fn upsert_donation_page(
              instagram = EXCLUDED.instagram, \
              pos_mode = COALESCE($10, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
-             alias = CASE WHEN $12 THEN $13 ELSE donation_pages.alias END, \
              archived_at = NULL, \
-             updated_at = now() \
-         RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                   alias, display_currency, website, twitter, \
-                   instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
+             updated_at = now()",
     )
     .bind(page.nym)
     .bind(page.kind)
@@ -114,10 +173,14 @@ pub async fn upsert_donation_page(
     .bind(page.instagram)
     .bind(page.pos_mode)
     .bind(page.enabled)
-    .bind(alias_present)
-    .bind(alias_value)
-    .fetch_one(pool)
-    .await
+    .execute(&mut *tx)
+    .await?;
+
+    let row = get_donation_page_by_nym_with(&mut *tx, page.nym, page.kind)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound)?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Soft-delete: mark `archived_at = now()`. The row is preserved so the
@@ -128,17 +191,22 @@ pub async fn archive_donation_page(
     nym: &str,
     kind: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
-    sqlx::query_as::<_, DonationPage>(
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
         "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
-         WHERE nym = $1 AND kind = $2 AND archived_at IS NULL \
-         RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                   alias, display_currency, website, twitter, \
-                   instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
+         WHERE nym = $1 AND kind = $2 AND archived_at IS NULL",
     )
     .bind(nym)
     .bind(kind)
-    .fetch_optional(pool)
-    .await
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let row = get_donation_page_by_nym_with(&mut *tx, nym, kind).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Update the avatar or og image hash for a nym's donation page. Used by
@@ -156,17 +224,11 @@ pub async fn update_donation_page_image_hash(
     let sql = match image_column {
         "avatar_sha256" => {
             "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
+             WHERE nym = $1 AND kind = $2"
         }
         "og_sha256" => {
             "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
+             WHERE nym = $1 AND kind = $2"
         }
         _ => {
             return Err(sqlx::Error::Protocol(format!(
@@ -174,12 +236,20 @@ pub async fn update_donation_page_image_hash(
             )))
         }
     };
-    sqlx::query_as::<_, DonationPage>(sql)
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(sql)
         .bind(nym)
         .bind(kind)
         .bind(new_sha256)
-        .fetch_optional(pool)
-        .await
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let row = get_donation_page_by_nym_with(&mut *tx, nym, kind).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 pub async fn get_donation_page_by_nym(
@@ -187,35 +257,88 @@ pub async fn get_donation_page_by_nym(
     nym: &str,
     kind: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
+    get_donation_page_by_nym_with(pool, nym, kind).await
+}
+
+async fn get_donation_page_by_nym_with<'e, E>(
+    executor: E,
+    nym: &str,
+    kind: &str,
+) -> Result<Option<DonationPage>, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query_as::<_, DonationPage>(
-        "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
-                alias, ct_descriptor, next_addr_idx, \
-                display_currency, website, twitter, \
-                instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
-         FROM donation_pages WHERE nym = $1 AND kind = $2",
+        "SELECT donation_pages.nym, donation_pages.kind, donation_pages.header, \
+                donation_pages.description, donation_pages.avatar_sha256, \
+                donation_pages.og_sha256, active_alias.name AS alias, \
+                (active_alias.name IS NOT NULL) AS alias_active, \
+                donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
+                donation_pages.display_currency, donation_pages.website, \
+                donation_pages.twitter, donation_pages.instagram, \
+                donation_pages.pos_mode, donation_pages.enabled, \
+                (donation_pages.archived_at IS NOT NULL) AS is_archived \
+         FROM donation_pages \
+         JOIN users ON users.nym = donation_pages.nym \
+         LEFT JOIN LATERAL ( \
+             SELECT name \
+             FROM public_names \
+             WHERE owner_npub = users.npub \
+               AND kind = 'alias' \
+               AND active = TRUE \
+             ORDER BY claimed_at, name \
+             LIMIT 1 \
+         ) AS active_alias ON TRUE \
+         WHERE donation_pages.nym = $1 AND donation_pages.kind = $2",
     )
     .bind(nym)
     .bind(kind)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
-/// Resolve a public alias slug to its donation-page row. The alias is globally
-/// unique (partial unique index), so this returns at most one row regardless
-/// of nym or kind. Used by the `/a/<alias>` routes; the caller decides how to
-/// treat archived/disabled rows.
+/// Resolve a lifetime alias reservation to the requested surface kind. New
+/// claims are globally unique across nyms and aliases; typed historical
+/// collisions remain unambiguous here because this lookup selects an alias
+/// claim explicitly. Inactive reservations are returned so an old link can
+/// render a non-payable archived response without releasing ownership.
 pub async fn get_donation_page_by_alias(
     pool: &PgPool,
     alias: &str,
+    kind: &str,
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
-        "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
-                alias, ct_descriptor, next_addr_idx, \
-                display_currency, website, twitter, \
-                instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
-         FROM donation_pages WHERE alias = $1",
+        "WITH alias_claim AS ( \
+             SELECT name, owner_npub, active \
+             FROM public_names \
+             WHERE name = $1 AND kind = 'alias' \
+         ), owner_user AS ( \
+             SELECT users.nym \
+             FROM users \
+             JOIN alias_claim ON alias_claim.owner_npub = users.npub \
+             JOIN donation_pages AS candidate_pages \
+               ON candidate_pages.nym = users.nym \
+              AND candidate_pages.kind = $2 \
+             ORDER BY users.is_active DESC, users.created_at DESC \
+             LIMIT 1 \
+         ) \
+         SELECT donation_pages.nym, donation_pages.kind, donation_pages.header, \
+                donation_pages.description, donation_pages.avatar_sha256, \
+                donation_pages.og_sha256, alias_claim.name AS alias, \
+                alias_claim.active AS alias_active, \
+                donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
+                donation_pages.display_currency, donation_pages.website, \
+                donation_pages.twitter, donation_pages.instagram, \
+                donation_pages.pos_mode, donation_pages.enabled, \
+                (donation_pages.archived_at IS NOT NULL) AS is_archived \
+         FROM alias_claim \
+         JOIN owner_user ON TRUE \
+         JOIN donation_pages \
+           ON donation_pages.nym = owner_user.nym \
+          AND donation_pages.kind = $2",
     )
     .bind(alias)
+    .bind(kind)
     .fetch_optional(pool)
     .await
 }
@@ -274,12 +397,14 @@ where
         .await?;
 
         if !in_use {
-            sqlx::query("UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2")
-                .bind(nym)
-                .bind(kind)
-                .bind(address_index + 1)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2",
+            )
+            .bind(nym)
+            .bind(kind)
+            .bind(address_index + 1)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(Some((address, address_index, ct_descriptor)));
         }

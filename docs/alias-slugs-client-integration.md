@@ -1,13 +1,19 @@
 # Alias slugs — client integration guide
 
-Merchant-chosen slugs let a donation-page surface be served at `/a/<slug>`,
-decoupled from the `nym` that anchors the merchant's Lightning Address. The
-public link and the served page never expose the nym. A merchant may pick a
-different slug for each surface (Payment Page vs PoS).
+Merchant-chosen slugs let both public merchant surfaces use one nym-free name:
+the Payment Page at `/a/<slug>` and PoS at `/a/<slug>/pos`. The alias belongs
+to the owning `npub`, not either `(nym, kind)` row. The public link and served
+alias pages never expose the nym.
+
+An npub may claim one lifetime nym and one optional lifetime alias. Nyms and
+aliases share one allocation namespace, and no claim is ever reassigned. With
+no active alias, both surfaces use their nym routes by default; this fallback
+does not create an alias row.
 
 This guide is the contract a client (mobile editor, web, etc.) implements. The
-server change is additive and backward-compatible: a client that never sends an
-alias keeps working unchanged.
+signed wire layout remains backward-compatible: a client that never sends an
+alias keeps working unchanged. Alias-capable clients must handle the stricter
+lifetime-reservation errors described below.
 
 Related: [`compatibility-ledger.md`](compatibility-ledger.md) (Donation Page
 Alias entry).
@@ -76,12 +82,13 @@ byte-exact contract tests in `src/donation_page/tests.rs`.
 
 `alias` is **tri-state**:
 
-- **omit the `alias` key** → leave the stored alias unchanged (and do not sign it).
-- `"alias": ""` → **clear** the slug (sign `""` as the terminal field).
-- `"alias": "myslug"` → **claim / change** (sign `"myslug"`).
+- **omit the `alias` key** → leave the npub-level alias state unchanged (and do not sign it).
+- `"alias": ""` → deactivate the alias (sign `""` as the terminal field). The reservation is retained permanently and generated links fall back to the nym.
+- `"alias": "myslug"` → claim it for the first time, idempotently preserve it, or reactivate the same lifetime claim.
+- Sending a different non-empty value after this npub has claimed an alias is rejected with `AliasAlreadyAssigned`; aliases cannot be renamed or released.
 
-A different slug per surface: issue one save with `kind:"payment_page"` + its
-alias, and another with `kind:"pos"` + its alias.
+Saving the alias through either `kind` updates the same owner-level claim. Do
+not maintain separate Payment Page and PoS alias fields in the client.
 
 ## 3. Slug rules
 
@@ -93,12 +100,13 @@ Enforced server-side; mirror them client-side for immediate feedback.
 - Reserved (rejected): `0`, `1`, `pos`, `a`, the brand names `bull`,
   `bullbitcoin`, `bull-bitcoin`, `bullpay`, `bullnym`, `bitcoin`, and all
   reserved route slugs.
-- Aliases are **globally unique** across all merchants and surfaces.
+- New alias and nym claims share one global namespace. A string already
+  reserved as either type is unavailable forever.
 
 ## 4. Responses
 
-**200 OK** → `DonationPageView`. Use `public_url` as the share link — it is
-`https://<domain>/a/<slug>` when a slug is set, otherwise the nym path:
+**200 OK** → `DonationPageView`. Use `public_url` as the share link. The
+effective public name is `active_alias ?? nym`:
 
 ```json
 {
@@ -109,15 +117,20 @@ Enforced server-side; mirror them client-side for immediate feedback.
 }
 ```
 
+For `kind:"pos"`, the corresponding URLs are `/a/alices-shop/pos` or
+`/alice/pos`. Nym routes remain valid after an alias is claimed.
+
 **409 Conflict**, body:
 
 ```json
-{ "status": "ERROR", "code": "AliasTaken",
-  "reason": "This link name is already taken. Choose a different one." }
+{ "status": "ERROR", "code": "NameTaken",
+  "reason": "This public name is permanently reserved. Choose a different name." }
 ```
 
-→ the slug is taken by another surface. Prompt for a different one (a suffix
-usually works).
+→ the string is already any merchant's nym or alias.
+
+`AliasAlreadyAssigned` means this npub already owns a different lifetime alias;
+offer reactivation of the existing alias rather than suggesting another name.
 
 **200 + LNURL error envelope**:
 
@@ -127,16 +140,16 @@ usually works).
 
 → invalid charset or reserved slug. Note that this API returns **HTTP 200 with
 an error envelope** for most validation failures (LNURL/LUD-06 convention);
-`AliasTaken` is one of the few that is a real non-200. A client's envelope
+name conflicts are among the few that are real non-200 responses. A client's envelope
 parser must handle a non-200 status on this endpoint.
 
 ## 5. Reading current state & sharing
 
 - Pre-fill the editor: `GET /donation-page/<nym>?kind=<payment_page|pos>`
-  returns the same `DonationPageView`, including `alias` and `public_url`.
-- Share `public_url`. The page at `/a/<slug>` is a self-contained PWA (donation
-  or PoS shell) served by the server — the client shares the link; there is
-  nothing to render client-side.
+  returns the same active alias for either kind, plus the kind-specific
+  `public_url`.
+- Share `public_url`. Payment Page uses `/a/<slug>` and PoS uses
+  `/a/<slug>/pos`; there is nothing to render client-side.
 
 ## 6. Rollout / version skew
 

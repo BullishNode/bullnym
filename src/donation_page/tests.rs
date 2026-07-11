@@ -254,6 +254,26 @@ fn test_pricer() -> PricerClient {
     PricerClient::new(Default::default()).unwrap()
 }
 
+#[test]
+fn public_surface_urls_fall_back_to_nym_and_share_one_alias() {
+    assert_eq!(
+        public_surface_url("bullpay.ca", "alice", db::KIND_PAYMENT_PAGE, None),
+        "https://bullpay.ca/alice"
+    );
+    assert_eq!(
+        public_surface_url("bullpay.ca", "alice", db::KIND_POS, None),
+        "https://bullpay.ca/alice/pos"
+    );
+    assert_eq!(
+        public_surface_url("bullpay.ca", "alice", db::KIND_PAYMENT_PAGE, Some("coffee")),
+        "https://bullpay.ca/a/coffee"
+    );
+    assert_eq!(
+        public_surface_url("bullpay.ca", "alice", db::KIND_POS, Some("coffee")),
+        "https://bullpay.ca/a/coffee/pos"
+    );
+}
+
 fn validate_req(req: &SaveDonationPageRequest) -> Result<(), AppError> {
     validate_lengths(req, &test_pricer(), TEST_DESCRIPTOR.len() + 1)
 }

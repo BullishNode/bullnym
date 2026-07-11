@@ -7,11 +7,12 @@ surfaces backed by the same non-custodial Liquid settlement model:
 1. **Lightning Address** — a public `nym@domain` LNURL-pay endpoint. Standard
    senders receive a BOLT11 invoice backed by a Boltz reverse swap; LUD-22
    senders can receive a direct Liquid address after proving UTXO ownership.
-2. **Payment Pages** — public pages at `https://<domain>/<nym>` where a payer
-   enters an amount and receives a payment page with Lightning, Liquid, and
-   Bitcoin payment instructions.
-3. **POS** — public terminals at `https://<domain>/<nym>/pos` with their own
-   descriptor, cursor, installable PWA shell, local history, and receipts.
+2. **Payment Pages** — public pages at `https://<domain>/<nym>` or
+   `https://<domain>/a/<alias>` where a payer enters an amount and receives a
+   payment page with Lightning, Liquid, and Bitcoin payment instructions.
+3. **POS** — public terminals at `https://<domain>/<nym>/pos` or
+   `https://<domain>/a/<alias>/pos` with their own descriptor, cursor,
+   installable PWA shell, local history, and receipts.
 4. **Invoices** — recipient-created receivables with signed mobile APIs,
    public payment URLs, fixed-sat or fiat-priced amounts, invoice listing,
    cancellation, and payment-status accounting.
@@ -20,7 +21,9 @@ The account identity is the Nostr `npub`. A **nym** is an optional public
 payment namespace owned by that `npub`: Lightning Address, Payment Page, and
 POS are attached to a nym. Lightning Address uses the nym's Liquid confidential
 descriptor. Payment Page and POS use separate Get Paid descriptors and address
-cursors; only legacy Payment Pages can fall back to the nym descriptor.
+cursors; only legacy Payment Pages can fall back to the nym descriptor. Each
+`npub` may also claim one optional lifetime alias shared by Payment Page and
+POS. If no alias is active, both surfaces use their nym routes.
 Invoices can be linked to a nym for routing and presentation, but they do not
 have to be. Wallet-origin invoices use recipient-supplied Bitcoin and/or Liquid
 addresses instead of requiring the server to store a descriptor.
@@ -30,8 +33,8 @@ addresses instead of requiring the server to store a descriptor.
 | Product | Who creates it | Public URL | Payment rails | Settlement destination |
 |---|---|---|---|---|
 | Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Active nym CT descriptor; Lightning allocates at claim, while unpaid LUD-22 reservations can share the current index until payment advances it |
-| Payment Page | Recipient configures a public page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the Payment Page CT descriptor, with legacy fallback to the active nym CT descriptor |
-| POS | Recipient configures a terminal for a nym | `/:nym/pos` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the POS CT descriptor; no Lightning Address fallback |
+| Payment Page | Recipient configures a public page for a nym | `/:nym` or `/a/:alias`, plus their invoice paths | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the Payment Page CT descriptor, with legacy fallback to the active nym CT descriptor |
+| POS | Recipient configures a terminal for a nym | `/:nym/pos` or `/a/:alias/pos` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the POS CT descriptor; no Lightning Address fallback |
 | Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from public surfaces use the selected surface Liquid address |
 
 Payment sessions use fixed-sat accounting. Fiat-denominated invoices convert
@@ -85,7 +88,8 @@ When registering a nym with the Bullnym server, the BULL app derives a nostr key
 
 - **Deactivating a nym:** this prevents senders from sending payments to the Lightning address (enforced by the server).
 - **Changing a descriptor associated to a nym:** in case the user migrates wallets but wants to keep the same nym.
-- **Creating a new nym:** this allows the user to create a new nym for a previously registered descriptor.
+- **Reactivating a nym:** a deactivated identity can reactivate its original
+  lifetime nym, but cannot replace it with a different nym.
 
 Why nostr? Nostr is not required for this authentication protocol, various other protocols built on BIP85 could have been used. However, there are other features that nostr enables such as sending and receiving messages and publishing the nym on the nostr relay network for discoverability. The better question is therefore "why not nostr?" and there doesn't seem to be any downside to using nostr for authentication.
 
@@ -138,12 +142,17 @@ The combined effect is that the cost of a sustained enumeration attack scales wi
 
 The Bullnym server supports NIP05 registration. This allows users to optionally register their nym and Lightning address on the nostr relay network. This allows for discoverability (find contacts via the Nostr network) and opens up interesting possibilities such as NIP57 (zaps). Honestly, I am not sure that this adds any value because the nostr keypair generated is not associated to the user's identity and therefore doesn't let nostr users find the payment details of their contacts. It may also have downsides (discoverability introduces ddos vectors). And it does not provide redundancy because if the Bullnym server goes offline, users will not be able to obtain payment details from recipients via nostr because the NIP05 info just points to the Bullnym server. However, given that BULL plans to eventually publish Silent Payment addresses on nostr, this is a neat proof of concept and a useful place to surface issues like how to deactivate payment instructions.
 
-## Some other considerations: nym reservations
+## Public-name reservations
 
-- Users can only register up to 3 nyms per nostr identity, to prevent griefing nyms. In addition to standard rate limiting to prevent griefing. When a user deactivates his 2nd nym, he will see a message telling him that he only has 1 nym left.
-- Deactivated nyms can never be taken by someone else, to prevent impersonation. They are "reserved forever" by the npub that first registered them.
-- Only 1 nym available per wallet at a time. This restriction is for system and ui/ux simplicity and could be lifted later.
-- Nyms that have never been used could be made to expire after a long period of time (to prevent griefing, but this is risky).
+- Each Nostr identity can claim one lifetime nym and one optional lifetime
+  alias. The alias belongs to the identity and is shared by Payment Page and
+  POS.
+- Nyms and aliases share one namespace for new claims. Deactivating either
+  name never releases it; the original owner can reactivate the same name, but
+  nobody can rename, delete, or take it over.
+- Existing deployments may contain historical multi-nym or multi-alias states.
+  The public-name migration preserves those reservations and marks them as
+  grandfathered instead of silently releasing a payment identifier.
 
 ---
 
@@ -166,6 +175,9 @@ HTTP layer (Axum)
 ├── /:nym/pos                         POS PWA shell
 ├── /:nym/invoice                     Payment Page checkout invoice creation
 ├── /:nym/pos/invoice                 POS checkout invoice creation
+├── /a/:alias                         Alias-selected Payment Page PWA shell
+├── /a/:alias/pos                     Alias-selected POS PWA shell
+├── /a/:alias[/pos]/invoice           Alias-selected checkout invoice creation
 ├── /:nym/i/:id                       Linked invoice/payment page
 ├── /invoice/:id                      Generic linked/unlinked invoice page
 ├── /sw.js, /pwa-assets/*             PWA service worker and assets
@@ -229,14 +241,21 @@ All write operations require a BIP-340 Schnorr signature over a domain-tagged pa
 | `GET` | `/donation-page/:nym?kind=...` | Public JSON state used by mobile |
 | `GET` | `/:nym` | Payment Page PWA shell |
 | `GET` | `/:nym/pos` | POS PWA shell |
+| `GET` | `/a/:alias` | Payment Page PWA shell selected by the owner's alias |
+| `GET` | `/a/:alias/pos` | POS PWA shell selected by the same alias |
 | `POST` | `/:nym/invoice` | Anonymous payer creates a Payment Page checkout invoice |
 | `POST` | `/:nym/pos/invoice` | Cashier creates a POS checkout invoice |
-| `GET` | `/:nym/i/:id` | Public payment page for the checkout invoice |
+| `POST` | `/a/:alias/invoice` | Anonymous payer creates an alias-selected Payment Page invoice |
+| `POST` | `/a/:alias/pos/invoice` | Cashier creates an alias-selected POS invoice |
+| `GET` | `/:nym/i/:id`, `/:nym/pos/i/:id`, `/a/:alias/i/:id`, `/a/:alias/pos/i/:id` | Public payment page for a checkout invoice; POS-prefixed forms support shell-relative navigation |
 
 Surface management is signed by the same Nostr/BIP-340 identity that owns the
 nym. `kind = "payment_page"` serves `/:nym`; `kind = "pos"` serves
 `/:nym/pos`. Payment Page can use a legacy fallback to the nym descriptor; POS
-requires its own descriptor. Runtime payments are `origin = 'checkout'`
+requires its own descriptor. One optional alias belongs to the owning `npub`,
+so the same alias selects Payment Page at `/a/:alias` and POS at
+`/a/:alias/pos`; without an active alias, the nym URLs remain canonical.
+Runtime payments are `origin = 'checkout'`
 invoice rows, so both surfaces share invoice status, payment-event accounting,
 Lightning offer refresh, Liquid address detection, and Bitcoin chain-swap
 settlement machinery.
@@ -352,7 +371,6 @@ nip05             = false   # opt-in /.well-known/nostr.json publishing
 min_sendable_msat          = 100_000          # 100 sats
 max_sendable_msat          = 25_000_000_000   # 25 M sats
 max_descriptor_len         = 1000
-max_lifetime_nyms_per_npub = 3                # Hard cap per npub (incl. inactive)
 
 [proof]
 min_proof_value_sat = 1000                    # LUD-22 UTXO ownership floor
@@ -408,8 +426,13 @@ Postgres is the single source of truth. All migrations are plain SQL under `migr
 
 Major tables:
 
-- **`users`** — one row per nym. Holds the server-auth `npub`, public `verification_npub`, Lightning Address `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, and `has_been_used`. `nym` is unique; deactivated rows reserve the name forever.
-- **`donation_pages`** — one row per `(nym, kind)` public surface. `kind` is `payment_page` or `pos`. Stores the surface descriptor and independent address cursor, public copy, display currency, social links, image hashes, enabled/archive state, and timestamps.
+- **`public_name_owners`** — one durable owner row per server-auth `npub`.
+- **`public_names`** — authoritative lifetime nym and alias reservations,
+  including active/deactivated state and explicit grandfathering of historical
+  states. New claims enforce one nym and one alias per owner in a shared
+  namespace.
+- **`users`** — one row per nym. Holds the server-auth `npub`, public `verification_npub`, Lightning Address `ct_descriptor`, `next_addr_idx`, `is_active`, `last_callback_at`, and `has_been_used`. Active identity lookups are joined to the corresponding public-name reservation.
+- **`donation_pages`** — one row per `(nym, kind)` public surface. `kind` is `payment_page` or `pos`. Stores the surface descriptor and independent address cursor, public copy, display currency, social links, image hashes, enabled/archive state, and timestamps. Aliases are resolved through `public_names`, not stored per surface.
 - **`invoices`** — unified payment-session table for public checkout invoices (`origin = 'checkout'`) and wallet-created invoices (`origin = 'wallet'`). Stores amount, fiat pricing metadata, accepted rails, concrete settlement destinations, invoice metadata, expiry, payment status, settlement status, and cumulative payment state.
 - **`invoice_payment_events`** — idempotent accounting evidence keyed by rail-specific event keys such as `liquid_direct:<txid>:<vout>`, `bitcoin_direct:<txid>:<vout>`, or `lightning_boltz_reverse:<swap_id>`.
 - **`swap_records`** — one row per Boltz reverse swap, and linked to an invoice when the swap belongs to public checkout or wallet-origin invoice payment. Includes `boltz_swap_id`, settlement address/index, amount, BOLT11 invoice, invoice association, and MuSig2 claim state. Lightning Address swaps have no invoice association.
@@ -418,6 +441,17 @@ Major tables:
 - **`nym_access_events`** — sliding-window counters for the distinct-nyms-per-IP and distinct-nyms-per-outpoint caps.
 - **`processed_webhook_events`** — webhook idempotency guard.
 - **Rate-limit counter tables** — per-IP, per-pubkey, register and metadata sliding windows. Pruned every 10 min by the GC task.
+
+For an existing database, apply `045_public_names_preflight.sql` first and
+inspect `public_name_migration_alias_choices`. Resolve every row with multiple
+historical aliases by selecting the alias that should remain active, or select
+`NULL` to leave all of that owner's aliases inactive. Then apply
+`046_public_names.sql`. Both migrations are transactional, and migration 046
+fails closed while any choice remains unresolved or the alias set has changed
+since preflight. Quiesce registration and surface writes between the two
+migrations. The database cannot discover names that were already hard-deleted,
+so operators must also compare backups or deployment records and restore any
+such reservations before migration 046.
 
 ## Background tasks
 

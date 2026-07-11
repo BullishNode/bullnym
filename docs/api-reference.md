@@ -19,7 +19,7 @@ address and construct swaps honestly.
 | nym | A 1-32 character public namespace and Lightning Address local part. | A deactivated nym remains reserved to its original identity. It is not released for reuse. |
 | CT descriptor | Liquid confidential descriptor from which the server derives fresh addresses. | The server can derive and unblind payments in that descriptor. Use a dedicated Bullnym wallet, not a general-purpose wallet. |
 | Payment Page | Public `/<nym>` or `/a/<alias>` checkout surface. | Can use a dedicated descriptor; legacy rows may fall back to the Lightning Address descriptor. |
-| POS | Public `/<nym>/pos` or `/a/<alias>` terminal. | Requires its own descriptor and never falls back to the Lightning Address descriptor. |
+| POS | Public `/<nym>/pos` or `/a/<alias>/pos` terminal. | Requires its own descriptor and never falls back to the Lightning Address descriptor. |
 | wallet invoice | Signed recipient-created receivable. | Recipient supplies unique BTC/Liquid addresses; the server does not derive them from a descriptor. |
 | checkout invoice | Anonymous payer-created session from Payment Page/POS. | Destination and enabled rails are controlled by the configured surface. |
 
@@ -79,7 +79,7 @@ response, including HTTP 2xx responses.
 | `201` | Successful nym registration. |
 | `400` | Framework query/path or malformed-JSON rejection; generally not a Bullnym error envelope. |
 | `401` | `AuthError`: malformed key/signature, bad signature, or timestamp outside the allowed window. |
-| `409` | A supplied Bitcoin/Liquid address is already assigned, or an alias is taken. Generate another value; blind retry is wrong. |
+| `409` | A supplied Bitcoin/Liquid address is already assigned, a public name is reserved, or the wallet already owns its lifetime nym/alias. Blind retry is wrong. |
 | `410` | Deprecated Liquid-offer endpoint. |
 | `413` | Axum request-body limit exceeded before the handler. |
 | `404`, `405` | Route not found or method not allowed; may be HTML/plain text rather than JSON. |
@@ -92,10 +92,10 @@ Only errors produced after a request reaches a Bullnym handler use the stable
 rejections can be plain text or HTML. Clients should first branch on HTTP
 status/content type, then parse a Bullnym envelope when the body is JSON.
 
-Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
-`NymReserved`, `KeyAlreadyRegistered`, `NymQuotaExceeded`,
+Stable error `code` values include `NymNotFound`, `NymTaken`, `NameTaken`,
+`NymInvalid`, `NymReserved`, `KeyAlreadyRegistered`, `NymAlreadyAssigned`,
 `InvalidDescriptor`, `AuthError`, `DonationPageInvalid`,
-`DonationPageNotFound`, `AliasTaken`, `InvoiceNotFound`, `InvalidAmount`,
+`DonationPageNotFound`, `AliasAlreadyAssigned`, `InvoiceNotFound`, `InvalidAmount`,
 `BitcoinAddressAlreadyUsed`, `LiquidAddressAlreadyUsed`,
 `ProofOfFundsRequired`, `ProofOfFundsInvalid`, `UtxoNotFound`, `UtxoSpent`,
 `PubkeyUtxoMismatch`, `RateLimitedSender`, `RateLimitedRecipient`,
@@ -108,7 +108,7 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 
 ```json
 { "details": { "nym": "alice", "domain": "pay.example.com" } }
-{ "details": { "quota": { "used": 3, "cap": 3, "remaining": 0 } } }
+{ "details": { "quota": { "used": 1, "cap": 1, "remaining": 0 } } }
 { "details": { "pending_count": 2 } }
 { "details": { "min_sat": 1000 } }
 ```
@@ -289,9 +289,9 @@ retain bounded short-term exchange-rate exposure during a pricer outage.
 ```
 
 Nyms allow lowercase ASCII letters, digits, and internal hyphens. Reserved
-route/product names are rejected. A key may have only one active nym and a
-configured lifetime quota (default deployment value: three). Deactivation does
-not restore quota. Registering a formerly owned nym reactivates it.
+route/product names are rejected. An npub may claim one lifetime nym;
+deactivation never releases it, and only that same nym can be reactivated.
+Nyms and aliases share the public-name namespace.
 
 Response (`201`):
 
@@ -300,7 +300,7 @@ Response (`201`):
   "nym": "alice",
   "lightning_address": "alice@pay.example.com",
   "nip05": "alice@pay.example.com",
-  "quota": { "used": 1, "cap": 3, "remaining": 2 }
+  "quota": { "used": 1, "cap": 1, "remaining": 0 }
 }
 ```
 
@@ -342,9 +342,9 @@ Omit/false `purge` for normal soft deactivation (`delete` action). It stops new
 payments but preserves history and allows reactivation. `purge: true` uses the
 `purge` action and deletes swap/reservation state only when no payment is in
 flight. Purge never makes the nym claimable by another identity and does not
-restore lifetime quota.
+free the wallet to claim a different lifetime nym.
 
-Response: `{ "quota": { "used": 2, "cap": 3, "remaining": 1 } }`.
+Response: `{ "quota": { "used": 1, "cap": 1, "remaining": 0 } }`.
 
 ### `GET /register/lookup?npub=<64-hex>`
 
@@ -354,12 +354,12 @@ Public and rate-limited. A successful response is:
 {
   "nym": "alice",
   "active": false,
-  "quota": { "used": 2, "cap": 3, "remaining": 1 },
+  "quota": { "used": 1, "cap": 1, "remaining": 0 },
   "previous_nyms": [
     { "nym": "alice", "created_at": "2026-07-09T12:00:00Z" }
   ],
-  "lifetime_nyms_used": 2,
-  "lifetime_nyms_cap": 3
+  "lifetime_nyms_used": 1,
+  "lifetime_nyms_cap": 1
 }
 ```
 
@@ -408,7 +408,7 @@ Options and implications:
 
 | Field | Wire/update semantics | Consequence |
 |---|---|---|
-| `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent row, descriptor, alias, and public workflow. Explicitly send it in new clients. |
+| `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent surface row and descriptor. Alias ownership is shared at npub level. Explicitly send it in new clients. |
 | `header` | Required, 1-80 UTF-8 bytes. | Replaces the stored value on every save. |
 | `description` | Required JSON string, 0-280 UTF-8 bytes. | Empty string clears it; omission is a framework deserialization error. |
 | `display_currency` | Required canonical uppercase supported code. | Replaces the stored value and controls display/fiat checkout; fetch supported currencies first. |
@@ -418,9 +418,9 @@ Options and implications:
 | `enabled` | Required boolean; signed as `1` or `0`. | False retains configuration but public payment use is disabled. It is not archival deletion. |
 | `ct_descriptor` | Non-empty descriptor replaces it; omitted/null/empty preserves it on update. POS creation requires non-empty; Payment Page creation may omit it and fall back to the nym descriptor. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. Empty string is appended to the signature even though storage preserves the descriptor. |
 | `pos_mode` | Legacy non-null boolean; omitted/null preserves it on update and is not appended to the signature. | New integrations should use `kind`; sending it changes the signed bytes. |
-| `alias` omitted/null | Preserve the current alias; no trailing signed field. | Maintains old-client compatibility. |
-| `alias: ""` | Clear; append an empty terminal signed field. | Removes the alias route. |
-| non-empty `alias` | Claim/change; append it as the terminal field. | Globally unique 1-32 lowercase/digit/hyphen slug served at `/a/<alias>`. This is branding, not anonymity. |
+| `alias` omitted/null | Preserve the npub-level alias state; no trailing signed field. | With no active alias, generated links use the nym without creating an alias claim. |
+| `alias: ""` | Deactivate; append an empty terminal signed field. | Alias routes become non-payable and generated links fall back to the nym. The lifetime reservation is retained. |
+| non-empty `alias` | First claim, idempotent save, or reactivation; append it as the terminal field. | One immutable lifetime alias per npub. Nyms and aliases share one namespace; a different later alias is rejected. Payment Page uses `/a/<alias>` and POS uses `/a/<alias>/pos`. |
 
 Every successful save clears `archived_at`, so saving an archived surface
 reactivates it. The request body limit is 8 KiB. Length checks use UTF-8 byte
@@ -452,6 +452,10 @@ Share `public_url`; do not compose paths client-side. Alias pages intentionally
 omit the nym from rendered configuration and payment descriptions, but readable
 aliases remain enumerable.
 
+Both surface reads return the same active alias. Without one,
+`effective_public_name = nym`; after a claim,
+`effective_public_name = alias`. Nym routes remain valid in either state.
+
 ### `GET /donation-page/:nym?kind=payment_page|pos`
 
 Public, rate-limited editor/read model returning `DonationPageView`. It may
@@ -474,16 +478,19 @@ in a `DonationPageView` are legacy read-only fields for previously stored media.
 |---|---|---|
 | `GET` | `/:nym` | Payment Page PWA |
 | `GET` | `/:nym/pos` | POS PWA |
-| `GET` | `/a/:slug` | Alias-selected Payment Page or POS PWA |
+| `GET` | `/a/:slug` | Alias-selected Payment Page PWA |
+| `GET` | `/a/:slug/pos` | Alias-selected POS PWA |
 | `GET` | `/:nym/manifest.webmanifest` | Payment Page manifest |
 | `GET` | `/:nym/pos/manifest.webmanifest` | POS manifest |
-| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected surface manifest |
+| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected Payment Page manifest |
+| `GET` | `/a/:slug/pos/manifest.webmanifest` | Alias-selected POS manifest |
 | `GET` | `/sw.js` | Service worker from the configured PWA distribution |
 | `GET` | `/pwa-assets/*` | Static PWA distribution files |
 | `POST` | `/:nym/invoice` | Payment Page checkout |
 | `POST` | `/:nym/pos/invoice` | POS checkout |
-| `POST` | `/a/:slug/invoice` | Alias-selected checkout |
-| `GET` | `/:nym/i/:id`, `/a/:slug/i/:id` | Linked payment page |
+| `POST` | `/a/:slug/invoice` | Alias-selected Payment Page checkout |
+| `POST` | `/a/:slug/pos/invoice` | Alias-selected POS checkout |
+| `GET` | `/:nym/i/:id`, `/:nym/pos/i/:id`, `/a/:slug/i/:id`, `/a/:slug/pos/i/:id` | Linked payment page; POS-prefixed forms support shell-relative navigation |
 
 The page and manifest routes are registered only when `features.payment_pages`
 is enabled. A manifest is returned only for an enabled, non-archived surface;

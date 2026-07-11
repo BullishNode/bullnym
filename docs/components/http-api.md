@@ -115,7 +115,7 @@ Response:
   "nym": "alice",
   "lightning_address": "alice@example.com",
   "nip05": null,
-  "quota": { "used": 1, "cap": 3, "remaining": 2 }
+  "quota": { "used": 1, "cap": 1, "remaining": 0 }
 }
 ```
 
@@ -150,7 +150,7 @@ The `donation_pages` table stores two surface kinds:
 | `ct_descriptor` | Required for `kind = "pos"`. Optional for legacy Payment Pages. |
 | `pos_mode` | Legacy optional-trailing flag. New clients use `kind`. |
 | `kind` | Optional-trailing field: `payment_page` default or `pos`. Sent after `ct_descriptor` when present. |
-| `alias` | Newest optional-trailing field. Omit to preserve, send `""` to clear, or send a globally unique slug. Must be last when present. |
+| `alias` | Newest optional-trailing field. Omit to preserve the npub-level claim, send `""` to deactivate without releasing it, or send the same non-empty value to claim/reactivate the one lifetime alias. Must be last when present. |
 
 Save signing field order after `nym_or_empty`:
 
@@ -176,8 +176,10 @@ enabled
 | `GET` | `/:nym/manifest.webmanifest` | Payment Page manifest. |
 | `GET` | `/:nym/pos` | POS terminal PWA shell. |
 | `GET` | `/:nym/pos/manifest.webmanifest` | POS manifest. |
-| `GET` | `/a/:slug` | Alias-selected Payment Page or POS shell. |
-| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected surface manifest. |
+| `GET` | `/a/:slug` | Alias-selected Payment Page shell. |
+| `GET` | `/a/:slug/pos` | Alias-selected POS shell. |
+| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected Payment Page manifest. |
+| `GET` | `/a/:slug/pos/manifest.webmanifest` | Alias-selected POS manifest. |
 | `GET` | `/sw.js` | Root-scoped service worker. |
 | `GET` | `/pwa-assets/*` | Built PWA assets. |
 
@@ -191,9 +193,12 @@ worker uses that header to avoid caching invoice pages.
 |---|---|---|---|
 | `POST` | `/:nym/invoice` | Payment Page | `invoice::create_anonymous` |
 | `POST` | `/:nym/pos/invoice` | POS | `invoice::create_anonymous_pos` |
-| `POST` | `/a/:slug/invoice` | Alias-selected Payment Page or POS | `invoice::create_anonymous_alias` |
+| `POST` | `/a/:slug/invoice` | Alias-selected Payment Page | `invoice::create_anonymous_alias` |
+| `POST` | `/a/:slug/pos/invoice` | Alias-selected POS | `invoice::create_anonymous_alias_pos` |
 | `GET` | `/:nym/i/:id` | Linked checkout or linked wallet invoice | `invoice::render_payment` |
+| `GET` | `/:nym/pos/i/:id` | POS shell-relative linked invoice | `invoice::render_payment` |
 | `GET` | `/a/:slug/i/:id` | Alias-linked checkout invoice | `invoice::render_payment_alias` |
+| `GET` | `/a/:slug/pos/i/:id` | Alias POS shell-relative linked invoice | `invoice::render_payment_alias` |
 
 Request body must provide exactly one amount form:
 

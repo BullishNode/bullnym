@@ -56,6 +56,8 @@ static NYM_REGEX: LazyLock<Regex> =
 static NOSTR_PUBKEY_HEX_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").unwrap());
 
+const LIFETIME_NYM_CAP: i64 = 1;
+
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub nym: String,
@@ -67,11 +69,9 @@ pub struct RegisterRequest {
     pub timestamp: u64,
 }
 
-/// Wire-shape view of a per-npub lifetime nym quota. Lives on every
-/// register/lookup/delete response and inside `NymQuotaExceeded.details`
-/// so the mobile decodes it from one shape regardless of which endpoint
-/// produced it. `remaining` is `(cap - used).max(0)` — included so clients
-/// don't have to recompute.
+/// Wire-shape view of per-npub lifetime nym usage. It remains on
+/// register/lookup/delete responses for client compatibility; the policy cap
+/// is now the fixed value one. `remaining` is `(cap - used).max(0)`.
 #[derive(Serialize, Clone, Copy)]
 pub struct QuotaView {
     pub used: i64,
@@ -209,17 +209,16 @@ pub async fn register(
     )?;
 
     // Atomic register flow under an advisory lock keyed on `npub`.
-    // Past nyms stay reserved forever (the inactive row keeps its name);
-    // re-registering the original nym reactivates the same row so swap
-    // history follows the FK; a different nym becomes a fresh row.
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    // The lifetime nym stays reserved forever. Re-registering that same nym
+    // reactivates its row so swap history follows the FK; a different nym is
+    // rejected for this npub.
     match db::register_user_atomic(
         &state.db,
         &req.npub,
         &req.nym,
         &req.ct_descriptor,
         verification_npub,
-        cap,
+        LIFETIME_NYM_CAP,
     )
     .await?
     {
@@ -230,9 +229,13 @@ pub async fn register(
                 domain: state.config.domain.clone(),
             });
         }
-        db::RegisterOutcome::QuotaExceeded { used, cap } => {
-            return Err(AppError::NymQuotaExceeded { used, cap });
+        db::RegisterOutcome::NymAlreadyAssigned { nym } => {
+            return Err(AppError::NymAlreadyAssigned {
+                nym,
+                domain: state.config.domain.clone(),
+            });
         }
+        db::RegisterOutcome::NameTaken => return Err(AppError::NameTaken),
     }
 
     let lightning_address = format!("{}@{}", req.nym, state.config.domain);
@@ -249,7 +252,7 @@ pub async fn register(
             nym: req.nym,
             lightning_address,
             nip05,
-            quota: QuotaView::new(used, cap),
+            quota: QuotaView::new(used, LIFETIME_NYM_CAP),
         }),
     ))
 }
@@ -340,8 +343,8 @@ pub async fn delete_registration(
     )?;
 
     // Pre-flight: confirm the (npub, nym) pair matches a current registration
-    // BEFORE the deactivate/purge fires. Catches stale-nym replays where the
-    // npub later registered a different nym.
+    // BEFORE the deactivate/purge fires. Catches a mismatched claimed nym and
+    // protects grandfathered multi-nym owners.
     let current = db::get_user_by_npub(&state.db, &req.npub)
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration found for this key".to_string()))?;
@@ -372,10 +375,9 @@ pub async fn delete_registration(
         tracing::info!("deactivated registration for {}", user.nym);
     }
 
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
     Ok(Json(DeleteResponse {
-        quota: QuotaView::new(used, cap),
+        quota: QuotaView::new(used, LIFETIME_NYM_CAP),
     }))
 }
 
@@ -436,8 +438,7 @@ pub async fn lookup_by_npub(
 
     let (active_nym, previous_nyms, used) =
         db::lookup_status_by_npub(&state.db, &params.npub).await?;
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
-    let quota = QuotaView::new(used, cap);
+    let quota = QuotaView::new(used, LIFETIME_NYM_CAP);
     if let Some(nym) = active_nym {
         return Ok(Json(LookupResponse {
             nym,
@@ -445,7 +446,7 @@ pub async fn lookup_by_npub(
             quota,
             previous_nyms,
             lifetime_nyms_used: used,
-            lifetime_nyms_cap: cap,
+            lifetime_nyms_cap: LIFETIME_NYM_CAP,
         }));
     }
     if let Some(head) = previous_nyms.first() {
@@ -456,7 +457,7 @@ pub async fn lookup_by_npub(
             quota,
             previous_nyms,
             lifetime_nyms_used: used,
-            lifetime_nyms_cap: cap,
+            lifetime_nyms_cap: LIFETIME_NYM_CAP,
         }));
     }
     Err(AppError::NymNotFound(

@@ -87,11 +87,12 @@ pub struct SaveDonationPageRequest {
     /// `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Merchant-chosen public URL slug for this surface, served at
-    /// `/a/<alias>`, decoupled from the nym. Optional and the NEWEST trailing
+    /// Owner-level public URL slug shared by Payment Page and POS, served at
+    /// `/a/<alias>` and `/a/<alias>/pos`. Optional and the NEWEST trailing
     /// field in the signed payload (after `kind`), so any client that omits it
     /// verifies against the older byte layout. Tri-state: absent leaves the
-    /// stored alias unchanged, `""` clears it, a non-empty value claims it.
+    /// owner's alias unchanged, `""` deactivates it, and a non-empty value
+    /// claims or reactivates its lifetime reservation.
     /// See `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub alias: Option<String>,
@@ -127,8 +128,8 @@ pub struct DonationPageView {
     pub is_archived: bool,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
-    /// Merchant-chosen alias slug for this surface, if one is claimed. `None`
-    /// means the surface is only reachable via its nym path.
+    /// Merchant-chosen alias slug shared by this npub's Payment Page and POS,
+    /// if the lifetime claim is currently active. `None` uses the nym routes.
     pub alias: Option<String>,
     /// Public URL the user can share. When an alias is set this is the
     /// nym-free `/a/<alias>` link (the whole point of the feature); otherwise
@@ -139,11 +140,7 @@ pub struct DonationPageView {
 
 impl DonationPageView {
     fn from_row(row: db::DonationPage, domain: &str) -> Self {
-        let public_url = match row.alias.as_deref() {
-            Some(alias) => format!("https://{domain}/a/{alias}"),
-            None if row.kind == db::KIND_POS => format!("https://{domain}/{}/pos", row.nym),
-            None => format!("https://{domain}/{}", row.nym),
-        };
+        let public_url = public_surface_url(domain, &row.nym, &row.kind, row.alias.as_deref());
         Self {
             nym: row.nym,
             header: row.header,
@@ -161,6 +158,15 @@ impl DonationPageView {
             alias: row.alias,
             public_url,
         }
+    }
+}
+
+fn public_surface_url(domain: &str, nym: &str, kind: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) if kind == db::KIND_POS => format!("https://{domain}/a/{alias}/pos"),
+        Some(alias) => format!("https://{domain}/a/{alias}"),
+        None if kind == db::KIND_POS => format!("https://{domain}/{nym}/pos"),
+        None => format!("https://{domain}/{nym}"),
     }
 }
 
@@ -346,8 +352,9 @@ pub async fn save(
     // Charset excludes "payment_page" (underscore) and descriptors; the
     // reserved-alias blocklist rejects "0"/"1"/"pos" and brand names.
     //
-    // Tri-state for the upsert: absent leaves the stored alias unchanged,
-    // `Some("")` clears it, a validated non-empty value claims it.
+    // Tri-state for the upsert: absent leaves the owner's alias unchanged,
+    // `Some("")` deactivates it, and a validated non-empty value claims or
+    // reactivates its lifetime reservation.
     let alias_update: Option<Option<&str>> = match req.alias.as_deref() {
         None => None,
         Some("") => Some(None),
@@ -429,7 +436,7 @@ pub async fn save(
         ));
     }
 
-    let row = db::upsert_donation_page(
+    let row = match db::upsert_donation_page(
         &state.db,
         &db::UpsertDonationPage {
             nym: &req.nym,
@@ -446,7 +453,18 @@ pub async fn save(
             alias: alias_update,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(row) => row,
+        Err(db::UpsertDonationPageError::NameTaken) => return Err(AppError::NameTaken),
+        Err(db::UpsertDonationPageError::AliasAlreadyAssigned) => {
+            return Err(AppError::AliasAlreadyAssigned)
+        }
+        Err(db::UpsertDonationPageError::OwnerInactive) => {
+            return Err(AppError::NymNotFound(req.nym.clone()))
+        }
+        Err(db::UpsertDonationPageError::Database(error)) => return Err(error.into()),
+    };
 
     // If an alias was just claimed, make sure the content-addressed image
     // copies exist so `/a/<alias>` can serve avatar/OG without the nym in the

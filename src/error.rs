@@ -8,6 +8,9 @@ pub enum AppError {
     NymNotFound(String),
     /// Name already registered (by anyone).
     NymTaken,
+    /// String is permanently reserved as either a nym or alias. This is the
+    /// shared-namespace conflict returned by new registry-backed paths.
+    NameTaken,
     /// The submitted nym fails the format rules (`internal_reason` is for
     /// logging; the wire copy is fixed).
     NymInvalid(String),
@@ -58,12 +61,10 @@ pub enum AppError {
         nym: String,
         domain: String,
     },
-    /// Wallet has registered the cap of lifetime nyms. Carries both `used`
-    /// and `cap` so the wire envelope ships the same `quota` object the
-    /// mobile receives on lookup.
-    NymQuotaExceeded {
-        used: i64,
-        cap: i64,
+    /// The wallet already owns a different lifetime nym reservation.
+    NymAlreadyAssigned {
+        nym: String,
+        domain: String,
     },
     /// CT descriptor was rejected (`internal_reason` is for logging).
     InvalidDescriptor(String),
@@ -89,10 +90,9 @@ pub enum AppError {
     /// already assigned to an invoice. Address reuse makes chain payment
     /// attribution ambiguous, so it is rejected at create time.
     LiquidAddressAlreadyUsed,
-    /// A merchant tried to claim a donation-page alias slug that is already in
-    /// use by another surface. Aliases are globally unique; returned as HTTP
-    /// 409 so the client prompts for a different slug.
-    AliasTaken,
+    /// The wallet already owns a different lifetime alias reservation.
+    /// Retrying with another new string cannot succeed.
+    AliasAlreadyAssigned,
 
     // --- Capacity / rate-limit ---
     /// One source (IP, pubkey, etc.) is making too many requests.
@@ -130,7 +130,7 @@ pub enum AppError {
 pub enum ErrorClass {
     /// Caller-side validation failure or auth failure.
     Auth,
-    /// Identity / namespace conflict (nym taken, quota, key collision).
+    /// Identity / namespace conflict (reserved name or key ownership).
     Identity,
     /// Soft rate-limit — sender, recipient, or network. The Liquid LUD-22
     /// path treats this as a reason to fall back to Lightning.
@@ -156,6 +156,7 @@ impl AppError {
 
             Self::NymNotFound(_)
             | Self::NymTaken
+            | Self::NameTaken
             | Self::NymInvalid(_)
             | Self::NymReserved
             | Self::DonationPageInvalid(_)
@@ -166,7 +167,7 @@ impl AppError {
             | Self::ImagePixelsTooLarge { .. }
             | Self::MultipartInvalid(_)
             | Self::KeyAlreadyRegistered { .. }
-            | Self::NymQuotaExceeded { .. }
+            | Self::NymAlreadyAssigned { .. }
             | Self::InvalidDescriptor(_)
             | Self::ProofOfFundsRequired { .. }
             | Self::ProofOfFundsInvalid(_)
@@ -179,7 +180,7 @@ impl AppError {
             | Self::RecoveryInProgress(_)
             | Self::BitcoinAddressAlreadyUsed
             | Self::LiquidAddressAlreadyUsed
-            | Self::AliasTaken => ErrorClass::Identity,
+            | Self::AliasAlreadyAssigned => ErrorClass::Identity,
 
             Self::RateLimitedSender
             | Self::RateLimitedRecipient
@@ -202,6 +203,7 @@ impl AppError {
         match self {
             Self::NymNotFound(_) => "NymNotFound",
             Self::NymTaken => "NymTaken",
+            Self::NameTaken => "NameTaken",
             Self::NymInvalid(_) => "NymInvalid",
             Self::NymReserved => "NymReserved",
             Self::DonationPageInvalid(_) => "DonationPageInvalid",
@@ -215,7 +217,7 @@ impl AppError {
             Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
             Self::MultipartInvalid(_) => "MultipartInvalid",
             Self::KeyAlreadyRegistered { .. } => "KeyAlreadyRegistered",
-            Self::NymQuotaExceeded { .. } => "NymQuotaExceeded",
+            Self::NymAlreadyAssigned { .. } => "NymAlreadyAssigned",
             Self::InvalidDescriptor(_) => "InvalidDescriptor",
             Self::AuthError(_) => "AuthError",
 
@@ -228,7 +230,7 @@ impl AppError {
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
-            Self::AliasTaken => "AliasTaken",
+            Self::AliasAlreadyAssigned => "AliasAlreadyAssigned",
 
             Self::RateLimitedSender => "RateLimitedSender",
             Self::RateLimitedRecipient => "RateLimitedRecipient",
@@ -259,6 +261,7 @@ impl std::fmt::Display for AppError {
         match self {
             Self::NymNotFound(nym) => write!(f, "nym not found: {nym}"),
             Self::NymTaken => write!(f, "nym already taken"),
+            Self::NameTaken => write!(f, "public name already taken"),
             Self::NymInvalid(reason) => write!(f, "invalid nym: {reason}"),
             Self::NymReserved => write!(f, "nym is reserved"),
             Self::DonationPageInvalid(reason) => write!(f, "donation page invalid: {reason}"),
@@ -278,8 +281,8 @@ impl std::fmt::Display for AppError {
             Self::KeyAlreadyRegistered { nym, domain } => {
                 write!(f, "key already has active address: {nym}@{domain}")
             }
-            Self::NymQuotaExceeded { used, cap } => {
-                write!(f, "nym quota exceeded: {used}/{cap} per key")
+            Self::NymAlreadyAssigned { nym, domain } => {
+                write!(f, "key already owns lifetime nym: {nym}@{domain}")
             }
             Self::InvalidDescriptor(reason) => write!(f, "invalid descriptor: {reason}"),
             Self::AuthError(reason) => write!(f, "auth error: {reason}"),
@@ -295,7 +298,7 @@ impl std::fmt::Display for AppError {
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
-            Self::AliasTaken => write!(f, "alias already taken"),
+            Self::AliasAlreadyAssigned => write!(f, "key already owns a lifetime alias"),
 
             Self::RateLimitedSender => write!(f, "rate limited (sender)"),
             Self::RateLimitedRecipient => write!(f, "rate limited (recipient)"),
@@ -332,6 +335,7 @@ impl IntoResponse for AppError {
         let reason: String = match &self {
             AppError::NymNotFound(_) => "No Lightning Address is registered with this name.".into(),
             AppError::NymTaken => "This name is already registered.".into(),
+            AppError::NameTaken => "This public name is permanently reserved. Choose a different name.".into(),
             AppError::NymInvalid(_) => "This name contains characters that are not allowed. Names must be 1–32 characters: lowercase letters, numbers, and hyphens, with no leading or trailing hyphen.".into(),
             AppError::NymReserved => "This name is reserved by the server. Choose a different name.".into(),
             AppError::DonationPageInvalid(reason) => format!("Donation page rejected: {reason}."),
@@ -350,11 +354,11 @@ impl IntoResponse for AppError {
             AppError::MultipartInvalid(_) => "Upload form was malformed. Retry from the app.".into(),
             AppError::KeyAlreadyRegistered { nym, domain } => format!(
                 "This wallet already has an active Lightning Address: {nym}@{domain}. \
-                 Deactivate it before registering a different name."
+                 This wallet cannot claim a second name."
             ),
-            AppError::NymQuotaExceeded { cap, .. } => format!(
-                "This wallet has registered the maximum of {cap} lifetime Lightning Addresses. \
-                 Reactivate one of the existing addresses, or use a different wallet."
+            AppError::NymAlreadyAssigned { nym, domain } => format!(
+                "This wallet already owns the lifetime Lightning Address {nym}@{domain}. \
+                 Reactivate that address; a wallet cannot claim a second name."
             ),
             AppError::InvalidDescriptor(reason) => format!("The wallet descriptor was rejected: {reason}."),
             AppError::AuthError(_) => "Wallet signature did not verify.".into(),
@@ -374,8 +378,8 @@ impl IntoResponse for AppError {
             AppError::LiquidAddressAlreadyUsed => {
                 "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
-            AppError::AliasTaken => {
-                "This link name is already taken. Choose a different one.".into()
+            AppError::AliasAlreadyAssigned => {
+                "This wallet already owns a lifetime link name. Reactivate that name instead of choosing a different one.".into()
             }
 
             AppError::RateLimitedSender => "Request rate limit exceeded for this source. Retry later.".into(),
@@ -407,13 +411,9 @@ impl IntoResponse for AppError {
             AppError::KeyAlreadyRegistered { nym, domain } => {
                 Some(json!({"nym": nym, "domain": domain}))
             }
-            AppError::NymQuotaExceeded { used, cap } => Some(json!({
-                "quota": {
-                    "used": used,
-                    "cap": cap,
-                    "remaining": (cap - used).max(0),
-                },
-            })),
+            AppError::NymAlreadyAssigned { nym, domain } => {
+                Some(json!({"nym": nym, "domain": domain}))
+            }
             AppError::PurgeBlocked(n) => Some(json!({"pending_count": n})),
             AppError::ProofOfFundsRequired { min_sat } => Some(json!({"min_sat": min_sat})),
             _ => None,
@@ -426,7 +426,9 @@ impl IntoResponse for AppError {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
             AppError::BitcoinAddressAlreadyUsed
             | AppError::LiquidAddressAlreadyUsed
-            | AppError::AliasTaken => StatusCode::CONFLICT,
+            | AppError::AliasAlreadyAssigned
+            | AppError::NameTaken
+            | AppError::NymAlreadyAssigned { .. } => StatusCode::CONFLICT,
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::OK,
         };
@@ -473,10 +475,10 @@ impl From<sqlx::Error> for AppError {
             if db_err.constraint() == Some("invoice_payment_addresses_liquid_address_key") {
                 return AppError::LiquidAddressAlreadyUsed;
             }
-            // Two merchants raced to claim the same donation-page alias slug;
-            // the partial unique index is the arbiter and the loser lands here.
-            if db_err.constraint() == Some("donation_pages_alias_uidx") {
-                return AppError::AliasTaken;
+            if db_err.constraint() == Some("public_names_shared_namespace_key")
+                || db_err.constraint() == Some("public_names_name_kind_key")
+            {
+                return AppError::NameTaken;
             }
             // A second reverse swap tried to persist an already-used Boltz swap
             // id (issue #69). Boltz ids are unique, so this is an integrity

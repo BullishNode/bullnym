@@ -31,15 +31,16 @@ use crate::AppState;
 /// scrubbed from HTML, config, image URLs, and manifest.
 enum PublicBase<'a> {
     Nym { nym: &'a str, base_path: &'a str },
-    Alias { slug: &'a str },
+    Alias { slug: &'a str, base_path: &'a str },
 }
 
 #[derive(Template)]
 #[template(path = "store_amount.html")]
 struct DonationPageTpl<'a> {
     /// Public base path the page's client-side JS appends `/invoice` and
-    /// `/i/<id>` to. `/<nym>` (or `/<nym>/pos`) on nym pages, `/a/<slug>` on
-    /// alias pages — so the alias page never embeds the nym.
+    /// `/i/<id>` to. `/<nym>` (or `/<nym>/pos`) on nym pages and
+    /// `/a/<slug>` (or `/a/<slug>/pos`) on alias pages, so an alias page never
+    /// embeds the nym.
     invoice_base: String,
     header: &'a str,
     description: &'a str,
@@ -87,8 +88,8 @@ struct PwaConfigView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     nym: Option<&'a str>,
     /// Public base path the client appends `/invoice` to. `/<nym>`,
-    /// `/<nym>/pos`, or `/a/<slug>` — the client no longer composes this from
-    /// the nym, so alias pages stay nym-free.
+    /// `/<nym>/pos`, `/a/<slug>`, or `/a/<slug>/pos` — the client no longer
+    /// composes this from the nym, so alias pages stay nym-free.
     invoice_base: &'a str,
     /// Stable namespace key for client-side storage (settings, history, PIN).
     /// Equals the nym on nym pages (no migration for installed PWAs) and the
@@ -525,12 +526,32 @@ async fn manifest_for_kind(
     resp
 }
 
-/// `GET /a/:slug/manifest.webmanifest` — PWA manifest for an alias surface.
-/// Resolves the slug to its `(nym, kind)` row and serves a manifest whose name
-/// and start_url reference the slug, never the nym.
+/// `GET /a/:slug/manifest.webmanifest` — PWA manifest for the alias-selected
+/// Payment Page. Its name and start URL reference the slug, never the nym.
 pub async fn manifest_alias(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    manifest_alias_for_kind(state, slug, db::KIND_PAYMENT_PAGE, peer_opt, headers).await
+}
+
+/// `GET /a/:slug/pos/manifest.webmanifest` — PWA manifest for the POS
+/// surface selected by the same npub-level alias.
+pub async fn manifest_alias_pos(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    manifest_alias_for_kind(state, slug, db::KIND_POS, peer_opt, headers).await
+}
+
+async fn manifest_alias_for_kind(
+    state: AppState,
+    slug: String,
+    kind: &'static str,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
@@ -544,8 +565,8 @@ pub async fn manifest_alias(
         return resp;
     }
 
-    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
-        Ok(Some(p)) if p.enabled && !p.is_archived => p,
+    let page = match db::get_donation_page_by_alias(&state.db, &slug, kind).await {
+        Ok(Some(p)) if p.alias_active && p.enabled && !p.is_archived => p,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(event = "manifest_alias_db_error", slug = %slug, error = %e);
@@ -553,7 +574,11 @@ pub async fn manifest_alias(
         }
     };
 
-    let start_path = format!("/a/{slug}");
+    let start_path = if kind == db::KIND_POS {
+        format!("/a/{slug}/pos")
+    } else {
+        format!("/a/{slug}")
+    };
     let manifest = web_manifest_for_page(&page, &start_path, &slug);
 
     let body = match serde_json::to_string(&manifest) {
@@ -582,8 +607,9 @@ pub async fn manifest_alias(
 /// whether the nym is allowed to appear in the served page:
 /// - `PublicBase::Nym` → served at `/<nym>` (Payment Page) or `/<nym>/pos`;
 ///   the nym appears in config/images (installed-PWA back-compat).
-/// - `PublicBase::Alias` → served at `/a/<slug>`; the nym is scrubbed from the
-///   embedded config, image URLs (served by content hash), and manifest.
+/// - `PublicBase::Alias` → served at `/a/<slug>` or `/a/<slug>/pos`; the nym
+///   is scrubbed from the embedded config, image URLs (served by content
+///   hash), and manifest.
 ///
 /// The POS shell is selected when the row is the POS surface OR carries the
 /// legacy `pos_mode` toggle.
@@ -608,8 +634,8 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
                 .as_ref()
                 .map(|hash| format!("https://{domain}/img/{nym}/og.jpg?v={hash}")),
         ),
-        PublicBase::Alias { slug } => (
-            format!("/a/{slug}"),
+        PublicBase::Alias { slug, base_path } => (
+            base_path.to_string(),
             slug.to_string(),
             None,
             page.avatar_sha256
@@ -787,13 +813,32 @@ pub async fn render_pos(
     render_live(&state, &page, PublicBase::Nym { nym: &nym, base_path: &base_path }).await
 }
 
-/// `GET /a/:slug` — public donation surface served under a merchant-chosen
-/// alias slug, decoupled from the nym. Resolves the slug to its `(nym, kind)`
-/// row and renders the Payment Page or POS surface accordingly, with the nym
-/// scrubbed from the served page (see `render_live` / `PublicBase::Alias`).
+/// `GET /a/:slug` — public Payment Page served under an owner-level alias,
+/// decoupled from the nym and scrubbed through `PublicBase::Alias`.
 pub async fn render_alias(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    render_alias_for_kind(state, slug, db::KIND_PAYMENT_PAGE, peer_opt, headers).await
+}
+
+/// `GET /a/:slug/pos` — public POS surface selected by the same npub-level
+/// alias as the Payment Page.
+pub async fn render_alias_pos(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    render_alias_for_kind(state, slug, db::KIND_POS, peer_opt, headers).await
+}
+
+async fn render_alias_for_kind(
+    state: AppState,
+    slug: String,
+    kind: &'static str,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
@@ -807,7 +852,7 @@ pub async fn render_alias(
         return resp;
     }
 
-    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
+    let page = match db::get_donation_page_by_alias(&state.db, &slug, kind).await {
         Ok(Some(p)) => p,
         Ok(None) => return render_404(&state, &slug),
         Err(e) => {
@@ -816,14 +861,27 @@ pub async fn render_alias(
         }
     };
 
-    if page.is_archived {
+    if !page.alias_active || page.is_archived {
         return render_archived(&state, &slug);
     }
     if !page.enabled {
         return render_404(&state, &slug);
     }
 
-    render_live(&state, &page, PublicBase::Alias { slug: &slug }).await
+    let base_path = if kind == db::KIND_POS {
+        format!("/a/{slug}/pos")
+    } else {
+        format!("/a/{slug}")
+    };
+    render_live(
+        &state,
+        &page,
+        PublicBase::Alias {
+            slug: &slug,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

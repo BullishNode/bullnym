@@ -7,6 +7,17 @@ instructions.
 The backing table is still named `donation_pages`. The current surface kind is
 `payment_page`.
 
+## Public Names
+
+The owning npub may claim one optional lifetime alias shared with its POS. A
+Payment Page is published at `/a/<alias>` and POS at `/a/<alias>/pos`. Without
+an active alias, the effective public name falls back to the nym and no alias
+claim is synthesized. Nym routes remain valid after an alias is claimed.
+
+Nyms and aliases share one reservation namespace. Clearing an alias only
+deactivates it; the same npub may reactivate it, but nobody can reuse it and the
+owner cannot replace it with a second alias.
+
 ## Ownership
 
 A Payment Page belongs to a nym and is managed by the same `npub` that owns the

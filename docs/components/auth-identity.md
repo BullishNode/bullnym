@@ -55,7 +55,10 @@ creation time.
 
 ## Nym Reservation Rules
 
-Deactivated nyms remain reserved to the original owner and cannot be claimed by
-another `npub`. The server enforces a lifetime nym cap per owner key and blocks
-reserved names that would shadow explicit routes such as `/health`, `/api`, or
-`/register`.
+`public_name_owners` is the stable npub identity registry and `public_names`
+holds permanent nym and alias claims. An npub may make one lifetime nym claim
+and one optional lifetime alias claim. Deactivation changes only active state;
+it never releases ownership. New nym and alias claims share one namespace, so
+a string reserved as either type cannot later be claimed as the other. The
+server also blocks names that would shadow explicit routes such as `/health`,
+`/api`, or `/register`.

@@ -115,13 +115,17 @@ policy inline.
 ## Donation Page Alias (public URL slug)
 
 - Current field: `alias` on signed `PUT /donation-page` (save) requests. A
-  merchant-chosen slug served at `/a/<alias>`, decoupled from the nym.
+  merchant-chosen npub-level slug served at `/a/<alias>` for Payment Page and
+  `/a/<alias>/pos` for POS, decoupled from the nym.
 - Compatibility behavior: `alias` is the NEWEST optional trailing signed field,
   appended AFTER `kind` (order: `pos_mode?`, `ct_descriptor?`, `kind?`,
   `alias?`). Any client that omits it verifies against the older byte layout,
   which stays a strict prefix of the new one, so shipped Bull Wallet signatures
-  keep verifying. Tri-state: absent leaves the stored alias unchanged, `""`
-  clears it, a non-empty value claims it (409 `AliasTaken` on collision).
+  keep verifying. Tri-state: absent leaves the owner-level state unchanged,
+  `""` deactivates without releasing the lifetime reservation, and a non-empty
+  value first-claims or reactivates the same alias. A different later alias is
+  rejected with `AliasAlreadyAssigned`; a nym/alias namespace collision is
+  `NameTaken`.
 - Confusion guard (load-bearing): `alias` is validated BEFORE signature
   verification and its value domain is kept provably disjoint from the other
   optional trailing fields, so a captured legacy message whose sole trailing

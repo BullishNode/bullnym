@@ -490,23 +490,32 @@ fn build_router(state: AppState) -> Router {
                 post(invoice::create_anonymous_pos).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/:nym/i/:id", get(invoice::render_payment))
-            // Alias surfaces served at `/a/<slug>`, decoupled from the nym.
+            .route("/:nym/pos/i/:id", get(invoice::render_payment))
+            // Alias surfaces are selected by one npub-level alias while the
+            // route selects Payment Page versus POS.
             // The literal `/a` first segment out-prioritises the `/:nym/...`
-            // param routes, and the two-segment shape can never be claimed by
-            // the single-segment donation-page fallback. One invoice route
-            // serves both the alias Payment Page and POS (kind resolved from
-            // the row); status/offer polling stays on the id-only
-            // `/api/v1/invoices/:id/...` routes.
+            // parameter routes, and alias paths cannot fall into the
+            // single-segment donation-page fallback.
             .route("/a/:slug", get(donation_render::render_alias))
+            .route("/a/:slug/pos", get(donation_render::render_alias_pos))
             .route(
                 "/a/:slug/manifest.webmanifest",
                 get(donation_render::manifest_alias),
             )
             .route(
+                "/a/:slug/pos/manifest.webmanifest",
+                get(donation_render::manifest_alias_pos),
+            )
+            .route(
                 "/a/:slug/invoice",
                 post(invoice::create_anonymous_alias).layer(DefaultBodyLimit::max(1024)),
             )
-            .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
+            .route(
+                "/a/:slug/pos/invoice",
+                post(invoice::create_anonymous_alias_pos).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/a/:slug/i/:id", get(invoice::render_payment_alias))
+            .route("/a/:slug/pos/i/:id", get(invoice::render_payment_alias));
 
         // Donation-page image upload needs a 2 MiB body cap, well above the
         // 64 KiB global. Layers are per-router in axum 0.7+ — putting the

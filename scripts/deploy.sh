@@ -34,6 +34,7 @@ fi
 
 echo "NOTE: migrations are applied manually and deliberately:"
 echo "  PGPASSWORD=\$(cat ~/.pgpass_payservice) psql -h 127.0.0.1 -U payservice -d payservice -f migrations/NNN_*.sql"
+echo "  public names: quiesce writes, apply 045, resolve every reported alias choice, then apply 046"
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'
 
 export CARGO_BUILD_JOBS=2

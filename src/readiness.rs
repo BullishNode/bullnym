@@ -172,6 +172,22 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND column_name = 'last_reconciled_at' \
             ) \
             AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'public_name_owners' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'public_names' \
+                  AND column_name = 'grandfathered' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_trigger \
+                WHERE tgname = 'public_names_enforce_new_claim_trigger' \
+                  AND NOT tgisinternal \
+            ) \
+            AND NOT EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \

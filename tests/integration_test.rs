@@ -134,6 +134,23 @@ fn test_app(state: AppState) -> Router {
         .route("/:nym/pos", get(donation_render::render_pos))
         .route("/:nym/invoice", post(invoice::create_anonymous))
         .route("/:nym/pos/invoice", post(invoice::create_anonymous_pos))
+        .route("/a/:slug", get(donation_render::render_alias))
+        .route("/a/:slug/pos", get(donation_render::render_alias_pos))
+        .route(
+            "/a/:slug/manifest.webmanifest",
+            get(donation_render::manifest_alias),
+        )
+        .route(
+            "/a/:slug/pos/manifest.webmanifest",
+            get(donation_render::manifest_alias_pos),
+        )
+        .route("/a/:slug/invoice", post(invoice::create_anonymous_alias))
+        .route(
+            "/a/:slug/pos/invoice",
+            post(invoice::create_anonymous_alias_pos),
+        )
+        .route("/a/:slug/i/:id", get(invoice::render_payment_alias))
+        .route("/a/:slug/pos/i/:id", get(invoice::render_payment_alias))
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route(
@@ -152,10 +169,12 @@ fn test_app(state: AppState) -> Router {
             axum::routing::delete(invoice::cancel_unlinked),
         )
         .route("/:nym/i/:id", get(invoice::render_payment))
+        .route("/:nym/pos/i/:id", get(invoice::render_payment))
         .route("/invoice/:id", get(invoice::render_unlinked_payment))
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
         .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
+        .fallback(donation_render::render_or_404)
         .with_state(state)
 }
 
@@ -367,6 +386,7 @@ struct DonationSaveSignFields<'a> {
     pos_mode: Option<bool>,
     ct_descriptor: Option<&'a str>,
     kind: Option<&'a str>,
+    alias: Option<&'a str>,
 }
 
 fn sign_donation_page_save_with_keypair(
@@ -397,6 +417,9 @@ fn sign_donation_page_save_with_keypair(
     if let Some(kind) = save.kind {
         fields.push(kind);
     }
+    if let Some(alias) = save.alias {
+        fields.push(alias);
+    }
     sign_la_action(keypair, "donation-page-save", npub, nym, &fields)
 }
 
@@ -422,6 +445,20 @@ async fn cleanup_db(pool: &PgPool) {
         .await
         .ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('bullnym.allow_public_name_delete', 'on', TRUE)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM public_names")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM public_name_owners")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -453,6 +490,17 @@ async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+async fn get_text(app: &Router, uri: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 async fn get_json_with_headers(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Value) {
@@ -689,6 +737,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -746,6 +795,7 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             pos_mode: Some(true),
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -808,6 +858,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -839,6 +890,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: Some("pos"),
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -880,6 +932,186 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
 }
 
 #[tokio::test]
+async fn one_alias_serves_both_surfaces_and_clear_falls_back_to_nym() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "sharedalias";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Shared Page",
+            description: "Payment Page",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some("payment_page"),
+            alias: Some("shared-shop"),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Shared Page",
+            "description": "Payment Page",
+            "display_currency": "USD",
+            "enabled": true,
+            "kind": "payment_page",
+            "alias": "shared-shop",
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["public_url"], "https://test.example.com/a/shared-shop");
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Shared POS",
+            description: "Counter",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some("pos"),
+            alias: None,
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Shared POS",
+            "description": "Counter",
+            "display_currency": "USD",
+            "enabled": true,
+            "kind": "pos",
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["alias"], "shared-shop");
+    assert_eq!(
+        body["public_url"],
+        "https://test.example.com/a/shared-shop/pos"
+    );
+
+    assert_eq!(get_path(&app, "/a/shared-shop").await.0, StatusCode::OK);
+    assert_eq!(get_path(&app, "/a/shared-shop/pos").await.0, StatusCode::OK);
+    assert_eq!(
+        get_path(&app, "/a/shared-shop/manifest.webmanifest")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_path(&app, "/a/shared-shop/pos/manifest.webmanifest")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, missing_invoice) = get_path(
+        &app,
+        "/a/shared-shop/pos/i/00000000-0000-0000-0000-000000000000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(missing_invoice["code"], "InvoiceNotFound");
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Shared POS",
+            description: "Counter",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some("pos"),
+            alias: Some(""),
+        },
+    );
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Shared POS",
+            "description": "Counter",
+            "display_currency": "USD",
+            "enabled": true,
+            "kind": "pos",
+            "alias": "",
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["alias"], Value::Null);
+    assert_eq!(
+        body["public_url"],
+        format!("https://test.example.com/{nym}/pos")
+    );
+    assert_eq!(get_path(&app, &format!("/{nym}")).await.0, StatusCode::OK);
+    assert_eq!(
+        get_path(&app, &format!("/{nym}/pos")).await.0,
+        StatusCode::OK
+    );
+
+    let (status, archived_html) = get_text(&app, "/a/shared-shop").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(archived_html.contains("no longer accepting donations"));
+
+    let (status, body) =
+        post_json(&app, "/a/shared-shop/invoice", json!({"amount_sat": 1000})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], "DonationPageNotFound");
+    assert_eq!(
+        get_path(&app, "/a/shared-shop/manifest.webmanifest")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn pos_save_without_descriptor_is_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -908,6 +1140,7 @@ async fn pos_save_without_descriptor_is_rejected() {
             pos_mode: None,
             ct_descriptor: None,
             kind: Some("pos"),
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -955,6 +1188,7 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -1309,8 +1543,9 @@ async fn register_duplicate_nym_rejected() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "NameTaken");
 
     cleanup_db(&pool).await;
 }
@@ -1490,6 +1725,8 @@ async fn webhook_skips_terminal_swaps() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: None,
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1554,6 +1791,9 @@ async fn webhook_advances_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_WEBHOOK_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1608,6 +1848,9 @@ async fn webhook_skips_terminal_chain_swap_records() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"CHAIN_TERMINAL_1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -1727,7 +1970,7 @@ async fn delete_registration_deactivates_user() {
 // --- Nym lifecycle tests ---
 
 #[tokio::test]
-async fn reregister_after_delete_succeeds() {
+async fn different_nym_after_delete_is_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -1764,20 +2007,24 @@ async fn reregister_after_delete_succeeds() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Re-register with new nym, same npub
+    // A deactivated wallet may restore its lifetime nym, but cannot replace it
+    // with a different one.
     let (new_sig, new_timestamp) =
         sign_register_with_keypair(&keypair, &npub, "lifecycle2", TEST_DESCRIPTOR);
     let (status, body) = post_json(&app, "/register", json!({
         "nym": "lifecycle2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": new_sig, "timestamp": new_timestamp,
     })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["nym"], "lifecycle2");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "NymAlreadyAssigned");
+    assert_eq!(body["details"]["nym"], "lifecycle1");
 
-    // New nym resolves
+    // The rejected nym was never created.
     let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle2").await;
-    assert_eq!(body["tag"], "payRequest");
+    assert_eq!(body["status"], "ERROR");
 
-    // Old nym does not resolve
+    // The lifetime nym remains reserved but inactive until explicitly
+    // reactivated with the same name.
     let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle1").await;
     assert_eq!(body["status"], "ERROR");
 
@@ -2733,7 +2980,7 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     .await
     .unwrap();
 
-    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool)
+    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 0)
         .await
         .unwrap();
     assert_eq!(expired_count, 2);
@@ -2773,6 +3020,7 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
         btc_sat: 300,
         liquid_sat: 60,
         lightning_sat: 1,
+        payment_grace_secs: 0,
     };
 
     let rows = pay_service::db::record_invoice_payment(
@@ -3388,7 +3636,7 @@ async fn checkout_underpaid_liquid_address_remains_watchable_and_recoverable() {
         .await
         .unwrap();
 
-    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let candidates = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     assert!(candidates
@@ -3722,6 +3970,8 @@ async fn invoice_only_lightning_swap_does_not_require_nym() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3812,7 +4062,7 @@ async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
     let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
     let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
 
-    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
         .unwrap();
     let invoice_ids: std::collections::HashSet<_> =
@@ -3844,6 +4094,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3866,6 +4118,8 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
             claim_key_hex: "dd".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3905,6 +4159,9 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chain-swap-rec-1\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -3973,6 +4230,9 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainretry-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4032,6 +4292,9 @@ async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
             claim_key_hex: "22".repeat(32).as_str(),
             refund_key_hex: "33".repeat(32).as_str(),
             boltz_response_json: "{\"id\":\"chainfail-swap\"}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4089,6 +4352,8 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
             claim_key_hex: "bb".repeat(32).as_str(),
             boltz_response_json: "{}",
             invoice_id: Some(invoice.id),
+            key_index: None,
+            root_fingerprint: None,
         },
     )
     .await
@@ -4380,55 +4645,18 @@ fn schnorr_sign_verify_roundtrip() {
     );
 }
 
-/// Two concurrent registers from the same npub, when only one slot remains
-/// under the lifetime cap, must result in exactly one Created and one
-/// non-success response — never two Createds (which would overshoot the cap)
-/// and never InternalError (the bug pre-advisory-lock).
+/// Two concurrent first registrations from one npub must create exactly one
+/// lifetime nym reservation. The loser sees the active claim, never a second
+/// row or an InternalError.
 #[tokio::test]
-async fn register_concurrent_does_not_exceed_cap() {
+async fn register_concurrent_creates_one_lifetime_nym() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
 
     // One keypair → one npub for all calls.
-    let (npub_hex, _, _, kp) = sign_registration_with_keypair("filler-0", TEST_DESCRIPTOR);
+    let (npub_hex, _, _, kp) = sign_registration_with_keypair("conc-a", TEST_DESCRIPTOR);
 
-    // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
-    // creating + deactivating filler rows. Goes through the atomic flow
-    // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-0",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-1",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Two concurrent register calls — only one slot remains. Without the
-    // advisory lock, both would pass `used < cap` (read=2) and both would
-    // INSERT, leaving 4 lifetime rows. With the lock, the loser sees either
-    // the active nym created by the winner or the exhausted lifetime cap.
     let (sig_a, timestamp_a) =
         sign_register_with_keypair(&kp, &npub_hex, "conc-a", TEST_DESCRIPTOR);
     let (sig_b, timestamp_b) =
@@ -4464,11 +4692,11 @@ async fn register_concurrent_does_not_exceed_cap() {
         (status_a == StatusCode::CREATED) as u32 + (status_b == StatusCode::CREATED) as u32;
     let guarded_reject_count = matches!(
         body_a["code"].as_str(),
-        Some("NymQuotaExceeded" | "KeyAlreadyRegistered")
+        Some("KeyAlreadyRegistered")
     ) as u32
         + matches!(
             body_b["code"].as_str(),
-            Some("NymQuotaExceeded" | "KeyAlreadyRegistered")
+            Some("KeyAlreadyRegistered")
         ) as u32;
 
     assert_eq!(
@@ -4487,13 +4715,20 @@ async fn register_concurrent_does_not_exceed_cap() {
         "must not return InternalError under contention; got {codes:?}"
     );
 
-    // DB invariant: exactly cap rows under this npub.
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
         .bind(&npub_hex)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 3, "lifetime cap must hold under contention");
+    let claim_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public_names \
+         WHERE owner_npub = $1 AND kind = 'nym'",
+    )
+    .bind(&npub_hex)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((user_count, claim_count), (1, 1));
 
     cleanup_db(&pool).await;
 }
