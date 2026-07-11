@@ -1,6 +1,9 @@
 /target
+/target2
 .env
 *.sqlite
+.agents/
+.codex/
 
 # Local Claude assistant scratch — never commit (workspace rule).
 CLAUDE.md

@@ -508,14 +508,6 @@ fn build_router(state: AppState) -> Router {
             )
             .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
 
-        // Donation-page image upload needs a 2 MiB body cap, well above the
-        // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
-        // image route in its own sub-router with its own RequestBodyLimitLayer
-        // keeps the global tight while letting this one path accept binaries.
-        let image_upload_router: Router<AppState> = Router::new()
-            .route("/donation-page/image", post(donation_page::upload_image))
-            .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
-        router = router.merge(image_upload_router);
     }
 
     if invoice_sessions_enabled {
