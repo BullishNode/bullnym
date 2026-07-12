@@ -20,8 +20,8 @@ use tower_http::trace::TraceLayer;
 
 use pay_service::{
     bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, donation_page,
-    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
-    reconciler, registration,
+    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, og_image, pricer, qr, rate_limit,
+    readiness, reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -51,6 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::Config::load(&config_path)?;
     tracing::info!("loaded config for domain: {}", config.domain);
+    if config.features.payment_pages {
+        og_image::ensure_fallbacks(&config.donation.image_root_path)
+            .await
+            .map_err(|e| format!("initialize branded OG fallbacks: {e}"))?;
+    }
     if config.rate_limit.trust_forwarded_for {
         tracing::warn!(
             "rate_limit.trust_forwarded_for=true; only run this behind a trusted reverse proxy \
@@ -70,6 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.features.nip05,
         config.workers.enabled,
     );
+    if config.features.payment_pages && !config.workers.enabled {
+        tracing::warn!(
+            "Payment Pages are enabled while background workers are disabled; \
+             OG generation still runs on save, but legacy backfill, retries, and \
+             host-local missing-file verification will not run"
+        );
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
@@ -193,6 +205,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = CancellationToken::new();
     if config.workers.enabled {
         tracing::info!("background workers enabled");
+        if config.features.payment_pages {
+            og_image::spawn_reconciler(
+                pool.clone(),
+                config.donation.image_root_path.clone(),
+                cancel.clone(),
+            );
+            tracing::info!("Payment Page OG image reconciler started");
+        }
         claimer::spawn_background_claimer(
             pool.clone(),
             config.clone(),
@@ -449,6 +469,7 @@ fn build_router(state: AppState) -> Router {
             // the row); status/offer polling stays on the id-only
             // `/api/v1/invoices/:id/...` routes.
             .route("/a/:slug", get(donation_render::render_alias))
+            .route("/a/:slug/", get(donation_render::render_alias))
             .route(
                 "/a/:slug/manifest.webmanifest",
                 get(donation_render::manifest_alias),
@@ -458,15 +479,6 @@ fn build_router(state: AppState) -> Router {
                 post(invoice::create_anonymous_alias).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
-
-        // Donation-page image upload needs a 2 MiB body cap, well above the
-        // 64 KiB global. Layers are per-router in axum 0.7+ — putting the
-        // image route in its own sub-router with its own RequestBodyLimitLayer
-        // keeps the global tight while letting this one path accept binaries.
-        let image_upload_router: Router<AppState> = Router::new()
-            .route("/donation-page/image", post(donation_page::upload_image))
-            .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
-        router = router.merge(image_upload_router);
     }
 
     if invoice_sessions_enabled {
@@ -527,6 +539,22 @@ fn build_router(state: AppState) -> Router {
         router = router.route(
             "/api/v1/:nym/invoices/:id/recover",
             post(invoice::recover_chain_swap).layer(DefaultBodyLimit::max(1024)),
+        );
+    }
+
+    // Signed, npub-keyed detection of stuck (recoverable) chain swaps. Read-only
+    // and ALWAYS-ON — deliberately NOT gated by `chain_swap_merchant_recovery`
+    // (that flag guards the dangerous broadcast path only): merchants must be
+    // able to SEE stranded funds before the recover action is enabled. The
+    // response carries `recovery_enabled` so the server drives the "Recover now"
+    // vs "Contact support" UI. Guarded by `invoices || payment_pages` for the
+    // same reason as the recover route: chain swaps are born under checkout
+    // (`payment_pages`), so a merchant could have a `refund_due` swap even on a
+    // deployment with `invoices` off — the detection route must not be absent.
+    if features.invoices || features.payment_pages {
+        router = router.route(
+            "/api/v1/invoices/recoverable",
+            get(invoice::list_recoverable_signed),
         );
     }
 

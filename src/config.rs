@@ -341,85 +341,28 @@ fn default_pwa_dist_dir() -> String {
     DEFAULT_PWA_DIST_DIR.to_string()
 }
 
-// --- Donation page image pipeline ---
+// --- Legacy donation page media ---
 
 const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
-const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
-const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 5_000;
-const DEFAULT_DONATION_IMAGE_MAX_PIXELS: u64 = 12_000_000;
-const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
-const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
-const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DonationConfig {
-    /// Filesystem root for image storage. The handler writes to
-    /// `<image_root_path>/<nym>/<kind>.webp`. nginx serves this directly
-    /// at `location ^~ /img/`. The directory must be writable by the
-    /// pay-service user and readable by nginx.
+    /// Filesystem root for previously stored Payment Page media. nginx serves
+    /// this directly at `location ^~ /img/` for legacy pages.
     #[serde(default = "default_donation_image_root")]
     pub image_root_path: String,
-    /// Hard cap on incoming image bytes. Enforced via per-route
-    /// `DefaultBodyLimit` BEFORE the multipart parser runs — bytes never
-    /// enter memory beyond this.
-    #[serde(default = "default_donation_image_max_bytes")]
-    pub image_max_bytes: usize,
-    /// Reject images whose decoded dimensions exceed this in either
-    /// axis. Image-bomb defense: read the header dimensions first
-    /// (cheap), reject before allocating the full pixel buffer. The
-    /// default is intentionally below large-camera panoramas because decode
-    /// memory grows with pixels, not upload bytes.
-    #[serde(default = "default_donation_image_max_dimension")]
-    pub image_max_dimension: u32,
-    /// Reject images whose decoded pixel area exceeds this value before
-    /// allocating the full pixel buffer.
-    #[serde(default = "default_donation_image_max_pixels")]
-    pub image_max_pixels: u64,
-    /// Output size for resized avatar (square).
-    #[serde(default = "default_donation_avatar_size")]
-    pub avatar_size: u32,
-    /// Output size for resized OG image (1200×630 is the Twitter/Facebook
-    /// summary_large_image standard).
-    #[serde(default = "default_donation_og_width")]
-    pub og_width: u32,
-    #[serde(default = "default_donation_og_height")]
-    pub og_height: u32,
 }
 
 impl Default for DonationConfig {
     fn default() -> Self {
         Self {
             image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
-            image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
-            image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
-            image_max_pixels: DEFAULT_DONATION_IMAGE_MAX_PIXELS,
-            avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
-            og_width: DEFAULT_DONATION_OG_WIDTH,
-            og_height: DEFAULT_DONATION_OG_HEIGHT,
         }
     }
 }
 
 fn default_donation_image_root() -> String {
     DEFAULT_DONATION_IMAGE_ROOT.to_string()
-}
-fn default_donation_image_max_bytes() -> usize {
-    DEFAULT_DONATION_IMAGE_MAX_BYTES
-}
-fn default_donation_image_max_dimension() -> u32 {
-    DEFAULT_DONATION_IMAGE_MAX_DIMENSION
-}
-fn default_donation_image_max_pixels() -> u64 {
-    DEFAULT_DONATION_IMAGE_MAX_PIXELS
-}
-fn default_donation_avatar_size() -> u32 {
-    DEFAULT_DONATION_AVATAR_SIZE
-}
-fn default_donation_og_width() -> u32 {
-    DEFAULT_DONATION_OG_WIDTH
-}
-fn default_donation_og_height() -> u32 {
-    DEFAULT_DONATION_OG_HEIGHT
 }
 
 const DEFAULT_POOL_SIZE: u32 = 10;
@@ -771,18 +714,6 @@ pub struct RateLimitConfig {
     #[serde(default = "default_donation_manifest_rate_window_secs")]
     pub donation_manifest_rate_window_secs: u32,
 
-    // --- Donation page image upload ---
-    /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
-    /// because a real user uploads avatar + OG once per session, not
-    /// many times per hour.
-    #[serde(default = "default_donation_image_uploads_per_npub_per_hour")]
-    pub donation_image_uploads_per_npub_per_hour: u32,
-    /// Per-source upload rate-limit. Defense-in-depth against IP-rotated
-    /// abuse — stops one IP from uploading to many npubs in quick
-    /// succession.
-    #[serde(default = "default_donation_image_uploads_per_source_per_min")]
-    pub donation_image_uploads_per_source_per_min: u32,
-
     /// Per-source rate-limit on public invoice status polling.
     #[serde(
         default = "default_invoice_status_per_source_per_min",
@@ -848,10 +779,6 @@ impl Default for RateLimitConfig {
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
             donation_manifest_rate_limit: default_donation_manifest_rate_limit(),
             donation_manifest_rate_window_secs: default_donation_manifest_rate_window_secs(),
-            donation_image_uploads_per_npub_per_hour:
-                default_donation_image_uploads_per_npub_per_hour(),
-            donation_image_uploads_per_source_per_min:
-                default_donation_image_uploads_per_source_per_min(),
             invoice_status_per_source_per_min: default_invoice_status_per_source_per_min(),
             invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
             invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
@@ -997,11 +924,11 @@ fn default_lightning_per_source_limit() -> u32 {
 fn default_lightning_per_source_window_secs() -> u32 {
     3600
 }
-/// 60/min: comfortable for a viral page being reloaded by many donators
-/// on the same NAT, while still bounding volumetric scraping. Per-source
-/// keying uses `source_key()` (IPv6 /56 aggregation).
+/// 300/min: link-preview providers legitimately fetch many unrelated public
+/// Pages through a small crawler IP pool. The nginx cache and this generous
+/// backstop absorb that traffic without a User-Agent trust bypass.
 fn default_donation_html_rate_limit() -> u32 {
-    60
+    300
 }
 fn default_donation_html_rate_window_secs() -> u32 {
     60
@@ -1011,15 +938,6 @@ fn default_donation_manifest_rate_limit() -> u32 {
 }
 fn default_donation_manifest_rate_window_secs() -> u32 {
     default_donation_html_rate_window_secs()
-}
-/// 6/h per npub: a real user uploads avatar + OG once per setup; six is
-/// generous headroom for retries and accidental re-uploads.
-fn default_donation_image_uploads_per_npub_per_hour() -> u32 {
-    6
-}
-/// 3/min per source: defense-in-depth against IP-rotated abuse.
-fn default_donation_image_uploads_per_source_per_min() -> u32 {
-    3
 }
 /// 60/min: invoice payment pages poll status during an active session.
 fn default_invoice_status_per_source_per_min() -> u32 {
@@ -1227,12 +1145,6 @@ impl Config {
         }
         if self.proof.message_tag.is_empty() {
             return Err("proof.message_tag must be non-empty".into());
-        }
-        if self.donation.image_max_dimension == 0 {
-            return Err("donation.image_max_dimension must be > 0".into());
-        }
-        if self.donation.image_max_pixels == 0 {
-            return Err("donation.image_max_pixels must be > 0".into());
         }
         if self.certification.enabled {
             if self.certification.token.is_empty() {

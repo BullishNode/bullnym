@@ -34,7 +34,7 @@ bullpay-la-v2\0donation-page-save\0<npub_hex>\0<nym>\0<f1>\0<f2>\0…\0<fN>\0<ti
 | # | field | rule |
 |---|-------|------|
 | 1 | `header` | always |
-| 2 | `description` | always (may be `""` — description is optional) |
+| 2 | `description` | always; explicit `kind=payment_page` requires 1-120 grapheme clusters and at most 512 UTF-8 bytes. Legacy requests that omit `kind` retain the former optional, at-most-280-byte contract. |
 | 3 | `display_currency` | always |
 | 4 | `website` | `""` when not set |
 | 5 | `twitter` | `""` when not set |

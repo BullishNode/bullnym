@@ -446,6 +446,91 @@ pub async fn get_refunding_chain_swap_for_invoice(
     .await
 }
 
+/// Merchant-detection projection: one row per chain swap of this npub in a
+/// recovery lifecycle state (`refund_due | refunding | refunded`), joined with
+/// minimal invoice context. Excludes ALL key material (`preimage_hex`,
+/// `claim_key_hex`, `refund_key_hex`, `boltz_response_json`, `boltz_swap_id`)
+/// by construction — those columns are never selected. Backs the signed
+/// `GET /api/v1/invoices/recoverable` detection endpoint; see
+/// `invoice::list_recoverable_signed`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct RecoverableChainSwapRow {
+    pub invoice_id: Uuid,
+    /// Owning nym (SF1 guarantees this is set for any swap that can exist; a
+    /// NULL row is legacy/manual data the API path skips). Used to build the
+    /// per-nym recover URL client-side.
+    pub nym: Option<String>,
+    pub status: String,
+    pub user_lock_amount_sat: i64,
+    /// COALESCE(renegotiated, original) — the renegotiation-aware value.
+    pub effective_server_lock_amount_sat: i64,
+    pub lockup_address: String,
+    /// Committed first-write-wins refund destination, or NULL. Part of the
+    /// reinstall reconciliation payload.
+    pub refund_address: Option<String>,
+    /// Broadcast recovery txid, or NULL until `refunded`.
+    pub refund_txid: Option<String>,
+    pub swap_created_at_unix: i64,
+    pub swap_updated_at_unix: i64,
+    pub invoice_status: String,
+    pub invoice_amount_sat: i64,
+    pub invoice_fiat_amount_minor: Option<i32>,
+    pub invoice_fiat_currency: Option<String>,
+    pub invoice_public_description: Option<String>,
+    pub invoice_number: Option<String>,
+    pub invoice_created_at_unix: i64,
+}
+
+/// All chain swaps owned by `npub_owner` currently in a recovery lifecycle
+/// state, oldest-first within status (`refund_due` before `refunding` before
+/// `refunded`). Scoped by `invoices.npub_owner`, so it answers "does this
+/// merchant have stranded funds?" in one query with no pagination — the
+/// populated size is stuck-swap incidents (expected 0). `limit` is applied as a
+/// hard cap (handler passes `RECOVERABLE_LIST_LIMIT + 1` to detect overflow).
+/// Driven by `chain_swap_records_status_idx` (migration 025) over a globally
+/// rare status set. Selects no key material.
+pub async fn list_recoverable_chain_swaps_for_npub(
+    pool: &PgPool,
+    npub_owner: &str,
+    limit: i64,
+) -> Result<Vec<RecoverableChainSwapRow>, sqlx::Error> {
+    sqlx::query_as::<_, RecoverableChainSwapRow>(
+        "SELECT cs.invoice_id, \
+                cs.nym, \
+                cs.status, \
+                cs.user_lock_amount_sat, \
+                COALESCE(cs.renegotiated_server_lock_amount_sat, \
+                         cs.server_lock_amount_sat) AS effective_server_lock_amount_sat, \
+                cs.lockup_address, \
+                cs.refund_address, \
+                cs.refund_txid, \
+                EXTRACT(EPOCH FROM cs.created_at)::BIGINT AS swap_created_at_unix, \
+                EXTRACT(EPOCH FROM cs.updated_at)::BIGINT AS swap_updated_at_unix, \
+                i.status AS invoice_status, \
+                i.amount_sat AS invoice_amount_sat, \
+                i.fiat_amount_minor AS invoice_fiat_amount_minor, \
+                i.fiat_currency AS invoice_fiat_currency, \
+                i.public_description AS invoice_public_description, \
+                i.invoice_number, \
+                EXTRACT(EPOCH FROM i.created_at)::BIGINT AS invoice_created_at_unix \
+         FROM chain_swap_records cs \
+         JOIN invoices i ON i.id = cs.invoice_id \
+         WHERE i.npub_owner = $1 \
+           AND cs.status IN ('refund_due', 'refunding', 'refunded') \
+         ORDER BY CASE cs.status \
+                      WHEN 'refund_due' THEN 0 \
+                      WHEN 'refunding'  THEN 1 \
+                      ELSE 2 \
+                  END, \
+                  cs.created_at ASC \
+         LIMIT $2",
+    )
+    .bind(npub_owner)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Records the customer's BTC refund address, FIRST-WRITE-WINS and immutable
 /// (G13/G14): the UPDATE only fires when `refund_address IS NULL` and the swap
 /// is still `refund_due`, so a bystander who knows the public invoice URL cannot

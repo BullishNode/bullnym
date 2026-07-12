@@ -45,6 +45,10 @@ so it does not get confused with the product contract.
 
 ## Reference
 
+- [Complete API Reference](api-reference.md): endpoint-by-endpoint client
+  contract, authentication bytes, request and response options, error handling,
+  retries, payment semantics, and the security/privacy implications of each
+  integration choice.
 - [Payment Architecture](payment-architecture.md): cross-product payment
   semantics and rail accounting model.
 - [Compatibility Ledger](compatibility-ledger.md): compatibility behavior that
@@ -52,8 +56,9 @@ so it does not get confused with the product contract.
 - [Alias Slugs — Client Integration](alias-slugs-client-integration.md):
   merchant-chosen `/a/<slug>` surfaces (issue #57) — the signed save field, the
   request/response contract, and the nym-scrubbing a client relies on.
-- [LUD-22 Currency Negotiation](lud-22-currency-negotiation.md): protocol
-  extension notes.
+- [LUD-22 Liquid Payment Negotiation](lud-22-currency-negotiation.md): exact
+  callback fields, ownership proof, commitment verification, responses, and
+  fallback semantics implemented by Bullnym.
 - [LUD-22 vs MRH](lud-22-vs-mrh-research.md): rationale for not using Magic
   Routing Hint as the on-chain shortcut.
 - [Stuck Swap Runbook](runbook-stuck-swap.md): operator recovery reference.

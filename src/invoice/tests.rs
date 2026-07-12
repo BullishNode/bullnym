@@ -72,6 +72,17 @@ fn recover_payload_field_order() {
 }
 
 #[test]
+fn recovery_list_payload_field_order() {
+    let f = recovery_list_payload_fields();
+    assert_eq!(
+        f.len(),
+        0,
+        "invoice-recovery-list is a ZERO-field signed payload — adding a field \
+         is a wire-breaking change the mobile signer MUST match in lockstep"
+    );
+}
+
+#[test]
 fn action_constants_distinct() {
     assert_ne!(ACTION_CREATE, ACTION_CANCEL);
     assert_ne!(ACTION_CREATE, ACTION_LIST);
@@ -79,6 +90,10 @@ fn action_constants_distinct() {
     assert_ne!(ACTION_RECOVER, ACTION_CREATE);
     assert_ne!(ACTION_RECOVER, ACTION_CANCEL);
     assert_ne!(ACTION_RECOVER, ACTION_LIST);
+    assert_ne!(ACTION_RECOVERY_LIST, ACTION_RECOVER);
+    assert_ne!(ACTION_RECOVERY_LIST, ACTION_LIST);
+    assert_ne!(ACTION_RECOVERY_LIST, ACTION_CREATE);
+    assert_ne!(ACTION_RECOVERY_LIST, ACTION_CANCEL);
 }
 
 #[test]

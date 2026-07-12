@@ -11,7 +11,7 @@ signature payloads, DTO parsing, or error mapping.
 Current signed mobile surfaces include:
 
 - Lightning Address registration/update/recovery and NIP-05 verification;
-- Payment Page get/save/archive/image upload;
+- Payment Page get/save/archive;
 - linked and unlinked invoice create/list/cancel;
 - BTCPay/SamRock descriptor exchange through the owning BTCPay flow.
 

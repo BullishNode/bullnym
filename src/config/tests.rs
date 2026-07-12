@@ -99,14 +99,6 @@ fn rate_limit_invoice_status_accepts_legacy_key() {
     assert_eq!(cfg.invoice_status_per_source_per_min, 43);
 }
 
-#[test]
-fn donation_image_default_dimension_bounds_decode_memory() {
-    let cfg = DonationConfig::default();
-
-    assert_eq!(cfg.image_max_dimension, 5_000);
-    assert_eq!(cfg.image_max_pixels, 12_000_000);
-}
-
 fn production_base_config() -> Config {
     Config {
         domain: "pay.example.com".to_string(),
@@ -204,18 +196,6 @@ fn non_production_allows_dev_webhook_and_public_listen() {
     cfg.boltz_webhook_url_secret.clear();
 
     cfg.validate_for_runtime("development", false).unwrap();
-}
-
-#[test]
-fn image_pixel_cap_must_be_nonzero() {
-    let mut cfg = production_base_config();
-    cfg.donation.image_max_pixels = 0;
-
-    let err = cfg.validate_for_runtime("development", false).unwrap_err();
-
-    assert!(err
-        .to_string()
-        .contains("donation.image_max_pixels must be > 0"));
 }
 
 #[test]

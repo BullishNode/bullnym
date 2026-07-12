@@ -64,6 +64,7 @@ pub const ACTION_CREATE: &str = "invoice-create";
 pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
 pub const ACTION_RECOVER: &str = "invoice-recover";
+pub const ACTION_RECOVERY_LIST: &str = "invoice-recovery-list";
 
 /// Hard upper bound and default for wallet-origin invoice expiry (7 days).
 /// Clients may omit `expires_at_unix`; the server then uses this default.
@@ -396,12 +397,12 @@ fn html_response(html: String) -> Response {
 // GET /robots.txt
 // =====================================================================
 
-/// Disallow indexing of the entire pay-service domain. Public LNURL
-/// endpoints are not indexable in any meaningful sense; the payment-page
-/// surface area renders user-supplied content and is private to whoever
-/// holds the URL.
+/// Permit crawlers to fetch public Payment Pages so they can read Open Graph
+/// metadata. Page responses independently send `X-Robots-Tag: noindex`, which
+/// prevents search indexing without blocking link-preview crawlers from the
+/// content they need.
 pub async fn robots_txt() -> Response {
-    let body = "User-agent: *\nDisallow: /\n";
+    let body = "User-agent: *\nDisallow: /.well-known/\nDisallow: /api/\nDisallow: /register\nDisallow: /webhook/\nAllow: /\n";
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -1943,6 +1944,17 @@ fn list_payload_fields<'a>(
     [page, page_size, status_filter_or_empty]
 }
 
+/// Signed-payload fields for `ACTION_RECOVERY_LIST` (the recoverable-swaps
+/// detection endpoint). ZERO fields: the action carries no request parameters
+/// that affect authorization or output shape — scope comes entirely from the
+/// `npub` already embedded in the LA-v2 message, and the response is the full
+/// (tiny, uncapped-by-client) recovery set for that identity. If parameters are
+/// ever added (pagination, filters) they MUST be appended here AND in the
+/// mobile signer in lockstep, or every signature will fail to verify.
+fn recovery_list_payload_fields() -> [&'static str; 0] {
+    []
+}
+
 // =====================================================================
 // POST /api/v1/<nym>/invoices  (linked)
 // POST /api/v1/invoices        (unlinked)
@@ -2546,6 +2558,174 @@ pub async fn list_signed(
         invoices,
         page: params.page,
         page_size,
+        has_more,
+    }))
+}
+
+/// Hard cap on rows returned by the recoverable-swaps detection endpoint. The
+/// populated size of this set is stuck-swap incidents for one merchant
+/// (expected 0); a merchant exceeding this is an operator incident, signalled
+/// to the client via `has_more: true` so it routes to "contact support" rather
+/// than paginating. Keeping this fixed server-side also keeps the signed
+/// payload at zero fields (see `recovery_list_payload_fields`).
+const RECOVERABLE_LIST_LIMIT: i64 = 100;
+
+#[derive(Deserialize)]
+pub struct RecoverableListQuery {
+    pub npub: String,
+    pub timestamp: u64,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+pub struct RecoverableInvoiceContext {
+    pub status: String,
+    pub amount_sat: i64,
+    pub fiat_amount_minor: Option<i32>,
+    pub fiat_currency: Option<String>,
+    pub public_description: Option<String>,
+    pub invoice_number: Option<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Serialize)]
+pub struct RecoverableItem {
+    pub invoice_id: Uuid,
+    /// Owning nym — used client-side to build
+    /// `POST /api/v1/<nym>/invoices/<invoice_id>/recover`.
+    pub nym: String,
+    /// "refund_due" | "refunding" | "refunded".
+    pub recovery_status: String,
+    pub user_lock_amount_sat: i64,
+    /// Renegotiation-aware (COALESCE(renegotiated, original)).
+    pub server_lock_amount_sat: i64,
+    pub lockup_address: String,
+    /// Committed first-write-wins destination, or null. The reconciliation
+    /// payload: on retry a `refund_due` row with this set MUST be recovered to
+    /// exactly this address.
+    pub refund_address: Option<String>,
+    /// Broadcast recovery txid, or null until `refunded`.
+    pub refund_txid: Option<String>,
+    pub swap_created_at_unix: i64,
+    pub swap_updated_at_unix: i64,
+    pub invoice: RecoverableInvoiceContext,
+}
+
+#[derive(Serialize)]
+pub struct RecoverableListResponse {
+    /// `features.chain_swap_merchant_recovery` — whether the recover ACTION is
+    /// live. Detection itself is always-on; the client shows "Recover now" when
+    /// true and "Contact support" when false, so flipping the flag needs no app
+    /// release.
+    pub recovery_enabled: bool,
+    pub items: Vec<RecoverableItem>,
+    pub count: usize,
+    /// True iff the hard `RECOVERABLE_LIST_LIMIT` cap was hit — an operator
+    /// incident; the client routes to "contact support" rather than paging.
+    pub has_more: bool,
+}
+
+/// `GET /api/v1/invoices/recoverable` — signed, npub-keyed detection of stuck
+/// (recoverable) chain swaps. Read-only and ALWAYS-ON (not gated by
+/// `chain_swap_merchant_recovery`): merchants must be able to SEE stranded
+/// funds before the broadcast path is enabled. Mirrors `list_signed`'s auth
+/// exactly — Schnorr `verify_la_v2` over an EMPTY nym and ZERO payload fields;
+/// npub scoping is structural (the signed message embeds `params.npub` and the
+/// query filters on the same value). Unlike `recover_chain_swap` it does NOT
+/// require an active registration, so a lapsed merchant can still see stranded
+/// funds. Emits no key material (the DB projection selects none).
+pub async fn list_recoverable_signed(
+    State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Query(params): Query<RecoverableListQuery>,
+) -> Result<Json<RecoverableListResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
+    let is_whitelisted = ip
+        .map(|ip| state.ip_whitelist.contains(ip))
+        .unwrap_or(false);
+    let is_certification_allowed = certification::allows_scope(
+        &state,
+        CertificationScope::MetadataLookup,
+        peer,
+        &headers,
+        "signed_invoice_recoverable",
+        Some(&params.npub),
+    );
+
+    if !is_whitelisted && !is_certification_allowed {
+        if let Some(ip) = ip {
+            state.rate_limiter.check_metadata_per_ip(ip).await?;
+        }
+    }
+
+    let fields = recovery_list_payload_fields();
+    // Nym ALWAYS empty on the npub-keyed detection list — the action is
+    // identity-wide (an npub may own swaps across nyms; each row carries its
+    // own nym for the client to build the per-nym recover URL).
+    auth::verify_la_v2(
+        ACTION_RECOVERY_LIST,
+        &params.npub,
+        "",
+        &fields,
+        params.timestamp,
+        &params.signature,
+    )?;
+
+    // npub scoping is structural: the signed message embeds `params.npub` and
+    // the query filters on the same value; a mismatch would need a forged
+    // signature, unreachable past verify_la_v2.
+    let rows = db::list_recoverable_chain_swaps_for_npub(
+        &state.db,
+        &params.npub,
+        RECOVERABLE_LIST_LIMIT + 1,
+    )
+    .await?;
+    let has_more = rows.len() as i64 > RECOVERABLE_LIST_LIMIT;
+
+    let mut items = Vec::with_capacity(rows.len().min(RECOVERABLE_LIST_LIMIT as usize));
+    for row in rows.into_iter().take(RECOVERABLE_LIST_LIMIT as usize) {
+        // SF1 guarantees every mintable swap has a nym; a NULL row is legacy or
+        // manually-inserted data the client cannot act on (it can't build the
+        // recover URL). Skip and alert rather than emit an unusable item —
+        // mirrors the recover endpoint's nym-mismatch defense.
+        let Some(nym) = row.nym else {
+            tracing::error!(
+                event = "recoverable_swap_without_nym_skipped",
+                invoice_id = %row.invoice_id,
+                status = %row.status,
+                "recoverable chain swap has no owning nym — omitting from detection response (operator P1)"
+            );
+            continue;
+        };
+        items.push(RecoverableItem {
+            invoice_id: row.invoice_id,
+            nym,
+            recovery_status: row.status,
+            user_lock_amount_sat: row.user_lock_amount_sat,
+            server_lock_amount_sat: row.effective_server_lock_amount_sat,
+            lockup_address: row.lockup_address,
+            refund_address: row.refund_address,
+            refund_txid: row.refund_txid,
+            swap_created_at_unix: row.swap_created_at_unix,
+            swap_updated_at_unix: row.swap_updated_at_unix,
+            invoice: RecoverableInvoiceContext {
+                status: row.invoice_status,
+                amount_sat: row.invoice_amount_sat,
+                fiat_amount_minor: row.invoice_fiat_amount_minor,
+                fiat_currency: row.invoice_fiat_currency,
+                public_description: row.invoice_public_description,
+                invoice_number: row.invoice_number,
+                created_at_unix: row.invoice_created_at_unix,
+            },
+        });
+    }
+
+    Ok(Json(RecoverableListResponse {
+        recovery_enabled: state.config.features.chain_swap_merchant_recovery,
+        count: items.len(),
+        items,
         has_more,
     }))
 }

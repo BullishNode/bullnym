@@ -8,13 +8,13 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | Table | Ownership | Purpose |
 |---|---|---|
 | `users` | Nym lifecycle | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, nym status, and Lightning Address cursor. |
-| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, display currency, links, image hashes, descriptor, address cursor, and archive state. |
+| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, display currency, links, legacy image hashes, the generated social-card key/version, retry count/time, descriptor, address cursor, and archive state. |
 | `invoices` | Payment sessions | Stores donation checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
 | `invoice_payment_events` | Accounting | Idempotent counted payment evidence keyed by rail-specific event keys. |
 | `invoice_payment_observations` | Non-accounting evidence | Direct Bitcoin sightings that are unconfirmed or below the confirmation threshold. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Donation-page Bitcoin-to-Liquid chain-swap state, lockup address, claim address, and lifecycle. |
-| `outpoint_addresses` | LUD-22 reservations | `(nym, outpoint)` to descriptor index cache for Liquid shortcut idempotency and TTL recycling. |
+| `outpoint_addresses` | LUD-22 reservations | `(nym, outpoint)` to descriptor index cache for Liquid shortcut idempotency and TTL cleanup of unfulfilled rows. |
 | `nym_access_events` | Abuse controls | Sliding-window distinct-nym access counters. |
 | `processed_webhook_events` | Webhook idempotency | Prevents duplicate Boltz webhook processing. |
 | Rate-limit tables | Abuse controls | Persistent sliding-window counters for selected limits. |

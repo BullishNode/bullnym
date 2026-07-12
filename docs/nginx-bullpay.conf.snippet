@@ -1,10 +1,7 @@
 # nginx snippet for /etc/nginx/sites-enabled/bullpay
 #
-# Adds direct-from-disk serving for donation-page images at /img/<nym>/<file>.
-# pay-service handles the upload pipeline and writes normalized images to
-# /opt/payservice/data/images/<nym>/avatar.webp and
-# /opt/payservice/data/images/<nym>/og.jpg; nginx serves them without
-# proxying through Rust.
+# Adds direct-from-disk serving for legacy donation-page media and immutable,
+# server-generated social cards at /img/og/v<template-version>/<content-key>.jpg.
 #
 # Place the `location ^~ /img/` block BEFORE any catch-all `proxy_pass`.
 # `^~` priority ensures /img/* is matched before regex location blocks.
@@ -12,13 +9,19 @@
 # Per-IP request rate limiting (backstop layer; in addition to Rust-side
 # gates). Keep the donation_html and donation_api zones modest — Rust
 # already gates these and these zones only catch volumetric noise.
-limit_req_zone $binary_remote_addr zone=donation_html:10m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=donation_html:10m rate=10r/s;
 limit_req_zone $binary_remote_addr zone=donation_api:10m rate=5r/s;
 # Generous per-IP backstop for PWA statics + sw.js. These must NOT share
 # donation_html (a cold install fetches ~15 files near-simultaneously), but
 # leaving them unlimited invites volumetric disk-I/O abuse — sw.js is a
 # per-request filesystem read in Rust.
 limit_req_zone $binary_remote_addr zone=pwa_static:10m rate=30r/s;
+
+# Public Payment Page HTML is identical for every visitor. Cache it briefly so
+# viral links and social-crawler pools do not repeat the DB lookup upstream.
+proxy_cache_path /var/cache/nginx/bullnym-pages levels=1:2
+                 keys_zone=bullnym_pages:20m max_size=250m inactive=10m
+                 use_temp_path=off;
 
 server {
     # ... existing TLS / server_name config ...
@@ -37,6 +40,9 @@ server {
     real_ip_header X-Forwarded-For;
 
     # Static donation-page images. nginx serves these directly from disk.
+    # This path is durable application data. In a multi-host deployment it
+    # must be shared, or each pay-service host must point nginx at the same
+    # host-local root that its OG verification worker populates.
     location ^~ /img/ {
         alias /opt/payservice/data/images/;
         types {
@@ -94,10 +100,16 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Rate-limit the donation HTML fallback (GET /<nym>).
+    # Rate-limit and cache the donation HTML fallback (GET /<nym>).
     # Excludes explicit routes that have their own protection.
     location ~ ^/(?!\.well-known/|register|webhook/|health|ready|version|certification/|api/|img/|pwa-assets/|sw\.js$|donation-page|lnurlp/) {
-        limit_req zone=donation_html burst=10 nodelay;
+        limit_req zone=donation_html burst=100 nodelay;
+        proxy_cache bullnym_pages;
+        proxy_cache_methods GET HEAD;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_valid 200 60s;
+        proxy_cache_lock on;
+        add_header X-Bullnym-Cache $upstream_cache_status always;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

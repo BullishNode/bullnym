@@ -47,6 +47,15 @@ setInterval(() => {
   state.now = Date.now()
 }, 10_000)
 
+// Public Page HTML deliberately embeds cache-only pricing so social crawlers
+// never wait on the upstream Pricer. A cold or stale server cache must not make
+// a human wait for the first 60-second interval before fiat entry becomes
+// usable, so refresh immediately when the injected seed is not current.
+if (state.minorPerBtc <= 0 || state.lastKnown) {
+  state.loading = true
+  void refresh()
+}
+
 export const rate = {
   get currency(): string {
     return state.currency

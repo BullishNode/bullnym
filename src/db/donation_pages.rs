@@ -27,6 +27,10 @@ pub struct DonationPage {
     pub description: String,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
+    /// Server-generated, content-addressed social card. This is deliberately
+    /// separate from `og_sha256`, the hash of a historical merchant upload.
+    pub generated_og_key: Option<String>,
+    pub generated_og_template_version: Option<i32>,
     /// Merchant-chosen public URL slug for this surface, served at
     /// `/a/<alias>`. Decoupled from `nym` so the public link need not leak the
     /// Lightning-Address name. Globally unique when present; `None` means the
@@ -58,6 +62,11 @@ pub struct UpsertDonationPage<'a> {
     pub instagram: Option<&'a str>,
     pub pos_mode: Option<bool>,
     pub enabled: bool,
+    /// The version is present once generation has been attempted for this
+    /// content. A missing key with a present version selects the branded
+    /// fallback instead of a stale legacy upload.
+    pub generated_og_key: Option<&'a str>,
+    pub generated_og_template_version: Option<i32>,
     /// Tri-state alias update: `None` leaves the stored alias unchanged,
     /// `Some(None)` clears it, `Some(Some(s))` claims/changes it. The partial
     /// unique index is the race arbiter — a colliding claim surfaces as a
@@ -67,8 +76,7 @@ pub struct UpsertDonationPage<'a> {
 
 /// Insert-or-update a donation page row. Mobile sends the full page config on
 /// every save (PUT semantics). Update path clears `archived_at` so a re-save
-/// after archive un-archives. Image hashes (`avatar_sha256`, `og_sha256`) are
-/// owned by `POST /donation-page/image`.
+/// after archive un-archives. Legacy image hashes are retained read-only.
 pub async fn upsert_donation_page(
     pool: &PgPool,
     page: &UpsertDonationPage<'_>,
@@ -83,9 +91,10 @@ pub async fn upsert_donation_page(
     sqlx::query_as::<_, DonationPage>(
         "INSERT INTO donation_pages \
             (nym, kind, ct_descriptor, header, description, display_currency, \
-             website, twitter, instagram, pos_mode, enabled, alias) \
+             website, twitter, instagram, pos_mode, enabled, alias, \
+             generated_og_key, generated_og_template_version) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, \
-                 CASE WHEN $12 THEN $13 END) \
+                 CASE WHEN $12 THEN $13 END, $14, $15) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
@@ -97,9 +106,14 @@ pub async fn upsert_donation_page(
              pos_mode = COALESCE($10, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
              alias = CASE WHEN $12 THEN $13 ELSE donation_pages.alias END, \
+             generated_og_key = EXCLUDED.generated_og_key, \
+             generated_og_template_version = EXCLUDED.generated_og_template_version, \
+             generated_og_failure_count = 0, \
+             generated_og_retry_after = NULL, \
              archived_at = NULL, \
              updated_at = now() \
          RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+                   generated_og_key, generated_og_template_version, \
                    alias, display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
@@ -116,6 +130,8 @@ pub async fn upsert_donation_page(
     .bind(page.enabled)
     .bind(alias_present)
     .bind(alias_value)
+    .bind(page.generated_og_key)
+    .bind(page.generated_og_template_version)
     .fetch_one(pool)
     .await
 }
@@ -132,6 +148,7 @@ pub async fn archive_donation_page(
         "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
          WHERE nym = $1 AND kind = $2 AND archived_at IS NULL \
          RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
+                   generated_og_key, generated_og_template_version, \
                    alias, display_currency, website, twitter, \
                    instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
@@ -141,47 +158,6 @@ pub async fn archive_donation_page(
     .await
 }
 
-/// Update the avatar or og image hash for a nym's donation page. Used by
-/// `POST /donation-page/image` after the resized WebP has been atomically
-/// written to disk. `kind_column` is one of `"avatar_sha256"` or
-/// `"og_sha256"`; the allowlist is repeated here because SQL identifiers
-/// cannot be parameterized.
-pub async fn update_donation_page_image_hash(
-    pool: &PgPool,
-    nym: &str,
-    kind: &str,
-    image_column: &str,
-    new_sha256: &str,
-) -> Result<Option<DonationPage>, sqlx::Error> {
-    let sql = match image_column {
-        "avatar_sha256" => {
-            "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
-        }
-        "og_sha256" => {
-            "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2 \
-             RETURNING nym, kind, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
-                       alias, display_currency, website, twitter, \
-                       instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived"
-        }
-        _ => {
-            return Err(sqlx::Error::Protocol(format!(
-                "invalid image kind column: {image_column}"
-            )))
-        }
-    };
-    sqlx::query_as::<_, DonationPage>(sql)
-        .bind(nym)
-        .bind(kind)
-        .bind(new_sha256)
-        .fetch_optional(pool)
-        .await
-}
-
 pub async fn get_donation_page_by_nym(
     pool: &PgPool,
     nym: &str,
@@ -189,6 +165,7 @@ pub async fn get_donation_page_by_nym(
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
+                generated_og_key, generated_og_template_version, \
                 alias, ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
                 instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
@@ -210,6 +187,7 @@ pub async fn get_donation_page_by_alias(
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "SELECT nym, kind, header, description, avatar_sha256, og_sha256, \
+                generated_og_key, generated_og_template_version, \
                 alias, ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
                 instagram, pos_mode, enabled, (archived_at IS NOT NULL) AS is_archived \
@@ -274,12 +252,14 @@ where
         .await?;
 
         if !in_use {
-            sqlx::query("UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2")
-                .bind(nym)
-                .bind(kind)
-                .bind(address_index + 1)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE donation_pages SET next_addr_idx = $3 WHERE nym = $1 AND kind = $2",
+            )
+            .bind(nym)
+            .bind(kind)
+            .bind(address_index + 1)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(Some((address, address_index, ct_descriptor)));
         }

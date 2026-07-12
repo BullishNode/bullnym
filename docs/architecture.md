@@ -61,7 +61,7 @@ Background workers
 | `registration.rs` | Nym create/update/delete and lookup. |
 | `lnurl.rs` | LNURL metadata and callback, including LUD-22 Liquid address negotiation. |
 | `nostr.rs` | NIP-05 public key lookup. |
-| `donation_page.rs` | Signed Payment Page/POS management and image upload. |
+| `donation_page.rs` | Signed Payment Page/POS management. |
 | `donation_render.rs` | Payment Page and POS shell rendering. |
 | `invoice.rs` | Checkout creation, signed wallet-origin invoices, status, offers, cancel, list, and render. |
 | `claimer.rs` | Boltz webhook handling and cooperative claim execution. |

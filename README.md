@@ -29,7 +29,7 @@ addresses instead of requiring the server to store a descriptor.
 
 | Product | Who creates it | Public URL | Payment rails | Settlement destination |
 |---|---|---|---|---|
-| Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Fresh address from the active nym CT descriptor |
+| Lightning Address | Recipient registers a nym | `/.well-known/lnurlp/:nym`, `nym@domain` | Lightning via Boltz reverse swap; Liquid via LUD-22 | Active nym CT descriptor; Lightning allocates at claim, while unpaid LUD-22 reservations can share the current index until payment advances it |
 | Payment Page | Recipient configures a public page for a nym | `/:nym` and `/:nym/i/:id` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the Payment Page CT descriptor, with legacy fallback to the active nym CT descriptor |
 | POS | Recipient configures a terminal for a nym | `/:nym/pos` | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Fresh address from the POS CT descriptor; no Lightning Address fallback |
 | Invoice | Recipient creates a receivable from mobile | `/:nym/i/:id` or `/invoice/:id` | Configurable per invoice: Lightning, Liquid, Bitcoin | Recipient-supplied Liquid/BTC addresses; checkout invoices created from public surfaces use the selected surface Liquid address |
@@ -108,27 +108,27 @@ The result of LUD-22 is that it creates a single "nym" service which is compatib
 
 We considered keeping MRH (Magic Routing Hint) alongside LUD-22 as an alternative on-chain shortcut and decided against it. The deciding factor is enumeration-attack resistance.
 
-MRH has no commitment from the sender. Anyone can hit the LNURL callback over HTTP, get an address allocated and embedded in the bolt11 routing hint, and never pay. The address counter on the recipient's CT descriptor advances anyway. With enough sustained traffic, the counter ratchets past the recipient wallet's gap limit, and gap-limit-bounded scanners (BDK, LWK by default) silently stop picking up new payments until the user does a manual full rescan. Funds aren't lost, but the receive UX breaks. The only available defense for MRH is per-source-IP throttling, which is bounded by what legitimate senders tolerate rather than by what attackers tolerate. The TTL-recycle trick we use elsewhere doesn't apply, because the address stays a valid Liquid receive address indefinitely after the bolt11 expires.
+MRH has no commitment from the sender. Anyone can hit the LNURL callback over HTTP, get an address allocated and embedded in the bolt11 routing hint, and never pay. The address counter on the recipient's CT descriptor advances anyway. With enough sustained traffic, the counter ratchets past the recipient wallet's gap limit, and gap-limit-bounded scanners (BDK, LWK by default) silently stop picking up new payments until the user does a manual full rescan. Funds aren't lost, but the receive UX breaks. The only available defense for MRH is per-source-IP throttling, which is bounded by what legitimate senders tolerate rather than by what attackers tolerate. Deleting stale instruction state, as the LUD-22 GC does for unfulfilled reservations, cannot make an MRH address safe to reuse because it remains a valid Liquid receive address after the BOLT11 expires.
 
-LUD-22 fixes this at the protocol layer by requiring the sender to prove ownership of a Liquid UTXO worth at least 1,000 sats before the server hands out an address. The server unblinds the confidential proof output (with the payer-supplied blinding key) to enforce the value, so the commitment is a real cost rather than an advisory one. On every dimension that matters, the contrast is sharp:
+LUD-22 fixes this at the protocol layer by requiring the sender to prove ownership of a Liquid UTXO worth at least 1,000 sats before the server hands out an address. The payer supplies the clear value plus its value and asset blinding factors; the server reconstructs and checks both confidential commitments against the on-chain output. This makes the commitment a real cost rather than an advisory one without sending the output's blinding private key. On every dimension that matters, the contrast is sharp:
 
 | Property | MRH | LUD-22 |
 |---|---|---|
 | Cost per request to attacker | Zero (HTTP GET) | ≥ 1,000 sats committed on-chain (value cryptographically enforced) |
-| Idempotency on repeat | None — counter advances every time | Cache hit (same outpoint and nym → same address) |
-| Recovery after attack | None — damage is cumulative | Automatic via TTL recycling |
-| Bound on damage | Unbounded over time | 3 nyms per UTXO per hour |
+| Idempotency on repeat | None — counter advances every time | Cache hit (same outpoint and nym → same descriptor index while the descriptor is unchanged) |
+| Recovery after attack | None — damage is cumulative | Unfulfilled reservation rows removed by GC |
+| Bound on damage | Unbounded cursor advancement | Unpaid requests do not advance the cursor; one UTXO can target at most 3 nyms/hour by default |
 
-The cost of deprecating MRH is borne by senders that supported MRH but not LUD-22 (mainly Aqua and other Boltz-library wallets). For those senders, payments now route through the standard reverse-swap path: roughly 580 extra sats of Boltz fees on a 100,000-sat payment, plus a few extra Liquid network transactions. The remediation is for those wallets to adopt LUD-22, at which point the on-chain shortcut is restored — with stronger privacy properties and a structurally cost-bounded defense profile.
+The cost of deprecating MRH is borne by senders that supported MRH but not LUD-22 (mainly Aqua and other Boltz-library wallets). For those senders, payments now route through the standard reverse-swap path: roughly 580 extra sats of Boltz fees on a 100,000-sat payment, plus a few extra Liquid network transactions. The remediation is for those wallets to adopt LUD-22, at which point the on-chain shortcut is restored with a structurally cost-bounded defense profile, at the documented cost of revealing the proof UTXO and its value to Bullnym.
 
 ## LUD-22 rate limiting
 
-The threat we are mitigating is descriptor-index exhaustion. Every address handed out via LUD-22 advances the recipient's CT descriptor counter. If an attacker can advance it freely, gap-limit-bounded wallets eventually stop seeing new payments. The 1,000-sat UTXO ownership proof required by LUD-22 — with the value enforced by unblinding the confidential proof output, not merely asserted by the sender — is what makes a real defense possible, because every request now costs the attacker something on-chain. That commitment gates several mechanisms:
+The threat we are mitigating is descriptor-index exhaustion and unbounded pending-reservation state. LUD-22 reservations use the recipient's current descriptor index without advancing it; the chain watcher advances the cursor only after it observes payment. The 1,000-sat UTXO ownership proof — with the supplied clear value and blinding factors rebound to the on-chain confidential commitments — makes broader enumeration and backend abuse costly as well. That commitment gates several mechanisms:
 
-1. **Idempotent mapping.** Each `(nym, outpoint)` pair always resolves to the same address. A repeated request with the same UTXO targeting the same nym hits cache; the descriptor counter does not advance. An attacker who simply repeats requests makes no progress.
-2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour (`distinct_nyms_per_outpoint`). To probe more, the attacker has to rotate UTXOs, which means real on-chain Liquid spends with real network fees and confirmation delays. This is the primary binding gate.
-3. **TTL recycling.** Pending reservations release after one hour. An attacker who never pays cannot hold address allocations indefinitely; the descriptor counter is bounded by the steady-state hostage size, not by total request count over time.
-4. **Per-pubkey volume cap.** A secondary gate keyed on the proof signing key (`per_pubkey_limit` / `per_pubkey_window_secs`). It is intended as defense-in-depth on top of the per-outpoint cap; deployments that set it high (as the shipped simulator config does) rely on the per-outpoint and per-IP gates as the effective bounds. Tighten it in production to bound per-key volume directly.
+1. **Idempotent mapping and deferred advancement.** Each `(nym, outpoint)` pair caches one descriptor index. Repeated and distinct unpaid reservations reuse the current index rather than advancing the descriptor counter. Only an observed payment advances the cursor. Replacing the recipient descriptor can change the address derived at a cached index, so descriptor rotation must be coordinated separately.
+2. **Per-outpoint fan-out cap.** A single UTXO can probe at most 3 distinct nyms per hour (`distinct_nyms_per_outpoint`). To probe more, the attacker must control additional funded UTXOs or rotate them through real on-chain Liquid spends with real network fees and backend visibility delays. This is the primary binding gate.
+3. **TTL cleanup.** Unfulfilled reservation rows are deleted after one hour. An attacker who never pays cannot hold pending-reservation state indefinitely. Cleanup does not rewind the descriptor cursor; unpaid reservations did not advance it.
+4. **Optional per-pubkey volume cap.** A secondary gate keyed on the proof signing key (`per_pubkey_limit` / `per_pubkey_window_secs`). It is disabled by default and can be enabled as defense-in-depth on top of the per-outpoint and per-source gates.
 
 Standard per-IP rate limiting (`per_ip_limit` / `per_ip_window_secs`) applies on top of all of these and, with the per-outpoint fan-out cap, is one of the two primary gates.
 
@@ -167,7 +167,7 @@ HTTP layer (Axum)
 ├── /:nym/invoice                     Payment Page checkout invoice creation
 ├── /:nym/pos/invoice                 POS checkout invoice creation
 ├── /:nym/i/:id                       Linked invoice/payment page
-├── /invoice/:id                      Unlinked invoice/payment page
+├── /invoice/:id                      Generic linked/unlinked invoice page
 ├── /sw.js, /pwa-assets/*             PWA service worker and assets
 ├── /api/v1/invoices...               Signed invoice create/list/cancel + public status/offers
 ├── /webhook/boltz/:secret            Boltz webhook URL-secret endpoint
@@ -178,9 +178,9 @@ HTTP layer (Axum)
 Background tasks (spawned in main, cancelled on SIGINT)
 ├── claimer                           Boltz webhook drain + MuSig2 cooperative claims
 ├── reconciler                        Polls Boltz for non-terminal swaps after missed webhooks
-├── chain_watcher                     Liquid Electrum deposit detection + LUD-22 TTL recycle
+├── chain_watcher                     Liquid Electrum deposit detection + funded-index advancement
 ├── bitcoin_watcher                   Bitcoin direct invoice detection
-├── rate-limit GC                     Prunes sliding-window counter rows in Postgres
+├── rate-limit GC                     Prunes counters/reservations and terminalizes expired invoices
 └── in-memory rate-limit sweep        Evicts idle per-IP buckets from process memory
 
 Stateful dependencies
@@ -206,7 +206,7 @@ updates around claim and accounting transitions.
 | `GET` | `/.well-known/nostr.json?name=:nym` | NIP-05 identity provider (opt-in; route enabled only when `[features] nip05` is on, default off). Returns the nym's `verification_npub` only when one was explicitly registered; a nym with no verification key resolves to no record (the server never publishes the auth key) |
 | `GET` | `/lnurlp/callback/:nym` | LNURL-pay callback. Returns a BOLT11 invoice (default Lightning rail) or a Liquid address (LUD-22 with `payment_method=L-BTC` plus a UTXO ownership proof) |
 
-Wallets that support LUD-22 send `payment_method=L-BTC` along with `outpoint`, `pubkey`, `sig`, and `blinding_key` query params. The server verifies the ECDSA ownership signature, checks the UTXO is unspent on Liquid Electrum, and unblinds the confidential output with the supplied blinding key to confirm the asset is L-BTC and the value is at least `proof.min_proof_value_sat` (default 1000). The unblinded asset is rebound to the on-chain asset generator, so an output that commits to another asset while its rangeproof message claims L-BTC is rejected; only confidential outputs qualify (explicit-value/explicit-asset outputs are rejected by design). It then returns either the cached `(nym, outpoint)` address or a freshly allocated one from the user's CT descriptor.
+Wallets that support LUD-22 send `payment_method=L-BTC` with `outpoint`, `pubkey`, `sig`, `value`, `value_bf`, and `asset_bf`. The server verifies the DER-ECDSA ownership signature, checks the UTXO is unspent through Liquid Electrum, and reconstructs the confidential asset and value commitments to enforce L-BTC and `proof.min_proof_value_sat` (default 1000). Explicit-value or explicit-asset outputs are rejected. It then returns an address derived at either the cached `(nym, outpoint)` index or the nym's current descriptor index. Multiple unpaid reservations can share that current address; the chain watcher advances the cursor only after observing payment. See [the implemented LUD-22 contract](docs/lud-22-currency-negotiation.md).
 
 ### Authenticated nym lifecycle
 
@@ -226,7 +226,6 @@ All write operations require a BIP-340 Schnorr signature over a domain-tagged pa
 |---|---|---|
 | `PUT` | `/donation-page` | Create or update a Payment Page or POS surface |
 | `DELETE` | `/donation-page` | Soft-archive a surface; the nym remains reserved |
-| `POST` | `/donation-page/image` | Upload Payment Page avatar or OpenGraph image; server normalizes to WebP |
 | `GET` | `/donation-page/:nym?kind=...` | Public JSON state used by mobile |
 | `GET` | `/:nym` | Payment Page PWA shell |
 | `GET` | `/:nym/pos` | POS PWA shell |
@@ -251,7 +250,7 @@ settlement machinery.
 | `DELETE` | `/api/v1/:nym/invoices/:id` | Signed cancellation of a linked invoice |
 | `DELETE` | `/api/v1/invoices/:id` | Signed cancellation of an unlinked invoice |
 | `GET` | `/api/v1/invoices?npub=...` | Signed list endpoint for mobile dashboard state |
-| `GET` | `/invoice/:id` | Public unlinked payment page |
+| `GET` | `/invoice/:id` | Generic public page for linked or unlinked invoices |
 | `GET` | `/api/v1/invoices/:id/status` | Public payment status for polling payment pages |
 | `POST` | `/api/v1/invoices/:id/lightning` | Create or refresh the current BOLT11 offer |
 | `POST` | `/api/v1/invoices/:id/liquid` | Deprecated; returns `410 Gone` because wallet-origin Liquid addresses are supplied at invoice creation |
@@ -307,7 +306,7 @@ mobile builds; it will be removed once warning volume drops.
 
 Donation pages and invoices use the same key material with product-specific
 actions such as `donation-page-save`, `donation-page-archive`,
-`donation-page-image`, `invoice-create`, `invoice-cancel`, and `invoice-list`.
+`invoice-create`, `invoice-cancel`, and `invoice-list`.
 Their payloads are domain-separated so a signature for one product action
 cannot be replayed as another.
 
@@ -348,15 +347,6 @@ lightning_address = true    # /.well-known/lnurlp, /lnurlp/callback, /register*
 invoices          = true    # wallet-origin invoice APIs and /invoice/:id
 payment_pages     = true    # donation/payment-page APIs and checkout invoices
 nip05             = false   # opt-in /.well-known/nostr.json publishing
-
-[donation]
-image_root_path       = "/opt/payservice/data/images"
-image_max_bytes       = 2_097_152
-image_max_dimension   = 5_000
-image_max_pixels      = 12_000_000
-avatar_size           = 256
-og_width              = 1200
-og_height             = 630
 
 [limits]
 min_sendable_msat          = 100_000          # 100 sats

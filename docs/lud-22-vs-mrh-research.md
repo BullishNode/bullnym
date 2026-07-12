@@ -7,17 +7,21 @@ LUD-22 vs MRH: rate-limiting research and the decision to deprecate MRH support
 
 ## Background
 
-Bullnym serves Lightning Address payments on three rails, picked by the server based on what the sender's wallet supports:
+During the design, Bullnym considered three Lightning Address paths. MRH was
+removed; only LUD-22 and the standard Lightning/MuSig2 path are implemented in
+the current server:
 
-1. **`transaction.direct` via Magic Routing Hint (MRH).** Boltz reverse swaps allow the server to embed a Liquid address as a routing hint inside the BOLT11 invoice. Senders whose wallet uses Boltz libraries (currently Aqua, the Boltz web app, and a few others) decode the hint, skip the Lightning HTLC entirely, and pay the Liquid address on-chain. No Lightning, no claim, no extra Boltz fees.
+1. **Historical: `transaction.direct` via Magic Routing Hint (MRH).** Boltz reverse swaps could embed a Liquid address as a routing hint inside the BOLT11 invoice. MRH-aware senders could decode the hint, skip the Lightning HTLC, and pay the Liquid address on-chain. Bullnym no longer supplies the address/address signature needed to create this hint.
 
 2. **LUD-22 Liquid-direct.** Bullnym's LNURL extension (`docs/lud-22-currency-negotiation.md`). Sender requests `payment_method=L-BTC` and provides a UTXO ownership proof. Server returns a Liquid address directly. No Lightning, no Boltz at all.
 
 3. **Cooperative MuSig2 claim.** Default Lightning rail. Sender pays the BOLT11 over Lightning. Boltz funds the lockup HTLC. Server's claimer cooperatively signs a MuSig2 keypath claim to a fresh address derived from the user's CT descriptor.
 
-Both LUD-22 and MRH consume an `address_index` from the user's descriptor. LUD-22 has well-developed defenses against descriptor-index exhaustion attacks (see `migrations/006_outpoint_addresses.sql`, `src/rate_limit.rs`). MRH does not.
+Both LUD-22 and MRH derive addresses from the user's descriptor. MRH consumes a fresh index when the unpaid instruction is created. LUD-22 reserves the current index and advances it only after the chain watcher observes payment, with additional proof and rate-limit defenses (see `migrations/006_outpoint_addresses.sql`, `src/db/reservations.rs`, and `src/rate_limit.rs`).
 
-This document compares the rate-limiting properties of the two paths and concludes that MRH cannot be defended to the same standard. The recommended action is to deprecate MRH support entirely on the bullnym server: stop setting `address` and `addressSignature` at swap creation, and defer address allocation to claim time on the cooperative MuSig2 path.
+This document records the comparison and the implemented decision: MRH support
+was removed, Bullnym stopped setting `address` and `addressSignature` at swap
+creation, and the cooperative MuSig2 path now allocates at claim time.
 
 ## The attack model
 
@@ -27,17 +31,17 @@ The harm is bounded (funds aren't lost, the descriptor still controls them), but
 
 ## How LUD-22 defends against this
 
-The LUD-22 path forces the sender to commit something on-chain before they can ask for an address. The commitment is a signed ownership proof of a Liquid UTXO worth at least `min_proof_value_sat` (currently 100). This commitment unlocks four cascading defenses:
+The LUD-22 path forces the sender to commit something on-chain before they can ask for an address. The commitment is a signed ownership proof of a Liquid UTXO worth at least `min_proof_value_sat` (default 1,000 sats). This commitment unlocks several cascading defenses:
 
-**Idempotent mapping.** The `outpoint_addresses` table caches `(nym, outpoint) -> address_index` with a `UNIQUE` constraint. The same UTXO targeting the same nym always returns the same address. An attacker who repeats their request gets a cache hit; they cannot ratchet anything by repeating.
+**Idempotent mapping and deferred advancement.** The `outpoint_addresses` table caches `(nym, outpoint) -> address_index` with a `UNIQUE` constraint. New unpaid reservations use the current `next_addr_idx` without incrementing it; the chain watcher advances the cursor only after observing payment. Repeating a request therefore gets a cache hit, and arbitrary unpaid requests do not ratchet the descriptor cursor. Replacing the descriptor can change the address derived at a cached index and is a separate wallet-migration concern.
 
-**Per-outpoint fan-out cap.** A single UTXO can be used to discover at most three different nyms per hour (`distinct_nyms_per_outpoint_limit`). To probe more nyms, the attacker must rotate UTXOs. Rotating a UTXO means spending it on-chain, which costs the spent value plus a real Liquid network fee, and takes confirmation time.
+**Per-outpoint fan-out cap.** A single UTXO can be used to discover at most three different nyms per hour (`distinct_nyms_per_outpoint_limit`). To probe more nyms, the attacker must control additional funded UTXOs or spend and recreate them on-chain, paying Liquid network fees and waiting for backend visibility.
 
-**Per-pubkey volume cap.** The script's signing key is rate-limited to 10 requests per hour on the Liquid path (`per_pubkey_limit`). Spreading across many keys means spreading across many UTXOs, which compounds with the on-chain cost.
+**Optional per-pubkey volume cap.** Deployments can rate-limit the proof signing key with `per_pubkey_limit`. It is disabled by default; the per-outpoint, per-source, and pending-reservation controls remain effective independently.
 
-**TTL recycling.** Unfulfilled `outpoint_addresses` rows are recycled after `pending_outpoint_ttl_secs` (3600). If the attacker doesn't pay, their address allocation eventually returns to the pool. The descriptor's `next_addr_idx` is bounded by the steady-state hostage size, not by attacker request count.
+**TTL cleanup.** Unfulfilled `outpoint_addresses` rows are deleted after the one-hour GC TTL. Cleanup releases pending-reservation state; it does not decrement the descriptor cursor, which unpaid reservations did not advance in the first place.
 
-The cost of a sustained enumeration attack against bullnym via LUD-22 scales linearly with the on-chain Liquid UTXO supply the attacker controls. To probe 1000 nyms in an hour, the attacker needs at least 334 distinct UTXOs (each ≥ 100 sats), each of which represents an on-chain commitment that the attacker funded.
+The cost of a sustained enumeration attack against Bullnym via LUD-22 scales linearly with the on-chain Liquid UTXO supply the attacker controls. To probe 1,000 nyms in an hour, the attacker needs at least 334 distinct UTXOs (each at least 1,000 sats), each of which represents an on-chain commitment that the attacker funded.
 
 ## How MRH "defends" against this
 
@@ -58,11 +62,11 @@ Direct comparison:
 
 | Property | LUD-22 | MRH |
 |---|---|---|
-| Cost per request to attacker | ≥ 100 sats committed on-chain plus spend cost of the UTXO | Zero (HTTP GET) |
+| Cost per request to attacker | At least 1,000 sats committed in a proved UTXO, plus funding/rotation fees | Zero (HTTP GET) |
 | Cost per nym discovered | At minimum, one UTXO per three nyms per hour | One HTTP GET per nym |
-| Idempotency on repeat request | Yes (cache hit on `(nym, outpoint)`) | No (every request advances `next_addr_idx`) |
-| Recovery after attack subsides | Automatic via TTL recycling | None; damage is cumulative and persistent |
-| Bound on per-resource damage | 3 nyms per UTXO per hour | Unbounded over time |
+| Idempotency on repeat request | Cache hit on `(nym, outpoint)`; same index while descriptor is unchanged | No (every request advances `next_addr_idx`) |
+| Recovery after attack subsides | Pending rows removed by TTL cleanup; unpaid requests did not advance the cursor | None; damage is cumulative and persistent |
+| Bound on per-resource damage | Unpaid requests cause no cursor advancement; 3 nyms per UTXO per hour by default | Unbounded over time |
 
 In every dimension that matters for resisting an enumeration attack, LUD-22 dominates.
 
@@ -90,9 +94,9 @@ Of the three counters, only the first (sender-side privacy from the server) is a
 
 The other two counters are real but bear on the cost of deprecating MRH, not on whether MRH can be defended.
 
-## Decision: deprecate MRH on the bullnym server
+## Implemented decision: remove MRH from the Bullnym server
 
-The recommendation is to stop setting `address` and `addressSignature` on Boltz reverse swaps created by bullnym. Concretely:
+Bullnym stopped setting `address` and `addressSignature` on Boltz reverse swaps. Concretely:
 
 - `serve_lightning` no longer calls `allocate_address_index` at swap creation.
 - The server creates Boltz reverse swaps without MRH metadata.
@@ -103,7 +107,7 @@ The descriptor's `next_addr_idx` advances exactly once per real incoming Lightni
 
 ## Costs of the deprecation
 
-The senders who currently rely on MRH (without supporting LUD-22) lose the on-chain shortcut. Their payments now route through the standard Boltz reverse swap and incur:
+Senders that support MRH but not LUD-22 no longer receive the on-chain shortcut from Bullnym. Their payments route through the standard Boltz reverse swap and incur:
 
 - The Boltz reverse-swap fee on the receiver side (~0.25% plus ~40 sats lockup and claim fees).
 - The sender's own submarine swap fee on their side, if their wallet sends from Liquid (Aqua does).
@@ -113,7 +117,7 @@ For a 100,000-sat payment, the additional cost is approximately 580 sats in Bolt
 
 The wallet population affected is small. Bull mobile uses LUD-22. Phoenix, Wallet of Satoshi, Zeus, and most Lightning-only wallets never used MRH. The affected set is essentially Aqua and any future Boltz-aware-but-not-LUD-22-aware wallet.
 
-The recommended remediation for affected wallets is to adopt LUD-22 (`docs/lud-22-currency-negotiation.md`). The protocol is small and the on-chain shortcut is restored with stronger privacy and a cost-bounded defense profile.
+The recommended remediation for affected wallets is to adopt LUD-22 (`docs/lud-22-currency-negotiation.md`). The protocol is small and restores the on-chain shortcut with a cost-bounded descriptor-exhaustion defense, while revealing the proof UTXO and its value to Bullnym as described above.
 
 ## What this does not address
 

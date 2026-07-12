@@ -13,7 +13,7 @@
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::db;
 use crate::ip_whitelist;
+use crate::og_image;
 use crate::pricer::CurrencyView;
 use crate::reserved_nyms;
 use crate::AppState;
@@ -43,9 +44,8 @@ struct DonationPageTpl<'a> {
     invoice_base: String,
     header: &'a str,
     description: &'a str,
-    public_url: String,
+    social_meta: String,
     avatar_url: Option<String>,
-    og_url: Option<String>,
     display_currency: &'a str,
     website: Option<&'a str>,
     twitter: Option<&'a str>,
@@ -71,7 +71,7 @@ struct DonationNotFoundTpl<'a> {
 #[template(path = "donation_archived.html")]
 struct DonationArchivedTpl<'a> {
     nym: &'a str,
-    domain: &'a str,
+    social_meta: String,
 }
 
 #[derive(Debug, Default)]
@@ -227,6 +227,10 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
+    h.insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow, noarchive"),
+    );
     // CSP: tight default with two narrow exceptions:
     // - 'unsafe-inline' for script and style — the page bundles its JS/CSS
     //   inline, no remote CDN. User-controlled fields are askama-escaped
@@ -242,12 +246,11 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(if pos_mode { POS_CSP } else { DONATION_CSP }),
     );
-    // 60s freshness gives a CDN/browser cache the chance to absorb a
-    // viral-link burst, while keeping mutations (e.g. archive) visible
-    // within a minute.
+    // Short browser freshness plus shared-cache stale serving absorbs crawler
+    // bursts while keeping Page edits visible quickly.
     h.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=60"),
+        HeaderValue::from_static("public, max-age=60, s-maxage=60, stale-while-revalidate=300"),
     );
 }
 
@@ -269,10 +272,17 @@ fn render_404(state: &AppState, nym: &str) -> Response {
     resp
 }
 
-fn render_archived(state: &AppState, nym: &str) -> Response {
+fn render_archived(state: &AppState, display_name: &str, public_path: &str) -> Response {
+    let public_url = format!("https://{}{}", state.config.domain, public_path);
+    let image_url = og_image::fallback_url(&state.config.domain, true);
     let body = DonationArchivedTpl {
-        nym,
-        domain: &state.config.domain,
+        nym: display_name,
+        social_meta: social_meta_tags(
+            "Page unavailable",
+            "This Bull Bitcoin Payment Page is no longer available.",
+            &public_url,
+            &image_url,
+        ),
     }
     .render()
     .unwrap_or_else(|_| "Archived".to_string());
@@ -351,27 +361,79 @@ fn web_manifest_for_page<'a>(
     }
 }
 
-fn og_meta_tags(header: &str, description: &str, og_url: Option<&str>) -> String {
-    let mut tags = format!(
-        r#"<meta property="og:title" content="{}">
-<meta property="og:description" content="{}">"#,
-        html_escape_attr(header),
-        html_escape_attr(description)
-    );
-    if let Some(og_url) = og_url {
-        tags.push_str(&format!(
-            r#"
-<meta property="og:image" content="{}">"#,
-            html_escape_attr(og_url)
-        ));
+fn social_meta_tags(header: &str, description: &str, public_url: &str, image_url: &str) -> String {
+    let title = og_image::normalized_social_text(header);
+    let description = og_image::social_description(description);
+    let description = if description.is_empty() {
+        "Send bitcoin with a Bull Bitcoin Payment Page.".to_string()
+    } else {
+        description
+    };
+    let alt = format!("{title} — Bull Bitcoin Payment Page");
+    format!(
+        r#"<title>{title}</title>
+<link rel="canonical" href="{public_url}">
+<meta name="description" content="{description}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Bull Bitcoin">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{description}">
+<meta property="og:url" content="{public_url}">
+<meta property="og:image" content="{image_url}">
+<meta property="og:image:url" content="{image_url}">
+<meta property="og:image:secure_url" content="{image_url}">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="{alt}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{description}">
+<meta name="twitter:image" content="{image_url}">
+<meta name="twitter:image:alt" content="{alt}">"#,
+        title = html_escape_attr(&title),
+        description = html_escape_attr(&description),
+        public_url = html_escape_attr(public_url),
+        image_url = html_escape_attr(image_url),
+        alt = html_escape_attr(&alt),
+    )
+}
+
+async fn stored_generated_og_url(
+    image_root: &str,
+    domain: &str,
+    nym: &str,
+    key: &str,
+    version: i32,
+) -> Option<String> {
+    let path = og_image::generated_path_for_version(image_root, version, key);
+    match tokio::fs::try_exists(&path).await {
+        Ok(true) => Some(og_image::generated_url(domain, version, key)),
+        Ok(false) => {
+            tracing::warn!(
+                event = "og_render_file_missing",
+                nym,
+                path = %path.display()
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "og_render_file_check_failed",
+                nym,
+                path = %path.display(),
+                error = %error
+            );
+            None
+        }
     }
-    tags
 }
 
 fn inject_pwa_shell(
     shell: &str,
     config: &PwaConfigView<'_>,
-    og_url: Option<&str>,
+    public_url: &str,
+    image_url: &str,
     manifest_href: &str,
 ) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(config)?;
@@ -382,12 +444,18 @@ fn inject_pwa_shell(
         r#"<link rel="manifest" href="{}">"#,
         html_escape_attr(manifest_href)
     );
+    // Built PWA shells historically carried a static title. Remove both known
+    // variants before inserting the authoritative social metadata so crawlers
+    // never have to choose between duplicate <title> elements.
+    let shell = shell
+        .replace("<title>bullnym</title>", "")
+        .replace("<title>bullnym POS</title>", "");
     Ok(shell
         .replace("<!-- BULLNYM_CONFIG -->", &config_script)
         .replace("<!-- BULLNYM_MANIFEST -->", &manifest_link)
         .replace(
             "<!-- BULLNYM_OG -->",
-            &og_meta_tags(config.header, config.description, og_url),
+            &social_meta_tags(config.header, config.description, public_url, image_url),
         ))
 }
 
@@ -459,7 +527,15 @@ pub async fn manifest(
     headers: HeaderMap,
 ) -> Response {
     let start_path = format!("/{nym}");
-    manifest_for_kind(&state, &nym, db::KIND_PAYMENT_PAGE, &start_path, peer_opt, &headers).await
+    manifest_for_kind(
+        &state,
+        &nym,
+        db::KIND_PAYMENT_PAGE,
+        &start_path,
+        peer_opt,
+        &headers,
+    )
+    .await
 }
 
 /// `GET /:nym/pos/manifest.webmanifest` — POS terminal PWA manifest. Served
@@ -591,12 +667,10 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
     let domain = &state.config.domain;
 
     // Derive the public path, the client-storage key, the (optional) nym for
-    // the embedded config, and the image URLs — all in one place so the
-    // nym-scrub is total for the alias branch. Image URLs only render after
-    // the upload pipeline has stored a hash. Alias pages address images by
-    // content hash (`/img/_h/<sha>.<ext>`) so no nym leaks; the `_h`
-    // directory can never collide with a nym (underscore is not URL-legal).
-    let (base_path, page_key, config_nym, avatar_url, og_url) = match base {
+    // the embedded config, and legacy image URLs — all in one place so the
+    // nym-scrub is total for the alias branch. Generated OG images are always
+    // content-addressed and therefore never contain a nym in their URL.
+    let (base_path, page_key, config_nym, avatar_url, legacy_og_url) = match base {
         PublicBase::Nym { nym, base_path } => (
             base_path.to_string(),
             nym.to_string(),
@@ -625,10 +699,36 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
     let is_pos = page.kind == db::KIND_POS || page.pos_mode;
     let manifest_href = format!("{base_path}/manifest.webmanifest");
 
-    // Fetch the fiat rate. None ⇒ embed minor_per_btc=0 and the JS hides
-    // fiat conversion + disables the Donate button. The page still
-    // renders (better than a hard 5xx).
-    let rate = state.pricer.get_rate(&page.display_currency).await;
+    let og_url = if !is_pos {
+        match (
+            page.generated_og_key.as_deref(),
+            page.generated_og_template_version,
+        ) {
+            (Some(key), Some(version)) => stored_generated_og_url(
+                &state.config.donation.image_root_path,
+                domain,
+                &page.nym,
+                key,
+                version,
+            )
+            .await
+            .unwrap_or_else(|| og_image::fallback_url(domain, false)),
+            // Untouched legacy rows keep their historical card until the
+            // reconciler publishes the first generated image.
+            (None, None) => legacy_og_url.unwrap_or_else(|| og_image::fallback_url(domain, false)),
+            // Any partial/failed generated state must never advertise a
+            // missing path or fall back to stale merchant-uploaded artwork.
+            _ => og_image::fallback_url(domain, false),
+        }
+    } else {
+        og_image::fallback_url(domain, false)
+    };
+    let social_meta = social_meta_tags(&page.header, &page.description, &public_url, &og_url);
+
+    // Public Page HTML must never wait on a live pricing HTTP request. Seed
+    // the PWA from memory when available; its rate store immediately refreshes
+    // through `/api/v1/rate` after the browser loads.
+    let rate = state.pricer.cached_rate(&page.display_currency);
     let (minor_per_btc, last_known_rate) = match &rate {
         Some(r) => (r.minor_per_btc, r.last_known_rate),
         None => (0, false),
@@ -656,7 +756,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
             liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
             domain,
         };
-        let body = inject_pwa_shell(&shell, &config, og_url.as_deref(), &manifest_href)
+        let body = inject_pwa_shell(&shell, &config, &public_url, &og_url, &manifest_href)
             .unwrap_or_else(|e| format!("template render failed: {e}"));
         let mut resp = (StatusCode::OK, body).into_response();
         apply_security_headers(&mut resp, is_pos);
@@ -668,9 +768,8 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
         invoice_base: base_path,
         header: &page.header,
         description: &page.description,
-        public_url,
+        social_meta,
         avatar_url,
-        og_url,
         display_currency: &page.display_currency,
         website: page.website.as_deref(),
         twitter: page.twitter.as_deref(),
@@ -735,7 +834,7 @@ pub async fn render_or_404(
     };
 
     if page.is_archived {
-        return render_archived(&state, nym);
+        return render_archived(&state, nym, &format!("/{nym}"));
     }
     if !page.enabled {
         // Draft state: treat as 404 publicly. Owner can still edit via
@@ -745,7 +844,15 @@ pub async fn render_or_404(
     }
 
     let base_path = format!("/{nym}");
-    render_live(&state, &page, PublicBase::Nym { nym, base_path: &base_path }).await
+    render_live(
+        &state,
+        &page,
+        PublicBase::Nym {
+            nym,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 /// `GET /:nym/pos` — public POS terminal shell for the nym's POS surface
@@ -777,14 +884,22 @@ pub async fn render_pos(
     };
 
     if page.is_archived {
-        return render_archived(&state, &nym);
+        return render_archived(&state, &nym, &format!("/{nym}/pos"));
     }
     if !page.enabled {
         return render_404(&state, &nym);
     }
 
     let base_path = format!("/{nym}/pos");
-    render_live(&state, &page, PublicBase::Nym { nym: &nym, base_path: &base_path }).await
+    render_live(
+        &state,
+        &page,
+        PublicBase::Nym {
+            nym: &nym,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 /// `GET /a/:slug` — public donation surface served under a merchant-chosen
@@ -817,7 +932,7 @@ pub async fn render_alias(
     };
 
     if page.is_archived {
-        return render_archived(&state, &slug);
+        return render_archived(&state, &slug, &format!("/a/{slug}"));
     }
     if !page.enabled {
         return render_404(&state, &slug);

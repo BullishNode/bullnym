@@ -14,11 +14,43 @@ nym. Management actions use:
 
 - `donation-page-save`
 - `donation-page-archive`
-- `donation-page-image`
 
 The row stores display text, display currency, links, enabled/archive state,
-image hashes, an optional Liquid CT descriptor, and an independent address
-cursor.
+legacy image hashes, a server-generated social-card key, an optional Liquid CT
+descriptor, and an independent address cursor.
+
+## Social previews
+
+Each Payment Page save pre-publishes a deterministic 1200×630 JPEG containing
+the official Bull Bitcoin logo, the Page title, and its short description. No
+other merchant data is rendered into the image. The URL is immutable and
+content-addressed under `/img/og/v<template-version>/<key>.jpg`; identical
+content is reused. A template upgrade keeps advertising the last valid stored
+version until its replacement has been published.
+
+Rendering failure never fails the Page save. The Page instead advertises a
+permanent branded fallback and the bounded background reconciler retries. The
+public Page GET only reads the stored key and cached pricing state: it performs
+no image generation and no live Pricer HTTP call. Archived Pages advertise a
+fixed branded unavailable card.
+
+Generated files are durable application data, not a disposable build artifact.
+Every Bullnym host must use a persistent image volume; horizontally scaled
+hosts either share that volume/object store or let each host's verification
+sweep materialize its own copy. Public rendering verifies a stored path before
+advertising it and falls back to the branded card when the file is absent. The
+worker periodically verifies current references and regenerates missing files.
+
+Immutable cards are retained indefinitely so already-shared social posts do not
+lose their image. Operators must monitor and provision the image volume for
+that retention policy; larger deployments should place `/img/og` on durable
+storage and plan an object-storage/CDN-backed implementation rather than
+applying an age-based deletion policy. The current renderer writes through a
+filesystem path and therefore requires a mounted/shared filesystem abstraction.
+
+Open Graph and Twitter metadata is present in the initial PWA/fallback HTML.
+Page HTML sends `X-Robots-Tag: noindex, nofollow, noarchive`; `robots.txt`
+allows the Page fetch so link-preview crawlers can see that metadata.
 
 ## Descriptor Use
 
@@ -61,12 +93,6 @@ The public payment page for a linked checkout remains `GET /:nym/i/:id`.
 
 Payment Page Bitcoin is a BTC-to-LBTC Boltz chain swap. It is not direct
 Bitcoin invoice settlement.
-
-## Images
-
-`POST /donation-page/image` uploads Payment Page avatar and OpenGraph images.
-The server normalizes images to WebP and stores hashes on the Payment Page row.
-POS currently has no separate image upload path.
 
 ## Archiving
 

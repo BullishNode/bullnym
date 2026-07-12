@@ -12,12 +12,11 @@
 //! looks up the active user by npub and asserts `req.nym == user.nym`
 //! before doing any DB write.
 
-use axum::extract::{ConnectInfo, Multipart, Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 
@@ -25,8 +24,9 @@ use crate::auth;
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
-use crate::image_pipeline::{self, ImageKind, PipelineConfig};
+use crate::image_pipeline::{self, ImageKind};
 use crate::ip_whitelist;
+use crate::og_image;
 use crate::pricer::{normalize_currency_code, PricerClient};
 use crate::reserved_nyms;
 use crate::AppState;
@@ -38,11 +38,11 @@ use crate::AppState;
 // archive action carries no payload beyond `nym`.
 pub const ACTION_SAVE: &str = "donation-page-save";
 pub const ACTION_ARCHIVE: &str = "donation-page-archive";
-pub const ACTION_IMAGE: &str = "donation-page-image";
 
 // --- Limits ---
 const MAX_HEADER_LEN: usize = 80;
-const MAX_DESCRIPTION_LEN: usize = 280;
+const MAX_DESCRIPTION_BYTES: usize = og_image::DESCRIPTION_MAX_BYTES;
+const MAX_LEGACY_DESCRIPTION_BYTES: usize = 280;
 const MAX_SOCIAL_LINK_LEN: usize = 200;
 const MAX_SOCIAL_HANDLE_LEN: usize = 50;
 
@@ -57,9 +57,8 @@ static INSTAGRAM_HANDLE_REGEX: LazyLock<Regex> =
 /// same URL-safe shape. Underscore is intentionally excluded (which is also
 /// what keeps `payment_page` from ever validating as an alias — see the
 /// signed-field confusion guard).
-static ALIAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap()
-});
+static ALIAS_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap());
 
 // --- Request / response wire types ---
 
@@ -171,16 +170,17 @@ fn validate_lengths(
     pricer: &PricerClient,
     max_descriptor_len: usize,
 ) -> Result<(), AppError> {
-    if req.header.is_empty() || req.header.len() > MAX_HEADER_LEN {
+    if req.header.trim().is_empty() || req.header.len() > MAX_HEADER_LEN {
         return Err(AppError::DonationPageInvalid(format!(
-            "header must be 1..={MAX_HEADER_LEN} chars"
+            "header must be 1..={MAX_HEADER_LEN} UTF-8 bytes"
         )));
     }
-    // description is OPTIONAL for both payment pages and POS — an empty
-    // description is allowed; only the upper bound is enforced when one is set.
-    if req.description.len() > MAX_DESCRIPTION_LEN {
+    // This is the hard storage/API safety ceiling. Surface-specific rules,
+    // including the new Payment Page grapheme cap, are applied after `kind` is
+    // resolved.
+    if req.description.len() > MAX_DESCRIPTION_BYTES {
         return Err(AppError::DonationPageInvalid(format!(
-            "description must be at most {MAX_DESCRIPTION_LEN} chars"
+            "description must be at most {MAX_DESCRIPTION_BYTES} UTF-8 bytes"
         )));
     }
     let normalized_currency = normalize_currency_code(&req.display_currency);
@@ -232,6 +232,31 @@ fn validate_lengths(
                 "instagram handle too long".to_string(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_description_for_kind(
+    req: &SaveDonationPageRequest,
+    kind: &str,
+) -> Result<(), AppError> {
+    if kind == db::KIND_PAYMENT_PAGE && req.kind.is_some() {
+        if !og_image::is_valid_payment_page_description(&req.description) {
+            return Err(AppError::DonationPageInvalid(format!(
+                "description must be 1..={} visible characters and at most {} UTF-8 bytes",
+                og_image::DESCRIPTION_MAX_GRAPHEMES,
+                og_image::DESCRIPTION_MAX_BYTES
+            )));
+        }
+    } else if req.description.len() > MAX_LEGACY_DESCRIPTION_BYTES {
+        // Requests that omit `kind` are the shipped legacy wire shape. Keep
+        // their former optional/280-byte contract so a server rollout does not
+        // strand older clients; generated metadata/images still truncate that
+        // content safely. Explicit modern Payment Page saves use the strict
+        // short-description contract above.
+        return Err(AppError::DonationPageInvalid(format!(
+            "description must be at most {MAX_LEGACY_DESCRIPTION_BYTES} UTF-8 bytes"
+        )));
     }
     Ok(())
 }
@@ -338,6 +363,8 @@ pub async fn save(
         })?,
     };
 
+    validate_description_for_kind(&req, kind)?;
+
     // Validate the alias slug BEFORE signature verification, alongside `kind`,
     // so the newest trailing signed field's value domain is provably disjoint
     // from the other optional trailing fields — pos_mode {"0","1"}, kind
@@ -374,7 +401,13 @@ pub async fn save(
     // Lightning-Address cursor fallback, so it would hard-fail at allocation.
     // Reject at save time — there are no legacy POS clients to grandfather
     // (KR-1).
-    if kind == db::KIND_POS && req.ct_descriptor.as_deref().filter(|s| !s.is_empty()).is_none() {
+    if kind == db::KIND_POS
+        && req
+            .ct_descriptor
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
         return Err(AppError::DonationPageInvalid(
             "a POS surface requires ct_descriptor".to_string(),
         ));
@@ -429,6 +462,39 @@ pub async fn save(
         ));
     }
 
+    // Rendering is server-owned and best-effort. The image is atomically
+    // written before its key is put in the row. A failure deliberately clears
+    // any prior generated key so changed text can never show a stale card; the
+    // public HTML will use the permanent branded fallback instead.
+    let generated_og = if kind == db::KIND_PAYMENT_PAGE {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            og_image::publish(
+                &state.config.donation.image_root_path,
+                &req.header,
+                &req.description,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(published)) => Some(published),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "donation_page_og_render_failed",
+                    nym = %req.nym,
+                    error = %error
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(event = "donation_page_og_render_timed_out", nym = %req.nym);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let row = db::upsert_donation_page(
         &state.db,
         &db::UpsertDonationPage {
@@ -443,6 +509,9 @@ pub async fn save(
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
             pos_mode: req.pos_mode,
             enabled: req.enabled,
+            generated_og_key: generated_og.as_ref().map(|image| image.key.as_str()),
+            generated_og_template_version: (kind == db::KIND_PAYMENT_PAGE)
+                .then_some(og_image::TEMPLATE_VERSION),
             alias: alias_update,
         },
     )
@@ -554,234 +623,6 @@ pub async fn archive(
         })?;
 
     Ok(Json(DonationPageView::from_row(row, &state.config.domain)))
-}
-
-/// POST /donation-page/image — multipart upload of avatar or OG image.
-///
-/// Multipart fields (in any order; all required):
-/// - `nym`         (text)
-/// - `npub`        (text, hex)
-/// - `kind`        (text, "avatar" | "og")
-/// - `sha256`      (text, hex of file bytes — must match the bytes server-side)
-/// - `timestamp`   (text, unix seconds)
-/// - `signature`   (text, hex Schnorr sig)
-/// - `file`        (binary, JPEG/PNG/WebP, ≤2 MiB)
-///
-/// Wire format:
-///   bullpay-la-v2\0donation-page-image\0<npub>\0<nym>\0<kind>\0<sha256>\0<timestamp>
-pub async fn upload_image(
-    State(state): State<AppState>,
-    peer_opt: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    mut multipart: Multipart,
-) -> Result<Json<DonationPageView>, AppError> {
-    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
-    let is_whitelisted = ip
-        .map(|ip| state.ip_whitelist.contains(ip))
-        .unwrap_or(false);
-
-    // Cheap source-IP gate FIRST — bytes for the multipart parse haven't
-    // been fully read yet, but the per-route 2 MiB layer already bounded
-    // the body. This stops a multipart-flood from a single source.
-    if !is_whitelisted {
-        if let Some(ip) = ip {
-            state
-                .rate_limiter
-                .check_donation_image_uploads_per_source(ip)
-                .await?;
-        }
-    }
-
-    // Parse multipart fields. Field-name allowlist is closed; anything
-    // unexpected is silently dropped (no surprise behavior on stray
-    // fields), but truly required fields are checked at the end.
-    let mut nym: Option<String> = None;
-    let mut npub: Option<String> = None;
-    let mut kind_str: Option<String> = None;
-    let mut sha256_hex: Option<String> = None;
-    let mut timestamp: Option<u64> = None;
-    let mut signature: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
-
-    // Cap multipart field count to defend against thousands-of-fields DoS.
-    // The 2 MiB body limit caps total bytes; this caps allocation count.
-    const MAX_MULTIPART_FIELDS: usize = 64;
-    let mut field_count = 0usize;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::MultipartInvalid(format!("parse: {e}")))?
-    {
-        field_count += 1;
-        if field_count > MAX_MULTIPART_FIELDS {
-            return Err(AppError::MultipartInvalid("too many fields".into()));
-        }
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "nym" => nym = Some(text_field(field).await?),
-            "npub" => npub = Some(text_field(field).await?),
-            "kind" => kind_str = Some(text_field(field).await?),
-            "sha256" => sha256_hex = Some(text_field(field).await?),
-            "timestamp" => {
-                let s = text_field(field).await?;
-                timestamp =
-                    Some(s.parse().map_err(|_| {
-                        AppError::MultipartInvalid("timestamp must be a u64".into())
-                    })?);
-            }
-            "signature" => signature = Some(text_field(field).await?),
-            "file" => {
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::MultipartInvalid(format!("file read: {e}")))?;
-                file_bytes = Some(bytes.to_vec());
-            }
-            _ => {
-                // Drain unknown fields so the caller doesn't stall on a
-                // half-read body.
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let nym = nym.ok_or_else(|| AppError::MultipartInvalid("missing 'nym'".into()))?;
-    let npub = npub.ok_or_else(|| AppError::MultipartInvalid("missing 'npub'".into()))?;
-    let kind_str = kind_str.ok_or_else(|| AppError::MultipartInvalid("missing 'kind'".into()))?;
-    let claimed_sha =
-        sha256_hex.ok_or_else(|| AppError::MultipartInvalid("missing 'sha256'".into()))?;
-    let timestamp =
-        timestamp.ok_or_else(|| AppError::MultipartInvalid("missing 'timestamp'".into()))?;
-    let signature =
-        signature.ok_or_else(|| AppError::MultipartInvalid("missing 'signature'".into()))?;
-    let file_bytes =
-        file_bytes.ok_or_else(|| AppError::MultipartInvalid("missing 'file'".into()))?;
-
-    let kind = ImageKind::parse(&kind_str)
-        .ok_or_else(|| AppError::ImageInvalid("kind must be 'avatar' or 'og'".into()))?;
-
-    // Verify Schnorr sig FIRST against the claimed_sha. The sig binds
-    // (action, npub, nym, kind, claimed_sha256, timestamp). Verifying
-    // the sig before computing the file's actual SHA-256 means an
-    // attacker can't burn server CPU on a 2 MiB file hash with an
-    // invalid sig.
-    auth::verify_la_v2(
-        ACTION_IMAGE,
-        &npub,
-        &nym,
-        &[kind.as_str(), &claimed_sha],
-        timestamp,
-        &signature,
-    )?;
-
-    // Now compute SHA-256 and confirm it matches the signed claim.
-    // This catches truncated/corrupted uploads where the bytes don't
-    // match what the mobile signed.
-    let computed_sha = {
-        let mut h = Sha256::new();
-        h.update(&file_bytes);
-        hex::encode(h.finalize())
-    };
-    if !computed_sha.eq_ignore_ascii_case(&claimed_sha) {
-        return Err(AppError::ImageInvalid(
-            "claimed sha256 does not match received bytes".into(),
-        ));
-    }
-
-    // Confirm the npub owns the nym and is active.
-    assert_nym_owner(&state, &nym, &npub).await?;
-
-    // Per-npub rate-limit (DB-backed, after sig verify).
-    if !is_whitelisted {
-        state
-            .rate_limiter
-            .check_donation_image_uploads_per_npub(&npub)
-            .await?;
-    }
-
-    // Donation page must already exist before image upload. Images belong to
-    // the Payment Page surface (the POS terminal has no avatar/OG image).
-    db::get_donation_page_by_nym(&state.db, &nym, db::KIND_PAYMENT_PAGE)
-        .await?
-        .ok_or_else(|| {
-            AppError::DonationPageNotFound(
-                "create the donation page before uploading images".to_string(),
-            )
-        })?;
-
-    // Run the image pipeline (decode/resize/re-encode) and the disk write
-    // inside a single spawn_blocking. Worst-case decode of a near-cap
-    // input could be hundreds of ms of synchronous CPU; offloading
-    // prevents that from stalling the tokio runtime under concurrent
-    // uploads.
-    let pipeline_cfg = PipelineConfig {
-        max_bytes: state.config.donation.image_max_bytes,
-        max_dimension: state.config.donation.image_max_dimension,
-        max_pixels: state.config.donation.image_max_pixels,
-        avatar_size: state.config.donation.avatar_size,
-        og_width: state.config.donation.og_width,
-        og_height: state.config.donation.og_height,
-    };
-    let path = image_pipeline::image_path(&state.config.donation.image_root_path, &nym, kind);
-    let image_root = state.config.donation.image_root_path.clone();
-    let processed = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
-        let p = image_pipeline::process(&file_bytes, kind, &pipeline_cfg)?;
-        image_pipeline::atomic_write(&path, &p.bytes).map_err(|e| {
-            tracing::error!(event = "image_atomic_write_failed", error = %e);
-            AppError::ImageInvalid("could not persist image".into())
-        })?;
-        // Content-addressed copy so an alias page can serve this image at
-        // /img/_h/<sha>.<ext> without leaking the nym in the URL. Best-effort:
-        // the nym path is already durable, so a failure here doesn't fail the
-        // upload — the alias-claim backfill and the next upload both retry.
-        let hash_path = image_pipeline::image_hash_path(&image_root, &p.source_sha256, kind);
-        if let Err(e) = image_pipeline::atomic_write(&hash_path, &p.bytes) {
-            tracing::warn!(event = "image_hash_write_failed", error = %e);
-        }
-        Ok(p)
-    })
-    .await
-    .map_err(|e| AppError::ImageInvalid(format!("image task join: {e}")))??;
-
-    // Update the row with the new sha256. Output bytes differ from input
-    // bytes (we re-encoded), so persist the SOURCE sha — that's what the
-    // signature committed to and what the donation_render template uses
-    // as a cache-buster query param.
-    let column = match kind {
-        ImageKind::Avatar => "avatar_sha256",
-        ImageKind::Og => "og_sha256",
-    };
-    let row = db::update_donation_page_image_hash(
-        &state.db,
-        &nym,
-        db::KIND_PAYMENT_PAGE,
-        column,
-        &processed.source_sha256,
-    )
-    .await?
-            .ok_or_else(|| {
-                AppError::DonationPageNotFound("donation page disappeared mid-upload".to_string())
-            })?;
-
-    Ok(Json(DonationPageView::from_row(row, &state.config.domain)))
-}
-
-/// Read a multipart text field with a small length cap. Used for the
-/// short fields (nym, npub, signature, etc.) — image bytes go through
-/// `field.bytes()` directly.
-async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
-    const MAX_TEXT_FIELD: usize = 4096;
-    let bytes = field
-        .bytes()
-        .await
-        .map_err(|e| AppError::MultipartInvalid(format!("text field read: {e}")))?;
-    if bytes.len() > MAX_TEXT_FIELD {
-        return Err(AppError::MultipartInvalid("text field too large".into()));
-    }
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| AppError::MultipartInvalid("text field not utf-8".into()))
 }
 
 #[derive(Deserialize)]

@@ -72,9 +72,7 @@ fn save_payload_fields_kind_is_trailing_after_descriptor() {
 fn save_payload_fields_legacy_omitting_kind_is_prefix() {
     // A legacy client omits kind entirely: the field list is byte-identical to
     // the pre-POS layout, so its old signature still verifies.
-    let with_kind = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, None,
-    );
+    let with_kind = save_payload_fields("h", "d", "USD", "", "", "", "1", None, None, None, None);
     assert_eq!(with_kind.len(), 7);
 }
 
@@ -199,37 +197,6 @@ fn v2_archive_message_byte_exact_contract() {
     assert_eq!(msg, expected, "v2 archive byte order regression");
 }
 
-#[test]
-fn v2_image_message_byte_exact_contract() {
-    let npub = "cd".repeat(32);
-    let timestamp: u64 = 1_700_000_000;
-    let sha256_hex = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
-    let msg = crate::auth::build_la_v2_message(
-        ACTION_IMAGE,
-        &npub,
-        "alice",
-        &["avatar", sha256_hex],
-        timestamp,
-    );
-
-    let mut expected: Vec<u8> = Vec::new();
-    expected.extend_from_slice(b"bullpay-la-v2");
-    expected.push(0);
-    expected.extend_from_slice(b"donation-page-image");
-    expected.push(0);
-    expected.extend_from_slice(npub.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"alice");
-    expected.push(0);
-    expected.extend_from_slice(b"avatar");
-    expected.push(0);
-    expected.extend_from_slice(sha256_hex.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"1700000000");
-
-    assert_eq!(msg, expected, "v2 image byte order regression");
-}
-
 fn make_req() -> SaveDonationPageRequest {
     SaveDonationPageRequest {
         nym: "alice".to_string(),
@@ -275,6 +242,8 @@ fn rejects_empty_header() {
     let mut req = make_req();
     req.header = String::new();
     assert!(validate_req(&req).is_err());
+    req.header = "   ".to_string();
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
@@ -287,8 +256,46 @@ fn rejects_long_header() {
 #[test]
 fn rejects_long_description() {
     let mut req = make_req();
-    req.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+    req.description = "a".repeat(MAX_DESCRIPTION_BYTES + 1);
     assert!(validate_req(&req).is_err());
+}
+
+#[test]
+fn explicit_payment_page_requires_a_short_description() {
+    let mut req = make_req();
+    req.kind = Some(db::KIND_PAYMENT_PAGE.to_string());
+    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+
+    req.description.push('a');
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+
+    req.description = "   ".to_string();
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+}
+
+#[test]
+fn omitted_kind_retains_the_legacy_description_contract() {
+    let mut req = make_req();
+    req.kind = None;
+    req.description.clear();
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+
+    req.description = "a".repeat(MAX_LEGACY_DESCRIPTION_BYTES);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+    req.description.push('a');
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+}
+
+#[test]
+fn pos_retains_its_optional_legacy_description_contract() {
+    let mut req = make_req();
+    req.kind = Some(db::KIND_POS.to_string());
+    req.description.clear();
+    assert!(validate_description_for_kind(&req, db::KIND_POS).is_ok());
+
+    req.description = "a".repeat(MAX_LEGACY_DESCRIPTION_BYTES + 1);
+    assert!(validate_description_for_kind(&req, db::KIND_POS).is_err());
 }
 
 #[test]
@@ -357,13 +364,21 @@ fn save_payload_fields_alias_without_kind_is_prefix_extension() {
     // A client may claim an alias without sending kind. The alias is still
     // appended last; every layout that omits it stays a byte-prefix.
     let with_alias = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, Some("shop"),
+        "h",
+        "d",
+        "USD",
+        "",
+        "",
+        "",
+        "1",
+        None,
+        None,
+        None,
+        Some("shop"),
     );
     assert_eq!(with_alias.len(), 8);
     assert_eq!(with_alias[7], "shop");
-    let without = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, None,
-    );
+    let without = save_payload_fields("h", "d", "USD", "", "", "", "1", None, None, None, None);
     assert_eq!(without.len(), 7);
     assert_eq!(&with_alias[..7], &without[..]);
 }
@@ -436,11 +451,16 @@ fn alias_regex_rejects_invalid_slugs() {
 fn alias_blocklist_rejects_confusion_and_brand_values() {
     // "0"/"1" are the pos_mode value domain (signed-field confusion guard);
     // "pos" is a kind value; brand names are impersonation risks.
-    for s in ["0", "1", "pos", "bull", "bullbitcoin", "bull-bitcoin", "bullpay"] {
-        assert!(
-            reserved_nyms::is_reserved_alias(s),
-            "should reserve {s:?}"
-        );
+    for s in [
+        "0",
+        "1",
+        "pos",
+        "bull",
+        "bullbitcoin",
+        "bull-bitcoin",
+        "bullpay",
+    ] {
+        assert!(reserved_nyms::is_reserved_alias(s), "should reserve {s:?}");
     }
     // A normal merchant slug is allowed.
     assert!(!reserved_nyms::is_reserved_alias("alices-shop"));

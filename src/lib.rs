@@ -17,6 +17,7 @@ pub mod invoice;
 pub mod ip_whitelist;
 pub mod lnurl;
 pub mod nostr;
+pub mod og_image;
 pub mod pricer;
 pub mod qr;
 pub mod rate_limit;

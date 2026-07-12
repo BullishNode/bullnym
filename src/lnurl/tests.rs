@@ -120,6 +120,25 @@ fn requests_method_case_sensitive() {
 }
 
 #[test]
+fn comment_at_advertised_limit_is_accepted() {
+    let comment = "a".repeat(COMMENT_ALLOWED as usize);
+    assert!(validate_comment(Some(&comment)).is_ok());
+}
+
+#[test]
+fn comment_over_advertised_limit_is_rejected() {
+    let comment = "a".repeat(COMMENT_ALLOWED as usize + 1);
+    let err = validate_comment(Some(&comment)).unwrap_err();
+    assert_eq!(err.code(), "InvalidAmount");
+}
+
+#[test]
+fn comment_limit_counts_unicode_characters() {
+    let comment = "\u{1f642}".repeat(COMMENT_ALLOWED as usize);
+    assert!(validate_comment(Some(&comment)).is_ok());
+}
+
+#[test]
 fn metadata_has_two_entries() {
     let meta = build_metadata("test", "example.com");
     let parsed: Vec<Vec<String>> = serde_json::from_str(&meta).unwrap();

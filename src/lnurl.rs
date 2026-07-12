@@ -15,6 +15,8 @@ use crate::ip_whitelist;
 use crate::utxo::{script_matches_pubkey, verify_ownership_sig, ParsedOutpoint};
 use crate::AppState;
 
+const COMMENT_ALLOWED: u16 = 144;
+
 // --- Metadata response (LUD-06 + extensions) ---
 
 #[derive(Serialize)]
@@ -116,6 +118,15 @@ fn requests_method(payment_method: Option<&str>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_comment(comment: Option<&str>) -> Result<(), AppError> {
+    if comment.is_some_and(|value| value.chars().count() > COMMENT_ALLOWED as usize) {
+        return Err(AppError::InvalidAmount(format!(
+            "comment exceeds {COMMENT_ALLOWED} characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve caller IP and apply the per-IP metadata rate-limit + (when a nym
 /// is being queried) the distinct-nyms-per-IP cap. Whitelisted callers
 /// bypass. Shared by `metadata` and `nostr::nostr_json`.
@@ -179,7 +190,7 @@ pub async fn metadata(
         min_sendable: state.config.limits.min_sendable_msat,
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
-        comment_allowed: 144,
+        comment_allowed: COMMENT_ALLOWED,
         payment_methods: vec!["L-BTC"],
     }))
 }
@@ -450,6 +461,7 @@ pub async fn callback(
             "amount must be a multiple of 1000 msat".to_string(),
         ));
     }
+    validate_comment(params.comment.as_deref())?;
     let amount_sat = params.amount / 1000;
 
     let user = db::get_active_user_by_nym(&state.db, &nym)
