@@ -4,6 +4,7 @@ pub mod boltz;
 pub mod boltz_breaker;
 pub mod certification;
 pub mod chain_watcher;
+pub mod chain_recovery;
 pub mod claimer;
 pub mod config;
 pub mod db;

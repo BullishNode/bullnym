@@ -633,9 +633,7 @@ fn resolve_invoice_status(
         "overpaid"
     } else if amount_sat.saturating_sub(received_sat) <= tolerance_sat {
         "paid"
-    } else if prior_status == "underpaid" {
-        "underpaid"
-    } else if expired {
+    } else if prior_status == "underpaid" || expired {
         "underpaid"
     } else {
         "partially_paid"

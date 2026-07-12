@@ -105,8 +105,8 @@ fn chain_swap_status_terminal() {
     // refund_due is the non-terminal join point of the refund waterfall — the
     // reconciler must keep revisiting it until it drains to claimed/refunded.
     assert!(!ChainSwapStatus::RefundDue.is_terminal());
-    // refunding is a non-terminal in-flight refund — a failed broadcast reverts
-    // it to refund_due, so it must stay revisitable (never terminal).
+    // refunding is a non-terminal in-flight recovery — ambiguity replays the
+    // write-ahead bytes, so the reconciler must keep revisiting it.
     assert!(!ChainSwapStatus::Refunding.is_terminal());
 }
 

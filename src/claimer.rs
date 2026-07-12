@@ -14,7 +14,6 @@ use lwk_wollet::elements;
 
 use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
-use boltz_client::network::esplora::EsploraBitcoinClient;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain, LiquidClient};
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateChainResponse, CreateReverseResponse, Side,
@@ -83,6 +82,7 @@ fn match_url_secret_pair(presented: &str, current: &str, previous: &str) -> UrlS
     }
 }
 
+#[cfg(test)]
 fn url_secret_matches_pair(presented: &str, current: &str, previous: &str) -> bool {
     match_url_secret_pair(presented, current, previous) != UrlSecretMatch::None
 }
@@ -1880,13 +1880,12 @@ async fn construct_chain_claim_tx(
 ///     ever starts from a claimable lifecycle state, never from
 ///     `refunding`/`refund_due`.
 ///   * **G14 (idempotency):** the refund address is persisted (first-write-wins)
-///     before this runs; the `refunding` flip is the single-winner gate. On a
-///     broadcast failure we revert `refunding` -> `refund_due` so the refund
-///     stays recoverable rather than stranded.
+///     before this runs. Exact signed bytes and intent commit in the same
+///     transaction as the single-winner `refunding` flip. A failed or ambiguous
+///     broadcast remains there and only those committed bytes may be replayed.
 ///
-/// The refund tx is constructed and broadcast OUTSIDE the advisory lock (the
-/// `refunding` state, not the lock, is what fences claims), mirroring the claim
-/// path where broadcast is the slow, retry-safe step.
+/// Construction and journaling happen under the advisory transaction lock;
+/// broadcast happens after commit without holding a database connection.
 /// Returns true if the chain-swap USER lockup transaction is CONFIRMED on-chain.
 ///
 /// The confirmation is checked by TXID, not by address: the deployment's esplora
@@ -2005,270 +2004,15 @@ pub(crate) async fn execute_chain_swap_refund(
         ));
     }
 
-    // Atomically claim the refund: refund_due -> refunding under the advisory
-    // lock, with a FOR UPDATE re-read to serialize against status webhook writers.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    let lock_key = format!("chain-claim:{}", swap.id);
-    let got_lock: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
-            .bind(&lock_key)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
-    if !got_lock {
-        return Err(AppError::ClaimError(
-            "chain swap is busy (claim/refund in progress); retry shortly".to_string(),
-        ));
-    }
-    let current = db::get_chain_swap_by_id_for_update(&mut *tx, swap.id)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {}", swap.id)))?;
-    let current_status = current.parsed_status().map_err(AppError::DbError)?;
-    if current_status == ChainSwapStatus::Refunding {
-        // A concurrent attempt already owns the refund; don't start a second
-        // broadcast. The owner (or the reconciler backstop) completes it.
-        return Err(AppError::ClaimError(
-            "refund already in progress".to_string(),
-        ));
-    }
-    if current_status != ChainSwapStatus::RefundDue {
-        return Err(AppError::ClaimError(format!(
-            "chain swap not refundable (status {current_status})"
-        )));
-    }
-    // G12 (B3): never refund a swap for which an L-BTC claim tx was ever
-    // constructed or broadcast — the claim (merchant paid) and the refund
-    // (customer paid) spend different UTXOs and could both confirm. A row can
-    // reach `refund_due` from `claiming`/`claim_failed` with an unconfirmed
-    // claim still in the Liquid mempool; let the claim path win. (The
-    // `mark_chain_swap_refunding` UPDATE also enforces this; the explicit check
-    // gives a clear operator signal.)
-    if current.claim_txid.is_some() || current.claim_tx_hex.is_some() {
-        tracing::error!(
-            event = "chain_swap_refund_blocked_claim_in_flight",
-            swap_id = %swap.boltz_swap_id,
-            invoice_id = %swap.invoice_id,
-            claim_txid = ?current.claim_txid,
-            "refund blocked: an L-BTC claim tx exists for this swap; refusing to refund to avoid a double payout (operator P1)"
-        );
-        return Err(AppError::ClaimError(
-            "refund blocked: a claim is already in progress for this payment".to_string(),
-        ));
-    }
-    let rows = db::mark_chain_swap_refunding(&mut *tx, swap.id)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    tx.commit()
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    if rows != 1 {
-        return Err(AppError::ClaimError(
-            "refund race lost; another actor advanced the swap".to_string(),
-        ));
-    }
-
     tracing::warn!(
         event = "chain_swap_refunding",
         swap_id = %swap.boltz_swap_id,
         invoice_id = %swap.invoice_id,
         refund_address = %refund_address,
-        "customer self-claim refund starting; refund_due -> refunding (operator P2)"
+        "journaled Bitcoin recovery starting (operator P2)"
     );
 
-    // Build + broadcast OUTSIDE the lock. On any failure, revert so the swap
-    // stays recoverable (never stranded in `refunding`).
-    match build_and_broadcast_chain_refund(state, &current, &refund_address).await {
-        Ok(txid) => {
-            let recorded = db::mark_chain_swap_refunded(&state.db, swap.id, &txid)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
-            if recorded != 1 {
-                // We broadcast a refund but the row was NOT in `refunding` when
-                // we tried to record it — a concurrent writer (e.g. a reconciler
-                // acting on a stale snapshot) moved it out from under us. The BTC
-                // IS refunded on-chain; the DB now disagrees. Loud P1 so an
-                // operator reconciles against the broadcast txid.
-                tracing::error!(
-                    event = "chain_swap_refund_broadcast_not_recorded",
-                    swap_id = %swap.boltz_swap_id,
-                    invoice_id = %swap.invoice_id,
-                    refund_txid = %txid,
-                    "refund broadcast but status was not `refunding` at record time; reconcile the swap against this txid (operator P1)"
-                );
-            } else {
-                tracing::warn!(
-                    event = "chain_swap_refunded",
-                    swap_id = %swap.boltz_swap_id,
-                    invoice_id = %swap.invoice_id,
-                    refund_txid = %txid,
-                    "customer self-claim refund broadcast; refunding -> refunded (operator P2)"
-                );
-            }
-            Ok(txid)
-        }
-        Err(e) => {
-            // Revert to refund_due so a later attempt / reconciler can retry.
-            // Re-broadcast is conflict-safe: any second refund tx spends the
-            // same lockup UTXO, so at most one confirms.
-            if let Err(revert_err) = db::revert_chain_swap_refunding_to_due(&state.db, swap.id).await
-            {
-                tracing::error!(
-                    event = "chain_swap_refund_revert_failed",
-                    swap_id = %swap.boltz_swap_id,
-                    error = %revert_err,
-                    "failed to revert refunding -> refund_due after a broadcast failure; swap stuck in refunding (operator P1)"
-                );
-            }
-            tracing::warn!(
-                event = "chain_swap_refund_broadcast_failed",
-                swap_id = %swap.boltz_swap_id,
-                invoice_id = %swap.invoice_id,
-                error = %e,
-                "customer self-claim refund failed to broadcast; reverted to refund_due for retry (operator P1)"
-            );
-            Err(e)
-        }
-    }
-}
-
-/// Constructs and broadcasts the BTC refund transaction spending the payer's
-/// lockup UTXO back to `refund_address`. Attempts the cooperative (Boltz
-/// partial-sig) refund first — valid pre-timeout and cheapest — and falls back
-/// to the unilateral script path (valid only after the lockup timelock) if the
-/// cooperative round-trip is refused. The Bitcoin chain client is the fork's
-/// esplora client pointed at the same mempool endpoint the watcher polls.
-async fn build_and_broadcast_chain_refund(
-    state: &AppState,
-    swap: &db::ChainSwapRecord,
-    refund_address: &str,
-) -> Result<String, AppError> {
-    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?;
-    let secp = boltz_client::Secp256k1::new();
-    let refund_secret_key =
-        boltz_client::bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
-            .map_err(|e| AppError::ClaimError(format!("invalid chain refund secret key: {e}")))?;
-    let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
-    let refund_public_key = boltz_client::PublicKey::new(refund_keypair.public_key());
-
-    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
-        .map_err(|e| AppError::ClaimError(format!("invalid chain boltz response json: {e}")))?;
-
-    // The BTC (user lockup) side of the chain swap — the UTXO we refund.
-    let lockup_script = SwapScript::chain_from_swap_resp(
-        Chain::Bitcoin(BitcoinChain::Bitcoin),
-        Side::Lockup,
-        boltz_response.lockup_details.clone(),
-        refund_public_key,
-    )
-    .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
-
-    let boltz_api = BoltzApiClientV2::new(
-        state.config.boltz.api_url.clone(),
-        Some(Duration::from_secs(15)),
-    );
-
-    // Construct the refund tx, rotating across the esplora endpoints (#47).
-    // `construct_refund` fetches the lockup UTXO from the Bitcoin chain client,
-    // so a no-address-index or "up-but-broken" primary node can fail
-    // construction *before* we ever reach the (already-failover'd) broadcast.
-    // Building one client per endpoint lets a broken primary fall through to a
-    // healthy provider. Defense-in-depth: the fork's `new_refund` already falls
-    // back to Boltz for the UTXO, so a healthy primary behaves identically
-    // (endpoint[0] wins on the first cooperative attempt).
-    //
-    // The cooperative->script fallback stays INSIDE each endpoint attempt: a
-    // cooperative refusal is a Boltz answer (post-timeout / Boltz unavailable),
-    // NOT an endpoint fault, so we must not rotate the esplora on it — we drop
-    // to the script path on the SAME endpoint. We only rotate when BOTH paths
-    // fail on an endpoint (the signature of a broken/no-index node).
-    let endpoints = state.config.bitcoin_watcher.effective_endpoints();
-    let mut construct_errors: Vec<String> = Vec::new();
-    let mut refund_tx = None;
-    for (i, endpoint) in endpoints.iter().enumerate() {
-        let bitcoin_client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
-        let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
-
-        let build = |cooperative: bool| {
-            let params = SwapTransactionParams {
-                keys: refund_keypair,
-                output_address: refund_address.to_string(),
-                // Conservative sat/vB. A too-low fee only delays the refund (RBF
-                // / re-broadcast possible); precise mempool fee estimation is a
-                // tracked refinement to validate in the staged broadcast test.
-                fee: Fee::Relative(2.0),
-                swap_id: swap.boltz_swap_id.clone(),
-                chain_client: &chain_client,
-                boltz_client: &boltz_api,
-                options: Some(TransactionOptions::default().with_cooperative(cooperative)),
-            };
-            lockup_script.construct_refund(params)
-        };
-
-        // Cooperative first (pre-timeout, cheapest).
-        match build(true).await {
-            Ok(tx) => {
-                refund_tx = Some(tx);
-                break;
-            }
-            Err(coop_err) => {
-                tracing::warn!(
-                    event = "chain_swap_refund_cooperative_failed",
-                    swap_id = %swap.boltz_swap_id,
-                    endpoint = %endpoint,
-                    error = %coop_err,
-                    "cooperative refund construction failed; attempting unilateral script path on same endpoint"
-                );
-                // Script path on the SAME endpoint — the network rejects a
-                // premature script-path spend, so this is safe.
-                match build(false).await {
-                    Ok(tx) => {
-                        refund_tx = Some(tx);
-                        break;
-                    }
-                    Err(script_err) => {
-                        // Both paths failed here — likely an endpoint fault
-                        // (no address index / up-but-broken). Rotate.
-                        if i + 1 < endpoints.len() {
-                            tracing::warn!(
-                                event = "chain_swap_refund_construct_failover",
-                                swap_id = %swap.boltz_swap_id,
-                                endpoint = %endpoint,
-                                "refund construction failed on this esplora endpoint; rotating to next"
-                            );
-                        }
-                        construct_errors
-                            .push(format!("{endpoint}: coop={coop_err}; script={script_err}"));
-                    }
-                }
-            }
-        }
-    }
-    let refund_tx = refund_tx.ok_or_else(|| {
-        AppError::ClaimError(format!(
-            "construct_chain_refund failed on all {} esplora endpoint(s): {}",
-            endpoints.len(),
-            construct_errors.join(" | ")
-        ))
-    })?;
-
-    // Broadcast with esplora endpoint failover (issue #47): a single broken or
-    // down node must not block the refund. `broadcast` tries each endpoint until
-    // one accepts (or reports the tx already known), so we survive the kind of
-    // "up-but-broken" esplora that blocked recovery before the failover existed.
-    let refund_hex = serialize_claim_tx_hex(&refund_tx)?;
-    let expected_txid = btc_like_txid(&refund_tx);
-    crate::esplora::broadcast(
-        &state.config.bitcoin_watcher.effective_endpoints(),
-        &refund_hex,
-        &expected_txid,
-    )
-    .await
+    crate::chain_recovery::execute_journaled_recovery(state, swap.id).await
 }
 
 /// Heuristic classifier for cooperative-claim refusals from Boltz.

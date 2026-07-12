@@ -90,6 +90,7 @@ pub fn script_matches_pubkey(script: &elements::Script, pubkey: &PublicKey) -> b
 ///  2. Rebuild the Pedersen value commitment from the cleartext `value` and both
 ///     blinding factors, and require it to equal `txout.value`. A forged value
 ///     cannot bind to the committed point.
+///
 /// Then enforce the value floor.
 ///
 /// Byte order: `value_bf`/`asset_bf` arrive as elements *display-order*

@@ -195,7 +195,7 @@ and recovery backlog are healthy.
 
 ## 6. Target data model
 
-Use the next available migrations after schema 044. Do not copy the obsolete
+Use the next available migration at implementation time. Do not copy obsolete
 migration numbers from `recovery-v2.md`.
 
 ### 6.1 `chain_swap_fundings`
@@ -230,7 +230,7 @@ extra funding remains open or enters `integrity_hold`; it is not assumed paid.
 
 ### 6.3 `chain_swap_tx_attempts`
 
-The write-ahead ledger for both `liquid_claim` and `btc_recovery`:
+The target write-ahead ledger for both `liquid_claim` and `btc_recovery`:
 
 - swap and optional funding identity;
 - kind, attempt number, and replacement parent;
@@ -246,6 +246,11 @@ Existing `claim_tx_hex`, `claim_txid`, and `refund_txid` remain compatibility
 columns during migration, but the attempt ledger becomes authoritative. The
 schema must prevent two active, unrelated recovery attempts for one source
 outpoint.
+
+Migration 046 deliberately introduces only the `btc_recovery` writer and
+executor needed to close issue #62's live broadcast ambiguity. Liquid claims
+adopt the ledger with issue #83, after their confirmation/output evidence is
+defined. Replacement lineage remains deferred with issue #86.
 
 ### 6.4 `chain_swap_operations`
 
@@ -432,10 +437,10 @@ shadow mode has no unexplained decision drift on staging.
 
 ### Phase 3 - Durable transactions, finality, and fees
 
-#### 3A. Generalize #62 into the transaction journal
+#### 3A. Introduce #62's transaction journal
 
-Implement [#62](https://github.com/BullishNode/bullnym/issues/62) for both claim
-and recovery attempts:
+Implement [#62](https://github.com/BullishNode/bullnym/issues/62) for Bitcoin
+recovery attempts first:
 
 1. acquire the per-swap lock;
 2. re-read evidence and reducer decision;
@@ -446,8 +451,9 @@ and recovery attempts:
 7. on ambiguity, inspect txid and source outpoint before rebroadcast;
 8. freeze unknown outspends instead of reconstructing.
 
-Keep cooperative claims first for their privacy advantage, but split the
-vendored Boltz API into prepare and execute steps. Preparation must expose the
+Liquid claims adopt the same ledger later under #83. Keep cooperative claims
+first for their privacy advantage, but split the vendored Boltz API into
+prepare and execute steps. Preparation must expose the
 proposed Bitcoin source-claim transaction hash/nonce and the exact Liquid claim
 template without sending Bullnym's partial signature or preimage. Persist that
 authorization, template, destination, and a `cooperative_claim_requested`
@@ -487,7 +493,7 @@ Complete [#64](https://github.com/BullishNode/bullnym/issues/64) phase 1:
 Recommended starting policy: two Liquid confirmations and three Bitcoin
 recovery confirmations, configurable and tested at the boundaries.
 
-#### 3D. Explicit Bitcoin fee replacement
+#### 3D. Explicit Bitcoin fee replacement (deferred post-release, issue #86)
 
 - signal RBF on recovery construction;
 - after a configured time/block deadline, create a linked replacement spending

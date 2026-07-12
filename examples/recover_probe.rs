@@ -64,6 +64,9 @@ async fn main() {
     let swap = db::record_chain_swap(
         &pool,
         &db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
             invoice_id: invoice.id,
             nym: Some(&nym),
             boltz_swap_id: "probe-swap-1",
