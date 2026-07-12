@@ -57,6 +57,37 @@ async fn test_pool() -> PgPool {
         .expect("failed to connect to test database")
 }
 
+/// A separate lazy pool for claim-preparation progress proofs. Seeding and
+/// assertions use `test_pool`; this pool exists only to make the number of
+/// connections available to the production claim path exact.
+fn constrained_test_pool(
+    max_connections: u32,
+    connect_barrier: Option<Arc<tokio::sync::Barrier>>,
+) -> PgPool {
+    let mut options = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(1));
+    if let Some(barrier) = connect_barrier {
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        options = options.after_connect(move |_connection, _metadata| {
+            let barrier = barrier.clone();
+            let arrivals = arrivals.clone();
+            Box::pin(async move {
+                // Rendezvous exactly the first pool-capacity connections. A
+                // later reconnect must not wait forever for a partner that
+                // will never exist after the initial proof has completed.
+                if arrivals.fetch_add(1, Ordering::SeqCst) < max_connections as usize {
+                    barrier.wait().await;
+                }
+                Ok(())
+            })
+        });
+    }
+    options
+        .connect_lazy(&require_test_db())
+        .expect("constrained test pool URL must parse")
+}
+
 fn test_config() -> Config {
     Config {
         domain: "test.example.com".to_string(),
@@ -2090,7 +2121,7 @@ async fn webhook_skips_terminal_swaps() {
 
 #[tokio::test]
 async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
-    let pool = test_pool().await;
+    let pool = constrained_test_pool(1, None);
     cleanup_db(&pool).await;
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
@@ -2121,18 +2152,22 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     .await
     .unwrap();
 
-    let (status, body) = post_json(
-        &app,
-        "/webhook/boltz",
-        json!({
-            "event": "swap.update",
-            "data": {
-                "id": "REVERSE_WEBHOOK_CLOSED_1",
-                "status": "transaction.confirmed"
-            }
-        }),
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "REVERSE_WEBHOOK_CLOSED_1",
+                    "status": "transaction.confirmed"
+                }
+            }),
+        ),
     )
-    .await;
+    .await
+    .expect("invoice-bound reverse claim must progress with one connection");
 
     assert_eq!(status, StatusCode::OK, "{body}");
     let swap = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_WEBHOOK_CLOSED_1")
@@ -2175,6 +2210,725 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     let _ = provider_task.await;
 
     cleanup_db(&pool).await;
+}
+
+async fn seed_claimable_reverse_pool_swap(
+    pool: &PgPool,
+    nym: &str,
+    boltz_swap_id: &str,
+    boltz_response_json: &str,
+    invoice_id: Option<uuid::Uuid>,
+) -> uuid::Uuid {
+    pay_service::db::record_swap(
+        pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some(nym),
+            boltz_swap_id,
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-claim-pool-proof",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json,
+            invoice_id,
+        },
+    )
+    .await
+    .unwrap();
+    let swap = pay_service::db::get_swap_by_boltz_id(pool, boltz_swap_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pay_service::db::update_swap_status(
+        pool,
+        swap.id,
+        pay_service::db::SwapStatus::LockupConfirmed,
+        None,
+    )
+    .await
+    .unwrap();
+    swap.id
+}
+
+async fn seed_claimable_chain_pool_swap(
+    pool: &PgPool,
+    invoice_id: uuid::Uuid,
+    nym: &str,
+    boltz_swap_id: &str,
+    boltz_response_json: &str,
+) -> uuid::Uuid {
+    let swap = pay_service::db::record_chain_swap(
+        pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id,
+            nym: Some(nym),
+            boltz_swap_id,
+            lockup_address: "bc1qclaimpoolproof",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::update_chain_swap_status(
+        pool,
+        swap.id,
+        pay_service::db::ChainSwapStatus::ServerLockConfirmed,
+        None,
+    )
+    .await
+    .unwrap();
+    swap.id
+}
+
+async fn reverse_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        claimer::exercise_reverse_claim_with_malformed_response(pool, swap_id),
+    )
+    .await
+    .expect("reverse claim preparation must complete within its bounded timeout");
+    match result {
+        Err(error) => error,
+        Ok(outcome) => panic!("expected deterministic reverse construction error, got {outcome:?}"),
+    }
+}
+
+async fn chain_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        claimer::exercise_chain_claim_with_malformed_response(pool, swap_id),
+    )
+    .await
+    .expect("chain claim preparation must complete within its bounded timeout");
+    match result {
+        Err(error) => error,
+        Ok(outcome) => panic!("expected deterministic chain construction error, got {outcome:?}"),
+    }
+}
+
+fn assert_local_claim_error(error: &AppError, expected: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains(expected),
+        "expected {expected:?}, got {message:?}"
+    );
+    assert!(
+        !message.to_ascii_lowercase().contains("pool timed out"),
+        "claim preparation self-starved on the SQLx pool: {message}"
+    );
+}
+
+#[tokio::test]
+async fn reverse_claim_preparation_progresses_with_one_connection() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reversepoolone").await;
+    let swap_id =
+        seed_claimable_reverse_pool_swap(&admin, "reversepoolone", "REVERSE_POOL_ONE", "{", None)
+            .await;
+    let constrained = constrained_test_pool(1, None);
+
+    let first_error = reverse_claim_pool_error(&constrained, swap_id).await;
+    assert_local_claim_error(&first_error, "invalid boltz response json");
+    let first = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_ONE")
+        .await
+        .unwrap()
+        .unwrap();
+    let first_address = first
+        .address
+        .clone()
+        .expect("resolved descriptor address must survive construction error");
+    assert_eq!(first.address_index, Some(0));
+
+    // Retry exercises the cached-address branch on the same one-connection
+    // pool. It must not consume another descriptor index.
+    let second_error = reverse_claim_pool_error(&constrained, swap_id).await;
+    assert_local_claim_error(&second_error, "invalid boltz response json");
+    let second = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_ONE")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'reversepoolone'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(second.address.as_deref(), Some(first_address.as_str()));
+    assert_eq!(second.address_index, Some(0));
+    assert_eq!(next_addr_idx, 1);
+    assert_eq!(second.claim_attempts, 2);
+    assert!(!second.cooperative_refused);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn chain_claim_preparation_progresses_with_one_connection() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "chainpoolone").await;
+    let invoice =
+        insert_test_invoice(&admin, "chainpoolone", &npub, "lq1chainpoolone", 3_600).await;
+    let swap_id =
+        seed_claimable_chain_pool_swap(&admin, invoice.id, "chainpoolone", "CHAIN_POOL_ONE", "{")
+            .await;
+    let constrained = constrained_test_pool(1, None);
+
+    let error = chain_claim_pool_error(&constrained, swap_id).await;
+    assert_local_claim_error(&error, "invalid chain boltz response json");
+    let swap = pay_service::db::get_chain_swap_by_boltz_id(&admin, "CHAIN_POOL_ONE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.claim_attempts, 1);
+    assert_eq!(swap.status, "server_lock_confirmed");
+    assert!(!swap.cooperative_refused);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn advisory_locked_chain_claim_skips_without_preparation() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "chainpoollocked").await;
+    let invoice = insert_test_invoice(
+        &admin,
+        "chainpoollocked",
+        &npub,
+        "lq1chainpoollocked",
+        3_600,
+    )
+    .await;
+    let swap_id = seed_claimable_chain_pool_swap(
+        &admin,
+        invoice.id,
+        "chainpoollocked",
+        "CHAIN_POOL_LOCKED",
+        "{",
+    )
+    .await;
+    let mut lock_holder = admin.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("chain-claim:{swap_id}"))
+        .execute(&mut *lock_holder)
+        .await
+        .unwrap();
+    let constrained = constrained_test_pool(1, None);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        claimer::exercise_chain_claim_with_malformed_response(&constrained, swap_id),
+    )
+    .await
+    .expect("advisory-lock loser must return promptly")
+    .unwrap();
+    assert!(matches!(outcome, claimer::ClaimOutcome::SkippedLockHeld));
+    let swap = pay_service::db::get_chain_swap_by_boltz_id(&admin, "CHAIN_POOL_LOCKED")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "server_lock_confirmed");
+    assert_eq!(swap.claim_attempts, 0);
+    assert!(swap.claim_tx_hex.is_none());
+    assert!(!swap.cooperative_refused);
+
+    lock_holder.rollback().await.unwrap();
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn malformed_claim_test_seams_reject_persisted_bytes_without_mutation() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reverseseamguard").await;
+    let reverse_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reverseseamguard",
+        "REVERSE_SEAM_GUARD",
+        "{",
+        None,
+    )
+    .await;
+
+    let npub = create_test_user(&admin, "chainseamguard").await;
+    let invoice =
+        insert_test_invoice(&admin, "chainseamguard", &npub, "lq1chainseamguard", 3_600).await;
+    let chain_id = seed_claimable_chain_pool_swap(
+        &admin,
+        invoice.id,
+        "chainseamguard",
+        "CHAIN_SEAM_GUARD",
+        "{",
+    )
+    .await;
+    sqlx::query("UPDATE swap_records SET claim_tx_hex = '00' WHERE id = $1")
+        .bind(reverse_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chain_swap_records SET claim_tx_hex = '00' WHERE id = $1")
+        .bind(chain_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let constrained = constrained_test_pool(1, None);
+    let reverse_error =
+        claimer::exercise_reverse_claim_with_malformed_response(&constrained, reverse_id)
+            .await
+            .expect_err("persisted reverse bytes must close the malformed-only seam");
+    let chain_error = claimer::exercise_chain_claim_with_malformed_response(&constrained, chain_id)
+        .await
+        .expect_err("persisted chain bytes must close the malformed-only seam");
+    assert!(reverse_error
+        .to_string()
+        .contains("without persisted claim bytes"));
+    assert!(chain_error
+        .to_string()
+        .contains("without persisted claim bytes"));
+
+    let reverse = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_SEAM_GUARD")
+        .await
+        .unwrap()
+        .unwrap();
+    let chain = pay_service::db::get_chain_swap_by_boltz_id(&admin, "CHAIN_SEAM_GUARD")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'reverseseamguard'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert!(reverse.address.is_none());
+    assert!(reverse.address_index.is_none());
+    assert_eq!(reverse.claim_attempts, 0);
+    assert_eq!(reverse.status, "lockup_confirmed");
+    assert_eq!(next_addr_idx, 0);
+    assert_eq!(chain.claim_attempts, 0);
+    assert_eq!(chain.status, "server_lock_confirmed");
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn reverse_claim_preparations_progress_at_saturated_capacity() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reversepoolsaturated").await;
+    let first_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reversepoolsaturated",
+        "REVERSE_POOL_SATURATED_1",
+        "{",
+        None,
+    )
+    .await;
+    let second_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reversepoolsaturated",
+        "REVERSE_POOL_SATURATED_2",
+        "{",
+        None,
+    )
+    .await;
+    let constrained = constrained_test_pool(2, Some(Arc::new(tokio::sync::Barrier::new(2))));
+
+    let (first_error, second_error) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(
+            reverse_claim_pool_error(&constrained, first_id),
+            reverse_claim_pool_error(&constrained, second_id)
+        )
+    })
+    .await
+    .expect("two reverse preparations must progress with exactly two connections");
+    assert_local_claim_error(&first_error, "invalid boltz response json");
+    assert_local_claim_error(&second_error, "invalid boltz response json");
+
+    let first = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_SATURATED_1")
+        .await
+        .unwrap()
+        .unwrap();
+    let second = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_SATURATED_2")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'reversepoolsaturated'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(next_addr_idx, 2);
+    assert_ne!(first.address, second.address);
+    assert_ne!(first.address_index, second.address_index);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn concurrent_same_reverse_swap_has_one_locked_preparation() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reversesamepool").await;
+    let swap_id =
+        seed_claimable_reverse_pool_swap(&admin, "reversesamepool", "REVERSE_POOL_SAME", "{", None)
+            .await;
+
+    // Hold the row after both constrained-pool connections rendezvous. The
+    // advisory-lock winner blocks here while the loser must promptly report
+    // SkippedLockHeld; once released, exactly one preparation allocates.
+    let mut row_blocker = admin.begin().await.unwrap();
+    sqlx::query("SELECT id FROM swap_records WHERE id = $1 FOR UPDATE")
+        .bind(swap_id)
+        .execute(&mut *row_blocker)
+        .await
+        .unwrap();
+    let constrained = constrained_test_pool(2, Some(Arc::new(tokio::sync::Barrier::new(2))));
+    let mut attempts = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let pool = constrained.clone();
+        attempts.spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                claimer::exercise_reverse_claim_with_malformed_response(&pool, swap_id),
+            )
+            .await
+            .expect("same-swap claim attempt must remain bounded")
+        });
+    }
+
+    let skipped = tokio::time::timeout(Duration::from_secs(2), attempts.join_next())
+        .await
+        .expect("advisory-lock loser must return before row-lock winner")
+        .expect("one same-swap task must finish")
+        .expect("same-swap task must not panic");
+    assert!(matches!(
+        skipped,
+        Ok(claimer::ClaimOutcome::SkippedLockHeld)
+    ));
+
+    row_blocker.rollback().await.unwrap();
+    let winner = attempts
+        .join_next()
+        .await
+        .expect("advisory-lock winner must finish")
+        .expect("winner task must not panic");
+    let winner_error = match winner {
+        Err(error) => error,
+        Ok(outcome) => panic!("expected deterministic construction error, got {outcome:?}"),
+    };
+    assert_local_claim_error(&winner_error, "invalid boltz response json");
+
+    let swap = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_SAME")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'reversesamepool'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(swap.address_index, Some(0));
+    assert_eq!(next_addr_idx, 1);
+    assert_eq!(swap.claim_attempts, 1);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn chain_claim_preparations_progress_at_saturated_capacity() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "chainpoolsaturated").await;
+    let first_invoice = insert_test_invoice(
+        &admin,
+        "chainpoolsaturated",
+        &npub,
+        "lq1chainpoolsaturated1",
+        3_600,
+    )
+    .await;
+    let second_invoice = insert_test_invoice(
+        &admin,
+        "chainpoolsaturated",
+        &npub,
+        "lq1chainpoolsaturated2",
+        3_600,
+    )
+    .await;
+    let first_id = seed_claimable_chain_pool_swap(
+        &admin,
+        first_invoice.id,
+        "chainpoolsaturated",
+        "CHAIN_POOL_SATURATED_1",
+        "{",
+    )
+    .await;
+    let second_id = seed_claimable_chain_pool_swap(
+        &admin,
+        second_invoice.id,
+        "chainpoolsaturated",
+        "CHAIN_POOL_SATURATED_2",
+        "{",
+    )
+    .await;
+    let constrained = constrained_test_pool(2, Some(Arc::new(tokio::sync::Barrier::new(2))));
+
+    let (first_error, second_error) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(
+            chain_claim_pool_error(&constrained, first_id),
+            chain_claim_pool_error(&constrained, second_id)
+        )
+    })
+    .await
+    .expect("two chain preparations must progress with exactly two connections");
+    assert_local_claim_error(&first_error, "invalid chain boltz response json");
+    assert_local_claim_error(&second_error, "invalid chain boltz response json");
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn reverse_cooperative_refusal_commits_with_one_connection() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "reverserefusalpool").await;
+    // A JSON string is deliberately the wrong response shape; serde includes
+    // its value in the local type error, deterministically exercising the real
+    // `swap expired` refusal classifier without a provider/Electrum fake.
+    let swap_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "reverserefusalpool",
+        "REVERSE_REFUSAL_POOL_ONE",
+        "\"swap expired\"",
+        None,
+    )
+    .await;
+    let constrained = constrained_test_pool(1, None);
+
+    let error = reverse_claim_pool_error(&constrained, swap_id).await;
+    assert_local_claim_error(&error, "swap expired");
+    let swap = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_REFUSAL_POOL_ONE")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'reverserefusalpool'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert!(swap.cooperative_refused);
+    assert!(swap.address.is_some());
+    assert_eq!(swap.address_index, Some(0));
+    assert_eq!(next_addr_idx, 1);
+    assert!(swap.claim_tx_hex.is_none());
+    assert_eq!(swap.status, "lockup_confirmed");
+    assert_eq!(swap.claim_attempts, 1);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn chain_cooperative_refusal_commits_with_one_connection() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "chainrefusalpool").await;
+    let invoice = insert_test_invoice(
+        &admin,
+        "chainrefusalpool",
+        &npub,
+        "lq1chainrefusalpool",
+        3_600,
+    )
+    .await;
+    // Same deterministic local classifier trigger as the reverse refusal test.
+    let swap_id = seed_claimable_chain_pool_swap(
+        &admin,
+        invoice.id,
+        "chainrefusalpool",
+        "CHAIN_REFUSAL_POOL_ONE",
+        "\"swap expired\"",
+    )
+    .await;
+    let constrained = constrained_test_pool(1, None);
+
+    let error = chain_claim_pool_error(&constrained, swap_id).await;
+    assert_local_claim_error(&error, "swap expired");
+    let swap = pay_service::db::get_chain_swap_by_boltz_id(&admin, "CHAIN_REFUSAL_POOL_ONE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(swap.cooperative_refused);
+    assert!(swap.claim_tx_hex.is_none());
+    assert_eq!(swap.status, "server_lock_confirmed");
+    assert_eq!(swap.claim_attempts, 1);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn terminal_and_unsupported_claims_do_not_prepare_or_allocate() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    create_test_user(&admin, "claimpoolterminal").await;
+    let reverse_id = seed_claimable_reverse_pool_swap(
+        &admin,
+        "claimpoolterminal",
+        "REVERSE_POOL_TERMINAL",
+        "{",
+        None,
+    )
+    .await;
+    pay_service::db::update_swap_status(
+        &admin,
+        reverse_id,
+        pay_service::db::SwapStatus::Claimed,
+        Some("terminal-proof-txid"),
+    )
+    .await
+    .unwrap();
+
+    create_test_user(&admin, "claimpoolunsupportedreverse").await;
+    pay_service::db::record_swap(
+        &admin,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("claimpoolunsupportedreverse"),
+            boltz_swap_id: "REVERSE_POOL_UNSUPPORTED",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-unsupported-claim-pool-proof",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{",
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let unsupported_reverse =
+        pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_UNSUPPORTED")
+            .await
+            .unwrap()
+            .unwrap();
+
+    let npub = create_test_user(&admin, "claimpoolunsupported").await;
+    let invoice = insert_test_invoice(
+        &admin,
+        "claimpoolunsupported",
+        &npub,
+        "lq1claimpoolunsupported",
+        3_600,
+    )
+    .await;
+    let chain = pay_service::db::record_chain_swap(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("claimpoolunsupported"),
+            boltz_swap_id: "CHAIN_POOL_UNSUPPORTED",
+            lockup_address: "bc1qclaimpoolunsupported",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{",
+        },
+    )
+    .await
+    .unwrap();
+
+    let constrained = constrained_test_pool(1, None);
+    let reverse = claimer::exercise_reverse_claim_with_malformed_response(&constrained, reverse_id)
+        .await
+        .unwrap();
+    assert!(matches!(reverse, claimer::ClaimOutcome::AlreadyTerminal));
+    let reverse_unsupported = claimer::exercise_reverse_claim_with_malformed_response(
+        &constrained,
+        unsupported_reverse.id,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reverse_unsupported,
+        claimer::ClaimOutcome::AlreadyTerminal
+    ));
+    let chain_outcome =
+        claimer::exercise_chain_claim_with_malformed_response(&constrained, chain.id)
+            .await
+            .unwrap();
+    assert!(matches!(
+        chain_outcome,
+        claimer::ClaimOutcome::AlreadyTerminal
+    ));
+
+    let reverse = pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_TERMINAL")
+        .await
+        .unwrap()
+        .unwrap();
+    let unsupported_reverse =
+        pay_service::db::get_swap_by_boltz_id(&admin, "REVERSE_POOL_UNSUPPORTED")
+            .await
+            .unwrap()
+            .unwrap();
+    let chain = pay_service::db::get_chain_swap_by_boltz_id(&admin, "CHAIN_POOL_UNSUPPORTED")
+        .await
+        .unwrap()
+        .unwrap();
+    let next_addr_idx: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'claimpoolterminal'")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    let unsupported_next_addr_idx: i32 = sqlx::query_scalar(
+        "SELECT next_addr_idx FROM users WHERE nym = 'claimpoolunsupportedreverse'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert!(reverse.address.is_none());
+    assert!(reverse.address_index.is_none());
+    assert_eq!(next_addr_idx, 0);
+    assert_eq!(unsupported_reverse.status, "pending");
+    assert!(unsupported_reverse.address.is_none());
+    assert!(unsupported_reverse.address_index.is_none());
+    assert_eq!(unsupported_reverse.claim_attempts, 0);
+    assert_eq!(unsupported_next_addr_idx, 0);
+    assert_eq!(chain.status, "pending");
+    assert_eq!(chain.claim_attempts, 0);
+    assert!(!chain.cooperative_refused);
+
+    drop(constrained);
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]

@@ -17,14 +17,17 @@ pub struct User {
     pub is_active: bool,
 }
 
-pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
+pub async fn get_user_by_nym<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    nym: &str,
+) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, nym, npub, verification_npub, \
                 ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE nym = $1",
     )
     .bind(nym)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

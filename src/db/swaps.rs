@@ -292,15 +292,16 @@ pub async fn get_swap_by_boltz_id(
     .await
 }
 
-/// Load a swap row by primary key. Generic over any sqlx executor so the
-/// claimer can call this inside its locked transaction (passing
-/// `&mut *tx`) instead of going back to the pool for a fresh connection.
+/// Load and row-lock a swap by primary key. This is used only by locked claim
+/// preparation: the row lock makes the status/claim-byte snapshot authoritative
+/// against webhook writers until preparation commits or rolls back. Generic
+/// over any executor so the claimer stays on its existing connection.
 pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     id: Uuid,
 ) -> Result<Option<SwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, SwapRecord>(&format!(
-        "SELECT {SWAP_RECORD_COLUMNS} FROM swap_records WHERE id = $1"
+        "SELECT {SWAP_RECORD_COLUMNS} FROM swap_records WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
     .fetch_optional(executor)
@@ -348,7 +349,10 @@ pub async fn update_swap_status(
 /// path.
 ///
 /// Idempotent. Status is not touched here — the row stays claimable.
-pub async fn mark_cooperative_refused(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn mark_cooperative_refused<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE swap_records \
          SET cooperative_refused = TRUE, updated_at = NOW() \
@@ -356,7 +360,7 @@ pub async fn mark_cooperative_refused(pool: &PgPool, id: Uuid) -> Result<(), sql
            AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
     )
     .bind(id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

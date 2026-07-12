@@ -36,6 +36,10 @@ use crate::utxo::UtxoBackend;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+const REVERSE_TEST_GUARD_REJECTED: &str =
+    "claim integration seam requires a malformed reverse response without persisted claim bytes";
+const CHAIN_TEST_GUARD_REJECTED: &str =
+    "claim integration seam requires a malformed chain response without persisted claim bytes";
 
 #[derive(Deserialize)]
 struct WebhookEnvelope {
@@ -1007,25 +1011,22 @@ async fn try_claim_with_retry(
 ///       `users.next_addr_idx` and derive a fresh CT address from the
 ///       user's descriptor.
 ///
-/// Serialized on the `swap_records` row via `SELECT ... FOR UPDATE`, so
-/// concurrent webhook deliveries (e.g. transaction.mempool followed by
-/// transaction.confirmed) can't double-allocate or split addresses.
+/// Runs inside the caller's locked claim-preparation transaction. The
+/// `SELECT ... FOR UPDATE` serializes concurrent webhook deliveries (e.g.
+/// transaction.mempool followed by transaction.confirmed) so they cannot
+/// double-allocate or split addresses, without checking out another pool
+/// connection while the advisory-lock connection is already held.
 async fn resolve_claim_address(
-    pool: &sqlx::PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &db::SwapRecord,
 ) -> Result<String, AppError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-
     // Re-read the swap row under FOR UPDATE — `swap` may be stale (the
     // caller loaded it before this call, possibly on a previous attempt).
     let row: Option<(Option<String>, Option<i32>, Option<uuid::Uuid>)> = sqlx::query_as(
         "SELECT address, address_index, invoice_id FROM swap_records WHERE id = $1 FOR UPDATE",
     )
     .bind(swap.id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
@@ -1035,9 +1036,6 @@ async fn resolve_claim_address(
     // (A) Cached destination — return as-is. Idempotent retries land on
     //     the same address regardless of how it was first resolved.
     if let Some(addr) = cached_addr {
-        tx.commit()
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
         return Ok(addr);
     }
 
@@ -1049,7 +1047,7 @@ async fn resolve_claim_address(
         let inv_row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT liquid_address FROM invoices WHERE id = $1")
                 .bind(inv_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
 
@@ -1060,19 +1058,15 @@ async fn resolve_claim_address(
         sqlx::query("UPDATE swap_records SET address = $1, address_index = NULL WHERE id = $2")
             .bind(&addr)
             .bind(swap.id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
-
-        tx.commit()
+            .execute(&mut **tx)
             .await
             .map_err(|e| AppError::DbError(e.to_string()))?;
 
         tracing::info!(
-            event = "lightning_swap_address_from_invoice",
+            event = "lightning_swap_address_from_invoice_prepared",
             swap_id = %swap.id,
             invoice_id = %inv_id,
-            "claim destination resolved from invoice.liquid_address"
+            "claim destination prepared from invoice.liquid_address; pending claim transaction commit"
         );
         return Ok(addr);
     }
@@ -1089,7 +1083,7 @@ async fn resolve_claim_address(
         ))
     })?;
 
-    let user = db::get_user_by_nym(pool, nym)
+    let user = db::get_user_by_nym(&mut **tx, nym)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("user not found: {nym}")))?;
@@ -1100,7 +1094,7 @@ async fn resolve_claim_address(
          RETURNING next_addr_idx - 1",
     )
     .bind(nym)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
 
@@ -1116,20 +1110,16 @@ async fn resolve_claim_address(
         .bind(swap.id)
         .bind(&derived)
         .bind(addr_index)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-
-    tx.commit()
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     tracing::info!(
-        event = "lightning_swap_address_allocated_at_claim",
+        event = "lightning_swap_address_allocation_prepared",
         nym = %nym,
         swap_id = %swap.id,
         address_index = addr_index,
-        "claim-time descriptor allocation"
+        "claim-time descriptor allocation prepared; pending claim transaction commit"
     );
 
     Ok(derived)
@@ -1181,6 +1171,54 @@ async fn claim_swap(
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
+    claim_swap_with_guard(
+        pool,
+        swap_id,
+        claim_clients,
+        boltz_url,
+        max_claim_attempts,
+        utxo_backend,
+        tolerances,
+        false,
+    )
+    .await
+}
+
+/// Constrained-pool integration seam. It executes the exact production path,
+/// but only while the persisted provider response is malformed and no claim
+/// bytes exist, guaranteeing a local construction error before any
+/// Electrum/Boltz call or broadcast.
+/// Normal application code calls the private [`claim_swap`] entry point.
+#[doc(hidden)]
+pub async fn exercise_reverse_claim_with_malformed_response(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+) -> Result<ClaimOutcome, AppError> {
+    let factory = LiquidClaimClientFactory::try_new(vec!["tcp://127.0.0.1:1".to_string()])?;
+    claim_swap_with_guard(
+        pool,
+        swap_id,
+        Some(&factory),
+        "http://127.0.0.1:1",
+        20,
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_swap_with_guard(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    claim_clients: Option<&LiquidClaimClientFactory>,
+    boltz_url: &str,
+    max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
+    require_malformed_response: bool,
+) -> Result<ClaimOutcome, AppError> {
     // Outer wrapper: records every Err uniformly via
     // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
     // are Ok variants and do NOT count as failures (no attempt was
@@ -1192,8 +1230,17 @@ async fn claim_swap(
         boltz_url,
         utxo_backend,
         tolerances,
+        require_malformed_response,
     )
     .await;
+    if require_malformed_response
+        && matches!(
+            &result,
+            Err(AppError::ClaimError(message)) if message == REVERSE_TEST_GUARD_REJECTED
+        )
+    {
+        return result;
+    }
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_claim_failure(pool, swap_id, &err_str, max_claim_attempts).await {
@@ -1245,6 +1292,29 @@ async fn claim_swap(
     result
 }
 
+/// Preserve preparation writes that were already durable before claim
+/// construction in the old two-transaction flow (notably the resolved reverse
+/// destination and descriptor cursor), then return the original local/provider
+/// error. Cooperative-refusal callers also set their one-way flag on this
+/// transaction before committing here.
+async fn commit_claim_preparation_error<T>(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    error: AppError,
+) -> Result<T, AppError> {
+    if let Err(commit_error) = tx.commit().await {
+        tracing::error!(
+            event = "claim_preparation_error_commit_failed",
+            original_error = %error,
+            error = %commit_error,
+            "failed to commit handled claim-preparation state"
+        );
+        return Err(AppError::DbError(format!(
+            "commit handled claim-preparation state after {error}: {commit_error}"
+        )));
+    }
+    Err(error)
+}
+
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
@@ -1252,6 +1322,7 @@ async fn claim_swap_inner(
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     let claim_clients = claim_clients.ok_or_else(|| {
         AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
@@ -1286,23 +1357,37 @@ async fn claim_swap_inner(
     let status = swap
         .parsed_status()
         .map_err(|e| AppError::ClaimError(format!("invalid persisted swap status: {e}")))?;
-    if status.is_terminal() {
-        tracing::debug!("claim_swap: {} already terminal ({})", swap_id, swap.status);
+    if !status.is_claimable() {
+        tracing::debug!("claim_swap: {} is not claimable ({})", swap_id, swap.status);
         return Ok(ClaimOutcome::AlreadyTerminal);
     }
+    if require_malformed_response
+        && (swap.claim_tx_hex.is_some()
+            || swap.boltz_response_json.as_deref().is_some_and(|response| {
+                serde_json::from_str::<CreateReverseResponse>(response).is_ok()
+            }))
+    {
+        return Err(AppError::ClaimError(
+            REVERSE_TEST_GUARD_REJECTED.to_string(),
+        ));
+    }
 
-    // resolve_claim_address opens its own short-lived tx with a row-level
-    // FOR UPDATE on the swap row. That's fine: we hold an advisory lock
-    // (in-memory, no row-level conflict) so its tx goes through cleanly.
-    let output_address = resolve_claim_address(pool, &swap).await?;
+    // Destination resolution uses this same transaction/connection. Returning
+    // to the pool here would self-starve at max_connections=1 and can deadlock
+    // a saturated pool when multiple claim preparations each hold one slot.
+    let output_address = resolve_claim_address(&mut tx, &swap).await?;
 
     let chain = Chain::Liquid(LiquidChain::Liquid);
     let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
         // Idempotent path: a previous attempt persisted the constructed
         // tx but failed somewhere between persistence and "Claimed"
         // status. Re-broadcast THAT tx, not a fresh one.
-        BtcLikeTransaction::from_hex(chain, hex)
-            .map_err(|e| AppError::ClaimError(format!("decode persisted claim_tx: {e}")))?
+        match BtcLikeTransaction::from_hex(chain, hex)
+            .map_err(|e| AppError::ClaimError(format!("decode persisted claim_tx: {e}")))
+        {
+            Ok(tx) => tx,
+            Err(error) => return commit_claim_preparation_error(tx, error).await,
+        }
     } else {
         // Choose the claim path. `cooperative_refused` is set by either:
         //   - the webhook handler on `swap.expired`, OR
@@ -1324,26 +1409,26 @@ async fn claim_swap_inner(
             Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
                 // Boltz refused cooperative MuSig2 (status mismatch,
                 // bad preimage, or operator-disabled). Flip the flag
-                // so the next sweep tick takes the script path; this
-                // attempt aborts (we'll already have committed nothing
-                // since we're inside the construction tx).
+                // so the next sweep tick takes the script path. The flag and
+                // any newly resolved destination must commit before this
+                // attempt returns the refusal to the retry wrapper.
                 tracing::warn!(
                     event = "swap_cooperative_refused_runtime",
                     swap_id = %swap.boltz_swap_id,
                     error = %e,
                     "boltz refused cooperative claim; flipping cooperative_refused for next attempt"
                 );
-                // mark_cooperative_refused opens its own short tx and is
-                // idempotent — safe to call from inside our locked tx
-                // (different connection; advisory lock doesn't conflict).
-                db::mark_cooperative_refused(pool, swap.id)
+                db::mark_cooperative_refused(&mut *tx, swap.id)
                     .await
                     .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
-                return Err(e);
+                return commit_claim_preparation_error(tx, e).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
-        let hex = serialize_claim_tx_hex(&constructed)?;
+        let hex = match serialize_claim_tx_hex(&constructed) {
+            Ok(hex) => hex,
+            Err(error) => return commit_claim_preparation_error(tx, error).await,
+        };
         let txid = btc_like_txid(&constructed);
         let claim_path = if use_cooperative {
             "cooperative"
@@ -1353,7 +1438,7 @@ async fn claim_swap_inner(
         // `WHERE claim_tx_hex IS NULL` makes this a no-op if a concurrent
         // attempt persisted first (defensive — the advisory lock should
         // have prevented this; the guard is there to fail closed).
-        sqlx::query(
+        let persisted = sqlx::query(
             "UPDATE swap_records \
              SET claim_tx_hex = $2, claim_txid = $3, claim_path = $4 \
              WHERE id = $1 AND claim_tx_hex IS NULL",
@@ -1365,13 +1450,19 @@ async fn claim_swap_inner(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+        if persisted.rows_affected() != 1 {
+            return Err(AppError::DbError(format!(
+                "reverse claim preparation lost its locked row: {}",
+                swap.id
+            )));
+        }
         constructed
     };
 
     // Status -> Claiming. The retry timestamp doubles as an in-flight
     // lease: webhook/reconciler/background races must wait for this
     // deadline before rebroadcasting the persisted transaction.
-    sqlx::query(
+    let marked_claiming = sqlx::query(
         "UPDATE swap_records \
          SET status = 'claiming', \
              next_claim_attempt_at = NOW() + $2::interval, \
@@ -1384,6 +1475,12 @@ async fn claim_swap_inner(
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
+    if marked_claiming.rows_affected() != 1 {
+        return Err(AppError::DbError(format!(
+            "reverse claim preparation could not publish claiming state: {}",
+            swap.id
+        )));
+    }
 
     tx.commit()
         .await
@@ -1521,6 +1618,53 @@ async fn claim_chain_swap(
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
+    claim_chain_swap_with_guard(
+        pool,
+        chain_swap_id,
+        claim_clients,
+        boltz_url,
+        max_claim_attempts,
+        utxo_backend,
+        tolerances,
+        false,
+    )
+    .await
+}
+
+/// Constrained-pool integration seam for chain claims. The persisted provider
+/// response must be malformed and no claim bytes may exist, guaranteeing that
+/// the exact production path fails locally before Electrum/Boltz I/O or
+/// broadcast.
+#[doc(hidden)]
+pub async fn exercise_chain_claim_with_malformed_response(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+) -> Result<ClaimOutcome, AppError> {
+    let factory = LiquidClaimClientFactory::try_new(vec!["tcp://127.0.0.1:1".to_string()])?;
+    claim_chain_swap_with_guard(
+        pool,
+        chain_swap_id,
+        Some(&factory),
+        "http://127.0.0.1:1",
+        20,
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_chain_swap_with_guard(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    claim_clients: Option<&LiquidClaimClientFactory>,
+    boltz_url: &str,
+    max_claim_attempts: i32,
+    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    tolerances: db::InvoiceAccountingTolerances,
+    require_malformed_response: bool,
+) -> Result<ClaimOutcome, AppError> {
     let result = claim_chain_swap_inner(
         pool,
         chain_swap_id,
@@ -1528,8 +1672,17 @@ async fn claim_chain_swap(
         boltz_url,
         utxo_backend,
         tolerances,
+        require_malformed_response,
     )
     .await;
+    if require_malformed_response
+        && matches!(
+            &result,
+            Err(AppError::ClaimError(message)) if message == CHAIN_TEST_GUARD_REJECTED
+        )
+    {
+        return result;
+    }
     if let Err(ref e) = result {
         let err_str = e.to_string();
         match db::record_chain_swap_claim_failure(pool, chain_swap_id, &err_str, max_claim_attempts)
@@ -1592,6 +1745,7 @@ async fn claim_chain_swap_inner(
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     let claim_clients = claim_clients.ok_or_else(|| {
         AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
@@ -1612,7 +1766,7 @@ async fn claim_chain_swap_inner(
         return Ok(ClaimOutcome::SkippedLockHeld);
     }
 
-    let swap = db::get_chain_swap_by_id(&mut *tx, chain_swap_id)
+    let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
@@ -1632,8 +1786,14 @@ async fn claim_chain_swap_inner(
     ) {
         return Ok(ClaimOutcome::AlreadyTerminal);
     }
+    if require_malformed_response
+        && (swap.claim_tx_hex.is_some()
+            || serde_json::from_str::<CreateChainResponse>(&swap.boltz_response_json).is_ok())
+    {
+        return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
+    }
 
-    let invoice = db::get_invoice_by_id(pool, swap.invoice_id)
+    let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id)))?;
@@ -1645,8 +1805,12 @@ async fn claim_chain_swap_inner(
     })?;
 
     let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
-        BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
-            .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))?
+        match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
+            .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))
+        {
+            Ok(tx) => tx,
+            Err(error) => return commit_claim_preparation_error(tx, error).await,
+        }
     } else {
         // Cooperative MuSig2 claim by default; script-path (preimage) claim once
         // `cooperative_refused` is set — by the `swap.expired` webhook or a prior
@@ -1670,16 +1834,19 @@ async fn claim_chain_swap_inner(
                     error = %e,
                     "boltz refused cooperative chain claim; flipping cooperative_refused for next sweep"
                 );
-                db::mark_chain_swap_cooperative_refused(pool, swap.id)
+                db::mark_chain_swap_cooperative_refused(&mut *tx, swap.id)
                     .await
                     .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
-                return Err(e);
+                return commit_claim_preparation_error(tx, e).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
-        let hex = serialize_claim_tx_hex(&constructed)?;
+        let hex = match serialize_claim_tx_hex(&constructed) {
+            Ok(hex) => hex,
+            Err(error) => return commit_claim_preparation_error(tx, error).await,
+        };
         let txid = btc_like_txid(&constructed);
-        sqlx::query(
+        let persisted = sqlx::query(
             "UPDATE chain_swap_records \
              SET claim_tx_hex = $2, claim_txid = $3 \
              WHERE id = $1 AND claim_tx_hex IS NULL",
@@ -1690,10 +1857,16 @@ async fn claim_chain_swap_inner(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+        if persisted.rows_affected() != 1 {
+            return Err(AppError::DbError(format!(
+                "chain claim preparation lost its locked row: {}",
+                swap.id
+            )));
+        }
         constructed
     };
 
-    sqlx::query(
+    let marked_claiming = sqlx::query(
         "UPDATE chain_swap_records \
          SET status = 'claiming', \
              next_claim_attempt_at = NOW() + $2::interval, \
@@ -1706,6 +1879,12 @@ async fn claim_chain_swap_inner(
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DbError(e.to_string()))?;
+    if marked_claiming.rows_affected() != 1 {
+        return Err(AppError::DbError(format!(
+            "chain claim preparation could not publish claiming state: {}",
+            swap.id
+        )));
+    }
 
     tx.commit()
         .await
