@@ -58,10 +58,14 @@ archive/      Historical plans, research, and test evidence
 
 Prerequisites:
 
-- Rust toolchain
+- Rustup with the pinned toolchain from `rust-toolchain.toml`
 - PostgreSQL
 - Node.js/npm when changing the PWA
-- a sibling `../boltz/boltz-rust` checkout matching the pinned project revision
+- Python 3.11+ for release provenance verification and records
+
+`boltz-client` is fetched from BullishNode/boltz-rust at the exact revision in
+`release-manifest.toml`, `Cargo.toml`, and `Cargo.lock`; a sibling checkout is
+not required for ordinary builds.
 
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@localhost/bullnym
@@ -70,6 +74,14 @@ export SWAP_MNEMONIC="twelve word development mnemonic ..."
 sqlx migrate run
 cargo test --lib
 cargo run
+```
+
+Contributors changing both repositories may explicitly activate the ignored
+local path override. It is never accepted by release preflight or CI:
+
+```bash
+cp .cargo/config.local.toml.example .cargo/config.toml
+# remove .cargo/config.toml before release verification
 ```
 
 The server listens on `0.0.0.0:8080` by default. Copy and review `config.toml`
@@ -108,7 +120,9 @@ and is not part of the current product contract.
 cargo test --lib
 cargo test --tests --no-run
 scripts/check-docs.sh
-./release-preflight.sh
+scripts/test-release-provenance.sh
+scripts/test-release-record.sh
+scripts/release-preflight.sh
 ```
 
 DB-backed integration tests require `TEST_DATABASE_URL` and a migrated test

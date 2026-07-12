@@ -624,6 +624,7 @@ checksum = "829a082bd3761fde7476dc2ed85ca56c11628948460ece621e4f56fef5046567"
 [[package]]
 name = "boltz-client"
 version = "0.3.1"
+source = "git+https://github.com/BullishNode/boltz-rust.git?rev=c20511854bbd996a74f914fa0327d4601b5d4f62#c20511854bbd996a74f914fa0327d4601b5d4f62"
 dependencies = [
  "async-trait",
  "bip39",

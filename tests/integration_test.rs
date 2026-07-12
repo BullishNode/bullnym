@@ -27,8 +27,8 @@ use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
 use pay_service::{
-    certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, registration,
-    AppState,
+    certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
+    registration, AppState,
 };
 
 use boltz_client::network::Network;
@@ -123,6 +123,7 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 fn test_app(state: AppState) -> Router {
     Router::new()
+        .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
@@ -520,6 +521,43 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+#[tokio::test]
+async fn readiness_rejects_schema_before_latest_migration() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts \
+         RENAME TO chain_swap_tx_attempts_before_readiness_test",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(pool.clone()));
+    let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts_before_readiness_test \
+         RENAME TO chain_swap_tx_attempts",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(pre_migration_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pre_migration_body["ready"], false);
+    assert_eq!(
+        pre_migration_body["expected_schema_marker"],
+        "046_chain_swap_tx_attempts"
+    );
+
+    let app = test_app(test_state(pool.clone()));
+    let (current_status, current_body) = get_path(&app, "/ready").await;
+    assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
+    assert_eq!(current_body["ready"], true);
 }
 
 // --- Registration tests ---

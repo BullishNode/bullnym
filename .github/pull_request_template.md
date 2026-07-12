@@ -16,6 +16,7 @@
 - [ ] Focused tests
 - [ ] `cargo test --lib`
 - [ ] `scripts/check-docs.sh`
+- [ ] `scripts/build-release.sh` or provenance not affected
 - [ ] PWA build/dist check or not applicable
 
 Describe skipped checks and remaining risks:
