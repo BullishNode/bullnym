@@ -103,23 +103,34 @@ impl BitcoinRecoveryBuilder for LiveRecoveryBuilder<'_> {
     }
 }
 
-struct EsploraRecoveryEvidence {
+/// Initialized, reusable witness for the Bitcoin recovery evidence path.
+/// Network reachability remains transient worker evidence; construction only
+/// validates the immutable endpoint set and builds the shared HTTP client.
+pub struct BitcoinRecoveryBackend {
     endpoints: Vec<String>,
     client: reqwest::Client,
 }
 
-impl EsploraRecoveryEvidence {
-    fn new(endpoints: Vec<String>) -> Result<Self, AppError> {
+impl BitcoinRecoveryBackend {
+    pub fn try_new(endpoints: Vec<String>) -> Result<Self, AppError> {
+        let endpoints: Vec<String> = endpoints
+            .into_iter()
+            .filter(|endpoint| crate::config::valid_http_endpoint(endpoint))
+            .collect();
         if endpoints.is_empty() {
-            return Err(AppError::ClaimError(
-                "Bitcoin recovery has no configured evidence backend".into(),
+            return Err(AppError::ElectrumError(
+                "Bitcoin recovery has no valid evidence backend".into(),
             ));
         }
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
-            .map_err(|e| AppError::ClaimError(format!("build Bitcoin evidence client: {e}")))?;
+            .map_err(|e| AppError::ElectrumError(format!("build Bitcoin evidence client: {e}")))?;
         Ok(Self { endpoints, client })
+    }
+
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
     }
 }
 
@@ -130,7 +141,7 @@ struct EsploraOutspend {
 }
 
 #[async_trait]
-impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
+impl BitcoinRecoveryEvidence for BitcoinRecoveryBackend {
     async fn raw_transaction(&self, txid: &str) -> Result<Option<Vec<u8>>, AppError> {
         let mut not_found = 0usize;
         let mut errors = Vec::new();
@@ -139,20 +150,22 @@ impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
             match self.client.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
                     let body = response.text().await.map_err(|e| {
-                        AppError::ClaimError(format!("read raw transaction from {endpoint}: {e}"))
+                        AppError::ElectrumError(format!(
+                            "read raw transaction from {endpoint}: {e}"
+                        ))
                     })?;
                     let bytes = hex::decode(body.trim()).map_err(|e| {
-                        AppError::ClaimError(format!(
+                        AppError::ElectrumError(format!(
                             "Bitcoin backend {endpoint} returned invalid transaction hex: {e}"
                         ))
                     })?;
                     let tx: Transaction = deserialize(&bytes).map_err(|e| {
-                        AppError::ClaimError(format!(
+                        AppError::ElectrumError(format!(
                             "Bitcoin backend {endpoint} returned invalid transaction: {e}"
                         ))
                     })?;
                     if tx.compute_txid().to_string() != txid {
-                        return Err(AppError::ClaimError(format!(
+                        return Err(AppError::ElectrumError(format!(
                             "Bitcoin backend {endpoint} returned bytes with the wrong txid"
                         )));
                     }
@@ -168,7 +181,7 @@ impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
         if not_found == self.endpoints.len() {
             Ok(None)
         } else {
-            Err(AppError::ClaimError(format!(
+            Err(AppError::ElectrumError(format!(
                 "Bitcoin transaction presence is unknown for {txid}: {}",
                 errors.join(" | ")
             )))
@@ -185,7 +198,7 @@ impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
             match self.client.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
                     let value: EsploraOutspend = response.json().await.map_err(|e| {
-                        AppError::ClaimError(format!(
+                        AppError::ElectrumError(format!(
                             "decode Bitcoin outspend from {endpoint}: {e}"
                         ))
                     })?;
@@ -199,7 +212,7 @@ impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
                                 txid: txid.to_lowercase(),
                             })
                             .ok_or_else(|| {
-                                AppError::ClaimError(format!(
+                                AppError::ElectrumError(format!(
                                     "Bitcoin backend {endpoint} reported a spend without a valid txid"
                                 ))
                             })
@@ -211,7 +224,7 @@ impl BitcoinRecoveryEvidence for EsploraRecoveryEvidence {
                 Err(e) => errors.push(format!("{endpoint}: {e}")),
             }
         }
-        Err(AppError::ClaimError(format!(
+        Err(AppError::ElectrumError(format!(
             "Bitcoin outspend state is unknown for {txid}:{vout}: {}",
             errors.join(" | ")
         )))
@@ -237,15 +250,17 @@ pub(crate) async fn execute_journaled_recovery(
     state: &AppState,
     chain_swap_id: Uuid,
 ) -> Result<String, AppError> {
-    let endpoints = state.config.bitcoin_watcher.effective_endpoints();
+    let evidence = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+    })?;
+    let endpoints = evidence.endpoints().to_vec();
     let builder = LiveRecoveryBuilder { state };
-    let evidence = EsploraRecoveryEvidence::new(endpoints.clone())?;
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
     execute_journaled_recovery_with_services(
         &state.db,
         chain_swap_id,
         &builder,
-        &evidence,
+        evidence,
         &broadcaster,
         &NoRecoveryFaults,
     )
@@ -351,12 +366,10 @@ pub async fn execute_journaled_recovery_with_services(
                 "broadcaster returned txid {returned_txid}, expected {}",
                 attempt.txid
             );
-            reconcile_after_broadcast_error(pool, &attempt, evidence, &error).await
+            reconcile_after_broadcast_error(pool, &attempt, evidence, AppError::ClaimError(error))
+                .await
         }
-        Err(error) => {
-            let error = error.to_string();
-            reconcile_after_broadcast_error(pool, &attempt, evidence, &error).await
-        }
+        Err(error) => reconcile_after_broadcast_error(pool, &attempt, evidence, error).await,
     }
 }
 
@@ -724,12 +737,17 @@ async fn reconcile_after_broadcast_error(
     pool: &sqlx::PgPool,
     attempt: &ChainSwapTxAttempt,
     evidence: &dyn BitcoinRecoveryEvidence,
-    error: &str,
+    error: AppError,
 ) -> Result<String, AppError> {
+    let error_text = error.to_string();
     match reconcile_attempt_evidence(attempt, evidence).await {
         Ok(EvidenceDecision::ExpectedObserved(reason)) => {
-            complete_expected_attempt(pool, attempt, &format!("{reason}; broadcaster: {error}"))
-                .await?;
+            complete_expected_attempt(
+                pool,
+                attempt,
+                &format!("{reason}; broadcaster: {error_text}"),
+            )
+            .await?;
             Ok(attempt.txid.clone())
         }
         Ok(EvidenceDecision::UnknownOutspend { source, spender }) => {
@@ -756,12 +774,26 @@ async fn reconcile_after_broadcast_error(
             );
             Err(AppError::ClaimError(reason))
         }
-        Ok(EvidenceDecision::Unspent) | Err(_) => {
-            let result = format!("broadcast outcome ambiguous: {error}");
+        Ok(EvidenceDecision::Unspent) => {
+            let result = format!("broadcast outcome ambiguous: {error_text}");
             db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
-            Err(AppError::ClaimError(result))
+            // Preserve the broadcaster's typed failure scope after the
+            // ambiguity is durably recorded. Re-wrapping a backend outage as
+            // ClaimError would let reconciler health report a false success.
+            Err(error)
+        }
+        Err(evidence_error) => {
+            let result = format!(
+                "broadcast outcome ambiguous: {error_text}; evidence unavailable: {evidence_error}"
+            );
+            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+            // Evidence is now the strongest reason the outcome cannot be
+            // resolved, so retain its typed backend failure for worker health.
+            Err(evidence_error)
         }
     }
 }
@@ -811,7 +843,13 @@ async fn construct_live_refund(
         state.config.boltz.api_url.clone(),
         Some(Duration::from_secs(15)),
     );
-    let endpoints = state.config.bitcoin_watcher.effective_endpoints();
+    let endpoints = state
+        .bitcoin_recovery_backend
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+        })?
+        .endpoints();
     let mut errors = Vec::new();
     for (index, endpoint) in endpoints.iter().enumerate() {
         let bitcoin_client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
@@ -861,9 +899,42 @@ async fn construct_live_refund(
             }
         }
     }
-    Err(AppError::ClaimError(format!(
+    Err(AppError::ElectrumError(format!(
         "construct chain recovery failed on all {} Bitcoin backend(s): {}",
         endpoints.len(),
         errors.join(" | ")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitcoinRecoveryBackend;
+
+    #[test]
+    fn recovery_backend_requires_a_valid_http_endpoint() {
+        assert!(BitcoinRecoveryBackend::try_new(Vec::new()).is_err());
+        assert!(BitcoinRecoveryBackend::try_new(vec![
+            "not-a-url".to_string(),
+            "ftp://example.com/api".to_string(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_backend_reuses_the_validated_endpoint_set() {
+        let backend = BitcoinRecoveryBackend::try_new(vec![
+            "invalid".to_string(),
+            "https://mempool.bullbitcoin.com/api".to_string(),
+            "http://127.0.0.1:3000".to_string(),
+        ])
+        .expect("valid recovery endpoints");
+
+        assert_eq!(
+            backend.endpoints(),
+            [
+                "https://mempool.bullbitcoin.com/api".to_string(),
+                "http://127.0.0.1:3000".to_string(),
+            ]
+        );
+    }
 }

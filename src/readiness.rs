@@ -87,10 +87,10 @@ async fn check_database(pool: &sqlx::PgPool) -> ComponentStatus {
 }
 
 async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
-    match timeout(READINESS_DB_TIMEOUT, schema_marker_present(pool)).await {
+    match timeout(READINESS_DB_TIMEOUT, schema_and_journal_ready(pool)).await {
         Ok(Ok(true)) => ComponentStatus::ok(),
         Ok(Ok(false)) => ComponentStatus::error(format!(
-            "expected schema marker {EXPECTED_SCHEMA_MARKER} is not present"
+            "expected schema marker {EXPECTED_SCHEMA_MARKER} is not present or its recovery journal is not writable"
         )),
         Ok(Err(e)) => {
             tracing::warn!("readiness schema probe failed: {e}");
@@ -98,6 +98,48 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
         }
         Err(_) => ComponentStatus::error("schema probe timed out"),
     }
+}
+
+/// Verify the complete current schema marker and the write privilege required
+/// by the recovery journal. Normal startup treats this as a foundation; the
+/// HTTP readiness endpoint reuses the same predicate so deploy and runtime
+/// checks cannot drift.
+pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    if !schema_marker_present(pool).await? {
+        return Ok(false);
+    }
+
+    let privileges = sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<bool>)>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_tx_attempts'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_tx_attempts'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_tx_attempts'), \
+                'UPDATE' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(journal_privileges_ready(privileges))
+}
+
+fn journal_privileges_ready(
+    (select, insert, update): (Option<bool>, Option<bool>, Option<bool>),
+) -> bool {
+    matches!(
+        (select, insert, update),
+        (Some(true), Some(true), Some(true))
+    )
 }
 
 async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
@@ -251,4 +293,29 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
     )
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::journal_privileges_ready;
+
+    #[test]
+    fn recovery_journal_requires_every_privilege() {
+        assert!(journal_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+
+        for privileges in [
+            (Some(false), Some(true), Some(true)),
+            (Some(true), Some(false), Some(true)),
+            (Some(true), Some(true), Some(false)),
+            (None, Some(true), Some(true)),
+            (Some(true), None, Some(true)),
+            (Some(true), Some(true), None),
+        ] {
+            assert!(!journal_privileges_ready(privileges));
+        }
+    }
 }

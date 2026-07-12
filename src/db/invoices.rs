@@ -270,42 +270,166 @@ pub async fn list_invoices_by_npub(
 /// linked + unlinked are covered uniformly) and regardless of how the
 /// address was sourced (descriptor allocator OR wallet-supplied).
 ///
-/// `ORDER BY created_at ASC` keeps scans deterministic if a client ever
-/// reuses a wallet-supplied address. Payment events are idempotent by
-/// outpoint, so repeated watcher ticks do not double count. Bounded by
-/// `LIMIT 1000` so a runaway invoice pipeline can't blow the watcher's
-/// per-tick budget; the next tick re-queries.
-///
-/// Order is `random()`, NOT `created_at ASC`: with oldest-first, once the open
-/// set exceeds `LIMIT 1000` the scan was pinned to the oldest (typically
-/// abandoned) invoices and never reached newer ones — a freshly-created invoice
-/// being paid right now would be permanently starved. Randomizing gives every
-/// open invoice an equal per-tick scan probability, so no invoice is ever
-/// permanently skipped. This is the minimal correct fix; a bounded round-robin
-/// (a `last_scanned_at` watermark, giving a hard coverage bound + an SLO metric)
-/// is the upgrade if production metrics show the probabilistic tail is too slow
-/// at scale — see issue #28.
-///
-/// Returned shape: `(invoice_id, liquid_address, amount_sat)`.
+/// Watchers page deterministically through a process-local scan epoch. The
+/// epoch captures PostgreSQL time once, then keysets on `(created_at, id)` so
+/// every row that existed at the cutoff is visited exactly once. Rows created
+/// later wait for the next epoch. One sentinel row beyond the 1,000-row work
+/// batch distinguishes a completed epoch from deferred work without a count.
+const LIQUID_WATCHER_BATCH_SIZE: usize = 1_000;
+
+pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
+            GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
+            liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
+     FROM invoices \
+     WHERE (status IN ('unpaid', 'in_progress', 'partially_paid') \
+            OR (origin = 'checkout' AND status = 'underpaid')) \
+       AND accept_liquid = TRUE \
+       AND liquid_address IS NOT NULL \
+       AND liquid_blinding_key_hex IS NOT NULL \
+       AND expires_at + ($1 || ' seconds')::interval > $2::timestamptz \
+       AND created_at <= $2::timestamptz \
+       AND ( \
+             $3::timestamptz IS NULL \
+             OR (created_at, id) > ($3::timestamptz, $4::uuid) \
+           ) \
+     ORDER BY created_at ASC, id ASC \
+     LIMIT $5";
+
+type LiquidWatcherInvoice = (Uuid, String, i64, String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherScanCursor {
+    pub created_at: String,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatcherScanEpoch {
+    snapshot: Option<String>,
+    cursor: Option<WatcherScanCursor>,
+}
+
+impl WatcherScanEpoch {
+    pub fn snapshot(&self) -> Option<&str> {
+        self.snapshot.as_deref()
+    }
+
+    pub fn cursor(&self) -> Option<&WatcherScanCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub fn begin(&mut self, snapshot: String) {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(snapshot);
+        }
+    }
+
+    pub fn advance(&mut self, cursor: WatcherScanCursor) {
+        self.cursor = Some(cursor);
+    }
+
+    pub fn finish(&mut self) {
+        self.snapshot = None;
+        self.cursor = None;
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct LiquidWatcherInvoicePageRow {
+    pub id: Uuid,
+    pub liquid_address: String,
+    pub amount_sat: i64,
+    pub liquid_blinding_key_hex: String,
+    pub created_at_cursor: String,
+}
+
+impl LiquidWatcherInvoicePageRow {
+    pub fn scan_cursor(&self) -> WatcherScanCursor {
+        WatcherScanCursor {
+            created_at: self.created_at_cursor.clone(),
+            id: self.id,
+        }
+    }
+}
+
+pub struct LiquidWatcherInvoicePage {
+    pub rows: Vec<LiquidWatcherInvoicePageRow>,
+    pub has_more: bool,
+}
+
+pub struct LiquidWatcherInvoiceBatch {
+    pub rows: Vec<LiquidWatcherInvoice>,
+    pub has_more: bool,
+}
+
+fn truncate_to_watcher_batch<T>(rows: &mut Vec<T>, limit: usize) -> bool {
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    has_more
+}
+
+/// Database-clock cutoff for one process-local watcher epoch. Text is used so
+/// the watcher does not need a second timestamp library; PostgreSQL parses its
+/// own representation back as `timestamptz` in the page query.
+pub async fn watcher_scan_snapshot(pool: &PgPool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar("SELECT clock_timestamp()::TEXT")
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn list_unpaid_invoices_with_liquid_address_page(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+    snapshot: &str,
+    cursor: Option<&WatcherScanCursor>,
+) -> Result<LiquidWatcherInvoicePage, sqlx::Error> {
+    let mut rows = sqlx::query_as::<_, LiquidWatcherInvoicePageRow>(LIQUID_WATCHER_PAGE_SQL)
+        .bind(payment_grace_secs as i64)
+        .bind(snapshot)
+        .bind(cursor.map(|cursor| cursor.created_at.as_str()))
+        .bind(cursor.map(|cursor| cursor.id))
+        .bind((LIQUID_WATCHER_BATCH_SIZE + 1) as i64)
+        .fetch_all(pool)
+        .await?;
+    let has_more = truncate_to_watcher_batch(&mut rows, LIQUID_WATCHER_BATCH_SIZE);
+    Ok(LiquidWatcherInvoicePage { rows, has_more })
+}
+
+pub async fn list_unpaid_invoices_with_liquid_address_batch(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+) -> Result<LiquidWatcherInvoiceBatch, sqlx::Error> {
+    let snapshot = watcher_scan_snapshot(pool).await?;
+    let page =
+        list_unpaid_invoices_with_liquid_address_page(pool, payment_grace_secs, &snapshot, None)
+            .await?;
+    let has_more = page.has_more;
+    let rows = page
+        .rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id,
+                row.liquid_address,
+                row.amount_sat,
+                row.liquid_blinding_key_hex,
+            )
+        })
+        .collect();
+    Ok(LiquidWatcherInvoiceBatch { rows, has_more })
+}
+
+/// Compatibility projection for callers that only need the bounded row set.
+/// Returned shape: `(invoice_id, liquid_address, amount_sat, blinding_key_hex)`.
 pub async fn list_unpaid_invoices_with_liquid_address(
     pool: &PgPool,
     payment_grace_secs: u64,
-) -> Result<Vec<(Uuid, String, i64, String)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, String, i64, String)>(
-        "SELECT id, liquid_address, GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0), liquid_blinding_key_hex \
-         FROM invoices \
-         WHERE (status IN ('unpaid', 'in_progress', 'partially_paid') \
-                OR (origin = 'checkout' AND status = 'underpaid')) \
-           AND accept_liquid = TRUE \
-           AND liquid_address IS NOT NULL \
-           AND liquid_blinding_key_hex IS NOT NULL \
-           AND expires_at + ($1 || ' seconds')::interval > NOW() \
-         ORDER BY random() \
-         LIMIT 1000",
+) -> Result<Vec<LiquidWatcherInvoice>, sqlx::Error> {
+    Ok(
+        list_unpaid_invoices_with_liquid_address_batch(pool, payment_grace_secs)
+            .await?
+            .rows,
     )
-    .bind(payment_grace_secs as i64)
-    .fetch_all(pool)
-    .await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1108,29 +1232,52 @@ pub async fn latest_lightning_pr_for_invoice(
 
 #[cfg(test)]
 mod status_tests {
-    use super::resolve_invoice_status;
+    use super::{
+        resolve_invoice_status, truncate_to_watcher_batch, WatcherScanCursor, WatcherScanEpoch,
+        LIQUID_WATCHER_BATCH_SIZE, LIQUID_WATCHER_PAGE_SQL,
+    };
+    use uuid::Uuid;
 
     // amount 100_000; btc tolerance 300, liquid tolerance 60 (illustrative).
     const AMT: i64 = 100_000;
 
     #[test]
+    fn liquid_watcher_expiry_membership_is_frozen_at_the_scan_epoch() {
+        assert!(LIQUID_WATCHER_PAGE_SQL
+            .contains("expires_at + ($1 || ' seconds')::interval > $2::timestamptz"));
+        assert!(!LIQUID_WATCHER_PAGE_SQL.contains("NOW()"));
+    }
+
+    #[test]
     fn within_tolerance_is_paid() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 99_750, 300, false), "paid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 99_750, 300, false),
+            "paid"
+        );
     }
 
     #[test]
     fn overpaid_when_exceeding_amount() {
-        assert_eq!(resolve_invoice_status("paid", AMT, 100_500, 60, false), "overpaid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 100_500, 60, false),
+            "overpaid"
+        );
     }
 
     #[test]
     fn partial_when_short_beyond_tolerance() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 90_000, 300, false), "partially_paid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 90_000, 300, false),
+            "partially_paid"
+        );
     }
 
     #[test]
     fn expired_short_is_underpaid() {
-        assert_eq!(resolve_invoice_status("unpaid", AMT, 90_000, 300, true), "underpaid");
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 90_000, 300, true),
+            "underpaid"
+        );
     }
 
     // The R2 regression: a settled invoice must not un-pay when a later event
@@ -1139,24 +1286,98 @@ mod status_tests {
     // Pre-fix this recomputed to partially_paid; post-fix it stays paid.
     #[test]
     fn settled_paid_does_not_regress_on_tighter_rail() {
-        assert_eq!(resolve_invoice_status("paid", AMT, 99_900, 60, false), "paid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 99_900, 60, false),
+            "paid"
+        );
     }
 
     #[test]
     fn settled_overpaid_does_not_regress() {
         // A cross-rail prune lowered the sum back under amount, recompute would
         // be partially_paid, but an overpaid invoice stays settled.
-        assert_eq!(resolve_invoice_status("overpaid", AMT, 99_000, 60, false), "overpaid");
+        assert_eq!(
+            resolve_invoice_status("overpaid", AMT, 99_000, 60, false),
+            "overpaid"
+        );
     }
 
     #[test]
     fn settled_paid_stays_paid_even_when_expired() {
         // Expiry must not un-settle an already-paid invoice.
-        assert_eq!(resolve_invoice_status("paid", AMT, 99_900, 60, true), "paid");
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 99_900, 60, true),
+            "paid"
+        );
     }
 
     #[test]
     fn underpaid_stays_underpaid_when_still_short() {
-        assert_eq!(resolve_invoice_status("underpaid", AMT, 95_000, 300, false), "underpaid");
+        assert_eq!(
+            resolve_invoice_status("underpaid", AMT, 95_000, 300, false),
+            "underpaid"
+        );
+    }
+
+    #[test]
+    fn liquid_watcher_batch_detects_only_the_sentinel_boundary() {
+        for (fetched, expected_more) in [
+            (LIQUID_WATCHER_BATCH_SIZE - 1, false),
+            (LIQUID_WATCHER_BATCH_SIZE, false),
+            (LIQUID_WATCHER_BATCH_SIZE + 1, true),
+        ] {
+            let mut rows = vec![(); fetched];
+            assert_eq!(
+                truncate_to_watcher_batch(&mut rows, LIQUID_WATCHER_BATCH_SIZE),
+                expected_more,
+                "unexpected has_more for {fetched} fetched rows"
+            );
+            assert_eq!(rows.len(), fetched.min(LIQUID_WATCHER_BATCH_SIZE));
+        }
+    }
+
+    #[test]
+    fn watcher_epoch_keeps_snapshot_across_pages_and_resets_only_on_finish() {
+        let mut epoch = WatcherScanEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string());
+        let first = WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: Uuid::from_u128(1),
+        };
+        epoch.advance(first.clone());
+
+        // Starting the next page cannot move the epoch cutoff. Rows created
+        // after the original PostgreSQL snapshot wait for the next epoch.
+        epoch.begin("2026-07-12 13:00:00+00".to_string());
+        assert_eq!(epoch.snapshot(), Some("2026-07-12 12:00:00+00"));
+        assert_eq!(epoch.cursor(), Some(&first));
+
+        let second = WatcherScanCursor {
+            created_at: "2026-07-12 11:30:00+00".to_string(),
+            id: Uuid::from_u128(2),
+        };
+        epoch.advance(second.clone());
+        assert_eq!(epoch.cursor(), Some(&second));
+
+        epoch.finish();
+        assert!(epoch.snapshot().is_none());
+        assert!(epoch.cursor().is_none());
+    }
+
+    #[test]
+    fn failed_page_leaves_epoch_cursor_on_last_proven_row() {
+        let mut epoch = WatcherScanEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string());
+        let proven = WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: Uuid::from_u128(10),
+        };
+        epoch.advance(proven.clone());
+
+        // A failed row deliberately performs no `advance`; the next page
+        // therefore starts immediately after the last proven row and retries
+        // the failure instead of skipping past it.
+        assert_eq!(epoch.cursor(), Some(&proven));
+        assert_eq!(epoch.snapshot(), Some("2026-07-12 12:00:00+00"));
     }
 }

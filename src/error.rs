@@ -108,6 +108,10 @@ pub enum AppError {
     /// Hard ceiling reached (e.g. `max_active_users`). Durable, not burst —
     /// clients should not retry-with-backoff. Internal `_reason` is for logs.
     ServiceUnavailable(String),
+    /// A money-admission prerequisite is not currently healthy. Detailed rail
+    /// and dependency reasons are emitted by the admission component only;
+    /// the wire response is deliberately fixed and retryable.
+    MoneyAdmissionUnavailable,
     /// Deactivation is blocked by `_pending` in-flight swaps.
     PurgeBlocked(usize),
 
@@ -189,9 +193,10 @@ impl AppError {
 
             Self::ServiceUnavailable(_) | Self::PurgeBlocked(_) => ErrorClass::Capacity,
 
-            Self::ElectrumError(_) | Self::BoltzError(_) | Self::ClaimError(_) => {
-                ErrorClass::Backend
-            }
+            Self::MoneyAdmissionUnavailable
+            | Self::ElectrumError(_)
+            | Self::BoltzError(_)
+            | Self::ClaimError(_) => ErrorClass::Backend,
 
             Self::DbError(_) => ErrorClass::Internal,
         }
@@ -236,6 +241,7 @@ impl AppError {
             Self::BackendThrottled => "BackendThrottled",
             Self::TooManyPendingReservations => "TooManyPendingReservations",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
+            Self::MoneyAdmissionUnavailable => "ServiceUnavailable",
             Self::PurgeBlocked(_) => "PurgeBlocked",
 
             Self::ElectrumError(_) => "ElectrumError",
@@ -303,6 +309,7 @@ impl std::fmt::Display for AppError {
             Self::BackendThrottled => write!(f, "backend throttled"),
             Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
             Self::ServiceUnavailable(r) => write!(f, "service unavailable: {r}"),
+            Self::MoneyAdmissionUnavailable => write!(f, "money admission unavailable"),
             Self::PurgeBlocked(n) => write!(f, "purge blocked: {n} in-flight swap(s)"),
 
             Self::ElectrumError(msg) => write!(f, "electrum error: {msg}"),
@@ -323,6 +330,9 @@ impl IntoResponse for AppError {
             AppError::ElectrumError(msg) => tracing::error!("electrum error: {msg}"),
             AppError::ProofOfFundsInvalid(msg) => tracing::warn!("proof invalid: {msg}"),
             AppError::ServiceUnavailable(msg) => tracing::error!("service unavailable: {msg}"),
+            AppError::MoneyAdmissionUnavailable => {
+                tracing::warn!("money admission temporarily unavailable")
+            }
             _ => tracing::warn!("{self}"),
         }
 
@@ -390,12 +400,15 @@ impl IntoResponse for AppError {
                     format!("Service temporarily unavailable: {reason}.")
                 }
             },
+            AppError::MoneyAdmissionUnavailable => {
+                "This payment method is temporarily unavailable. Try again later.".into()
+            }
             AppError::PurgeBlocked(n) => format!(
                 "Deactivation is blocked: {n} payment(s) are still in flight. \
                  These payments must complete or expire first."
             ),
 
-            AppError::ElectrumError(_) => "Liquid network is unreachable.".into(),
+            AppError::ElectrumError(_) => "Blockchain backend is unreachable.".into(),
             AppError::BoltzError(_) => "Lightning swap service is unavailable.".into(),
             AppError::ClaimError(_) => "Swap claim failed.".into(),
             AppError::DbError(_) => "Internal server error.".into(),
@@ -427,7 +440,9 @@ impl IntoResponse for AppError {
             AppError::BitcoinAddressAlreadyUsed
             | AppError::LiquidAddressAlreadyUsed
             | AppError::AliasTaken => StatusCode::CONFLICT,
-            AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::ServiceUnavailable(_) | AppError::MoneyAdmissionUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::OK,
         };
 
@@ -491,5 +506,45 @@ impl From<sqlx::Error> for AppError {
             }
         }
         AppError::DbError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn money_admission_response_is_generic_and_retryable() {
+        let response = AppError::MoneyAdmissionUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read admission response body");
+        let value: Value = serde_json::from_slice(&body).expect("parse admission response JSON");
+
+        assert_eq!(value["status"], "ERROR");
+        assert_eq!(value["code"], "ServiceUnavailable");
+        assert_eq!(
+            value["reason"],
+            "This payment method is temporarily unavailable. Try again later."
+        );
+
+        let wire = String::from_utf8(body.to_vec()).expect("response is UTF-8");
+        for private_term in [
+            "claimer",
+            "reconciler",
+            "workers",
+            "schema",
+            "journal",
+            "fee_policy",
+            "recovery_commitment",
+        ] {
+            assert!(
+                !wire.contains(private_term),
+                "private admission term leaked: {private_term}"
+            );
+        }
     }
 }

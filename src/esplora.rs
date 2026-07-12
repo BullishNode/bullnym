@@ -72,7 +72,7 @@ pub async fn broadcast(
         endpoints = endpoints.len(),
         "all esplora endpoints rejected the broadcast"
     );
-    Err(AppError::ClaimError(format!(
+    Err(AppError::ElectrumError(format!(
         "broadcast failed on all {} esplora endpoint(s): {}",
         endpoints.len(),
         errors.join(" | ")
@@ -160,7 +160,9 @@ mod tests {
     #[test]
     fn already_known_classifier_excludes_missing_inputs() {
         assert!(is_already_known("txn-already-known"));
-        assert!(is_already_known(r#"{"code":-27,"message":"already in chain"}"#));
+        assert!(is_already_known(
+            r#"{"code":-27,"message":"already in chain"}"#
+        ));
         assert!(!is_already_known(
             r#"{"code":-25,"message":"bad-txns-inputs-missingorspent"}"#
         ));

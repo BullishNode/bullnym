@@ -531,6 +531,17 @@ pub struct ReconcilerSwap {
     pub invoice_id: Option<Uuid>,
 }
 
+/// Capture one process-local reconciliation epoch from the database clock.
+/// Keeping the value as integer Unix microseconds avoids adding a timestamp
+/// crate solely for an opaque scan boundary; queries convert it back with
+/// `to_timestamp`. A worker retains this value across bounded pages and drops
+/// it only when the frozen set drains or a systemic page failure occurs.
+pub async fn reconciler_scan_epoch_micros(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT")
+        .fetch_one(pool)
+        .await
+}
+
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -547,50 +558,39 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
     }
 }
 
-/// Reconciler scan: every non-terminal swap older than `min_age_secs`,
-/// oldest-`updated_at`-first, capped at `limit`.
+pub(crate) const REVERSE_RECONCILER_SCAN_SQL: &str = "WITH scan AS ( \
+         SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
+     ) \
+     SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
+            nym, amount_sat, invoice_id \
+     FROM swap_records, scan \
+     WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
+       AND updated_at <= scan.epoch - ($1 || ' seconds')::interval \
+       AND ($3::uuid IS NULL OR id > $3) \
+     ORDER BY id ASC \
+     LIMIT $4";
+
+/// Reconciler scan: every non-terminal swap in the frozen `epoch_micros`
+/// snapshot that is older than `min_age_secs` and follows the process-local
+/// immutable UUID cursor, capped at `limit`.
 ///
-/// `min_age_secs` skips fresh rows so we don't race the webhook
-/// handler on a swap that's still mid-flight. `limit` bounds peak
-/// Boltz API RPM during backlog drain.
+/// `min_age_secs` skips fresh rows so we don't race the webhook handler on a
+/// swap that's still mid-flight. The caller asks for its processing cap plus
+/// one, using the extra row as proof that the epoch has not drained yet.
 pub async fn list_non_terminal_swaps_oldest_first(
     pool: &PgPool,
     min_age_secs: u64,
+    epoch_micros: i64,
+    after_id: Option<Uuid>,
     limit: u32,
 ) -> Result<Vec<ReconcilerSwap>, sqlx::Error> {
-    sqlx::query_as::<_, ReconcilerSwap>(
-        "SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-                nym, amount_sat, invoice_id \
-         FROM swap_records \
-         WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
-           AND updated_at < NOW() - ($1 || ' seconds')::interval \
-         ORDER BY (status IN ('lockup_mempool', 'lockup_confirmed', 'claiming', 'claim_failed') \
-                   OR cooperative_refused) DESC, \
-                  last_reconciled_at ASC NULLS FIRST \
-         LIMIT $2",
-    )
-    .bind(min_age_secs as i64)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-}
-
-/// Stamp `last_reconciled_at = NOW()` on a batch of swaps. Called once at the
-/// start of every reconciler tick, on the whole fetched batch, BEFORE the
-/// per-swap loop. Stamping up-front (rather than per-row after processing) is
-/// deliberate: a tick that crashes mid-loop must not leave the batch with a
-/// stale `last_reconciled_at` and re-pin it as "oldest" forever — the round-
-/// robin ordering (see `list_non_terminal_swaps_oldest_first`) then rotates
-/// past this batch on the next tick regardless of how the tick ended.
-pub async fn mark_swaps_reconciled(pool: &PgPool, ids: &[Uuid]) -> Result<(), sqlx::Error> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    sqlx::query("UPDATE swap_records SET last_reconciled_at = NOW() WHERE id = ANY($1)")
-        .bind(ids)
-        .execute(pool)
-        .await?;
-    Ok(())
+    sqlx::query_as::<_, ReconcilerSwap>(REVERSE_RECONCILER_SCAN_SQL)
+        .bind(min_age_secs as i64)
+        .bind(epoch_micros)
+        .bind(after_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
 }
 
 /// Reverse (Lightning) swaps that reached `claimed` — merchant funds are on
@@ -602,32 +602,42 @@ pub async fn mark_swaps_reconciled(pool: &PgPool, ids: &[Uuid]) -> Result<(), sq
 /// reconciler never revisits `claimed` (terminal) rows. The settlement-repair
 /// task re-runs the idempotent flip for these.
 ///
-/// Bounded by `max_age_secs` (only recently-claimed rows) and `limit`.
+pub(crate) const REVERSE_SETTLEMENT_REPAIR_SCAN_SQL: &str = "WITH scan AS ( \
+         SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
+     ) \
+     SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
+            nym, amount_sat, invoice_id \
+     FROM swap_records s, scan \
+     WHERE s.status = 'claimed' \
+       AND s.invoice_id IS NOT NULL \
+       AND s.claim_txid IS NOT NULL \
+       AND s.updated_at <= scan.epoch \
+       AND s.updated_at > scan.epoch - ($1 || ' seconds')::interval \
+       AND ($3::uuid IS NULL OR s.id > $3) \
+       AND NOT EXISTS ( \
+             SELECT 1 FROM invoice_payment_events e \
+              WHERE e.invoice_id = s.invoice_id \
+                AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
+         ) \
+     ORDER BY s.id ASC \
+     LIMIT $4";
+
+/// Bounded by `max_age_secs` (only recently-claimed rows), the process-local
+/// immutable UUID cursor, and `limit`.
 pub async fn list_claimed_swaps_missing_lightning_event(
     pool: &PgPool,
     max_age_secs: u64,
+    epoch_micros: i64,
+    after_id: Option<Uuid>,
     limit: u32,
 ) -> Result<Vec<ReconcilerSwap>, sqlx::Error> {
-    sqlx::query_as::<_, ReconcilerSwap>(
-        "SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-                nym, amount_sat, invoice_id \
-         FROM swap_records s \
-         WHERE s.status = 'claimed' \
-           AND s.invoice_id IS NOT NULL \
-           AND s.claim_txid IS NOT NULL \
-           AND s.updated_at > NOW() - ($1 || ' seconds')::interval \
-           AND NOT EXISTS ( \
-                 SELECT 1 FROM invoice_payment_events e \
-                  WHERE e.invoice_id = s.invoice_id \
-                    AND e.event_key = 'lightning_boltz_reverse:' || s.boltz_swap_id \
-             ) \
-         ORDER BY s.updated_at ASC \
-         LIMIT $2",
-    )
-    .bind(max_age_secs as i64)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, ReconcilerSwap>(REVERSE_SETTLEMENT_REPAIR_SCAN_SQL)
+        .bind(max_age_secs as i64)
+        .bind(epoch_micros)
+        .bind(after_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
 }
 
 /// Schedule an immediate retry from the reconciler. Sets

@@ -189,9 +189,9 @@ obligations.
 
 ### I8 - New obligations require recovery readiness
 
-Bullnym may expose a new swap address only when key derivation, schema, workers,
-chain observation, fee policy, recovery destination, startup reconciliation,
-and recovery backlog are healthy.
+Bullnym may expose a new swap address only when key derivation, schema,
+required current-process workers, chain observation, fee policy, the exact
+recovery destination, and startup reconciliation are healthy.
 
 ## 6. Target data model
 
@@ -262,11 +262,21 @@ cooperative-claim request that may disclose the preimage:
 - `prepared`, `requested`, `acknowledged`, `reconciled`, `failed`;
 - timestamps, retry count, and last error.
 
-### 6.5 `worker_heartbeats`
+### 6.5 Process-local money admission
 
-Persist the last successful cycle for the claimer, reverse reconciler, chain
-reconciler, slow recovery, confirmation watcher, and automatic recovery worker.
-In-process logs are not an admission signal.
+The accepted deployment contract uses one in-process, per-rail admission
+snapshot. Persistent `worker_heartbeats` and cross-replica health coordination
+are explicitly rejected: a new process starts closed and must observe its own
+required workers complete successful startup cycles before it exposes a new
+payment instruction. Historical database state can never open a new process.
+
+Hard prerequisites close their dependent rail immediately. Runtime cycles use
+three-failure/two-success hysteresis, and three missed cadences close the rail.
+The snapshot gates only new addresses, invoices, keys, and provider
+obligations; existing status, webhook, observation, claim, reconciliation,
+settlement-repair, and recovery work never consults it. See
+`architecture/abuse-and-readiness.md` for the rail matrix and public/private
+error contract.
 
 ### 6.6 Recovery commitment and creation metadata
 
@@ -347,14 +357,19 @@ fresh checkout; reproducible release artifact identifies the exact Boltz fork.
 
 #### 1A. Minimal admission guard
 
-Implement [#68](https://github.com/BullishNode/bullnym/issues/68) phase 1:
+Implement [#68](https://github.com/BullishNode/bullnym/issues/68) as one
+process-local, per-rail guard:
 
-- persist worker heartbeats;
-- require workers enabled, current schema, loaded keys, fresh claimer and chain
-  reconciler heartbeats, and completed startup scan;
-- check before key allocation, Boltz creation, or exposing an address;
-- return a generic `503` and log a structured internal reason;
-- leave direct rails and all existing-obligation workers running.
+- start every process closed and require its own successful worker startup
+  scans; no persisted heartbeat may open a new process;
+- require workers enabled, current schema/journal capability, initialized
+  rail backends, safe key lineage, and the exact hard facts for that rail;
+- check before key/address allocation, Boltz creation, invoice publication, or
+  exposing a payer instruction;
+- use fixed three-failure/two-success hysteresis and three-cadence staleness
+  for runtime worker cycles;
+- return a generic `503` and log only structured internal reason codes;
+- leave unrelated direct rails and every existing-obligation path running.
 
 #### 1B. Finish derivation recovery
 
@@ -605,19 +620,23 @@ Merge the intent of [#29](https://github.com/BullishNode/bullnym/issues/29) and
 phone offline, records the actual amount exactly once, and survives crashes,
 backend failover, and a fee replacement.
 
-### Phase 6 - Full admission policy, restoration, and rollout
+### Phase 6 - Complete recovery facts, restoration, and rollout
 
-Complete [#68](https://github.com/BullishNode/bullnym/issues/68) phase 2. New
-chain-swap admission requires:
+Issue [#68](https://github.com/BullishNode/bullnym/issues/68) supplies the
+enforced admission boundary in Phase 1. Later packages supply hard facts to
+that boundary rather than replacing it with another admission policy. In
+particular, new chain-swap admission remains closed until it can verify:
 
-- fresh worker heartbeats and completed startup reconciliation;
-- healthy derivation guard and durable recovery-manifest export;
-- registered recovery destination for the merchant;
-- healthy Bitcoin and Liquid evidence paths;
-- valid fee policy;
-- no unresolved systemic integrity hold;
-- oldest open-obligation and unconfirmed-transaction ages below thresholds;
-- recovery and confirmation queues below capacity thresholds.
+- this process's required workers completed startup and remain live;
+- the current schema/journal and safe derivation lineage;
+- initialized Bitcoin, Liquid, and Boltz evidence paths;
+- a persisted live fee decision from #64;
+- the exact merchant recovery commitment from #84.
+
+Do not add persistent heartbeats, cross-replica coordination, backlog scoring,
+age/exposure prediction, or queue-capacity policy to #68. An integrity hold or
+a later recovery capability may close a typed hard fact, but existing status,
+observation, claim, reconciliation, and recovery execution must remain online.
 
 Add runbooks and drills for:
 
@@ -632,7 +651,8 @@ Add runbooks and drills for:
 
 ## 9. Rollout sequence
 
-1. Land Phase 0 and the Phase 1 admission guard with no payer-visible change.
+1. Land Phase 0 and the Phase 1 admission guard with enforcement active. A
+   short staging shadow comparison is allowed, but no production bypass ships.
 2. Deploy complete creation validation; fail closed by omitting only the BTC
    swap rail when validation or readiness fails.
 3. Deploy Phase 2 evidence collection and reducer in shadow mode for at least
@@ -667,7 +687,7 @@ Rollback rules:
 | [#62](https://github.com/BullishNode/bullnym/issues/62) | Phase 3A, generalized claim/recovery transaction journal. |
 | [#64](https://github.com/BullishNode/bullnym/issues/64) | Phase 3B only; create a separate child for Phase 3D replacement. |
 | [#65](https://github.com/BullishNode/bullnym/issues/65) | Phase 1B remaining work after PR #76. |
-| [#68](https://github.com/BullishNode/bullnym/issues/68) | Phase 1A and Phase 6 admission gates. |
+| [#68](https://github.com/BullishNode/bullnym/issues/68) | One process-local per-rail admission gate; later phases supply typed hard facts. |
 | [#70](https://github.com/BullishNode/bullnym/issues/70) | Phase 0 reproducibility. |
 | [#30](https://github.com/BullishNode/bullnym/issues/30) | Phase 2A durable inbox. |
 | [#38](https://github.com/BullishNode/bullnym/issues/38) | Phase 4 operation journal and actual-value settlement. |
@@ -763,7 +783,7 @@ The plan is complete only when all of the following are demonstrated:
 - an offline merchant receives either confirmed L-BTC or confirmed recovered
   BTC without tapping a recovery action;
 - archived invoices retain late monetary evidence;
-- new admission closes before recovery capacity is lost, while existing
-  recovery continues;
+- new admission closes before a required recovery capability becomes
+  unavailable, while existing recovery continues;
 - the complete fault matrix and at least one real low-value automatic recovery
   pass before broad production enablement.

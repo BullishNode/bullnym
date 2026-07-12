@@ -1,5 +1,5 @@
-use axum::body::Body;
 use async_trait::async_trait;
+use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -8,12 +8,14 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tower::ServiceExt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
@@ -31,10 +33,12 @@ use pay_service::{
     registration, AppState,
 };
 
+use bitcoin::hashes::Hash as BitcoinHash;
 use boltz_client::network::Network;
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::SwapMasterKey;
-use secp256k1::{Keypair, Message, Secp256k1};
+use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
 // --- Test infrastructure ---
@@ -96,19 +100,31 @@ fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
 
     let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), RateLimitConfig::default()));
     let pricer = Arc::new(PricerClient::new(PricerConfig::default()).unwrap());
+    let boltz_api_url = config.boltz.api_url.clone();
+    let liquid_claim_client_factory = Arc::new(
+        pay_service::claimer::LiquidClaimClientFactory::try_new(
+            config.claim_liquid_electrum_urls(),
+        )
+        .unwrap(),
+    );
+    let bitcoin_recovery_backend = Arc::new(
+        pay_service::chain_recovery::BitcoinRecoveryBackend::try_new(
+            config.bitcoin_watcher.effective_endpoints(),
+        )
+        .unwrap(),
+    );
 
     AppState {
         db: pool,
         config: Arc::new(config),
-        boltz: Arc::new(BoltzService::new(
-            "http://127.0.0.1:1",
-            swap_master_key,
-            None,
-        )),
+        admission: pay_service::admission::MoneyAdmission::healthy_test_fixture(),
+        boltz: Arc::new(BoltzService::new(&boltz_api_url, swap_master_key, None)),
         ip_whitelist: Arc::new(IpWhitelist::default()),
         certification: Arc::new(certification::CertificationAllowlist::default()),
         rate_limiter,
         utxo_backend: None,
+        liquid_claim_client_factory: Some(liquid_claim_client_factory),
+        bitcoin_recovery_backend: Some(bitcoin_recovery_backend),
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
         swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
@@ -152,8 +168,16 @@ fn test_app(state: AppState) -> Router {
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
         .route("/api/v1/invoices", get(invoice::list_signed))
         .route(
+            "/api/v1/invoices/:id/lightning",
+            post(invoice::fetch_lightning_offer),
+        )
+        .route(
             "/api/v1/invoices/recoverable",
             get(invoice::list_recoverable_signed),
+        )
+        .route(
+            "/api/v1/:nym/invoices/:id/recover",
+            post(invoice::recover_chain_swap),
         )
         .route(
             "/api/v1/:nym/invoices/:id",
@@ -176,6 +200,38 @@ fn auth_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn fresh_bolt11(amount_sat: u64) -> String {
+    let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
+    let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-admission-test");
+    InvoiceBuilder::new(Currency::Bitcoin)
+        .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
+        .description("Bullnym admission test".into())
+        .payment_hash(payment_hash)
+        .payment_secret(PaymentSecret([24; 32]))
+        .duration_since_epoch(Duration::from_secs(auth_timestamp()))
+        .expiry_time(Duration::from_secs(3_600))
+        .min_final_cltv_expiry_delta(144)
+        .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+        .unwrap()
+        .to_string()
+}
+
+fn expired_bolt11(amount_sat: u64) -> String {
+    let private_key = SecretKey::from_slice(&[43; 32]).unwrap();
+    let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-expired-admission-test");
+    InvoiceBuilder::new(Currency::Bitcoin)
+        .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
+        .description("Bullnym expired admission test".into())
+        .payment_hash(payment_hash)
+        .payment_secret(PaymentSecret([25; 32]))
+        .duration_since_epoch(Duration::from_secs(auth_timestamp().saturating_sub(3_600)))
+        .expiry_time(Duration::from_secs(60))
+        .min_final_cltv_expiry_delta(144)
+        .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+        .unwrap()
+        .to_string()
 }
 
 fn sign_registration(nym: &str, ct_descriptor: &str) -> (String, String, u64) {
@@ -373,6 +429,22 @@ fn sign_invoice_recovery_list_with_keypair(keypair: &Keypair, npub: &str) -> (St
     sign_la_action(keypair, "invoice-recovery-list", npub, "", &[])
 }
 
+fn sign_invoice_recover_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    invoice_id: &str,
+    btc_address: &str,
+) -> (String, u64) {
+    sign_la_action(
+        keypair,
+        "invoice-recover",
+        npub,
+        nym,
+        &[invoice_id, btc_address],
+    )
+}
+
 struct DonationSaveSignFields<'a> {
     header: &'a str,
     description: &'a str,
@@ -460,6 +532,31 @@ async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) 
     (status, body)
 }
 
+async fn post_json_from(
+    app: &Router,
+    uri: &str,
+    body: Value,
+    peer: SocketAddr,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder.body(Body::from(body.to_string())).unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
 async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -470,6 +567,36 @@ async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+async fn get_path_from(app: &Router, uri: &str, peer: SocketAddr) -> (StatusCode, Value) {
+    let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn spawn_counting_http_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 2\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                )
+                .await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
 }
 
 async fn get_json_with_headers(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Value) {
@@ -590,10 +717,14 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     .unwrap();
     assert!(row.pos_mode);
 
-    let fetched = pay_service::db::get_donation_page_by_nym(&pool, "posround", pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let fetched = pay_service::db::get_donation_page_by_nym(
+        &pool,
+        "posround",
+        pay_service::db::KIND_PAYMENT_PAGE,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(fetched.pos_mode);
 
     let row = pay_service::db::upsert_donation_page(
@@ -875,14 +1006,11 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["nym"], nym);
 
-    let row = pay_service::db::get_donation_page_by_nym(
-        &pool,
-        nym,
-        pay_service::db::KIND_PAYMENT_PAGE,
-    )
-    .await
-    .unwrap()
-    .expect("Page mutation persists despite OG failure");
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .expect("Page mutation persists despite OG failure");
     assert_eq!(row.header, "Persist despite preview failure");
     assert_eq!(row.generated_og_key, None);
     assert_eq!(
@@ -1133,10 +1261,11 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert!(row.pos_mode);
     assert_eq!(row.header, "Legacy Save");
 
@@ -1194,10 +1323,11 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["pos_mode"], true);
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert!(row.pos_mode);
     assert_eq!(row.website.as_deref(), Some("https://example.com"));
 
@@ -1276,10 +1406,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["kind"], "pos");
-    assert!(body["public_url"]
-        .as_str()
-        .unwrap()
-        .ends_with("/posco/pos"));
+    assert!(body["public_url"].as_str().unwrap().ends_with("/posco/pos"));
 
     // Each surface resolves independently through the editor read.
     let (status, page) = get_path(&app, "/donation-page/posco").await;
@@ -1393,10 +1520,11 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["kind"], "payment_page");
 
-    let row = pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-        .await
-        .unwrap()
-        .unwrap();
+    let row =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(row.kind, "payment_page");
     // No POS row was created.
     assert!(
@@ -1481,12 +1609,13 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
         .await
         .unwrap();
     assert_eq!(la_idx, 3, "POS allocation must not touch the LA cursor");
-    let pos_idx: i32 =
-        sqlx::query_scalar("SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = 'pos'")
-            .bind(nym)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let pos_idx: i32 = sqlx::query_scalar(
+        "SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = 'pos'",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(pos_idx, 8);
 
     cleanup_db(&pool).await;
@@ -1533,7 +1662,8 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
     .await
     .unwrap();
 
-    let (status, body) = post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
+    let (status, body) =
+        post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "DonationPageNotFound");
@@ -1959,10 +2089,102 @@ async fn webhook_skips_terminal_swaps() {
 }
 
 #[tokio::test]
+async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let npub = create_test_user(&pool, "reversewebhook").await;
+    let invoice =
+        insert_test_invoice(&pool, "reversewebhook", &npub, "lq1reversewebhook", 3_600).await;
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("reversewebhook"),
+            boltz_swap_id: "REVERSE_WEBHOOK_CLOSED_1",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-existing-obligation",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "REVERSE_WEBHOOK_CLOSED_1",
+                "status": "transaction.confirmed"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_WEBHOOK_CLOSED_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "lockup_confirmed");
+    assert_eq!(swap.address.as_deref(), Some("lq1reversewebhook"));
+    assert_eq!(swap.claim_attempts, 1);
+    assert!(
+        swap.last_claim_error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid boltz response json")),
+        "funding evidence must reach claim construction and schedule its local failure: {:?}",
+        swap.last_claim_error
+    );
+    let (claim_scheduled, failure_recorded): (bool, bool) = sqlx::query_as(
+        "SELECT next_claim_attempt_at IS NOT NULL, last_claim_error_at IS NOT NULL \
+         FROM swap_records WHERE id = $1",
+    )
+    .bind(swap.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(claim_scheduled);
+    assert!(failure_recorded);
+
+    let invoice_after = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice_after.status, "in_progress");
+    assert_eq!(invoice_after.settlement_status, "pending");
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "the deterministic local claim failure must not escape to a live provider"
+    );
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn webhook_advances_chain_swap_records() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let state = test_state(pool.clone());
+    // Admission closure applies only to new obligations. Existing provider
+    // evidence must continue through the same state transition path.
+    state.admission.set_workers_enabled(false);
     let app = test_app(state);
 
     let npub = create_test_user(&pool, "chainwebhook").await;
@@ -2106,6 +2328,717 @@ async fn callback_rejects_invalid_amounts() {
     // Above maximum
     let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=99000000000000").await;
     assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_fee_policy_ready(false);
+    let app = test_app(state);
+
+    let (npub, sig, timestamp) = sign_registration("admissionclosed", TEST_DESCRIPTOR);
+    let (register_status, register_body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "admissionclosed",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "verification_npub": npub,
+            "signature": sig,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(register_status, StatusCode::CREATED, "{register_body}");
+
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let reverse_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let chain_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (status, body) = get_path(&app, "/lnurlp/callback/admissionclosed?amount=100000").await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    assert_eq!(
+        body["reason"],
+        "This payment method is temporarily unavailable. Try again later."
+    );
+    for private_term in ["fee_policy", "worker", "claimer", "reconciler", "schema"] {
+        assert!(
+            !body.to_string().contains(private_term),
+            "private admission reason leaked: {private_term}"
+        );
+    }
+
+    let sequence_after = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sequence_after, sequence_before);
+    let swap_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        swap_count, reverse_before,
+        "closed admission created a reverse provider obligation"
+    );
+    let chain_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        chain_count, chain_before,
+        "closed admission created a chain provider obligation"
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "closed admission called the provider"
+    );
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn whitelisted_liquid_admission_failure_does_not_fallback_to_lightning() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "liquidclosed").await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.ip_whitelist =
+        Arc::new(IpWhitelist::parse(&["127.0.0.1".to_string()]).expect("parse test whitelist"));
+    let liquid_reporter = state
+        .admission
+        .reporter(pay_service::admission::Worker::LiquidWatcher);
+    liquid_reporter.cycle_succeeded();
+    drop(liquid_reporter);
+    let app = test_app(state);
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = get_path_from(
+        &app,
+        "/lnurlp/callback/liquidclosed?amount=100000&payment_method=L-BTC",
+        "127.0.0.1:42000".parse().unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before,
+        "a hard Liquid admission failure fell through to Lightning"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn healthy_direct_liquid_checkout_omits_closed_swap_rails() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "directbaseline").await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "directbaseline",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Direct baseline",
+            description: "Direct Liquid remains independently payable",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_fee_policy_ready(true);
+    state.admission.set_recovery_commitment_ready(false);
+    let reverse_reporter = state
+        .admission
+        .reporter(pay_service::admission::Worker::ReverseReconciler);
+    reverse_reporter.cycle_succeeded();
+    drop(reverse_reporter);
+    let app = test_app(state);
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let reverse_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let chain_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) =
+        post_json(&app, "/directbaseline/invoice", json!({"amount_sat": 1000})).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["invoice_id"].is_string(), "{body}");
+    assert!(
+        body["liquid_address"]
+            .as_str()
+            .is_some_and(|address| !address.is_empty()),
+        "{body}"
+    );
+    assert_eq!(body["lightning_pr"], "");
+    assert!(body["bitcoin_chain_address"].is_null());
+    assert!(body["bitcoin_chain_bip21"].is_null());
+    let sequence_after = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sequence_after, sequence_before);
+    let reverse_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let chain_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reverse_after, reverse_before);
+    assert_eq!(chain_after, chain_before);
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "closed swap rails called Boltz"
+    );
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn certification_invoice_scope_does_not_bypass_closed_admission() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "certclosed").await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "certclosed",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Certification closed",
+            description: "Certification cannot bypass money safety",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    config.certification = CertificationConfig {
+        enabled: true,
+        source_allowlist: vec!["127.0.0.1".into()],
+        token: "cert-admission-token".into(),
+        scopes: vec!["invoice_create".into()],
+    };
+    let certification = certification::CertificationAllowlist::parse(&config.certification)
+        .expect("parse certification allowlist");
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.certification = Arc::new(certification);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let cursor_before: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = $2")
+            .bind("certclosed")
+            .bind(pay_service::db::KIND_PAYMENT_PAGE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let reverse_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let chain_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json_from(
+        &app,
+        "/certclosed/invoice",
+        json!({"amount_sat": 1000}),
+        "127.0.0.1:42001".parse().unwrap(),
+        &[("x-bullnym-certification-token", "cert-admission-token")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    let invoice_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(invoice_count, 0);
+    let cursor_after: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM donation_pages WHERE nym = $1 AND kind = $2")
+            .bind("certclosed")
+            .bind(pay_service::db::KIND_PAYMENT_PAGE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cursor_after, cursor_before);
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before
+    );
+    let reverse_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let chain_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reverse_after, reverse_before);
+    assert_eq!(chain_after, chain_before);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_admission_returns_existing_reusable_lightning_offer() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "reusableclosed").await;
+    let invoice =
+        insert_test_invoice(&pool, "reusableclosed", &npub, "lq1reusableclosed", 3_600).await;
+    sqlx::query("UPDATE invoices SET accept_ln = TRUE WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let bolt11 = fresh_bolt11(1_000);
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("reusableclosed"),
+            boltz_swap_id: "REUSABLE_CLOSED_1",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: &bolt11,
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/lightning", invoice.id),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pr"], bolt11);
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_without_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "liquidproofclosed";
+    create_test_user(&pool, nym).await;
+
+    let secp = Secp256k1::new();
+    let cached_key = SecretKey::from_slice(&[7; 32]).unwrap();
+    let cached_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &cached_key).to_string();
+    let cached_outpoint = format!("{}:0", "11".repeat(32));
+    let cached_index =
+        pay_service::db::allocate_outpoint_address(&pool, nym, &cached_outpoint, &cached_pubkey)
+            .await
+            .unwrap();
+    let expected_address =
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, cached_index as u32).unwrap();
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let proof_tag = config.proof.message_tag.clone();
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+
+    let cursor_before: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let reservations_before: Vec<(String, i32, Option<String>, bool)> = sqlx::query_as(
+        "SELECT outpoint, addr_index, pubkey, fulfilled FROM outpoint_addresses \
+         WHERE nym = $1 ORDER BY outpoint",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let sign_proof = |secret_key: &SecretKey, outpoint: &str| {
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, secret_key).to_string();
+        let digest =
+            pay_service::utxo::ownership_message_digest(proof_tag.as_bytes(), nym, outpoint);
+        let signature = hex::encode(
+            secp.sign_ecdsa(&Message::from_digest(digest), secret_key)
+                .serialize_der(),
+        );
+        (pubkey, signature)
+    };
+    let (cached_pubkey, cached_sig) = sign_proof(&cached_key, &cached_outpoint);
+    let proof_blinder = "01".repeat(32);
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"L-BTC": {"address": expected_address}}));
+    let cursor_after_cached: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let reservations_after_cached: Vec<(String, i32, Option<String>, bool)> = sqlx::query_as(
+        "SELECT outpoint, addr_index, pubkey, fulfilled FROM outpoint_addresses \
+         WHERE nym = $1 ORDER BY outpoint",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        cursor_after_cached, cursor_before,
+        "cached Liquid proof moved the address cursor"
+    );
+    assert_eq!(
+        reservations_after_cached, reservations_before,
+        "cached Liquid proof changed its reservation"
+    );
+
+    let uncached_key = SecretKey::from_slice(&[8; 32]).unwrap();
+    let uncached_outpoint = format!("{}:1", "22".repeat(32));
+    let (uncached_pubkey, uncached_sig) = sign_proof(&uncached_key, &uncached_outpoint);
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={uncached_outpoint}&pubkey={uncached_pubkey}&sig={uncached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "status": "ERROR",
+            "code": "ServiceUnavailable",
+            "reason": "This payment method is temporarily unavailable. Try again later."
+        })
+    );
+    let cursor_after: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let reservations_after: Vec<(String, i32, Option<String>, bool)> = sqlx::query_as(
+        "SELECT outpoint, addr_index, pubkey, fulfilled FROM outpoint_addresses \
+         WHERE nym = $1 ORDER BY outpoint",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        cursor_after, cursor_before,
+        "closed admission moved the address cursor"
+    );
+    assert_eq!(
+        reservations_after, reservations_before,
+        "closed admission created or changed an outpoint reservation"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_admission_rejects_absent_and_expired_lazy_lightning_without_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+
+    let cases = [("absent", None), ("expired", Some(expired_bolt11(1_000)))];
+    for (case, previous_pr) in cases {
+        let nym = format!("lazyclosed{case}");
+        let npub = create_test_user(&pool, &nym).await;
+        let invoice = insert_test_invoice(&pool, &nym, &npub, &format!("lq1{nym}"), 3_600).await;
+        sqlx::query("UPDATE invoices SET accept_ln = TRUE WHERE id = $1")
+            .bind(invoice.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        if let Some(previous_pr) = previous_pr {
+            pay_service::db::record_swap(
+                &pool,
+                &pay_service::db::NewSwapRecord {
+                    key_index: None,
+                    root_fingerprint: None,
+                    nym: Some(&nym),
+                    boltz_swap_id: "EXPIRED_LAZY_CLOSED_1",
+                    address: None,
+                    address_index: None,
+                    amount_sat: 1_000,
+                    invoice: &previous_pr,
+                    preimage_hex: "aa".repeat(32).as_str(),
+                    claim_key_hex: "bb".repeat(32).as_str(),
+                    boltz_response_json: "{}",
+                    invoice_id: Some(invoice.id),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap();
+        let swap_rows_before: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id::TEXT, boltz_swap_id, invoice, key_index, status \
+                 FROM swap_records ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/invoices/{}/lightning", invoice.id),
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "case {case}: {body}"
+        );
+        assert_eq!(
+            body,
+            json!({
+                "status": "ERROR",
+                "code": "ServiceUnavailable",
+                "reason": "This payment method is temporarily unavailable. Try again later."
+            }),
+            "case {case}"
+        );
+        assert_eq!(
+            pay_service::db::swap_key_seq_next_value(&pool)
+                .await
+                .unwrap(),
+            sequence_before,
+            "case {case}: closed admission consumed a swap key"
+        );
+        let swap_rows_after: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id::TEXT, boltz_swap_id, invoice, key_index, status \
+                 FROM swap_records ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            swap_rows_after, swap_rows_before,
+            "case {case}: closed admission changed swap rows"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: closed admission called Boltz"
+        );
+    }
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_admission_does_not_block_recovery_before_boltz_failure() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "recoverclosed";
+    let (npub, keypair, invoice, swap) = seed_merchant_invoice_swap(
+        &pool,
+        nym,
+        "RECOVER_CLOSED_1",
+        JOURNAL_LOCKUP_ADDRESS,
+        1_010,
+        1_000,
+    )
+    .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    config.features.chain_swap_merchant_recovery = true;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let invoice_id = invoice.id.to_string();
+    let (signature, timestamp) = sign_invoice_recover_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        &invoice_id,
+        JOURNAL_DESTINATION_ADDRESS,
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/{nym}/invoices/{invoice_id}/recover"),
+        json!({
+            "npub": npub,
+            "timestamp": timestamp,
+            "signature": signature,
+            "btc_address": JOURNAL_DESTINATION_ADDRESS,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "status": "ERROR",
+            "code": "BoltzError",
+            "reason": "Lightning swap service is unavailable."
+        })
+    );
+    assert_ne!(body["code"], "ServiceUnavailable");
+    assert_ne!(
+        body["reason"],
+        "This payment method is temporarily unavailable. Try again later."
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        1,
+        "recovery must reach the Boltz safety pre-check exactly once"
+    );
+    let persisted = pay_service::db::get_chain_swap_by_id(&pool, swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, "refund_due");
+    assert_eq!(
+        persisted.refund_address.as_deref(),
+        Some(JOURNAL_DESTINATION_ADDRESS),
+        "the signed first-write recovery destination must survive provider failure"
+    );
+    provider_task.abort();
+    let _ = provider_task.await;
 
     cleanup_db(&pool).await;
 }
@@ -2718,6 +3651,216 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
 }
 
 #[tokio::test]
+async fn disabled_workers_reject_direct_invoice_before_publication() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let (npub, _, _, keypair) = sign_registration_with_keypair("directclosed", TEST_DESCRIPTOR);
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let (signature, timestamp) =
+        sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "closed direct admission published an invoice");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn disabled_workers_reject_signed_lightning_only_invoice_atomically() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lnonlyclosed", TEST_DESCRIPTOR);
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let expires_at = expires_at_unix.to_string();
+    let liquid_address =
+        "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv";
+    let (signature, timestamp) = sign_la_action(
+        &keypair,
+        "invoice-create",
+        &npub,
+        "",
+        &[
+            "1000",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "false",
+            "true",
+            "false",
+            "",
+            liquid_address,
+            "",
+            &expires_at,
+        ],
+    );
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": false,
+            "accept_ln": true,
+            "accept_liquid": false,
+            "bitcoin_address": null,
+            "liquid_address": liquid_address,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "closed Lightning admission published an invoice");
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before,
+        "closed Lightning admission consumed a swap key"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_invoice_http_gate_reopens_only_after_two_healthy_watcher_cycles() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let reporter = state
+        .admission
+        .reporter(pay_service::admission::Worker::BitcoinWatcher);
+    reporter.cycle_succeeded();
+    let app = test_app(state);
+    let (npub, _, _, keypair) = sign_registration_with_keypair("directreopen", TEST_DESCRIPTOR);
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let (signature, timestamp) =
+        sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
+    let request_body = || {
+        json!({
+            "npub": npub.clone(),
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature.clone(),
+        })
+    };
+
+    for _ in 0..3 {
+        reporter.cycle_failed();
+    }
+    let (status, body) = post_json(&app, "/api/v1/invoices", request_body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "status": "ERROR",
+            "code": "ServiceUnavailable",
+            "reason": "This payment method is temporarily unavailable. Try again later."
+        })
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    reporter.cycle_succeeded();
+    let (status, body) = post_json(&app, "/api/v1/invoices", request_body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "one recovery success reopened admission");
+
+    reporter.cycle_succeeded();
+    let (status, body) = post_json(&app, "/api/v1/invoices", request_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["invoice_id"].is_string(), "{body}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn signed_invoice_create_defaults_expiry_when_omitted() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -2914,7 +4057,9 @@ async fn invoice_render_paths_preserve_linked_owner_boundary() {
 async fn invoice_status_and_render_share_terminal_state_after_payment() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let app = test_app(test_state(pool.clone()));
+    let state = test_state(pool.clone());
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
     let npub = create_test_user(&pool, "renderpaid").await;
     let invoice = insert_test_invoice(&pool, "renderpaid", &npub, "lq1renderpaid", 3_600).await;
 
@@ -4848,30 +5993,16 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-0",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, None, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
         .execute(&pool)
         .await
         .unwrap();
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-1",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-    )
-    .await
-    .unwrap();
+    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, None, 3)
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
         .execute(&pool)
         .await
@@ -4963,7 +6094,12 @@ async fn seed_merchant_invoice_swap(
     lockup_address: &str,
     user_lock_amount_sat: i64,
     server_lock_amount_sat: i64,
-) -> (String, Keypair, pay_service::db::Invoice, pay_service::db::ChainSwapRecord) {
+) -> (
+    String,
+    Keypair,
+    pay_service::db::Invoice,
+    pay_service::db::ChainSwapRecord,
+) {
     let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
     pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
         .await
@@ -5049,6 +6185,7 @@ impl pay_service::chain_recovery::BitcoinRecoveryEvidence for FakeBitcoinChain {
 enum FakeBroadcastResult {
     Accept,
     AcceptResponseLost,
+    BackendUnavailable,
     Reject,
     WrongTxid,
 }
@@ -5090,11 +6227,7 @@ impl FakeRecoveryBroadcaster {
 
 #[async_trait]
 impl pay_service::chain_recovery::BitcoinRecoveryBroadcaster for FakeRecoveryBroadcaster {
-    async fn broadcast(
-        &self,
-        raw_tx_hex: &str,
-        expected_txid: &str,
-    ) -> Result<String, AppError> {
+    async fn broadcast(&self, raw_tx_hex: &str, expected_txid: &str) -> Result<String, AppError> {
         self.calls.lock().await.push(raw_tx_hex.to_string());
         let result = self
             .results
@@ -5113,6 +6246,9 @@ impl pay_service::chain_recovery::BitcoinRecoveryBroadcaster for FakeRecoveryBro
                     "scripted broadcaster accepted the transaction but lost the response".into(),
                 ))
             }
+            FakeBroadcastResult::BackendUnavailable => Err(AppError::ElectrumError(
+                "scripted Bitcoin broadcast backend unavailable".into(),
+            )),
             FakeBroadcastResult::Reject => Err(AppError::ClaimError(
                 "scripted broadcaster rejected the transaction".into(),
             )),
@@ -5239,13 +6375,9 @@ async fn seed_recovery_journal_harness(
     pay_service::db::mark_chain_swap_refund_due(pool, swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(
-        pool,
-        swap.id,
-        JOURNAL_DESTINATION_ADDRESS,
-    )
-    .await
-    .unwrap();
+    pay_service::db::set_chain_swap_refund_address(pool, swap.id, JOURNAL_DESTINATION_ADDRESS)
+        .await
+        .unwrap();
     let swap = pay_service::db::get_chain_swap_by_id(pool, swap.id)
         .await
         .unwrap()
@@ -5260,6 +6392,51 @@ async fn seed_recovery_journal_harness(
         expected_txid,
         expected_raw_hex,
     }
+}
+
+#[tokio::test]
+async fn closed_admission_still_completes_existing_chain_recovery() {
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    state.admission.set_workers_enabled(false);
+    assert!(
+        !state
+            .admission
+            .decision(pay_service::admission::Rail::BitcoinChain)
+            .allowed(),
+        "test precondition: new chain obligations must be closed"
+    );
+    let harness =
+        seed_recovery_journal_harness(&state.db, "closed", [FakeBroadcastResult::Accept]).await;
+
+    let txid = execute_journaled_recovery_with_services(
+        &state.db,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .expect("closed admission must not block an existing recovery obligation");
+
+    assert_eq!(txid, harness.expected_txid);
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    let final_swap = pay_service::db::get_chain_swap_by_id(&state.db, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_swap.status, "refunded");
+    assert_eq!(
+        final_swap.refund_txid.as_deref(),
+        Some(harness.expected_txid.as_str())
+    );
+
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]
@@ -5345,7 +6522,10 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             .unwrap()
             .unwrap();
         assert_eq!(final_swap.status, "refunded");
-        assert_eq!(final_swap.refund_txid.as_deref(), Some(harness.expected_txid.as_str()));
+        assert_eq!(
+            final_swap.refund_txid.as_deref(),
+            Some(harness.expected_txid.as_str())
+        );
 
         let calls = harness.broadcaster.calls.lock().await;
         assert!(calls.iter().all(|raw| raw == &harness.expected_raw_hex));
@@ -5369,9 +6549,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
 
 #[tokio::test]
 async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast() {
-    use pay_service::chain_recovery::{
-        execute_journaled_recovery_with_services, NoRecoveryFaults,
-    };
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -5414,9 +6592,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
 
 #[tokio::test]
 async fn recovery_journal_retries_identical_bytes_after_rejection() {
-    use pay_service::chain_recovery::{
-        execute_journaled_recovery_with_services, NoRecoveryFaults,
-    };
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -5427,18 +6603,16 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
     )
     .await;
 
-    assert!(
-        execute_journaled_recovery_with_services(
-            &pool,
-            harness.swap.id,
-            harness.builder.as_ref(),
-            harness.chain.as_ref(),
-            harness.broadcaster.as_ref(),
-            &NoRecoveryFaults,
-        )
-        .await
-        .is_err()
-    );
+    assert!(execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .is_err());
     let ambiguous = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
         .await
         .unwrap()
@@ -5460,6 +6634,38 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
     assert_eq!(calls[0], harness.expected_raw_hex);
     assert_eq!(calls[1], harness.expected_raw_hex);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_journal_preserves_systemic_broadcast_failure_scope() {
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness = seed_recovery_journal_harness(
+        &pool,
+        "backenddown",
+        [FakeBroadcastResult::BackendUnavailable],
+    )
+    .await;
+
+    let result = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await;
+
+    assert!(matches!(result, Err(AppError::ElectrumError(_))));
+    let attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "broadcast_ambiguous");
     cleanup_db(&pool).await;
 }
 
@@ -5503,8 +6709,7 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let harness =
-        seed_recovery_journal_harness(&pool, "baddestination", [FakeBroadcastResult::Accept])
-            .await;
+        seed_recovery_journal_harness(&pool, "baddestination", [FakeBroadcastResult::Accept]).await;
     let BtcLikeTransaction::Bitcoin(mut transaction) = harness.builder.transaction.clone() else {
         unreachable!()
     };
@@ -5554,18 +6759,16 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
     let harness =
         seed_recovery_journal_harness(&pool, "unknownspend", [FakeBroadcastResult::Accept]).await;
     let fault = OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
-    assert!(
-        execute_journaled_recovery_with_services(
-            &pool,
-            harness.swap.id,
-            harness.builder.as_ref(),
-            harness.chain.as_ref(),
-            harness.broadcaster.as_ref(),
-            &fault,
-        )
-        .await
-        .is_err()
-    );
+    assert!(execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &fault,
+    )
+    .await
+    .is_err());
     let unknown_txid = "ab".repeat(32);
     harness.chain.outspends.lock().await.insert(
         (harness.source_txid.clone(), 0),
@@ -5596,9 +6799,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
 
 #[tokio::test]
 async fn concurrent_recovery_workers_share_one_immutable_intent() {
-    use pay_service::chain_recovery::{
-        execute_journaled_recovery_with_services, NoRecoveryFaults,
-    };
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -5622,7 +6823,10 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &NoRecoveryFaults,
     );
     let (a, b) = tokio::join!(first, second);
-    assert!(a.is_ok() || b.is_ok(), "at least one worker must finish: {a:?} {b:?}");
+    assert!(
+        a.is_ok() || b.is_ok(),
+        "at least one worker must finish: {a:?} {b:?}"
+    );
 
     // A worker that lost the advisory-lock race can retry idempotently.
     execute_journaled_recovery_with_services(
@@ -5645,14 +6849,16 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         .await
         .unwrap()
         .unwrap();
-    let mutation = sqlx::query(
-        "UPDATE chain_swap_tx_attempts SET destination_address = $2 WHERE id = $1",
-    )
-    .bind(attempt.id)
-    .bind(JOURNAL_LOCKUP_ADDRESS)
-    .execute(&pool)
-    .await;
-    assert!(mutation.is_err(), "database must reject destination mutation");
+    let mutation =
+        sqlx::query("UPDATE chain_swap_tx_attempts SET destination_address = $2 WHERE id = $1")
+            .bind(attempt.id)
+            .bind(JOURNAL_LOCKUP_ADDRESS)
+            .execute(&pool)
+            .await;
+    assert!(
+        mutation.is_err(),
+        "database must reject destination mutation"
+    );
     cleanup_db(&pool).await;
 }
 
@@ -5699,9 +6905,15 @@ async fn recoverable_list_shows_refund_due_swap() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
-    let (npub, keypair, invoice, swap) =
-        seed_merchant_invoice_swap(&pool, "recdue", "recdue-1", "bc1qrecduelockup", 1_010, 1_000)
-            .await;
+    let (npub, keypair, invoice, swap) = seed_merchant_invoice_swap(
+        &pool,
+        "recdue",
+        "recdue-1",
+        "bc1qrecduelockup",
+        1_010,
+        1_000,
+    )
+    .await;
     pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
         .await
         .unwrap();
@@ -5751,7 +6963,9 @@ async fn recoverable_list_is_npub_scoped() {
     let (sig, timestamp) = sign_invoice_recovery_list_with_keypair(&b_keypair, &b_npub);
     let (status, body) = get_path(
         &app,
-        &format!("/api/v1/invoices/recoverable?npub={b_npub}&timestamp={timestamp}&signature={sig}"),
+        &format!(
+            "/api/v1/invoices/recoverable?npub={b_npub}&timestamp={timestamp}&signature={sig}"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -5846,9 +7060,13 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
     pay_service::db::mark_chain_swap_refund_due(&pool, done_swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(&pool, done_swap.id, "bc1qdonedest0000000000000000000000000")
-        .await
-        .unwrap();
+    pay_service::db::set_chain_swap_refund_address(
+        &pool,
+        done_swap.id,
+        "bc1qdonedest0000000000000000000000000",
+    )
+    .await
+    .unwrap();
     pay_service::db::mark_chain_swap_refunding(&pool, done_swap.id)
         .await
         .unwrap();
@@ -5879,11 +7097,13 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
     .await
     .unwrap();
     // Phase-3 renegotiation: the merchant-credit amount changed to 1900.
-    sqlx::query("UPDATE chain_swap_records SET renegotiated_server_lock_amount_sat = 1900 WHERE id = $1")
-        .bind(due_swap.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records SET renegotiated_server_lock_amount_sat = 1900 WHERE id = $1",
+    )
+    .bind(due_swap.id)
+    .execute(&pool)
+    .await
+    .unwrap();
     pay_service::db::mark_chain_swap_refund_due(&pool, due_swap.id)
         .await
         .unwrap();
@@ -5896,7 +7116,10 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["count"], 2, "body: {body}");
-    assert_eq!(body["items"][0]["recovery_status"], "refund_due", "refund_due sorts first");
+    assert_eq!(
+        body["items"][0]["recovery_status"], "refund_due",
+        "refund_due sorts first"
+    );
     assert_eq!(
         body["items"][0]["server_lock_amount_sat"], 1_900,
         "renegotiated (effective) amount must win over the stale original"
@@ -5916,8 +7139,22 @@ async fn public_status_never_leaks_recovery_state() {
             .await;
     let canary = "bc1qLEAKCANARYrefunddestination0000000000";
 
-    let public = ["refund_due", "refunding", "refunded", "refund_address", "refund_txid", canary];
-    let allowed_settlement = ["none", "pending", "settled", "claim_stuck", "refunded", "failed"];
+    let public = [
+        "refund_due",
+        "refunding",
+        "refunded",
+        "refund_address",
+        "refund_txid",
+        canary,
+    ];
+    let allowed_settlement = [
+        "none",
+        "pending",
+        "settled",
+        "claim_stuck",
+        "refunded",
+        "failed",
+    ];
 
     // Drive: refund_due (+committed address) → refunding → refunded, asserting
     // the anonymous status endpoint leaks none of it at each stage.
@@ -5940,11 +7177,8 @@ async fn public_status_never_leaks_recovery_state() {
                 .unwrap();
         }
 
-        let (status, body) = get_path(
-            &app,
-            &format!("/api/v1/invoices/{}/status", invoice.id),
-        )
-        .await;
+        let (status, body) =
+            get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
         assert_eq!(status, StatusCode::OK, "stage {stage}: body {body}");
         let raw = body.to_string();
         for needle in public {
@@ -5991,10 +7225,13 @@ async fn recoverable_list_auth_negative() {
 
     // Stale timestamp (well outside the freshness window).
     let stale_ts = auth_timestamp() - 3_600;
-    let stale_sig = sign_la_action_with_timestamp(&keypair, "invoice-recovery-list", &npub, "", &[], stale_ts);
+    let stale_sig =
+        sign_la_action_with_timestamp(&keypair, "invoice-recovery-list", &npub, "", &[], stale_ts);
     let (status, _) = get_path(
         &app,
-        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={stale_ts}&signature={stale_sig}"),
+        &format!(
+            "/api/v1/invoices/recoverable?npub={npub}&timestamp={stale_ts}&signature={stale_sig}"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "stale timestamp");
@@ -6014,7 +7251,10 @@ async fn recoverable_list_auth_negative() {
 
     // Unsigned / missing query params → 4xx (deserialization rejects).
     let (status, _) = get_path(&app, "/api/v1/invoices/recoverable").await;
-    assert!(status.is_client_error(), "unsigned request must be rejected");
+    assert!(
+        status.is_client_error(),
+        "unsigned request must be rejected"
+    );
 
     cleanup_db(&pool).await;
 }
@@ -6040,7 +7280,10 @@ async fn recoverable_list_reports_recovery_enabled_flag() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["recovery_enabled"], false);
-    assert_eq!(body["count"], 1, "detection is always-on regardless of the flag");
+    assert_eq!(
+        body["count"], 1,
+        "detection is always-on regardless of the flag"
+    );
 
     // Flag ON: recovery_enabled true.
     let mut config = test_config();
@@ -6066,9 +7309,15 @@ async fn recoverable_list_skips_nymless_swap() {
     // Good swap (has nym) + a legacy NULL-nym swap on a second invoice of the
     // same merchant. The NULL-nym row is unusable (no recover URL) and must be
     // silently skipped while the good one is still returned.
-    let (npub, keypair, _, good_swap) =
-        seed_merchant_invoice_swap(&pool, "recnymless", "recnymless-good", "bc1qgood", 1_010, 1_000)
-            .await;
+    let (npub, keypair, _, good_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "recnymless",
+        "recnymless-good",
+        "bc1qgood",
+        1_010,
+        1_000,
+    )
+    .await;
     pay_service::db::mark_chain_swap_refund_due(&pool, good_swap.id)
         .await
         .unwrap();
