@@ -103,6 +103,22 @@ impl PricerClient {
         self.supported_currencies.iter().any(|c| c.code == currency)
     }
 
+    /// Read the in-memory value without contacting the upstream Pricer.
+    /// Public Payment Page HTML uses this so link crawlers are never held up
+    /// by a cold or unavailable pricing service; browser code refreshes via
+    /// `GET /api/v1/rate` after the HTML has loaded.
+    pub fn cached_rate(&self, currency: &str) -> Option<RateView> {
+        let currency = normalize_currency_code(currency);
+        self.cache.get(&currency).map(|entry| RateView {
+            currency,
+            minor_per_btc: entry.minor_per_btc,
+            precision: entry.precision,
+            fetched_at_unix: entry.fetched_at_unix,
+            last_known_rate: entry.fetched_at.elapsed()
+                >= Duration::from_secs(self.cfg.cache_ttl_secs),
+        })
+    }
+
     /// Fetch a fresh rate for `currency` (e.g. "USD"), or return the cached
     /// rate if it's within the configured TTL. On upstream error and a
     /// non-empty cache, returns the stale rate with `last_known_rate=true`.

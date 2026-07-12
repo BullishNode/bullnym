@@ -537,6 +537,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -564,12 +565,378 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )
     .await
     .unwrap();
     assert!(!row.pos_mode);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "ogretry").await;
+
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "ogretry",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Retry test",
+            description: "A short retry description",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // /proc cannot accept application-created directories, deterministically
+    // exercising the render/write failure path without altering permissions on
+    // a shared test directory.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker = pay_service::og_image::spawn_reconciler(
+        pool.clone(),
+        format!("/proc/bullnym-og-retry-test-{}", std::process::id()),
+        cancel.clone(),
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let observed = loop {
+        let row = sqlx::query_as::<_, (i32, bool, Option<String>, Option<i32>)>(
+            "SELECT generated_og_failure_count, \
+                    generated_og_retry_after IS NOT NULL, \
+                    generated_og_key, generated_og_template_version \
+             FROM donation_pages WHERE nym = 'ogretry' AND kind = 'payment_page'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if row.0 > 0 {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "OG reconciler did not persist retry state"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops after cancellation")
+        .expect("worker task succeeds");
+
+    assert_eq!(observed.0, 1);
+    assert!(observed.1, "retry time must be persisted");
+    assert_eq!(observed.2, None);
+    assert_eq!(
+        observed.3,
+        Some(pay_service::og_image::TEMPLATE_VERSION),
+        "a failed first-generation attempt must select the branded fallback"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "ogbackfill").await;
+    create_test_user(&pool, "ogmissing").await;
+
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "ogbackfill",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Legacy preview",
+            description: "Backfill this Page after the worker starts.",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "ogmissing",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Missing preview",
+            description: "Repair a database reference whose local file is absent.",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+    let stale_missing_key = "33".repeat(32);
+    assert_eq!(
+        pay_service::db::attach_generated_og_if_current(
+            &pool,
+            "ogmissing",
+            pay_service::db::KIND_PAYMENT_PAGE,
+            "Missing preview",
+            "Repair a database reference whose local file is absent.",
+            pay_service::og_image::TEMPLATE_VERSION,
+            &stale_missing_key,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "bullnym-og-reconcile-{unique}-{}",
+        std::process::id()
+    ));
+    let root_str = root.to_string_lossy().into_owned();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker =
+        pay_service::og_image::spawn_reconciler(pool.clone(), root_str.clone(), cancel.clone());
+
+    let backfill_key = pay_service::og_image::content_key(
+        "Legacy preview",
+        "Backfill this Page after the worker starts.",
+    );
+    let repaired_key = pay_service::og_image::content_key(
+        "Missing preview",
+        "Repair a database reference whose local file is absent.",
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let backfilled = pay_service::db::get_donation_page_by_nym(
+            &pool,
+            "ogbackfill",
+            pay_service::db::KIND_PAYMENT_PAGE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let repaired = pay_service::db::get_donation_page_by_nym(
+            &pool,
+            "ogmissing",
+            pay_service::db::KIND_PAYMENT_PAGE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if backfilled.generated_og_key.as_deref() == Some(backfill_key.as_str())
+            && repaired.generated_og_key.as_deref() == Some(repaired_key.as_str())
+            && pay_service::og_image::generated_path(&root_str, &backfill_key).is_file()
+            && pay_service::og_image::generated_path(&root_str, &repaired_key).is_file()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "OG reconciler did not complete backfill and missing-file repair"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops after cancellation")
+        .expect("worker task succeeds");
+    std::fs::remove_dir_all(root).expect("remove reconciler image directory");
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payment_page_save_commits_when_og_storage_is_unwritable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "ogsavefail";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let mut config = test_config();
+    config.donation.image_root_path = format!("/proc/bullnym-og-save-test-{}", std::process::id());
+    let app = test_app(test_state_with_config(pool.clone(), config));
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Persist despite preview failure",
+            description: "Payments must not depend on social image storage.",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+        },
+    );
+
+    let (status, body) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Persist despite preview failure",
+            "description": "Payments must not depend on social image storage.",
+            "display_currency": "USD",
+            "enabled": true,
+            "kind": pay_service::db::KIND_PAYMENT_PAGE,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["nym"], nym);
+
+    let row = pay_service::db::get_donation_page_by_nym(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE,
+    )
+    .await
+    .unwrap()
+    .expect("Page mutation persists despite OG failure");
+    assert_eq!(row.header, "Persist despite preview failure");
+    assert_eq!(row.generated_og_key, None);
+    assert_eq!(
+        row.generated_og_template_version,
+        Some(pay_service::og_image::TEMPLATE_VERSION)
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn og_key_attaches_only_to_the_matching_persisted_page_content() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "ogcommit").await;
+
+    fn make_page(description: &str) -> pay_service::db::UpsertDonationPage<'_> {
+        pay_service::db::UpsertDonationPage {
+            nym: "ogcommit",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Persist first",
+            description,
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
+            alias: None,
+        }
+    }
+
+    let inserted = pay_service::db::upsert_donation_page(&pool, &make_page("Version one"))
+        .await
+        .unwrap();
+    assert_eq!(inserted.generated_og_key, None);
+
+    let first_key = "11".repeat(32);
+    assert_eq!(
+        pay_service::db::attach_generated_og_if_current(
+            &pool,
+            "ogcommit",
+            pay_service::db::KIND_PAYMENT_PAGE,
+            "Persist first",
+            "Version one",
+            pay_service::og_image::TEMPLATE_VERSION,
+            &first_key,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+
+    let unchanged = pay_service::db::upsert_donation_page(&pool, &make_page("Version one"))
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.generated_og_key.as_deref(),
+        Some(first_key.as_str())
+    );
+
+    let changed = pay_service::db::upsert_donation_page(&pool, &make_page("Version two"))
+        .await
+        .unwrap();
+    assert_eq!(changed.generated_og_key, None);
+
+    assert_eq!(
+        pay_service::db::attach_generated_og_if_current(
+            &pool,
+            "ogcommit",
+            pay_service::db::KIND_PAYMENT_PAGE,
+            "Persist first",
+            "Version one",
+            pay_service::og_image::TEMPLATE_VERSION,
+            &first_key,
+        )
+        .await
+        .unwrap(),
+        0,
+        "a render for superseded content must never attach"
+    );
+
+    let second_key = "22".repeat(32);
+    assert_eq!(
+        pay_service::db::attach_generated_og_if_current(
+            &pool,
+            "ogcommit",
+            pay_service::db::KIND_PAYMENT_PAGE,
+            "Persist first",
+            "Version two",
+            pay_service::og_image::TEMPLATE_VERSION,
+            &second_key,
+        )
+        .await
+        .unwrap(),
+        1
+    );
 
     cleanup_db(&pool).await;
 }
@@ -596,6 +963,7 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -677,6 +1045,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -1027,6 +1396,7 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -1111,6 +1481,7 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            generated_og_template_version: None,
             alias: None,
         },
     )

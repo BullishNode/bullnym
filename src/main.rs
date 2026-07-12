@@ -20,9 +20,8 @@ use tower_http::trace::TraceLayer;
 
 use pay_service::{
     bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page,
-    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
-    reconciler, registration,
+    donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr, og_image, pricer, qr,
+    rate_limit, readiness, reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -71,6 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.features.nip05,
         config.workers.enabled,
     );
+    if config.features.payment_pages && !config.workers.enabled {
+        tracing::warn!(
+            "Payment Pages are enabled while background workers are disabled; \
+             OG generation still runs on save, but legacy backfill, retries, and \
+             host-local missing-file verification will not run"
+        );
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
@@ -231,6 +237,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = CancellationToken::new();
     if config.workers.enabled {
         tracing::info!("background workers enabled");
+        if config.features.payment_pages {
+            og_image::spawn_reconciler(
+                pool.clone(),
+                config.donation.image_root_path.clone(),
+                cancel.clone(),
+            );
+            tracing::info!("Payment Page OG image reconciler started");
+        }
         claimer::spawn_background_claimer(
             pool.clone(),
             config.clone(),
@@ -411,6 +425,11 @@ fn build_router(state: AppState) -> Router {
             get(pricer::supported_currencies),
         )
         .route("/api/v1/rate", get(pricer::rate))
+        .route(og_image::FALLBACK_LIVE_PATH, get(og_image::fallback_live))
+        .route(
+            og_image::FALLBACK_UNAVAILABLE_PATH,
+            get(og_image::fallback_unavailable),
+        )
         .nest_service(
             "/pwa-assets",
             ServiceBuilder::new()
@@ -498,6 +517,7 @@ fn build_router(state: AppState) -> Router {
             // the row); status/offer polling stays on the id-only
             // `/api/v1/invoices/:id/...` routes.
             .route("/a/:slug", get(donation_render::render_alias))
+            .route("/a/:slug/", get(donation_render::render_alias))
             .route(
                 "/a/:slug/manifest.webmanifest",
                 get(donation_render::manifest_alias),

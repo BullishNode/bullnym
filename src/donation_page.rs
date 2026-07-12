@@ -27,6 +27,7 @@ use crate::descriptor;
 use crate::error::AppError;
 use crate::image_pipeline::{self, ImageKind, PipelineConfig};
 use crate::ip_whitelist;
+use crate::og_image;
 use crate::pricer::{normalize_currency_code, PricerClient};
 use crate::reserved_nyms;
 use crate::AppState;
@@ -42,7 +43,8 @@ pub const ACTION_IMAGE: &str = "donation-page-image";
 
 // --- Limits ---
 const MAX_HEADER_LEN: usize = 80;
-const MAX_DESCRIPTION_LEN: usize = 280;
+const MAX_DESCRIPTION_BYTES: usize = og_image::DESCRIPTION_MAX_BYTES;
+const MAX_LEGACY_DESCRIPTION_BYTES: usize = 280;
 const MAX_SOCIAL_LINK_LEN: usize = 200;
 const MAX_SOCIAL_HANDLE_LEN: usize = 50;
 
@@ -171,16 +173,16 @@ fn validate_lengths(
     pricer: &PricerClient,
     max_descriptor_len: usize,
 ) -> Result<(), AppError> {
-    if req.header.is_empty() || req.header.len() > MAX_HEADER_LEN {
+    if req.header.trim().is_empty() || req.header.len() > MAX_HEADER_LEN {
         return Err(AppError::DonationPageInvalid(format!(
-            "header must be 1..={MAX_HEADER_LEN} chars"
+            "header must be 1..={MAX_HEADER_LEN} UTF-8 bytes"
         )));
     }
-    // description is OPTIONAL for both payment pages and POS — an empty
-    // description is allowed; only the upper bound is enforced when one is set.
-    if req.description.len() > MAX_DESCRIPTION_LEN {
+    // This is the hard API safety ceiling. Surface-specific rules, including
+    // the Payment Page grapheme cap, are applied after `kind` is resolved.
+    if req.description.len() > MAX_DESCRIPTION_BYTES {
         return Err(AppError::DonationPageInvalid(format!(
-            "description must be at most {MAX_DESCRIPTION_LEN} chars"
+            "description must be at most {MAX_DESCRIPTION_BYTES} UTF-8 bytes"
         )));
     }
     let normalized_currency = normalize_currency_code(&req.display_currency);
@@ -232,6 +234,29 @@ fn validate_lengths(
                 "instagram handle too long".to_string(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_description_for_kind(
+    req: &SaveDonationPageRequest,
+    kind: &str,
+) -> Result<(), AppError> {
+    if kind == db::KIND_PAYMENT_PAGE {
+        if !og_image::is_valid_payment_page_description(&req.description) {
+            return Err(AppError::DonationPageInvalid(format!(
+                "description must be 1..={} visible characters and at most {} UTF-8 bytes",
+                og_image::DESCRIPTION_MAX_GRAPHEMES,
+                og_image::DESCRIPTION_MAX_BYTES
+            )));
+        }
+    } else if req.description.len() > MAX_LEGACY_DESCRIPTION_BYTES {
+        // POS retains its optional description contract. Payment Page uses the
+        // same approved 120-character contract whether `kind` is explicit or
+        // omitted; historical-client compatibility is not a product target.
+        return Err(AppError::DonationPageInvalid(format!(
+            "description must be at most {MAX_LEGACY_DESCRIPTION_BYTES} UTF-8 bytes"
+        )));
     }
     Ok(())
 }
@@ -338,6 +363,8 @@ pub async fn save(
         })?,
     };
 
+    validate_description_for_kind(&req, kind)?;
+
     // Validate the alias slug BEFORE signature verification, alongside `kind`,
     // so the newest trailing signed field's value domain is provably disjoint
     // from the other optional trailing fields — pos_mode {"0","1"}, kind
@@ -429,6 +456,10 @@ pub async fn save(
         ));
     }
 
+    // Persist the merchant's Page mutation before doing any rendering work.
+    // Changed content clears the old generated key in the upsert, so public
+    // HTML immediately selects the bundled fallback until this best-effort
+    // post-commit step (or the reconciler) attaches the matching new key.
     let row = db::upsert_donation_page(
         &state.db,
         &db::UpsertDonationPage {
@@ -443,10 +474,61 @@ pub async fn save(
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
             pos_mode: req.pos_mode,
             enabled: req.enabled,
+            generated_og_template_version: (kind == db::KIND_PAYMENT_PAGE)
+                .then_some(og_image::TEMPLATE_VERSION),
             alias: alias_update,
         },
     )
     .await?;
+
+    if kind == db::KIND_PAYMENT_PAGE {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            og_image::publish(
+                &state.config.donation.image_root_path,
+                &req.header,
+                &req.description,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(published)) => {
+                match db::attach_generated_og_if_current(
+                    &state.db,
+                    &req.nym,
+                    kind,
+                    &req.header,
+                    &req.description,
+                    published.template_version,
+                    &published.key,
+                )
+                .await
+                {
+                    Ok(0) => tracing::debug!(
+                        event = "donation_page_og_attach_obsolete",
+                        nym = %req.nym,
+                        "Page changed while its OG image rendered"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        event = "donation_page_og_attach_failed",
+                        nym = %req.nym,
+                        error = %error
+                    ),
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "donation_page_og_render_failed",
+                    nym = %req.nym,
+                    error = %error
+                );
+            }
+            Err(_) => {
+                tracing::warn!(event = "donation_page_og_render_timed_out", nym = %req.nym);
+            }
+        }
+    }
 
     // If an alias was just claimed, make sure the content-addressed image
     // copies exist so `/a/<alias>` can serve avatar/OG without the nym in the

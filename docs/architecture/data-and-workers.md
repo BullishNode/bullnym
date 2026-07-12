@@ -8,7 +8,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | Table | Ownership | Purpose |
 |---|---|---|
 | `users` | Nym lifecycle | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, nym status, and Lightning Address cursor. |
-| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, legacy read-only media hashes, descriptor, address cursor, alias, and archive state. |
+| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, legacy read-only media hashes, descriptor, address cursor, alias, and archive state. |
 | `invoices` | Payment sessions | Stores checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
 | `invoice_payment_events` | Accounting | Idempotent counted payment evidence keyed by rail-specific event keys. |
 | `invoice_payment_observations` | Non-accounting evidence | Direct Bitcoin sightings that are unconfirmed or below the confirmation threshold. |
@@ -72,6 +72,7 @@ Payment observations are status evidence only and must never update
 | Reverse/chain reconcilers | non-terminal swap rows | Poll provider state to recover missed webhooks and schedule guarded transitions. |
 | Slow recovery | funded `claim_stuck` rows | Revive claims on a long exponential backoff after the fast budget is exhausted. |
 | Settlement repair | claimed reverse swaps | Idempotently recreate a missing invoice payment event after a crash between claim and invoice updates. |
+| Payment Page OG reconciler | live `payment_page` rows | Generate versioned, content-addressed social cards; backfill legacy rows; retry render/write failures; and verify referenced files exist on the serving host. |
 | Liquid watcher | persisted blinded destinations | Detect matching Liquid outputs and advance descriptor observations. |
 | Bitcoin watcher | direct-Bitcoin invoice destinations | Persist observations, count outputs after the configured confirmation threshold, and detect disappearance before credit. |
 | GC | terminal and rate-limit rows | Apply retention and partial-checkout expiry policies. |

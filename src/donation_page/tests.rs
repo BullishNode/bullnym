@@ -275,6 +275,8 @@ fn rejects_empty_header() {
     let mut req = make_req();
     req.header = String::new();
     assert!(validate_req(&req).is_err());
+    req.header = "   ".to_string();
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
@@ -287,8 +289,46 @@ fn rejects_long_header() {
 #[test]
 fn rejects_long_description() {
     let mut req = make_req();
-    req.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+    req.description = "a".repeat(MAX_DESCRIPTION_BYTES + 1);
     assert!(validate_req(&req).is_err());
+}
+
+#[test]
+fn explicit_payment_page_requires_a_short_description() {
+    let mut req = make_req();
+    req.kind = Some(db::KIND_PAYMENT_PAGE.to_string());
+    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+
+    req.description.push('a');
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+
+    req.description = "   ".to_string();
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+}
+
+#[test]
+fn omitted_kind_uses_the_payment_page_description_contract() {
+    let mut req = make_req();
+    req.kind = None;
+    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+    req.description.push('a');
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+
+    req.description.clear();
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+}
+
+#[test]
+fn pos_retains_its_optional_legacy_description_contract() {
+    let mut req = make_req();
+    req.kind = Some(db::KIND_POS.to_string());
+    req.description.clear();
+    assert!(validate_description_for_kind(&req, db::KIND_POS).is_ok());
+
+    req.description = "a".repeat(MAX_LEGACY_DESCRIPTION_BYTES + 1);
+    assert!(validate_description_for_kind(&req, db::KIND_POS).is_err());
 }
 
 #[test]

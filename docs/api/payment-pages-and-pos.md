@@ -29,7 +29,7 @@ Options and implications:
 |---|---|---|
 | `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent row, descriptor, alias, and public workflow. Explicitly send it in new clients. |
 | `header` | Required, 1-80 UTF-8 bytes. | Replaces the stored value on every save. |
-| `description` | Required JSON string, 0-280 UTF-8 bytes. | Empty string clears it; omission is a framework deserialization error. |
+| `description` | Required JSON string. Payment Page saves require 1-120 user-perceived Unicode characters and at most 512 UTF-8 bytes, including when `kind` is omitted and therefore defaults to `payment_page`. POS keeps the optional 0-280-byte contract. | Replaces the stored short description and the text rendered into social-preview metadata/images. Omission is a framework deserialization error. |
 | `display_currency` | Required canonical uppercase supported code. | Replaces the stored value and controls display/fiat checkout; fetch supported currencies first. |
 | `website` | HTTPS URL up to 200 UTF-8 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored website. |
 | `twitter` | ASCII letters/digits/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
@@ -118,6 +118,17 @@ Accept-Encoding`. Files below `/pwa-assets/assets/` cache for one year with
 `immutable`; other PWA assets cache for one hour. `/pwa-assets/apps/*` is
 deliberately unavailable and always returns `404`.
 
+Live Payment Page HTML includes complete Open Graph and Twitter large-card
+metadata. The image is a versioned, content-addressed 1200×630 JPEG generated
+by Bullnym from the Page title and short description; its fixed frame always
+contains the Bull Bitcoin logo. A save persists Page content first and then
+attempts a bounded render. Bullnym attaches the result only while that exact
+content remains current. Rendering also runs in the background reconciler but
+never on public GET. Permanent branded fallbacks embedded in the server binary
+are served from `/og/fallback-*.jpg` whenever a generated file is unavailable.
+HTML responses send `X-Robots-Tag: noindex` while `/robots.txt` still permits
+preview crawlers to fetch public Pages.
+
 Checkout accepts exactly one amount representation:
 
 ```json
@@ -157,4 +168,3 @@ the Liquid checkout remains valid and the client should later call
 `POST /api/v1/invoices/:id/lightning` to obtain a BOLT11. Creating a checkout
 allocates payment resources and is rate-limited; do not create one merely to
 preview an amount.
-

@@ -3,22 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ header }}</title>
-
-    <meta property="og:type" content="website">
-    <meta property="og:title" content="{{ header }}">
-    <meta property="og:description" content="{{ description }}">
-    <meta property="og:url" content="{{ public_url }}">
-    {% match og_url %}{% when Some with (url) %}<meta property="og:image" content="{{ url }}">
-    <meta property="og:image:width" content="1200">
-    <meta property="og:image:height" content="630">
-    <meta property="og:image:type" content="image/jpeg">
-    <meta property="og:image:alt" content="{{ header }}">{% when None %}{% endmatch %}
-
-    <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="{{ header }}">
-    <meta name="twitter:description" content="{{ description }}">
-    {% match og_url %}{% when Some with (url) %}<meta name="twitter:image" content="{{ url }}">{% when None %}{% endmatch %}
+    {{ social_meta|safe }}
 
     {# CSP: no remote scripts/fonts; the only outbound network calls are
        same-origin (POST /<nym>/invoice). #}
