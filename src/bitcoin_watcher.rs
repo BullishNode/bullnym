@@ -420,7 +420,7 @@ impl BitcoinWatcher {
                             tx,
                             observation.amount_sat,
                             observation.vout as usize,
-                            observation.confirmations as u32,
+                            observation.confirmations,
                         )
                         .await
                     {

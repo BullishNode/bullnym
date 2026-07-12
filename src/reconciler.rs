@@ -306,24 +306,36 @@ async fn run_one_chain_tick(
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    // Phase 4 backstop: recover chain swaps stranded in `refunding` (customer
-    // disconnected or the process restarted mid-refund). Revert them to
-    // `refund_due` so a retry can complete; a re-broadcast is UTXO-conflict-safe
-    // (same lockup UTXO, same immutable address). The age floor (10× the swap
-    // reconciler min-age, min 10 min) keeps an actively-broadcasting refund from
-    // being reverted out from under itself.
+    // Write-ahead recovery backstop: a dropped request or process restart can
+    // leave a committed attempt in `refunding`.  Never reset it to
+    // `refund_due` (that used to authorize reconstruction after an ambiguous
+    // broadcast). Re-enter the journal executor, which probes chain evidence
+    // and replays only the exact committed bytes. The age floor keeps an active
+    // request from racing this worker.
     let refunding_stale_secs = (config.min_age_secs as i64).saturating_mul(10).max(600);
-    match db::revert_stale_refunding_chain_swaps(&state.db, refunding_stale_secs).await {
-        Ok(reverted) if !reverted.is_empty() => {
-            tracing::error!(
-                event = "chain_swap_refunding_stuck_reverted",
-                count = reverted.len(),
-                ids = ?reverted,
-                "reverted stuck `refunding` chain swap(s) to `refund_due` for retry (operator P1 — verify no refund tx confirmed before re-refunding)"
-            );
+    match db::list_stale_refunding_chain_swaps(&state.db, refunding_stale_secs).await {
+        Ok(recoveries) => {
+            for swap in recoveries {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                match crate::claimer::execute_chain_swap_refund(state, &swap).await {
+                    Ok(txid) => tracing::warn!(
+                        event = "chain_swap_recovery_resumed",
+                        swap_id = %swap.boltz_swap_id,
+                        recovery_txid = %txid,
+                        "stale journaled Bitcoin recovery reconciled"
+                    ),
+                    Err(error) => tracing::warn!(
+                        event = "chain_swap_recovery_resume_deferred",
+                        swap_id = %swap.boltz_swap_id,
+                        error = %error,
+                        "stale journaled Bitcoin recovery remains pending"
+                    ),
+                }
+            }
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("chain reconciler: revert_stale_refunding failed: {e}"),
+        Err(e) => tracing::warn!("chain reconciler: list stale refunding failed: {e}"),
     }
 
     let stale = db::list_non_terminal_chain_swaps_oldest_first(

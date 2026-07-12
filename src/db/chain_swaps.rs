@@ -26,12 +26,12 @@ pub enum ChainSwapStatus {
     /// self-claim (→ `Refunded`). Must never be terminalized to a dead state.
     RefundDue,
     /// Customer self-claim refund in flight (Phase 4). Set atomically from
-    /// `RefundDue` under the per-swap advisory lock BEFORE the BTC refund tx is
-    /// broadcast, and EXCLUDED from every claim path — this is the double-payout
-    /// guard (G12): the L-BTC claim and the BTC refund spend different UTXOs on
-    /// different chains and could otherwise both confirm. NON-TERMINAL: on
-    /// broadcast failure it reverts to `RefundDue` (retryable); on success it
-    /// advances to `Refunded`.
+    /// `RefundDue` in the same transaction that commits the exact BTC recovery
+    /// attempt, and EXCLUDED from every claim path — this is the double-payout
+    /// guard (G12): the L-BTC claim and the BTC recovery spend different UTXOs
+    /// on different chains and could otherwise both confirm. NON-TERMINAL: an
+    /// ambiguous broadcast remains `Refunding` and replays the committed bytes;
+    /// known broadcast advances to `Refunded`.
     Refunding,
 }
 
@@ -654,8 +654,9 @@ pub async fn mark_chain_swap_refunding<'e, E: sqlx::PgExecutor<'e>>(
 }
 
 /// Terminal success: `refunding` -> `refunded`, recording the broadcast txid.
-/// Guarded to `refunding` so it cannot terminalize a swap that reverted or was
-/// never in flight. Returns rows affected.
+/// Legacy/test compatibility helper; the journal executor uses the stricter
+/// atomic attempt+swap update. Guarded to `refunding` so it cannot terminalize
+/// a swap that was never in flight. Returns rows affected.
 pub async fn mark_chain_swap_refunded(
     pool: &PgPool,
     id: Uuid,
@@ -673,51 +674,27 @@ pub async fn mark_chain_swap_refunded(
     Ok(result.rows_affected())
 }
 
-/// Reverts `refunding` -> `refund_due` on a broadcast failure so the refund
-/// stays recoverable (retryable by a later customer attempt or the reconciler)
-/// rather than stranding funds in a non-draining state. Guarded to `refunding`.
-/// Returns rows affected.
-pub async fn revert_chain_swap_refunding_to_due(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE chain_swap_records \
-         SET status = 'refund_due', updated_at = NOW() \
-         WHERE id = $1 AND status = 'refunding'",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Reconciler backstop for STUCK `refunding` rows (Phase 4). The refund executor
-/// runs inline in the request handler; if the customer's connection drops (or
-/// the process restarts) after the `refund_due` -> `refunding` flip but before
-/// completion, the row is stranded in `refunding` — invisible to the operator
-/// `refund_due` surface and rejected by the endpoint as "already in progress".
-/// This reverts any `refunding` row untouched for `min_age_secs` back to
-/// `refund_due` so a later customer/reconciler attempt retries it. Safe: a
-/// re-broadcast spends the same lockup UTXO to the same immutable address, so at
-/// most one refund tx ever confirms. `min_age_secs` must comfortably exceed a
-/// normal broadcast round-trip so an ACTIVE refund is never reverted. Returns
-/// the ids reverted (for alerting).
-pub async fn revert_stale_refunding_chain_swaps(
+/// Stale in-flight Bitcoin recoveries for the reconciler.  They must remain in
+/// `refunding`: resetting to `refund_due` used to authorize reconstruction
+/// after an ambiguous broadcast.  The journal executor instead reloads and
+/// reconciles/rebroadcasts the exact committed attempt.  Legacy rows without
+/// an attempt are returned too so the executor can stop them with an explicit
+/// integrity alert rather than silently manufacture new bytes.
+pub async fn list_stale_refunding_chain_swaps(
     pool: &PgPool,
     min_age_secs: i64,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "UPDATE chain_swap_records \
-         SET status = 'refund_due', updated_at = NOW() \
-         WHERE status = 'refunding' \
-           AND updated_at < NOW() - make_interval(secs => $1) \
-         RETURNING id",
-    )
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+           FROM chain_swap_records \
+          WHERE status = 'refunding' \
+            AND updated_at < NOW() - make_interval(secs => $1) \
+          ORDER BY updated_at ASC \
+          LIMIT 100"
+    ))
     .bind(min_age_secs as f64)
     .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    .await
 }
 
 /// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at

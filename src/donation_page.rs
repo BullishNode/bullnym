@@ -276,6 +276,9 @@ fn validate_description_for_kind(
 /// `kind`). Its validated value domain is kept disjoint from the other
 /// trailing fields (see the save handler) so a captured legacy message can
 /// never be replayed as an alias claim. See `docs/compatibility-ledger.md`.
+// The positional list is the signed wire contract; grouping it into a struct
+// would obscure the byte-exact legacy field order this helper exists to test.
+#[allow(clippy::too_many_arguments)]
 fn save_payload_fields<'a>(
     header: &'a str,
     description: &'a str,

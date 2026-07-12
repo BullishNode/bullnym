@@ -40,12 +40,14 @@ pub async fn broadcast(
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if status.is_success() {
-                    let txid = body.trim().to_string();
-                    if txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Some(txid) = accepted_response_txid(&body, expected_txid) {
                         tracing::info!(event = "btc_esplora_broadcast_ok", endpoint = %ep, txid = %txid);
                         return Ok(txid);
                     }
-                    errors.push(format!("{ep}: 2xx but unparseable body: {body}"));
+                    let txid = body.trim().to_lowercase();
+                    errors.push(format!(
+                        "{ep}: 2xx but returned txid '{txid}', expected '{expected_txid}'"
+                    ));
                 } else if is_already_known(&body) {
                     tracing::info!(
                         event = "btc_esplora_broadcast_already_known",
@@ -75,6 +77,11 @@ pub async fn broadcast(
         endpoints.len(),
         errors.join(" | ")
     )))
+}
+
+fn accepted_response_txid(body: &str, expected_txid: &str) -> Option<String> {
+    let returned = body.trim().to_lowercase();
+    (returned == expected_txid.to_lowercase()).then_some(returned)
 }
 
 /// A `sendrawtransaction`/esplora rejection body indicating our tx is already
@@ -133,4 +140,29 @@ pub async fn get_json<T: serde::de::DeserializeOwned>(
         "all esplora endpoints failed a GET"
     );
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accepted_response_txid, is_already_known};
+
+    #[test]
+    fn successful_broadcast_body_must_match_locally_computed_txid() {
+        let expected = "ab".repeat(32);
+        assert_eq!(
+            accepted_response_txid(&expected.to_uppercase(), &expected),
+            Some(expected.clone())
+        );
+        assert_eq!(accepted_response_txid(&"cd".repeat(32), &expected), None);
+        assert_eq!(accepted_response_txid("not-a-txid", &expected), None);
+    }
+
+    #[test]
+    fn already_known_classifier_excludes_missing_inputs() {
+        assert!(is_already_known("txn-already-known"));
+        assert!(is_already_known(r#"{"code":-27,"message":"already in chain"}"#));
+        assert!(!is_already_known(
+            r#"{"code":-25,"message":"bad-txns-inputs-missingorspent"}"#
+        ));
+    }
 }
