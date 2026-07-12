@@ -21,6 +21,9 @@ scripts/check-docs.sh
 PWA changes additionally require `npm test`, `npm run build`, and
 `npm run check:dist` from `pwa/`. Database integration tests require an isolated
 `TEST_DATABASE_URL`. Never aim broad tests at production payment resources.
+The supported local gate is `scripts/test-db.sh`; it owns a disposable Docker
+PostgreSQL instance, exercises fresh and checked-in upgrade-fixture paths, and
+forces `--test-threads=1` because the integration fixtures share cleanup state.
 
 ## Documentation lifecycle
 

@@ -114,3 +114,18 @@ scripts/check-docs.sh
 DB-backed integration tests require `TEST_DATABASE_URL` and a migrated test
 database. Deployed payment-rail certification and mobile compatibility are
 separate verification layers; see [Contributing](CONTRIBUTING.md).
+
+Use `scripts/test-db.sh` for the self-contained database gate. It creates a
+uniquely named PostgreSQL 16 container on a random loopback port, applies every
+migration to both a fresh database and an upgrade-fixture database, and runs the
+integration target serially against each. Cleanup is automatic even when a
+migration or test fails, unless `--keep` is explicitly requested.
+
+```bash
+scripts/test-db.sh
+scripts/test-db.sh --mode fresh --filter og_reconciler
+scripts/test-db.sh --keep
+```
+
+Migration-specific upgrade fixtures live in `tests/migration-hooks/` as
+matching `<migration>.before.sql` and `<migration>.after.sql` files.
