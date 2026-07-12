@@ -7,6 +7,7 @@ use lwk_wollet::elements;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::admission::Rail;
 use crate::certification::{self, CertificationScope};
 use crate::db;
 use crate::descriptor;
@@ -264,6 +265,11 @@ async fn serve_liquid(
         let addr_index = match db::get_outpoint_address(&state.db, nym, &proof.outpoint).await? {
             Some(cached) => cached.addr_index,
             None => {
+                state
+                    .admission
+                    .enforce(Rail::DirectLiquid)
+                    .map_err(|_| LiquidOutcome::Hard(AppError::MoneyAdmissionUnavailable))?;
+
                 // Distinct-nym fan-out limits (Soft on rate-limit).
                 if let Some(ip) = caller_ip {
                     rl_gate(state.rate_limiter.check_distinct_nyms_per_ip(ip, nym).await)?;
@@ -326,6 +332,10 @@ async fn serve_liquid(
         };
         Some(addr_index)
     } else {
+        state
+            .admission
+            .enforce(Rail::DirectLiquid)
+            .map_err(|_| LiquidOutcome::Hard(AppError::MoneyAdmissionUnavailable))?;
         None
     };
 
@@ -367,6 +377,11 @@ pub(crate) async fn create_lightning_swap(
     nym: &str,
     amount_sat: u64,
 ) -> Result<(LightningResponse, String), AppError> {
+    state
+        .admission
+        .enforce(Rail::LightningReverse)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;

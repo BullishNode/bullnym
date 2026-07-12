@@ -14,6 +14,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `invoice_payment_observations` | Non-accounting evidence | Direct Bitcoin sightings that are unconfirmed or below the confirmation threshold. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
+| `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
 | `outpoint_addresses` | LUD-22 reservations | `(nym, outpoint)` to descriptor index cache for Liquid shortcut idempotency and TTL cleanup of unfulfilled rows. |
 | `nym_access_events` | Abuse controls | Sliding-window distinct-nym access counters. |
 | `processed_webhook_events` | Webhook idempotency | Prevents duplicate Boltz webhook processing. |
@@ -71,7 +72,7 @@ Payment observations are status evidence only and must never update
 | Chain-swap claim sweep | retryable `chain_swap_records` | Claim provider LBTC to the committed checkout destination. |
 | Reverse/chain reconcilers | non-terminal swap rows | Poll provider state to recover missed webhooks and schedule guarded transitions. |
 | Slow recovery | funded `claim_stuck` rows | Revive claims on a long exponential backoff after the fast budget is exhausted. |
-| Settlement repair | claimed reverse swaps | Idempotently recreate a missing invoice payment event after a crash between claim and invoice updates. |
+| Settlement repair | claimed reverse and chain swaps | Idempotently recreate a missing invoice payment event after a crash between claim and invoice updates. |
 | Payment Page OG reconciler | live `payment_page` rows | Generate versioned, content-addressed social cards; backfill legacy rows; retry render/write failures; and verify referenced files exist on the serving host. |
 | Liquid watcher | persisted blinded destinations | Detect matching Liquid outputs and advance descriptor observations. |
 | Bitcoin watcher | direct-Bitcoin invoice destinations | Persist observations, count outputs after the configured confirmation threshold, and detect disappearance before credit. |
@@ -80,6 +81,56 @@ Payment observations are status evidence only and must never update
 Provider webhooks are latency hints, not the only recovery trigger. Reconciler
 queries and chain evidence allow progress after webhook loss. Provider status
 is also not independent proof that a transaction confirmed.
+
+## Worker liveness and admission
+
+Money-moving workers report progress and cycle outcomes to an in-process,
+per-rail admission snapshot. The snapshot is intentionally not persisted: a
+new process must prove its own dependencies and complete its own startup scans
+instead of inheriting another process's health. Liquid and Bitcoin watchers run
+an immediate startup scan, and the claimer/reconciler/recovery workers run an
+immediate startup cycle before admission can open their dependent rail.
+Direct watcher backends, the retained Liquid claim-client factory, the reused
+Bitcoin recovery-evidence client, and the Boltz client are initialized as
+separate rail facts. A direct backend cannot stand in for a swap claim or
+recovery path merely because both use the same configured provider fallback.
+
+One or two consecutive failed cycles leave the worker suspect while service
+continues. Three consecutive failures, three missed worker cadences,
+or an unexpected task stop closes the affected rail. Two successful cycles are
+required to reopen after a failure or stale closure. Whole-process intentional
+shutdown is distinguished from an unexpected task drop.
+
+A rate-budget deferral that leaves a watcher scan incomplete is not a successful
+cycle. Active- and idle-tier outcomes are latched independently, so success in
+one tier cannot erase failures in the other. Malformed or business-local rows
+remain isolated, while all-provider failures and required database writes that
+fail make the worker cycle unhealthy.
+
+Watcher startup covers both active and idle tiers. Each tier freezes a snapshot
+from the database clock and advances through deterministic keyset pages. The
+Liquid watcher completes and latches its nym phase before advancing through
+invoice pages, so a large nym set cannot continually restart and starve a large
+invoice set. Each nym also freezes one bounded descriptor/lookahead range and
+retains its exact address subcursor across deferral; payments that advance the
+live descriptor cursor cannot extend that epoch or starve later nyms.
+Intermediate pages report progress only; an empty page still probes the
+configured chain backend, and a token-limited page that makes no forward
+progress fails the cycle. Admission opens only after the complete snapshot
+drains successfully.
+
+Capped reconciler and repair scans likewise retain a process-local database-time
+epoch with deterministic keyset cursors across intermediate pages. Multi-rail
+workers latch each completed subset so one large subset cannot continually
+restart or starve another. Draining or a systemic failure discards the local
+epoch and cursors. No persisted row marker is used as scan-completion or health
+evidence, so another process cannot make a restarted process inherit successful
+admission.
+
+These signals gate only the publication of new payment instructions. Worker
+execution itself is never gated, so an admission closure cannot prevent the
+claims, reconciliation, settlement repair, or recovery needed for existing
+obligations.
 
 ## Competing-spend safety
 

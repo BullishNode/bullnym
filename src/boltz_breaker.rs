@@ -139,6 +139,25 @@ mod tests {
     }
 
     #[test]
+    fn default_contract_is_five_failures_and_thirty_seconds() {
+        assert_eq!(DEFAULT_FAILURE_THRESHOLD, 5);
+        assert_eq!(DEFAULT_OPEN_FOR, Duration::from_secs(30));
+
+        let breaker = BoltzBreaker::default();
+        assert_eq!(breaker.threshold, DEFAULT_FAILURE_THRESHOLD);
+        assert_eq!(breaker.open_for, DEFAULT_OPEN_FOR);
+
+        let now = t0();
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD - 1 {
+            breaker.record_at(now, true);
+        }
+        assert_eq!(breaker.gate_at(now), Gate::Allow);
+        breaker.record_at(now, true);
+        assert_eq!(breaker.gate_at(now), Gate::Reject);
+        assert_eq!(breaker.gate_at(now + DEFAULT_OPEN_FOR), Gate::Allow);
+    }
+
+    #[test]
     fn stays_closed_below_threshold() {
         let b = BoltzBreaker::new(3, Duration::from_secs(30));
         let now = t0();

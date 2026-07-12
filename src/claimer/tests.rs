@@ -1,6 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use elements::encode::serialize;
+use std::cell::Cell;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
@@ -110,6 +111,47 @@ fn cooperative_refusal_rejects_unrelated_errors() {
             "did not expect refusal classification for: {phrase}"
         );
     }
+}
+
+#[test]
+fn claim_cycle_is_unhealthy_when_systemic_operations_fail() {
+    let errors = [
+        AppError::DbError("database unavailable".to_string()),
+        AppError::ElectrumError("all endpoints unavailable".to_string()),
+        AppError::BoltzError("provider timeout".to_string()),
+        AppError::ClaimError("electrum connection failed on all urls".to_string()),
+        AppError::ClaimError("construct_claim failed: provider timeout".to_string()),
+        AppError::ClaimError("broadcast failed: connection reset".to_string()),
+    ];
+    let mut health = ClaimCycleHealth::default();
+    for error in &errors {
+        assert_eq!(
+            classify_claim_failure(error),
+            ClaimFailureScope::Systemic,
+            "expected systemic classification for {error}"
+        );
+        health.observe_error(error);
+    }
+    assert!(health.systemic_failure);
+}
+
+#[test]
+fn claim_cycle_keeps_malformed_and_business_local_obligations_local() {
+    let errors = [
+        AppError::ClaimError("invalid boltz response json: expected value".to_string()),
+        AppError::ClaimError("decode persisted claim_tx: invalid hex".to_string()),
+        AppError::ClaimError("construct_claim failed: swap expired".to_string()),
+    ];
+    let mut health = ClaimCycleHealth::default();
+    for error in &errors {
+        assert_eq!(
+            classify_claim_failure(error),
+            ClaimFailureScope::Local,
+            "expected local classification for {error}"
+        );
+        health.observe_error(error);
+    }
+    assert!(!health.systemic_failure);
 }
 
 #[test]
@@ -358,9 +400,81 @@ fn chain_swap_status_mapping_still_advances_and_terminalizes_correctly() {
 #[test]
 fn electrum_host_port_strips_scheme_for_boltz_client() {
     // boltz-client re-adds ssl://; we must hand it a bare host:port.
-    assert_eq!(electrum_host_port("ssl://les.bullbitcoin.com:50002"), "les.bullbitcoin.com:50002");
-    assert_eq!(electrum_host_port("ssl://172.16.0.15:50002"), "172.16.0.15:50002");
+    assert_eq!(
+        electrum_host_port("ssl://les.bullbitcoin.com:50002"),
+        "les.bullbitcoin.com:50002"
+    );
+    assert_eq!(
+        electrum_host_port("ssl://172.16.0.15:50002"),
+        "172.16.0.15:50002"
+    );
     assert_eq!(electrum_host_port("tcp://host:50001"), "host:50001");
     // Already bare — unchanged.
     assert_eq!(electrum_host_port("host:50002"), "host:50002");
+}
+
+#[test]
+fn liquid_claim_factory_requires_a_structurally_valid_endpoint() {
+    assert!(LiquidClaimClientFactory::try_new(Vec::new()).is_err());
+    assert!(LiquidClaimClientFactory::try_new(vec![
+        "not-a-url".to_string(),
+        "ssl://missing-port".to_string(),
+        "tcp://host:0".to_string(),
+    ])
+    .is_err());
+}
+
+#[test]
+fn liquid_claim_factory_retains_only_valid_failover_endpoints() {
+    let factory = LiquidClaimClientFactory::try_new(vec![
+        "invalid".to_string(),
+        "ssl://les.bullbitcoin.com:995".to_string(),
+        "tcp://127.0.0.1:50001".to_string(),
+    ])
+    .expect("at least one valid claim endpoint");
+
+    assert_eq!(
+        factory.urls(),
+        [
+            "ssl://les.bullbitcoin.com:995".to_string(),
+            "tcp://127.0.0.1:50001".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn claim_client_startup_retries_until_success_then_never_probes_again() {
+    let calls = Cell::new(0usize);
+    let mut startup = ClaimClientStartup::default();
+
+    let first = startup
+        .ensure_initialized(|| async {
+            calls.set(calls.get() + 1);
+            Err(AppError::ClaimError("scripted probe failure".to_string()))
+        })
+        .await;
+    assert!(first.is_err());
+    assert!(!startup.initialized);
+    assert_eq!(calls.get(), 1);
+
+    let initialized_now = startup
+        .ensure_initialized(|| async {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .await
+        .expect("second probe succeeds");
+    assert!(initialized_now);
+    assert!(startup.initialized);
+    assert_eq!(calls.get(), 2);
+
+    let initialized_now = startup
+        .ensure_initialized(|| async {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .await
+        .expect("latched startup remains healthy");
+    assert!(!initialized_now);
+    assert_eq!(calls.get(), 2, "latched startup must not probe again");
 }

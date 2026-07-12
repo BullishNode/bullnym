@@ -54,8 +54,59 @@ needs full bypass behavior.
 Certification scopes are for deterministic server/payment-rail tests. They do
 not turn bullnym-test into a mobile test environment.
 
+Neither certification nor the IP whitelist bypasses money admission. A caller
+with every certification scope still cannot make Bullnym publish a new payment
+instruction while that rail is closed.
+
+## Money Admission
+
+Money admission is a process-local, per-rail safety boundary for creating new
+monetary obligations. Every process starts closed and must observe a successful
+current-process cycle from each worker required by the requested rail before it
+can publish new payer instructions.
+
+| Rail | Required runtime signals |
+|---|---|
+| Direct Liquid | Current schema, enabled workers, initialized direct-Liquid backend, and Liquid watcher. |
+| Direct Bitcoin | Current schema, enabled workers, initialized direct-Bitcoin watcher client, and Bitcoin watcher. |
+| Lightning reverse swap | Current schema, enabled workers, initialized Liquid-claim factory and Boltz client, safe swap-key lineage, an admitted fee policy, reverse claimer/reconciler, settlement repair, and slow recovery. |
+| Bitcoin chain swap | Current schema, enabled workers, initialized Liquid-claim factory, Bitcoin recovery-evidence client, and Boltz client, safe swap-key lineage, writable recovery journal, an admitted fee policy, a merchant-specific recovery commitment, chain claimer/reconciler, settlement repair, and slow recovery. |
+
+Direct-observation clients and swap settlement/evidence clients are independent
+hard facts. Bullnym retains the exact validated Liquid claim factory and
+Bitcoin evidence client that existing-obligation paths use; it never infers
+their readiness from a different backend or from a merely nonempty endpoint
+list. Before an empty claimer scan can succeed, the process retries the exact
+Liquid claim socket construction and genesis probe until its first success,
+then latches that initialization for the process. Later provider reachability
+remains transient worker evidence rather than a permanent startup fact.
+
+Hard prerequisite loss closes the affected rail immediately. A worker becomes
+suspect after one failed cycle, closes its rails after three consecutive failed
+cycles or at three missed cadences, and needs two successful
+cycles to reopen after either closure. A stopped worker closes its rails.
+
+Admission is checked immediately before the first irreversible mutation, such
+as advancing a descriptor/key cursor, inserting a new payable invoice, or
+creating a provider obligation. Existing payment instructions, status reads,
+webhooks, claims, reconciliation, settlement repair, and recovery continue
+while new-money admission is closed.
+
+An admission rejection is HTTP 503 with the fixed public message `This payment
+method is temporarily unavailable. Try again later.` Detailed rail and
+dependency reason codes appear only in transition logs. This prevents callers
+from learning internal backend, key-lineage, worker, fee-policy, or recovery
+state.
+
+Reverse-swap and chain-swap admission intentionally remain closed until issue
+#64 supplies the live persisted fee decision. Chain-swap admission also remains
+closed until issue #84 binds the merchant-specific committed recovery
+destination before an offer is created. Direct rails can remain available
+independently when their own prerequisites are healthy.
+
 ## Preflight
 
 Broad certification should call `/certification/preflight` before setup or
 money movement. If source, token, scope, balances, or server provenance are not
 ready, the run should fail preflight instead of producing skipped scenarios.
+Preflight success does not override a closed money rail.

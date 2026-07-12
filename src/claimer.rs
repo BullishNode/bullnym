@@ -25,6 +25,7 @@ use boltz_client::util::fees::Fee;
 use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
+use crate::admission::WorkerReporter;
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
@@ -237,7 +238,9 @@ async fn dispatch_webhook(
         return Ok("ok");
     };
 
-    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    let status = swap
+        .parsed_status()
+        .map_err(|e| AppError::ClaimError(format!("invalid persisted swap status: {e}")))?;
     if status.is_terminal() {
         tracing::debug!("ignoring webhook for {} swap {}", swap.status, data.id);
         return Ok("ok");
@@ -268,7 +271,7 @@ async fn dispatch_webhook(
             try_claim_with_retry(
                 &state.db,
                 &swap,
-                &state.config.claim_liquid_electrum_urls(),
+                state.liquid_claim_client_factory.as_deref(),
                 &state.config.boltz.api_url,
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
@@ -443,7 +446,10 @@ async fn try_renegotiate_chain_swap(
     if !got_lock {
         // Another waterfall step (claim / self-claim / concurrent renegotiation)
         // owns this swap — let it decide the outcome; do not refund here.
-        tracing::debug!("renegotiate: lock held for {}, skipping", swap.boltz_swap_id);
+        tracing::debug!(
+            "renegotiate: lock held for {}, skipping",
+            swap.boltz_swap_id
+        );
         return Ok(true);
     }
 
@@ -533,7 +539,9 @@ pub(crate) async fn handle_chain_swap_webhook(
     swap: &db::ChainSwapRecord,
     boltz_status: &str,
 ) -> Result<(), AppError> {
-    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    let status = swap
+        .parsed_status()
+        .map_err(|e| AppError::ClaimError(format!("invalid persisted chain status: {e}")))?;
     if status.is_terminal() {
         tracing::debug!(
             "ignoring webhook for terminal chain swap {} ({})",
@@ -603,7 +611,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.claim_liquid_electrum_urls(),
+            state.liquid_claim_client_factory.as_deref(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -661,7 +669,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.claim_liquid_electrum_urls(),
+            state.liquid_claim_client_factory.as_deref(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -776,7 +784,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         try_claim_chain_swap_with_retry(
             &state.db,
             swap,
-            &state.config.claim_liquid_electrum_urls(),
+            state.liquid_claim_client_factory.as_deref(),
             &state.config.boltz.api_url,
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
@@ -814,7 +822,7 @@ fn chain_swap_status_from_boltz_status(boltz_status: &str) -> Option<ChainSwapSt
 async fn try_claim_chain_swap_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::ChainSwapRecord,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -823,7 +831,7 @@ async fn try_claim_chain_swap_with_retry(
     match claim_chain_swap(
         pool,
         swap.id,
-        electrum_urls,
+        claim_clients,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -863,6 +871,79 @@ pub enum ClaimOutcome {
     AlreadyTerminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimFailureScope {
+    Local,
+    Systemic,
+}
+
+/// Health of one rail-specific claimer sweep. A malformed persisted
+/// obligation must remain isolated, while database and provider-wide failures
+/// make the worker cycle unhealthy for admission hysteresis.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ClaimCycleHealth {
+    systemic_failure: bool,
+}
+
+impl ClaimCycleHealth {
+    fn observe_error(&mut self, error: &AppError) {
+        if classify_claim_failure(error) == ClaimFailureScope::Systemic {
+            self.systemic_failure = true;
+        }
+    }
+
+    fn report(self, reporter: &WorkerReporter) {
+        if self.systemic_failure {
+            reporter.cycle_failed();
+        } else {
+            reporter.cycle_succeeded();
+        }
+    }
+}
+
+fn classify_claim_failure(error: &AppError) -> ClaimFailureScope {
+    match error {
+        AppError::DbError(_) | AppError::ElectrumError(_) | AppError::BoltzError(_) => {
+            ClaimFailureScope::Systemic
+        }
+        AppError::ClaimError(message) => {
+            if is_cooperative_refusal(error) || is_local_claim_error(message) {
+                ClaimFailureScope::Local
+            } else {
+                // Unknown claim-path errors fail closed. Known malformed-data and
+                // business-local shapes are enumerated below; the remaining
+                // errors are connection, provider, construction, or broadcast
+                // failures shared by the worker's operating environment.
+                ClaimFailureScope::Systemic
+            }
+        }
+        _ => ClaimFailureScope::Local,
+    }
+}
+
+fn is_local_claim_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "swap_records row gone:",
+        "swap not found:",
+        "chain swap not found:",
+        "invoice not found:",
+        "user not found:",
+        "address allocation failed:",
+        "address index overflow",
+        "decode persisted",
+        "missing ",
+        "invalid ",
+        "swap script build failed:",
+        "chain claim script build failed:",
+        "chain lockup script build failed:",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+        || message.contains(" has no ")
+        || message.contains(" no nym and no invoice ")
+}
+
 /// Webhook-path single-shot claim attempt. Errors are recorded by
 /// `claim_swap` itself (which calls `db::record_claim_failure` to
 /// schedule the next retry on the documented backoff). The background
@@ -876,7 +957,7 @@ pub enum ClaimOutcome {
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
     swap: &db::SwapRecord,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -885,7 +966,7 @@ async fn try_claim_with_retry(
     match claim_swap(
         pool,
         swap.id,
-        electrum_urls,
+        claim_clients,
         boltz_url,
         max_claim_attempts,
         utxo_backend,
@@ -1094,7 +1175,7 @@ async fn resolve_claim_address(
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1107,7 +1188,7 @@ async fn claim_swap(
     let result = claim_swap_inner(
         pool,
         swap_id,
-        electrum_urls,
+        claim_clients,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1135,6 +1216,7 @@ async fn claim_swap(
                         swap_id = %swap_id,
                         "failed to mark invoice settlement_status=claim_stuck: {e}"
                     );
+                    return Err(AppError::DbError(e.to_string()));
                 }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
@@ -1156,6 +1238,7 @@ async fn claim_swap(
                     "failed to record claim failure for swap {}: {db_err}",
                     swap_id
                 );
+                return Err(AppError::DbError(db_err.to_string()));
             }
         }
     }
@@ -1165,11 +1248,14 @@ async fn claim_swap(
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
+    let claim_clients = claim_clients.ok_or_else(|| {
+        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+    })?;
     // Acquire single-flight and prepare the claim tx.
     let mut tx = pool
         .begin()
@@ -1197,7 +1283,9 @@ async fn claim_swap_inner(
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("swap not found: {swap_id}")))?;
 
-    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    let status = swap
+        .parsed_status()
+        .map_err(|e| AppError::ClaimError(format!("invalid persisted swap status: {e}")))?;
     if status.is_terminal() {
         tracing::debug!("claim_swap: {} already terminal ({})", swap_id, swap.status);
         return Ok(ClaimOutcome::AlreadyTerminal);
@@ -1226,7 +1314,7 @@ async fn claim_swap_inner(
         let constructed = match construct_claim_tx(
             &swap,
             &output_address,
-            electrum_urls,
+            claim_clients,
             boltz_url,
             use_cooperative,
         )
@@ -1248,7 +1336,9 @@ async fn claim_swap_inner(
                 // mark_cooperative_refused opens its own short tx and is
                 // idempotent — safe to call from inside our locked tx
                 // (different connection; advisory lock doesn't conflict).
-                let _ = db::mark_cooperative_refused(pool, swap.id).await;
+                db::mark_cooperative_refused(pool, swap.id)
+                    .await
+                    .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -1306,7 +1396,7 @@ async fn claim_swap_inner(
     // dies between here and the final update, the next sweep tick re-acquires
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
-    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
+    let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
     let mut txid = btc_like_txid(&claim_tx);
@@ -1425,7 +1515,7 @@ async fn claim_swap_inner(
 async fn claim_chain_swap(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
@@ -1434,7 +1524,7 @@ async fn claim_chain_swap(
     let result = claim_chain_swap_inner(
         pool,
         chain_swap_id,
-        electrum_urls,
+        claim_clients,
         boltz_url,
         utxo_backend,
         tolerances,
@@ -1453,20 +1543,20 @@ async fn claim_chain_swap(
                     last_error = %err_str,
                     "chain swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
-                if let Ok(Some(row)) = db::get_chain_swap_by_id(pool, chain_swap_id).await {
-                    if let Err(e) = db::mark_invoice_settlement_status(
-                        pool,
-                        Some(row.invoice_id),
-                        "claim_stuck",
-                    )
+                let row = db::get_chain_swap_by_id(pool, chain_swap_id)
                     .await
-                    {
-                        tracing::error!(
-                            event = "invoice_chain_swap_claim_stuck_mark_failed",
-                            swap_id = %chain_swap_id,
-                            "failed to mark invoice settlement_status=claim_stuck: {e}"
-                        );
-                    }
+                    .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
+                if let Some(row) = row {
+                    db::mark_invoice_settlement_status(pool, Some(row.invoice_id), "claim_stuck")
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                event = "invoice_chain_swap_claim_stuck_mark_failed",
+                                swap_id = %chain_swap_id,
+                                "failed to mark invoice settlement_status=claim_stuck: {e}"
+                            );
+                            AppError::DbError(e.to_string())
+                        })?;
                 }
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
@@ -1488,6 +1578,7 @@ async fn claim_chain_swap(
                     "failed to record chain-swap claim failure for {}: {db_err}",
                     chain_swap_id
                 );
+                return Err(AppError::DbError(db_err.to_string()));
             }
         }
     }
@@ -1497,11 +1588,14 @@ async fn claim_chain_swap(
 async fn claim_chain_swap_inner(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
-    electrum_urls: &[String],
+    claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
+    let claim_clients = claim_clients.ok_or_else(|| {
+        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+    })?;
     let mut tx = pool
         .begin()
         .await
@@ -1523,7 +1617,9 @@ async fn claim_chain_swap_inner(
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
 
-    let status = swap.parsed_status().map_err(AppError::DbError)?;
+    let status = swap
+        .parsed_status()
+        .map_err(|e| AppError::ClaimError(format!("invalid persisted chain status: {e}")))?;
     if status.is_terminal() {
         return Ok(ClaimOutcome::AlreadyTerminal);
     }
@@ -1560,7 +1656,7 @@ async fn claim_chain_swap_inner(
         let constructed = match construct_chain_claim_tx(
             &swap,
             &output_address,
-            electrum_urls,
+            claim_clients,
             boltz_url,
             use_cooperative,
         )
@@ -1574,7 +1670,9 @@ async fn claim_chain_swap_inner(
                     error = %e,
                     "boltz refused cooperative chain claim; flipping cooperative_refused for next sweep"
                 );
-                let _ = db::mark_chain_swap_cooperative_refused(pool, swap.id).await;
+                db::mark_chain_swap_cooperative_refused(pool, swap.id)
+                    .await
+                    .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -1613,7 +1711,7 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
+    let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let mut txid = btc_like_txid(&claim_tx);
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
@@ -1727,7 +1825,7 @@ async fn claim_chain_swap_inner(
 async fn construct_claim_tx(
     swap: &db::SwapRecord,
     output_address: &str,
-    electrum_urls: &[String],
+    claim_clients: &LiquidClaimClientFactory,
     boltz_url: &str,
     cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1766,7 +1864,7 @@ async fn construct_claim_tx(
 
     // New connection per construct call: ElectrumLiquidClient wraps a TCP
     // socket and isn't Send+Sync, so it can't be shared across tasks.
-    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
+    let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1794,7 +1892,7 @@ async fn construct_claim_tx(
 async fn construct_chain_claim_tx(
     swap: &db::ChainSwapRecord,
     output_address: &str,
-    electrum_urls: &[String],
+    claim_clients: &LiquidClaimClientFactory,
     boltz_url: &str,
     use_cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
@@ -1837,7 +1935,7 @@ async fn construct_chain_claim_tx(
     )
     .map_err(|e| AppError::ClaimError(format!("chain lockup script build failed: {e}")))?;
 
-    let liquid_client = connect_liquid_electrum(electrum_urls).await?;
+    let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     // Bound the claim-path Boltz client. With no timeout a hung Boltz (as seen
     // during a degradation/DDoS) blocks the cooperative-claim round-trip
@@ -1892,9 +1990,14 @@ async fn construct_chain_claim_tx(
 /// runs without an address/script-hash index (address endpoints error), but
 /// txid + block endpoints work. So we ask Boltz for the lockup funding txid
 /// (`/swap/chain/{id}/transactions` -> userLock.transaction.id) and then query
-/// the esplora `/tx/{txid}/status`. Best-effort: on any error returns false
-/// (defer the refund) — refusing to refund is the fund-safe direction.
-async fn chain_lockup_confirmed(boltz_url: &str, esploras: &[String], swap_id: &str) -> bool {
+/// the esplora `/tx/{txid}/status`. An observed unconfirmed transaction is
+/// `Ok(false)`; an unavailable provider is a typed backend error so worker
+/// health cannot mistake an outage for a healthy deferral.
+async fn chain_lockup_confirmed(
+    boltz_url: &str,
+    esploras: &[String],
+    swap_id: &str,
+) -> Result<bool, AppError> {
     // 1) lockup funding txid from Boltz
     #[derive(serde::Deserialize)]
     struct LockTx {
@@ -1914,19 +2017,33 @@ async fn chain_lockup_confirmed(boltz_url: &str, esploras: &[String], swap_id: &
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(error) => {
+            return Err(AppError::BoltzError(format!(
+                "build recovery confirmation client: {error}"
+            )))
+        }
     };
     let txs_url = format!(
         "{}/swap/chain/{}/transactions",
         boltz_url.trim_end_matches('/'),
         swap_id
     );
-    let txid = match client.get(&txs_url).send().await {
-        Ok(r) if r.status().is_success() => match r.json::<ChainTxs>().await {
-            Ok(c) => c.user_lock.transaction.id,
-            Err(_) => return false,
-        },
-        _ => return false,
+    let response = client.get(&txs_url).send().await.map_err(|error| {
+        AppError::BoltzError(format!("fetch recovery lockup transaction: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(AppError::BoltzError(format!(
+            "fetch recovery lockup transaction returned HTTP {}",
+            response.status()
+        )));
+    }
+    let txid = match response.json::<ChainTxs>().await {
+        Ok(c) => c.user_lock.transaction.id,
+        Err(error) => {
+            return Err(AppError::BoltzError(format!(
+                "decode recovery lockup transaction: {error}"
+            )))
+        }
     };
 
     // 2) confirmation from the esplora, txid-based (no address index needed),
@@ -1938,7 +2055,11 @@ async fn chain_lockup_confirmed(boltz_url: &str, esploras: &[String], swap_id: &
     crate::esplora::get_json::<TxStatus>(esploras, &format!("tx/{txid}/status"))
         .await
         .map(|s| s.confirmed)
-        .unwrap_or(false)
+        .ok_or_else(|| {
+            AppError::ElectrumError(format!(
+                "Bitcoin lockup confirmation is unavailable for {txid}"
+            ))
+        })
 }
 
 pub(crate) async fn execute_chain_swap_refund(
@@ -1985,23 +2106,30 @@ pub(crate) async fn execute_chain_swap_refund(
     // `sendrawtransaction` rejects it. Defer until the lockup has >=1 conf; the
     // caller (endpoint poll / reconciler) retries and it self-heals. This avoids
     // the wasted `refunding`->revert churn and the confusing broadcast errors.
-    if !chain_lockup_confirmed(
+    let bitcoin_recovery_backend = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+    })?;
+    match chain_lockup_confirmed(
         &state.config.boltz.api_url,
-        &state.config.bitcoin_watcher.effective_endpoints(),
+        bitcoin_recovery_backend.endpoints(),
         &swap.boltz_swap_id,
     )
     .await
     {
-        tracing::info!(
-            event = "chain_swap_recover_deferred_unconfirmed_lockup",
-            swap_id = %swap.boltz_swap_id,
-            invoice_id = %swap.invoice_id,
-            lockup_address = %swap.lockup_address,
-            "recovery deferred: BTC lockup not yet confirmed; retry after confirmation"
-        );
-        return Err(AppError::RecoveryNotAvailable(
-            "recovery deferred: BTC lockup not yet confirmed".to_string(),
-        ));
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                event = "chain_swap_recover_deferred_unconfirmed_lockup",
+                swap_id = %swap.boltz_swap_id,
+                invoice_id = %swap.invoice_id,
+                lockup_address = %swap.lockup_address,
+                "recovery deferred: BTC lockup not yet confirmed; retry after confirmation"
+            );
+            return Err(AppError::RecoveryNotAvailable(
+                "recovery deferred: BTC lockup not yet confirmed".to_string(),
+            ));
+        }
+        Err(error) => return Err(error),
     }
 
     tracing::warn!(
@@ -2056,33 +2184,69 @@ fn electrum_host_port(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-/// Connect a Liquid Electrum client for the claim/broadcast path, trying each
-/// URL until one connects AND answers a cheap probe — the same provider
-/// failover the UtxoBackend pool already has (#47). `ElectrumLiquidClient::new`
-/// attempts the connection, so a DOWN endpoint fails here and we rotate. An
-/// "up-but-broken" backend (TCP accepts, requests error) would otherwise be
-/// returned healthy and pin every retry to it; a post-connect `get_genesis_hash`
-/// probe (a single `blockchain.block.header` at height 0) catches that and
-/// rotates too. The already-present `utxo_backend` tx-existence probe still
-/// rescues an on-chain-but-errored broadcast. Returns the first client that
-/// connects and validates, or an aggregated error.
+/// Retained, process-local witness for the exact Liquid claim client path.
+///
+/// The underlying Boltz Electrum client owns a socket and is intentionally
+/// created per operation, so it cannot live in [`AppState`]. This factory is
+/// the initialized hard fact instead: it validates and retains the immutable
+/// failover configuration used by every claim construction and broadcast.
+/// Reachability remains transient worker evidence and is checked by
+/// [`connect`](Self::connect), never promoted to a permanent hard failure.
+#[derive(Debug)]
+pub struct LiquidClaimClientFactory {
+    urls: Vec<String>,
+}
+
+impl LiquidClaimClientFactory {
+    pub fn try_new(urls: Vec<String>) -> Result<Self, AppError> {
+        let urls: Vec<String> = urls
+            .into_iter()
+            .filter(|url| crate::config::valid_electrum_endpoint(url))
+            .collect();
+        if urls.is_empty() {
+            return Err(AppError::ClaimError(
+                "no valid Liquid claim client endpoint is configured".to_string(),
+            ));
+        }
+        Ok(Self { urls })
+    }
+
+    #[cfg(test)]
+    fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
+    /// Connect a Liquid Electrum client for the claim/broadcast path, trying
+    /// each validated URL until one connects and answers a cheap probe — the
+    /// same provider failover the UtxoBackend pool already has (#47).
+    async fn connect(&self) -> Result<ElectrumLiquidClient, AppError> {
+        connect_liquid_electrum(&self.urls).await
+    }
+}
+
 async fn connect_liquid_electrum(urls: &[String]) -> Result<ElectrumLiquidClient, AppError> {
     let mut errors: Vec<String> = Vec::new();
     for (i, url) in urls.iter().enumerate() {
-        let client =
-            match ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_host_port(url), true, true, 30) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        event = "liquid_electrum_failover",
-                        endpoint = %url,
-                        err = %e,
-                        "Liquid electrum connect failed; trying next endpoint"
-                    );
-                    errors.push(format!("{url}: connect: {e}"));
-                    continue;
-                }
-            };
+        let tls = url.starts_with("ssl://");
+        let client = match ElectrumLiquidClient::new(
+            LiquidChain::Liquid,
+            electrum_host_port(url),
+            tls,
+            tls,
+            30,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    event = "liquid_electrum_failover",
+                    endpoint = %url,
+                    err = %e,
+                    "Liquid electrum connect failed; trying next endpoint"
+                );
+                errors.push(format!("{url}: connect: {e}"));
+                continue;
+            }
+        };
         // Post-connect validation: a genesis-header fetch is cheap and
         // deterministic; an up-but-broken node errors here and we rotate.
         if let Err(e) = client.get_genesis_hash().await {
@@ -2193,17 +2357,43 @@ fn spending_tx_matches_claim_destination(
     })
 }
 
+#[derive(Debug, Default)]
+struct ClaimClientStartup {
+    initialized: bool,
+}
+
+impl ClaimClientStartup {
+    /// Returns `true` only for the call that first proves initialization.
+    /// Once latched, the probe closure is never invoked again.
+    async fn ensure_initialized<F, Fut>(&mut self, probe: F) -> Result<bool, AppError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), AppError>>,
+    {
+        if self.initialized {
+            return Ok(false);
+        }
+        probe().await?;
+        self.initialized = true;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
 pub fn spawn_background_claimer(
     pool: sqlx::PgPool,
     config: Arc<Config>,
+    claim_clients: Option<Arc<LiquidClaimClientFactory>>,
     utxo_backend: Option<Arc<dyn UtxoBackend>>,
     cancel: CancellationToken,
-) {
+    mut reverse_reporter: WorkerReporter,
+    mut chain_reporter: WorkerReporter,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut first_run = true;
+        let mut first_reverse_run = true;
+        let mut claim_client_startup = ClaimClientStartup::default();
         // Heartbeat counter. Log liveness every N ticks so "is the
         // background claimer running?" is a grep-able question, not a
         // process-tree archaeology one. At 10s/tick x 30 ticks, that's
@@ -2211,113 +2401,171 @@ pub fn spawn_background_claimer(
         const HEARTBEAT_EVERY_N_TICKS: u32 = 30;
         let mut tick_count: u32 = 0;
         loop {
-            tick_count = tick_count.wrapping_add(1);
-            let ready = match db::get_ready_to_claim_swaps(&pool).await {
-                Ok(swaps) => swaps,
-                Err(e) => {
-                    tracing::error!("background claimer: db query failed: {e}");
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => continue,
-                    }
-                }
-            };
-
-            if !ready.is_empty() {
-                if first_run {
-                    tracing::info!(
-                        "background claimer: found {} unclaimed swaps on startup",
-                        ready.len()
-                    );
-                }
-                for swap in &ready {
-                    match claim_swap(
-                        &pool,
-                        swap.id,
-                        &config.claim_liquid_electrum_urls(),
-                        &config.boltz.api_url,
-                        config.claim.max_claim_attempts,
-                        utxo_backend.as_ref(),
-                        db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
-                    )
+            // The factory is the immutable hard capability, but #68 also
+            // requires this process to prove the exact socket/client path
+            // before an empty DB scan may open swap admission. Probe once;
+            // transient startup failures stay under worker hysteresis and are
+            // retried, while later operation failures are observed by the
+            // ordinary claim cycles.
+            if let Some(factory) = claim_clients.as_deref() {
+                match claim_client_startup
+                    .ensure_initialized(|| async {
+                        let client = factory.connect().await?;
+                        drop(client);
+                        Ok(())
+                    })
                     .await
-                    {
-                        Ok(ClaimOutcome::Broadcast) => {
+                {
+                    Ok(initialized_now) => {
+                        if initialized_now {
                             tracing::info!(
-                                "background claimer: claimed swap {}",
-                                swap.boltz_swap_id
+                                event = "liquid_claim_client_initialized",
+                                "Liquid claim client path initialized for this process"
                             );
-                        }
-                        Ok(ClaimOutcome::SkippedLockHeld) => {
-                            tracing::debug!(
-                                "background claimer: skipped {} (lock held)",
-                                swap.boltz_swap_id
-                            );
-                        }
-                        Ok(ClaimOutcome::AlreadyTerminal) => {
-                            tracing::debug!(
-                                "background claimer: skipped {} (already terminal)",
-                                swap.boltz_swap_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("background claimer: swap {}: {e}", swap.boltz_swap_id);
                         }
                     }
+                    Err(error) => {
+                        reverse_reporter.cycle_failed();
+                        chain_reporter.cycle_failed();
+                        tracing::warn!(
+                            event = "liquid_claim_client_startup_failed",
+                            error = %error,
+                            "Liquid claim client initialization failed; retrying"
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                reverse_reporter.intentional_shutdown();
+                                chain_reporter.intentional_shutdown();
+                                return;
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => {}
+                        }
+                        continue;
+                    }
                 }
-            } else if first_run {
-                tracing::info!("background claimer: no unclaimed swaps found");
             }
 
-            let ready_chain = match db::get_ready_to_claim_chain_swaps(&pool).await {
-                Ok(swaps) => swaps,
-                Err(e) => {
-                    tracing::error!("background claimer: chain-swap db query failed: {e}");
-                    Vec::new()
-                }
-            };
-            if !ready_chain.is_empty() {
-                tracing::info!(
-                    "background claimer: found {} chain swap(s) ready to claim",
-                    ready_chain.len()
-                );
-                for swap in &ready_chain {
-                    match claim_chain_swap(
-                        &pool,
-                        swap.id,
-                        &config.claim_liquid_electrum_urls(),
-                        &config.boltz.api_url,
-                        config.claim.max_claim_attempts,
-                        utxo_backend.as_ref(),
-                        db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
-                    )
-                    .await
-                    {
-                        Ok(ClaimOutcome::Broadcast) => {
+            tick_count = tick_count.wrapping_add(1);
+            let mut ready_count = 0;
+            match db::get_ready_to_claim_swaps(&pool).await {
+                Ok(ready) => {
+                    ready_count = ready.len();
+                    let mut health = ClaimCycleHealth::default();
+                    if !ready.is_empty() {
+                        if first_reverse_run {
                             tracing::info!(
-                                "background claimer: claimed chain swap {}",
-                                swap.boltz_swap_id
+                                "background claimer: found {} unclaimed swaps on startup",
+                                ready.len()
                             );
                         }
-                        Ok(ClaimOutcome::SkippedLockHeld) => {
-                            tracing::debug!(
-                                "background claimer: skipped chain swap {} (lock held)",
-                                swap.boltz_swap_id
-                            );
+                        for swap in &ready {
+                            reverse_reporter.progress();
+                            match claim_swap(
+                                &pool,
+                                swap.id,
+                                claim_clients.as_deref(),
+                                &config.boltz.api_url,
+                                config.claim.max_claim_attempts,
+                                utxo_backend.as_ref(),
+                                db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+                            )
+                            .await
+                            {
+                                Ok(ClaimOutcome::Broadcast) => {
+                                    tracing::info!(
+                                        "background claimer: claimed swap {}",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::SkippedLockHeld) => {
+                                    tracing::debug!(
+                                        "background claimer: skipped {} (lock held)",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::AlreadyTerminal) => {
+                                    tracing::debug!(
+                                        "background claimer: skipped {} (already terminal)",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Err(e) => {
+                                    health.observe_error(&e);
+                                    tracing::warn!(
+                                        "background claimer: swap {}: {e}",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                            }
                         }
-                        Ok(ClaimOutcome::AlreadyTerminal) => {
-                            tracing::debug!(
-                                "background claimer: skipped chain swap {} (already terminal)",
-                                swap.boltz_swap_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "background claimer: chain swap {}: {e}",
-                                swap.boltz_swap_id
-                            );
+                    } else if first_reverse_run {
+                        tracing::info!("background claimer: no unclaimed swaps found");
+                    }
+                    health.report(&reverse_reporter);
+                    first_reverse_run = false;
+                }
+                Err(e) => {
+                    tracing::error!("background claimer: db query failed: {e}");
+                    reverse_reporter.cycle_failed();
+                }
+            }
+
+            let mut ready_chain_count = 0;
+            match db::get_ready_to_claim_chain_swaps(&pool).await {
+                Ok(ready_chain) => {
+                    ready_chain_count = ready_chain.len();
+                    let mut health = ClaimCycleHealth::default();
+                    if !ready_chain.is_empty() {
+                        tracing::info!(
+                            "background claimer: found {} chain swap(s) ready to claim",
+                            ready_chain.len()
+                        );
+                        for swap in &ready_chain {
+                            chain_reporter.progress();
+                            match claim_chain_swap(
+                                &pool,
+                                swap.id,
+                                claim_clients.as_deref(),
+                                &config.boltz.api_url,
+                                config.claim.max_claim_attempts,
+                                utxo_backend.as_ref(),
+                                db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+                            )
+                            .await
+                            {
+                                Ok(ClaimOutcome::Broadcast) => {
+                                    tracing::info!(
+                                        "background claimer: claimed chain swap {}",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::SkippedLockHeld) => {
+                                    tracing::debug!(
+                                        "background claimer: skipped chain swap {} (lock held)",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::AlreadyTerminal) => {
+                                    tracing::debug!(
+                                        "background claimer: skipped chain swap {} (already terminal)",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                                Err(e) => {
+                                    health.observe_error(&e);
+                                    tracing::warn!(
+                                        "background claimer: chain swap {}: {e}",
+                                        swap.boltz_swap_id
+                                    );
+                                }
+                            }
                         }
                     }
+                    health.report(&chain_reporter);
+                }
+                Err(e) => {
+                    tracing::error!("background claimer: chain-swap db query failed: {e}");
+                    chain_reporter.cycle_failed();
                 }
             }
 
@@ -2326,20 +2574,21 @@ pub fn spawn_background_claimer(
                     target: "claimer",
                     event = "claimer_heartbeat",
                     tick = tick_count,
-                    ready_count = ready.len(),
-                    ready_chain_count = ready_chain.len(),
+                    ready_count = ready_count,
+                    ready_chain_count = ready_chain_count,
                     "background claimer heartbeat"
                 );
             }
 
-            first_run = false;
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    reverse_reporter.intentional_shutdown();
+                    chain_reporter.intentional_shutdown();
                     tracing::info!("background claimer: shutting down");
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => {}
             }
         }
-    });
+    })
 }

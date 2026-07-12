@@ -31,7 +31,7 @@ pub struct ChainSwapResult {
 }
 
 pub struct BoltzService {
-    api: BoltzApiClientV2,
+    api: Option<BoltzApiClientV2>,
     swap_master_key: SwapMasterKey,
     webhook_url: Option<String>,
     /// Fast-fails user-facing swap creation during a Boltz outage instead of
@@ -45,21 +45,35 @@ impl BoltzService {
         swap_master_key: SwapMasterKey,
         webhook_url: Option<String>,
     ) -> Self {
+        let api = crate::config::valid_http_endpoint(boltz_url)
+            .then(|| reqwest::Client::builder().build().ok())
+            .flatten()
+            .map(|client| {
+                // Bound request-path Boltz calls: Boltz normally answers in
+                // <2s, so a 10s ceiling fails fast with a clean error when
+                // Boltz hangs instead of blocking past nginx's timeout.
+                BoltzApiClientV2::with_client(
+                    boltz_url.to_string(),
+                    client,
+                    Some(std::time::Duration::from_secs(10)),
+                )
+            });
         Self {
-            // Bound request-path Boltz calls: Boltz normally answers in <2s, so
-            // a 10s ceiling fails fast with a clean error when Boltz hangs
-            // (e.g. degraded under load) instead of blocking past nginx's
-            // upstream timeout and surfacing a 504 to the caller. Combined with
-            // the best-effort Lightning-offer handling in invoice.rs, a Boltz
-            // outage degrades to "Liquid rail available" rather than a hang.
-            api: BoltzApiClientV2::new(
-                boltz_url.to_string(),
-                Some(std::time::Duration::from_secs(10)),
-            ),
+            api,
             swap_master_key,
             webhook_url,
             breaker: crate::boltz_breaker::BoltzBreaker::default(),
         }
+    }
+
+    pub fn client_ready(&self) -> bool {
+        self.api.is_some()
+    }
+
+    fn api(&self) -> Result<&BoltzApiClientV2, AppError> {
+        self.api
+            .as_ref()
+            .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))
     }
 
     /// Stable, non-secret identifier of the master seed behind this service's
@@ -130,7 +144,7 @@ impl BoltzService {
 
         let response: CreateReverseResponse = {
             let result = self
-                .api
+                .api()?
                 .post_reverse_req(request)
                 .await
                 .map_err(|e| AppError::BoltzError(format!("{e}")));
@@ -222,7 +236,7 @@ impl BoltzService {
 
         let response: CreateChainResponse = {
             let result = self
-                .api
+                .api()?
                 .post_chain_req(request)
                 .await
                 .map_err(|e| AppError::BoltzError(format!("{e}")));
@@ -281,7 +295,7 @@ impl BoltzService {
     /// treats that as "not renegotiable" and falls through to `refund_due`.
     pub async fn get_chain_swap_quote(&self, swap_id: &str) -> Result<u64, AppError> {
         let quote = self
-            .api
+            .api()?
             .get_quote(swap_id)
             .await
             .map_err(|e| AppError::BoltzError(format!("chain swap get_quote failed: {e}")))?;
@@ -296,7 +310,7 @@ impl BoltzService {
         swap_id: &str,
         amount_sat: u64,
     ) -> Result<(), AppError> {
-        self.api
+        self.api()?
             .accept_quote(swap_id, amount_sat)
             .await
             .map_err(|e| AppError::BoltzError(format!("chain swap accept_quote failed: {e}")))?;
@@ -327,17 +341,43 @@ mod tests {
         // Same seed -> same fingerprint across calls.
         assert_eq!(fp, svc.derivation_root_fingerprint().unwrap());
         // Same seed via a fresh service -> same fingerprint.
-        assert_eq!(fp, test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap());
+        assert_eq!(
+            fp,
+            test_service(TEST_MNEMONIC)
+                .derivation_root_fingerprint()
+                .unwrap()
+        );
     }
 
     #[test]
     fn root_fingerprint_differs_across_seeds() {
-        let a = test_service(TEST_MNEMONIC).derivation_root_fingerprint().unwrap();
+        let a = test_service(TEST_MNEMONIC)
+            .derivation_root_fingerprint()
+            .unwrap();
         let b = test_service(
             "legal winner thank year wave sausage worth useful legal winner thank yellow",
         )
         .derivation_root_fingerprint()
         .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn client_readiness_requires_a_valid_http_base_url() {
+        assert!(test_service(TEST_MNEMONIC).client_ready());
+
+        for url in [
+            "not-a-url",
+            "https://api.boltz.exchange:0/v2",
+            "https://user@api.boltz.exchange/v2",
+            "https://api.boltz.exchange/v2?query=1",
+            "https://api.boltz.exchange/v2#fragment",
+        ] {
+            let key = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+            let invalid = BoltzService::new(url, key, None);
+            assert!(!invalid.client_ready(), "accepted {url}");
+            assert!(invalid.api().is_err());
+            assert!(invalid.derivation_root_fingerprint().is_ok());
+        }
     }
 }

@@ -86,6 +86,62 @@ fn electrum_urls_preserves_explicit_scheme() {
 }
 
 #[test]
+fn explicit_electrum_validation_does_not_let_failovers_hide_invalid_config() {
+    let mut cfg = ElectrumConfig::default();
+    assert!(cfg.explicit_urls_valid());
+
+    cfg.liquid_url = Some("not-an-electrum-endpoint".to_string());
+    assert!(!cfg.explicit_urls_valid());
+    assert!(!cfg.urls_with_builtin_failover().is_empty());
+
+    cfg.liquid_url = Some("http://example.com:50002".to_string());
+    assert!(!cfg.explicit_urls_valid());
+
+    cfg.liquid_url = Some("ssl://::1:50002".to_string());
+    assert!(!cfg.explicit_urls_valid());
+
+    for invalid in [
+        "ssl://[not-ipv6]:50002",
+        "ssl://[::gg]:50002",
+        "ssl://foo]:50002",
+        "ssl://[::1:50002",
+        "ssl://host:0",
+        "ssl://user@host:50002",
+        "ssl://host:50002/path",
+        "ssl://host:50002?query=1",
+    ] {
+        cfg.liquid_url = Some(invalid.to_string());
+        assert!(!cfg.explicit_urls_valid(), "accepted {invalid}");
+    }
+
+    cfg.liquid_url = Some("tcp://127.0.0.1:50001".to_string());
+    cfg.liquid_urls = vec!["ssl://[::1]:50002".to_string()];
+    assert!(cfg.explicit_urls_valid());
+}
+
+#[test]
+fn explicit_bitcoin_validation_does_not_let_builtins_hide_invalid_config() {
+    let mut cfg = BitcoinWatcherConfig::default();
+    assert!(cfg.explicit_endpoints_valid());
+
+    cfg.endpoint = "not-an-http-endpoint".to_string();
+    assert!(!cfg.explicit_endpoints_valid());
+    assert!(!cfg.effective_endpoints().is_empty());
+
+    cfg.endpoint = "https://mempool.bullbitcoin.com/api".to_string();
+    for invalid in [
+        "ftp://invalid.example/api",
+        "https://example.com:0/api",
+        "https://user@example.com/api",
+        "https://example.com/api?query=1",
+        "https://example.com/api#fragment",
+    ] {
+        cfg.endpoints = vec![invalid.to_string()];
+        assert!(!cfg.explicit_endpoints_valid(), "accepted {invalid}");
+    }
+}
+
+#[test]
 fn rate_limit_invoice_status_uses_current_key() {
     let cfg: RateLimitConfig = toml::from_str("invoice_status_per_source_per_min = 42").unwrap();
 
@@ -135,6 +191,19 @@ fn production_base_config() -> Config {
         boltz_webhook_url_secret: "webhook-secret".to_string(),
         boltz_webhook_url_secret_previous: String::new(),
     }
+}
+
+#[test]
+fn liquid_claim_validation_includes_boltz_and_shared_electrum_settings() {
+    let mut cfg = production_base_config();
+    assert!(cfg.liquid_claim_settings_valid());
+
+    cfg.boltz.electrum_url = "invalid".to_string();
+    assert!(!cfg.liquid_claim_settings_valid());
+
+    cfg.boltz.electrum_url = "ssl://liquid-electrum.example.com:50002".to_string();
+    cfg.electrum.liquid_urls = vec!["ssl://missing-port".to_string()];
+    assert!(!cfg.liquid_claim_settings_valid());
 }
 
 #[test]

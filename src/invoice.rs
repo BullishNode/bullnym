@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::admission::Rail;
 use crate::auth;
 use crate::certification::{self, CertificationScope};
 use crate::db;
@@ -210,7 +211,9 @@ pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
 /// - `invoice_id == None` → no-op for non-invoice swaps.
 /// - `record_invoice_payment` is idempotent on
 ///   `lightning_boltz_reverse:<boltz_swap_id>`.
-/// - On error: LOG and RETURN. Never propagate.
+/// - On error: LOG and return `false`. Callers that supervise settlement
+///   repair can then mark that worker cycle unhealthy without changing the
+///   idempotent payment-recording contract.
 pub async fn flip_invoice_on_lightning_settlement(
     pool: &sqlx::PgPool,
     invoice_id: Option<Uuid>,
@@ -218,9 +221,9 @@ pub async fn flip_invoice_on_lightning_settlement(
     boltz_swap_id: &str,
     claim_txid: &str,
     tolerances: db::InvoiceAccountingTolerances,
-) {
+) -> bool {
     let Some(id) = invoice_id else {
-        return;
+        return true;
     };
     let event_key = format!("lightning_boltz_reverse:{boltz_swap_id}");
     match db::record_invoice_payment(
@@ -248,6 +251,7 @@ pub async fn flip_invoice_on_lightning_settlement(
                 amount_sat = amount_sat,
                 "lightning settlement recorded invoice payment"
             );
+            true
         }
         Ok(_) => {
             tracing::debug!(
@@ -256,6 +260,7 @@ pub async fn flip_invoice_on_lightning_settlement(
                 boltz_swap_id = %boltz_swap_id,
                 "invoice payment event already recorded or invoice cancelled; no-op"
             );
+            true
         }
         Err(e) => {
             tracing::error!(
@@ -265,6 +270,7 @@ pub async fn flip_invoice_on_lightning_settlement(
                 amount_sat = amount_sat,
                 "record_invoice_payment failed (swap CAS already committed): {e}"
             );
+            false
         }
     }
 }
@@ -281,9 +287,9 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
     boltz_swap_id: &str,
     claim_txid: &str,
     tolerances: db::InvoiceAccountingTolerances,
-) {
+) -> bool {
     let Some(id) = invoice_id else {
-        return;
+        return true;
     };
     let event_key = format!("bitcoin_boltz_chain:{boltz_swap_id}");
     match db::record_invoice_payment(
@@ -311,6 +317,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
                 amount_sat = amount_sat,
                 "bitcoin chain-swap settlement recorded invoice payment"
             );
+            true
         }
         Ok(_) => {
             tracing::debug!(
@@ -319,6 +326,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
                 boltz_swap_id = %boltz_swap_id,
                 "invoice payment event already recorded or invoice cancelled; no-op"
             );
+            true
         }
         Err(e) => {
             tracing::error!(
@@ -328,6 +336,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
                 amount_sat = amount_sat,
                 "record_invoice_payment failed (chain-swap CAS already committed): {e}"
             );
+            false
         }
     }
 }
@@ -455,7 +464,16 @@ pub async fn create_anonymous(
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
-    create_anonymous_for_kind(state, nym, db::KIND_PAYMENT_PAGE, None, peer_opt, headers, req).await
+    create_anonymous_for_kind(
+        state,
+        nym,
+        db::KIND_PAYMENT_PAGE,
+        None,
+        peer_opt,
+        headers,
+        req,
+    )
+    .await
 }
 
 /// POST /:nym/pos/invoice — keyless POS terminal checkout. Same anonymous
@@ -561,6 +579,15 @@ async fn create_anonymous_for_kind(
     let owner = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+
+    // Direct Liquid is the independently payable baseline for anonymous
+    // checkout. Provider-backed rails remain best-effort below, but no new
+    // descriptor address or invoice may be exposed while its own watcher is
+    // unavailable.
+    state
+        .admission
+        .enforce(Rail::DirectLiquid)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
 
     // Eagerly allocate a Liquid address from the donation page owner's
     // CT descriptor. Donation Page checkout never uses customer- or
@@ -1690,6 +1717,11 @@ async fn create_lightning_offer(
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<String, AppError> {
+    state
+        .admission
+        .enforce(Rail::LightningReverse)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
@@ -1783,6 +1815,11 @@ async fn create_bitcoin_chain_offer(
         );
         return Ok(None);
     }
+
+    state
+        .admission
+        .enforce(Rail::BitcoinChain)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
 
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -2211,6 +2248,30 @@ async fn create_invoice_inner(
         note: None,
     };
     let (amount_sat, fiat) = parse_create_request(&anon_shape, state).await?;
+
+    // Direct addresses are immediately present on the signed invoice, so all
+    // requested direct rails must be observable before the row is published.
+    // Lightning creates its instruction separately: an LN-only invoice must
+    // be ready now, while a multi-rail invoice may remain payable on a healthy
+    // direct rail and retry Lightning lazily after readiness recovers.
+    if req.accept_btc {
+        state
+            .admission
+            .enforce(Rail::DirectBitcoin)
+            .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    }
+    if req.accept_liquid {
+        state
+            .admission
+            .enforce(Rail::DirectLiquid)
+            .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    }
+    if req.accept_ln && !req.accept_btc && !req.accept_liquid {
+        state
+            .admission
+            .enforce(Rail::LightningReverse)
+            .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    }
 
     let new_invoice = db::NewInvoice {
         nym_owner: linked_nym.as_deref(),

@@ -420,32 +420,45 @@ pub async fn mark_chain_swap_renegotiated<'e, E: sqlx::PgExecutor<'e>>(
 /// as proof of payment (a row without claim evidence is surfaced as an
 /// integrity incident by the caller, never fabricated into a payment).
 /// Bounded + oldest-first so repair cannot monopolize the reconciler.
+pub(crate) const CHAIN_SETTLEMENT_REPAIR_ELIGIBILITY_SQL: &str = "WHERE c.status = 'claimed' \
+       AND c.claim_txid IS NOT NULL \
+       AND c.updated_at <= scan.epoch \
+       AND c.updated_at > scan.epoch - ($1 || ' seconds')::interval \
+       AND ($3::uuid IS NULL OR c.id > $3) \
+       AND NOT EXISTS ( \
+             SELECT 1 FROM invoice_payment_events e \
+              WHERE e.invoice_id = c.invoice_id \
+                AND e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
+         )";
+
 pub async fn list_claimed_chain_swaps_missing_payment_event(
     pool: &PgPool,
     max_age_secs: u64,
+    epoch_micros: i64,
+    after_id: Option<Uuid>,
     limit: u32,
 ) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-         FROM chain_swap_records c \
-         WHERE c.status = 'claimed' \
-           AND c.claim_txid IS NOT NULL \
-           AND c.updated_at > NOW() - ($1 || ' seconds')::interval \
-           AND NOT EXISTS ( \
-                 SELECT 1 FROM invoice_payment_events e \
-                  WHERE e.invoice_id = c.invoice_id \
-                    AND e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
-             ) \
-         ORDER BY c.updated_at ASC \
-         LIMIT $2"
+        "WITH scan AS ( \
+             SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
+         ) \
+         SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records c, scan \
+         {CHAIN_SETTLEMENT_REPAIR_ELIGIBILITY_SQL} \
+         ORDER BY c.id ASC \
+         LIMIT $4"
     ))
     .bind(max_age_secs as i64)
+    .bind(epoch_micros)
+    .bind(after_id)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
 }
 
-pub async fn list_refund_due_chain_swaps(pool: &PgPool) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+pub async fn list_refund_due_chain_swaps(
+    pool: &PgPool,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
          FROM chain_swap_records \
@@ -680,68 +693,72 @@ pub async fn mark_chain_swap_refunded(
 /// reconciles/rebroadcasts the exact committed attempt.  Legacy rows without
 /// an attempt are returned too so the executor can stop them with an explicit
 /// integrity alert rather than silently manufacture new bytes.
+pub(crate) const STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL: &str = "WHERE c.status = 'refunding' \
+       AND c.updated_at <= scan.epoch - ($1 || ' seconds')::interval \
+       AND ($3::uuid IS NULL OR c.id > $3)";
+
 pub async fn list_stale_refunding_chain_swaps(
     pool: &PgPool,
     min_age_secs: i64,
-) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-           FROM chain_swap_records \
-          WHERE status = 'refunding' \
-            AND updated_at < NOW() - make_interval(secs => $1) \
-          ORDER BY updated_at ASC \
-          LIMIT 100"
-    ))
-    .bind(min_age_secs as f64)
-    .fetch_all(pool)
-    .await
-}
-
-/// Non-terminal chain swaps older than `min_age_secs`, oldest first, capped at
-/// `max_rows`. Drives the chain-swap reconciler: unlike the claim sweep
-/// (`get_ready_to_claim_chain_swaps`, which only covers server-lock/claiming
-/// states), this covers EVERY non-terminal state — including `pending` and
-/// `user_lock_*` — so a chain swap stranded by a dropped Boltz webhook is
-/// re-driven by polling Boltz `get_swap`. Mirrors
-/// `swaps::list_non_terminal_swaps_oldest_first`.
-pub async fn list_non_terminal_chain_swaps_oldest_first(
-    pool: &PgPool,
-    min_age_secs: u64,
+    epoch_micros: i64,
+    after_id: Option<Uuid>,
     limit: u32,
 ) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-         FROM chain_swap_records \
-         WHERE status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
-           AND updated_at < NOW() - ($1 || ' seconds')::interval \
-         ORDER BY (status IN ('user_lock_mempool', 'user_lock_confirmed', \
-                              'server_lock_mempool', 'server_lock_confirmed', \
-                              'claiming', 'claim_failed', 'refund_due', 'refunding')) DESC, \
-                  last_reconciled_at ASC NULLS FIRST \
-         LIMIT $2"
+        "WITH scan AS ( \
+             SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
+         ) \
+         SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+           FROM chain_swap_records c, scan \
+          {STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL} \
+          ORDER BY c.id ASC \
+          LIMIT $4"
     ))
-    .bind(min_age_secs as i64)
+    .bind(min_age_secs)
+    .bind(epoch_micros)
+    .bind(after_id)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
 }
 
-/// Stamp `last_reconciled_at = NOW()` on a batch of chain swaps at tick start,
-/// on the whole fetched batch, BEFORE the per-swap loop. Mirrors
-/// `swaps::mark_swaps_reconciled` — see that fn for why the batch is stamped
-/// up-front rather than per-row after processing.
-pub async fn mark_chain_swaps_reconciled(
+/// Non-terminal chain swaps in the frozen `epoch_micros` snapshot, older than
+/// `min_age_secs`, not yet visited in that epoch, and capped at `limit`. Drives
+/// the chain-swap reconciler: unlike the claim sweep
+/// (`get_ready_to_claim_chain_swaps`, which only covers server-lock/claiming
+/// states), this covers EVERY non-terminal state — including `pending` and
+/// `user_lock_*` — so a chain swap stranded by a dropped Boltz webhook is
+/// re-driven by polling Boltz `get_swap`. Mirrors
+/// `swaps::list_non_terminal_swaps_oldest_first`.
+pub(crate) const CHAIN_RECONCILER_ELIGIBILITY_SQL: &str =
+    "WHERE c.status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
+       AND c.status <> 'refunding' \
+       AND c.updated_at <= scan.epoch - ($1 || ' seconds')::interval \
+       AND ($3::uuid IS NULL OR c.id > $3)";
+
+pub async fn list_non_terminal_chain_swaps_oldest_first(
     pool: &PgPool,
-    ids: &[Uuid],
-) -> Result<(), sqlx::Error> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    sqlx::query("UPDATE chain_swap_records SET last_reconciled_at = NOW() WHERE id = ANY($1)")
-        .bind(ids)
-        .execute(pool)
-        .await?;
-    Ok(())
+    min_age_secs: u64,
+    epoch_micros: i64,
+    after_id: Option<Uuid>,
+    limit: u32,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "WITH scan AS ( \
+             SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
+         ) \
+         SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+         FROM chain_swap_records c, scan \
+         {CHAIN_RECONCILER_ELIGIBILITY_SQL} \
+         ORDER BY c.id ASC \
+         LIMIT $4"
+    ))
+    .bind(min_age_secs as i64)
+    .bind(epoch_micros)
+    .bind(after_id)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn record_chain_swap_claim_failure(

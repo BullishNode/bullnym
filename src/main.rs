@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
@@ -19,9 +20,9 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr, og_image, pricer, qr,
-    rate_limit, readiness, reconciler, registration,
+    admission, bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db,
+    derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr,
+    og_image, pricer, qr, rate_limit, readiness, reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -105,6 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("database connection failed: {e}"))?;
     tracing::info!("connected to database");
 
+    let schema_and_journal_ready = readiness::schema_and_journal_ready(&pool)
+        .await
+        .map_err(|e| format!("database schema verification failed: {e}"))?;
+    if !schema_and_journal_ready {
+        return Err(format!(
+            "database is missing expected schema marker {} or writable recovery journal",
+            version::EXPECTED_SCHEMA_MARKER
+        )
+        .into());
+    }
+    tracing::info!(
+        schema_marker = version::EXPECTED_SCHEMA_MARKER,
+        "database schema and recovery journal verified"
+    );
+
     let swap_master_key =
         SwapMasterKey::from_mnemonic(&config.swap_mnemonic, None, Network::Mainnet)
             .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
@@ -130,16 +146,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Log the sanitized URL — never log the secret. Production logs
     // pipe to multiple sinks; the secret is high-value.
-    tracing::info!(
-        "boltz service initialized ({}) webhook=https://{}/webhook/boltz/{}",
-        config.boltz.api_url,
-        config.domain,
-        if config.boltz_webhook_url_secret.is_empty() {
-            "<unauthenticated>"
-        } else {
-            "<redacted>"
-        }
-    );
+    if boltz_service.client_ready() {
+        tracing::info!(
+            "boltz service initialized ({}) webhook=https://{}/webhook/boltz/{}",
+            config.boltz.api_url,
+            config.domain,
+            if config.boltz_webhook_url_secret.is_empty() {
+                "<unauthenticated>"
+            } else {
+                "<redacted>"
+            }
+        );
+    } else {
+        tracing::error!(
+            event = "boltz_client_init_failed",
+            "Boltz client URL is invalid; new swap admission is closed"
+        );
+    }
 
     // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
     let whitelist = ip_whitelist::IpWhitelist::parse(&config.rate_limit.ip_whitelist)
@@ -182,6 +205,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let direct_liquid_settings_valid = config.electrum.explicit_urls_valid();
+    let liquid_claim_settings_valid = config.liquid_claim_settings_valid();
+    let bitcoin_backend_settings_valid = config.bitcoin_watcher.explicit_endpoints_valid();
+    if !direct_liquid_settings_valid {
+        tracing::error!(
+            event = "direct_liquid_config_invalid",
+            "explicit Liquid backend configuration is invalid; direct Liquid admission is closed"
+        );
+    }
+    if !liquid_claim_settings_valid {
+        tracing::error!(
+            event = "liquid_claim_config_invalid",
+            "explicit Liquid claim configuration is invalid; new swap admission is closed"
+        );
+    }
+    if !bitcoin_backend_settings_valid {
+        tracing::error!(
+            event = "bitcoin_backend_config_invalid",
+            "explicit Bitcoin backend configuration is invalid; dependent admission is closed"
+        );
+    }
+
+    // Swap claim clients own blocking Electrum sockets and are created per
+    // operation. Retain the exact validated factory used by those operations
+    // so admission never mistakes the direct-Liquid UTXO backend for claim
+    // capability. A factory failure closes only new swap admission.
+    let liquid_claim_client_factory =
+        match claimer::LiquidClaimClientFactory::try_new(config.claim_liquid_electrum_urls()) {
+            Ok(factory) => Some(Arc::new(factory)),
+            Err(error) => {
+                tracing::error!(
+                    event = "liquid_claim_client_init_failed",
+                    error = %error,
+                    "Liquid claim client factory is unavailable; new swap admission is closed"
+                );
+                None
+            }
+        };
+
+    // Chain recovery uses this same initialized evidence object for every
+    // journal reconciliation. Invalid rail-specific configuration is not a
+    // process-readiness failure: HTTP and existing non-chain paths stay up.
+    let bitcoin_recovery_backend =
+        match pay_service::chain_recovery::BitcoinRecoveryBackend::try_new(
+            config.bitcoin_watcher.effective_endpoints(),
+        ) {
+            Ok(backend) => Some(Arc::new(backend)),
+            Err(error) => {
+                tracing::error!(
+                    event = "bitcoin_recovery_client_init_failed",
+                    error = %error,
+                    "Bitcoin recovery evidence client is unavailable; new chain-swap admission is closed"
+                );
+                None
+            }
+        };
+
+    // Construct the direct-Bitcoin watcher before taking the admission
+    // snapshot. Its reporter still owns startup/liveness evidence, while this
+    // retained object proves the actual HTTP watcher client initialized.
+    let initialized_bitcoin_watcher = if config.bitcoin_watcher.enabled {
+        match bitcoin_watcher::BitcoinWatcher::new(
+            config.bitcoin_watcher.clone(),
+            db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+            pool.clone(),
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::error!(
+                    event = "bitcoin_watcher_client_init_failed",
+                    error = %error,
+                    "Bitcoin watcher client is unavailable; direct Bitcoin admission is closed"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let rate_limiter = Arc::new(rate_limit::RateLimiter::new(
         pool.clone(),
         config.rate_limit.clone(),
@@ -207,10 +310,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fingerprint of the swap-key seed, persisted with every new swap so a
     // rewound key sequence (e.g. an older DB backup restored over live data) is
-    // detectable. Compute it once at startup and check for a rewind. The check
-    // is best-effort: a failure (including migration 044 not yet applied) logs
-    // and continues — readiness gating already blocks traffic until the schema
-    // marker is present. See derivation_guard and migration 044.
+    // detectable. Compute it once at startup and check for a rewind. An
+    // unverifiable or rewound lineage closes only new swap admission while
+    // HTTP and existing-obligation recovery remain available. The periodic
+    // supervised check below updates the same fail-closed fact. See
+    // derivation_guard and migration 044.
     let swap_key_root_fingerprint = boltz
         .derivation_root_fingerprint()
         .map_err(|e| format!("swap key fingerprint derivation failed: {e}"))?;
@@ -218,43 +322,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fingerprint = %swap_key_root_fingerprint,
         "swap key derivation fingerprint computed"
     );
-    match derivation_guard::check_rollback(&pool, &swap_key_root_fingerprint).await {
-        Ok(true) => tracing::error!(
-            event = "swap_key_sequence_rollback",
-            fingerprint = %swap_key_root_fingerprint,
-            "swap_key_seq would next issue an index that is already persisted \
-             on a swap — the key sequence may have been rewound by a database \
-             restore. New swaps would reuse existing key material. Investigate \
-             before accepting new payments; restore the correct backup or \
-             advance swap_key_seq past the highest persisted index."
-        ),
-        Ok(false) => tracing::info!(
-            event = "swap_key_sequence_ok",
-            "swap key sequence is ahead of all persisted indices"
-        ),
-        Err(e) => tracing::warn!(
-            event = "swap_key_sequence_check_skipped",
-            error = %e,
-            "swap-key rollback check could not run (schema may predate migration \
-             044); continuing without the check"
-        ),
-    }
+    let swap_key_lineage_safe =
+        match derivation_guard::check_rollback(&pool, &swap_key_root_fingerprint).await {
+            Ok(true) => {
+                tracing::error!(
+                    event = "swap_key_sequence_rollback",
+                    fingerprint = %swap_key_root_fingerprint,
+                    "swap_key_seq would next issue an index that is already persisted \
+                     on a swap — the key sequence may have been rewound by a database \
+                     restore. New swap admission is closed; restore the correct backup \
+                     or advance swap_key_seq past the highest persisted index."
+                );
+                false
+            }
+            Ok(false) => {
+                tracing::info!(
+                    event = "swap_key_sequence_ok",
+                    "swap key sequence is ahead of all persisted indices"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    event = "swap_key_sequence_check_failed",
+                    error = %e,
+                    "swap-key lineage could not be verified; new swap admission is closed"
+                );
+                false
+            }
+        };
     let swap_key_root_fingerprint = Arc::new(swap_key_root_fingerprint);
+
+    let admission = admission::MoneyAdmission::new(
+        admission::FoundationFacts {
+            workers_enabled: config.workers.enabled,
+            schema_ready: schema_and_journal_ready,
+            direct_liquid_backend_ready: direct_liquid_settings_valid && utxo_backend.is_some(),
+            direct_bitcoin_watcher_ready: bitcoin_backend_settings_valid
+                && initialized_bitcoin_watcher.is_some(),
+            liquid_claim_client_ready: liquid_claim_settings_valid
+                && liquid_claim_client_factory.is_some(),
+            bitcoin_evidence_client_ready: bitcoin_backend_settings_valid
+                && bitcoin_recovery_backend.is_some(),
+            boltz_client_ready: boltz.client_ready(),
+            swap_key_lineage_safe,
+            recovery_journal_ready: schema_and_journal_ready,
+            // #64 owns live fee observation and persistence. Until it lands,
+            // new reverse and chain swaps deliberately remain fail-closed.
+            fee_policy_ready: false,
+            // #84 owns the signed, merchant-specific recovery commitment.
+            recovery_commitment_ready: false,
+        },
+        admission::WorkerCadences::from_runtime(
+            Duration::from_secs(config.reconciler.interval_secs),
+            Duration::from_secs(config.reconciler.slow_recovery_interval_secs),
+            Duration::from_secs(u64::from(
+                config.rate_limit.chain_watcher_active_user_tick_secs,
+            )),
+            Duration::from_secs(config.bitcoin_watcher.active_tick_secs),
+        ),
+    );
 
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
+        admission,
         boltz: boltz.clone(),
         ip_whitelist: whitelist.clone(),
         certification: certification_allowlist.clone(),
         rate_limiter: rate_limiter.clone(),
         utxo_backend,
+        liquid_claim_client_factory,
+        bitcoin_recovery_backend,
         pricer: pricer_client,
         pwa_shells,
-        swap_key_root_fingerprint,
+        swap_key_root_fingerprint: swap_key_root_fingerprint.clone(),
     };
 
     let cancel = CancellationToken::new();
+    {
+        let pool = pool.clone();
+        let fingerprint = swap_key_root_fingerprint.clone();
+        let mut lineage_reporter = state.admission.swap_key_lineage_reporter();
+        let cancel_lineage = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            // The synchronous startup check above supplied the initial fact.
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel_lineage.cancelled() => {
+                        lineage_reporter.intentional_shutdown();
+                        return;
+                    },
+                    _ = tick.tick() => {
+                        match derivation_guard::check_rollback(&pool, fingerprint.as_str()).await {
+                            Ok(rollback_detected) => {
+                                lineage_reporter.observed_safe(!rollback_detected);
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    event = "swap_key_sequence_monitor_failed",
+                                    error = %error,
+                                    "swap-key lineage cannot be verified; closing new swap admission"
+                                );
+                                lineage_reporter.observed_safe(false);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     if config.workers.enabled {
         tracing::info!("background workers enabled");
         if config.features.payment_pages {
@@ -265,22 +444,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             tracing::info!("Payment Page OG image reconciler started");
         }
-        claimer::spawn_background_claimer(
+        let _claimer_task = claimer::spawn_background_claimer(
             pool.clone(),
             config.clone(),
+            state.liquid_claim_client_factory.clone(),
             state.utxo_backend.clone(),
             cancel.clone(),
+            state.admission.reporter(admission::Worker::ReverseClaimer),
+            state.admission.reporter(admission::Worker::ChainClaimer),
         );
 
         // Reconciler: polls boltz_api.get_swap for every non-terminal swap
         // older than `min_age_secs` and patches our DB to match Boltz's
         // view. Closes the dropped-webhook gap (Boltz's webhook delivery
         // gives up after ~5 min) by querying state directly.
-        reconciler::spawn(
+        let _reverse_reconciler_task = reconciler::spawn(
             pool.clone(),
             config.boltz.api_url.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
+            state
+                .admission
+                .reporter(admission::Worker::ReverseReconciler),
         );
         tracing::info!(
             "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
@@ -292,10 +477,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Chain-swap reconciler: same dropped-webhook recovery as above, but for
         // `chain_swap_records` (which the reverse reconciler does not touch).
         // Without this a chain swap stranded by a missed webhook never recovers.
-        reconciler::spawn_chain(
+        let _chain_reconciler_task = reconciler::spawn_chain(
             state.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
+            state.admission.reporter(admission::Worker::ChainReconciler),
         );
         tracing::info!("chain reconciler started (shares reconciler config)");
 
@@ -304,20 +490,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // completed (crash / transient failure between the claimed commit and
         // the flip). Closes the merchant-paid-but-invoice-unpaid gap; the flip
         // is idempotent so this is a safe no-op when the event already exists.
-        reconciler::spawn_settlement_repair(
+        let _settlement_repair_task = reconciler::spawn_settlement_repair(
             state.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
+            state
+                .admission
+                .reporter(admission::Worker::SettlementRepair),
         );
         tracing::info!("settlement repair started (shares reconciler config)");
 
         // Slow recovery: revives funded `claim_stuck` swaps back into the claim
         // sweep on a long capped backoff so a transient-outage-stranded output
         // isn't abandoned once the retry budget is spent (issue #63).
-        reconciler::spawn_slow_recovery(
+        let _slow_recovery_task = reconciler::spawn_slow_recovery(
             state.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
+            state.admission.reporter(admission::Worker::SlowRecovery),
         );
         tracing::info!("slow recovery started (shares reconciler config)");
 
@@ -370,6 +560,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
             let accounting_tolerances =
                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
+            let liquid_reporter = state.admission.reporter(admission::Worker::LiquidWatcher);
             let active = watcher_cfg.active_tick_secs;
             let idle = watcher_cfg.idle_tick_secs;
             tokio::spawn(async move {
@@ -380,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cancel_watcher,
                     watcher_cfg,
                     accounting_tolerances,
+                    liquid_reporter,
                 )
                 .await;
             });
@@ -395,17 +587,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bitcoin watcher: polls mempool.bullbitcoin.com for invoice on-chain
         // BTC settlement. Independent of the Liquid chain watcher above —
         // separate API, separate rate-limit policy, separate cadence.
-        if config.bitcoin_watcher.enabled {
-            let pool = state.db.clone();
+        if let Some(watcher) = initialized_bitcoin_watcher {
             let cancel_btc = cancel.clone();
-            let btc_cfg = config.bitcoin_watcher.clone();
-            let accounting_tolerances =
-                db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
+            let bitcoin_reporter = state.admission.reporter(admission::Worker::BitcoinWatcher);
             tokio::spawn(async move {
-                bitcoin_watcher::run(btc_cfg, accounting_tolerances, pool, cancel_btc).await;
+                watcher.run(cancel_btc, bitcoin_reporter).await;
             });
         } else {
-            tracing::info!("bitcoin watcher disabled by config");
+            tracing::info!("bitcoin watcher disabled or its client failed to initialize");
         }
     } else {
         tracing::warn!(
@@ -414,6 +603,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Axum may continue polling in-flight handlers during graceful shutdown.
+    // Close new-money admission synchronously before worker cancellation so a
+    // handler that reaches its final mutation boundary after shutdown begins
+    // cannot publish an obligation whose worker has already exited.
+    let shutdown_admission = state.admission.clone();
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -426,6 +620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("received shutdown signal");
+        shutdown_admission.set_workers_enabled(false);
         cancel.cancel();
     })
     .await?;
@@ -547,7 +742,6 @@ fn build_router(state: AppState) -> Router {
                 post(invoice::create_anonymous_alias).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/a/:slug/i/:id", get(invoice::render_payment_alias));
-
     }
 
     if invoice_sessions_enabled {

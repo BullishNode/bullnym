@@ -177,6 +177,15 @@ impl ParsedOutpoint {
 /// Minimal interface the LNURL handler needs from a blockchain backend.
 #[async_trait::async_trait]
 pub trait UtxoBackend: Send + Sync {
+    /// Cheap liveness probe used by the Liquid watcher even when its current
+    /// database scan is empty. Test/backfill implementations retain a no-op
+    /// default; the production Electrum backend overrides this with a real
+    /// server ping so an empty process cannot open admission on configuration
+    /// alone while every endpoint is unreachable.
+    async fn health_check(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
     /// Fetch the raw transaction bytes. Cache-backed — txs are immutable so
     /// long TTLs are safe.
     async fn get_raw_tx(&self, txid_hex: &str) -> Result<Vec<u8>, AppError>;
@@ -437,6 +446,20 @@ where
 
 #[async_trait::async_trait]
 impl UtxoBackend for ElectrumClient {
+    async fn health_check(&self) -> Result<(), AppError> {
+        let state = self.state.clone();
+        let urls = self.urls.clone();
+        tokio::task::spawn_blocking(move || {
+            run_op_blocking(&state, &urls, "server_ping", |client| {
+                use electrum_client::ElectrumApi;
+                client.ping()
+            })
+        })
+        .await
+        .map_err(|e| AppError::ElectrumError(format!("health check join: {e}")))?
+        .map_err(|e| AppError::ElectrumError(format!("server ping: {e}")))
+    }
+
     async fn get_raw_tx(&self, txid_hex: &str) -> Result<Vec<u8>, AppError> {
         {
             let mut cache = self.cache.lock().await;

@@ -599,10 +599,23 @@ pub struct BitcoinWatcherConfig {
 /// Hardcoded Bitcoin esplora failover providers (Bull Bitcoin, Blockstream),
 /// appended after the configured endpoint(s). mempool.space-shape REST; values
 /// from the bullbitcoin-mobile wallet defaults.
-pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] =
-    ["https://mempool.bullbitcoin.com/api", "https://mempool.space/api"];
+pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] = [
+    "https://mempool.bullbitcoin.com/api",
+    "https://mempool.space/api",
+];
 
 impl BitcoinWatcherConfig {
+    /// Validate only operator-visible settings. Built-in failovers remain
+    /// available to existing observation/recovery work, but they must not hide
+    /// malformed explicit configuration from money admission.
+    pub fn explicit_endpoints_valid(&self) -> bool {
+        valid_http_endpoint(&self.endpoint)
+            && self
+                .endpoints
+                .iter()
+                .all(|endpoint| valid_http_endpoint(endpoint))
+    }
+
     /// Ordered, deduplicated esplora endpoint list: configured `endpoint`
     /// first (primary), then any extra `endpoints`, then the two hardcoded
     /// provider failovers. Trailing slashes trimmed. Never empty. Behaviour is
@@ -1116,6 +1129,19 @@ impl Default for ElectrumConfig {
 }
 
 impl ElectrumConfig {
+    /// Validate the configured values before built-in failovers are appended.
+    /// An invalid explicit value is a rail-scoped admission failure even when
+    /// a built-in endpoint can keep existing obligations recoverable.
+    pub fn explicit_urls_valid(&self) -> bool {
+        self.liquid_url
+            .as_deref()
+            .is_none_or(valid_electrum_endpoint)
+            && self
+                .liquid_urls
+                .iter()
+                .all(|url| valid_electrum_endpoint(url))
+    }
+
     /// Resolve the configured URLs into a single ordered list, accepting
     /// either the legacy single-string field or the new list field (or both).
     /// URLs without an explicit `ssl://` or `tcp://` scheme are normalized to
@@ -1165,8 +1191,10 @@ impl ElectrumConfig {
 /// Hardcoded Liquid Electrum failover providers (Bull Bitcoin, Blockstream).
 /// Values from the bullbitcoin-mobile wallet defaults (`les` first — it has
 /// been the more reliable of the two).
-pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] =
-    ["ssl://les.bullbitcoin.com:995", "ssl://blockstream.info:995"];
+pub const BUILTIN_LIQUID_ELECTRUM_URLS: [&str; 2] = [
+    "ssl://les.bullbitcoin.com:995",
+    "ssl://blockstream.info:995",
+];
 
 /// Add a default `ssl://` prefix to URLs that lack a scheme. Logs a warning
 /// so operators can fix their configs.
@@ -1181,6 +1209,44 @@ pub fn normalize_electrum_url(raw: &str) -> String {
         );
         format!("ssl://{}", raw)
     }
+}
+
+pub fn valid_electrum_endpoint(raw: &str) -> bool {
+    let host_port = if let Some(endpoint) = raw.strip_prefix("ssl://") {
+        endpoint
+    } else if let Some(endpoint) = raw.strip_prefix("tcp://") {
+        endpoint
+    } else if raw.contains("://") {
+        return false;
+    } else {
+        raw
+    };
+    let Some((_, port)) = host_port.rsplit_once(':') else {
+        return false;
+    };
+    if !port.parse::<u16>().is_ok_and(|port| port != 0) {
+        return false;
+    }
+    reqwest::Url::parse(&format!("http://{host_port}")).is_ok_and(|url| {
+        url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+pub fn valid_http_endpoint(raw: &str) -> bool {
+    reqwest::Url::parse(raw).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.port() != Some(0)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 fn default_liquid_electrum_url() -> String {
@@ -1207,6 +1273,10 @@ fn default_max_descriptor_len() -> usize {
 }
 
 impl Config {
+    pub fn liquid_claim_settings_valid(&self) -> bool {
+        valid_electrum_endpoint(&self.boltz.electrum_url) && self.electrum.explicit_urls_valid()
+    }
+
     /// Ordered, deduplicated Liquid Electrum URL list for the CLAIM path
     /// (chain-swap + reverse-swap claim construction/broadcast). The legacy
     /// single `boltz.electrum_url` stays the primary; the `[electrum]` pool
