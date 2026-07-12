@@ -1,0 +1,11 @@
+# Stable, source-derived release provenance. Keep this pin synchronized with
+# Cargo.toml and Cargo.lock; build.rs and scripts/verify-release-provenance.sh
+# fail when the three disagree.
+format_version = 1
+
+[boltz_client]
+repository = "https://github.com/BullishNode/boltz-rust.git"
+commit = "c20511854bbd996a74f914fa0327d4601b5d4f62"
+
+[content]
+pwa_directory = "pwa/dist"

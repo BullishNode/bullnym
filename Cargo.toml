@@ -13,7 +13,7 @@ elements-miniscript = "0.4.0"
 # Bitcoin mainnet address validation for invoice handlers (validators.rs).
 # Only needed for parse + network-discriminate; no chainstate, no descriptors.
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
-boltz-client = { path = "../boltz/boltz-rust", features = ["electrum"] }
+boltz-client = { git = "https://github.com/BullishNode/boltz-rust.git", rev = "c20511854bbd996a74f914fa0327d4601b5d4f62", features = ["electrum"] }
 lightning-invoice = "0.32"
 secp256k1 = { version = "0.29", features = ["global-context"] }
 serde = { version = "1", features = ["derive"] }
@@ -47,6 +47,11 @@ unicode-segmentation = "1"
 # Server-side QR code generation for the donation-page payment view.
 # Default features off — we only need the SVG renderer.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8"
 
 [dev-dependencies]
 http-body-util = "0.1"

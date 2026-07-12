@@ -1,0 +1,5 @@
+# Optional local-only override for contributors editing boltz-rust alongside
+# Bullnym. Copy this file to `.cargo/config.toml`; release preflight and CI
+# deliberately reject that active override.
+
+paths = ["../boltz/boltz-rust"]

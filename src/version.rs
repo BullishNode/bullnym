@@ -1,7 +1,44 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "045_generated_donation_page_og";
+pub const EXPECTED_SCHEMA_MARKER: &str = env!("BULLNYM_SCHEMA_MARKER");
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BuildProvenance {
+    pub service: &'static str,
+    pub crate_version: &'static str,
+    pub build_commit: &'static str,
+    pub build_profile: &'static str,
+    pub build_source_state: &'static str,
+    pub boltz_client_repository: &'static str,
+    pub boltz_client_commit: &'static str,
+    pub boltz_client_verification: &'static str,
+    pub pwa_content_sha256: &'static str,
+    pub expected_schema_marker: &'static str,
+    pub rustc_version: &'static str,
+    pub cargo_version: &'static str,
+    pub build_target: &'static str,
+}
+
+impl BuildProvenance {
+    pub fn current() -> Self {
+        Self {
+            service: "pay-service",
+            crate_version: env!("CARGO_PKG_VERSION"),
+            build_commit: env!("BULLNYM_BUILD_COMMIT"),
+            build_profile: env!("BULLNYM_BUILD_PROFILE"),
+            build_source_state: env!("BULLNYM_BUILD_SOURCE_STATE"),
+            boltz_client_repository: env!("BULLNYM_BOLTZ_CLIENT_REPOSITORY"),
+            boltz_client_commit: env!("BULLNYM_BOLTZ_CLIENT_COMMIT"),
+            boltz_client_verification: env!("BULLNYM_BOLTZ_CLIENT_VERIFICATION"),
+            pwa_content_sha256: env!("BULLNYM_PWA_CONTENT_SHA256"),
+            expected_schema_marker: EXPECTED_SCHEMA_MARKER,
+            rustc_version: env!("BULLNYM_RUSTC_VERSION"),
+            cargo_version: env!("BULLNYM_CARGO_VERSION"),
+            build_target: env!("BULLNYM_BUILD_TARGET"),
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {
@@ -15,17 +52,33 @@ pub struct VersionResponse {
     pub expected_schema_marker: &'static str,
 }
 
+impl VersionResponse {
+    pub fn current() -> Self {
+        let build = BuildProvenance::current();
+        Self {
+            service: build.service,
+            crate_version: build.crate_version,
+            build_commit: build.build_commit,
+            build_branch: option_env!("BULLNYM_BUILD_BRANCH").unwrap_or("unknown"),
+            build_time: option_env!("BULLNYM_BUILD_TIME").unwrap_or("unknown"),
+            build_dirty: match build.build_source_state {
+                "clean" => "false",
+                "dirty-debug" => "true",
+                _ => "unknown",
+            },
+            runtime_mode: std::env::var("BULLNYM_RUNTIME_MODE")
+                .unwrap_or_else(|_| "unknown".into()),
+            expected_schema_marker: build.expected_schema_marker,
+        }
+    }
+}
+
+pub fn build_info_json() -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BuildProvenance::current())
+}
+
 pub async fn version() -> Json<VersionResponse> {
-    Json(VersionResponse {
-        service: "pay-service",
-        crate_version: env!("CARGO_PKG_VERSION"),
-        build_commit: option_env!("BULLNYM_BUILD_COMMIT").unwrap_or("unknown"),
-        build_branch: option_env!("BULLNYM_BUILD_BRANCH").unwrap_or("unknown"),
-        build_time: option_env!("BULLNYM_BUILD_TIME").unwrap_or("unknown"),
-        build_dirty: option_env!("BULLNYM_BUILD_DIRTY").unwrap_or("unknown"),
-        runtime_mode: std::env::var("BULLNYM_RUNTIME_MODE").unwrap_or_else(|_| "unknown".into()),
-        expected_schema_marker: EXPECTED_SCHEMA_MARKER,
-    })
+    Json(VersionResponse::current())
 }
 
 #[cfg(test)]
@@ -64,7 +117,36 @@ mod tests {
             super::EXPECTED_SCHEMA_MARKER
         );
         assert_eq!(json["runtime_mode"], "test");
-        assert!(json.get("build_commit").is_some());
+        assert_eq!(json["build_commit"], env!("BULLNYM_BUILD_COMMIT"));
+        assert!(json.get("build_branch").is_some());
+        assert!(json.get("build_time").is_some());
         assert!(json.get("build_dirty").is_some());
+        assert!(json.get("boltz_client_commit").is_none());
+        assert!(json.get("pwa_content_sha256").is_none());
+    }
+
+    #[test]
+    fn build_info_cli_payload_is_valid_stable_json() {
+        let json: Value = serde_json::from_str(&super::build_info_json().unwrap()).unwrap();
+        assert_eq!(
+            json["expected_schema_marker"],
+            super::EXPECTED_SCHEMA_MARKER
+        );
+        assert_eq!(json["build_commit"], env!("BULLNYM_BUILD_COMMIT"));
+        assert_eq!(
+            json["boltz_client_commit"],
+            env!("BULLNYM_BOLTZ_CLIENT_COMMIT")
+        );
+        assert_eq!(
+            json["boltz_client_verification"],
+            env!("BULLNYM_BOLTZ_CLIENT_VERIFICATION")
+        );
+        assert_eq!(
+            json["boltz_client_repository"],
+            "https://github.com/BullishNode/boltz-rust.git"
+        );
+        assert_eq!(json["rustc_version"], env!("BULLNYM_RUSTC_VERSION"));
+        assert_eq!(json["cargo_version"], env!("BULLNYM_CARGO_VERSION"));
+        assert_eq!(json["build_target"], env!("BULLNYM_BUILD_TARGET"));
     }
 }

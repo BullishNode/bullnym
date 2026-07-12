@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--repo-root" ]]; then
+    (($# == 2)) || { echo "usage: $0 [--repo-root PATH]" >&2; exit 2; }
+    repo_root="$(cd "$2" && pwd)"
+elif (($# != 0)); then
+    echo "usage: $0 [--repo-root PATH]" >&2
+    exit 2
+fi
 
-check_clean_worktree() {
-    local label="$1"
-    local path="$2"
+if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "release preflight failed: Bullnym Git checkout not found at $repo_root" >&2
+    exit 1
+fi
 
-    if [[ ! -d "$path/.git" ]]; then
-        echo "release preflight failed: $label git checkout not found at $path" >&2
-        return 1
-    fi
+index_flags="$(git -C "$repo_root" ls-files -v | grep -v '^H ' || true)"
+if [[ -n "$index_flags" ]]; then
+    echo "release preflight failed: Bullnym index has assume-unchanged, skip-worktree, or nonstandard entries" >&2
+    echo "$index_flags" >&2
+    exit 1
+fi
 
-    local status
-    status="$(git -C "$path" status --porcelain)"
-    if [[ -n "$status" ]]; then
-        echo "release preflight failed: $label worktree is dirty at $path" >&2
-        echo "$status" >&2
-        return 1
-    fi
-}
+status="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$status" ]]; then
+    echo "release preflight failed: Bullnym worktree is dirty at $repo_root" >&2
+    echo "$status" >&2
+    exit 1
+fi
 
-check_clean_worktree "bullnym" "$repo_root"
-check_clean_worktree "boltz-client path dependency" "$repo_root/../boltz/boltz-rust"
+"$repo_root/scripts/verify-release-provenance.sh" --repo-root "$repo_root"
 
-echo "release preflight passed: bullnym and boltz-client dependency are clean"
+commit="$(git -C "$repo_root" rev-parse HEAD)"
+echo "release preflight passed: clean Bullnym $commit with the pinned Boltz dependency"

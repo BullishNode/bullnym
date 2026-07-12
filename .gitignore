@@ -4,6 +4,7 @@
 *.sqlite
 .agents/
 .codex/
+.cargo/config.toml
 
 # Local Claude assistant scratch — never commit (workspace rule).
 CLAUDE.md

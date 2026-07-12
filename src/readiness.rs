@@ -242,6 +242,11 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
                   AND column_name = 'generated_og_retry_after' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_tx_attempts' \
             )",
     )
     .fetch_one(pool)

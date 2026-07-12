@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-and-provenance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.92.0
+          components: clippy,rustfmt
+
+      - name: Prove release pin failure modes
+        run: |
+          scripts/test-release-provenance.sh
+          scripts/test-release-record.sh
+
+      - name: Verify the resolved Boltz revision
+        run: scripts/release-preflight.sh
+
+      - name: Unit and privacy tests
+        run: |
+          cargo test --lib --locked
+          cargo test --test invoice_memo_privacy --locked
+
+      - name: Compile and lint every Rust target
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --lib --tests --locked -- -D warnings
+
+      - name: Fresh and upgrade database integration tests
+        run: scripts/test-db.sh
+
+      - name: Documentation integrity
+        run: scripts/check-docs.sh
+
+      - name: Build reproducible release record
+        run: |
+          if cargo build --release --locked; then
+            echo "direct release build unexpectedly bypassed provenance wrapper" >&2
+            exit 1
+          fi
+          scripts/build-release.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pay-service-${{ github.sha }}
+          path: |
+            target/verified-release/pay-service
+            target/verified-release/pay-service.release.json
+          if-no-files-found: error

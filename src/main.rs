@@ -28,6 +28,11 @@ use pay_service::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--build-info") {
+        println!("{}", version::build_info_json()?);
+        return Ok(());
+    }
+
     dotenvy::dotenv().ok();
 
     // rustls 0.23 panics if more than one CryptoProvider feature is linked
@@ -44,6 +49,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "pay_service=info,tower_http=info".into()),
         )
         .init();
+
+    let provenance = version::BuildProvenance::current();
+    tracing::info!(
+        bullnym_commit = provenance.build_commit,
+        boltz_client_commit = provenance.boltz_client_commit,
+        boltz_client_verification = provenance.boltz_client_verification,
+        build_profile = provenance.build_profile,
+        source_state = provenance.build_source_state,
+        schema_marker = provenance.expected_schema_marker,
+        pwa_content_sha256 = provenance.pwa_content_sha256,
+        rustc_version = provenance.rustc_version,
+        cargo_version = provenance.cargo_version,
+        build_target = provenance.build_target,
+        "build provenance"
+    );
 
     let config_path = std::env::args()
         .nth(1)
