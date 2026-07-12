@@ -62,10 +62,9 @@ pub struct UpsertDonationPage<'a> {
     pub instagram: Option<&'a str>,
     pub pos_mode: Option<bool>,
     pub enabled: bool,
-    /// The version is present once generation has been attempted for this
-    /// content. A missing key with a present version selects the branded
-    /// fallback instead of a stale legacy upload.
-    pub generated_og_key: Option<&'a str>,
+    /// The target renderer version for this content. A missing key with a
+    /// present version selects the branded fallback while post-commit
+    /// generation/reconciliation is pending.
     pub generated_og_template_version: Option<i32>,
     /// Tri-state alias update: `None` leaves the stored alias unchanged,
     /// `Some(None)` clears it, `Some(Some(s))` claims/changes it. The partial
@@ -95,7 +94,7 @@ pub async fn upsert_donation_page(
              website, twitter, instagram, pos_mode, enabled, alias, \
              generated_og_key, generated_og_template_version) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, \
-                 CASE WHEN $12 THEN $13 END, $14, $15) \
+                 CASE WHEN $12 THEN $13 END, NULL, $14) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
@@ -107,7 +106,14 @@ pub async fn upsert_donation_page(
              pos_mode = COALESCE($10, donation_pages.pos_mode), \
              enabled = EXCLUDED.enabled, \
              alias = CASE WHEN $12 THEN $13 ELSE donation_pages.alias END, \
-             generated_og_key = EXCLUDED.generated_og_key, \
+             generated_og_key = CASE \
+                 WHEN donation_pages.header = EXCLUDED.header \
+                  AND donation_pages.description = EXCLUDED.description \
+                  AND donation_pages.generated_og_template_version \
+                      IS NOT DISTINCT FROM EXCLUDED.generated_og_template_version \
+                 THEN donation_pages.generated_og_key \
+                 ELSE NULL \
+             END, \
              generated_og_template_version = EXCLUDED.generated_og_template_version, \
              generated_og_failure_count = 0, \
              generated_og_retry_after = NULL, \
@@ -131,10 +137,40 @@ pub async fn upsert_donation_page(
     .bind(page.enabled)
     .bind(alias_present)
     .bind(alias_value)
-    .bind(page.generated_og_key)
     .bind(page.generated_og_template_version)
     .fetch_one(pool)
     .await
+}
+
+/// Attach a generated social card only if the persisted Page still has the
+/// exact content/version that was rendered. This is the cancellation/concurrent
+/// edit guard for post-commit generation.
+pub async fn attach_generated_og_if_current(
+    pool: &PgPool,
+    nym: &str,
+    kind: &str,
+    header: &str,
+    description: &str,
+    template_version: i32,
+    key: &str,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE donation_pages \
+         SET generated_og_key = $6, generated_og_failure_count = 0, \
+             generated_og_retry_after = NULL \
+         WHERE nym = $1 AND kind = $2 \
+           AND header = $3 AND description = $4 \
+           AND generated_og_template_version = $5",
+    )
+    .bind(nym)
+    .bind(kind)
+    .bind(header)
+    .bind(description)
+    .bind(template_version)
+    .bind(key)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
 }
 
 /// Soft-delete: mark `archived_at = now()`. The row is preserved so the

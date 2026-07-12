@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{header, HeaderValue, Response, StatusCode};
 use cosmic_text::{
     fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight, Wrap,
 };
@@ -32,6 +34,11 @@ pub const HEIGHT: u32 = 630;
 pub const TEMPLATE_VERSION: i32 = 1;
 pub const DESCRIPTION_MAX_GRAPHEMES: usize = 120;
 pub const DESCRIPTION_MAX_BYTES: usize = 512;
+/// Fallback assets have their own stable URL version. Generated-card template
+/// bumps must not silently change these paths unless the fallback bytes also
+/// change and new routes are shipped.
+pub const FALLBACK_LIVE_PATH: &str = "/og/fallback-live-v1.jpg";
+pub const FALLBACK_UNAVAILABLE_PATH: &str = "/og/fallback-unavailable-v1.jpg";
 
 const TEMPLATE_KEY: &[u8] = b"bullnym-payment-page-og";
 const JPEG_QUALITY: u8 = 88;
@@ -48,6 +55,9 @@ const FOREGROUND: Rgba<u8> = Rgba([0x21, 0x1F, 0x1A, 0xFF]);
 const BULL_RED: Rgba<u8> = Rgba([0xB7, 0x00, 0x0B, 0xFF]);
 
 const LOGO_BYTES: &[u8] = include_bytes!("../pwa/public/bb-logo-light.png");
+const FALLBACK_LIVE_BYTES: &[u8] = include_bytes!("../assets/og/og-fallback-live-v1.jpg");
+const FALLBACK_UNAVAILABLE_BYTES: &[u8] =
+    include_bytes!("../assets/og/og-fallback-unavailable-v1.jpg");
 
 const FONT_BYTES: &[&[u8]] = &[
     include_bytes!("../assets/og/fonts/NotoSans-Regular.ttf"),
@@ -190,56 +200,36 @@ pub fn generated_url(domain: &str, version: i32, key: &str) -> String {
 }
 
 pub fn fallback_url(domain: &str, unavailable: bool) -> String {
-    let name = fallback_filename(unavailable);
-    format!("https://{domain}/img/og/{name}")
-}
-
-fn fallback_path(root: &str, unavailable: bool) -> PathBuf {
-    Path::new(root)
-        .join("og")
-        .join(fallback_filename(unavailable))
-}
-
-fn fallback_filename(unavailable: bool) -> String {
-    if unavailable {
-        format!("fallback-unavailable-v{TEMPLATE_VERSION}.jpg")
+    let path = if unavailable {
+        FALLBACK_UNAVAILABLE_PATH
     } else {
-        format!("fallback-live-v{TEMPLATE_VERSION}.jpg")
-    }
+        FALLBACK_LIVE_PATH
+    };
+    format!("https://{domain}{path}")
 }
 
-/// Ensure branded fallbacks exist before the HTTP server starts. Failing here
-/// is deliberate: serving Page metadata that points at an absent/unbranded
-/// fallback violates the public contract.
-pub async fn ensure_fallbacks(root: &str) -> Result<(), OgImageError> {
-    let root = root.to_string();
-    let permit = RENDER_PERMIT
-        .acquire()
-        .await
-        .map_err(|_| OgImageError::new("OG renderer semaphore closed"))?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        for (unavailable, title, description) in [
-            (
-                false,
-                "Bull Bitcoin Payment Page",
-                "Send bitcoin with a simple, secure payment page.",
-            ),
-            (
-                true,
-                "Page unavailable",
-                "This Bull Bitcoin Payment Page is no longer available.",
-            ),
-        ] {
-            let path = fallback_path(&root, unavailable);
-            let bytes = render_jpeg(title, description)?;
-            image_pipeline::atomic_write(&path, &bytes)
-                .map_err(|e| OgImageError::new(format!("write {}: {e}", path.display())))?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| OgImageError::new(format!("fallback render task: {e}")))?
+pub async fn fallback_live() -> Response<Body> {
+    fallback_response(FALLBACK_LIVE_BYTES)
+}
+
+pub async fn fallback_unavailable() -> Response<Body> {
+    fallback_response(FALLBACK_UNAVAILABLE_BYTES)
+}
+
+fn fallback_response(bytes: &'static [u8]) -> Response<Body> {
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Render and atomically publish a custom Page image. An existing content key
@@ -578,39 +568,40 @@ pub fn spawn_reconciler(
                     );
                     // Every selected row either publishes or receives a future
                     // retry time, so an immediate follow-up cannot hot-loop on
-                    // the same failed batch. It also prevents the verification
-                    // sweep from being starved by a trickle of new rows.
+                    // the same failed batch.
                     wait = Duration::from_secs(2);
                 }
                 Err(error) => {
                     tracing::warn!(event = "og_reconcile_failed", error = %error);
                 }
-                Ok(_) if tokio::time::Instant::now() >= verify_due => {
-                    match verify_current_files_once(&pool, &image_root, verify_cursor.as_ref())
-                        .await
+                Ok(_) => {}
+            }
+
+            // Verification is an independent bounded lane. Do not put it in
+            // the empty-generation branch: a continuous stream of Page edits
+            // must never starve repair of missing files on this serving host.
+            if tokio::time::Instant::now() >= verify_due {
+                match verify_current_files_once(&pool, &image_root, verify_cursor.as_ref()).await {
+                    Ok((selected, failures, next_cursor))
+                        if selected >= VERIFY_BATCH_SIZE as usize =>
                     {
-                        Ok((selected, failures, next_cursor))
-                            if selected >= VERIFY_BATCH_SIZE as usize =>
-                        {
-                            tracing::info!(event = "og_verify_batch", selected, failures);
-                            verify_cursor = next_cursor;
-                            wait = Duration::from_secs(2);
-                        }
-                        Ok((selected, failures, _)) => {
-                            tracing::info!(event = "og_verify_complete", selected, failures);
-                            verify_cursor = None;
-                            verify_due = tokio::time::Instant::now() + VERIFY_INTERVAL;
-                        }
-                        Err(error) => {
-                            tracing::warn!(event = "og_verify_failed", error = %error);
-                        }
+                        tracing::info!(event = "og_verify_batch", selected, failures);
+                        verify_cursor = next_cursor;
+                        verify_due = tokio::time::Instant::now() + Duration::from_secs(2);
+                        wait = wait.min(Duration::from_secs(2));
+                    }
+                    Ok((selected, failures, _)) => {
+                        tracing::info!(event = "og_verify_complete", selected, failures);
+                        verify_cursor = None;
+                        verify_due = tokio::time::Instant::now() + VERIFY_INTERVAL;
+                    }
+                    Err(error) => {
+                        tracing::warn!(event = "og_verify_failed", error = %error);
+                        verify_due = tokio::time::Instant::now() + RECONCILE_INTERVAL;
                     }
                 }
-                Ok(_) => {
-                    wait =
-                        wait.min(verify_due.saturating_duration_since(tokio::time::Instant::now()));
-                }
             }
+            wait = wait.min(verify_due.saturating_duration_since(tokio::time::Instant::now()));
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(wait) => {}
@@ -805,6 +796,7 @@ async fn verify_current_files_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use image::ImageReader;
 
     #[test]
@@ -861,6 +853,18 @@ mod tests {
         assert_eq!(
             generated_url("bullpay.ca", 7, &key),
             format!("https://bullpay.ca/img/og/v7/{key}.jpg")
+        );
+    }
+
+    #[test]
+    fn fallback_urls_use_their_independent_asset_version() {
+        assert_eq!(
+            fallback_url("bullpay.ca", false),
+            "https://bullpay.ca/og/fallback-live-v1.jpg"
+        );
+        assert_eq!(
+            fallback_url("bullpay.ca", true),
+            "https://bullpay.ca/og/fallback-unavailable-v1.jpg"
         );
     }
 
@@ -922,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_is_content_addressed_and_fallbacks_are_always_present() {
+    async fn publish_is_content_addressed() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time after epoch")
@@ -932,10 +936,6 @@ mod tests {
             std::process::id()
         ));
         let root_str = root.to_string_lossy();
-
-        ensure_fallbacks(&root_str).await.expect("write fallbacks");
-        assert!(fallback_path(&root_str, false).is_file());
-        assert!(fallback_path(&root_str, true).is_file());
 
         let first = publish(&root_str, "A Page", "A short description")
             .await
@@ -947,5 +947,53 @@ mod tests {
         assert!(generated_path(&root_str, &first.key).is_file());
 
         std::fs::remove_dir_all(root).expect("remove test image directory");
+    }
+
+    #[test]
+    fn bundled_fallbacks_match_the_current_renderer() {
+        let live = render_jpeg(
+            "Bull Bitcoin Payment Page",
+            "Send bitcoin with a simple, secure payment page.",
+        )
+        .expect("render live fallback");
+        let unavailable = render_jpeg(
+            "Page unavailable",
+            "This Bull Bitcoin Payment Page is no longer available.",
+        )
+        .expect("render unavailable fallback");
+
+        assert_eq!(live.as_slice(), FALLBACK_LIVE_BYTES);
+        assert_eq!(unavailable.as_slice(), FALLBACK_UNAVAILABLE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn bundled_fallback_handlers_serve_exact_immutable_jpegs() {
+        async fn assert_response(response: Response<Body>, expected: &[u8]) {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("image/jpeg"))
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static(
+                    "public, max-age=31536000, immutable"
+                ))
+            );
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff"))
+            );
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect fallback body")
+                .to_bytes();
+            assert_eq!(body.as_ref(), expected);
+        }
+
+        assert_response(fallback_live().await, FALLBACK_LIVE_BYTES).await;
+        assert_response(fallback_unavailable().await, FALLBACK_UNAVAILABLE_BYTES).await;
     }
 }

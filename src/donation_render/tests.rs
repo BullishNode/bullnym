@@ -61,6 +61,10 @@ fn security_headers_keep_donation_csp_tight() {
         resp.headers().get("x-robots-tag").expect("robots header"),
         "noindex, nofollow, noarchive"
     );
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).expect("cache header"),
+        "public, max-age=60, s-maxage=60, stale-while-revalidate=300"
+    );
 }
 
 #[test]
@@ -125,6 +129,30 @@ fn live_template_renders_social_preview_metadata() {
     assert!(html.contains(
         r#"<meta name="twitter:image:alt" content="Alice Store — Bull Bitcoin Payment Page">"#
     ));
+}
+
+#[test]
+fn archived_template_renders_unavailable_social_preview_metadata() {
+    let image_url = og_image::fallback_url("bullpay.ca", true);
+    let tpl = DonationArchivedTpl {
+        nym: "alices-shop",
+        social_meta: social_meta_tags(
+            "Page unavailable",
+            "This Bull Bitcoin Payment Page is no longer available.",
+            "https://bullpay.ca/a/alices-shop",
+            &image_url,
+        ),
+    };
+
+    let html = tpl.render().expect("archived template renders");
+    assert!(html.contains(r#"<title>Page unavailable</title>"#));
+    assert!(html.contains(
+        r#"<link rel="canonical" href="https://bullpay.ca/a/alices-shop">"#
+    ));
+    assert!(html.contains(
+        r#"<meta property="og:image" content="https://bullpay.ca/og/fallback-unavailable-v1.jpg">"#
+    ));
+    assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
 }
 
 #[tokio::test]
@@ -308,7 +336,7 @@ fn pwa_shell_escapes_manifest_href_attr() {
         shell,
         &config,
         "https://bullpay.ca/alice",
-        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "https://bullpay.ca/og/fallback-live-v1.jpg",
         r#"/bad"name/manifest.webmanifest"#,
     )
     .expect("injects shell");
@@ -341,7 +369,7 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         shell,
         &config,
         "https://bullpay.ca/alice",
-        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "https://bullpay.ca/og/fallback-live-v1.jpg",
         "/alice/manifest.webmanifest",
     )
     .expect("injects shell");
@@ -450,7 +478,7 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
         shell,
         &config,
         "https://bullpay.ca/a/alices-shop",
-        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "https://bullpay.ca/og/fallback-live-v1.jpg",
         "/a/alices-shop/manifest.webmanifest",
     )
     .expect("injects shell");
@@ -492,7 +520,7 @@ fn nym_config_still_carries_nym_and_invoice_base() {
         shell,
         &config,
         "https://bullpay.ca/alice",
-        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "https://bullpay.ca/og/fallback-live-v1.jpg",
         "/alice/manifest.webmanifest",
     )
     .expect("injects shell");

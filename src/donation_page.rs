@@ -242,7 +242,7 @@ fn validate_description_for_kind(
     req: &SaveDonationPageRequest,
     kind: &str,
 ) -> Result<(), AppError> {
-    if kind == db::KIND_PAYMENT_PAGE && req.kind.is_some() {
+    if kind == db::KIND_PAYMENT_PAGE {
         if !og_image::is_valid_payment_page_description(&req.description) {
             return Err(AppError::DonationPageInvalid(format!(
                 "description must be 1..={} visible characters and at most {} UTF-8 bytes",
@@ -251,10 +251,9 @@ fn validate_description_for_kind(
             )));
         }
     } else if req.description.len() > MAX_LEGACY_DESCRIPTION_BYTES {
-        // Requests that omit `kind` are the shipped legacy wire shape. Keep
-        // their former optional/280-byte contract so a server rollout does not
-        // strand older clients; generated metadata/images still truncate that
-        // content safely. POS also retains its optional description contract.
+        // POS retains its optional description contract. Payment Page uses the
+        // same approved 120-character contract whether `kind` is explicit or
+        // omitted; historical-client compatibility is not a product target.
         return Err(AppError::DonationPageInvalid(format!(
             "description must be at most {MAX_LEGACY_DESCRIPTION_BYTES} UTF-8 bytes"
         )));
@@ -457,39 +456,10 @@ pub async fn save(
         ));
     }
 
-    // Rendering is server-owned and best-effort. The image is atomically
-    // written before its key is put in the row. A failure deliberately clears
-    // any prior generated key so changed text can never show a stale card; the
-    // public HTML will use the permanent branded fallback instead.
-    let generated_og = if kind == db::KIND_PAYMENT_PAGE {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            og_image::publish(
-                &state.config.donation.image_root_path,
-                &req.header,
-                &req.description,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(published)) => Some(published),
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    event = "donation_page_og_render_failed",
-                    nym = %req.nym,
-                    error = %error
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(event = "donation_page_og_render_timed_out", nym = %req.nym);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
+    // Persist the merchant's Page mutation before doing any rendering work.
+    // Changed content clears the old generated key in the upsert, so public
+    // HTML immediately selects the bundled fallback until this best-effort
+    // post-commit step (or the reconciler) attaches the matching new key.
     let row = db::upsert_donation_page(
         &state.db,
         &db::UpsertDonationPage {
@@ -504,13 +474,61 @@ pub async fn save(
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
             pos_mode: req.pos_mode,
             enabled: req.enabled,
-            generated_og_key: generated_og.as_ref().map(|image| image.key.as_str()),
             generated_og_template_version: (kind == db::KIND_PAYMENT_PAGE)
                 .then_some(og_image::TEMPLATE_VERSION),
             alias: alias_update,
         },
     )
     .await?;
+
+    if kind == db::KIND_PAYMENT_PAGE {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            og_image::publish(
+                &state.config.donation.image_root_path,
+                &req.header,
+                &req.description,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(published)) => {
+                match db::attach_generated_og_if_current(
+                    &state.db,
+                    &req.nym,
+                    kind,
+                    &req.header,
+                    &req.description,
+                    published.template_version,
+                    &published.key,
+                )
+                .await
+                {
+                    Ok(0) => tracing::debug!(
+                        event = "donation_page_og_attach_obsolete",
+                        nym = %req.nym,
+                        "Page changed while its OG image rendered"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        event = "donation_page_og_attach_failed",
+                        nym = %req.nym,
+                        error = %error
+                    ),
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "donation_page_og_render_failed",
+                    nym = %req.nym,
+                    error = %error
+                );
+            }
+            Err(_) => {
+                tracing::warn!(event = "donation_page_og_render_timed_out", nym = %req.nym);
+            }
+        }
+    }
 
     // If an alias was just claimed, make sure the content-addressed image
     // copies exist so `/a/<alias>` can serve avatar/OG without the nym in the

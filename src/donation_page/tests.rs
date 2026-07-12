@@ -308,15 +308,15 @@ fn explicit_payment_page_requires_a_short_description() {
 }
 
 #[test]
-fn omitted_kind_retains_the_legacy_description_contract() {
+fn omitted_kind_uses_the_payment_page_description_contract() {
     let mut req = make_req();
     req.kind = None;
-    req.description.clear();
-    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
-
-    req.description = "a".repeat(MAX_LEGACY_DESCRIPTION_BYTES);
+    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
     assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
     req.description.push('a');
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+
+    req.description.clear();
     assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
 }
 

@@ -28,16 +28,20 @@ metadata. Bullnym renders a 1200×630 JPEG when the Page is saved; the only
 merchant-specific elements are the Page title and short description, while the
 Bull Bitcoin logo and visual frame are fixed in every generated image.
 
-New clients use the short-description contract defined by the
-[Payment Page API](../api/payment-pages-and-pos.md). Older requests that omit
-`kind` retain their compatible wire contract and are safely truncated in
-metadata and generated cards.
+Payment Pages use the short-description contract defined by the
+[Payment Page API](../api/payment-pages-and-pos.md): 1–120 user-perceived
+Unicode characters and at most 512 UTF-8 bytes. Because an omitted `kind`
+selects `payment_page`, the same contract applies whether the caller sends the
+kind explicitly or relies on that default.
 
 Generated files are immutable and content-addressed under
-`/img/og/v<template-version>/<content-key>.jpg`. Rendering never occurs on a
-public Page GET. Save-time generation has a short timeout; permanent branded
-fallback images keep previews valid on failure, and the background worker
-backfills old rows, retries failures with durable backoff, and repairs missing
+`/img/og/v<template-version>/<content-key>.jpg`. A save commits Page content
+first, clears any stale generated-image key, and then attempts a bounded render;
+the result is attached only if the persisted content still matches. Rendering
+never occurs on a public Page GET. Branded fallbacks embedded in the Bullnym
+binary are served from `/og/fallback-*.jpg`, so an unwritable generated-image
+directory cannot prevent startup or break Page saves. The background worker
+backfills rows, retries failures with durable backoff, and repairs missing
 host-local files. Page responses are `noindex` but remain fetchable by social
 link-preview crawlers.
 

@@ -51,11 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::Config::load(&config_path)?;
     tracing::info!("loaded config for domain: {}", config.domain);
-    if config.features.payment_pages {
-        og_image::ensure_fallbacks(&config.donation.image_root_path)
-            .await
-            .map_err(|e| format!("initialize branded OG fallbacks: {e}"))?;
-    }
     if config.rate_limit.trust_forwarded_for {
         tracing::warn!(
             "rate_limit.trust_forwarded_for=true; only run this behind a trusted reverse proxy \
@@ -430,6 +425,11 @@ fn build_router(state: AppState) -> Router {
             get(pricer::supported_currencies),
         )
         .route("/api/v1/rate", get(pricer::rate))
+        .route(og_image::FALLBACK_LIVE_PATH, get(og_image::fallback_live))
+        .route(
+            og_image::FALLBACK_UNAVAILABLE_PATH,
+            get(og_image::fallback_unavailable),
+        )
         .nest_service(
             "/pwa-assets",
             ServiceBuilder::new()
