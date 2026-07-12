@@ -218,6 +218,30 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'chain_swap_records' \
                   AND column_name = 'claim_key_index' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'generated_og_key' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'generated_og_template_version' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'generated_og_failure_count' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'generated_og_retry_after' \
             )",
     )
     .fetch_one(pool)

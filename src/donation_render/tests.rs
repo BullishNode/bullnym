@@ -57,6 +57,10 @@ fn security_headers_keep_donation_csp_tight() {
     assert_eq!(csp, DONATION_CSP);
     assert!(csp.contains("connect-src 'self' wss://liquid.network"));
     assert!(!csp.contains("connect-src 'self' https:"));
+    assert_eq!(
+        resp.headers().get("x-robots-tag").expect("robots header"),
+        "noindex, nofollow, noarchive"
+    );
 }
 
 #[test]
@@ -84,9 +88,13 @@ fn live_template_renders_social_preview_metadata() {
         invoice_base: "/alice".to_string(),
         header: "Alice Store",
         description: "Fresh coffee",
-        public_url: "https://bullpay.ca/alice".to_string(),
+        social_meta: social_meta_tags(
+            "Alice Store",
+            "Fresh coffee",
+            "https://bullpay.ca/alice",
+            og_url,
+        ),
         avatar_url: None,
-        og_url: Some(og_url.to_string()),
         display_currency: "CAD",
         website: None,
         twitter: None,
@@ -105,10 +113,47 @@ fn live_template_renders_social_preview_metadata() {
     assert!(html.contains(r#"<meta property="og:image:width" content="1200">"#));
     assert!(html.contains(r#"<meta property="og:image:height" content="630">"#));
     assert!(html.contains(r#"<meta property="og:image:type" content="image/jpeg">"#));
-    assert!(html.contains(r#"<meta property="og:image:alt" content="Alice Store">"#));
+    assert!(html.contains(
+        r#"<meta property="og:image:alt" content="Alice Store — Bull Bitcoin Payment Page">"#
+    ));
     assert!(html.contains(&format!(
         r#"<meta name="twitter:image" content="{og_url}">"#
     )));
+    assert!(html.contains(r#"<meta property="og:site_name" content="Bull Bitcoin">"#));
+    assert!(html.contains(r#"<link rel="canonical" href="https://bullpay.ca/alice">"#));
+    assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
+    assert!(html.contains(
+        r#"<meta name="twitter:image:alt" content="Alice Store — Bull Bitcoin Payment Page">"#
+    ));
+}
+
+#[tokio::test]
+async fn stored_generated_image_uses_its_own_version_and_requires_the_file() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "bullnym-og-render-url-{unique}-{}",
+        std::process::id()
+    ));
+    let root_str = root.to_string_lossy();
+    let key = "ab".repeat(32);
+    let path = og_image::generated_path_for_version(&root_str, 7, &key);
+    std::fs::create_dir_all(path.parent().expect("version directory"))
+        .expect("create version directory");
+    std::fs::write(&path, b"present").expect("write image marker");
+
+    assert_eq!(
+        stored_generated_og_url(&root_str, "bullpay.ca", "alice", &key, 7).await,
+        Some(format!("https://bullpay.ca/img/og/v7/{key}.jpg"))
+    );
+    assert_eq!(
+        stored_generated_og_url(&root_str, "bullpay.ca", "alice", &"cd".repeat(32), 7,).await,
+        None
+    );
+
+    std::fs::remove_dir_all(root).expect("remove test image directory");
 }
 
 #[test]
@@ -122,6 +167,8 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         description: "Description".to_string(),
         avatar_sha256: None,
         og_sha256: None,
+        generated_og_key: None,
+        generated_og_template_version: None,
         alias: None,
         display_currency: "USD".to_string(),
         website: None,
@@ -157,6 +204,8 @@ fn web_manifest_uses_header_for_name() {
         description: "Description".to_string(),
         avatar_sha256: None,
         og_sha256: None,
+        generated_og_key: None,
+        generated_og_template_version: None,
         alias: None,
         display_currency: "USD".to_string(),
         website: None,
@@ -176,7 +225,7 @@ fn web_manifest_uses_header_for_name() {
 
 #[test]
 fn pwa_shell_injects_config_and_og_placeholders() {
-    let shell = r#"<!doctype html><head><!-- BULLNYM_OG --><!-- BULLNYM_MANIFEST --></head><body><!-- BULLNYM_CONFIG --></body>"#;
+    let shell = r#"<!doctype html><head><title>bullnym</title><!-- BULLNYM_OG --><!-- BULLNYM_MANIFEST --></head><body><!-- BULLNYM_CONFIG --></body>"#;
     let config = PwaConfigView {
         nym: Some("alice"),
         invoice_base: "/alice/pos",
@@ -198,7 +247,8 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     let html = inject_pwa_shell(
         shell,
         &config,
-        Some("https://bullpay.ca/img/alice/og.jpg?v=a&b"),
+        "https://bullpay.ca/alice",
+        "https://bullpay.ca/img/alice/og.jpg?v=a&b",
         "/alice/manifest.webmanifest",
     )
     .expect("injects shell");
@@ -213,10 +263,18 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     assert!(html.contains(r#""mode":"pos""#));
     assert!(html.contains(r#""avatar_url":"https://bullpay.ca/img/alice/avatar.webp""#));
     assert!(html.contains(r#"<meta property="og:title" content="Alice &amp; Sons">"#));
+    assert!(html.contains("<title>Alice &amp; Sons</title>"));
+    assert!(!html.contains("<title>bullnym</title>"));
     assert!(html.contains(r#"<meta property="og:description" content="Coffee &quot;now&quot;">"#));
     assert!(html.contains(
         r#"<meta property="og:image" content="https://bullpay.ca/img/alice/og.jpg?v=a&amp;b">"#
     ));
+    assert!(
+        html.find(r#"<meta property="og:image""#)
+            .expect("OG image tag")
+            < 8 * 1024,
+        "crawler metadata must stay in the first response range"
+    );
     assert!(!html.contains("<!-- BULLNYM_CONFIG -->"));
     assert!(!html.contains("<!-- BULLNYM_MANIFEST -->"));
     assert!(!html.contains("<!-- BULLNYM_OG -->"));
@@ -246,8 +304,14 @@ fn pwa_shell_escapes_manifest_href_attr() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None, r#"/bad"name/manifest.webmanifest"#)
-        .expect("injects shell");
+    let html = inject_pwa_shell(
+        shell,
+        &config,
+        "https://bullpay.ca/alice",
+        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        r#"/bad"name/manifest.webmanifest"#,
+    )
+    .expect("injects shell");
 
     assert!(html.contains(r#"<link rel="manifest" href="/bad&quot;name/manifest.webmanifest">"#));
 }
@@ -273,8 +337,14 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None, "/alice/manifest.webmanifest")
-        .expect("injects shell");
+    let html = inject_pwa_shell(
+        shell,
+        &config,
+        "https://bullpay.ca/alice",
+        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "/alice/manifest.webmanifest",
+    )
+    .expect("injects shell");
 
     assert!(html.contains(r#"\u003c/script>"#));
     assert!(!html.contains("</script><script>"));
@@ -376,8 +446,14 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
         liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
         domain: "bullpay.ca",
     };
-    let html = inject_pwa_shell(shell, &config, None, "/a/alices-shop/manifest.webmanifest")
-        .expect("injects shell");
+    let html = inject_pwa_shell(
+        shell,
+        &config,
+        "https://bullpay.ca/a/alices-shop",
+        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "/a/alices-shop/manifest.webmanifest",
+    )
+    .expect("injects shell");
     let json = injected_config_json(&html);
     assert!(
         json.get("nym").is_none(),
@@ -385,7 +461,10 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
     );
     assert_eq!(json["invoice_base"], "/a/alices-shop");
     assert_eq!(json["page_key"], "alices-shop");
-    assert_eq!(json["avatar_url"], "https://bullpay.ca/img/_h/deadbeef.webp");
+    assert_eq!(
+        json["avatar_url"],
+        "https://bullpay.ca/img/_h/deadbeef.webp"
+    );
 }
 
 #[test]
@@ -409,8 +488,14 @@ fn nym_config_still_carries_nym_and_invoice_base() {
         liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
         domain: "bullpay.ca",
     };
-    let html = inject_pwa_shell(shell, &config, None, "/alice/manifest.webmanifest")
-        .expect("injects shell");
+    let html = inject_pwa_shell(
+        shell,
+        &config,
+        "https://bullpay.ca/alice",
+        "https://bullpay.ca/img/og/fallback-live-v1.jpg",
+        "/alice/manifest.webmanifest",
+    )
+    .expect("injects shell");
     let json = injected_config_json(&html);
     assert_eq!(json["nym"], "alice");
     assert_eq!(json["invoice_base"], "/alice");
@@ -430,6 +515,8 @@ fn web_manifest_fallback_uses_provided_name_not_nym() {
         description: "d".to_string(),
         avatar_sha256: None,
         og_sha256: None,
+        generated_og_key: None,
+        generated_og_template_version: None,
         alias: Some("alices-shop".to_string()),
         display_currency: "USD".to_string(),
         website: None,

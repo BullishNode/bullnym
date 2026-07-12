@@ -16,9 +16,30 @@ nym. Management actions use:
 - `donation-page-archive`
 
 The row stores display text, display currency, links, enabled/archive state, an
-optional Liquid CT descriptor, and an independent address cursor. Legacy media
-hashes may be returned for old rows, but Bullnym no longer accepts image
-uploads and clients must treat those fields as read-only compatibility data.
+optional Liquid CT descriptor, an independent address cursor, and the current
+generated social-card key/template version. Legacy media hashes may be returned
+for old rows, but Bullnym no longer accepts image uploads and clients must treat
+those fields as read-only compatibility data.
+
+## Social previews
+
+Every live Payment Page publishes complete Open Graph and Twitter large-card
+metadata. Bullnym renders a 1200×630 JPEG when the Page is saved; the only
+merchant-specific elements are the Page title and short description, while the
+Bull Bitcoin logo and visual frame are fixed in every generated image.
+
+New clients use the short-description contract defined by the
+[Payment Page API](../api/payment-pages-and-pos.md). Older requests that omit
+`kind` retain their compatible wire contract and are safely truncated in
+metadata and generated cards.
+
+Generated files are immutable and content-addressed under
+`/img/og/v<template-version>/<content-key>.jpg`. Rendering never occurs on a
+public Page GET. Save-time generation has a short timeout; permanent branded
+fallback images keep previews valid on failure, and the background worker
+backfills old rows, retries failures with durable backoff, and repairs missing
+host-local files. Page responses are `noindex` but remain fetchable by social
+link-preview crawlers.
 
 ## Descriptor Use
 
@@ -42,7 +63,8 @@ rails settle to that address:
 ## Flow
 
 1. Payer opens `GET /:nym`.
-2. Server returns the Payment Page PWA shell with injected config.
+2. Server returns the Payment Page PWA shell with injected config and complete
+   social-preview metadata.
 3. Payer submits an amount to `POST /:nym/invoice`.
 4. Bullnym creates an `origin = 'checkout'` invoice and allocates one Liquid
    settlement address.

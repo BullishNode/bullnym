@@ -537,6 +537,8 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -564,12 +566,91 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )
     .await
     .unwrap();
     assert!(!row.pos_mode);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "ogretry").await;
+
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "ogretry",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Retry test",
+            description: "A short retry description",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // /proc cannot accept application-created directories, deterministically
+    // exercising the render/write failure path without altering permissions on
+    // a shared test directory.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker = pay_service::og_image::spawn_reconciler(
+        pool.clone(),
+        format!("/proc/bullnym-og-retry-test-{}", std::process::id()),
+        cancel.clone(),
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let observed = loop {
+        let row = sqlx::query_as::<_, (i32, bool, Option<String>, Option<i32>)>(
+            "SELECT generated_og_failure_count, \
+                    generated_og_retry_after IS NOT NULL, \
+                    generated_og_key, generated_og_template_version \
+             FROM donation_pages WHERE nym = 'ogretry' AND kind = 'payment_page'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if row.0 > 0 {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "OG reconciler did not persist retry state"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+        .await
+        .expect("worker stops after cancellation")
+        .expect("worker task succeeds");
+
+    assert_eq!(observed.0, 1);
+    assert!(observed.1, "retry time must be persisted");
+    assert_eq!(observed.2, None);
+    assert_eq!(
+        observed.3,
+        Some(pay_service::og_image::TEMPLATE_VERSION),
+        "a failed first-generation attempt must select the branded fallback"
+    );
 
     cleanup_db(&pool).await;
 }
@@ -596,6 +677,8 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             instagram: None,
             pos_mode: Some(false),
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -677,6 +760,8 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             instagram: None,
             pos_mode: Some(true),
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -1027,6 +1112,8 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )
@@ -1111,6 +1198,8 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
             instagram: None,
             pos_mode: None,
             enabled: true,
+            generated_og_key: None,
+            generated_og_template_version: None,
             alias: None,
         },
     )

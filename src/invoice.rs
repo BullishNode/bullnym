@@ -397,12 +397,12 @@ fn html_response(html: String) -> Response {
 // GET /robots.txt
 // =====================================================================
 
-/// Disallow indexing of the entire pay-service domain. Public LNURL
-/// endpoints are not indexable in any meaningful sense; the payment-page
-/// surface area renders user-supplied content and is private to whoever
-/// holds the URL.
+/// Permit crawlers to fetch public Payment Pages so they can read Open Graph
+/// metadata. Page responses independently send `X-Robots-Tag: noindex`, which
+/// prevents search indexing without blocking link-preview crawlers from the
+/// content they need.
 pub async fn robots_txt() -> Response {
-    let body = "User-agent: *\nDisallow: /\n";
+    let body = "User-agent: *\nDisallow: /.well-known/\nDisallow: /api/\nDisallow: /register\nDisallow: /webhook/\nAllow: /\n";
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,

@@ -1,7 +1,7 @@
 use axum::Json;
 use serde::Serialize;
 
-pub const EXPECTED_SCHEMA_MARKER: &str = "044_swap_derivation_metadata";
+pub const EXPECTED_SCHEMA_MARKER: &str = "045_generated_donation_page_og";
 
 #[derive(Debug, Serialize)]
 pub struct VersionResponse {

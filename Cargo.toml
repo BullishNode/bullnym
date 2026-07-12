@@ -41,6 +41,9 @@ askama_axum = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Donation-page image pipeline: decode jpg/png/webp, resize, and re-encode.
 image = "0.25"
+# Deterministic multilingual shaping/rasterization for generated social cards.
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+unicode-segmentation = "1"
 # Server-side QR code generation for the donation-page payment view.
 # Default features off — we only need the SVG renderer.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

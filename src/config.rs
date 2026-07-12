@@ -401,10 +401,10 @@ const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DonationConfig {
-    /// Filesystem root for image storage. The handler writes to
-    /// `<image_root_path>/<nym>/<kind>.webp`. nginx serves this directly
-    /// at `location ^~ /img/`. The directory must be writable by the
-    /// pay-service user and readable by nginx.
+    /// Filesystem root for image storage. Generated social cards are written
+    /// below `<image_root_path>/og/`; historical merchant media may also live
+    /// below this root. nginx serves it directly at `location ^~ /img/`. The
+    /// directory must be writable by pay-service and readable by nginx.
     #[serde(default = "default_donation_image_root")]
     pub image_root_path: String,
     /// Hard cap on incoming image bytes. Enforced via per-route
@@ -1045,11 +1045,11 @@ fn default_lightning_per_source_limit() -> u32 {
 fn default_lightning_per_source_window_secs() -> u32 {
     3600
 }
-/// 60/min: comfortable for a viral page being reloaded by many donators
-/// on the same NAT, while still bounding volumetric scraping. Per-source
-/// keying uses `source_key()` (IPv6 /56 aggregation).
+/// 300/min: public social-preview crawlers may fetch many unrelated Pages
+/// through a small shared IP pool. Nginx caching absorbs normal bursts; this
+/// remains a generous per-source backstop against volumetric scraping.
 fn default_donation_html_rate_limit() -> u32 {
-    60
+    300
 }
 fn default_donation_html_rate_window_secs() -> u32 {
     60
