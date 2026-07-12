@@ -329,8 +329,8 @@ pub async fn get_ready_to_claim_chain_swaps(
 /// `swap.expired` for a chain swap, or when a cooperative claim is refused at
 /// runtime, so the next claim attempt takes the script path. Never writes
 /// through a terminal row. Mirrors `swaps::mark_cooperative_refused`.
-pub async fn mark_chain_swap_cooperative_refused(
-    pool: &PgPool,
+pub async fn mark_chain_swap_cooperative_refused<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     id: Uuid,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
@@ -340,7 +340,7 @@ pub async fn mark_chain_swap_cooperative_refused(
            AND status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck', 'refunding')",
     )
     .bind(id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }

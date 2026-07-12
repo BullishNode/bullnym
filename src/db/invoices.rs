@@ -206,12 +206,15 @@ pub async fn insert_invoice(
     Ok(inserted)
 }
 
-pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {
+pub async fn get_invoice_by_id<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as::<_, Invoice>(&format!(
         "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1"
     ))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
