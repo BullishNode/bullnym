@@ -33,9 +33,13 @@ bind the UUIDs in the object key.
 
 Retrying the same identity with the same bytes is idempotent. The same identity
 with different bytes is an integrity conflict. The Bullnym API exposes no
-overwrite or delete operation. Reads are capped at one MiB and lexicographic
-S3 list pages are capped at 1,000 objects per call with an exclusive typed
-cursor for the next request.
+overwrite or delete operation. Reads are capped at one MiB. Diagnostic list
+pages are capped at 1,000 objects per call with an exclusive typed cursor, but
+the generic `ObjectStore` stream does not guarantee order, so cursor pagination
+must not establish restore completeness. The restore path instead consumes one
+complete stream under external quiescence, fails at object 10,001, validates
+every retained key and size, rejects duplicate typed identities, and sorts only
+after EOF.
 
 ## Configuration boundary
 

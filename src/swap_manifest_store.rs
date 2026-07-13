@@ -6,6 +6,7 @@
 //! delete operation.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -20,8 +21,10 @@ use crate::swap_manifest::EncryptedSwapManifestV1;
 
 /// The format package has the same one-MiB encoded-envelope ceiling.
 pub const MAX_MANIFEST_OBJECT_BYTES: usize = 1_048_576;
-/// A caller must explicitly page or narrow a later restore scan above this cap.
+/// Maximum size of one compatibility/diagnostic cursor page.
 pub const MAX_MANIFEST_LIST_RESULTS: usize = 1_000;
+/// Hard ceiling for one complete, single-stream witness scan.
+pub const MAX_MANIFEST_FULL_SCAN_RESULTS: usize = 10_000;
 
 const OBJECT_FORMAT_VERSION: &str = "1";
 const OBJECT_DIGEST_ATTRIBUTE: &str = "bullnym-sha256";
@@ -266,6 +269,7 @@ pub enum CorruptReadKind {
     InvalidUtf8,
     InvalidEnvelope,
     UnexpectedObjectKey,
+    DuplicateObjectIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +284,9 @@ pub enum ManifestStoreError {
     },
     InvalidListLimit {
         requested: usize,
+        max: usize,
+    },
+    ListResultLimitExceeded {
         max: usize,
     },
     NotFound {
@@ -328,6 +335,12 @@ impl fmt::Display for ManifestStoreError {
                 write!(
                     f,
                     "recovery-manifest list limit {requested} is outside 1..={max}"
+                )
+            }
+            Self::ListResultLimitExceeded { max } => {
+                write!(
+                    f,
+                    "recovery-manifest listing exceeds its {max}-object limit"
                 )
             }
             Self::NotFound { .. } => f.write_str("recovery manifest was not found"),
@@ -582,12 +595,19 @@ impl RecoveryManifestStore {
         })
     }
 
-    /// Return a bounded diagnostic/restore page under the dedicated v1 prefix.
+    /// Return a bounded diagnostic page under the dedicated v1 prefix.
+    ///
+    /// `ObjectStore` does not guarantee stream order. Repeating this cursor API
+    /// therefore must not be used to establish restore-set completeness.
     pub async fn list_v1(&self, limit: usize) -> Result<ManifestListPage, ManifestStoreError> {
         self.list_v1_after(None, limit).await
     }
 
-    /// Continue a bounded S3 listing after the prior page's exclusive cursor.
+    /// Continue a bounded diagnostic listing after an exclusive cursor.
+    ///
+    /// This compatibility API is useful for bounded inspection only. It cannot
+    /// prove completeness over the generic unordered `ObjectStore` contract;
+    /// restore uses [`Self::list_all_v1_bounded`] under external quiescence.
     pub async fn list_v1_after(
         &self,
         after: Option<ManifestObjectId>,
@@ -648,6 +668,69 @@ impl RecoveryManifestStore {
             truncated,
             next_after,
         })
+    }
+
+    /// Consume one complete, bounded v1 listing without assuming stream order.
+    ///
+    /// The caller must prevent object creation for the full scan. The generic
+    /// `ObjectStore` stream is consumed to EOF, every retained key and size is
+    /// validated, duplicate typed identities are rejected, and only then is
+    /// the complete result sorted. Encountering object `max_objects + 1`
+    /// fails before that entry is retained or any larger result is allocated.
+    pub async fn list_all_v1_bounded(
+        &self,
+        max_objects: usize,
+    ) -> Result<Vec<ManifestObjectSummary>, ManifestStoreError> {
+        if !(1..=MAX_MANIFEST_FULL_SCAN_RESULTS).contains(&max_objects) {
+            return Err(ManifestStoreError::InvalidListLimit {
+                requested: max_objects,
+                max: MAX_MANIFEST_FULL_SCAN_RESULTS,
+            });
+        }
+
+        let list_prefix = Path::from(format!("{}/v1", self.prefix));
+        let mut stream = self.backend.list(Some(&list_prefix));
+        let mut objects = Vec::with_capacity(max_objects);
+        let mut seen = BTreeSet::new();
+        while let Some(meta) = stream
+            .try_next()
+            .await
+            .map_err(|error| map_object_store_error(error, "list", None))?
+        {
+            if objects.len() == max_objects {
+                return Err(ManifestStoreError::ListResultLimitExceeded { max: max_objects });
+            }
+            let id = self.parse_object_key_v1(&meta.location).ok_or(
+                ManifestStoreError::CorruptRead {
+                    id: None,
+                    kind: CorruptReadKind::UnexpectedObjectKey,
+                },
+            )?;
+            if meta.size == 0 {
+                return Err(ManifestStoreError::corrupt(
+                    id,
+                    CorruptReadKind::EmptyObject,
+                ));
+            }
+            if meta.size > MAX_MANIFEST_OBJECT_BYTES as u64 {
+                return Err(ManifestStoreError::corrupt(
+                    id,
+                    CorruptReadKind::OversizedObject { actual: meta.size },
+                ));
+            }
+            if !seen.insert(id) {
+                return Err(ManifestStoreError::CorruptRead {
+                    id: None,
+                    kind: CorruptReadKind::DuplicateObjectIdentity,
+                });
+            }
+            objects.push(ManifestObjectSummary {
+                id,
+                encoded_bytes: meta.size,
+            });
+        }
+        objects.sort_unstable_by_key(|object| object.id);
+        Ok(objects)
     }
 
     fn with_backend(backend: Arc<dyn ObjectStore>, prefix: String) -> Self {
