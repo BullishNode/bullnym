@@ -21,6 +21,8 @@ KEEP=0
 STARTED=0
 RUN_IGNORED=0
 LOCKED=0
+BULLNYM_CARGO_SERIALIZED_WRAPPER="${BULLNYM_CARGO_SERIALIZED_WRAPPER:-}"
+BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
@@ -240,7 +242,16 @@ run_integration_suite() {
     args+=(-- --test-threads=1)
   fi
   echo "test-db: running serial integration suite against $database"
-  TEST_DATABASE_URL="$(db_url "$database")" cargo "${args[@]}"
+  if [[ -n "$BULLNYM_CARGO_SERIALIZED_WRAPPER" || -n "$BULLNYM_CARGO_SERIALIZED_LANE" ]]; then
+    [[ -x "$BULLNYM_CARGO_SERIALIZED_WRAPPER" ]] \
+      || die "BULLNYM_CARGO_SERIALIZED_WRAPPER must be executable"
+    [[ -n "$BULLNYM_CARGO_SERIALIZED_LANE" ]] \
+      || die "BULLNYM_CARGO_SERIALIZED_LANE is required with the wrapper"
+    TEST_DATABASE_URL="$(db_url "$database")" \
+      "$BULLNYM_CARGO_SERIALIZED_WRAPPER" "$BULLNYM_CARGO_SERIALIZED_LANE" "${args[@]}"
+  else
+    TEST_DATABASE_URL="$(db_url "$database")" cargo "${args[@]}"
+  fi
 }
 
 docker exec "$CONTAINER" \
