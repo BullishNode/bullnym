@@ -5,6 +5,8 @@ pool_size = 5
 [boltz]
 api_url = "https://api.boltz.exchange/v2"
 electrum_url = "les.bullbitcoin.com:995"
+# Increment only when intentionally rotating the swap-key master seed.
+key_epoch = 1
 
 [features]
 lightning_address = true

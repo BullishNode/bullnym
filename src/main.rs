@@ -316,43 +316,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unverifiable or rewound lineage closes only new swap admission while
     // HTTP and existing-obligation recovery remain available. The periodic
     // supervised check below updates the same fail-closed fact. See
-    // derivation_guard and migration 044.
+    // derivation_guard and migrations 044/050.
     let swap_key_root_fingerprint = boltz
         .derivation_root_fingerprint()
         .map_err(|e| format!("swap key fingerprint derivation failed: {e}"))?;
     tracing::info!(
         fingerprint = %swap_key_root_fingerprint,
+        key_epoch = config.boltz.key_epoch,
+        derivation_scheme_version = db::DERIVATION_SCHEME_VERSION,
         "swap key derivation fingerprint computed"
     );
-    let swap_key_lineage_safe =
-        match derivation_guard::check_rollback(&pool, &swap_key_root_fingerprint).await {
-            Ok(true) => {
-                tracing::error!(
-                    event = "swap_key_sequence_rollback",
-                    fingerprint = %swap_key_root_fingerprint,
-                    "swap_key_seq would next issue an index that is already persisted \
-                     on a swap — the key sequence may have been rewound by a database \
-                     restore. New swap admission is closed; restore the correct backup \
-                     or advance swap_key_seq past the highest persisted index."
-                );
-                false
-            }
-            Ok(false) => {
-                tracing::info!(
-                    event = "swap_key_sequence_ok",
-                    "swap key sequence is ahead of all persisted indices"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::error!(
-                    event = "swap_key_sequence_check_failed",
-                    error = %e,
-                    "swap-key lineage could not be verified; new swap admission is closed"
-                );
-                false
-            }
-        };
+    let swap_key_lineage_safe = match derivation_guard::check_rollback(
+        &pool,
+        &swap_key_root_fingerprint,
+        config.boltz.key_epoch,
+        db::DERIVATION_SCHEME_VERSION,
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::error!(
+                event = "swap_key_sequence_rollback",
+                fingerprint = %swap_key_root_fingerprint,
+                "swap_key_seq would next issue an index that is already durably reserved \
+                 or attached to a legacy swap — the sequence may have been rewound by a database \
+                 restore. New swap admission is closed; restore the correct backup \
+                 or advance swap_key_seq past the highest persisted index."
+            );
+            false
+        }
+        Ok(false) => {
+            tracing::info!(
+                event = "swap_key_sequence_ok",
+                "swap key sequence is ahead of all durable allocations and legacy indices"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "swap_key_sequence_check_failed",
+                error = %e,
+                "swap-key lineage could not be verified; new swap admission is closed"
+            );
+            false
+        }
+    };
     let swap_key_root_fingerprint = Arc::new(swap_key_root_fingerprint);
 
     let admission = admission::MoneyAdmission::new(
@@ -405,6 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let pool = pool.clone();
         let fingerprint = swap_key_root_fingerprint.clone();
+        let key_epoch = state.config.boltz.key_epoch;
         let mut lineage_reporter = state.admission.swap_key_lineage_reporter();
         let cancel_lineage = cancel.clone();
         tokio::spawn(async move {
@@ -418,7 +427,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     },
                     _ = tick.tick() => {
-                        match derivation_guard::check_rollback(&pool, fingerprint.as_str()).await {
+                        match derivation_guard::check_rollback(
+                            &pool,
+                            fingerprint.as_str(),
+                            key_epoch,
+                            db::DERIVATION_SCHEME_VERSION,
+                        ).await {
                             Ok(rollback_detected) => {
                                 lineage_reporter.observed_safe(!rollback_detected);
                             }

@@ -51,7 +51,7 @@ pub struct AppState {
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
     /// Fingerprint of the swap-key master seed (see [`derivation_guard`] and
-    /// migration 044). Persisted with each new swap so a rewound key sequence
-    /// is detectable on the next startup.
+    /// migrations 044/050). Persisted in the allocation registry before each
+    /// provider call so a rewound key sequence is detectable even for orphans.
     pub swap_key_root_fingerprint: Arc<String>,
 }

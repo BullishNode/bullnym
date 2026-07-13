@@ -385,6 +385,23 @@ pub(crate) async fn create_lightning_swap(
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
+    let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+    let claim_public_key_hex = derived_key.public_key_hex();
+    let preimage_hash_hex = derived_key.preimage_hash_hex();
+    let key_allocation_id = db::reserve_swap_key_allocation(
+        &state.db,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: swap_key_index as i64,
+            purpose: db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: Some(&preimage_hash_hex),
+        },
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
 
     let metadata_str = build_metadata(nym, &state.config.domain);
     let description_hash_hex = hex::encode(Sha256::digest(metadata_str.as_bytes()));
@@ -393,12 +410,7 @@ pub(crate) async fn create_lightning_swap(
     // the descriptor index at claim time. See docs/lud-22-vs-mrh-research.md.
     let result = state
         .boltz
-        .create_reverse_swap(
-            swap_key_index,
-            amount_sat,
-            None,
-            Some(&description_hash_hex),
-        )
+        .create_reverse_swap(derived_key, amount_sat, None, Some(&description_hash_hex))
         .await?;
 
     let preimage_hex = hex::encode(&result.preimage);
@@ -406,7 +418,7 @@ pub(crate) async fn create_lightning_swap(
     let boltz_response_json = serde_json::to_string(&result.boltz_response)
         .map_err(|e| AppError::BoltzError(format!("failed to serialize boltz response: {e}")))?;
 
-    db::record_swap(
+    db::record_swap_with_lineage(
         &state.db,
         &db::NewSwapRecord {
             nym: Some(nym),
@@ -422,6 +434,13 @@ pub(crate) async fn create_lightning_swap(
             invoice_id: None,
             key_index: Some(swap_key_index as i64),
             root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
+        },
+        &db::ReverseSwapLineage {
+            allocation_id: key_allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
         },
     )
     .await

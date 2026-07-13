@@ -1,5 +1,6 @@
 # Operations
 
+- [Swap-key lineage and recovery](swap-key-lineage.md)
 - [Configuration](configuration.md)
 - [Deployment](deployment.md)
 - [Monitoring](monitoring.md)

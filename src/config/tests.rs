@@ -171,6 +171,7 @@ fn production_base_config() -> Config {
         boltz: BoltzConfig {
             api_url: "https://api.boltz.exchange/v2".to_string(),
             electrum_url: "ssl://liquid-electrum.example.com:50002".to_string(),
+            key_epoch: 1,
         },
         pricer: PricerConfig::default(),
         pwa: PwaConfig::default(),
@@ -203,6 +204,23 @@ fn direct_payment_finality_defaults_and_overrides_are_explicit() {
     let liquid: LiquidWatcherConfig = toml::from_str("finality_confirmations = 5").unwrap();
     assert_eq!(bitcoin.confirmations_required, 4);
     assert_eq!(liquid.finality_confirmations, 5);
+}
+
+#[test]
+fn swap_key_epoch_defaults_to_one_and_must_be_positive() {
+    let boltz: BoltzConfig = toml::from_str(
+        r#"
+api_url = "https://api.boltz.exchange/v2"
+electrum_url = "ssl://liquid-electrum.example.com:50002"
+"#,
+    )
+    .unwrap();
+    assert_eq!(boltz.key_epoch, 1);
+
+    let mut cfg = production_base_config();
+    cfg.boltz.key_epoch = 0;
+    let error = cfg.validate_for_runtime("development", false).unwrap_err();
+    assert!(error.to_string().contains("boltz.key_epoch"));
 }
 
 #[test]

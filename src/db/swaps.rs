@@ -161,9 +161,28 @@ pub struct NewSwapRecord<'a> {
     pub root_fingerprint: Option<&'a str>,
 }
 
+pub struct ReverseSwapLineage<'a> {
+    pub allocation_id: Uuid,
+    pub key_epoch: i32,
+    pub derivation_scheme_version: i32,
+    pub claim_public_key_hex: &'a str,
+    pub preimage_hash_hex: &'a str,
+}
+
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    record_swap_in_tx(&mut tx, swap).await?;
+    insert_swap_in_tx(&mut tx, swap, None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn record_swap_with_lineage(
+    pool: &PgPool,
+    swap: &NewSwapRecord<'_>,
+    lineage: &ReverseSwapLineage<'_>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    insert_swap_in_tx(&mut tx, swap, Some(lineage)).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -176,12 +195,30 @@ pub async fn record_swap_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     swap: &NewSwapRecord<'_>,
 ) -> Result<(), sqlx::Error> {
+    insert_swap_in_tx(tx, swap, None).await
+}
+
+pub async fn record_swap_in_tx_with_lineage(
+    tx: &mut Transaction<'_, Postgres>,
+    swap: &NewSwapRecord<'_>,
+    lineage: &ReverseSwapLineage<'_>,
+) -> Result<(), sqlx::Error> {
+    insert_swap_in_tx(tx, swap, Some(lineage)).await
+}
+
+async fn insert_swap_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    swap: &NewSwapRecord<'_>,
+    lineage: Option<&ReverseSwapLineage<'_>>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
           preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id, \
-          key_index, root_fingerprint) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12)",
+          key_index, root_fingerprint, key_allocation_id, key_epoch, \
+          derivation_scheme_version, claim_public_key_hex, preimage_hash_hex) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12, \
+                 $13, $14, $15, $16, $17)",
     )
     .bind(swap.nym)
     .bind(swap.boltz_swap_id)
@@ -195,6 +232,11 @@ pub async fn record_swap_in_tx(
     .bind(swap.invoice_id)
     .bind(swap.key_index)
     .bind(swap.root_fingerprint)
+    .bind(lineage.map(|lineage| lineage.allocation_id))
+    .bind(lineage.map(|lineage| lineage.key_epoch))
+    .bind(lineage.map(|lineage| lineage.derivation_scheme_version))
+    .bind(lineage.map(|lineage| lineage.claim_public_key_hex))
+    .bind(lineage.map(|lineage| lineage.preimage_hash_hex))
     .execute(&mut **tx)
     .await?;
     if let Some(nym) = swap.nym {

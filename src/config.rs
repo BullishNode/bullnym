@@ -185,6 +185,15 @@ fn default_payment_grace_secs() -> u64 {
 pub struct BoltzConfig {
     pub api_url: String,
     pub electrum_url: String,
+    /// Operator-controlled generation of the swap-key root. Increment when
+    /// intentionally rotating the master key; historical rows retain their
+    /// persisted epoch. Must be positive.
+    #[serde(default = "default_swap_key_epoch")]
+    pub key_epoch: i32,
+}
+
+fn default_swap_key_epoch() -> i32 {
+    1
 }
 
 // --- Claim retry policy ---
@@ -1374,6 +1383,9 @@ impl Config {
     }
 
     fn validate_common(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.boltz.key_epoch <= 0 {
+            return Err("boltz.key_epoch must be > 0".into());
+        }
         if self.limits.min_sendable_msat > self.limits.max_sendable_msat {
             return Err("min_sendable_msat must be <= max_sendable_msat".into());
         }

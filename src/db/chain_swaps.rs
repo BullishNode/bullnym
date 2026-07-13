@@ -112,6 +112,16 @@ pub struct NewChainSwapRecord<'a> {
     pub root_fingerprint: Option<&'a str>,
 }
 
+pub struct ChainSwapLineage<'a> {
+    pub claim_allocation_id: Uuid,
+    pub refund_allocation_id: Uuid,
+    pub key_epoch: i32,
+    pub derivation_scheme_version: i32,
+    pub claim_public_key_hex: &'a str,
+    pub refund_public_key_hex: &'a str,
+    pub preimage_hash_hex: &'a str,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct ChainSwapRecord {
     pub id: Uuid,
@@ -199,13 +209,39 @@ pub async fn record_chain_swap(
     pool: &PgPool,
     swap: &NewChainSwapRecord<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(pool, swap, None).await
+}
+
+pub async fn record_chain_swap_with_lineage(
+    pool: &PgPool,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(pool, swap, Some(lineage)).await
+}
+
+pub async fn record_chain_swap_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(&mut **tx, swap, None).await
+}
+
+async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: Option<&ChainSwapLineage<'_>>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "INSERT INTO chain_swap_records \
              (invoice_id, nym, boltz_swap_id, from_chain, to_chain, lockup_address, lockup_bip21, \
               user_lock_amount_sat, server_lock_amount_sat, preimage_hex, claim_key_hex, \
               refund_key_hex, boltz_response_json, claim_key_index, refund_key_index, \
-              root_fingerprint) \
-         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+              root_fingerprint, claim_key_allocation_id, refund_key_allocation_id, \
+              key_epoch, derivation_scheme_version, claim_public_key_hex, \
+              refund_public_key_hex, preimage_hash_hex) \
+         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                 $15, $16, $17, $18, $19, $20, $21) \
          RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
     ))
     .bind(swap.invoice_id)
@@ -222,7 +258,14 @@ pub async fn record_chain_swap(
     .bind(swap.claim_key_index)
     .bind(swap.refund_key_index)
     .bind(swap.root_fingerprint)
-    .fetch_one(pool)
+    .bind(lineage.map(|lineage| lineage.claim_allocation_id))
+    .bind(lineage.map(|lineage| lineage.refund_allocation_id))
+    .bind(lineage.map(|lineage| lineage.key_epoch))
+    .bind(lineage.map(|lineage| lineage.derivation_scheme_version))
+    .bind(lineage.map(|lineage| lineage.claim_public_key_hex))
+    .bind(lineage.map(|lineage| lineage.refund_public_key_hex))
+    .bind(lineage.map(|lineage| lineage.preimage_hash_hex))
+    .fetch_one(executor)
     .await
 }
 

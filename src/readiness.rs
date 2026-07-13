@@ -18,6 +18,7 @@ type DirectLifecyclePrivileges = (
 );
 
 type WatcherLanePrivileges = (Option<bool>, Option<bool>, Option<bool>);
+type SwapKeyLineagePrivileges = (Option<bool>, Option<bool>, Option<bool>);
 
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
@@ -115,7 +116,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// HTTP readiness endpoint reuses the same predicate so deploy and runtime
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-    if !schema_marker_present(pool).await? {
+    if !schema_marker_present(pool).await? || !swap_key_lineage_invariants_present(pool).await? {
         return Ok(false);
     }
 
@@ -192,9 +193,138 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     .fetch_one(pool)
     .await?;
 
+    let swap_key_lineage_privileges = sqlx::query_as::<_, SwapKeyLineagePrivileges>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.swap_key_allocations'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.swap_key_allocations'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.swap_key_legacy_high_water'), \
+                'SELECT' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
     Ok(journal_privileges_ready(privileges)
         && direct_lifecycle_privileges_ready(direct_lifecycle_privileges)
-        && watcher_lane_privileges_ready(watcher_lane_privileges))
+        && watcher_lane_privileges_ready(watcher_lane_privileges)
+        && swap_key_lineage_privileges_ready(swap_key_lineage_privileges))
+}
+
+/// Migration 050 is a safety boundary, not merely an additive table marker.
+/// Verify every database invariant that prevents swap-key reuse or mutable
+/// lineage. Trigger checks include the owning table, function, timing, event,
+/// row scope, and enabled state via PostgreSQL's exact `tgtype` bitmask.
+async fn swap_key_lineage_invariants_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT \
+            NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('swap_key_allocations', 'swap_key_allocations_root_fingerprint_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_key_epoch_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_scheme_version_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_child_index_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_purpose_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_public_key_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_preimage_hash_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_preimage_purpose_check', 'c'), \
+                    ('swap_key_allocations', 'swap_key_allocations_derivation_identity_key', 'u'), \
+                    ('swap_key_allocations', 'swap_key_allocations_public_key_key', 'u'), \
+                    ('swap_key_legacy_high_water', 'swap_key_legacy_high_water_pkey', 'p'), \
+                    ('swap_key_legacy_high_water', 'swap_key_legacy_high_water_root_fingerprint_check', 'c'), \
+                    ('swap_key_legacy_high_water', 'swap_key_legacy_high_water_max_child_index_check', 'c'), \
+                    ('swap_records', 'swap_records_key_allocation_id_fkey', 'f'), \
+                    ('swap_records', 'swap_records_lineage_shape_check', 'c'), \
+                    ('swap_records', 'swap_records_lineage_epoch_check', 'c'), \
+                    ('swap_records', 'swap_records_lineage_scheme_check', 'c'), \
+                    ('swap_records', 'swap_records_claim_public_key_check', 'c'), \
+                    ('swap_records', 'swap_records_preimage_hash_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_claim_key_allocation_id_fkey', 'f'), \
+                    ('chain_swap_records', 'chain_swap_records_refund_key_allocation_id_fkey', 'f'), \
+                    ('chain_swap_records', 'chain_swap_records_lineage_shape_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_lineage_epoch_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_lineage_scheme_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_claim_public_key_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_refund_public_key_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_preimage_hash_check', 'c') \
+                ) AS required(table_name, constraint_name, constraint_type) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_constraint c \
+                    JOIN pg_class relation ON relation.oid = c.conrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                    WHERE namespace.nspname = 'public' \
+                      AND relation.relname = required.table_name \
+                      AND c.conname = required.constraint_name \
+                      AND c.contype::TEXT = required.constraint_type \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('swap_key_allocations', 'swap_key_allocations_preimage_hash_key'), \
+                    ('swap_records', 'swap_records_key_allocation_id_key'), \
+                    ('chain_swap_records', 'chain_swap_records_claim_key_allocation_id_key'), \
+                    ('chain_swap_records', 'chain_swap_records_refund_key_allocation_id_key'), \
+                    ('swap_records', 'swap_records_fingerprint_key_index_key'), \
+                    ('chain_swap_records', 'chain_swap_records_fingerprint_claim_index_key'), \
+                    ('chain_swap_records', 'chain_swap_records_fingerprint_refund_index_key') \
+                ) AS required(table_name, index_name) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_index i \
+                    JOIN pg_class index_relation ON index_relation.oid = i.indexrelid \
+                    JOIN pg_class table_relation ON table_relation.oid = i.indrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = table_relation.relnamespace \
+                    WHERE namespace.nspname = 'public' \
+                      AND table_relation.relname = required.table_name \
+                      AND index_relation.relname = required.index_name \
+                      AND i.indisunique \
+                      AND i.indisvalid \
+                      AND i.indpred IS NOT NULL \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('swap_key_allocations', 'swap_key_allocations_validate_legacy_high_water', 'validate_swap_key_allocation_against_legacy', 7), \
+                    ('swap_key_allocations', 'swap_key_allocations_reject_update', 'reject_swap_key_allocation_mutation', 19), \
+                    ('swap_key_allocations', 'swap_key_allocations_reject_delete', 'reject_swap_key_allocation_mutation', 11), \
+                    ('swap_key_legacy_high_water', 'swap_key_legacy_high_water_reject_update', 'reject_swap_key_legacy_high_water_mutation', 19), \
+                    ('swap_key_legacy_high_water', 'swap_key_legacy_high_water_reject_delete', 'reject_swap_key_legacy_high_water_mutation', 11), \
+                    ('swap_records', 'swap_records_validate_lineage', 'validate_reverse_swap_key_lineage', 23), \
+                    ('chain_swap_records', 'chain_swap_records_validate_lineage', 'validate_chain_swap_key_lineage', 23), \
+                    ('swap_records', 'swap_records_reject_lineage_update', 'reject_swap_record_lineage_mutation', 19), \
+                    ('chain_swap_records', 'chain_swap_records_reject_lineage_update', 'reject_chain_swap_record_lineage_mutation', 19) \
+                ) AS required(table_name, trigger_name, function_name, trigger_type) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_trigger trg \
+                    JOIN pg_class relation ON relation.oid = trg.tgrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                    JOIN pg_proc proc ON proc.oid = trg.tgfoid \
+                    WHERE namespace.nspname = 'public' \
+                      AND relation.relname = required.table_name \
+                      AND trg.tgname = required.trigger_name \
+                      AND proc.proname = required.function_name \
+                      AND trg.tgtype = required.trigger_type::SMALLINT \
+                      AND NOT trg.tgisinternal \
+                      AND trg.tgenabled IN ('O', 'A') \
+                ) \
+            )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 fn journal_privileges_ready(
@@ -224,6 +354,15 @@ fn direct_lifecycle_privileges_ready(
 fn watcher_lane_privileges_ready((select, insert, update): WatcherLanePrivileges) -> bool {
     matches!(
         (select, insert, update),
+        (Some(true), Some(true), Some(true))
+    )
+}
+
+fn swap_key_lineage_privileges_ready(
+    (allocation_select, allocation_insert, high_water_select): SwapKeyLineagePrivileges,
+) -> bool {
+    matches!(
+        (allocation_select, allocation_insert, high_water_select),
         (Some(true), Some(true), Some(true))
     )
 }
@@ -476,6 +615,62 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND t.tgname = 'invoice_payment_event_compatibility_insert_classifier' \
                   AND NOT t.tgisinternal \
                   AND t.tgenabled IN ('O', 'A') \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'swap_key_allocations' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'swap_key_allocations' \
+                  AND c.conname = 'swap_key_allocations_derivation_identity_key' \
+                  AND c.contype = 'u' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'swap_records' \
+                  AND column_name = 'key_allocation_id' \
+                  AND is_nullable = 'YES' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name = 'refund_key_allocation_id' \
+                  AND is_nullable = 'YES' \
+            ) \
+            AND ( \
+                SELECT COUNT(*) FROM pg_indexes \
+                WHERE schemaname = 'public' \
+                  AND indexname IN ( \
+                      'swap_records_key_allocation_id_key', \
+                      'chain_swap_records_claim_key_allocation_id_key', \
+                      'chain_swap_records_refund_key_allocation_id_key' \
+                  ) \
+            ) = 3 \
+            AND ( \
+                SELECT COUNT(*) FROM pg_indexes \
+                WHERE schemaname = 'public' \
+                  AND indexname IN ( \
+                      'swap_records_fingerprint_key_index_key', \
+                      'chain_swap_records_fingerprint_claim_index_key', \
+                      'chain_swap_records_fingerprint_refund_index_key' \
+                  ) \
+            ) = 3 \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_trigger t \
+                JOIN pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND c.relname = 'swap_key_allocations' \
+                  AND t.tgname = 'swap_key_allocations_reject_update' \
+                  AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
             )",
     )
     .fetch_one(pool)
@@ -485,7 +680,8 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_lifecycle_privileges_ready, journal_privileges_ready, watcher_lane_privileges_ready,
+        direct_lifecycle_privileges_ready, journal_privileges_ready,
+        swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
     };
 
     #[test]
@@ -548,5 +744,34 @@ mod tests {
         ] {
             assert!(!watcher_lane_privileges_ready(privileges));
         }
+    }
+
+    #[test]
+    fn swap_key_lineage_requires_allocation_write_and_high_water_read_privileges() {
+        assert!(swap_key_lineage_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+        assert!(!swap_key_lineage_privileges_ready((
+            Some(false),
+            Some(true),
+            Some(true),
+        )));
+        assert!(!swap_key_lineage_privileges_ready((
+            Some(true),
+            Some(false),
+            Some(true),
+        )));
+        assert!(!swap_key_lineage_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(false),
+        )));
+        assert!(!swap_key_lineage_privileges_ready((
+            None,
+            Some(true),
+            Some(true),
+        )));
     }
 }

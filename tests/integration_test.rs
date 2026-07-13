@@ -96,6 +96,7 @@ fn test_config() -> Config {
         boltz: BoltzConfig {
             api_url: "http://127.0.0.1:1".to_string(),
             electrum_url: "blockstream.info:995".to_string(),
+            key_epoch: 1,
         },
         pricer: PricerConfig::default(),
         pwa: PwaConfig::default(),
@@ -557,12 +558,51 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Allocation rows are deliberately immutable to normal UPDATE/DELETE;
+    // test isolation uses DDL after every referencing swap row is gone.
+    sqlx::query("TRUNCATE swap_key_allocations CASCADE")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("TRUNCATE swap_key_legacy_high_water")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM invoices").execute(pool).await.ok();
     sqlx::query("DELETE FROM donation_pages")
         .execute(pool)
         .await
         .ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
+}
+
+/// Seed a row that deliberately models a database created before migration
+/// 050. Production inserts must never use this path: migration 050 rejects
+/// every new swap without allocation lineage. `session_replication_role` is
+/// transaction-local and available only to the isolated test database owner.
+async fn record_pre_050_reverse_fixture(
+    pool: &PgPool,
+    swap: &pay_service::db::NewSwapRecord<'_>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await?;
+    pay_service::db::record_swap_in_tx(&mut tx, swap).await?;
+    tx.commit().await
+}
+
+async fn record_pre_050_chain_fixture(
+    pool: &PgPool,
+    swap: &pay_service::db::NewChainSwapRecord<'_>,
+) -> Result<pay_service::db::ChainSwapRecord, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await?;
+    let row = pay_service::db::record_chain_swap_in_tx(&mut tx, swap).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -816,9 +856,9 @@ async fn readiness_rejects_schema_before_latest_migration() {
     cleanup_db(&pool).await;
 
     sqlx::query(
-        "ALTER TABLE watcher_lane_progress RENAME CONSTRAINT \
-         watcher_lane_progress_cursor_shape_check \
-         TO watcher_lane_progress_cursor_shape_check_before_readiness_test",
+        "ALTER TABLE swap_key_allocations RENAME CONSTRAINT \
+         swap_key_allocations_derivation_identity_key \
+         TO swap_key_allocations_derivation_identity_key_before_readiness_test",
     )
     .execute(&pool)
     .await
@@ -828,9 +868,9 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
-        "ALTER TABLE watcher_lane_progress RENAME CONSTRAINT \
-         watcher_lane_progress_cursor_shape_check_before_readiness_test \
-         TO watcher_lane_progress_cursor_shape_check",
+        "ALTER TABLE swap_key_allocations RENAME CONSTRAINT \
+         swap_key_allocations_derivation_identity_key_before_readiness_test \
+         TO swap_key_allocations_derivation_identity_key",
     )
     .execute(&pool)
     .await
@@ -840,13 +880,849 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "049_watcher_lane_progress"
+        "050_swap_key_lineage"
     );
 
     let app = test_app(test_state(pool.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+
+    // A nonredundant immutability member is part of the marker too: retaining
+    // the tables and unique constraints is not enough if an allocation can be
+    // deleted and its single-use identity freed.
+    sqlx::query(
+        "ALTER TABLE swap_key_allocations DISABLE TRIGGER swap_key_allocations_reject_delete",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let (missing_delete_guard_status, missing_delete_guard_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE swap_key_allocations ENABLE TRIGGER swap_key_allocations_reject_delete",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(missing_delete_guard_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_delete_guard_body["ready"], false);
+
+    let app = test_app(test_state(pool.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
+    assert_eq!(restored_body["ready"], true);
+}
+
+#[tokio::test]
+async fn swap_key_registry_is_global_concurrent_and_immutable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let single_use_indexes: (bool, bool, bool) = sqlx::query_as(
+        "SELECT \
+            (SELECT indisunique FROM pg_index \
+              WHERE indexrelid = 'swap_records_key_allocation_id_key'::regclass), \
+            (SELECT indisunique FROM pg_index \
+              WHERE indexrelid = 'chain_swap_records_claim_key_allocation_id_key'::regclass), \
+            (SELECT indisunique FROM pg_index \
+              WHERE indexrelid = 'chain_swap_records_refund_key_allocation_id_key'::regclass)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(single_use_indexes, (true, true, true));
+
+    let root = "1111111111111111";
+    let first_public = format!("02{}", "11".repeat(32));
+    let first_hash = "aa".repeat(32);
+    let first_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_000,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &first_public,
+            preimage_hash_hex: Some(&first_hash),
+        },
+    )
+    .await
+    .unwrap();
+
+    let cross_purpose = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_000,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &format!("03{}", "22".repeat(32)),
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        cross_purpose
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23505")
+    );
+
+    // Epoch is an operational generation label, not part of the key
+    // derivation itself. Re-labeling the same root/index under another epoch
+    // must still fail on the globally unique derived public key.
+    let epoch_only_hash = "ac".repeat(32);
+    let epoch_only_reuse = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_000,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &first_public,
+            preimage_hash_hex: Some(&epoch_only_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        epoch_only_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_public_key_key")
+    );
+
+    let concurrent_public = format!("02{}", "33".repeat(32));
+    let concurrent_hash = "bb".repeat(32);
+    let reserve = |pool: PgPool| {
+        let concurrent_public = concurrent_public.clone();
+        let concurrent_hash = concurrent_hash.clone();
+        async move {
+            pay_service::db::reserve_swap_key_allocation(
+                &pool,
+                &pay_service::db::NewSwapKeyAllocation {
+                    root_fingerprint: root,
+                    key_epoch: 1,
+                    derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                    child_index: 8_001,
+                    purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+                    public_key_hex: &concurrent_public,
+                    preimage_hash_hex: Some(&concurrent_hash),
+                },
+            )
+            .await
+        }
+    };
+    let (left, right) = tokio::join!(reserve(pool.clone()), reserve(pool.clone()));
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let concurrent_error = left.err().or_else(|| right.err()).unwrap();
+    assert_eq!(
+        concurrent_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23505")
+    );
+
+    let mutation = sqlx::query("UPDATE swap_key_allocations SET child_index = 9000 WHERE id = $1")
+        .bind(first_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    let npub = "55".repeat(32);
+    pay_service::db::create_user(&pool, "lineageimmutable", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let reverse_preimage = "66".repeat(32);
+    let reverse_claim_key = "77".repeat(32);
+    pay_service::db::record_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: Some("lineageimmutable"),
+            boltz_swap_id: "LINEAGE_IMMUTABLE_REVERSE",
+            address: None,
+            address_index: None,
+            amount_sat: 8_000,
+            invoice: "lnbc-lineage-immutable",
+            preimage_hex: &reverse_preimage,
+            claim_key_hex: &reverse_claim_key,
+            boltz_response_json: "{}",
+            invoice_id: None,
+            key_index: Some(8_000),
+            root_fingerprint: Some(root),
+        },
+        &pay_service::db::ReverseSwapLineage {
+            allocation_id: first_id,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &first_public,
+            preimage_hash_hex: &first_hash,
+        },
+    )
+    .await
+    .unwrap();
+    let reverse_reuse = pay_service::db::record_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: Some("lineageimmutable"),
+            boltz_swap_id: "LINEAGE_REUSED_REVERSE_ALLOCATION",
+            address: None,
+            address_index: None,
+            amount_sat: 8_000,
+            invoice: "lnbc-lineage-reused",
+            preimage_hex: &reverse_preimage,
+            claim_key_hex: &reverse_claim_key,
+            boltz_response_json: "{}",
+            invoice_id: None,
+            key_index: Some(8_000),
+            root_fingerprint: Some(root),
+        },
+        &pay_service::db::ReverseSwapLineage {
+            allocation_id: first_id,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &first_public,
+            preimage_hash_hex: &first_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        reverse_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_records_key_allocation_id_key") | Some("swap_records_fingerprint_key_index_key")
+    ));
+    sqlx::query("UPDATE swap_records SET status = 'lockup_mempool' WHERE boltz_swap_id = $1")
+        .bind("LINEAGE_IMMUTABLE_REVERSE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row_mutation =
+        sqlx::query("UPDATE swap_records SET key_epoch = 2 WHERE boltz_swap_id = $1")
+            .bind("LINEAGE_IMMUTABLE_REVERSE")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        row_mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    let reverse_delete = sqlx::query("DELETE FROM swap_records WHERE boltz_swap_id = $1")
+        .bind("LINEAGE_IMMUTABLE_REVERSE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reverse_delete.rows_affected(), 1);
+    let reverse_allocation_persisted: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM swap_key_allocations WHERE id = $1)")
+            .bind(first_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(reverse_allocation_persisted);
+    let post_purge_public = format!("03{}", "78".repeat(32));
+    let post_purge_hash = "79".repeat(32);
+    let post_purge_identity_reuse = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_000,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &post_purge_public,
+            preimage_hash_hex: Some(&post_purge_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        post_purge_identity_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_derivation_identity_key")
+    );
+
+    let chain_invoice = insert_test_invoice(
+        &pool,
+        "lineageimmutable",
+        &npub,
+        "lq1lineageimmutable",
+        3_600,
+    )
+    .await;
+    let chain_root = "3333333333333333";
+    let chain_claim_public = format!("02{}", "88".repeat(32));
+    let chain_refund_public = format!("03{}", "99".repeat(32));
+    let chain_hash = "cc".repeat(32);
+    let chain_claim_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_100,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &chain_claim_public,
+            preimage_hash_hex: Some(&chain_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let chain_refund_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_101,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &chain_refund_public,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let chain_preimage = "dd".repeat(32);
+    let chain_claim_key = "ee".repeat(32);
+    let chain_refund_key = "ff".repeat(32);
+    pay_service::db::record_chain_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: chain_invoice.id,
+            nym: Some("lineageimmutable"),
+            boltz_swap_id: "LINEAGE_IMMUTABLE_CHAIN",
+            lockup_address: "bc1qlineageimmutable",
+            lockup_bip21: None,
+            user_lock_amount_sat: 8_200,
+            server_lock_amount_sat: 8_000,
+            preimage_hex: &chain_preimage,
+            claim_key_hex: &chain_claim_key,
+            refund_key_hex: &chain_refund_key,
+            boltz_response_json: "{}",
+            claim_key_index: Some(8_100),
+            refund_key_index: Some(8_101),
+            root_fingerprint: Some(chain_root),
+        },
+        &pay_service::db::ChainSwapLineage {
+            claim_allocation_id: chain_claim_id,
+            refund_allocation_id: chain_refund_id,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &chain_claim_public,
+            refund_public_key_hex: &chain_refund_public,
+            preimage_hash_hex: &chain_hash,
+        },
+    )
+    .await
+    .unwrap();
+    let alternate_refund_public = format!("02{}", "ab".repeat(32));
+    let alternate_refund_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_102,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &alternate_refund_public,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let reused_claim = pay_service::db::record_chain_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: chain_invoice.id,
+            nym: Some("lineageimmutable"),
+            boltz_swap_id: "LINEAGE_REUSED_CHAIN_CLAIM",
+            lockup_address: "bc1qlineagereusedclaim",
+            lockup_bip21: None,
+            user_lock_amount_sat: 8_200,
+            server_lock_amount_sat: 8_000,
+            preimage_hex: &chain_preimage,
+            claim_key_hex: &chain_claim_key,
+            refund_key_hex: &chain_refund_key,
+            boltz_response_json: "{}",
+            claim_key_index: Some(8_100),
+            refund_key_index: Some(8_102),
+            root_fingerprint: Some(chain_root),
+        },
+        &pay_service::db::ChainSwapLineage {
+            claim_allocation_id: chain_claim_id,
+            refund_allocation_id: alternate_refund_id,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &chain_claim_public,
+            refund_public_key_hex: &alternate_refund_public,
+            preimage_hash_hex: &chain_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        reused_claim
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_claim_key_allocation_id_key")
+            | Some("chain_swap_records_fingerprint_claim_index_key")
+    ));
+
+    let alternate_claim_public = format!("03{}", "bc".repeat(32));
+    let alternate_claim_hash = "de".repeat(32);
+    let alternate_claim_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_103,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &alternate_claim_public,
+            preimage_hash_hex: Some(&alternate_claim_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let reused_refund = pay_service::db::record_chain_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: chain_invoice.id,
+            nym: Some("lineageimmutable"),
+            boltz_swap_id: "LINEAGE_REUSED_CHAIN_REFUND",
+            lockup_address: "bc1qlineagereusedrefund",
+            lockup_bip21: None,
+            user_lock_amount_sat: 8_200,
+            server_lock_amount_sat: 8_000,
+            preimage_hex: &chain_preimage,
+            claim_key_hex: &chain_claim_key,
+            refund_key_hex: &chain_refund_key,
+            boltz_response_json: "{}",
+            claim_key_index: Some(8_103),
+            refund_key_index: Some(8_101),
+            root_fingerprint: Some(chain_root),
+        },
+        &pay_service::db::ChainSwapLineage {
+            claim_allocation_id: alternate_claim_id,
+            refund_allocation_id: chain_refund_id,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &alternate_claim_public,
+            refund_public_key_hex: &chain_refund_public,
+            preimage_hash_hex: &alternate_claim_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        reused_refund
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_refund_key_allocation_id_key")
+            | Some("chain_swap_records_fingerprint_refund_index_key")
+    ));
+    let persisted_chain_lineage: (String, String, String, String) = sqlx::query_as(
+        "SELECT claim_public_key_hex, refund_public_key_hex, preimage_hash_hex, \
+                key_epoch::TEXT \
+           FROM chain_swap_records WHERE boltz_swap_id = $1",
+    )
+    .bind("LINEAGE_IMMUTABLE_CHAIN")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_chain_lineage.0, chain_claim_public);
+    assert_eq!(persisted_chain_lineage.1, chain_refund_public);
+    assert_eq!(persisted_chain_lineage.2, chain_hash);
+    assert_eq!(persisted_chain_lineage.3, "2");
+    let chain_delete = sqlx::query("DELETE FROM chain_swap_records WHERE boltz_swap_id = $1")
+        .bind("LINEAGE_IMMUTABLE_CHAIN")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chain_delete.rows_affected(), 1);
+    let retained_chain_allocations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations WHERE id IN ($1, $2)")
+            .bind(chain_claim_id)
+            .bind(chain_refund_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_chain_allocations, 2);
+    let post_purge_chain_public = format!("02{}", "bd".repeat(32));
+    let post_purge_chain_hash = "df".repeat(32);
+    let post_purge_chain_identity_reuse = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_100,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &post_purge_chain_public,
+            preimage_hash_hex: Some(&post_purge_chain_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        post_purge_chain_identity_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_derivation_identity_key")
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn derivation_guard_covers_orphans_active_generation_rotation_and_legacy_rows() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let root = "4444444444444444";
+    let next = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let orphan_index = next + 5;
+    let orphan_public = format!("02{}", "41".repeat(32));
+    let orphan_hash = "42".repeat(32);
+    pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 7,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: orphan_index,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &orphan_public,
+            preimage_hash_hex: Some(&orphan_hash),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        pay_service::derivation_guard::check_rollback(
+            &pool,
+            root,
+            7,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "a rewound sequence missed a durable orphan allocation"
+    );
+    assert!(
+        !pay_service::derivation_guard::check_rollback(
+            &pool,
+            root,
+            8,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "an inactive epoch incorrectly closed the rotated generation"
+    );
+    assert!(
+        !pay_service::derivation_guard::check_rollback(
+            &pool,
+            "5555555555555555",
+            7,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "a different derivation root incorrectly closed admission"
+    );
+
+    // A coordinated rotation uses both a new root and a higher epoch. The same
+    // child number is a distinct derivation identity only because the secret
+    // root changed; both generations remain independently auditable.
+    let rotated_root = "5555555555555555";
+    let rotated_public = format!("03{}", "49".repeat(32));
+    let rotated_hash = "4a".repeat(32);
+    pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: rotated_root,
+            key_epoch: 8,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: orphan_index,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &rotated_public,
+            preimage_hash_hex: Some(&rotated_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let generations: Vec<(String, i32, i64)> = sqlx::query_as(
+        "SELECT root_fingerprint, key_epoch, child_index \
+           FROM swap_key_allocations \
+          WHERE child_index = $1 ORDER BY root_fingerprint",
+    )
+    .bind(orphan_index)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generations,
+        vec![
+            (root.to_string(), 7, orphan_index),
+            (rotated_root.to_string(), 8, orphan_index),
+        ]
+    );
+
+    sqlx::query("SELECT setval('swap_key_seq', $1, true)")
+        .bind(orphan_index)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !pay_service::derivation_guard::check_rollback(
+            &pool,
+            root,
+            7,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "guard did not recover after the sequence advanced past the orphan"
+    );
+    assert!(
+        !pay_service::derivation_guard::check_rollback(
+            &pool,
+            rotated_root,
+            8,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "the active rotated generation did not evaluate independently"
+    );
+
+    // Migration-044 rows remain a conservative bound even when queried under
+    // another epoch because their historical epoch was unknowable.
+    let npub = "43".repeat(32);
+    pay_service::db::create_user(&pool, "legacyguard", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let legacy_index = orphan_index + 10;
+    let legacy_preimage = "44".repeat(32);
+    let legacy_claim_key = "45".repeat(32);
+    let legacy_swap = pay_service::db::NewSwapRecord {
+        nym: Some("legacyguard"),
+        boltz_swap_id: "LEGACY_DERIVATION_GUARD",
+        address: None,
+        address_index: None,
+        amount_sat: 1_000,
+        invoice: "lnbc-legacy-guard",
+        preimage_hex: &legacy_preimage,
+        claim_key_hex: &legacy_claim_key,
+        boltz_response_json: "{}",
+        invoice_id: None,
+        key_index: Some(legacy_index),
+        root_fingerprint: Some(root),
+    };
+    let post_migration_legacy_insert = pay_service::db::record_swap(&pool, &legacy_swap)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        post_migration_legacy_insert
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    // Seed a true pre-050 row for upgrade-compatibility behavior.
+    record_pre_050_reverse_fixture(&pool, &legacy_swap)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO swap_key_legacy_high_water (root_fingerprint, max_child_index) \
+         VALUES ($1, $2)",
+    )
+    .bind(root)
+    .bind(legacy_index)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let legacy_public_key = format!("02{}", "46".repeat(32));
+    let legacy_hash = "47".repeat(32);
+    let legacy_reuse = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 99,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: legacy_index,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &legacy_public_key,
+            preimage_hash_hex: Some(&legacy_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        legacy_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_legacy_high_water")
+    );
+    let legacy_delete = sqlx::query("DELETE FROM swap_records WHERE boltz_swap_id = $1")
+        .bind("LEGACY_DERIVATION_GUARD")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy_delete.rows_affected(), 1);
+    assert_eq!(
+        pay_service::db::max_legacy_swap_key_index(&pool, root)
+            .await
+            .unwrap(),
+        Some(legacy_index)
+    );
+    let purged_legacy_public = format!("03{}", "4b".repeat(32));
+    let purged_legacy_hash = "4c".repeat(32);
+    let purged_legacy_reuse = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 100,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: legacy_index - 1,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &purged_legacy_public,
+            preimage_hash_hex: Some(&purged_legacy_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        purged_legacy_reuse
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_legacy_high_water")
+    );
+    assert!(
+        pay_service::derivation_guard::check_rollback(
+            &pool,
+            root,
+            99,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "legacy migration-044 lineage stopped protecting a rotated epoch"
+    );
+    sqlx::query("SELECT setval('swap_key_seq', $1, true)")
+        .bind(legacy_index)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!pay_service::derivation_guard::check_rollback(
+        &pool,
+        root,
+        99,
+        pay_service::db::DERIVATION_SCHEME_VERSION,
+    )
+    .await
+    .unwrap());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn derivation_guard_does_not_false_positive_during_concurrent_allocation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let root = "5656565656565656";
+    let expected_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    // Pause after every durable maximum is read but immediately before NEXT.
+    // With the unsafe sequence-first order, NEXT has already been sampled at
+    // this seam; with the safe order, the concurrent allocation advances it
+    // before the guard reads it.
+    let hook = pay_service::derivation_guard::install_derivation_guard_integration_test_hook(
+        root,
+        1,
+        pay_service::db::DERIVATION_SCHEME_VERSION,
+    );
+    assert!(
+        !pay_service::derivation_guard::check_rollback(
+            &pool,
+            "5757575757575757",
+            1,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+        .unwrap(),
+        "unrelated guard probe unexpectedly reported rollback"
+    );
+    let guard_pool = pool.clone();
+    let guard = tokio::spawn(async move {
+        pay_service::derivation_guard::check_rollback(
+            &guard_pool,
+            root,
+            1,
+            pay_service::db::DERIVATION_SCHEME_VERSION,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), hook.wait_until_reached())
+        .await
+        .expect("derivation guard did not reach the pre-sequence boundary");
+
+    let issued_index = pay_service::db::next_swap_key_index(&pool).await.unwrap();
+    assert_eq!(issued_index as i64, expected_index);
+    let public_key = format!("02{}", "57".repeat(32));
+    let preimage_hash = "58".repeat(32);
+    pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: issued_index as i64,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+
+    hook.release();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(2), guard)
+            .await
+            .expect("derivation guard remained blocked")
+            .expect("derivation guard task panicked")
+            .unwrap(),
+        "a normal concurrent allocation was misclassified as sequence rollback"
+    );
+
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]
@@ -2304,7 +3180,7 @@ async fn webhook_skips_terminal_swaps() {
         .await
         .unwrap();
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -2373,7 +3249,7 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     let npub = create_test_user(&pool, "reversewebhook").await;
     let invoice =
         insert_test_invoice(&pool, "reversewebhook", &npub, "lq1reversewebhook", 3_600).await;
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -2463,7 +3339,7 @@ async fn seed_claimable_reverse_pool_swap(
     boltz_response_json: &str,
     invoice_id: Option<uuid::Uuid>,
 ) -> uuid::Uuid {
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -2504,7 +3380,7 @@ async fn seed_claimable_chain_pool_swap(
     boltz_swap_id: &str,
     boltz_response_json: &str,
 ) -> uuid::Uuid {
-    let swap = pay_service::db::record_chain_swap(
+    let swap = record_pre_050_chain_fixture(
         pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -3055,7 +3931,7 @@ async fn terminal_and_unsupported_claims_do_not_prepare_or_allocate() {
     .unwrap();
 
     create_test_user(&admin, "claimpoolunsupportedreverse").await;
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &admin,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -3089,7 +3965,7 @@ async fn terminal_and_unsupported_claims_do_not_prepare_or_allocate() {
         3_600,
     )
     .await;
-    let chain = pay_service::db::record_chain_swap(
+    let chain = record_pre_050_chain_fixture(
         &admin,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -3186,7 +4062,7 @@ async fn webhook_advances_chain_swap_records() {
 
     let npub = create_test_user(&pool, "chainwebhook").await;
     let invoice = insert_test_invoice(&pool, "chainwebhook", &npub, "lq1chainwebhook", 60).await;
-    pay_service::db::record_chain_swap(
+    record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -3246,7 +4122,7 @@ async fn webhook_skips_terminal_chain_swap_records() {
 
     let npub = create_test_user(&pool, "chainterminal").await;
     let invoice = insert_test_invoice(&pool, "chainterminal", &npub, "lq1chainterminal", 60).await;
-    let row = pay_service::db::record_chain_swap(
+    let row = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -3673,7 +4549,7 @@ async fn lazy_lightning_offer_lock_contention_fails_fast_without_mutation_and_re
     // Seed a reusable offer so the post-contention request can prove the
     // ordinary idempotent path still works without depending on Boltz output.
     let bolt11 = fresh_bolt11(1_000);
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -3802,7 +4678,7 @@ async fn reusable_lightning_offer_progresses_with_one_pool_connection() {
         .unwrap();
 
     let bolt11 = fresh_bolt11(1_000);
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &admin,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -3830,23 +4706,36 @@ async fn reusable_lightning_offer_progresses_with_one_pool_connection() {
         .unwrap();
 
     let constrained = constrained_test_pool(1, None);
+    let backend_before: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&constrained)
+        .await
+        .unwrap();
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
     config.boltz.api_url = boltz_url;
     let app = test_app(test_state_with_config(constrained.clone(), config));
-    let (status, body) = tokio::time::timeout(
-        Duration::from_secs(2),
-        post_json(
-            &app,
-            &format!("/api/v1/invoices/{}/lightning", invoice.id),
-            json!({}),
-        ),
-    )
-    .await
-    .expect("offer reuse attempted a nested pool acquisition with one connection");
+    let path = format!("/api/v1/invoices/{}/lightning", invoice.id);
+    let (status, body) =
+        tokio::time::timeout(Duration::from_secs(2), post_json(&app, &path, json!({})))
+            .await
+            .expect("offer reuse attempted a nested pool acquisition with one connection");
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
+    let (second_status, second_body) =
+        tokio::time::timeout(Duration::from_secs(2), post_json(&app, &path, json!({})))
+            .await
+            .expect("second offer reuse did not return its connection to the pool");
+    assert_eq!(second_status, StatusCode::OK, "{second_body}");
+    assert_eq!(second_body["pr"], bolt11);
+    let backend_after: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&constrained)
+        .await
+        .unwrap();
+    assert_eq!(
+        backend_after, backend_before,
+        "successful cached-offer paths churned the physical PostgreSQL session"
+    );
     assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&admin)
@@ -3872,6 +4761,157 @@ async fn reusable_lightning_offer_progresses_with_one_pool_connection() {
 }
 
 #[tokio::test]
+async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let nym = "lazyoffercancelled";
+    let npub = create_test_user(&admin, nym).await;
+    let invoice = insert_test_invoice(&admin, nym, &npub, "lq1lazyoffercancelled", 3_600).await;
+    sqlx::query("UPDATE invoices SET accept_ln = TRUE WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let bolt11 = fresh_bolt11(1_000);
+    let provider =
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_CANCEL_RETRY_1", &bolt11).await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let constrained = constrained_test_pool(1, None);
+    let app = test_app(test_state_with_config(constrained.clone(), config));
+    let path = format!("/api/v1/invoices/{}/lightning", invoice.id);
+
+    let first_app = app.clone();
+    let first_path = path.clone();
+    let first = tokio::spawn(async move { post_json(&first_app, &first_path, json!({})).await });
+    provider.wait_until_request_is_blocked().await;
+    first.abort();
+    assert!(
+        first.await.unwrap_err().is_cancelled(),
+        "first lazy-offer request was not cancelled at provider I/O"
+    );
+    // Let the fixture finish the abandoned HTTP handler. The request future's
+    // drop must already have closed the one PostgreSQL session that still held
+    // the advisory lock.
+    provider.release_response().await;
+
+    let retry_app = app.clone();
+    let retry_path = path.clone();
+    let retry = tokio::spawn(async move { post_json(&retry_app, &retry_path, json!({})).await });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    let (status, body) = tokio::time::timeout(Duration::from_secs(3), retry)
+        .await
+        .expect("retry could not acquire the single-connection pool after cancellation")
+        .expect("lazy-offer retry task failed");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pr"], bolt11);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    let allocation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM swap_key_allocations WHERE purpose = 'reverse_claim'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        allocation_count, 2,
+        "cancelled provider I/O should leave one auditable gap before retry"
+    );
+    let attached_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM swap_records WHERE boltz_swap_id = 'LAZY_OFFER_CANCEL_RETRY_1'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(attached_count, 1);
+
+    provider.shutdown().await;
+    drop(app);
+    constrained.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn failed_lazy_provider_call_leaves_durable_auditable_key_gap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "lazyofferproviderfailure";
+    let npub = create_test_user(&pool, nym).await;
+    let invoice =
+        insert_test_invoice(&pool, nym, &npub, "lq1lazyofferproviderfailure", 3_600).await;
+    sqlx::query("UPDATE invoices SET accept_ln = TRUE WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let app = test_app(test_state_with_config(pool.clone(), config));
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/lightning", invoice.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "LNURL errors use a JSON error envelope"
+    );
+    assert_eq!(body["code"], "BoltzError", "unexpected response: {body}");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before + 1
+    );
+
+    let orphan: (i64, String, i32, i32, String, String, String) = sqlx::query_as(
+        "SELECT child_index, root_fingerprint, key_epoch, \
+                derivation_scheme_version, purpose, public_key_hex, \
+                preimage_hash_hex \
+           FROM swap_key_allocations WHERE child_index = $1",
+    )
+    .bind(sequence_before)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan.0, sequence_before);
+    assert_eq!(orphan.1, "0000000000000000");
+    assert_eq!(orphan.2, 1);
+    assert_eq!(orphan.3, pay_service::db::DERIVATION_SCHEME_VERSION);
+    assert_eq!(orphan.4, "reverse_claim");
+    assert_eq!(orphan.5.len(), 66);
+    assert_eq!(orphan.6.len(), 64);
+    let attached: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM swap_records WHERE key_allocation_id IN (\
+             SELECT id FROM swap_key_allocations WHERE child_index = $1\
+         )",
+    )
+    .bind(sequence_before)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attached, 0,
+        "failed provider allocation was attached to a swap"
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_older_pending() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -3885,7 +4925,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
         .unwrap();
 
     let older_pending_bolt11 = fresh_bolt11(1_000);
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -3914,7 +4954,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     .unwrap();
 
     let terminal_bolt11 = fresh_bolt11(1_000);
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -3954,7 +4994,8 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
-    let app = test_app(test_state_with_config(pool.clone(), config));
+    let constrained = constrained_test_pool(1, None);
+    let app = test_app(test_state_with_config(constrained.clone(), config));
     let path = format!("/api/v1/invoices/{}/lightning", invoice.id);
 
     let (detail_status, detail) =
@@ -3982,7 +5023,48 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["invoiceAmount"], 1_000);
+    let requested_claim_public_key = requests[0]["claimPublicKey"]
+        .as_str()
+        .expect("reverse request claimPublicKey")
+        .to_string();
+    let requested_preimage_hash = requests[0]["preimageHash"]
+        .as_str()
+        .expect("reverse request preimageHash")
+        .to_string();
     drop(requests);
+
+    let lineage: (
+        i64,
+        String,
+        i32,
+        i32,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT s.key_index, s.root_fingerprint, s.key_epoch, \
+                s.derivation_scheme_version, s.claim_public_key_hex, \
+                s.preimage_hash_hex, a.purpose, a.child_index, \
+                a.public_key_hex, a.preimage_hash_hex \
+           FROM swap_records s \
+           JOIN swap_key_allocations a ON a.id = s.key_allocation_id \
+          WHERE s.boltz_swap_id = 'LAZY_OFFER_TERMINAL_REPLACEMENT_1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lineage.0, lineage.7);
+    assert_eq!(lineage.1, "0000000000000000");
+    assert_eq!(lineage.2, 1);
+    assert_eq!(lineage.3, pay_service::db::DERIVATION_SCHEME_VERSION);
+    assert_eq!(lineage.4, requested_claim_public_key);
+    assert_eq!(lineage.5, requested_preimage_hash);
+    assert_eq!(lineage.6, "reverse_claim");
+    assert_eq!(lineage.4, lineage.8);
+    assert_eq!(Some(lineage.5), lineage.9);
 
     let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
         "SELECT boltz_swap_id, status, amount_sat, key_index \
@@ -4011,6 +5093,8 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     assert_eq!(reusable, Some((replacement_bolt11, 1_000)));
 
     provider.shutdown().await;
+    drop(app);
+    constrained.close().await;
     cleanup_db(&pool).await;
 }
 
@@ -4310,7 +5394,7 @@ async fn closed_admission_returns_existing_reusable_lightning_offer() {
         .unwrap();
 
     let bolt11 = fresh_bolt11(1_000);
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -4518,7 +5602,7 @@ async fn closed_admission_rejects_absent_and_expired_lazy_lightning_without_muta
             .unwrap();
 
         if let Some(previous_pr) = previous_pr {
-            pay_service::db::record_swap(
+            record_pre_050_reverse_fixture(
                 &pool,
                 &pay_service::db::NewSwapRecord {
                     key_index: None,
@@ -4949,6 +6033,11 @@ async fn delete_request(app: &Router, body: Value) -> (StatusCode, Value) {
 }
 
 async fn insert_swap(pool: &PgPool, nym: &str, status: &str, addr_idx: i32) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
@@ -4965,9 +6054,10 @@ async fn insert_swap(pool: &PgPool, nym: &str, status: &str, addr_idx: i32) {
     .bind("bb".repeat(32))
     .bind("{}")
     .bind(status)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn create_test_user(pool: &PgPool, nym: &str) -> String {
@@ -7598,7 +8688,7 @@ async fn cancelled_invoice_records_late_boltz_settlement_once() {
 
     let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
     let claim_txid = "6363636363636363636363636363636363636363636363636363636363636363";
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -9785,7 +10875,7 @@ async fn invoice_only_lightning_swap_does_not_require_nym() {
     let npub = create_test_user(&pool, "invoiceonly").await;
     let invoice = insert_test_invoice(&pool, "invoiceonly", &npub, "lq1invoiceonly", 60).await;
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -9893,7 +10983,7 @@ async fn swap_component_writers_recompose_without_hiding_direct_resolution() {
         assert_eq!(row.settlement_status, incident);
     }
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -10018,7 +11108,7 @@ async fn write_test_swap_component(
             let invoice = format!("lnbc-component-writer-{seed}");
             let preimage = "aa".repeat(32);
             let claim_key = "bb".repeat(32);
-            pay_service::db::record_swap(
+            record_pre_050_reverse_fixture(
                 pool,
                 &pay_service::db::NewSwapRecord {
                     key_index: None,
@@ -10455,7 +11545,7 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     let npub = create_test_user(&pool, "latestpr").await;
     let invoice = insert_test_invoice(&pool, "latestpr", &npub, "lq1latestpr", 60).await;
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -10479,7 +11569,7 @@ async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
         .await
         .unwrap();
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -10517,7 +11607,7 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
     let npub = create_test_user(&pool, "chainswaprec").await;
     let invoice = insert_test_invoice(&pool, "chainswaprec", &npub, "lq1chainswaprec", 60).await;
 
-    let row = pay_service::db::record_chain_swap(
+    let row = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -10590,7 +11680,7 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
     let npub = create_test_user(&pool, "chainretry").await;
     let invoice = insert_test_invoice(&pool, "chainretry", &npub, "lq1chainretry", 60).await;
 
-    let row = pay_service::db::record_chain_swap(
+    let row = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -10652,7 +11742,7 @@ async fn chain_swap_claim_failure_transitions_to_stuck_at_budget() {
     let npub = create_test_user(&pool, "chainfail").await;
     let invoice = insert_test_invoice(&pool, "chainfail", &npub, "lq1chainfail", 60).await;
 
-    let row = pay_service::db::record_chain_swap(
+    let row = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -10713,7 +11803,7 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
     let npub = create_test_user(&pool, "claimretry").await;
     let invoice = insert_test_invoice(&pool, "claimretry", &npub, "lq1claimretry", 60).await;
 
-    pay_service::db::record_swap(
+    record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
             key_index: None,
@@ -10861,7 +11951,7 @@ async fn purge_blocked_when_pending_swap_exists() {
 }
 
 #[tokio::test]
-async fn purge_drops_only_terminal_swap_history() {
+async fn purge_deletes_terminal_swap_secrets_but_retains_key_exclusions() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -10879,6 +11969,129 @@ async fn purge_drops_only_terminal_swap_history() {
     insert_swap(&pool, "purger3", "claimed", 0).await;
     insert_swap(&pool, "purger3", "expired", 1).await;
 
+    let chain_invoice =
+        insert_test_invoice(&pool, "purger3", &npub, "lq1purger3chainswap", 60).await;
+    let chain = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: chain_invoice.id,
+            nym: Some("purger3"),
+            boltz_swap_id: "PURGE_TERMINAL_CHAIN_SECRETS",
+            lockup_address: "bc1qpurger3terminalchain",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "86".repeat(32).as_str(),
+            claim_key_hex: "87".repeat(32).as_str(),
+            refund_key_hex: "88".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        chain.id,
+        pay_service::db::ChainSwapStatus::Expired,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let root = "9191919191919191";
+    let public_key = format!("02{}", "92".repeat(32));
+    let preimage_hash = "93".repeat(32);
+    let allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_100,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let preimage = "94".repeat(32);
+    let claim_key = "95".repeat(32);
+    pay_service::db::record_swap_with_lineage(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: Some("purger3"),
+            boltz_swap_id: "PURGE_RETAINED_LINEAGE",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-purge-retained-lineage",
+            preimage_hex: &preimage,
+            claim_key_hex: &claim_key,
+            boltz_response_json: "{}",
+            invoice_id: None,
+            key_index: Some(9_100),
+            root_fingerprint: Some(root),
+        },
+        &pay_service::db::ReverseSwapLineage {
+            allocation_id,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &public_key,
+            preimage_hash_hex: &preimage_hash,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE swap_records SET status = 'claimed' WHERE boltz_swap_id = $1")
+        .bind("PURGE_RETAINED_LINEAGE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Model a complete migration-044 identity and the migration-050 backfill
+    // that permanently survives deletion of its secret-bearing row.
+    let legacy_root = "9696969696969696";
+    let legacy_index = 9_600_i64;
+    let legacy_preimage = "97".repeat(32);
+    let legacy_claim_key = "98".repeat(32);
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: Some("purger3"),
+            boltz_swap_id: "PURGE_MIGRATION_044_SECRETS",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-purge-migration-044",
+            preimage_hex: &legacy_preimage,
+            claim_key_hex: &legacy_claim_key,
+            boltz_response_json: "{}",
+            invoice_id: None,
+            key_index: Some(legacy_index),
+            root_fingerprint: Some(legacy_root),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE swap_records SET status = 'expired' WHERE boltz_swap_id = $1")
+        .bind("PURGE_MIGRATION_044_SECRETS")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO swap_key_legacy_high_water (root_fingerprint, max_child_index) \
+         VALUES ($1, $2)",
+    )
+    .bind(legacy_root)
+    .bind(legacy_index)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let (purge_sig, purge_timestamp) = sign_purge_with_keypair(&keypair, &npub, "purger3");
     let (status, _) = delete_request(
         &app,
@@ -10889,11 +12102,87 @@ async fn purge_drops_only_terminal_swap_history() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger3'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 0);
+    let reverse_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = 'purger3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let chain_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records WHERE nym = 'purger3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reverse_rows, 0, "purge retained reverse private secrets");
+    assert_eq!(chain_rows, 0, "purge retained chain private secrets");
+
+    let retained_allocation: (String, i64, String, String) = sqlx::query_as(
+        "SELECT root_fingerprint, child_index, public_key_hex, preimage_hash_hex \
+           FROM swap_key_allocations WHERE id = $1",
+    )
+    .bind(allocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_allocation,
+        (
+            root.to_string(),
+            9_100,
+            public_key.clone(),
+            preimage_hash.clone(),
+        )
+    );
+    let reused_identity_public = format!("03{}", "99".repeat(32));
+    let reused_identity_hash = "9a".repeat(32);
+    let reused_identity = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_100,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &reused_identity_public,
+            preimage_hash_hex: Some(&reused_identity_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        reused_identity
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_derivation_identity_key")
+    );
+
+    assert_eq!(
+        pay_service::db::max_legacy_swap_key_index(&pool, legacy_root)
+            .await
+            .unwrap(),
+        Some(legacy_index)
+    );
+    let legacy_reuse_public = format!("02{}", "9b".repeat(32));
+    let legacy_reuse_hash = "9c".repeat(32);
+    let reused_legacy_index = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: legacy_root,
+            key_epoch: 2,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: legacy_index,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &legacy_reuse_public,
+            preimage_hash_hex: Some(&legacy_reuse_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        reused_legacy_index
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("swap_key_allocations_legacy_high_water")
+    );
 
     cleanup_db(&pool).await;
 }
@@ -11147,7 +12436,7 @@ async fn seed_merchant_invoice_swap(
         .await
         .unwrap();
     let invoice = insert_test_invoice(pool, nym, &npub, &format!("lq1{nym}"), 3_600).await;
-    let swap = pay_service::db::record_chain_swap(
+    let swap = record_pre_050_chain_fixture(
         pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -12117,7 +13406,7 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
         .unwrap();
 
     let invoice2 = insert_test_invoice(&pool, "recorder", &npub, "lq1recorder2", 3_600).await;
-    let due_swap = pay_service::db::record_chain_swap(
+    let due_swap = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
@@ -12365,7 +13654,7 @@ async fn recoverable_list_skips_nymless_swap() {
         .unwrap();
 
     let invoice2 = insert_test_invoice(&pool, "recnymless", &npub, "lq1recnymless2", 3_600).await;
-    let bad_swap = pay_service::db::record_chain_swap(
+    let bad_swap = record_pre_050_chain_fixture(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,

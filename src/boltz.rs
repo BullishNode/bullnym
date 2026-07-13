@@ -30,6 +30,25 @@ pub struct ChainSwapResult {
     pub boltz_response: CreateChainResponse,
 }
 
+/// One deterministically derived swap key plus its claim preimage.  This type
+/// intentionally does not implement `Debug`: both fields contain signing or
+/// claim secrets.  Callers can inspect only the non-secret evidence needed to
+/// reserve the key before sending it to Boltz.
+pub struct DerivedSwapKey {
+    keypair: Keypair,
+    preimage: Preimage,
+}
+
+impl DerivedSwapKey {
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.keypair.public_key().serialize())
+    }
+
+    pub fn preimage_hash_hex(&self) -> String {
+        self.preimage.sha256.to_string()
+    }
+}
+
 pub struct BoltzService {
     api: Option<BoltzApiClientV2>,
     swap_master_key: SwapMasterKey,
@@ -82,7 +101,7 @@ impl BoltzService {
     /// (START WITH 100), so index 0 is never used to sign and only serves as a
     /// deterministic seed fingerprint. Persisted alongside each swap so a
     /// database restore that rewinds the key sequence can be detected. See
-    /// migration 044.
+    /// migrations 044/050.
     pub fn derivation_root_fingerprint(&self) -> Result<String, AppError> {
         use sha2::{Digest, Sha256};
         let keypair = self
@@ -93,9 +112,18 @@ impl BoltzService {
         Ok(hex::encode(&digest[..8]))
     }
 
+    pub fn derive_swap_key(&self, child_index: u64) -> Result<DerivedSwapKey, AppError> {
+        let keypair = self
+            .swap_master_key
+            .derive_swapkey(child_index)
+            .map_err(|e| AppError::BoltzError(format!("key derivation failed: {e}")))?;
+        let preimage = Preimage::from_swap_key(&keypair);
+        Ok(DerivedSwapKey { keypair, preimage })
+    }
+
     pub async fn create_reverse_swap(
         &self,
-        swap_key_index: u64,
+        derived_key: DerivedSwapKey,
         amount_sat: u64,
         description: Option<&str>,
         description_hash: Option<&str>,
@@ -105,11 +133,7 @@ impl BoltzService {
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
             ));
         }
-        let keypair = self
-            .swap_master_key
-            .derive_swapkey(swap_key_index)
-            .map_err(|e| AppError::BoltzError(format!("key derivation failed: {e}")))?;
-        let preimage = Preimage::from_swap_key(&keypair);
+        let DerivedSwapKey { keypair, preimage } = derived_key;
 
         let claim_public_key = PublicKey::new(keypair.public_key());
 
@@ -174,8 +198,8 @@ impl BoltzService {
 
     pub async fn create_btc_to_lbtc_chain_swap(
         &self,
-        claim_key_index: u64,
-        refund_key_index: u64,
+        claim_key: DerivedSwapKey,
+        refund_key: DerivedSwapKey,
         amount_sat: u64,
     ) -> Result<ChainSwapResult, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
@@ -183,15 +207,14 @@ impl BoltzService {
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
             ));
         }
-        let claim_keypair = self
-            .swap_master_key
-            .derive_swapkey(claim_key_index)
-            .map_err(|e| AppError::BoltzError(format!("claim key derivation failed: {e}")))?;
-        let refund_keypair = self
-            .swap_master_key
-            .derive_swapkey(refund_key_index)
-            .map_err(|e| AppError::BoltzError(format!("refund key derivation failed: {e}")))?;
-        let preimage = Preimage::from_swap_key(&claim_keypair);
+        let DerivedSwapKey {
+            keypair: claim_keypair,
+            preimage,
+        } = claim_key;
+        let DerivedSwapKey {
+            keypair: refund_keypair,
+            ..
+        } = refund_key;
 
         let claim_public_key = PublicKey::new(claim_keypair.public_key());
         let refund_public_key = PublicKey::new(refund_keypair.public_key());
@@ -360,6 +383,21 @@ mod tests {
         .derivation_root_fingerprint()
         .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derived_swap_key_exposes_stable_nonsecret_lineage_evidence() {
+        let first = test_service(TEST_MNEMONIC).derive_swap_key(123).unwrap();
+        let same = test_service(TEST_MNEMONIC).derive_swap_key(123).unwrap();
+        let next = test_service(TEST_MNEMONIC).derive_swap_key(124).unwrap();
+
+        assert_eq!(first.public_key_hex().len(), 66);
+        assert!(matches!(&first.public_key_hex()[..2], "02" | "03"));
+        assert_eq!(first.preimage_hash_hex().len(), 64);
+        assert_eq!(first.public_key_hex(), same.public_key_hex());
+        assert_eq!(first.preimage_hash_hex(), same.preimage_hash_hex());
+        assert_ne!(first.public_key_hex(), next.public_key_hex());
+        assert_ne!(first.preimage_hash_hex(), next.preimage_hash_hex());
     }
 
     #[test]

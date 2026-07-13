@@ -42,6 +42,7 @@ use axum::Json;
 use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::Acquire;
 use uuid::Uuid;
 
 use crate::admission::Rail;
@@ -1054,6 +1055,65 @@ fn public_direct_payment_addresses(inv: &db::Invoice) -> PublicDirectPaymentAddr
     }
 }
 
+/// Owns the PostgreSQL session that carries the lazy-offer advisory lock.
+/// Normal paths explicitly unlock and return the physical connection to the
+/// pool. If the request future is cancelled or errors while still locked,
+/// `Drop` closes that one backend session so the lock cannot leak into the
+/// pool. `close_on_drop` is intentionally armed only on that exceptional path.
+struct InvoiceOfferAdvisoryLock {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_key: String,
+    locked: bool,
+}
+
+impl InvoiceOfferAdvisoryLock {
+    fn new(connection: sqlx::pool::PoolConnection<sqlx::Postgres>, lock_key: String) -> Self {
+        Self {
+            connection,
+            lock_key,
+            locked: true,
+        }
+    }
+
+    async fn unlock(&mut self) -> Result<(), AppError> {
+        let lock_key = self.lock_key.clone();
+        let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1))")
+            .bind(lock_key)
+            .fetch_one(&mut **self)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        if !unlocked {
+            return Err(AppError::DbError(
+                "invoice Lightning advisory lock was not held by its connection".into(),
+            ));
+        }
+        self.locked = false;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for InvoiceOfferAdvisoryLock {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for InvoiceOfferAdvisoryLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for InvoiceOfferAdvisoryLock {
+    fn drop(&mut self) {
+        if self.locked {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
 /// Public invoice projections combine several tables. Keep every field in one
 /// PostgreSQL snapshot so a reducer commit cannot mix an old invoice row with
 /// new event sums or payment offers in the same response/render/list item.
@@ -1665,74 +1725,63 @@ async fn ensure_reusable_lightning_offer(
     }
 
     let lock_key = db::invoice_lightning_lock_key(inv.id);
-    // Serialize concurrent offer creation for this invoice with a
-    // TRANSACTION-scoped advisory lock. A session-level `pg_advisory_lock` on a
-    // pooled connection leaks if the handler future is dropped (client
-    // disconnect / timeout) between lock and the manual unlock: the connection
-    // returns to the pool still holding the lock, wedging every subsequent
-    // `/lightning` request for this invoice and eventually exhausting the pool —
-    // exactly under Boltz degradation, when clients time out and retry.
-    // `pg_try_advisory_xact_lock` auto-releases on commit/rollback AND on
-    // connection drop, so cancellation cannot leak it, and it never blocks.
-    let mut tx = state
+    // Serialize creation with a session advisory lock on one checked-out
+    // connection. Once acquired, the RAII guard unlocks on normal paths and
+    // closes the backend session only if cancellation/error drops it while
+    // still locked. This lets allocation autocommit before Boltz without
+    // churning a physical pool connection on every cached-offer request.
+    let mut pooled_connection = state
         .db
-        .begin()
+        .acquire()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1))")
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
         .bind(&lock_key)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *pooled_connection)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
     if !acquired {
         // Another offer request or a direct-payment reducer owns the invoice
         // projection boundary. Never answer from the pre-lock snapshot: the
         // exact payable amount may be changing. Signal a short retry instead.
-        drop(tx);
+        drop(pooled_connection);
         return Err(AppError::ServiceUnavailable(
             "invoice payment state is changing; retry the Lightning offer request".into(),
         ));
     }
+    let mut connection = InvoiceOfferAdvisoryLock::new(pooled_connection, lock_key);
 
     // Holding the same advisory boundary as the direct-payment reducer: reload
     // every mutable projection and recompute exact presentation value. This
     // prevents a pre-lock partial/sufficient payment from minting a stale
     // full-value offer.
-    let current = db::get_invoice_by_id(&mut *tx, inv.id)
+    let current = db::get_invoice_by_id(&mut *connection, inv.id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string()))?;
     if !invoice_payment_rails_are_payable(&current) || !current.accept_ln {
-        tx.rollback()
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        connection.unlock().await?;
         return Ok(None);
     }
     let now = unix_now();
     if current.expires_at_unix <= now {
-        tx.rollback()
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        connection.unlock().await?;
         return Ok(None);
     }
-    let received_sat = db::invoice_presentation_received_sat(&mut *tx, current.id)
+    let received_sat = db::invoice_presentation_received_sat(&mut *connection, current.id)
         .await?
         .unwrap_or_else(|| current.paid_amount_sat.unwrap_or(0));
     let amount_sat = remaining_amount_from_received(&current, received_sat);
     if amount_sat <= 0 {
-        tx.rollback()
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
+        connection.unlock().await?;
         return Ok(None);
     }
 
     // Double-check the latest offer under the serialization boundary and
     // create only when its amount/expiry no longer matches.
-    let latest = db::latest_lightning_pr_for_invoice(&mut *tx, inv.id).await?;
+    let latest = db::latest_lightning_pr_for_invoice(&mut *connection, inv.id).await?;
     if let Some((pr, pr_amount_sat)) = latest {
         if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
-            tx.commit()
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            connection.unlock().await?;
             return Ok(Some(pr));
         }
         tracing::info!(
@@ -1748,19 +1797,36 @@ async fn ensure_reusable_lightning_offer(
         .admission
         .enforce(Rail::LightningReverse)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
-    let swap_key_index = db::next_swap_key_index(&mut *tx)
+    let swap_key_index = db::next_swap_key_index(&mut *connection)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
-    let prepared =
-        match request_lightning_offer(state, swap_key_index, amount_sat as u64, &current).await {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                let _ = tx.rollback().await;
-                return Err(e);
-            }
-        };
+    let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+    let claim_public_key_hex = derived_key.public_key_hex();
+    let preimage_hash_hex = derived_key.preimage_hash_hex();
+    let key_allocation_id = db::reserve_swap_key_allocation(
+        &mut *connection,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: swap_key_index as i64,
+            purpose: db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: Some(&preimage_hash_hex),
+        },
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
+    let prepared = request_lightning_offer(state, derived_key, amount_sat as u64, &current).await?;
 
-    db::record_swap_in_tx(
+    // The allocation above is already durable. Start a short transaction only
+    // for provider-result persistence plus the final invoice revalidation.
+    let mut tx = connection
+        .begin()
+        .await
+        .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    db::record_swap_in_tx_with_lineage(
         &mut tx,
         &prepared.as_new_swap_record(
             lightning_swap_nym(&current),
@@ -1769,6 +1835,13 @@ async fn ensure_reusable_lightning_offer(
             swap_key_index,
             state.swap_key_root_fingerprint.as_str(),
         ),
+        &db::ReverseSwapLineage {
+            allocation_id: key_allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
+        },
     )
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
@@ -1799,6 +1872,10 @@ async fn ensure_reusable_lightning_offer(
     tx.commit()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    // Release the single-flight session lock before acquiring from the pool in
+    // the best-effort callback touch below (also required for pool_size=1).
+    connection.unlock().await?;
+    drop(connection);
     if let Some(nym) = lightning_swap_nym(&current) {
         db::touch_user_callback(&state.db, nym).await;
     }
@@ -1989,7 +2066,7 @@ impl PreparedLightningOffer {
 
 async fn request_lightning_offer(
     state: &AppState,
-    swap_key_index: u64,
+    derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<PreparedLightningOffer, AppError> {
@@ -2004,7 +2081,7 @@ async fn request_lightning_offer(
     let result = state
         .boltz
         .create_reverse_swap(
-            swap_key_index,
+            derived_key,
             amount_sat,
             boltz_description.description.as_deref(),
             boltz_description.description_hash.as_deref(),
@@ -2040,9 +2117,26 @@ async fn create_lightning_offer(
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
         .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
-    let prepared = request_lightning_offer(state, swap_key_index, amount_sat, invoice).await?;
+    let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+    let claim_public_key_hex = derived_key.public_key_hex();
+    let preimage_hash_hex = derived_key.preimage_hash_hex();
+    let key_allocation_id = db::reserve_swap_key_allocation(
+        &state.db,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: swap_key_index as i64,
+            purpose: db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: Some(&preimage_hash_hex),
+        },
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
+    let prepared = request_lightning_offer(state, derived_key, amount_sat, invoice).await?;
 
-    db::record_swap(
+    db::record_swap_with_lineage(
         &state.db,
         &prepared.as_new_swap_record(
             swap_nym,
@@ -2051,6 +2145,13 @@ async fn create_lightning_offer(
             swap_key_index,
             state.swap_key_root_fingerprint.as_str(),
         ),
+        &db::ReverseSwapLineage {
+            allocation_id: key_allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
+        },
     )
     .await
     .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
@@ -2111,9 +2212,43 @@ async fn create_bitcoin_chain_offer(
         .await
         .map_err(|e| AppError::BoltzError(format!("chain refund key allocation failed: {e}")))?;
 
+    let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
+    let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
+    let claim_public_key_hex = claim_key.public_key_hex();
+    let refund_public_key_hex = refund_key.public_key_hex();
+    let preimage_hash_hex = claim_key.preimage_hash_hex();
+    let claim_key_allocation_id = db::reserve_swap_key_allocation(
+        &state.db,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: claim_key_index as i64,
+            purpose: db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: Some(&preimage_hash_hex),
+        },
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("chain claim key reservation failed: {e}")))?;
+    let refund_key_allocation_id = db::reserve_swap_key_allocation(
+        &state.db,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: refund_key_index as i64,
+            purpose: db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key_hex,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("chain refund key reservation failed: {e}")))?;
+
     let result = state
         .boltz
-        .create_btc_to_lbtc_chain_swap(claim_key_index, refund_key_index, amount_sat)
+        .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
         .await?;
     let public_url = invoice_public_url(
         &state.config.domain,
@@ -2133,7 +2268,7 @@ async fn create_bitcoin_chain_offer(
         AppError::BoltzError(format!("failed to serialize chain-swap response: {e}"))
     })?;
 
-    db::record_chain_swap(
+    db::record_chain_swap_with_lineage(
         &state.db,
         &db::NewChainSwapRecord {
             invoice_id: invoice.id,
@@ -2150,6 +2285,15 @@ async fn create_bitcoin_chain_offer(
             claim_key_index: Some(claim_key_index as i64),
             refund_key_index: Some(refund_key_index as i64),
             root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
+        },
+        &db::ChainSwapLineage {
+            claim_allocation_id: claim_key_allocation_id,
+            refund_allocation_id: refund_key_allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            refund_public_key_hex: &refund_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
         },
     )
     .await
