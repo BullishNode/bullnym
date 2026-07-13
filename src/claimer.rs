@@ -133,6 +133,23 @@ fn match_webhook_url_secret(presented: &str, config: &Config) -> UrlSecretMatch 
     )
 }
 
+/// Preserve the standard structured [`AppError`] response body and logging,
+/// but make dispatcher failures visible to Boltz at the HTTP layer so it
+/// retries the same delivery. Some public endpoints intentionally encode
+/// errors in HTTP 200 responses; that convention is not valid for webhooks.
+fn webhook_dispatch_response(result: Result<&'static str, AppError>) -> Response {
+    match result {
+        Ok(body) => body.into_response(),
+        Err(error) => {
+            let mut response = error.into_response();
+            if response.status().is_success() {
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            response
+        }
+    }
+}
+
 /// Authenticated webhook entrypoint: `/webhook/boltz/:secret`.
 /// Routes the request to the shared dispatcher only after the URL
 /// segment matches a configured secret in constant time.
@@ -164,9 +181,9 @@ pub async fn webhook_with_secret(
             return Ok((StatusCode::NOT_FOUND, "").into_response());
         }
     }
-    dispatch_webhook(state, peer_opt, headers, body)
-        .await
-        .map(IntoResponse::into_response)
+    Ok(webhook_dispatch_response(
+        dispatch_webhook(state, peer_opt, headers, body).await,
+    ))
 }
 
 /// Compatibility webhook entrypoint: `/webhook/boltz`.
@@ -201,9 +218,9 @@ pub async fn webhook_unauthenticated(
     tracing::warn!(
         "boltz webhook: BOLTZ_WEBHOOK_URL_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
     );
-    dispatch_webhook(state, peer_opt, headers, body)
-        .await
-        .map(IntoResponse::into_response)
+    Ok(webhook_dispatch_response(
+        dispatch_webhook(state, peer_opt, headers, body).await,
+    ))
 }
 
 /// Shared post-auth webhook handler.

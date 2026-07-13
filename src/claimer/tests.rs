@@ -121,6 +121,29 @@ fn url_secret_rejects_length_mismatch() {
 }
 
 #[test]
+fn issue30_webhook_dispatch_success_stops_provider_retries() {
+    let response = webhook_dispatch_response(Ok("ok"));
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn issue30_webhook_dispatch_errors_are_http_retryable() {
+    for error in [
+        AppError::DbError("transition commit failed".to_string()),
+        AppError::ClaimError("renegotiation failed".to_string()),
+        AppError::RateLimitedNetwork,
+    ] {
+        let response = webhook_dispatch_response(Err(error));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let response = webhook_dispatch_response(Err(AppError::ServiceUnavailable(
+        "provider unavailable".to_string(),
+    )));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
 fn cooperative_refusal_recognises_known_phrases() {
     for phrase in [
         "construct_claim failed: serde error: swap expired at line 1",
