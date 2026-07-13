@@ -5439,14 +5439,78 @@ async fn m11_unsafe_provider_snapshots_disable_only_lightning() {
         create_test_user(&pool, &nym).await;
         let mut config = test_config();
         config.boltz.api_url = boltz_url.clone();
+        let product_min_sendable = config.limits.min_sendable_msat;
+        let product_max_sendable = config.limits.max_sendable_msat;
+        let metadata_origin = format!("https://{}", config.domain);
         let mut state = test_state_with_provider_limits(pool.clone(), config, refresh);
         state.ip_whitelist =
             Arc::new(IpWhitelist::parse(&["127.0.0.1".to_string()]).expect("parse test whitelist"));
         let app = test_app(state);
         let before = m11_creation_mutation_snapshot(&pool).await;
 
+        let (metadata_status, metadata_body) =
+            get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+        assert_eq!(
+            metadata_status,
+            StatusCode::OK,
+            "case {case}: {metadata_body}"
+        );
+        assert_eq!(metadata_body["tag"], "payRequest", "case {case}");
+        assert_eq!(
+            metadata_body["minSendable"],
+            json!(product_min_sendable),
+            "case {case}"
+        );
+        assert_eq!(
+            metadata_body["maxSendable"],
+            json!(product_max_sendable),
+            "case {case}"
+        );
+        assert_eq!(
+            metadata_body["payment_methods"],
+            json!(["L-BTC"]),
+            "case {case}"
+        );
+        let callback = metadata_body["callback"]
+            .as_str()
+            .expect("metadata callback string");
+        let expected_callback = format!("{metadata_origin}/lnurlp/callback/{nym}");
+        assert_eq!(callback, expected_callback, "case {case}");
+        let callback_path = callback
+            .strip_prefix(&metadata_origin)
+            .expect("callback on configured metadata origin");
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: metadata performed provider I/O"
+        );
+
+        let (liquid_status, liquid_body) = get_path_from(
+            &app,
+            &format!("{callback_path}?amount=100000&payment_method=L-BTC"),
+            "127.0.0.1:42111".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(liquid_status, StatusCode::OK, "case {case}: {liquid_body}");
+        assert!(
+            liquid_body["L-BTC"]["address"]
+                .as_str()
+                .is_some_and(|address| !address.is_empty()),
+            "case {case}: {liquid_body}"
+        );
+        assert_eq!(
+            m11_creation_mutation_snapshot(&pool).await,
+            before,
+            "case {case}: direct Liquid touched provider-creation state"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: direct Liquid caused provider I/O"
+        );
+
         let (lightning_status, lightning_body) =
-            get_path(&app, &format!("/lnurlp/callback/{nym}?amount=100000")).await;
+            get_path(&app, &format!("{callback_path}?amount=100000")).await;
         assert_eq!(
             lightning_status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5466,29 +5530,10 @@ async fn m11_unsafe_provider_snapshots_disable_only_lightning() {
             before,
             "case {case}: unavailable Lightning mutated creation state"
         );
-
-        let (liquid_status, liquid_body) = get_path_from(
-            &app,
-            &format!("/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC"),
-            "127.0.0.1:42111".parse().unwrap(),
-        )
-        .await;
-        assert_eq!(liquid_status, StatusCode::OK, "case {case}: {liquid_body}");
-        assert!(
-            liquid_body["L-BTC"]["address"]
-                .as_str()
-                .is_some_and(|address| !address.is_empty()),
-            "case {case}: {liquid_body}"
-        );
-        assert_eq!(
-            m11_creation_mutation_snapshot(&pool).await,
-            before,
-            "case {case}: direct Liquid touched provider-creation state"
-        );
         assert_eq!(
             provider_calls.load(Ordering::SeqCst),
             0,
-            "case {case}: an unsafe provider snapshot caused provider I/O"
+            "case {case}: unavailable Lightning reached the provider"
         );
     }
 

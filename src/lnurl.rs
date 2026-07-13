@@ -197,15 +197,24 @@ pub async fn metadata(
     // Cheap, in-process read only. Keep it after abuse/certification and nym
     // existence gates so rejected metadata requests cannot probe provider
     // readiness. Standard Lightning does not require a zero-conf limit.
-    let lightning_range = state
-        .boltz
-        .provider_limits()
-        .lightning_address_range(
-            state.config.limits.min_sendable_msat,
-            state.config.limits.max_sendable_msat,
-        )
-        .map_err(lightning_address_unavailable)?;
-    let (min_sendable, max_sendable) = lightning_range.limits_msat();
+    let lightning_range = state.boltz.provider_limits().lightning_address_range(
+        state.config.limits.min_sendable_msat,
+        state.config.limits.max_sendable_msat,
+    );
+    let (min_sendable, max_sendable) = match lightning_range {
+        Ok(range) => range.limits_msat(),
+        Err(_) => {
+            // LUD-22 uses this response to discover independent alternative
+            // payment methods, while minSendable/maxSendable apply only to
+            // implicit Lightning. The extension has no method-specific
+            // availability flag, so keep Liquid discoverable and let the
+            // Lightning callback's pre-allocation revalidation fail closed.
+            (
+                state.config.limits.min_sendable_msat,
+                state.config.limits.max_sendable_msat,
+            )
+        }
+    };
 
     let callback = format!("https://{}/lnurlp/callback/{}", state.config.domain, nym);
 
