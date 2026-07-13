@@ -158,6 +158,9 @@ Bitcoin merchant receive flows do not need floating fiat rates.
 All accounting comes from idempotent, countable payment events. Migration 047
 keeps inactive and superseded direct evidence in the same table for audit, but
 only `active` and rollout-compatible `legacy_unverified` rows contribute value.
+Migration 048 makes cancellation an instruction-closure marker rather than an
+accounting blind spot: a late payment event is still recorded and projected,
+while the invoice remains `cancelled` and cannot issue new payment details.
 
 Event fields:
 

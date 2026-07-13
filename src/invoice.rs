@@ -355,7 +355,7 @@ pub async fn flip_invoice_on_lightning_settlement(
                 event = "invoice_flip_noop",
                 invoice_id = %id,
                 boltz_swap_id = %boltz_swap_id,
-                "invoice payment event already recorded or invoice cancelled; no-op"
+                "invoice payment event already recorded; no-op"
             );
             true
         }
@@ -421,7 +421,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
                 event = "invoice_bitcoin_boltz_flip_noop",
                 invoice_id = %id,
                 boltz_swap_id = %boltz_swap_id,
-                "invoice payment event already recorded or invoice cancelled; no-op"
+                "invoice payment event already recorded; no-op"
             );
             true
         }

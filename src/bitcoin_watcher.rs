@@ -167,13 +167,13 @@ const BITCOIN_WATCHER_PAGE_SQL: &str = "SELECT id, bitcoin_address, amount_sat, 
             created_at::TEXT AS created_at_cursor \
      FROM invoices \
      WHERE bitcoin_address IS NOT NULL \
-       AND status NOT IN ('cancelled', 'expired') \
        AND ( \
              ( \
                status IN ('unpaid', 'in_progress', 'partially_paid') \
                AND accept_btc = TRUE \
                AND expires_at + ($2 || ' seconds')::interval > $3::timestamptz \
              ) \
+             OR status IN ('cancelled', 'expired') \
              OR EXISTS ( \
                SELECT 1 FROM invoice_payment_observations o \
                WHERE o.invoice_id = invoices.id \
@@ -546,10 +546,9 @@ impl BitcoinWatcher {
         epoch: &BitcoinTierScanEpoch,
     ) -> Result<InvoicePollBatch, sqlx::Error> {
         // Active tier: created within last `active_window_secs`.
-        // Idle tier:   created earlier than that (the rest of the still-
-        //              unpaid corpus). Both predicates exclude expired
-        //              rows so the watcher doesn't waste an RPS slot on
-        //              a row about to be GC'd.
+        // Idle tier:   created earlier than that. Closed rows remain in their
+        //              age tier because expiry/cancellation suppresses new
+        //              instructions, not late chain evidence.
         let cmp = if is_active { ">" } else { "<=" };
         let snapshot = epoch
             .scan
@@ -783,8 +782,7 @@ impl BitcoinWatcher {
                 }
                 Ok(
                     db::ApplyDirectObservationOutcome::AlreadyApplied
-                    | db::ApplyDirectObservationOutcome::Stale { .. }
-                    | db::ApplyDirectObservationOutcome::Closed,
+                    | db::ApplyDirectObservationOutcome::Stale { .. },
                 ) => InvoiceCheckOutcome::Complete,
                 Err(e) => {
                     tracing::error!(
@@ -1875,6 +1873,8 @@ mod tests {
             .contains("expires_at + ($2 || ' seconds')::interval > $3::timestamptz"));
         assert!(BITCOIN_WATCHER_PAGE_SQL.contains("invoice_payment_observations"));
         assert!(BITCOIN_WATCHER_PAGE_SQL.contains("invoice_payment_events"));
+        assert!(BITCOIN_WATCHER_PAGE_SQL.contains("OR status IN ('cancelled', 'expired')"));
+        assert!(!BITCOIN_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
         assert!(!BITCOIN_WATCHER_PAGE_SQL.contains("NOW()"));
     }
 
