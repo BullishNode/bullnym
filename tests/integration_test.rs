@@ -2123,6 +2123,200 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
 }
 
 #[tokio::test]
+async fn manifest_staging_evidence_reads_exact_public_lineage_and_fails_on_dangling_rows() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "manifeststage";
+    let npub = "91".repeat(32);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(
+        &pool,
+        nym,
+        &npub,
+        "lq1manifeststagingmerchantdestination",
+        3_600,
+    )
+    .await;
+
+    let root = "9191919191919191";
+    let claim_public_key = format!("02{}", "92".repeat(32));
+    let refund_public_key = format!("03{}", "93".repeat(32));
+    let later_public_key = format!("02{}", "94".repeat(32));
+    let preimage_hash = "95".repeat(32);
+    let later_preimage_hash = "96".repeat(32);
+    let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_001,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_002,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_003,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &later_public_key,
+            preimage_hash_hex: Some(&later_preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+
+    const PRIVATE_PREIMAGE_CANARY: &str =
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const PRIVATE_CLAIM_KEY_CANARY: &str =
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+    const PRIVATE_REFUND_KEY_CANARY: &str =
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+    const PROVIDER_RESPONSE_CANARY: &str = "{\"private_provider_response\":\"must-not-load\"}";
+    let creation_terms = valid_chain_swap_creation_terms_fixture();
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id: "MANIFEST_STAGE_EVIDENCE",
+            lockup_address: "bc1qmanifeststaginglockup",
+            lockup_bip21: Some("bitcoin:bc1qmanifeststaginglockup?amount=0.00025431"),
+            user_lock_amount_sat: 25_431,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: PRIVATE_PREIMAGE_CANARY,
+            claim_key_hex: PRIVATE_CLAIM_KEY_CANARY,
+            refund_key_hex: PRIVATE_REFUND_KEY_CANARY,
+            boltz_response_json: PROVIDER_RESPONSE_CANARY,
+            claim_key_index: Some(9_001),
+            refund_key_index: Some(9_002),
+            root_fingerprint: Some(root),
+        },
+        &pay_service::db::ChainSwapLineage {
+            claim_allocation_id,
+            refund_allocation_id,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key,
+            refund_public_key_hex: &refund_public_key,
+            preimage_hash_hex: &preimage_hash,
+        },
+        &creation_terms,
+    )
+    .await
+    .unwrap();
+
+    let evidence = pay_service::db::load_manifest_staging_evidence(&pool, inserted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.persisted_lineage.chain_swap_id, inserted.id);
+    assert_eq!(evidence.persisted_lineage.root_fingerprint, root);
+    assert_eq!(evidence.persisted_lineage.key_epoch, 3);
+    assert_eq!(
+        evidence.persisted_lineage.claim.allocation_id,
+        claim_allocation_id
+    );
+    assert_eq!(
+        evidence.persisted_lineage.refund.allocation_id,
+        refund_allocation_id
+    );
+    assert_eq!(evidence.claim_allocation.child_index, 9_001);
+    assert_eq!(
+        evidence.claim_allocation.purpose,
+        pay_service::db::SwapKeyPurpose::ChainClaim
+    );
+    assert_eq!(
+        evidence.claim_allocation.preimage_hash_hex,
+        Some(preimage_hash)
+    );
+    assert_eq!(evidence.refund_allocation.child_index, 9_002);
+    assert_eq!(
+        evidence.refund_allocation.purpose,
+        pay_service::db::SwapKeyPurpose::ChainRefund
+    );
+    assert_eq!(evidence.refund_allocation.preimage_hash_hex, None);
+    assert_eq!(evidence.allocation_high_water.child_index, 9_003);
+
+    let rendered = format!("{evidence:?}");
+    for secret in [
+        PRIVATE_PREIMAGE_CANARY,
+        PRIVATE_CLAIM_KEY_CANARY,
+        PRIVATE_REFUND_KEY_CANARY,
+        PROVIDER_RESPONSE_CANARY,
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+    assert!(
+        pay_service::db::load_manifest_staging_evidence(&pool, uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Model a damaged restore with a dangling lineage reference. The loader's
+    // LEFT JOIN must distinguish the present chain row from an absent chain
+    // row and fail closed instead of manufacturing allocation evidence.
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM swap_key_allocations WHERE id = $1")
+        .bind(refund_allocation_id)
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    corruption.commit().await.unwrap();
+
+    let error = pay_service::db::load_manifest_staging_evidence(&pool, inserted.id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        pay_service::db::ManifestStagingEvidenceReadError::IncompleteStoredEvidence {
+            field: "refund_allocation.id"
+        }
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    let rendered = format!("{error:?} {error}");
+    for secret in [
+        PRIVATE_PREIMAGE_CANARY,
+        PRIVATE_CLAIM_KEY_CANARY,
+        PRIVATE_REFUND_KEY_CANARY,
+        PROVIDER_RESPONSE_CANARY,
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
