@@ -626,6 +626,30 @@ mod tests {
     }
 
     #[test]
+    fn persisted_evidence_restore_rederives_destination_script() {
+        let context = context(MerchantSettlementPath::BitcoinRecovery);
+        let evidence = ConfirmedMerchantOutputEvidence::from_verified(
+            &context,
+            &verified(ORIGINAL_TXID, false, 73_219, MerchantAsset::Bitcoin),
+        )
+        .unwrap();
+
+        let mut wrong_script = evidence.snapshot();
+        wrong_script.destination_script_hex = "51".to_owned();
+        assert_eq!(
+            ConfirmedMerchantOutputEvidence::restore(wrong_script),
+            Err(MerchantSettlementAdoptionError::InvalidPersistedEvidence)
+        );
+
+        let mut wrong_address = evidence.snapshot();
+        wrong_address.destination_address = LIQUID_ADDRESS.to_owned();
+        assert_eq!(
+            ConfirmedMerchantOutputEvidence::restore(wrong_address),
+            Err(MerchantSettlementAdoptionError::InvalidPersistedEvidence)
+        );
+    }
+
+    #[test]
     fn invalid_or_cross_swap_context_cannot_create_an_accounting_intent() {
         assert_eq!(
             MerchantSettlementContext::new(

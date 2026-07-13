@@ -71,6 +71,9 @@ pub struct MerchantSettlementPersistenceResult {
     pub checkpoint_version: i64,
     pub projection_changed: bool,
     pub parent_transition: MerchantSettlementParentTransition,
+    /// The same transaction moved the active immutable attempt back into a
+    /// state accepted by exact-byte replay.
+    pub journal_rebroadcast_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +564,7 @@ pub async fn persist_merchant_settlement_outcome(
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
+    let journal_rebroadcast_required = transition_attempt_locked(&mut tx, snapshot).await?;
     let parent_transition = transition_parent_locked(&mut tx, snapshot).await?;
     let swap_status = if snapshot.lifecycle.accounting == SettlementAccountingState::Finalized {
         "settled"
@@ -579,7 +583,63 @@ pub async fn persist_merchant_settlement_outcome(
         checkpoint_version,
         projection_changed,
         parent_transition,
+        journal_rebroadcast_required,
     })
+}
+
+async fn transition_attempt_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &MerchantSettlementAdoptionSnapshot,
+) -> Result<bool, MerchantSettlementRepositoryError> {
+    if snapshot.lifecycle.accounting != SettlementAccountingState::Demoted {
+        return Ok(false);
+    }
+    let active_txid = snapshot.lifecycle.active_txid.as_str();
+    let attempt: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, purpose, status FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND txid = $2 FOR UPDATE",
+    )
+    .bind(snapshot.context.chain_swap_id())
+    .bind(active_txid)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (attempt_id, purpose, status) =
+        attempt.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
+    let purpose_matches = match snapshot.context.path() {
+        MerchantSettlementPath::LiquidClaim => {
+            matches!(
+                purpose.as_str(),
+                "liquid_claim" | "liquid_claim_replacement"
+            )
+        }
+        MerchantSettlementPath::BitcoinRecovery => purpose == "btc_recovery",
+    };
+    if !purpose_matches
+        || !matches!(
+            status.as_str(),
+            "constructed" | "broadcast_ambiguous" | "broadcast" | "confirmed" | "finalized"
+        )
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    if matches!(status.as_str(), "broadcast" | "confirmed" | "finalized") {
+        let rows = sqlx::query(
+            "UPDATE chain_swap_tx_attempts SET status = 'broadcast_ambiguous', \
+                 last_broadcast_result = 'merchant settlement demoted; exact journal replay required', \
+                 updated_at = NOW() \
+              WHERE id = $1 AND txid = $2 AND status = $3",
+        )
+        .bind(attempt_id)
+        .bind(active_txid)
+        .bind(&status)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if rows != 1 {
+            return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+        }
+    }
+    Ok(true)
 }
 
 async fn transition_parent_locked(
@@ -976,11 +1036,21 @@ fn select_journals(
             if replacement.replace(row).is_some() {
                 return Err(MerchantSettlementRepositoryError::MissingJournal);
             }
+        } else {
+            // A swap may retain only the journal family selected by its
+            // settlement context. Silently preferring one of two cross-path
+            // journals would create ambiguous double-settlement authority.
+            return Err(MerchantSettlementRepositoryError::MissingJournal);
         }
     }
     let original = original.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
     if let Some(replacement) = &replacement {
-        if replacement.replaces_txid.as_deref() != Some(original.txid.as_str()) {
+        if replacement.replaces_txid.as_deref() != Some(original.txid.as_str())
+            || replacement.destination_address != original.destination_address
+            || replacement.destination_script_hex != original.destination_script_hex
+            || replacement.asset != original.asset
+            || replacement.liquid_blinding_key_hex != original.liquid_blinding_key_hex
+        {
             return Err(MerchantSettlementRepositoryError::MissingJournal);
         }
     }
@@ -1006,20 +1076,34 @@ fn approved_from_journal(
 fn previous_confirmation(
     snapshot: SettlementLifecycleSnapshot,
 ) -> MerchantSettlementPreviousConfirmation {
-    if let Some(block) = snapshot.last_reorged_block {
-        return MerchantSettlementPreviousConfirmation::Reorged {
-            previous_block_height: block.height(),
-            previous_block_hash: block.hash().to_owned(),
-        };
-    }
+    let last_reorged_block = snapshot.last_reorged_block;
     match snapshot.state {
-        SettlementState::Mempool => MerchantSettlementPreviousConfirmation::Mempool,
         SettlementState::Confirmed { block, .. } | SettlementState::Finalized { block, .. } => {
             MerchantSettlementPreviousConfirmation::Confirmed {
                 block_height: block.height(),
                 block_hash: block.hash().to_owned(),
             }
         }
+        SettlementState::Reorged { previous_block } => {
+            MerchantSettlementPreviousConfirmation::Reorged {
+                previous_block_height: previous_block.height(),
+                previous_block_hash: previous_block.hash().to_owned(),
+            }
+        }
+        SettlementState::Mempool => match last_reorged_block {
+            Some(block) => MerchantSettlementPreviousConfirmation::Reorged {
+                previous_block_height: block.height(),
+                previous_block_hash: block.hash().to_owned(),
+            },
+            None => MerchantSettlementPreviousConfirmation::Mempool,
+        },
+        SettlementState::Broadcast => match last_reorged_block {
+            Some(block) => MerchantSettlementPreviousConfirmation::Reorged {
+                previous_block_height: block.height(),
+                previous_block_hash: block.hash().to_owned(),
+            },
+            None => MerchantSettlementPreviousConfirmation::NeverObserved,
+        },
         _ => MerchantSettlementPreviousConfirmation::NeverObserved,
     }
 }
