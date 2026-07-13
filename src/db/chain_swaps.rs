@@ -49,6 +49,423 @@ impl ChainSwapStatus {
     }
 }
 
+/// One provider-status observation delivered by either the Boltz webhook or
+/// the reconciler. This is deliberately limited to status persistence: the
+/// later chain-evidence action reducer owns claim/recovery decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapProviderStatusInput {
+    /// Re-read and lock the current row without changing provider-derived
+    /// state. Used for status hints such as `transaction.claimed` whose truth
+    /// must be independently established by the local claim path.
+    Observe,
+    UserLockMempool,
+    UserLockConfirmed,
+    ServerLockMempool,
+    ServerLockConfirmed,
+    /// Boltz's wall-clock expiry hint. A funded user lock becomes recoverable;
+    /// a still-viable Liquid path only switches permanently to script claim.
+    SwapExpired,
+    /// Provider evidence that the normal server-lock creation failed. Combined
+    /// with a locally observed user lock this can make the row recoverable, but
+    /// it must never overwrite a server lock or in-flight/finished settlement.
+    FundingFailed,
+}
+
+/// Result of applying one provider observation under the chain-swap row lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSwapProviderTransition {
+    pub previous_status: ChainSwapStatus,
+    pub current_status: ChainSwapStatus,
+    pub cooperative_refused: bool,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainSwapProviderDecision {
+    status: ChainSwapStatus,
+    cooperative_refused: bool,
+}
+
+fn provider_progress_status(input: ChainSwapProviderStatusInput) -> Option<ChainSwapStatus> {
+    match input {
+        ChainSwapProviderStatusInput::UserLockMempool => Some(ChainSwapStatus::UserLockMempool),
+        ChainSwapProviderStatusInput::UserLockConfirmed => Some(ChainSwapStatus::UserLockConfirmed),
+        ChainSwapProviderStatusInput::ServerLockMempool => Some(ChainSwapStatus::ServerLockMempool),
+        ChainSwapProviderStatusInput::ServerLockConfirmed => {
+            Some(ChainSwapStatus::ServerLockConfirmed)
+        }
+        ChainSwapProviderStatusInput::Observe
+        | ChainSwapProviderStatusInput::SwapExpired
+        | ChainSwapProviderStatusInput::FundingFailed => None,
+    }
+}
+
+fn provider_progress_rank(status: ChainSwapStatus) -> Option<u8> {
+    match status {
+        ChainSwapStatus::Pending => Some(0),
+        ChainSwapStatus::UserLockMempool => Some(1),
+        ChainSwapStatus::UserLockConfirmed => Some(2),
+        ChainSwapStatus::ServerLockMempool => Some(3),
+        ChainSwapStatus::ServerLockConfirmed => Some(4),
+        // Claim, recovery, and legacy terminal states are separate branches.
+        // Provider lifecycle hints may redrive their executor, but may not
+        // rewrite the persisted branch back to an earlier observation.
+        ChainSwapStatus::Claiming
+        | ChainSwapStatus::Claimed
+        | ChainSwapStatus::ClaimFailed
+        | ChainSwapStatus::ClaimStuck
+        | ChainSwapStatus::Expired
+        | ChainSwapStatus::LockupFailed
+        | ChainSwapStatus::Refunded
+        | ChainSwapStatus::RefundDue
+        | ChainSwapStatus::Refunding => None,
+    }
+}
+
+fn reduce_chain_swap_provider_status(
+    current: ChainSwapStatus,
+    cooperative_refused: bool,
+    input: ChainSwapProviderStatusInput,
+) -> ChainSwapProviderDecision {
+    if let Some(observed) = provider_progress_status(input) {
+        if cooperative_refused
+            && matches!(
+                current,
+                ChainSwapStatus::Pending
+                    | ChainSwapStatus::UserLockMempool
+                    | ChainSwapStatus::UserLockConfirmed
+            )
+            && matches!(
+                observed,
+                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed
+            )
+        {
+            // Expiry/failure can arrive before local payer-lock evidence. The
+            // one-way refusal fact is not recovery authority by itself, but it
+            // combines with a later user lock exactly as the opposite delivery
+            // order does.
+            return ChainSwapProviderDecision {
+                status: ChainSwapStatus::RefundDue,
+                cooperative_refused,
+            };
+        }
+        let status = match (
+            provider_progress_rank(current),
+            provider_progress_rank(observed),
+        ) {
+            (Some(current_rank), Some(observed_rank)) if observed_rank > current_rank => observed,
+            // `refund_due` is only a provisional recovery-eligibility branch.
+            // A late valid server lock restores the normal Liquid path until a
+            // recovery executor has atomically claimed ownership by moving the
+            // row to `refunding`.
+            (None, Some(observed_rank))
+                if current == ChainSwapStatus::RefundDue
+                    && observed_rank
+                        >= provider_progress_rank(ChainSwapStatus::ServerLockMempool)
+                            .expect("server-lock progress rank") =>
+            {
+                observed
+            }
+            _ => current,
+        };
+        return ChainSwapProviderDecision {
+            status,
+            cooperative_refused,
+        };
+    }
+
+    match input {
+        ChainSwapProviderStatusInput::SwapExpired => match current {
+            ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
+                ChainSwapProviderDecision {
+                    status: ChainSwapStatus::RefundDue,
+                    // Preserve the expiry fact even if a late server lock
+                    // subsequently revokes recovery eligibility.
+                    cooperative_refused: true,
+                }
+            }
+            ChainSwapStatus::Pending
+            | ChainSwapStatus::ServerLockMempool
+            | ChainSwapStatus::ServerLockConfirmed
+            | ChainSwapStatus::Claiming
+            | ChainSwapStatus::ClaimFailed => ChainSwapProviderDecision {
+                status: current,
+                cooperative_refused: true,
+            },
+            ChainSwapStatus::Claimed
+            | ChainSwapStatus::ClaimStuck
+            | ChainSwapStatus::Expired
+            | ChainSwapStatus::LockupFailed
+            | ChainSwapStatus::Refunded
+            | ChainSwapStatus::RefundDue
+            | ChainSwapStatus::Refunding => ChainSwapProviderDecision {
+                status: current,
+                cooperative_refused,
+            },
+        },
+        ChainSwapProviderStatusInput::FundingFailed => match current {
+            ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
+                ChainSwapProviderDecision {
+                    status: ChainSwapStatus::RefundDue,
+                    cooperative_refused: true,
+                }
+            }
+            // Provider failure alone is not proof that the payer funded the
+            // Bitcoin lock. Pending remains pending, while the one-way fact is
+            // retained so later local user-lock evidence can combine with it.
+            ChainSwapStatus::Pending => ChainSwapProviderDecision {
+                status: current,
+                cooperative_refused: true,
+            },
+            ChainSwapStatus::ServerLockMempool
+            | ChainSwapStatus::ServerLockConfirmed
+            | ChainSwapStatus::Claiming
+            | ChainSwapStatus::Claimed
+            | ChainSwapStatus::ClaimFailed
+            | ChainSwapStatus::ClaimStuck
+            | ChainSwapStatus::Expired
+            | ChainSwapStatus::LockupFailed
+            | ChainSwapStatus::Refunded
+            | ChainSwapStatus::RefundDue
+            | ChainSwapStatus::Refunding => ChainSwapProviderDecision {
+                status: current,
+                cooperative_refused,
+            },
+        },
+        ChainSwapProviderStatusInput::Observe => ChainSwapProviderDecision {
+            status: current,
+            cooperative_refused,
+        },
+        ChainSwapProviderStatusInput::UserLockMempool
+        | ChainSwapProviderStatusInput::UserLockConfirmed
+        | ChainSwapProviderStatusInput::ServerLockMempool
+        | ChainSwapProviderStatusInput::ServerLockConfirmed => {
+            unreachable!("provider progress inputs return above")
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_transition_tests {
+    use super::*;
+
+    const ALL_STATUSES: &[ChainSwapStatus] = &[
+        ChainSwapStatus::Pending,
+        ChainSwapStatus::UserLockMempool,
+        ChainSwapStatus::UserLockConfirmed,
+        ChainSwapStatus::ServerLockMempool,
+        ChainSwapStatus::ServerLockConfirmed,
+        ChainSwapStatus::Claiming,
+        ChainSwapStatus::Claimed,
+        ChainSwapStatus::ClaimFailed,
+        ChainSwapStatus::ClaimStuck,
+        ChainSwapStatus::Expired,
+        ChainSwapStatus::LockupFailed,
+        ChainSwapStatus::Refunded,
+        ChainSwapStatus::RefundDue,
+        ChainSwapStatus::Refunding,
+    ];
+
+    const PROGRESS_INPUTS: &[ChainSwapProviderStatusInput] = &[
+        ChainSwapProviderStatusInput::UserLockMempool,
+        ChainSwapProviderStatusInput::UserLockConfirmed,
+        ChainSwapProviderStatusInput::ServerLockMempool,
+        ChainSwapProviderStatusInput::ServerLockConfirmed,
+    ];
+
+    #[test]
+    fn provider_progress_is_monotonic_and_branch_sticky() {
+        for &current in ALL_STATUSES {
+            for &input in PROGRESS_INPUTS {
+                let observed = provider_progress_status(input).unwrap();
+                let decision = reduce_chain_swap_provider_status(current, false, input);
+                let expected = match (
+                    provider_progress_rank(current),
+                    provider_progress_rank(observed),
+                ) {
+                    (Some(current_rank), Some(observed_rank)) if observed_rank > current_rank => {
+                        observed
+                    }
+                    (None, Some(observed_rank))
+                        if current == ChainSwapStatus::RefundDue
+                            && observed_rank
+                                >= provider_progress_rank(ChainSwapStatus::ServerLockMempool)
+                                    .unwrap() =>
+                    {
+                        observed
+                    }
+                    _ => current,
+                };
+                assert_eq!(
+                    decision.status, expected,
+                    "current={current:?}, input={input:?}"
+                );
+                assert!(!decision.cooperative_refused);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_and_reordered_progress_are_noops() {
+        let cases = [
+            (
+                ChainSwapStatus::UserLockConfirmed,
+                ChainSwapProviderStatusInput::UserLockMempool,
+            ),
+            (
+                ChainSwapStatus::UserLockConfirmed,
+                ChainSwapProviderStatusInput::UserLockConfirmed,
+            ),
+            (
+                ChainSwapStatus::ServerLockConfirmed,
+                ChainSwapProviderStatusInput::ServerLockMempool,
+            ),
+            (
+                ChainSwapStatus::ServerLockConfirmed,
+                ChainSwapProviderStatusInput::UserLockMempool,
+            ),
+            (
+                ChainSwapStatus::ClaimFailed,
+                ChainSwapProviderStatusInput::ServerLockConfirmed,
+            ),
+        ];
+        for (current, input) in cases {
+            let decision = reduce_chain_swap_provider_status(current, false, input);
+            assert_eq!(decision.status, current);
+            assert!(!decision.cooperative_refused);
+        }
+    }
+
+    #[test]
+    fn expiry_preserves_liquid_progress_and_only_recovers_user_lock_states() {
+        for &current in ALL_STATUSES {
+            let decision = reduce_chain_swap_provider_status(
+                current,
+                false,
+                ChainSwapProviderStatusInput::SwapExpired,
+            );
+            let (expected_status, expected_refused) = match current {
+                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
+                    (ChainSwapStatus::RefundDue, true)
+                }
+                ChainSwapStatus::Pending
+                | ChainSwapStatus::ServerLockMempool
+                | ChainSwapStatus::ServerLockConfirmed
+                | ChainSwapStatus::Claiming
+                | ChainSwapStatus::ClaimFailed => (current, true),
+                ChainSwapStatus::Claimed
+                | ChainSwapStatus::ClaimStuck
+                | ChainSwapStatus::Expired
+                | ChainSwapStatus::LockupFailed
+                | ChainSwapStatus::Refunded
+                | ChainSwapStatus::RefundDue
+                | ChainSwapStatus::Refunding => (current, false),
+            };
+            assert_eq!(
+                (decision.status, decision.cooperative_refused),
+                (expected_status, expected_refused),
+                "current={current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_evidence_cannot_overwrite_server_or_resolution_branches() {
+        for &current in ALL_STATUSES {
+            let decision = reduce_chain_swap_provider_status(
+                current,
+                false,
+                ChainSwapProviderStatusInput::FundingFailed,
+            );
+            let (expected_status, expected_refused) = match current {
+                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
+                    (ChainSwapStatus::RefundDue, true)
+                }
+                ChainSwapStatus::Pending => (current, true),
+                _ => (current, false),
+            };
+            assert_eq!(
+                (decision.status, decision.cooperative_refused),
+                (expected_status, expected_refused),
+                "current={current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_server_lock_revokes_unstarted_recovery_and_reenters_claim_path() {
+        let failed = reduce_chain_swap_provider_status(
+            ChainSwapStatus::UserLockConfirmed,
+            false,
+            ChainSwapProviderStatusInput::FundingFailed,
+        );
+        assert_eq!(failed.status, ChainSwapStatus::RefundDue);
+
+        let late_server_lock = reduce_chain_swap_provider_status(
+            failed.status,
+            failed.cooperative_refused,
+            ChainSwapProviderStatusInput::ServerLockConfirmed,
+        );
+        assert_eq!(
+            late_server_lock.status,
+            ChainSwapStatus::ServerLockConfirmed
+        );
+
+        let recovery_already_owned = reduce_chain_swap_provider_status(
+            ChainSwapStatus::Refunding,
+            false,
+            ChainSwapProviderStatusInput::ServerLockConfirmed,
+        );
+        assert_eq!(
+            recovery_already_owned.status,
+            ChainSwapStatus::Refunding,
+            "provider hints may not cross an already-owned recovery execution"
+        );
+    }
+
+    #[test]
+    fn early_failure_or_expiry_combines_with_later_user_lock_in_either_order() {
+        for failure in [
+            ChainSwapProviderStatusInput::FundingFailed,
+            ChainSwapProviderStatusInput::SwapExpired,
+        ] {
+            let failure_first =
+                reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, failure);
+            assert_eq!(failure_first.status, ChainSwapStatus::Pending);
+            assert!(failure_first.cooperative_refused);
+            assert_eq!(
+                reduce_chain_swap_provider_status(
+                    failure_first.status,
+                    failure_first.cooperative_refused,
+                    failure,
+                ),
+                failure_first,
+                "duplicate failure evidence must be a no-op"
+            );
+            let user_after = reduce_chain_swap_provider_status(
+                failure_first.status,
+                failure_first.cooperative_refused,
+                ChainSwapProviderStatusInput::UserLockConfirmed,
+            );
+
+            let user_first = reduce_chain_swap_provider_status(
+                ChainSwapStatus::Pending,
+                false,
+                ChainSwapProviderStatusInput::UserLockConfirmed,
+            );
+            let failure_after = reduce_chain_swap_provider_status(
+                user_first.status,
+                user_first.cooperative_refused,
+                failure,
+            );
+
+            assert_eq!(user_after, failure_after, "failure={failure:?}");
+            assert_eq!(user_after.status, ChainSwapStatus::RefundDue);
+            assert!(user_after.cooperative_refused);
+        }
+    }
+}
+
 impl fmt::Display for ChainSwapStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -490,6 +907,64 @@ pub async fn latest_payable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
     .bind(amount_sat)
     .fetch_optional(executor)
     .await
+}
+
+/// Atomically fold one webhook/reconciliation provider status into the
+/// persisted chain-swap lifecycle.
+///
+/// The row lock makes concurrent webhook and polling inputs serialize on the
+/// latest committed state. The reducer is monotonic for provider progress,
+/// keeps owned recovery/claim branches sticky, lets a late server lock revoke
+/// only an unstarted `refund_due`, and treats duplicates as true no-ops
+/// (including preserving `updated_at`). No delivery-dedup row participates in
+/// this correctness decision, so an aborted caller can safely retry the same
+/// evidence later.
+pub async fn apply_chain_swap_provider_status(
+    pool: &PgPool,
+    id: Uuid,
+    input: ChainSwapProviderStatusInput,
+) -> Result<Option<ChainSwapProviderTransition>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(current) = get_chain_swap_by_id_for_update(&mut *tx, id).await? else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let previous_status = current.parsed_status().map_err(|error| {
+        sqlx::Error::Protocol(format!(
+            "invalid persisted chain swap status for {}: {error}",
+            current.id
+        ))
+    })?;
+    let decision =
+        reduce_chain_swap_provider_status(previous_status, current.cooperative_refused, input);
+    let changed = decision.status != previous_status
+        || decision.cooperative_refused != current.cooperative_refused;
+
+    if changed {
+        let updated = sqlx::query(
+            "UPDATE chain_swap_records \
+             SET status = $2, cooperative_refused = $3, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(decision.status.to_string())
+        .bind(decision.cooperative_refused)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "locked chain swap disappeared during provider transition: {id}"
+            )));
+        }
+    }
+
+    tx.commit().await?;
+    Ok(Some(ChainSwapProviderTransition {
+        previous_status,
+        current_status: decision.status,
+        cooperative_refused: decision.cooperative_refused,
+        changed,
+    }))
 }
 
 pub async fn update_chain_swap_status(
