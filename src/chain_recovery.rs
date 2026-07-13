@@ -1328,9 +1328,22 @@ async fn construct_live_refund(
 mod tests {
     use boltz_client::util::fees::Fee;
 
-    use super::{bitcoin_recovery_fee, BitcoinRecoveryBackend};
+    use super::{
+        bitcoin_recovery_fee, BitcoinRecoveryBackend, BitcoinRecoveryEvidence,
+        BitcoinRecoveryTransactionStatus,
+    };
     use crate::builder_fee::BitcoinBuilderFeeDecision;
     use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::get,
+        Router,
+    };
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     fn bitcoin_builder_fee(rate: f64) -> BitcoinBuilderFeeDecision {
         let observation = LiveBitcoin::new(
@@ -1361,6 +1374,80 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockEsploraState {
+        tip: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        status: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        block: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockEsploraState {
+        fn new(
+            tip: impl IntoIterator<Item = (StatusCode, String)>,
+            status: impl IntoIterator<Item = (StatusCode, String)>,
+            block: impl IntoIterator<Item = (StatusCode, String)>,
+        ) -> Self {
+            Self {
+                tip: Arc::new(Mutex::new(tip.into_iter().collect())),
+                status: Arc::new(Mutex::new(status.into_iter().collect())),
+                block: Arc::new(Mutex::new(block.into_iter().collect())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    fn next_response(queue: &Mutex<VecDeque<(StatusCode, String)>>) -> (StatusCode, String) {
+        queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("mock Esplora response queue is complete")
+    }
+
+    async fn mock_tip(State(state): State<MockEsploraState>) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push("tip".into());
+        next_response(&state.tip)
+    }
+
+    async fn mock_status(
+        State(state): State<MockEsploraState>,
+        Path(_txid): Path<String>,
+    ) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push("status".into());
+        next_response(&state.status)
+    }
+
+    async fn mock_block(
+        State(state): State<MockEsploraState>,
+        Path(height): Path<u32>,
+    ) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push(format!("block:{height}"));
+        next_response(&state.block)
+    }
+
+    async fn spawn_mock_esplora(state: MockEsploraState) -> String {
+        let app = Router::new()
+            .route("/blocks/tip/height", get(mock_tip))
+            .route("/tx/:txid/status", get(mock_status))
+            .route("/block-height/:height", get(mock_block))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Esplora");
+        let address = listener.local_addr().expect("mock Esplora address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock Esplora");
+        });
+        format!("http://{address}")
+    }
+
+    fn confirmed_status(height: u32, hash: &str) -> String {
+        format!(r#"{{"confirmed":true,"block_height":{height},"block_hash":"{hash}"}}"#)
+    }
+
     #[test]
     fn recovery_backend_requires_a_valid_http_endpoint() {
         assert!(BitcoinRecoveryBackend::try_new(Vec::new()).is_err());
@@ -1387,5 +1474,144 @@ mod tests {
                 "http://127.0.0.1:3000".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_anchors_one_endpoint_and_rechecks_status_and_tip() {
+        let block_hash = "aa".repeat(32);
+        let state = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::OK, confirmed_status(99, &block_hash)),
+                (StatusCode::OK, confirmed_status(99, &block_hash)),
+            ],
+            [(StatusCode::OK, block_hash.clone())],
+        );
+        let endpoint = spawn_mock_esplora(state.clone()).await;
+        let backend = BitcoinRecoveryBackend::try_new(vec![endpoint]).unwrap();
+        let txid = "11".repeat(32);
+
+        let snapshot = backend.status_snapshot(&txid, Some(99)).await.unwrap();
+
+        assert_eq!(snapshot.tip_height, 100);
+        assert_eq!(snapshot.prior_block_hash, Some(block_hash.clone()));
+        assert_eq!(
+            snapshot.status,
+            BitcoinRecoveryTransactionStatus::Confirmed {
+                block_height: 99,
+                block_hash,
+            }
+        );
+        assert_eq!(
+            state.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "block:99", "status", "tip"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_rejects_block_mismatch_and_toctou() {
+        let claimed_hash = "aa".repeat(32);
+        let anchored_hash = "bb".repeat(32);
+        let mismatch = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [(StatusCode::OK, confirmed_status(99, &claimed_hash))],
+            [(StatusCode::OK, anchored_hash)],
+        );
+        let mismatch_backend =
+            BitcoinRecoveryBackend::try_new(vec![spawn_mock_esplora(mismatch.clone()).await])
+                .unwrap();
+        assert!(mismatch_backend
+            .status_snapshot(&"22".repeat(32), None)
+            .await
+            .is_err());
+        assert_eq!(
+            mismatch.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "block:99"]
+        );
+
+        let toctou = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [
+                (StatusCode::OK, r#"{"confirmed":false}"#.into()),
+                (StatusCode::OK, confirmed_status(100, &claimed_hash)),
+            ],
+            [],
+        );
+        let toctou_backend =
+            BitcoinRecoveryBackend::try_new(vec![spawn_mock_esplora(toctou.clone()).await])
+                .unwrap();
+        assert!(toctou_backend
+            .status_snapshot(&"33".repeat(32), None)
+            .await
+            .is_err());
+        assert_eq!(
+            toctou.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_requires_all_endpoints_for_positive_absence() {
+        let absent_a = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let absent_b = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let endpoints = vec![
+            spawn_mock_esplora(absent_a).await,
+            spawn_mock_esplora(absent_b).await,
+        ];
+        let backend = BitcoinRecoveryBackend::try_new(endpoints).unwrap();
+        let snapshot = backend
+            .status_snapshot(&"44".repeat(32), None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, BitcoinRecoveryTransactionStatus::Absent);
+
+        let absent = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let uncertain = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [(StatusCode::SERVICE_UNAVAILABLE, "unavailable".into())],
+            [],
+        );
+        let backend = BitcoinRecoveryBackend::try_new(vec![
+            spawn_mock_esplora(absent).await,
+            spawn_mock_esplora(uncertain).await,
+        ])
+        .unwrap();
+        assert!(backend
+            .status_snapshot(&"55".repeat(32), None)
+            .await
+            .is_err());
     }
 }
