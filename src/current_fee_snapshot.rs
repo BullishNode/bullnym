@@ -3,8 +3,9 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use crate::fee_policy::{
-    BitcoinFeeDecision, BitcoinFeePolicy, FeeObservationRejection, FeePolicyError, FeeRail,
-    LiquidFeeDecision, LiquidFeePolicy, LiveBitcoin, LiveLiquid,
+    BitcoinFeeDecision, BitcoinFeePolicy, BitcoinLastKnownGood, FeeObservationRejection,
+    FeePolicyError, FeeRail, LiquidFeeDecision, LiquidFeePolicy, LiquidLastKnownGood, LiveBitcoin,
+    LiveLiquid,
 };
 
 /// Current-process Bitcoin evidence accepted by the typed Bitcoin policy.
@@ -34,30 +35,34 @@ impl CurrentFeeGeneration {
     }
 }
 
-struct RailSnapshot<T> {
+struct RailSnapshot<Live, LastKnownGood> {
     generation: CurrentFeeGeneration,
-    observation: Option<T>,
+    live: Option<Live>,
+    last_known_good: Option<LastKnownGood>,
 }
 
-impl<T> Default for RailSnapshot<T> {
+impl<Live, LastKnownGood> Default for RailSnapshot<Live, LastKnownGood> {
     fn default() -> Self {
         Self {
             generation: CurrentFeeGeneration::default(),
-            observation: None,
+            live: None,
+            last_known_good: None,
         }
     }
 }
 
 /// A cloneable, process-local holder for the latest explicitly supplied live
-/// fee evidence on each rail.
+/// fee evidence and the latest explicitly restored persisted observation on
+/// each rail.
 ///
-/// A new instance is empty. It performs no polling, persistence, LKG restore,
-/// readiness mutation, or transaction construction. Clones share the same
-/// two rail-local locks; separately constructed instances share nothing.
+/// A new instance is empty. It performs no polling, database I/O, readiness
+/// mutation, or transaction construction. Restored observations must come
+/// through the typed same-rail restore methods. Clones share the same two
+/// rail-local locks; separately constructed instances share nothing.
 #[derive(Clone)]
 pub struct CurrentFeeSnapshot {
-    bitcoin: Arc<RwLock<RailSnapshot<LiveBitcoinFeeObservation>>>,
-    liquid: Arc<RwLock<RailSnapshot<LiveLiquidFeeObservation>>>,
+    bitcoin: Arc<RwLock<RailSnapshot<LiveBitcoinFeeObservation, BitcoinLastKnownGood>>>,
+    liquid: Arc<RwLock<RailSnapshot<LiveLiquidFeeObservation, LiquidLastKnownGood>>>,
 }
 
 impl CurrentFeeSnapshot {
@@ -74,7 +79,7 @@ impl CurrentFeeSnapshot {
         &self,
         observation: LiveBitcoinFeeObservation,
     ) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
-        update_rail(&self.bitcoin, FeeRail::Bitcoin, Some(observation))
+        update_live(&self.bitcoin, FeeRail::Bitcoin, Some(observation))
     }
 
     /// Replace the current-process Liquid observation and return the exact
@@ -83,31 +88,54 @@ impl CurrentFeeSnapshot {
         &self,
         observation: LiveLiquidFeeObservation,
     ) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
-        update_rail(&self.liquid, FeeRail::Liquid, Some(observation))
+        update_live(&self.liquid, FeeRail::Liquid, Some(observation))
     }
 
-    /// Explicitly clear Bitcoin evidence. Clearing an already-empty rail still
-    /// advances its generation so the clear remains an ordered process event.
+    /// Restore one persisted Bitcoin observation as typed same-rail LKG
+    /// evidence. The caller remains responsible for database I/O and row
+    /// validation before crossing this boundary.
+    pub fn restore_bitcoin_last_known_good(
+        &self,
+        observation: BitcoinLastKnownGood,
+    ) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
+        restore_last_known_good(&self.bitcoin, FeeRail::Bitcoin, observation)
+    }
+
+    /// Restore one persisted Liquid observation as typed same-rail LKG
+    /// evidence. The caller remains responsible for database I/O and row
+    /// validation before crossing this boundary.
+    pub fn restore_liquid_last_known_good(
+        &self,
+        observation: LiquidLastKnownGood,
+    ) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
+        restore_last_known_good(&self.liquid, FeeRail::Liquid, observation)
+    }
+
+    /// Explicitly clear current-process Bitcoin live evidence. A restored LKG
+    /// remains available. Clearing an already-empty live slot still advances
+    /// its generation so the clear remains an ordered process event.
     pub fn clear_bitcoin(&self) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
-        update_rail(&self.bitcoin, FeeRail::Bitcoin, None)
+        update_live(&self.bitcoin, FeeRail::Bitcoin, None)
     }
 
-    /// Explicitly clear Liquid evidence. Clearing an already-empty rail still
-    /// advances its generation so the clear remains an ordered process event.
+    /// Explicitly clear current-process Liquid live evidence. A restored LKG
+    /// remains available. Clearing an already-empty live slot still advances
+    /// its generation so the clear remains an ordered process event.
     pub fn clear_liquid(&self) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
-        update_rail(&self.liquid, FeeRail::Liquid, None)
+        update_live(&self.liquid, FeeRail::Liquid, None)
     }
 
     /// Re-evaluate the currently stored Bitcoin evidence against the supplied
-    /// validated policy and deterministic clock. No LKG candidate is invented.
+    /// validated policy and deterministic clock, preferring usable live
+    /// evidence and falling back only to explicitly restored same-rail LKG.
     pub fn read_bitcoin(
         &self,
         policy: &BitcoinFeePolicy,
         now_unix: u64,
     ) -> Result<CurrentBitcoinFee, CurrentFeeSnapshotError> {
-        let (generation, observation) = read_rail(&self.bitcoin, FeeRail::Bitcoin)?;
+        let (generation, live, last_known_good) = read_rail(&self.bitcoin, FeeRail::Bitcoin)?;
         policy
-            .decide_typed(observation.as_ref(), None, now_unix)
+            .decide_typed(live.as_ref(), last_known_good.as_ref(), now_unix)
             .map(|decision| CurrentBitcoinFee {
                 generation,
                 decision,
@@ -116,15 +144,51 @@ impl CurrentFeeSnapshot {
     }
 
     /// Re-evaluate the currently stored Liquid evidence against the supplied
-    /// validated policy and deterministic clock. No LKG candidate is invented.
+    /// validated policy and deterministic clock, preferring usable live
+    /// evidence and falling back only to explicitly restored same-rail LKG.
     pub fn read_liquid(
         &self,
         policy: &LiquidFeePolicy,
         now_unix: u64,
     ) -> Result<CurrentLiquidFee, CurrentFeeSnapshotError> {
-        let (generation, observation) = read_rail(&self.liquid, FeeRail::Liquid)?;
+        let (generation, live, last_known_good) = read_rail(&self.liquid, FeeRail::Liquid)?;
         policy
-            .decide_typed(observation.as_ref(), None, now_unix)
+            .decide_typed(live.as_ref(), last_known_good.as_ref(), now_unix)
+            .map(|decision| CurrentLiquidFee {
+                generation,
+                decision,
+            })
+            .map_err(|error| policy_error(FeeRail::Liquid, generation, error))
+    }
+
+    /// Return the current Bitcoin live decision that is eligible to cross the
+    /// persistence boundary. Restored LKG is deliberately excluded: reading a
+    /// persisted row must never refresh its lifetime by persisting it again.
+    pub fn accepted_bitcoin_for_persistence(
+        &self,
+        policy: &BitcoinFeePolicy,
+        now_unix: u64,
+    ) -> Result<CurrentBitcoinFee, CurrentFeeSnapshotError> {
+        let (generation, live, _) = read_rail(&self.bitcoin, FeeRail::Bitcoin)?;
+        policy
+            .decide_typed(live.as_ref(), None, now_unix)
+            .map(|decision| CurrentBitcoinFee {
+                generation,
+                decision,
+            })
+            .map_err(|error| policy_error(FeeRail::Bitcoin, generation, error))
+    }
+
+    /// Return the current Liquid live decision that is eligible to cross the
+    /// persistence boundary. Restored LKG is deliberately excluded.
+    pub fn accepted_liquid_for_persistence(
+        &self,
+        policy: &LiquidFeePolicy,
+        now_unix: u64,
+    ) -> Result<CurrentLiquidFee, CurrentFeeSnapshotError> {
+        let (generation, live, _) = read_rail(&self.liquid, FeeRail::Liquid)?;
+        policy
+            .decide_typed(live.as_ref(), None, now_unix)
             .map(|decision| CurrentLiquidFee {
                 generation,
                 decision,
@@ -149,28 +213,46 @@ impl fmt::Debug for CurrentFeeSnapshot {
     }
 }
 
-fn update_rail<T>(
-    rail: &RwLock<RailSnapshot<T>>,
+fn update_live<Live, LastKnownGood>(
+    rail: &RwLock<RailSnapshot<Live, LastKnownGood>>,
     fee_rail: FeeRail,
-    observation: Option<T>,
+    observation: Option<Live>,
 ) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
     let mut state = rail
         .write()
         .map_err(|_| CurrentFeeSnapshotError::StateUnavailable { rail: fee_rail })?;
     let generation = state.generation.next(fee_rail)?;
-    state.observation = observation;
+    state.live = observation;
     state.generation = generation;
     Ok(generation)
 }
 
-fn read_rail<T: Clone>(
-    rail: &RwLock<RailSnapshot<T>>,
+fn restore_last_known_good<Live, LastKnownGood>(
+    rail: &RwLock<RailSnapshot<Live, LastKnownGood>>,
     fee_rail: FeeRail,
-) -> Result<(CurrentFeeGeneration, Option<T>), CurrentFeeSnapshotError> {
+    observation: LastKnownGood,
+) -> Result<CurrentFeeGeneration, CurrentFeeSnapshotError> {
+    let mut state = rail
+        .write()
+        .map_err(|_| CurrentFeeSnapshotError::StateUnavailable { rail: fee_rail })?;
+    let generation = state.generation.next(fee_rail)?;
+    state.last_known_good = Some(observation);
+    state.generation = generation;
+    Ok(generation)
+}
+
+fn read_rail<Live: Clone, LastKnownGood: Clone>(
+    rail: &RwLock<RailSnapshot<Live, LastKnownGood>>,
+    fee_rail: FeeRail,
+) -> Result<(CurrentFeeGeneration, Option<Live>, Option<LastKnownGood>), CurrentFeeSnapshotError> {
     let state = rail
         .read()
         .map_err(|_| CurrentFeeSnapshotError::StateUnavailable { rail: fee_rail })?;
-    Ok((state.generation, state.observation.clone()))
+    Ok((
+        state.generation,
+        state.live.clone(),
+        state.last_known_good.clone(),
+    ))
 }
 
 /// A Bitcoin policy decision tied to the rail-local mutation generation that
@@ -336,14 +418,17 @@ fn policy_error(
     error: FeePolicyError,
 ) -> CurrentFeeSnapshotError {
     let reason = match error {
-        FeePolicyError::TemporarilyUnavailable { live, .. } => match live {
-            FeeObservationRejection::Missing => CurrentFeeUnavailableReason::Missing,
-            FeeObservationRejection::Stale { .. } => CurrentFeeUnavailableReason::Stale,
-            FeeObservationRejection::FromFuture { .. } => CurrentFeeUnavailableReason::FromFuture,
-            FeeObservationRejection::OutsideBounds { .. } => {
-                CurrentFeeUnavailableReason::OutsideBounds
-            }
-        },
+        FeePolicyError::TemporarilyUnavailable {
+            live,
+            last_known_good,
+            ..
+        } => rejection_reason(
+            if matches!(last_known_good, FeeObservationRejection::Missing) {
+                live
+            } else {
+                last_known_good
+            },
+        ),
         _ => CurrentFeeUnavailableReason::PolicyRejected,
     };
     CurrentFeeSnapshotError::Unavailable {
@@ -353,13 +438,25 @@ fn policy_error(
     }
 }
 
+fn rejection_reason(rejection: FeeObservationRejection) -> CurrentFeeUnavailableReason {
+    match rejection {
+        FeeObservationRejection::Missing => CurrentFeeUnavailableReason::Missing,
+        FeeObservationRejection::Stale { .. } => CurrentFeeUnavailableReason::Stale,
+        FeeObservationRejection::FromFuture { .. } => CurrentFeeUnavailableReason::FromFuture,
+        FeeObservationRejection::OutsideBounds { .. } => CurrentFeeUnavailableReason::OutsideBounds,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::TypeId;
     use std::sync::Barrier;
     use std::thread;
 
-    use crate::fee_policy::{FeeFreshness, FeeObservationSource, FeeProvenance, SatPerVbyte};
+    use crate::fee_policy::{
+        BitcoinLastKnownGood, FeeFreshness, FeeObservationSource, FeeProvenance,
+        LiquidLastKnownGood, SatPerVbyte,
+    };
 
     use super::*;
 
@@ -377,6 +474,14 @@ mod tests {
 
     fn liquid(value: f64, observed_at_unix: u64, source: &str) -> LiveLiquidFeeObservation {
         LiveLiquidFeeObservation::new(rate(value), observed_at_unix, provenance(source))
+    }
+
+    fn bitcoin_lkg(value: f64, observed_at_unix: u64, source: &str) -> BitcoinLastKnownGood {
+        BitcoinLastKnownGood::new(rate(value), observed_at_unix, provenance(source))
+    }
+
+    fn liquid_lkg(value: f64, observed_at_unix: u64, source: &str) -> LiquidLastKnownGood {
+        LiquidLastKnownGood::new(rate(value), observed_at_unix, provenance(source))
     }
 
     #[test]
@@ -516,6 +621,116 @@ mod tests {
         assert!(snapshot
             .read_liquid(&LiquidFeePolicy::default(), 1_000)
             .is_ok());
+    }
+
+    #[test]
+    fn restored_lkg_is_same_rail_fallback_without_extending_its_observation_time() {
+        let snapshot = CurrentFeeSnapshot::new();
+        let bitcoin_policy = BitcoinFeePolicy::default();
+        let liquid_policy = LiquidFeePolicy::default();
+
+        assert_eq!(
+            snapshot
+                .restore_bitcoin_last_known_good(bitcoin_lkg(
+                    3.25,
+                    10_000,
+                    "persisted-bitcoin-secret",
+                ))
+                .unwrap()
+                .as_u64(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .restore_liquid_last_known_good(
+                    liquid_lkg(0.25, 10_000, "persisted-liquid-secret",)
+                )
+                .unwrap()
+                .as_u64(),
+            1
+        );
+
+        let bitcoin = snapshot.read_bitcoin(&bitcoin_policy, 10_100).unwrap();
+        assert_eq!(bitcoin.decision().rate(), rate(3.25));
+        assert_eq!(
+            bitcoin.decision().source(),
+            FeeObservationSource::BitcoinLastKnownGood
+        );
+        assert_eq!(bitcoin.decision().observed_at_unix(), 10_000);
+        assert_eq!(
+            bitcoin.decision().freshness(),
+            FeeFreshness::Fresh {
+                age_secs: 100,
+                max_age_secs: bitcoin_policy.last_known_good_max_age_secs(),
+            }
+        );
+
+        let liquid = snapshot.read_liquid(&liquid_policy, 10_100).unwrap();
+        assert_eq!(liquid.decision().rate(), rate(0.25));
+        assert_eq!(
+            liquid.decision().source(),
+            FeeObservationSource::LiquidLastKnownGood
+        );
+        assert_eq!(liquid.decision().observed_at_unix(), 10_000);
+
+        assert_eq!(
+            snapshot
+                .read_bitcoin(
+                    &bitcoin_policy,
+                    10_001 + bitcoin_policy.last_known_good_max_age_secs(),
+                )
+                .unwrap_err()
+                .reason(),
+            Some(CurrentFeeUnavailableReason::Stale)
+        );
+        assert_eq!(
+            snapshot
+                .accepted_bitcoin_for_persistence(&bitcoin_policy, 10_100)
+                .unwrap_err()
+                .reason(),
+            Some(CurrentFeeUnavailableReason::Missing)
+        );
+        assert_eq!(
+            snapshot
+                .accepted_liquid_for_persistence(&liquid_policy, 10_100)
+                .unwrap_err()
+                .reason(),
+            Some(CurrentFeeUnavailableReason::Missing)
+        );
+    }
+
+    #[test]
+    fn live_evidence_wins_and_only_live_is_persistable() {
+        let snapshot = CurrentFeeSnapshot::new();
+        let bitcoin_policy = BitcoinFeePolicy::default();
+        snapshot
+            .restore_bitcoin_last_known_good(bitcoin_lkg(2.0, 10_000, "persisted-bitcoin"))
+            .unwrap();
+        snapshot
+            .update_bitcoin(bitcoin(7.0, 10_100, "current-process-bitcoin"))
+            .unwrap();
+
+        let selected = snapshot.read_bitcoin(&bitcoin_policy, 10_100).unwrap();
+        let persistable = snapshot
+            .accepted_bitcoin_for_persistence(&bitcoin_policy, 10_100)
+            .unwrap();
+        assert_eq!(selected.generation(), persistable.generation());
+        assert_eq!(selected.decision(), persistable.decision());
+        assert_eq!(
+            persistable.decision().source(),
+            FeeObservationSource::LiveBitcoin
+        );
+
+        snapshot.clear_bitcoin().unwrap();
+        let fallback = snapshot.read_bitcoin(&bitcoin_policy, 10_100).unwrap();
+        assert_eq!(fallback.decision().rate(), rate(2.0));
+        assert_eq!(
+            fallback.decision().source(),
+            FeeObservationSource::BitcoinLastKnownGood
+        );
+        assert!(snapshot
+            .accepted_bitcoin_for_persistence(&bitcoin_policy, 10_100)
+            .is_err());
     }
 
     #[test]
@@ -665,7 +880,7 @@ mod tests {
         {
             let mut state = snapshot.bitcoin.write().unwrap();
             state.generation = CurrentFeeGeneration(u64::MAX);
-            state.observation = Some(bitcoin(2.0, 1_000, "retained-at-overflow"));
+            state.live = Some(bitcoin(2.0, 1_000, "retained-at-overflow"));
         }
 
         assert_eq!(
