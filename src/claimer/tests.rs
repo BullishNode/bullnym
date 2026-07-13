@@ -80,6 +80,50 @@ fn changed_liquid_decision_changes_each_next_claim_construction_path() {
 }
 
 #[test]
+fn liquid_actual_fee_uses_discounted_virtual_size_basis() {
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let confidential_value = boltz_elements::confidential::Value::new_confidential_from_assetid(
+        &secp,
+        50_000,
+        boltz_elements::AssetId::LIQUID_BTC,
+        boltz_elements::confidential::ValueBlindingFactor::zero(),
+        boltz_elements::confidential::AssetBlindingFactor::zero(),
+    );
+    let transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![
+            boltz_elements::TxOut {
+                asset: boltz_elements::confidential::Asset::Explicit(
+                    boltz_elements::AssetId::LIQUID_BTC,
+                ),
+                value: confidential_value,
+                nonce: boltz_elements::confidential::Nonce::Null,
+                script_pubkey: boltz_elements::Script::from(vec![0x51]),
+                witness: boltz_elements::TxOutWitness::default(),
+            },
+            boltz_elements::TxOut {
+                asset: boltz_elements::confidential::Asset::Explicit(
+                    boltz_elements::AssetId::LIQUID_BTC,
+                ),
+                value: boltz_elements::confidential::Value::Explicit(1_000),
+                nonce: boltz_elements::confidential::Nonce::Null,
+                script_pubkey: boltz_elements::Script::new(),
+                witness: boltz_elements::TxOutWitness::default(),
+            },
+        ],
+    };
+    assert_ne!(transaction.vsize(), transaction.discount_vsize());
+
+    let (fee_sat, rate_sat_vb) =
+        liquid_actual_fee(&BtcLikeTransaction::Liquid(transaction.clone())).unwrap();
+
+    assert_eq!(fee_sat, 1_000);
+    assert_eq!(rate_sat_vb, 1_000.0 / transaction.discount_vsize() as f64);
+}
+
+#[test]
 fn chain_claim_uses_validated_immutable_creation_destination() {
     let terms = valid_chain_creation_terms();
     assert_eq!(

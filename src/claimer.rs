@@ -2923,10 +2923,14 @@ fn liquid_actual_fee(tx: &BtcLikeTransaction) -> Result<(i64, f64), AppError> {
             ))
         }
     };
-    let vsize = transaction.vsize();
+    // Liquid claims are constructed through boltz-client with
+    // `is_discount_ct = true`, so the relative fee is applied to Elements'
+    // discounted confidential-transaction virtual size. Record the actual
+    // effective rate on that same basis.
+    let vsize = transaction.discount_vsize();
     if vsize == 0 {
         return Err(AppError::ClaimError(
-            "constructed Liquid claim has zero virtual size".into(),
+            "constructed Liquid claim has zero discounted virtual size".into(),
         ));
     }
     let fee_sat_i64 = i64::try_from(fee_sat)
