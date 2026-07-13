@@ -33,6 +33,7 @@ pub mod qr;
 pub mod rate_limit;
 pub mod readiness;
 pub mod reconciler;
+pub mod recovery_address_registration;
 pub mod registration;
 pub mod reserved_nyms;
 pub mod swap_manifest;
