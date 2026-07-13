@@ -82,6 +82,15 @@ fn is_lower_hex_32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn x_only_role_keys_are_distinct(keys: &[&PublicKey]) -> bool {
+    keys.iter().enumerate().all(|(index, key)| {
+        let x_only = key.inner.x_only_public_key().0;
+        keys[index + 1..]
+            .iter()
+            .all(|other| other.inner.x_only_public_key().0 != x_only)
+    })
+}
+
 fn expected_claim_script(hashlock: hash160::Hash, receiver: &PublicKey) -> ScriptBuf {
     Builder::new()
         .push_opcode(OP_SIZE)
@@ -197,9 +206,9 @@ fn validate_chain_creation_response(
     {
         return Err(invalid_chain_response("provider swap id is malformed"));
     }
-    if claim_public_key == refund_public_key {
+    if !x_only_role_keys_are_distinct(&[claim_public_key, refund_public_key]) {
         return Err(invalid_chain_response(
-            "local claim and refund keys must be distinct",
+            "local claim and refund x-only keys must be distinct",
         ));
     }
 
@@ -312,14 +321,14 @@ fn validate_chain_creation_response(
             "chain-swap key roles are inconsistent",
         ));
     }
-    if response.lockup_details.server_public_key == response.claim_details.server_public_key
-        || response.lockup_details.server_public_key == *claim_public_key
-        || response.lockup_details.server_public_key == *refund_public_key
-        || response.claim_details.server_public_key == *claim_public_key
-        || response.claim_details.server_public_key == *refund_public_key
-    {
+    if !x_only_role_keys_are_distinct(&[
+        claim_public_key,
+        refund_public_key,
+        &response.lockup_details.server_public_key,
+        &response.claim_details.server_public_key,
+    ]) {
         return Err(invalid_chain_response(
-            "provider and local chain-swap keys are not role-distinct",
+            "provider and local chain-swap x-only keys are not role-distinct",
         ));
     }
 
@@ -1087,6 +1096,21 @@ mod tests {
                 .derivation_root_fingerprint()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn taproot_role_distinctness_rejects_opposite_parity_for_the_same_x_coordinate() {
+        let even = PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let odd = PublicKey::from_str(
+            "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+
+        assert_ne!(even, odd);
+        assert!(!x_only_role_keys_are_distinct(&[&even, &odd]));
     }
 
     #[test]

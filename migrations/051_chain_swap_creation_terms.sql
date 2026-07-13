@@ -178,6 +178,44 @@ BEGIN
         RAISE EXCEPTION 'chain swap creation terms are immutable'
             USING ERRCODE = '55000';
     END IF;
+
+    -- The canonical response digest is useful only if every payer/provider
+    -- field it approves remains bound to the same row. Historical rows retain
+    -- their legacy behavior, but a complete post-051 creation record freezes
+    -- the exact instruction, amounts, response, secret material, and ownership
+    -- identity that existed before exposure.
+    IF OLD.pinned_pair_hash IS NOT NULL AND ROW(
+        OLD.invoice_id,
+        OLD.nym,
+        OLD.boltz_swap_id,
+        OLD.from_chain,
+        OLD.to_chain,
+        OLD.lockup_address,
+        OLD.lockup_bip21,
+        OLD.user_lock_amount_sat,
+        OLD.server_lock_amount_sat,
+        OLD.preimage_hex,
+        OLD.claim_key_hex,
+        OLD.refund_key_hex,
+        OLD.boltz_response_json
+    ) IS DISTINCT FROM ROW(
+        NEW.invoice_id,
+        NEW.nym,
+        NEW.boltz_swap_id,
+        NEW.from_chain,
+        NEW.to_chain,
+        NEW.lockup_address,
+        NEW.lockup_bip21,
+        NEW.user_lock_amount_sat,
+        NEW.server_lock_amount_sat,
+        NEW.preimage_hex,
+        NEW.claim_key_hex,
+        NEW.refund_key_hex,
+        NEW.boltz_response_json
+    ) THEN
+        RAISE EXCEPTION 'chain swap creation terms are immutable'
+            USING ERRCODE = '55000';
+    END IF;
     RETURN NEW;
 END
 $$;
@@ -188,6 +226,19 @@ CREATE TRIGGER chain_swap_records_require_creation_terms
 
 CREATE TRIGGER chain_swap_records_reject_creation_terms_update
     BEFORE UPDATE OF
+        invoice_id,
+        nym,
+        boltz_swap_id,
+        from_chain,
+        to_chain,
+        lockup_address,
+        lockup_bip21,
+        user_lock_amount_sat,
+        server_lock_amount_sat,
+        preimage_hex,
+        claim_key_hex,
+        refund_key_hex,
+        boltz_response_json,
         pinned_pair_hash,
         canonical_pair_quote_json,
         creation_response_sha256,

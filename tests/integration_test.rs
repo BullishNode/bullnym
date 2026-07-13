@@ -1960,6 +1960,20 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
             .as_deref(),
         Some("55000")
     );
+    let response_mutation = sqlx::query(
+        "UPDATE chain_swap_records SET boltz_response_json = '{\"id\":\"mutated\"}' WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        response_mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
     pay_service::db::update_chain_swap_status(
         &pool,
         inserted.id,

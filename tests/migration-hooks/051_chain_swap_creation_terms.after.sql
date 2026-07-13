@@ -174,6 +174,24 @@ BEGIN
         NULL;
     END;
 
+    BEGIN
+        UPDATE chain_swap_records
+           SET boltz_response_json = '{"id":"migration-051-mutated"}'
+         WHERE id = '51000000-0000-0000-0000-000000000003';
+        RAISE EXCEPTION 'migration 051 allowed approved response mutation';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        NULL;
+    END;
+
+    BEGIN
+        UPDATE chain_swap_records
+           SET lockup_bip21 = 'bitcoin:mutated?amount=21'
+         WHERE id = '51000000-0000-0000-0000-000000000003';
+        RAISE EXCEPTION 'migration 051 allowed payer instruction mutation';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        NULL;
+    END;
+
     -- Lifecycle fields remain mutable on complete rows too.
     UPDATE chain_swap_records
        SET status = 'user_lock_mempool'

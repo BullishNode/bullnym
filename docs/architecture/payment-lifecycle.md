@@ -368,11 +368,12 @@ Public checkout behavior:
 
 Rows created before schema 051 have no creation packet and retain an explicit
 legacy claim fallback. Every post-051 insert must contain the complete packet;
-the database rejects partial packets and makes committed terms immutable. The
-canonical response digest is rechecked before Liquid claim or Bitcoin recovery
-signing. Emergency Bitcoin commitment remains nullable until its signed
-registration issue is deployed; those rows are therefore not yet fully
-recovery-v3 compliant.
+the database rejects partial packets and freezes both the evidence packet and
+its bound payer instruction, amounts, provider response, ownership, and key
+material. The canonical response digest is rechecked before Liquid claim or
+Bitcoin recovery signing. Emergency Bitcoin commitment remains nullable until
+its signed registration issue is deployed; those rows are therefore not yet
+fully recovery-v3 compliant.
 
 Product copy must make settlement clear:
 

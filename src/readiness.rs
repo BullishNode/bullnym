@@ -693,16 +693,32 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                       'merchant_emergency_btc_address' \
                   ) \
             ) = 14 \
-            AND EXISTS ( \
-                SELECT 1 FROM pg_constraint c \
+            AND ( \
+                SELECT COUNT(*) FROM pg_constraint c \
                 JOIN pg_class t ON t.oid = c.conrelid \
                 JOIN pg_namespace n ON n.oid = t.relnamespace \
                 WHERE n.nspname = 'public' \
                   AND t.relname = 'chain_swap_records' \
-                  AND c.conname = 'chain_swap_records_creation_terms_shape_check' \
+                  AND c.conname IN ( \
+                      'chain_swap_records_creation_terms_shape_check', \
+                      'chain_swap_records_pinned_pair_hash_check', \
+                      'chain_swap_records_pair_quote_json_check', \
+                      'chain_swap_records_creation_response_sha256_check', \
+                      'chain_swap_records_btc_claim_script_sha256_check', \
+                      'chain_swap_records_btc_refund_script_sha256_check', \
+                      'chain_swap_records_liquid_claim_script_sha256_check', \
+                      'chain_swap_records_liquid_refund_script_sha256_check', \
+                      'chain_swap_records_btc_timeout_height_check', \
+                      'chain_swap_records_liquid_timeout_height_check', \
+                      'chain_swap_records_btc_network_check', \
+                      'chain_swap_records_liquid_network_check', \
+                      'chain_swap_records_liquid_asset_id_check', \
+                      'chain_swap_records_merchant_liquid_destination_check', \
+                      'chain_swap_records_merchant_emergency_btc_address_check' \
+                  ) \
                   AND c.contype = 'c' \
                   AND c.convalidated \
-            ) \
+            ) = 15 \
             AND ( \
                 SELECT COUNT(*) FROM pg_trigger t \
                 JOIN pg_class c ON c.oid = t.tgrelid \
