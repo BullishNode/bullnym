@@ -2510,6 +2510,7 @@ fn is_cooperative_refusal(err: &AppError) -> bool {
         || s.contains("invalid preimage")
         || s.contains("cooperative claim disabled")
         || s.contains("cooperative signing disabled")
+        || s.contains("not eligible for a cooperative claim")
         || s.contains("not eligible for cooperative")
 }
 

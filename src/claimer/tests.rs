@@ -150,6 +150,8 @@ fn cooperative_refusal_recognises_known_phrases() {
         "construct_claim failed: invalid preimage",
         "construct_claim failed: cooperative claim disabled",
         "construct_claim failed: cooperative signing disabled",
+        // Exact production wording observed from the pinned Boltz client.
+        "construct_claim failed: swap not eligible for a cooperative claim",
         "construct_claim failed: not eligible for cooperative",
         // case-insensitive
         "construct_claim failed: SWAP EXPIRED",
