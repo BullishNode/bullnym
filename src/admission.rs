@@ -88,6 +88,7 @@ pub enum Dependency {
     BoltzClient,
     SwapKeyLineage,
     RecoveryJournal,
+    ProviderRecoveryConsistency,
     FeePolicy,
     RecoveryCommitment,
     Worker(Worker),
@@ -105,6 +106,7 @@ impl Dependency {
             Self::BoltzClient => "boltz_client",
             Self::SwapKeyLineage => "swap_key_lineage",
             Self::RecoveryJournal => "recovery_journal",
+            Self::ProviderRecoveryConsistency => "provider_recovery_consistency",
             Self::FeePolicy => "fee_policy",
             Self::RecoveryCommitment => "recovery_commitment",
             Self::Worker(worker) => worker.as_str(),
@@ -211,6 +213,9 @@ pub struct FoundationFacts {
     pub boltz_client_ready: bool,
     pub swap_key_lineage_safe: bool,
     pub recovery_journal_ready: bool,
+    /// Exact startup agreement between the provider restore snapshot, the
+    /// authenticated manifest witness, and local PostgreSQL recovery evidence.
+    pub provider_recovery_consistent: bool,
     /// Remains false until issue #64 supplies a persisted live decision.
     pub fee_policy_ready: bool,
     /// Global capability only. Issue #84 must additionally bind the exact
@@ -319,6 +324,7 @@ impl MoneyAdmission {
                 boltz_client_ready: true,
                 swap_key_lineage_safe: true,
                 recovery_journal_ready: true,
+                provider_recovery_consistent: true,
                 fee_policy_ready: true,
                 recovery_commitment_ready: true,
             },
@@ -677,6 +683,11 @@ fn decide(state: &State, rail: Rail, now: Instant) -> AdmissionDecision {
                 facts.recovery_journal_ready,
                 Dependency::RecoveryJournal,
             );
+            add_unsafe(
+                &mut reasons,
+                facts.provider_recovery_consistent,
+                Dependency::ProviderRecoveryConsistency,
+            );
             add_unavailable(&mut reasons, facts.fee_policy_ready, Dependency::FeePolicy);
             add_unavailable(
                 &mut reasons,
@@ -824,6 +835,7 @@ mod tests {
             boltz_client_ready: true,
             swap_key_lineage_safe: true,
             recovery_journal_ready: true,
+            provider_recovery_consistent: true,
             fee_policy_ready: true,
             recovery_commitment_ready: true,
         }
@@ -964,6 +976,10 @@ mod tests {
             &[Rail::BitcoinChain],
         );
         assert_foundation_matrix(
+            |facts| facts.provider_recovery_consistent = false,
+            &[Rail::BitcoinChain],
+        );
+        assert_foundation_matrix(
             |facts| facts.fee_policy_ready = false,
             &[Rail::LightningReverse, Rail::BitcoinChain],
         );
@@ -996,6 +1012,27 @@ mod tests {
         assert!(chain.reasons.iter().any(|reason| {
             reason.dependency == Dependency::RecoveryCommitment
                 && reason.code == ReasonCode::Unavailable
+        }));
+    }
+
+    #[test]
+    fn provider_recovery_disagreement_closes_only_new_chain_swaps() {
+        let mut facts = healthy_facts();
+        facts.provider_recovery_consistent = false;
+        let admission = MoneyAdmission::new(facts, WorkerCadences::long_for_tests());
+        let _reporters = make_rail_healthy(&admission, Rail::BitcoinChain);
+        let _reverse_reporters = make_rail_healthy(&admission, Rail::LightningReverse);
+        let _liquid_reporters = make_rail_healthy(&admission, Rail::DirectLiquid);
+        let _bitcoin_reporters = make_rail_healthy(&admission, Rail::DirectBitcoin);
+
+        assert!(admission.decision(Rail::DirectLiquid).allowed());
+        assert!(admission.decision(Rail::DirectBitcoin).allowed());
+        assert!(admission.decision(Rail::LightningReverse).allowed());
+        let chain = admission.decision(Rail::BitcoinChain);
+        assert!(!chain.allowed());
+        assert!(chain.reasons.iter().any(|reason| {
+            reason.dependency == Dependency::ProviderRecoveryConsistency
+                && reason.code == ReasonCode::Unsafe
         }));
     }
 

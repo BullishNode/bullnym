@@ -48,6 +48,7 @@ use uuid::Uuid;
 use crate::admission::Rail;
 use crate::auth;
 use crate::certification::{self, CertificationScope};
+use crate::chain_swap_creation_permit::{ChainSwapCreationPermit, ChainSwapCreationPermitError};
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
@@ -66,6 +67,7 @@ pub enum InvoiceIntegrationTestHookPoint {
     StatusAfterInvoiceRead,
     ListAfterInvoiceRead,
     OfferBeforeCommit,
+    ChainOfferBeforeRecoveryGate,
 }
 
 #[derive(Debug)]
@@ -1221,7 +1223,8 @@ async fn render_invoice_template(
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
     let rails_payable = invoice_payment_rails_are_payable(&inv);
     let bitcoin_chain_offer = if rails_payable {
-        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
+        db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
+            .await?
     } else {
         None
     };
@@ -1375,7 +1378,8 @@ pub async fn status(
     let rails_payable = invoice_payment_rails_are_payable(&inv);
     let lightning_pr = latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
     let bitcoin_chain_offer = if rails_payable {
-        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
+        db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
+            .await?
     } else {
         None
     };
@@ -2155,6 +2159,20 @@ struct BitcoinChainOffer {
     lockup_bip21: Option<String>,
 }
 
+fn retain_persisted_offer_after_permit_release(
+    offer: BitcoinChainOffer,
+    release: Result<(), ChainSwapCreationPermitError>,
+) -> BitcoinChainOffer {
+    if let Err(error) = release {
+        tracing::error!(
+            event = "chain_swap_creation_permit_release_failed_after_persistence",
+            error = %error,
+            "chain-swap creation permit release failed after durable local persistence; returning the persisted payer offer"
+        );
+    }
+    offer
+}
+
 /// Internal: create a Boltz BTC-to-LBTC chain swap for a Donation Page
 /// checkout invoice. The payer sees a Bitcoin lockup address; after
 /// Boltz locks LBTC on the server side, the chain-swap claimer spends
@@ -2242,6 +2260,29 @@ async fn create_bitcoin_chain_offer(
     // Keep the selected immutable record in scope so the durable swap insert
     // atomically binds its `commitment_id` and exact address without a second,
     // rotation-sensitive lookup.
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    )
+    .await;
+    let Some(recovery_runtime) = state.recovery_manifest_runtime_v1() else {
+        tracing::warn!(
+            event = "chain_swap_creation_recovery_runtime_unavailable",
+            "chain-swap creation refused before key allocation because protected recovery runtime is unavailable"
+        );
+        return Err(AppError::ServiceUnavailable(
+            "chain-swap recovery capability is unavailable".into(),
+        ));
+    };
+    let creation_permit = ChainSwapCreationPermit::acquire(&state.db, recovery_runtime)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                event = "chain_swap_creation_permit_refused",
+                error = %error,
+                "chain-swap creation refused before key allocation"
+            );
+            AppError::ServiceUnavailable("chain-swap creation boundary is unavailable".into())
+        })?;
 
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -2284,6 +2325,19 @@ async fn create_bitcoin_chain_offer(
     .await
     .map_err(|e| AppError::DbError(format!("chain refund key reservation failed: {e}")))?;
 
+    // Allocate retry identity before the mutating provider call. The exact ID
+    // follows this provider result through canonical persistence and durable
+    // delivery; it is never regenerated after Boltz has accepted the swap.
+    let manifest_id = Uuid::new_v4();
+    let merchant_policy = crate::swap_manifest::MerchantPolicyReferencesV1::new(
+        invoice.id,
+        swap_nym,
+        &merchant_liquid_destination,
+        Some((
+            recovery_commitment.commitment_id,
+            recovery_commitment.canonical_btc_address(),
+        )),
+    );
     let result = state
         .boltz
         .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
@@ -2304,74 +2358,36 @@ async fn create_bitcoin_chain_offer(
         &public_url,
     );
 
-    let preimage_hex = hex::encode(&result.preimage);
-    let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
-    let refund_key_hex = hex::encode(result.refund_keypair.secret_bytes());
-    let user_lock_amount_sat = i64::try_from(result.user_lock_amount_sat)
-        .map_err(|_| AppError::BoltzError("chain user-lock amount exceeds i64".into()))?;
-    let server_lock_amount_sat = i64::try_from(result.server_lock_amount_sat)
-        .map_err(|_| AppError::BoltzError("chain server-lock amount exceeds i64".into()))?;
-    db::record_chain_swap_with_lineage_and_creation_evidence(
+    crate::swap_manifest_persistence::persist_created_chain_swap(
         &state.db,
-        &db::NewChainSwapRecord {
-            invoice_id: invoice.id,
-            nym: Some(swap_nym),
-            boltz_swap_id: &result.swap_id,
-            lockup_address: &result.lockup_address,
-            lockup_bip21: Some(&lockup_bip21),
-            user_lock_amount_sat,
-            server_lock_amount_sat,
-            preimage_hex: &preimage_hex,
-            claim_key_hex: &claim_key_hex,
-            refund_key_hex: &refund_key_hex,
-            boltz_response_json: &result.canonical_response_json,
-            claim_key_index: Some(claim_key_index as i64),
-            refund_key_index: Some(refund_key_index as i64),
-            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
-        },
-        &db::ChainSwapLineage {
-            claim_allocation_id: claim_key_allocation_id,
-            refund_allocation_id: refund_key_allocation_id,
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            claim_public_key_hex: &claim_public_key_hex,
-            refund_public_key_hex: &refund_public_key_hex,
-            preimage_hash_hex: &preimage_hash_hex,
-        },
-        &db::NewChainSwapCreationEvidence {
-            creation_terms: db::NewChainSwapCreationTerms {
-                pinned_pair_hash: &result.creation_terms.pinned_pair_hash,
-                canonical_pair_quote_json: &result.creation_terms.canonical_pair_quote_json,
-                creation_response_sha256: &result.creation_terms.creation_response_sha256,
-                btc_claim_script_sha256: &result.creation_terms.btc_claim_script_sha256,
-                btc_refund_script_sha256: &result.creation_terms.btc_refund_script_sha256,
-                liquid_claim_script_sha256: &result.creation_terms.liquid_claim_script_sha256,
-                liquid_refund_script_sha256: &result.creation_terms.liquid_refund_script_sha256,
-                btc_timeout_height: i64::from(result.creation_terms.btc_timeout_height),
-                liquid_timeout_height: i64::from(result.creation_terms.liquid_timeout_height),
-                btc_network: result.creation_terms.btc_network,
-                liquid_network: result.creation_terms.liquid_network,
-                liquid_asset_id: &result.creation_terms.liquid_asset_id,
-                merchant_liquid_destination: &merchant_liquid_destination,
-                merchant_emergency_btc_address: Some(
-                    recovery_commitment.canonical_btc_address(),
-                ),
+        recovery_runtime,
+        crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
+            chain_swap: &result,
+            lockup_bip21: &lockup_bip21,
+            lineage: crate::swap_manifest_persistence::CreatedChainSwapLineage {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                claim_allocation_id: claim_key_allocation_id,
+                refund_allocation_id: refund_key_allocation_id,
+                claim_child_index: claim_key_index as i64,
+                refund_child_index: refund_key_index as i64,
             },
-            recovery_address_commitment_id: Some(recovery_commitment.commitment_id),
+            merchant_policy: &merchant_policy,
+            manifest_id,
         },
     )
     .await
-    .map_err(|e| {
-        AppError::DbError(format!(
-            "failed to record chain swap {}: {e}",
-            result.swap_id
-        ))
-    })?;
+    .map_err(|error| AppError::DbError(error.to_string()))?;
 
-    Ok(Some(BitcoinChainOffer {
+    let offer = BitcoinChainOffer {
         lockup_address: result.lockup_address,
         lockup_bip21: Some(lockup_bip21),
-    }))
+    };
+    let release = creation_permit.release().await;
+    Ok(Some(retain_persisted_offer_after_permit_release(
+        offer, release,
+    )))
 }
 
 /// Focused integration seam for the chain-offer creation boundary.

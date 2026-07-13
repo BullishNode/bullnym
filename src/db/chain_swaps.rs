@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::ClaimFailureOutcome;
@@ -813,6 +813,38 @@ pub async fn record_chain_swap_with_lineage_and_creation_evidence(
     insert_chain_swap(pool, swap, Some(lineage), Some(creation_evidence)).await
 }
 
+/// Transaction-aware counterpart to
+/// [`record_chain_swap_with_lineage_and_creation_terms`].
+pub async fn record_chain_swap_with_lineage_and_creation_terms_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_terms: &NewChainSwapCreationTerms<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    let evidence = NewChainSwapCreationEvidence {
+        creation_terms: *creation_terms,
+        recovery_address_commitment_id: None,
+    };
+    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(&evidence)).await
+}
+
+/// Transaction-aware post-053 insertion API carrying the exact immutable
+/// recovery-policy identity and address pair.
+pub async fn record_chain_swap_with_lineage_and_creation_evidence_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(
+        &mut **tx,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+    )
+    .await
+}
+
 pub async fn record_chain_swap_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &NewChainSwapRecord<'_>,
@@ -948,6 +980,126 @@ pub async fn latest_payable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
     .bind(invoice_id)
     .bind(amount_sat)
     .fetch_optional(executor)
+    .await
+}
+
+/// Latest chain-swap offer that may be exposed to an unauthenticated payer.
+///
+/// A provider-created row is persisted before recovery-manifest staging so a
+/// post-provider failure cannot erase its canonical response or recovery
+/// keys. Such a row remains a blocking non-terminal `pending` obligation, but
+/// it is not a payer instruction until its exact manifest is durably delivered
+/// and acknowledged. Public invoice reads must use this query rather than
+/// [`latest_payable_chain_swap_for_invoice`].
+pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_id: Uuid,
+    amount_sat: i64,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
+         WHERE invoice_id = $1 \
+           AND status = 'pending' \
+           AND server_lock_amount_sat = $2 \
+           AND EXISTS ( \
+                 SELECT 1 FROM chain_swap_manifest_deliveries delivery \
+                  WHERE delivery.chain_swap_id = chain_swap_records.id \
+                    AND delivery.delivery_state = 'delivered' \
+           ) \
+         ORDER BY created_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .bind(amount_sat)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Whether one complete issue-#80 chain-swap creation record lacks any
+/// migration-052 manifest-ledger obligation.
+///
+/// Migration 051 constrains its thirteen mandatory creation-term columns to
+/// an all-or-none shape. Testing that exact shape distinguishes canonical
+/// post-#80 records from historical/incomplete rows without selecting an
+/// identity, provider response, address, key, or other row value. `EXISTS`
+/// stops at the first uncovered record, keeping this creation-boundary probe
+/// bounded regardless of table size. The emergency destination is deliberately
+/// absent from the shape because migration 051 makes it optional.
+pub async fn has_manifestless_complete_chain_swap<'e, E>(executor: E) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 \
+               FROM chain_swap_records chain_swap \
+              WHERE num_nonnulls( \
+                        chain_swap.pinned_pair_hash, \
+                        chain_swap.canonical_pair_quote_json, \
+                        chain_swap.creation_response_sha256, \
+                        chain_swap.btc_claim_script_sha256, \
+                        chain_swap.btc_refund_script_sha256, \
+                        chain_swap.liquid_claim_script_sha256, \
+                        chain_swap.liquid_refund_script_sha256, \
+                        chain_swap.btc_timeout_height, \
+                        chain_swap.liquid_timeout_height, \
+                        chain_swap.btc_network, \
+                        chain_swap.liquid_network, \
+                        chain_swap.liquid_asset_id, \
+                        chain_swap.merchant_liquid_destination \
+                    ) = 13 \
+                AND NOT EXISTS ( \
+                      SELECT 1 \
+                        FROM chain_swap_manifest_deliveries delivery \
+                       WHERE delivery.chain_swap_id = chain_swap.id \
+                ) \
+              LIMIT 1 \
+         )",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Lock and return the oldest complete canonical chain swap without a
+/// migration-052 manifest-ledger row.
+///
+/// Creation time followed by UUID is a stable total order even when multiple
+/// rows share the same PostgreSQL timestamp. The caller must already own the
+/// manifest-ledger tail lock in the same transaction, so the negative ledger
+/// predicate cannot race a concurrent append before the repair row is staged.
+/// Historical rows without the complete migration-051 creation packet are
+/// deliberately excluded.
+pub async fn oldest_manifestless_complete_chain_swap_for_update(
+    connection: &mut PgConnection,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+           FROM chain_swap_records chain_swap \
+          WHERE num_nonnulls( \
+                    chain_swap.pinned_pair_hash, \
+                    chain_swap.canonical_pair_quote_json, \
+                    chain_swap.creation_response_sha256, \
+                    chain_swap.btc_claim_script_sha256, \
+                    chain_swap.btc_refund_script_sha256, \
+                    chain_swap.liquid_claim_script_sha256, \
+                    chain_swap.liquid_refund_script_sha256, \
+                    chain_swap.btc_timeout_height, \
+                    chain_swap.liquid_timeout_height, \
+                    chain_swap.btc_network, \
+                    chain_swap.liquid_network, \
+                    chain_swap.liquid_asset_id, \
+                    chain_swap.merchant_liquid_destination \
+                ) = 13 \
+            AND NOT EXISTS ( \
+                  SELECT 1 \
+                    FROM chain_swap_manifest_deliveries delivery \
+                   WHERE delivery.chain_swap_id = chain_swap.id \
+            ) \
+          ORDER BY chain_swap.created_at, chain_swap.id \
+          LIMIT 1 \
+          FOR UPDATE"
+    ))
+    .fetch_optional(connection)
     .await
 }
 
