@@ -3457,14 +3457,17 @@ async fn webhook_parses_boltz_envelope() {
 }
 
 #[tokio::test]
-async fn webhook_rejects_malformed_payload() {
+async fn issue30_webhook_rejects_malformed_payload_with_retryable_status() {
     let pool = test_pool().await;
     let app = test_app(test_state(pool.clone()));
 
-    // Missing data field
+    // A malformed delivery must retain the structured AppError contract while
+    // returning non-2xx so Boltz retries instead of treating it as handled.
     let (status, body) = post_json(&app, "/webhook/boltz", json!({"id": "x", "status": "y"})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "ClaimError");
+    assert_eq!(body["reason"], "Swap claim failed.");
 }
 
 #[tokio::test]
