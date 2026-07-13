@@ -8,7 +8,10 @@
 use std::{collections::BTreeMap, fmt};
 
 use crate::{
-    merchant_output_verifier::VerifiedMerchantOutput,
+    merchant_output_verifier::{
+        ApprovedMerchantDestination, LiquidMerchantOutputObservation,
+        MerchantOutputVerificationError, VerifiedMerchantOutput,
+    },
     merchant_settlement_adoption::{
         ConfirmedMerchantOutputEvidence, MerchantOutputAccountingIdentity,
         MerchantOutputAccountingIntent, MerchantSettlementAdoptionError, MerchantSettlementContext,
@@ -17,7 +20,8 @@ use crate::{
     merchant_settlement_lifecycle::{
         apply_settlement_evidence, MerchantSettlementLifecycle, SettlementAccountingState,
         SettlementBlock, SettlementChain, SettlementEvidence, SettlementFinalityPolicy,
-        SettlementLifecycleError, SettlementTransition, SettlementTxid,
+        SettlementLifecycleError, SettlementLifecycleSnapshot, SettlementTransition,
+        SettlementTxid,
     },
 };
 
@@ -59,8 +63,30 @@ struct RetainedMerchantOutput {
     finalized: bool,
 }
 
-/// Restart-safe, pure service state. Cloning this value models loading an
-/// atomic repository checkpoint after a process restart.
+/// Durable service-owned verifier evidence. The repository representation may
+/// map this to columns later; only [`MerchantSettlementAdoptionService::restore`]
+/// turns it back into runtime authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedMerchantOutputSnapshot {
+    pub evidence: ConfirmedMerchantOutputEvidence,
+    pub intent: MerchantOutputAccountingIntent,
+    pub recorded: bool,
+    pub active: bool,
+    pub finalized: bool,
+}
+
+/// Complete restart checkpoint for the reducer plus the evidence needed to
+/// repair exact-value accounting without consulting a provider amount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerchantSettlementAdoptionSnapshot {
+    pub context: MerchantSettlementContext,
+    pub lifecycle: SettlementLifecycleSnapshot,
+    pub retained: Vec<RetainedMerchantOutputSnapshot>,
+    pub active_event_key: Option<String>,
+}
+
+/// Restart-safe, pure service state. Only a validated typed checkpoint may
+/// rehydrate it after a process restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerchantSettlementAdoptionService {
     context: MerchantSettlementContext,
@@ -96,6 +122,207 @@ impl MerchantSettlementAdoptionService {
 
     pub fn context(&self) -> &MerchantSettlementContext {
         &self.context
+    }
+
+    pub fn snapshot(&self) -> MerchantSettlementAdoptionSnapshot {
+        MerchantSettlementAdoptionSnapshot {
+            context: self.context.clone(),
+            lifecycle: self.lifecycle.snapshot(),
+            retained: self
+                .retained
+                .values()
+                .map(|retained| RetainedMerchantOutputSnapshot {
+                    evidence: retained.evidence.clone(),
+                    intent: retained.intent.clone(),
+                    recorded: retained.recorded,
+                    active: retained.active,
+                    finalized: retained.finalized,
+                })
+                .collect(),
+            active_event_key: self.active_event_key.clone(),
+        }
+    }
+
+    pub fn restore(
+        snapshot: MerchantSettlementAdoptionSnapshot,
+        policy: SettlementFinalityPolicy,
+    ) -> Result<Self, MerchantSettlementProcessingError> {
+        let lifecycle = MerchantSettlementLifecycle::restore(snapshot.lifecycle, policy)?;
+        let expected_chain = match snapshot.context.path() {
+            MerchantSettlementPath::LiquidClaim => SettlementChain::Liquid,
+            MerchantSettlementPath::BitcoinRecovery => SettlementChain::Bitcoin,
+        };
+        if lifecycle.chain() != expected_chain || snapshot.retained.len() > 2 {
+            return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+        }
+
+        let mut retained = BTreeMap::new();
+        for record in snapshot.retained {
+            if !record.recorded
+                || record.finalized && !record.active
+                || record.evidence.journal_txid() != lifecycle.journal_txid().as_str()
+                || record
+                    .evidence
+                    .accounting_intent(&snapshot.context)
+                    .as_ref()
+                    != Ok(&record.intent)
+            {
+                return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+            }
+            let event_key = record.intent.identity.event_key().to_owned();
+            if retained
+                .insert(
+                    event_key,
+                    RetainedMerchantOutput {
+                        evidence: record.evidence,
+                        intent: record.intent,
+                        recorded: record.recorded,
+                        active: record.active,
+                        finalized: record.finalized,
+                    },
+                )
+                .is_some()
+            {
+                return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+            }
+        }
+
+        let active_records: Vec<_> = retained
+            .iter()
+            .filter(|(_, record)| record.active)
+            .collect();
+        match lifecycle.accounting_state() {
+            SettlementAccountingState::Unrecorded
+                if !retained.is_empty()
+                    || !active_records.is_empty()
+                    || snapshot.active_event_key.is_some() =>
+            {
+                return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+            }
+            SettlementAccountingState::Demoted
+                if retained.is_empty()
+                    || !active_records.is_empty()
+                    || snapshot.active_event_key.is_some() =>
+            {
+                return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+            }
+            SettlementAccountingState::Confirmed | SettlementAccountingState::Finalized
+                if active_records.len() != 1
+                    || snapshot.active_event_key.as_deref()
+                        != Some(active_records[0].0.as_str())
+                    || active_records[0].1.evidence.txid() != lifecycle.active_txid().as_str()
+                    || active_records[0].1.finalized
+                        != matches!(
+                            lifecycle.accounting_state(),
+                            SettlementAccountingState::Finalized
+                        ) =>
+            {
+                return Err(MerchantSettlementProcessingError::InvalidCheckpoint);
+            }
+            SettlementAccountingState::Unrecorded
+            | SettlementAccountingState::Confirmed
+            | SettlementAccountingState::Finalized
+            | SettlementAccountingState::Demoted => {}
+        }
+
+        Ok(Self {
+            context: snapshot.context,
+            policy,
+            lifecycle,
+            retained,
+            active_event_key: snapshot.active_event_key,
+        })
+    }
+
+    /// Consume the production Liquid observation directly. Adapter-validated
+    /// mempool evidence can advance transaction identity but cannot create an
+    /// amount; confirmed evidence must still pass the verifier at one
+    /// confirmation before accounting is touched.
+    pub fn apply_liquid_observation(
+        &mut self,
+        observation: &LiquidMerchantOutputObservation,
+        approved_destination: &ApprovedMerchantDestination,
+    ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError> {
+        if self.context.path() != MerchantSettlementPath::LiquidClaim {
+            return Err(MerchantSettlementProcessingError::WrongSettlementPath);
+        }
+        match observation {
+            LiquidMerchantOutputObservation::Observed(adapted)
+                if adapted.observed().confirmations() == 0 =>
+            {
+                self.apply_liquid_mempool(adapted)
+            }
+            LiquidMerchantOutputObservation::Observed(adapted) => {
+                let verified = adapted.verify(approved_destination, 1)?;
+                self.apply_verified_confirmation(&verified)
+            }
+            LiquidMerchantOutputObservation::Evicted { txid } => {
+                self.require_active_observation(txid)?;
+                self.apply_eviction()
+            }
+            LiquidMerchantOutputObservation::ReorgDemoted {
+                txid,
+                previous_block_height,
+                previous_block_hash,
+            } => {
+                self.require_active_observation(txid)?;
+                self.apply_reorg(*previous_block_height, previous_block_hash)
+            }
+        }
+    }
+
+    fn apply_liquid_mempool(
+        &mut self,
+        adapted: &crate::merchant_output_verifier::AdaptedMerchantOutputEvidence,
+    ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError> {
+        if adapted.original_journal_txid() != self.lifecycle.journal_txid().as_str() {
+            return Err(MerchantSettlementProcessingError::JournalMismatch);
+        }
+        let observed_txid = SettlementTxid::parse(adapted.candidate_txid())?;
+        let mut next = self.clone();
+        let mut outcome = MerchantSettlementProcessingOutcome::default();
+        if adapted.is_linked_replacement() {
+            let original_txid = SettlementTxid::parse(adapted.original_journal_txid())?;
+            if next.lifecycle.active_txid() == &original_txid {
+                let transition = apply_settlement_evidence(
+                    &next.lifecycle,
+                    &SettlementEvidence::Replaced {
+                        replaced_txid: original_txid,
+                        replacement_txid: observed_txid.clone(),
+                    },
+                    next.policy,
+                )?;
+                outcome.extend(next.adopt_transition(transition, None)?);
+            } else if next.lifecycle.active_txid() != &observed_txid {
+                return Err(MerchantSettlementProcessingError::ObservationTransactionMismatch);
+            }
+        } else if next.lifecycle.active_txid() != &observed_txid
+            || observed_txid.as_str() != adapted.original_journal_txid()
+        {
+            return Err(MerchantSettlementProcessingError::ObservationTransactionMismatch);
+        }
+        let transition = apply_settlement_evidence(
+            &next.lifecycle,
+            &SettlementEvidence::Mempool {
+                txid: observed_txid,
+            },
+            next.policy,
+        )?;
+        outcome.extend(next.adopt_transition(transition, None)?);
+        *self = next;
+        Ok(outcome)
+    }
+
+    fn require_active_observation(
+        &self,
+        txid: &str,
+    ) -> Result<(), MerchantSettlementProcessingError> {
+        let observed = SettlementTxid::parse(txid)?;
+        if &observed == self.lifecycle.active_txid() {
+            Ok(())
+        } else {
+            Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
+        }
     }
 
     /// Accept a confirmed output only after the fail-closed verifier has
@@ -340,11 +567,15 @@ impl MerchantSettlementAdoptionService {
 pub enum MerchantSettlementProcessingError {
     Adoption(MerchantSettlementAdoptionError),
     Lifecycle(SettlementLifecycleError),
+    Verification(MerchantOutputVerificationError),
     JournalMismatch,
     UnlinkedReplacement,
+    WrongSettlementPath,
+    ObservationTransactionMismatch,
     MissingRetainedEvidence,
     ImmutableEvidenceConflict,
     ActiveFamilyConflict,
+    InvalidCheckpoint,
 }
 
 impl From<MerchantSettlementAdoptionError> for MerchantSettlementProcessingError {
@@ -359,16 +590,28 @@ impl From<SettlementLifecycleError> for MerchantSettlementProcessingError {
     }
 }
 
+impl From<MerchantOutputVerificationError> for MerchantSettlementProcessingError {
+    fn from(error: MerchantOutputVerificationError) -> Self {
+        Self::Verification(error)
+    }
+}
+
 impl fmt::Display for MerchantSettlementProcessingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Adoption(_) => "verified merchant output cannot be adopted",
             Self::Lifecycle(_) => "merchant settlement lifecycle rejected evidence",
+            Self::Verification(_) => "merchant settlement observation did not verify",
             Self::JournalMismatch => "verified merchant output belongs to another journal",
             Self::UnlinkedReplacement => "merchant replacement is not explicitly linked",
+            Self::WrongSettlementPath => "merchant observation uses the wrong settlement path",
+            Self::ObservationTransactionMismatch => {
+                "merchant observation does not name the active transaction"
+            }
             Self::MissingRetainedEvidence => "lifecycle accounting lacks verifier evidence",
             Self::ImmutableEvidenceConflict => "merchant accounting event is immutable",
             Self::ActiveFamilyConflict => "merchant accounting family already has an active event",
+            Self::InvalidCheckpoint => "merchant settlement checkpoint is invalid",
         })
     }
 }
@@ -381,11 +624,14 @@ mod tests {
     use std::{collections::btree_map::Entry, str::FromStr};
 
     use crate::merchant_output_verifier::{
-        verify_merchant_output, ApprovedMerchantDestination, JournaledMerchantTransaction,
-        MerchantAsset, MerchantOutputEvidence, MerchantOutputVerificationError,
-        ObservedMerchantOutput,
+        adapt_liquid_merchant_output, verify_merchant_output, ApprovedMerchantDestination,
+        JournaledMerchantTransaction, LinkedReplacementJournalEvidence, MerchantAsset,
+        MerchantConfirmationEvidence, MerchantOutputCommitment, MerchantOutputEvidence,
+        MerchantOutputVerificationError, MerchantSourcePrevout, MerchantTransactionJournalEvidence,
+        MerchantTransactionObservation, ObservedMerchantOutput,
     };
-    use lwk_wollet::elements::Address as LiquidAddress;
+    use crate::merchant_settlement_lifecycle::SettlementState;
+    use lwk_wollet::elements::{self, Address as LiquidAddress};
     use uuid::Uuid;
 
     const BITCOIN_ADDRESS: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
@@ -442,6 +688,143 @@ mod tests {
             SettlementFinalityPolicy::new(2, 3).unwrap(),
         )
         .unwrap()
+    }
+
+    struct LiquidSourceFixture {
+        original_raw: Vec<u8>,
+        original_txid: String,
+        replacement_raw: Vec<u8>,
+        replacement_txid: String,
+        source_txid: String,
+        address: String,
+        script_hex: String,
+        asset: MerchantAsset,
+        blinding_key: elements::secp256k1_zkp::SecretKey,
+    }
+
+    impl LiquidSourceFixture {
+        fn new(original_amount_sat: u64, replacement_amount_sat: u64) -> Self {
+            let secp = elements::secp256k1_zkp::Secp256k1::new();
+            let blinding_key = elements::secp256k1_zkp::SecretKey::from_slice(&[7; 32]).unwrap();
+            let blinding_pubkey =
+                elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+            let address = LiquidAddress::from_str(LIQUID_ADDRESS)
+                .unwrap()
+                .to_unconfidential()
+                .to_confidential(blinding_pubkey);
+            let script = address.script_pubkey();
+            let source_txid = elements::Txid::from_str(ORIGINAL_TXID).unwrap();
+            let asset_id = elements::AssetId::from_str(LIQUID_ASSET).unwrap();
+            let transaction = |amount_sat| elements::Transaction {
+                version: 2,
+                lock_time: elements::LockTime::ZERO,
+                input: vec![elements::TxIn {
+                    previous_output: elements::OutPoint::new(source_txid, 3),
+                    is_pegin: false,
+                    script_sig: elements::Script::new(),
+                    sequence: elements::Sequence::MAX,
+                    asset_issuance: elements::AssetIssuance::default(),
+                    witness: elements::TxInWitness::default(),
+                }],
+                output: vec![elements::TxOut {
+                    asset: elements::confidential::Asset::Explicit(asset_id),
+                    value: elements::confidential::Value::Explicit(amount_sat),
+                    nonce: elements::confidential::Nonce::Null,
+                    script_pubkey: script.clone(),
+                    witness: elements::TxOutWitness::default(),
+                }],
+            };
+            let original = transaction(original_amount_sat);
+            let replacement = transaction(replacement_amount_sat);
+            Self {
+                original_raw: elements::encode::serialize(&original),
+                original_txid: original.txid().to_string(),
+                replacement_raw: elements::encode::serialize(&replacement),
+                replacement_txid: replacement.txid().to_string(),
+                source_txid: source_txid.to_string(),
+                address: address.to_string(),
+                script_hex: hex::encode(script.as_bytes()),
+                asset: MerchantAsset::Liquid(LIQUID_ASSET.to_owned()),
+                blinding_key,
+            }
+        }
+
+        fn approved(&self) -> ApprovedMerchantDestination {
+            ApprovedMerchantDestination::liquid(
+                self.address.clone(),
+                self.script_hex.clone(),
+                LIQUID_ASSET,
+            )
+        }
+
+        fn service(&self) -> MerchantSettlementAdoptionService {
+            MerchantSettlementAdoptionService::new(
+                context(MerchantSettlementPath::LiquidClaim),
+                &self.original_txid,
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn observation(
+            &self,
+            replacement: bool,
+            confirmation: MerchantConfirmationEvidence<'_>,
+        ) -> LiquidMerchantOutputObservation {
+            let sources = [MerchantSourcePrevout {
+                txid: &self.source_txid,
+                vout: 3,
+                amount_sat: 91_000,
+                script_pubkey_hex: "51",
+            }];
+            let original = MerchantTransactionJournalEvidence {
+                raw_transaction: &self.original_raw,
+                txid: &self.original_txid,
+                source_prevouts: &sources,
+                merchant: MerchantOutputCommitment {
+                    destination_address: &self.address,
+                    destination_script_hex: &self.script_hex,
+                    asset: &self.asset,
+                    amount_sat: 88_000,
+                    vout: 0,
+                },
+            };
+            let replacement_journal = MerchantTransactionJournalEvidence {
+                raw_transaction: &self.replacement_raw,
+                txid: &self.replacement_txid,
+                source_prevouts: &sources,
+                merchant: MerchantOutputCommitment {
+                    destination_address: &self.address,
+                    destination_script_hex: &self.script_hex,
+                    asset: &self.asset,
+                    amount_sat: 87_000,
+                    vout: 0,
+                },
+            };
+            let linked = LinkedReplacementJournalEvidence {
+                replaces_txid: &self.original_txid,
+                replacement: replacement_journal,
+            };
+            let (raw_transaction, txid) = if replacement {
+                (&self.replacement_raw, &self.replacement_txid)
+            } else {
+                (&self.original_raw, &self.original_txid)
+            };
+            let observation = MerchantTransactionObservation {
+                raw_transaction,
+                txid,
+                confirmation,
+            };
+            LiquidMerchantOutputObservation::Observed(
+                adapt_liquid_merchant_output(
+                    &original,
+                    replacement.then_some(&linked),
+                    &observation,
+                    &self.blinding_key,
+                )
+                .unwrap(),
+            )
+        }
     }
 
     fn verified(
@@ -764,11 +1147,203 @@ mod tests {
             command => panic!("unexpected first command: {command:?}"),
         };
 
-        let mut restarted = service.clone();
+        let mut restarted = MerchantSettlementAdoptionService::restore(
+            service.snapshot(),
+            SettlementFinalityPolicy::new(2, 3).unwrap(),
+        )
+        .unwrap();
         let duplicate = restarted.apply_verified_confirmation(&confirmed).unwrap();
         assert!(duplicate.commands.is_empty());
         assert_eq!(restarted.repair_accounting_intent(), Some(&first_intent));
         assert!(restarted.blocks_value_changing_fallback());
+    }
+
+    #[test]
+    fn liquid_source_mempool_then_confirmation_records_exact_output() {
+        let fixture = LiquidSourceFixture::new(88_000, 87_000);
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        let mempool = fixture.observation(false, MerchantConfirmationEvidence::Mempool);
+        let mempool_outcome = service
+            .apply_liquid_observation(&mempool, &approved)
+            .unwrap();
+        assert!(mempool_outcome.commands.is_empty());
+        assert!(matches!(
+            service.lifecycle().state(),
+            SettlementState::Mempool
+        ));
+        assert!(service.repair_accounting_intent().is_none());
+
+        let confirmed = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        let outcome = service
+            .apply_liquid_observation(&confirmed, &approved)
+            .unwrap();
+        let MerchantSettlementPersistenceCommand::Record(intent) = &outcome.commands[0] else {
+            panic!("first confirmation must record exact output")
+        };
+        assert_eq!(intent.actual_amount_sat, 88_000);
+        assert_eq!(intent.txid, fixture.original_txid);
+    }
+
+    #[test]
+    fn liquid_source_linked_replacement_mempool_then_confirmation_is_distinct() {
+        let fixture = LiquidSourceFixture::new(88_000, 87_000);
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        service
+            .apply_liquid_observation(
+                &fixture.observation(false, MerchantConfirmationEvidence::Mempool),
+                &approved,
+            )
+            .unwrap();
+        let replacement_mempool = fixture.observation(true, MerchantConfirmationEvidence::Mempool);
+        let mempool_outcome = service
+            .apply_liquid_observation(&replacement_mempool, &approved)
+            .unwrap();
+        assert!(mempool_outcome.commands.is_empty());
+        assert!(mempool_outcome.redrive_observation);
+        assert_eq!(
+            service.lifecycle().active_txid().as_str(),
+            fixture.replacement_txid
+        );
+
+        let confirmed = fixture.observation(
+            true,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_001,
+                block_hash: BLOCK_B,
+            },
+        );
+        let outcome = service
+            .apply_liquid_observation(&confirmed, &approved)
+            .unwrap();
+        let MerchantSettlementPersistenceCommand::Record(intent) = &outcome.commands[0] else {
+            panic!("replacement confirmation must record its own output")
+        };
+        assert_eq!(intent.actual_amount_sat, 87_000);
+        assert_eq!(intent.txid, fixture.replacement_txid);
+        assert!(intent
+            .identity
+            .event_key()
+            .contains(&fixture.replacement_txid));
+    }
+
+    #[test]
+    fn liquid_source_eviction_and_reorg_redrive_on_separate_ticks() {
+        let fixture = LiquidSourceFixture::new(88_000, 87_000);
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        let confirmed_a = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        service
+            .apply_liquid_observation(&confirmed_a, &approved)
+            .unwrap();
+        let eviction = LiquidMerchantOutputObservation::Evicted {
+            txid: fixture.original_txid.clone(),
+        };
+        let first_tick = service
+            .apply_liquid_observation(&eviction, &approved)
+            .unwrap();
+        assert!(first_tick.redrive_observation);
+        assert!(matches!(
+            first_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Deactivate(_)]
+        ));
+        let second_tick = service
+            .apply_liquid_observation(&confirmed_a, &approved)
+            .unwrap();
+        assert!(matches!(
+            second_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+
+        let reorg = LiquidMerchantOutputObservation::ReorgDemoted {
+            txid: fixture.original_txid.clone(),
+            previous_block_height: 700_000,
+            previous_block_hash: BLOCK_A.to_owned(),
+        };
+        let first_tick = service.apply_liquid_observation(&reorg, &approved).unwrap();
+        assert!(first_tick.redrive_observation);
+        let confirmed_b = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_001,
+                block_hash: BLOCK_B,
+            },
+        );
+        let second_tick = service
+            .apply_liquid_observation(&confirmed_b, &approved)
+            .unwrap();
+        assert!(matches!(
+            second_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+    }
+
+    #[test]
+    fn liquid_source_checkpoint_restore_repairs_and_rejects_mismatched_demotion() {
+        let fixture = LiquidSourceFixture::new(88_000, 87_000);
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        let confirmed = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        service
+            .apply_liquid_observation(&confirmed, &approved)
+            .unwrap();
+        let snapshot = service.snapshot();
+        let mut restored = MerchantSettlementAdoptionService::restore(
+            snapshot.clone(),
+            SettlementFinalityPolicy::new(2, 3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .repair_accounting_intent()
+                .unwrap()
+                .actual_amount_sat,
+            88_000
+        );
+
+        let before = restored.snapshot();
+        let mismatched = LiquidMerchantOutputObservation::Evicted {
+            txid: REPLACEMENT_TXID.to_owned(),
+        };
+        assert_eq!(
+            restored.apply_liquid_observation(&mismatched, &approved),
+            Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
+        );
+        assert_eq!(restored.snapshot(), before);
+
+        let mut malformed = snapshot;
+        malformed.active_event_key = Some("wrong-event".to_owned());
+        assert_eq!(
+            MerchantSettlementAdoptionService::restore(
+                malformed,
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            ),
+            Err(MerchantSettlementProcessingError::InvalidCheckpoint)
+        );
     }
 
     #[test]
