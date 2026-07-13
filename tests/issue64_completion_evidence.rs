@@ -1,14 +1,39 @@
 #[path = "support/issue64_completion.rs"]
 mod support;
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use pay_service::config::{FeePolicyConfig, FeeSourceConfig};
 use pay_service::current_fee_snapshot::CurrentFeeSnapshot;
 use pay_service::fee_policy::{BitcoinFeePolicy, FeeObservationSource, FeeRail, LiquidFeePolicy};
+use pay_service::fee_runtime::FeeRuntime;
 
 use support::{
     assert_swap_admission_closed_for_fee_policy, bitcoin_construction_fee, liquid_construction_fee,
-    live_bitcoin, live_liquid, JournaledRecoveryFixture, PersistedLkgFixture, RestartedFeeFixture,
-    RuntimeDecisions, NOW_UNIX,
+    live_bitcoin, live_liquid, JournaledRecoveryFixture, PersistedLkgFixture,
+    RestoringFeePersistence, RuntimeDecisions, NOW_UNIX,
 };
+
+fn current_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock must be after the Unix epoch")
+        .as_secs()
+}
+
+fn offline_runtime(persistence: RestoringFeePersistence) -> FeeRuntime {
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.sources = vec![FeeSourceConfig {
+        id: "offline-bitcoin".to_owned(),
+        endpoint: "https://127.0.0.1:1/api".to_owned(),
+    }];
+    config.liquid.sources = vec![FeeSourceConfig {
+        id: "offline-liquid".to_owned(),
+        endpoint: "https://127.0.0.1:1/api".to_owned(),
+    }];
+    FeeRuntime::from_config(&config, Arc::new(persistence)).unwrap()
+}
 
 #[test]
 fn accepted_fresh_per_rail_evidence_changes_the_next_construction_fee() {
@@ -123,10 +148,19 @@ fn recent_persisted_lkg_restores_after_restart_with_exact_provenance() {
         PersistedLkgFixture::capture_liquid(first_decisions.liquid.as_ref().unwrap());
     drop(first_process);
 
-    let mut restarted_process = RestartedFeeFixture::new();
-    restarted_process.restore_bitcoin_last_known_good(persisted_bitcoin.restore_bitcoin().unwrap());
-    restarted_process.restore_liquid_last_known_good(persisted_liquid.restore_liquid().unwrap());
-    let restored = restarted_process.decisions(&bitcoin_policy, &liquid_policy, NOW_UNIX + 30);
+    let restarted_process = CurrentFeeSnapshot::new();
+    restarted_process
+        .restore_bitcoin_last_known_good(persisted_bitcoin.restore_bitcoin().unwrap())
+        .unwrap();
+    restarted_process
+        .restore_liquid_last_known_good(persisted_liquid.restore_liquid().unwrap())
+        .unwrap();
+    let restored = RuntimeDecisions::from_snapshot(
+        &restarted_process,
+        &bitcoin_policy,
+        &liquid_policy,
+        NOW_UNIX + 30,
+    );
     assert!(restored.ready());
 
     let bitcoin = restored.bitcoin.unwrap();
@@ -148,7 +182,12 @@ fn recent_persisted_lkg_restores_after_restart_with_exact_provenance() {
     );
 
     // Restored evidence cannot be persisted again to extend its lifetime.
-    assert!(!restarted_process.has_live_evidence_eligible_for_persistence());
+    assert!(restarted_process
+        .accepted_bitcoin_for_persistence(&bitcoin_policy, NOW_UNIX + 30)
+        .is_err());
+    assert!(restarted_process
+        .accepted_liquid_for_persistence(&liquid_policy, NOW_UNIX + 30)
+        .is_err());
 }
 
 #[test]
@@ -156,76 +195,90 @@ fn expired_future_or_invalid_restored_evidence_fails_closed() {
     let bitcoin_policy = BitcoinFeePolicy::default();
     let liquid_policy = LiquidFeePolicy::default();
 
-    let mut expired = RestartedFeeFixture::new();
-    expired.restore_bitcoin_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Bitcoin,
-            original_source: FeeObservationSource::LiveBitcoin,
-            rate_sat_per_vbyte: 5.0,
-            observed_at_unix: NOW_UNIX - bitcoin_policy.last_known_good_max_age_secs() - 1,
-            provenance: "expired-bitcoin".to_owned(),
-        }
-        .restore_bitcoin()
-        .unwrap(),
-    );
-    expired.restore_liquid_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Liquid,
-            original_source: FeeObservationSource::LiveLiquid,
-            rate_sat_per_vbyte: 0.25,
-            observed_at_unix: NOW_UNIX - liquid_policy.last_known_good_max_age_secs() - 1,
-            provenance: "expired-liquid".to_owned(),
-        }
-        .restore_liquid()
-        .unwrap(),
-    );
-    let expired = expired.decisions(&bitcoin_policy, &liquid_policy, NOW_UNIX);
+    let expired = CurrentFeeSnapshot::new();
+    expired
+        .restore_bitcoin_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Bitcoin,
+                original_source: FeeObservationSource::LiveBitcoin,
+                rate_sat_per_vbyte: 5.0,
+                observed_at_unix: NOW_UNIX - bitcoin_policy.last_known_good_max_age_secs() - 1,
+                provenance: "expired-bitcoin".to_owned(),
+            }
+            .restore_bitcoin()
+            .unwrap(),
+        )
+        .unwrap();
+    expired
+        .restore_liquid_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Liquid,
+                original_source: FeeObservationSource::LiveLiquid,
+                rate_sat_per_vbyte: 0.25,
+                observed_at_unix: NOW_UNIX - liquid_policy.last_known_good_max_age_secs() - 1,
+                provenance: "expired-liquid".to_owned(),
+            }
+            .restore_liquid()
+            .unwrap(),
+        )
+        .unwrap();
+    let expired =
+        RuntimeDecisions::from_snapshot(&expired, &bitcoin_policy, &liquid_policy, NOW_UNIX);
     assert!(expired.bitcoin.is_err());
     assert!(expired.liquid.is_err());
     assert_swap_admission_closed_for_fee_policy(&expired.apply_to_admission());
 
-    let mut future = RestartedFeeFixture::new();
-    future.restore_bitcoin_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Bitcoin,
-            original_source: FeeObservationSource::LiveBitcoin,
-            rate_sat_per_vbyte: 5.0,
-            observed_at_unix: NOW_UNIX + 1,
-            provenance: "future-bitcoin".to_owned(),
-        }
-        .restore_bitcoin()
-        .unwrap(),
-    );
-    let future_error = future
-        .decisions(&bitcoin_policy, &liquid_policy, NOW_UNIX)
-        .bitcoin;
+    let future = CurrentFeeSnapshot::new();
+    future
+        .restore_bitcoin_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Bitcoin,
+                original_source: FeeObservationSource::LiveBitcoin,
+                rate_sat_per_vbyte: 5.0,
+                observed_at_unix: NOW_UNIX + 1,
+                provenance: "future-bitcoin".to_owned(),
+            }
+            .restore_bitcoin()
+            .unwrap(),
+        )
+        .unwrap();
+    let future_error =
+        RuntimeDecisions::from_snapshot(&future, &bitcoin_policy, &liquid_policy, NOW_UNIX).bitcoin;
     assert!(future_error.is_err());
 
-    let mut outside_policy_bounds = RestartedFeeFixture::new();
-    outside_policy_bounds.restore_bitcoin_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Bitcoin,
-            original_source: FeeObservationSource::LiveBitcoin,
-            rate_sat_per_vbyte: bitcoin_policy.cap().as_f64() + 1.0,
-            observed_at_unix: NOW_UNIX,
-            provenance: "unsafe-restored-bitcoin".to_owned(),
-        }
-        .restore_bitcoin()
-        .unwrap(),
+    let outside_policy_bounds = CurrentFeeSnapshot::new();
+    outside_policy_bounds
+        .restore_bitcoin_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Bitcoin,
+                original_source: FeeObservationSource::LiveBitcoin,
+                rate_sat_per_vbyte: bitcoin_policy.cap().as_f64() + 1.0,
+                observed_at_unix: NOW_UNIX,
+                provenance: "unsafe-restored-bitcoin".to_owned(),
+            }
+            .restore_bitcoin()
+            .unwrap(),
+        )
+        .unwrap();
+    outside_policy_bounds
+        .restore_liquid_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Liquid,
+                original_source: FeeObservationSource::LiveLiquid,
+                rate_sat_per_vbyte: liquid_policy.cap().as_f64() + 0.1,
+                observed_at_unix: NOW_UNIX,
+                provenance: "unsafe-restored-liquid".to_owned(),
+            }
+            .restore_liquid()
+            .unwrap(),
+        )
+        .unwrap();
+    let outside_policy_bounds = RuntimeDecisions::from_snapshot(
+        &outside_policy_bounds,
+        &bitcoin_policy,
+        &liquid_policy,
+        NOW_UNIX,
     );
-    outside_policy_bounds.restore_liquid_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Liquid,
-            original_source: FeeObservationSource::LiveLiquid,
-            rate_sat_per_vbyte: liquid_policy.cap().as_f64() + 0.1,
-            observed_at_unix: NOW_UNIX,
-            provenance: "unsafe-restored-liquid".to_owned(),
-        }
-        .restore_liquid()
-        .unwrap(),
-    );
-    let outside_policy_bounds =
-        outside_policy_bounds.decisions(&bitcoin_policy, &liquid_policy, NOW_UNIX);
     assert!(outside_policy_bounds.bitcoin.is_err());
     assert!(outside_policy_bounds.liquid.is_err());
     assert_swap_admission_closed_for_fee_policy(&outside_policy_bounds.apply_to_admission());
@@ -261,38 +314,47 @@ fn expired_future_or_invalid_restored_evidence_fails_closed() {
 fn refresh_failure_uses_only_a_still_valid_lkg() {
     let bitcoin_policy = BitcoinFeePolicy::default();
     let liquid_policy = LiquidFeePolicy::default();
-    let mut snapshot = RestartedFeeFixture::new();
+    let snapshot = CurrentFeeSnapshot::new();
 
     // A failed refresh supplies no live candidate. A restored quote remains
     // authority only for its original observation window.
-    snapshot.restore_bitcoin_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Bitcoin,
-            original_source: FeeObservationSource::LiveBitcoin,
-            rate_sat_per_vbyte: 7.5,
-            observed_at_unix: NOW_UNIX,
-            provenance: "persisted-bitcoin-after-refresh-failure".to_owned(),
-        }
-        .restore_bitcoin()
-        .unwrap(),
-    );
-    snapshot.restore_liquid_last_known_good(
-        PersistedLkgFixture {
-            rail: FeeRail::Liquid,
-            original_source: FeeObservationSource::LiveLiquid,
-            rate_sat_per_vbyte: 0.5,
-            observed_at_unix: NOW_UNIX,
-            provenance: "persisted-liquid-after-refresh-failure".to_owned(),
-        }
-        .restore_liquid()
-        .unwrap(),
-    );
+    snapshot
+        .restore_bitcoin_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Bitcoin,
+                original_source: FeeObservationSource::LiveBitcoin,
+                rate_sat_per_vbyte: 7.5,
+                observed_at_unix: NOW_UNIX,
+                provenance: "persisted-bitcoin-after-refresh-failure".to_owned(),
+            }
+            .restore_bitcoin()
+            .unwrap(),
+        )
+        .unwrap();
+    snapshot
+        .restore_liquid_last_known_good(
+            PersistedLkgFixture {
+                rail: FeeRail::Liquid,
+                original_source: FeeObservationSource::LiveLiquid,
+                rate_sat_per_vbyte: 0.5,
+                observed_at_unix: NOW_UNIX,
+                provenance: "persisted-liquid-after-refresh-failure".to_owned(),
+            }
+            .restore_liquid()
+            .unwrap(),
+        )
+        .unwrap();
 
     let last_valid_instant = NOW_UNIX
         + bitcoin_policy
             .last_known_good_max_age_secs()
             .min(liquid_policy.last_known_good_max_age_secs());
-    let valid = snapshot.decisions(&bitcoin_policy, &liquid_policy, last_valid_instant);
+    let valid = RuntimeDecisions::from_snapshot(
+        &snapshot,
+        &bitcoin_policy,
+        &liquid_policy,
+        last_valid_instant,
+    );
     assert!(valid.ready());
     assert_eq!(
         valid.bitcoin.as_ref().unwrap().source(),
@@ -303,9 +365,78 @@ fn refresh_failure_uses_only_a_still_valid_lkg() {
         FeeObservationSource::LiquidLastKnownGood
     );
 
-    let expired = snapshot.decisions(&bitcoin_policy, &liquid_policy, last_valid_instant + 1);
+    let expired = RuntimeDecisions::from_snapshot(
+        &snapshot,
+        &bitcoin_policy,
+        &liquid_policy,
+        last_valid_instant + 1,
+    );
     assert!(!expired.ready());
     assert_swap_admission_closed_for_fee_policy(&expired.apply_to_admission());
+}
+
+#[tokio::test]
+async fn production_runtime_authorizes_only_a_complete_durable_restore() {
+    let now_unix = current_unix();
+    let bitcoin = PersistedLkgFixture {
+        rail: FeeRail::Bitcoin,
+        original_source: FeeObservationSource::LiveBitcoin,
+        rate_sat_per_vbyte: 11.0,
+        observed_at_unix: now_unix,
+        provenance: "runtime-restored-bitcoin".to_owned(),
+    }
+    .restore_bitcoin()
+    .unwrap();
+    let liquid = PersistedLkgFixture {
+        rail: FeeRail::Liquid,
+        original_source: FeeObservationSource::LiveLiquid,
+        rate_sat_per_vbyte: 0.75,
+        observed_at_unix: now_unix,
+        provenance: "runtime-restored-liquid".to_owned(),
+    }
+    .restore_liquid()
+    .unwrap();
+
+    let complete = offline_runtime(RestoringFeePersistence::new(
+        Some(bitcoin.clone()),
+        Some(liquid),
+    ));
+    assert!(!complete.readiness_now().ready());
+    let report = complete.initialize().await;
+    assert!(report.readiness().bitcoin_ready());
+    assert!(report.readiness().liquid_ready());
+    assert!(report.readiness().ready());
+    assert!(complete.readiness_now().ready());
+
+    let bitcoin_decision = complete.bitcoin_decision_now().unwrap();
+    assert_eq!(
+        bitcoin_decision.source(),
+        FeeObservationSource::BitcoinLastKnownGood
+    );
+    assert_eq!(bitcoin_decision.rate().as_f64(), 11.0);
+    assert_eq!(bitcoin_decision.observed_at_unix(), now_unix);
+    assert_eq!(
+        bitcoin_decision.provenance().expose_for_persistence(),
+        "runtime-restored-bitcoin"
+    );
+    let liquid_decision = complete.liquid_decision_now().unwrap();
+    assert_eq!(
+        liquid_decision.source(),
+        FeeObservationSource::LiquidLastKnownGood
+    );
+    assert_eq!(liquid_decision.rate().as_f64(), 0.75);
+
+    let incomplete = offline_runtime(RestoringFeePersistence::new(Some(bitcoin), None));
+    let report = incomplete.initialize().await;
+    assert!(report.readiness().bitcoin_ready());
+    assert!(!report.readiness().liquid_ready());
+    assert!(!report.readiness().ready());
+    assert!(incomplete.bitcoin_decision_now().is_ok());
+    assert!(incomplete.liquid_decision_now().is_err());
+
+    let admission = pay_service::admission::MoneyAdmission::healthy_test_fixture();
+    admission.set_fee_policy_ready(report.readiness().ready());
+    assert_swap_admission_closed_for_fee_policy(&admission);
 }
 
 #[test]

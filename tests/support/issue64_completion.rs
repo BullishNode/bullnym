@@ -1,11 +1,13 @@
+use async_trait::async_trait;
 use pay_service::admission::{Dependency, MoneyAdmission, Rail, ReasonCode};
 use pay_service::builder_fee::{BitcoinBuilderFeeDecision, LiquidBuilderFeeDecision};
-use pay_service::current_fee_snapshot::CurrentFeeSnapshot;
+use pay_service::current_fee_snapshot::{CurrentBitcoinFee, CurrentFeeSnapshot, CurrentLiquidFee};
 use pay_service::fee_policy::{
     BitcoinFeeDecision, BitcoinFeePolicy, BitcoinLastKnownGood, FeeObservationSource,
     FeePolicyError, FeeProvenance, FeeRail, LiquidFeeDecision, LiquidFeePolicy,
     LiquidLastKnownGood, LiveBitcoin, LiveLiquid, SatPerVbyte,
 };
+use pay_service::fee_runtime::{FeePersistenceError, FeeRuntimePersistence};
 
 pub const NOW_UNIX: u64 = 20_000;
 
@@ -150,43 +152,52 @@ pub struct RuntimeDecisions {
     pub liquid: Result<LiquidFeeDecision, ()>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RestartedFeeFixture {
-    bitcoin_last_known_good: Option<BitcoinLastKnownGood>,
-    liquid_last_known_good: Option<LiquidLastKnownGood>,
+#[derive(Clone, Debug)]
+pub struct RestoringFeePersistence {
+    bitcoin: Option<BitcoinLastKnownGood>,
+    liquid: Option<LiquidLastKnownGood>,
 }
 
-impl RestartedFeeFixture {
-    pub fn new() -> Self {
-        Self::default()
+impl RestoringFeePersistence {
+    pub fn new(bitcoin: Option<BitcoinLastKnownGood>, liquid: Option<LiquidLastKnownGood>) -> Self {
+        Self { bitcoin, liquid }
     }
+}
 
-    pub fn restore_bitcoin_last_known_good(&mut self, observation: BitcoinLastKnownGood) {
-        self.bitcoin_last_known_good = Some(observation);
-    }
-
-    pub fn restore_liquid_last_known_good(&mut self, observation: LiquidLastKnownGood) {
-        self.liquid_last_known_good = Some(observation);
-    }
-
-    pub fn decisions(
-        &self,
-        bitcoin_policy: &BitcoinFeePolicy,
-        liquid_policy: &LiquidFeePolicy,
-        now_unix: u64,
-    ) -> RuntimeDecisions {
-        RuntimeDecisions {
-            bitcoin: bitcoin_policy
-                .decide_typed(None, self.bitcoin_last_known_good.as_ref(), now_unix)
-                .map_err(|_| ()),
-            liquid: liquid_policy
-                .decide_typed(None, self.liquid_last_known_good.as_ref(), now_unix)
-                .map_err(|_| ()),
+#[async_trait]
+impl FeeRuntimePersistence for RestoringFeePersistence {
+    async fn restore(&self, snapshot: &CurrentFeeSnapshot) -> Result<(), FeePersistenceError> {
+        if let Some(bitcoin) = self.bitcoin.clone() {
+            snapshot
+                .restore_bitcoin_last_known_good(bitcoin)
+                .map_err(|_| FeePersistenceError::RestoreFailed)?;
         }
+        if let Some(liquid) = self.liquid.clone() {
+            snapshot
+                .restore_liquid_last_known_good(liquid)
+                .map_err(|_| FeePersistenceError::RestoreFailed)?;
+        }
+        Ok(())
     }
 
-    pub fn has_live_evidence_eligible_for_persistence(&self) -> bool {
-        false
+    async fn persist_accepted_bitcoin(
+        &self,
+        _snapshot: &CurrentFeeSnapshot,
+        _current: &CurrentBitcoinFee,
+        _policy: &BitcoinFeePolicy,
+        _accepted_at_unix: u64,
+    ) -> Result<(), FeePersistenceError> {
+        Err(FeePersistenceError::WriteFailed)
+    }
+
+    async fn persist_accepted_liquid(
+        &self,
+        _snapshot: &CurrentFeeSnapshot,
+        _current: &CurrentLiquidFee,
+        _policy: &LiquidFeePolicy,
+        _accepted_at_unix: u64,
+    ) -> Result<(), FeePersistenceError> {
+        Err(FeePersistenceError::WriteFailed)
     }
 }
 
