@@ -9,7 +9,8 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::{
     merchant_output_verifier::{
-        ApprovedMerchantDestination, LiquidMerchantOutputObservation,
+        AdaptedMerchantOutputEvidence, ApprovedMerchantDestination,
+        BitcoinMerchantOutputObservation, LiquidMerchantOutputObservation,
         MerchantOutputVerificationError, VerifiedMerchantOutput,
     },
     merchant_settlement_adoption::{
@@ -250,7 +251,7 @@ impl MerchantSettlementAdoptionService {
             LiquidMerchantOutputObservation::Observed(adapted)
                 if adapted.observed().confirmations() == 0 =>
             {
-                self.apply_liquid_mempool(adapted)
+                self.apply_adapted_mempool(adapted)
             }
             LiquidMerchantOutputObservation::Observed(adapted) => {
                 let verified = adapted.verify(approved_destination, 1)?;
@@ -271,9 +272,45 @@ impl MerchantSettlementAdoptionService {
         }
     }
 
-    fn apply_liquid_mempool(
+    /// Symmetric Bitcoin recovery boundary. The source independently anchors
+    /// the observation; accounting still begins at one confirmation while the
+    /// lifecycle preserves the Bitcoin three-confirmation finality policy.
+    pub fn apply_bitcoin_recovery_observation(
         &mut self,
-        adapted: &crate::merchant_output_verifier::AdaptedMerchantOutputEvidence,
+        observation: &BitcoinMerchantOutputObservation,
+        approved_destination: &ApprovedMerchantDestination,
+    ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError> {
+        if self.context.path() != MerchantSettlementPath::BitcoinRecovery {
+            return Err(MerchantSettlementProcessingError::WrongSettlementPath);
+        }
+        match observation {
+            BitcoinMerchantOutputObservation::Observed(adapted)
+                if adapted.observed().confirmations() == 0 =>
+            {
+                self.apply_adapted_mempool(adapted)
+            }
+            BitcoinMerchantOutputObservation::Observed(adapted) => {
+                let verified = adapted.verify(approved_destination, 1)?;
+                self.apply_verified_confirmation(&verified)
+            }
+            BitcoinMerchantOutputObservation::Evicted { txid } => {
+                self.require_active_observation(txid)?;
+                self.apply_eviction()
+            }
+            BitcoinMerchantOutputObservation::ReorgDemoted {
+                txid,
+                previous_block_height,
+                previous_block_hash,
+            } => {
+                self.require_active_observation(txid)?;
+                self.apply_reorg(*previous_block_height, previous_block_hash)
+            }
+        }
+    }
+
+    fn apply_adapted_mempool(
+        &mut self,
+        adapted: &AdaptedMerchantOutputEvidence,
     ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError> {
         if adapted.original_journal_txid() != self.lifecycle.journal_txid().as_str() {
             return Err(MerchantSettlementProcessingError::JournalMismatch);
@@ -624,13 +661,18 @@ mod tests {
     use std::{collections::btree_map::Entry, str::FromStr};
 
     use crate::merchant_output_verifier::{
-        adapt_liquid_merchant_output, verify_merchant_output, ApprovedMerchantDestination,
+        adapt_bitcoin_merchant_output, adapt_liquid_merchant_output, verify_merchant_output,
+        ApprovedMerchantDestination, BitcoinMerchantOutputObservation,
         JournaledMerchantTransaction, LinkedReplacementJournalEvidence, MerchantAsset,
         MerchantConfirmationEvidence, MerchantOutputCommitment, MerchantOutputEvidence,
         MerchantOutputVerificationError, MerchantSourcePrevout, MerchantTransactionJournalEvidence,
         MerchantTransactionObservation, ObservedMerchantOutput,
     };
     use crate::merchant_settlement_lifecycle::SettlementState;
+    use bitcoin::{
+        absolute, consensus::serialize, transaction, Amount, OutPoint, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Txid, Witness,
+    };
     use lwk_wollet::elements::{self, Address as LiquidAddress};
     use uuid::Uuid;
 
@@ -821,6 +863,118 @@ mod tests {
                     replacement.then_some(&linked),
                     &observation,
                     &self.blinding_key,
+                )
+                .unwrap(),
+            )
+        }
+    }
+
+    struct BitcoinSourceFixture {
+        original_raw: Vec<u8>,
+        original_txid: String,
+        replacement_raw: Vec<u8>,
+        replacement_txid: String,
+        source_txid: String,
+        asset: MerchantAsset,
+    }
+
+    impl BitcoinSourceFixture {
+        fn new() -> Self {
+            let source_txid = Txid::from_str(ORIGINAL_TXID).unwrap();
+            let script = ScriptBuf::from_bytes(hex::decode(BITCOIN_SCRIPT).unwrap());
+            let transaction = |amount_sat, sequence| Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(source_txid, 3),
+                    script_sig: ScriptBuf::new(),
+                    sequence,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(amount_sat),
+                    script_pubkey: script.clone(),
+                }],
+            };
+            let original = transaction(89_000, Sequence::MAX);
+            let replacement = transaction(88_000, Sequence::ZERO);
+            Self {
+                original_raw: serialize(&original),
+                original_txid: original.compute_txid().to_string(),
+                replacement_raw: serialize(&replacement),
+                replacement_txid: replacement.compute_txid().to_string(),
+                source_txid: source_txid.to_string(),
+                asset: MerchantAsset::Bitcoin,
+            }
+        }
+
+        fn approved(&self) -> ApprovedMerchantDestination {
+            ApprovedMerchantDestination::bitcoin(BITCOIN_ADDRESS, BITCOIN_SCRIPT)
+        }
+
+        fn service(&self) -> MerchantSettlementAdoptionService {
+            MerchantSettlementAdoptionService::new(
+                context(MerchantSettlementPath::BitcoinRecovery),
+                &self.original_txid,
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn observation(
+            &self,
+            replacement: bool,
+            confirmation: MerchantConfirmationEvidence<'_>,
+        ) -> BitcoinMerchantOutputObservation {
+            let sources = [MerchantSourcePrevout {
+                txid: &self.source_txid,
+                vout: 3,
+                amount_sat: 91_000,
+                script_pubkey_hex: "51",
+            }];
+            let original = MerchantTransactionJournalEvidence {
+                raw_transaction: &self.original_raw,
+                txid: &self.original_txid,
+                source_prevouts: &sources,
+                merchant: MerchantOutputCommitment {
+                    destination_address: BITCOIN_ADDRESS,
+                    destination_script_hex: BITCOIN_SCRIPT,
+                    asset: &self.asset,
+                    amount_sat: 89_000,
+                    vout: 0,
+                },
+            };
+            let replacement_journal = MerchantTransactionJournalEvidence {
+                raw_transaction: &self.replacement_raw,
+                txid: &self.replacement_txid,
+                source_prevouts: &sources,
+                merchant: MerchantOutputCommitment {
+                    destination_address: BITCOIN_ADDRESS,
+                    destination_script_hex: BITCOIN_SCRIPT,
+                    asset: &self.asset,
+                    amount_sat: 88_000,
+                    vout: 0,
+                },
+            };
+            let linked = LinkedReplacementJournalEvidence {
+                replaces_txid: &self.original_txid,
+                replacement: replacement_journal,
+            };
+            let (raw_transaction, txid) = if replacement {
+                (&self.replacement_raw, &self.replacement_txid)
+            } else {
+                (&self.original_raw, &self.original_txid)
+            };
+            let observation = MerchantTransactionObservation {
+                raw_transaction,
+                txid,
+                confirmation,
+            };
+            BitcoinMerchantOutputObservation::Observed(
+                adapt_bitcoin_merchant_output(
+                    &original,
+                    replacement.then_some(&linked),
+                    &observation,
                 )
                 .unwrap(),
             )
@@ -1344,6 +1498,214 @@ mod tests {
             ),
             Err(MerchantSettlementProcessingError::InvalidCheckpoint)
         );
+    }
+
+    #[test]
+    fn bitcoin_source_accounts_at_one_and_finalizes_only_at_three_confirmations() {
+        let fixture = BitcoinSourceFixture::new();
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        let mempool = fixture.observation(false, MerchantConfirmationEvidence::Mempool);
+        assert!(service
+            .apply_bitcoin_recovery_observation(&mempool, &approved)
+            .unwrap()
+            .commands
+            .is_empty());
+
+        let confirmed_one = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        let one = service
+            .apply_bitcoin_recovery_observation(&confirmed_one, &approved)
+            .unwrap();
+        let MerchantSettlementPersistenceCommand::Record(intent) = &one.commands[0] else {
+            panic!("one confirmation must record the exact Bitcoin output")
+        };
+        assert_eq!(intent.actual_amount_sat, 89_000);
+        assert_eq!(intent.txid, fixture.original_txid);
+        assert!(matches!(
+            service.lifecycle().state(),
+            SettlementState::Confirmed {
+                required_confirmations: 3,
+                ..
+            }
+        ));
+
+        let confirmed_two = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 2,
+                block_height: 840_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        assert!(service
+            .apply_bitcoin_recovery_observation(&confirmed_two, &approved)
+            .unwrap()
+            .commands
+            .is_empty());
+
+        let confirmed_three = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 3,
+                block_height: 840_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        assert!(matches!(
+            service
+                .apply_bitcoin_recovery_observation(&confirmed_three, &approved)
+                .unwrap()
+                .commands
+                .as_slice(),
+            [MerchantSettlementPersistenceCommand::Finalize(_)]
+        ));
+    }
+
+    #[test]
+    fn bitcoin_source_demotion_is_active_tx_bound_and_redrives() {
+        let fixture = BitcoinSourceFixture::new();
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        let confirmed_a = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        service
+            .apply_bitcoin_recovery_observation(&confirmed_a, &approved)
+            .unwrap();
+
+        let before = service.snapshot();
+        let wrong_eviction = BitcoinMerchantOutputObservation::Evicted {
+            txid: fixture.replacement_txid.clone(),
+        };
+        assert_eq!(
+            service.apply_bitcoin_recovery_observation(&wrong_eviction, &approved),
+            Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
+        );
+        assert_eq!(service.snapshot(), before);
+
+        let eviction = BitcoinMerchantOutputObservation::Evicted {
+            txid: fixture.original_txid.clone(),
+        };
+        let evicted = service
+            .apply_bitcoin_recovery_observation(&eviction, &approved)
+            .unwrap();
+        assert!(evicted.redrive_observation);
+        assert!(matches!(
+            evicted.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Deactivate(_)]
+        ));
+        assert!(matches!(
+            service
+                .apply_bitcoin_recovery_observation(&confirmed_a, &approved)
+                .unwrap()
+                .commands
+                .as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+
+        let reorg = BitcoinMerchantOutputObservation::ReorgDemoted {
+            txid: fixture.original_txid.clone(),
+            previous_block_height: 840_000,
+            previous_block_hash: BLOCK_A.to_owned(),
+        };
+        let reorged = service
+            .apply_bitcoin_recovery_observation(&reorg, &approved)
+            .unwrap();
+        assert!(reorged.redrive_observation);
+        let confirmed_b = fixture.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_001,
+                block_hash: BLOCK_B,
+            },
+        );
+        assert!(matches!(
+            service
+                .apply_bitcoin_recovery_observation(&confirmed_b, &approved)
+                .unwrap()
+                .commands
+                .as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+    }
+
+    #[test]
+    fn bitcoin_source_linked_replacement_restores_and_refuses_parent_demotion() {
+        let fixture = BitcoinSourceFixture::new();
+        let approved = fixture.approved();
+        let mut service = fixture.service();
+        service
+            .apply_bitcoin_recovery_observation(
+                &fixture.observation(false, MerchantConfirmationEvidence::Mempool),
+                &approved,
+            )
+            .unwrap();
+        service
+            .apply_bitcoin_recovery_observation(
+                &fixture.observation(true, MerchantConfirmationEvidence::Mempool),
+                &approved,
+            )
+            .unwrap();
+        let replacement = fixture.observation(
+            true,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_001,
+                block_hash: BLOCK_B,
+            },
+        );
+        let outcome = service
+            .apply_bitcoin_recovery_observation(&replacement, &approved)
+            .unwrap();
+        let MerchantSettlementPersistenceCommand::Record(intent) = &outcome.commands[0] else {
+            panic!("replacement confirmation must record its exact output")
+        };
+        assert_eq!(intent.actual_amount_sat, 88_000);
+        assert_eq!(intent.txid, fixture.replacement_txid);
+        assert!(intent
+            .identity
+            .event_key()
+            .contains(&fixture.replacement_txid));
+
+        let mut restored = MerchantSettlementAdoptionService::restore(
+            service.snapshot(),
+            SettlementFinalityPolicy::new(2, 3).unwrap(),
+        )
+        .unwrap();
+        assert!(restored
+            .apply_bitcoin_recovery_observation(&replacement, &approved)
+            .unwrap()
+            .commands
+            .is_empty());
+        assert_eq!(
+            restored.repair_accounting_intent().unwrap().txid,
+            fixture.replacement_txid
+        );
+
+        let before = restored.snapshot();
+        let stale_parent_reorg = BitcoinMerchantOutputObservation::ReorgDemoted {
+            txid: fixture.original_txid,
+            previous_block_height: 840_001,
+            previous_block_hash: BLOCK_B.to_owned(),
+        };
+        assert_eq!(
+            restored.apply_bitcoin_recovery_observation(&stale_parent_reorg, &approved),
+            Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
+        );
+        assert_eq!(restored.snapshot(), before);
     }
 
     #[test]
