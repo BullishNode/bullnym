@@ -344,17 +344,7 @@ async fn dispatch_webhook(
             )
             .await;
 
-            try_claim_with_retry(
-                &state.db,
-                &swap,
-                state.liquid_claim_client_factory.as_deref(),
-                &state.config.boltz.api_url,
-                state.config.claim.max_claim_attempts,
-                state.utxo_backend.as_ref(),
-                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-                state.fee_runtime.as_ref(),
-            )
-            .await;
+            try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
         }
         "invoice.settled" => {
             // Preimage was disclosed and Boltz settled the LN HTLC. This
@@ -740,17 +730,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             local_status = %status,
             "boltz reports chain swap claimed; local claim path remains authoritative for invoice accounting"
         );
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-            state.fee_runtime.as_ref(),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         return Ok(());
     }
 
@@ -768,17 +748,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         // Nudge the claimer: if the server lockup is already confirmed/claiming
         // the script-path claim runs now; otherwise the sweep / reconciler
         // picks it up once the lockup appears.
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-            state.fee_runtime.as_ref(),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         return Ok(());
     }
 
@@ -873,17 +843,7 @@ pub(crate) async fn handle_chain_swap_webhook(
                 boltz_status,
                 "provider failure disagrees with the local Liquid branch; preserving and redriving claim"
             );
-            try_claim_chain_swap_with_retry(
-                &state.db,
-                swap,
-                state.liquid_claim_client_factory.as_deref(),
-                &state.config.boltz.api_url,
-                state.config.claim.max_claim_attempts,
-                state.utxo_backend.as_ref(),
-                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-                state.fee_runtime.as_ref(),
-            )
-            .await;
+            try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         } else {
             tracing::debug!(
                 swap_id = %swap.boltz_swap_id,
@@ -947,17 +907,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             | ChainSwapStatus::Claiming
             | ChainSwapStatus::ClaimFailed
     ) {
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-            state.fee_runtime.as_ref(),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
     }
     Ok(())
 }
@@ -995,27 +945,46 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
     }
 }
 
-async fn try_claim_chain_swap_with_retry(
-    pool: &sqlx::PgPool,
-    swap: &db::ChainSwapRecord,
-    claim_clients: Option<&LiquidClaimClientFactory>,
-    boltz_url: &str,
+struct ClaimAttemptContext<'a> {
+    pool: &'a sqlx::PgPool,
+    claim_clients: Option<&'a LiquidClaimClientFactory>,
+    boltz_url: &'a str,
     max_claim_attempts: i32,
-    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    utxo_backend: Option<&'a Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
-    fee_runtime: &FeeRuntime,
+    fee_runtime: &'a FeeRuntime,
+}
+
+impl<'a> ClaimAttemptContext<'a> {
+    fn from_state(state: &'a AppState) -> Self {
+        Self {
+            pool: &state.db,
+            claim_clients: state.liquid_claim_client_factory.as_deref(),
+            boltz_url: &state.config.boltz.api_url,
+            max_claim_attempts: state.config.claim.max_claim_attempts,
+            utxo_backend: state.utxo_backend.as_ref(),
+            tolerances: db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+            fee_runtime: state.fee_runtime.as_ref(),
+        }
+    }
+}
+
+async fn try_claim_chain_swap_with_retry(
+    swap: &db::ChainSwapRecord,
+    context: ClaimAttemptContext<'_>,
 ) {
-    let fee_decision = fee_runtime
+    let fee_decision = context
+        .fee_runtime
         .liquid_construction_decision_now(FeeConstructionPurpose::ChainLiquidClaim)
         .ok();
     match claim_chain_swap(
-        pool,
+        context.pool,
         swap.id,
-        claim_clients,
-        boltz_url,
-        max_claim_attempts,
-        utxo_backend,
-        tolerances,
+        context.claim_clients,
+        context.boltz_url,
+        context.max_claim_attempts,
+        context.utxo_backend,
+        context.tolerances,
         fee_decision.as_ref().map(|(decision, _)| decision),
         fee_decision.as_ref().map(|(_, record)| record),
     )
@@ -1146,27 +1115,19 @@ fn is_local_claim_error(message: &str) -> bool {
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
 /// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
-async fn try_claim_with_retry(
-    pool: &sqlx::PgPool,
-    swap: &db::SwapRecord,
-    claim_clients: Option<&LiquidClaimClientFactory>,
-    boltz_url: &str,
-    max_claim_attempts: i32,
-    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
-    tolerances: db::InvoiceAccountingTolerances,
-    fee_runtime: &FeeRuntime,
-) {
-    let fee_decision = fee_runtime
+async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContext<'_>) {
+    let fee_decision = context
+        .fee_runtime
         .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
         .ok();
     match claim_swap(
-        pool,
+        context.pool,
         swap.id,
-        claim_clients,
-        boltz_url,
-        max_claim_attempts,
-        utxo_backend,
-        tolerances,
+        context.claim_clients,
+        context.boltz_url,
+        context.max_claim_attempts,
+        context.utxo_backend,
+        context.tolerances,
         fee_decision.as_ref().map(|(decision, _)| decision),
         fee_decision.as_ref().map(|(_, record)| record),
     )
@@ -3050,16 +3011,66 @@ impl ClaimClientStartup {
 #[cfg(test)]
 mod tests;
 
-pub fn spawn_background_claimer(
+/// Owned runtime dependencies for the long-lived reverse and chain claim
+/// sweeps. Worker health reporters are grouped separately because they are
+/// mutable rail-local state, not claim-construction capabilities.
+pub struct BackgroundClaimerDependencies {
     pool: sqlx::PgPool,
     config: Arc<Config>,
     claim_clients: Option<Arc<LiquidClaimClientFactory>>,
     utxo_backend: Option<Arc<dyn UtxoBackend>>,
     fee_runtime: Arc<FeeRuntime>,
     cancel: CancellationToken,
-    mut reverse_reporter: WorkerReporter,
-    mut chain_reporter: WorkerReporter,
+}
+
+impl BackgroundClaimerDependencies {
+    pub fn new(
+        pool: sqlx::PgPool,
+        config: Arc<Config>,
+        claim_clients: Option<Arc<LiquidClaimClientFactory>>,
+        utxo_backend: Option<Arc<dyn UtxoBackend>>,
+        fee_runtime: Arc<FeeRuntime>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            pool,
+            config,
+            claim_clients,
+            utxo_backend,
+            fee_runtime,
+            cancel,
+        }
+    }
+}
+
+/// Rail-local admission reporters consumed by the background claimer task.
+pub struct BackgroundClaimerReporters {
+    reverse: WorkerReporter,
+    chain: WorkerReporter,
+}
+
+impl BackgroundClaimerReporters {
+    pub fn new(reverse: WorkerReporter, chain: WorkerReporter) -> Self {
+        Self { reverse, chain }
+    }
+}
+
+pub fn spawn_background_claimer(
+    dependencies: BackgroundClaimerDependencies,
+    reporters: BackgroundClaimerReporters,
 ) -> tokio::task::JoinHandle<()> {
+    let BackgroundClaimerDependencies {
+        pool,
+        config,
+        claim_clients,
+        utxo_backend,
+        fee_runtime,
+        cancel,
+    } = dependencies;
+    let BackgroundClaimerReporters {
+        reverse: mut reverse_reporter,
+        chain: mut chain_reporter,
+    } = reporters;
     tokio::spawn(async move {
         let mut first_reverse_run = true;
         let mut claim_client_startup = ClaimClientStartup::default();

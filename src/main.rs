@@ -638,14 +638,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Payment Page OG image reconciler started");
         }
         let _claimer_task = claimer::spawn_background_claimer(
-            pool.clone(),
-            config.clone(),
-            state.liquid_claim_client_factory.clone(),
-            state.utxo_backend.clone(),
-            state.fee_runtime.clone(),
-            cancel.clone(),
-            state.admission.reporter(admission::Worker::ReverseClaimer),
-            state.admission.reporter(admission::Worker::ChainClaimer),
+            claimer::BackgroundClaimerDependencies::new(
+                pool.clone(),
+                config.clone(),
+                state.liquid_claim_client_factory.clone(),
+                state.utxo_backend.clone(),
+                state.fee_runtime.clone(),
+                cancel.clone(),
+            ),
+            claimer::BackgroundClaimerReporters::new(
+                state.admission.reporter(admission::Worker::ReverseClaimer),
+                state.admission.reporter(admission::Worker::ChainClaimer),
+            ),
         );
 
         // Reconciler: polls boltz_api.get_swap for every non-terminal swap
