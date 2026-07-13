@@ -13131,16 +13131,37 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             assert_eq!(attempt.txid, harness.expected_txid);
         }
 
-        let resumed = execute_journaled_recovery_with_services(
-            &pool,
-            harness.swap.id,
-            harness.builder.as_ref(),
-            harness.chain.as_ref(),
-            harness.broadcaster.as_ref(),
-            &NoRecoveryFaults,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("fault {point:?} did not resume: {e}"));
+        // Dropping the faulted SQLx transaction queues its rollback; it does
+        // not wait for PostgreSQL to release the transaction advisory lock.
+        // Model the real worker contract by retrying only that transient lock
+        // loss, while still surfacing every other resume failure immediately.
+        let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let resumed = loop {
+            match execute_journaled_recovery_with_services(
+                &pool,
+                harness.swap.id,
+                harness.builder.as_ref(),
+                harness.chain.as_ref(),
+                harness.broadcaster.as_ref(),
+                &NoRecoveryFaults,
+            )
+            .await
+            {
+                Err(AppError::ClaimError(message))
+                    if message
+                        == "chain swap is busy (claim/recovery in progress); retry shortly" =>
+                {
+                    assert!(
+                        tokio::time::Instant::now() < retry_deadline,
+                        "fault {point:?} did not release its recovery advisory lock"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => {
+                    break result.unwrap_or_else(|e| panic!("fault {point:?} did not resume: {e}"))
+                }
+            }
+        };
         assert_eq!(resumed, harness.expected_txid);
 
         let final_attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
