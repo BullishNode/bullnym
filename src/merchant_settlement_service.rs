@@ -1117,6 +1117,53 @@ mod tests {
         }
     }
 
+    /// Models the real worker transaction boundary: every tick restores the
+    /// last durable checkpoint, applies one typed source outcome, applies the
+    /// returned commands, then persists the next checkpoint.
+    struct DeterministicRestoringWorker {
+        checkpoint: MerchantSettlementAdoptionSnapshot,
+        policy: SettlementFinalityPolicy,
+        sink: DeterministicAccountingSink,
+    }
+
+    impl DeterministicRestoringWorker {
+        fn new(service: MerchantSettlementAdoptionService) -> Self {
+            Self {
+                checkpoint: service.snapshot(),
+                policy: SettlementFinalityPolicy::new(2, 3).unwrap(),
+                sink: DeterministicAccountingSink::default(),
+            }
+        }
+
+        fn liquid_tick(
+            &mut self,
+            observation: &LiquidMerchantOutputObservation,
+            approved: &ApprovedMerchantDestination,
+        ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError>
+        {
+            let mut service =
+                MerchantSettlementAdoptionService::restore(self.checkpoint.clone(), self.policy)?;
+            let outcome = service.apply_liquid_observation(observation, approved)?;
+            self.sink.apply(&outcome);
+            self.checkpoint = service.snapshot();
+            Ok(outcome)
+        }
+
+        fn bitcoin_tick(
+            &mut self,
+            observation: &BitcoinMerchantOutputObservation,
+            approved: &ApprovedMerchantDestination,
+        ) -> Result<MerchantSettlementProcessingOutcome, MerchantSettlementProcessingError>
+        {
+            let mut service =
+                MerchantSettlementAdoptionService::restore(self.checkpoint.clone(), self.policy)?;
+            let outcome = service.apply_bitcoin_recovery_observation(observation, approved)?;
+            self.sink.apply(&outcome);
+            self.checkpoint = service.snapshot();
+            Ok(outcome)
+        }
+    }
+
     #[test]
     fn liquid_one_confirmation_records_actual_value_once_then_finalizes() {
         let mut service = service(MerchantSettlementPath::LiquidClaim);
@@ -1706,6 +1753,121 @@ mod tests {
             Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
         );
         assert_eq!(restored.snapshot(), before);
+    }
+
+    #[test]
+    fn restoring_worker_two_tick_redrive_is_exact_across_both_rails() {
+        let liquid = LiquidSourceFixture::new(88_000, 87_000);
+        let liquid_approved = liquid.approved();
+        let mut liquid_worker = DeterministicRestoringWorker::new(liquid.service());
+        liquid_worker
+            .liquid_tick(
+                &liquid.observation(false, MerchantConfirmationEvidence::Mempool),
+                &liquid_approved,
+            )
+            .unwrap();
+        let liquid_confirmed = liquid.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        liquid_worker
+            .liquid_tick(&liquid_confirmed, &liquid_approved)
+            .unwrap();
+        assert_eq!(liquid_worker.sink.active_value_sat(), 88_000);
+
+        let liquid_evicted = LiquidMerchantOutputObservation::Evicted {
+            txid: liquid.original_txid.clone(),
+        };
+        let first_tick = liquid_worker
+            .liquid_tick(&liquid_evicted, &liquid_approved)
+            .unwrap();
+        assert!(first_tick.redrive_observation);
+        assert!(first_tick.rebroadcast_journaled);
+        assert!(matches!(
+            first_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Deactivate(_)]
+        ));
+        assert_eq!(liquid_worker.sink.active_value_sat(), 0);
+        let second_tick = liquid_worker
+            .liquid_tick(&liquid_confirmed, &liquid_approved)
+            .unwrap();
+        assert!(matches!(
+            second_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+        assert_eq!(liquid_worker.sink.active_value_sat(), 88_000);
+        assert_eq!(liquid_worker.sink.total_records(), 1);
+
+        let bitcoin = BitcoinSourceFixture::new();
+        let bitcoin_approved = bitcoin.approved();
+        let mut bitcoin_worker = DeterministicRestoringWorker::new(bitcoin.service());
+        bitcoin_worker
+            .bitcoin_tick(
+                &bitcoin.observation(false, MerchantConfirmationEvidence::Mempool),
+                &bitcoin_approved,
+            )
+            .unwrap();
+        let bitcoin_confirmed_a = bitcoin.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_000,
+                block_hash: BLOCK_A,
+            },
+        );
+        bitcoin_worker
+            .bitcoin_tick(&bitcoin_confirmed_a, &bitcoin_approved)
+            .unwrap();
+        assert_eq!(bitcoin_worker.sink.active_value_sat(), 89_000);
+
+        let bitcoin_reorged = BitcoinMerchantOutputObservation::ReorgDemoted {
+            txid: bitcoin.original_txid.clone(),
+            previous_block_height: 840_000,
+            previous_block_hash: BLOCK_A.to_owned(),
+        };
+        let first_tick = bitcoin_worker
+            .bitcoin_tick(&bitcoin_reorged, &bitcoin_approved)
+            .unwrap();
+        assert!(first_tick.redrive_observation);
+        assert!(!first_tick.rebroadcast_journaled);
+        assert_eq!(bitcoin_worker.sink.active_value_sat(), 0);
+
+        let bitcoin_confirmed_b = bitcoin.observation(
+            false,
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 840_001,
+                block_hash: BLOCK_B,
+            },
+        );
+        let second_tick = bitcoin_worker
+            .bitcoin_tick(&bitcoin_confirmed_b, &bitcoin_approved)
+            .unwrap();
+        assert!(matches!(
+            second_tick.commands.as_slice(),
+            [MerchantSettlementPersistenceCommand::Activate(_)]
+        ));
+        assert_eq!(bitcoin_worker.sink.active_value_sat(), 89_000);
+        assert_eq!(bitcoin_worker.sink.total_records(), 1);
+
+        let checkpoint_before_mismatch = bitcoin_worker.checkpoint.clone();
+        let value_before_mismatch = bitcoin_worker.sink.active_value_sat();
+        let mismatched = BitcoinMerchantOutputObservation::Evicted {
+            txid: bitcoin.replacement_txid,
+        };
+        assert_eq!(
+            bitcoin_worker.bitcoin_tick(&mismatched, &bitcoin_approved),
+            Err(MerchantSettlementProcessingError::ObservationTransactionMismatch)
+        );
+        assert_eq!(bitcoin_worker.checkpoint, checkpoint_before_mismatch);
+        assert_eq!(
+            bitcoin_worker.sink.active_value_sat(),
+            value_before_mismatch
+        );
     }
 
     #[test]
