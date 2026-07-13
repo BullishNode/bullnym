@@ -4685,48 +4685,36 @@ async fn reverse_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppErro
 
 async fn chain_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError {
     let fee_decision = accepted_live_liquid_fee_decision();
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        async {
-            match claimer::exercise_chain_claim_with_malformed_response(
-                pool,
-                swap_id,
-                &fee_decision,
-            )
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        match claimer::exercise_chain_claim_with_malformed_response(pool, swap_id, &fee_decision)
             .await
-            {
-                Ok(claimer::ClaimOutcome::SkippedLockHeld) => {}
-                result => return result,
-            }
+        {
+            Ok(claimer::ClaimOutcome::SkippedLockHeld) => {}
+            result => return result,
+        }
 
-            // Dropping the preceding no-fee SQLx transaction schedules its
-            // rollback, so the webhook can return just before its transaction
-            // advisory lock is released. Block on that exact lock once; when
-            // this acquisition succeeds the rollback handoff is complete.
-            // Commit releases our handoff lock before one final seam attempt.
-            let lock_key = format!("chain-claim:{swap_id}");
-            let mut handoff = pool
-                .begin()
-                .await
-                .map_err(|error| AppError::DbError(error.to_string()))?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-                .bind(&lock_key)
-                .execute(&mut *handoff)
-                .await
-                .map_err(|error| AppError::DbError(error.to_string()))?;
-            handoff
-                .commit()
-                .await
-                .map_err(|error| AppError::DbError(error.to_string()))?;
-
-            claimer::exercise_chain_claim_with_malformed_response(
-                pool,
-                swap_id,
-                &fee_decision,
-            )
+        // Dropping the preceding no-fee SQLx transaction schedules its
+        // rollback, so the webhook can return just before its transaction
+        // advisory lock is released. Block on that exact lock once; when
+        // this acquisition succeeds the rollback handoff is complete.
+        // Commit releases our handoff lock before one final seam attempt.
+        let lock_key = format!("chain-claim:{swap_id}");
+        let mut handoff = pool
+            .begin()
             .await
-        },
-    )
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .execute(&mut *handoff)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        handoff
+            .commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+
+        claimer::exercise_chain_claim_with_malformed_response(pool, swap_id, &fee_decision).await
+    })
     .await
     .expect("chain claim preparation must complete within its bounded timeout");
     match result {
