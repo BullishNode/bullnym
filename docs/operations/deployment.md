@@ -19,7 +19,9 @@
 4. Back up PostgreSQL and confirm the swap mnemonic recovery procedure.
 5. Apply migrations before starting a binary that depends on the new schema.
    Migration 050 is a stop-the-writers boundary; follow the dedicated sequence
-   below instead of applying it while an older service is live.
+   below instead of applying it while an older service is live. Migration 051
+   is also a stopped-service cutover because its new insert trigger requires
+   the complete creation packet written by a 051-aware chain-swap caller.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -57,6 +59,17 @@ the allocation journal. The backup must preserve `swap_key_allocations`,
 After migration 050 exists, automatic rollback to any pre-050 binary is refused
 even when no swap has yet been created; recover by repairing or rolling forward
 with a lineage-aware binary.
+
+Migration 051 is the chain-swap creation-evidence writer boundary. Stop the
+service and drain its database sessions, take and validate a fresh backup, then
+apply `051_chain_swap_creation_terms.sql` and start only the matching binary.
+The migration deliberately leaves historical rows nullable but rejects every
+new chain-swap insert that lacks all required creation terms. Therefore a 050
+binary accidentally started on schema 051 fails closed before exposing a payer
+instruction, but it can still create provider-side orphans and must not be used
+as a rollback strategy. Repair or roll forward with a 051-aware binary. Verify
+that new rows contain one immutable creation packet and that legacy rows remain
+readable before reopening chain-swap admission.
 
 ## Reproducing a prior artifact
 

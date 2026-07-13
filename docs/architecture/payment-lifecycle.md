@@ -350,9 +350,29 @@ Public checkout behavior:
 
 - expose the Bitcoin instruction only if the remaining amount is above Boltz
   minimum and below Boltz maximum for BTC-to-LBTC
-- use the session Liquid address as the LBTC destination
+- fetch and pin the exact BTC-to-LBTC pair hash before creation; reject stale
+  quotes and independently recompute the payer gross-up
+- validate both returned Taproot trees byte-for-byte, including leaf versions,
+  local hashlock, key roles, mainnet address families, amounts, and cross-chain
+  timeout ordering
+- ignore the provider BIP21 and build the payer URI locally from the validated
+  Bitcoin address, exact payer amount, and Bullnym checkout URL
+- copy the canonical session Liquid address into immutable per-swap creation
+  terms and use that copy—not a later invoice lookup—as the LBTC claim
+  destination
+- commit the canonical provider response, response digest, pair quote, script
+  digests, networks, L-BTC asset, timeouts, key lineage, and merchant
+  destination atomically before returning either the address or BIP21
 - single-flight chain swap creation per session and remaining amount
 - do not create a new chain swap after session expiry
+
+Rows created before schema 051 have no creation packet and retain an explicit
+legacy claim fallback. Every post-051 insert must contain the complete packet;
+the database rejects partial packets and makes committed terms immutable. The
+canonical response digest is rechecked before Liquid claim or Bitcoin recovery
+signing. Emergency Bitcoin commitment remains nullable until its signed
+registration issue is deployed; those rows are therefore not yet fully
+recovery-v3 compliant.
 
 Product copy must make settlement clear:
 
