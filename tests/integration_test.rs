@@ -1199,7 +1199,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "053_recovery_address_commitments"
+        "054_fee_policy_authority"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -5083,16 +5083,22 @@ async fn malformed_claim_test_seams_reject_persisted_bytes_without_mutation() {
         "{",
     )
     .await;
+    let mut legacy_claim_bytes = admin.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *legacy_claim_bytes)
+        .await
+        .unwrap();
     sqlx::query("UPDATE swap_records SET claim_tx_hex = '00' WHERE id = $1")
         .bind(reverse_id)
-        .execute(&admin)
+        .execute(&mut *legacy_claim_bytes)
         .await
         .unwrap();
     sqlx::query("UPDATE chain_swap_records SET claim_tx_hex = '00' WHERE id = $1")
         .bind(chain_id)
-        .execute(&admin)
+        .execute(&mut *legacy_claim_bytes)
         .await
         .unwrap();
+    legacy_claim_bytes.commit().await.unwrap();
 
     let constrained = constrained_test_pool(1, None);
     let reverse_error = claimer::exercise_reverse_claim_with_malformed_response(
@@ -14534,6 +14540,11 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
     )
     .await
     .unwrap();
+    let mut legacy_claim_bytes = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *legacy_claim_bytes)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE chain_swap_records \
          SET status = 'claiming', \
@@ -14542,9 +14553,10 @@ async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
              next_claim_attempt_at = NOW() - INTERVAL '1 second' \
          WHERE boltz_swap_id = 'chainretry-swap'",
     )
-    .execute(&pool)
+    .execute(&mut *legacy_claim_bytes)
     .await
     .unwrap();
+    legacy_claim_bytes.commit().await.unwrap();
 
     let ready = pay_service::db::get_ready_to_claim_chain_swaps(&pool)
         .await
@@ -14648,6 +14660,11 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
     .await
     .unwrap();
 
+    let mut legacy_claim_bytes = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *legacy_claim_bytes)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE swap_records \
          SET status = 'claiming', \
@@ -14656,9 +14673,10 @@ async fn ready_to_claim_swaps_includes_retry_rows_with_claim_txid() {
              next_claim_attempt_at = NOW() - INTERVAL '1 second' \
          WHERE boltz_swap_id = 'claimretry-swap'",
     )
-    .execute(&pool)
+    .execute(&mut *legacy_claim_bytes)
     .await
     .unwrap();
+    legacy_claim_bytes.commit().await.unwrap();
 
     let ready = pay_service::db::get_ready_to_claim_swaps(&pool)
         .await
