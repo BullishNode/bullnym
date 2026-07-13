@@ -51,6 +51,23 @@ Credential fields and the endpoint are redacted from `Debug`; provider error
 details are not copied into public errors. Future runtime wiring must load the
 credentials from a protected environment file rather than checked-in TOML.
 
+## Disposable MinIO contract gate
+
+Run the opt-in real-adapter check with:
+
+```bash
+scripts/test-swap-manifest-store-minio.sh
+```
+
+The harness starts a uniquely named MinIO container on a random loopback port,
+creates a disposable bucket, and runs the otherwise ignored integration test.
+It proves create-only write, identical retry, differing-byte conflict without
+overwrite, verified read-after-write, bounded cursor pagination, rejected
+credentials, and public error/debug redaction. The pinned MinIO server and
+client images can be deliberately overridden with `MINIO_IMAGE` and
+`MINIO_MC_IMAGE`. The harness removes and verifies removal of its container and
+network on success or failure.
+
 ## Off-host provisioning still required
 
 The production VM currently has no configured independent object store. Before
