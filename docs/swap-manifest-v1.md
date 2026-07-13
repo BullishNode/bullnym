@@ -44,10 +44,14 @@ valid manifest forgery.
 
 Version 1 contains closed typed fields, with no extension map:
 
-- restore identity: manifest UUID, chain-swap UUID, Boltz swap ID, and creation
-  time;
-- derivation lineage: root fingerprint, key epoch, scheme version, and the
-  allocation UUID/index/purpose/public key for both claim and refund keys;
+- restore identity: manifest UUID, monotonic manifest sequence, predecessor
+  manifest UUID, chain-swap UUID, Boltz swap ID, and creation time. Sequence 1
+  is the only record without a predecessor; later records must name a non-nil,
+  non-self predecessor;
+- derivation lineage: root fingerprint, key epoch, scheme version, signed
+  allocator child-index high-water, and the allocation UUID/index/purpose/
+  public key for both claim and refund keys. The high-water may include
+  concurrent allocations but cannot trail either allocation in this record;
 - the claim preimage **hash**, never the preimage;
 - immutable creation evidence: lockup address, locally constructed BIP21,
   payer and merchant amounts, canonical provider response, pinned canonical
@@ -57,11 +61,23 @@ Version 1 contains closed typed fields, with no extension map:
   destination, and the optional append-only emergency-Bitcoin commitment UUID
   plus exact address.
 
-Readers cross-check the provider ID, lockup address, both amounts, pair hash,
-BIP21 address/amount, response digest, and duplicated policy destinations.
+Readers parse the canonical response through the pinned Boltz chain-response
+schema and cross-check the provider ID, lockup address, both amounts, pair hash,
+BIP21 address/amount, response digest, and duplicated policy destinations. They
+also reconstruct both pinned swap-script parsers and the four exact templates:
+every leaf byte digest and Bitcoin `0xc0`/Liquid `0xc4` leaf version, both
+advertised and scripted timeouts, and the claim/refund allocation key roles must
+agree. Both script hashlocks must equal `RIPEMD160(stored preimage SHA256)`.
 Claim/refund allocation identities must be valid compressed secp256k1 keys and
-distinct after x-only normalization; opposite compressed parity does not create
-a distinct Taproot role key.
+all local/provider roles must be distinct after x-only normalization; opposite
+compressed parity does not create a distinct Taproot role key. Covenant or
+other fifth leaves are not part of manifest v1 and fail closed.
+
+The sequence/predecessor fields define one configured append-only witness, not
+a quorum or a second live database. Later export wiring must serialize sequence
+and predecessor allocation at the durability boundary; readers will check
+adjacent records and monotonic high-water across the object set. This format
+package validates only the self-contained invariants of one signed record.
 
 The payload has no preimage, claim private key, refund private key, seed,
 descriptor, xprv, or arbitrary caller-defined field. The canonical provider

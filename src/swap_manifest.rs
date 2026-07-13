@@ -13,6 +13,17 @@
 use std::fmt;
 use std::str::FromStr;
 
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::{hash160, Hash as _};
+use bitcoin::opcodes::all::{
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_EQUALVERIFY, OP_HASH160, OP_SIZE,
+};
+use bitcoin::script::Builder;
+use bitcoin::ScriptBuf;
+use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
+use boltz_client::swaps::boltz::{CreateChainResponse, Leaf, Side};
+use boltz_client::util::secrets::Preimage;
+use boltz_client::{BtcSwapScript, LBtcSwapScript, PublicKey as BoltzPublicKey};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use secp256k1::rand::RngCore;
@@ -35,6 +46,8 @@ const MAX_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_PAIR_QUOTE_BYTES: usize = 64 * 1024;
 const XCHACHA_NONCE_BYTES: usize = 24;
 const POLY1305_TAG_BYTES: usize = 16;
+const BTC_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
+const LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
 
 /// Stable identities used to correlate an external record with a restored
 /// database and the provider's xpub restore output.
@@ -42,6 +55,10 @@ const POLY1305_TAG_BYTES: usize = 16;
 #[serde(deny_unknown_fields)]
 pub struct SwapRestoreIdentityV1 {
     pub manifest_id: Uuid,
+    /// Monotonic position in the single configured append-only witness.
+    pub manifest_sequence: u64,
+    /// `None` only for sequence 1; otherwise the preceding manifest UUID.
+    pub previous_manifest_id: Option<Uuid>,
     pub chain_swap_id: Uuid,
     pub boltz_swap_id: String,
     pub created_at_unix: i64,
@@ -74,6 +91,10 @@ pub struct SwapDerivationLineageV1 {
     pub root_fingerprint: String,
     pub key_epoch: i32,
     pub derivation_scheme_version: i32,
+    /// Allocator high-water observed by this signed record. It may exceed this
+    /// swap's indexes when allocations are concurrent, but may never trail
+    /// either allocation carried by the record.
+    pub allocation_high_water_child_index: i64,
     pub claim: ManifestKeyAllocationV1,
     pub refund: ManifestKeyAllocationV1,
 }
@@ -377,6 +398,18 @@ impl SwapManifestV1 {
 
         let identity = &self.restore_identity;
         require_non_nil("manifest id", identity.manifest_id)?;
+        match (identity.manifest_sequence, identity.previous_manifest_id) {
+            (0, _) => return invalid("manifest sequence must be positive"),
+            (1, None) => {}
+            (1, Some(_)) => return invalid("genesis manifest must not name a predecessor"),
+            (_, None) => return invalid("non-genesis manifest must name its predecessor"),
+            (_, Some(previous)) => {
+                require_non_nil("previous manifest id", previous)?;
+                if previous == identity.manifest_id {
+                    return invalid("manifest must not name itself as its predecessor");
+                }
+            }
+        }
         require_non_nil("chain swap id", identity.chain_swap_id)?;
         if identity.boltz_swap_id.is_empty()
             || identity.boltz_swap_id.len() > 128
@@ -405,6 +438,11 @@ impl SwapManifestV1 {
             || claim_public_key.x_only_public_key().0 == refund_public_key.x_only_public_key().0
         {
             return invalid("claim and refund derivation identities must be distinct");
+        }
+        if lineage.allocation_high_water_child_index
+            < lineage.claim.child_index.max(lineage.refund.child_index)
+        {
+            return invalid("allocation high-water trails a manifest allocation");
         }
 
         let creation = &self.creation;
@@ -455,7 +493,13 @@ impl SwapManifestV1 {
         {
             return invalid("creation response digest does not match canonical bytes");
         }
-        validate_provider_creation_cross_references(self, &provider_response, &pair_quote)?;
+        validate_provider_creation_cross_references(
+            self,
+            &provider_response,
+            &pair_quote,
+            claim_public_key,
+            refund_public_key,
+        )?;
         if creation.btc_timeout_height <= 0 || creation.liquid_timeout_height <= 0 {
             return invalid("swap timeout heights must be positive");
         }
@@ -707,40 +751,242 @@ fn validate_canonical_object(
 
 fn validate_provider_creation_cross_references(
     manifest: &SwapManifestV1,
-    response: &Value,
+    response_value: &Value,
     pair_quote: &Value,
+    claim_public_key: secp256k1::PublicKey,
+    refund_public_key: secp256k1::PublicKey,
 ) -> Result<(), SwapManifestError> {
     let creation = &manifest.creation;
-    if response.get("id").and_then(Value::as_str)
-        != Some(manifest.restore_identity.boltz_swap_id.as_str())
-    {
+    let response: CreateChainResponse =
+        serde_json::from_value(response_value.clone()).map_err(|error| {
+            SwapManifestError::InvalidField(format!(
+                "provider response does not match the pinned chain-response schema: {error}"
+            ))
+        })?;
+    if response.id != manifest.restore_identity.boltz_swap_id {
         return invalid("provider response id does not match restore identity");
     }
-    let lockup = response.get("lockupDetails");
-    if lockup
-        .and_then(|details| details.get("lockupAddress"))
-        .and_then(Value::as_str)
-        != Some(creation.lockup_address.as_str())
-    {
+    if response.lockup_details.lockup_address != creation.lockup_address {
         return invalid("provider lockup address does not match creation evidence");
     }
-    if lockup
-        .and_then(|details| details.get("amount"))
-        .and_then(Value::as_i64)
-        != Some(creation.user_lock_amount_sat)
-    {
+    if u64::try_from(creation.user_lock_amount_sat).ok() != Some(response.lockup_details.amount) {
         return invalid("provider user-lock amount does not match creation evidence");
     }
-    if response
-        .get("claimDetails")
-        .and_then(|details| details.get("amount"))
-        .and_then(Value::as_i64)
-        != Some(creation.server_lock_amount_sat)
-    {
+    if u64::try_from(creation.server_lock_amount_sat).ok() != Some(response.claim_details.amount) {
         return invalid("provider server-lock amount does not match creation evidence");
     }
     if pair_quote.get("hash").and_then(Value::as_str) != Some(creation.pinned_pair_hash.as_str()) {
         return invalid("pair quote hash does not match the pinned pair hash");
+    }
+
+    validate_provider_swap_contract(
+        manifest,
+        &response,
+        BoltzPublicKey::new(claim_public_key),
+        BoltzPublicKey::new(refund_public_key),
+    )?;
+    Ok(())
+}
+
+fn validate_provider_swap_contract(
+    manifest: &SwapManifestV1,
+    response: &CreateChainResponse,
+    claim_public_key: BoltzPublicKey,
+    refund_public_key: BoltzPublicKey,
+) -> Result<(), SwapManifestError> {
+    if response
+        .lockup_details
+        .swap_tree
+        .covenant_claim_leaf
+        .is_some()
+        || response
+            .claim_details
+            .swap_tree
+            .covenant_claim_leaf
+            .is_some()
+    {
+        return invalid("provider response contains an unexpected covenant leaf");
+    }
+
+    let claim_preimage_sha256 = manifest
+        .derivation_lineage
+        .claim
+        .preimage_hash_hex
+        .as_deref()
+        .ok_or_else(|| {
+            SwapManifestError::InvalidField("claim preimage SHA-256 is missing".into())
+        })?;
+    // The pinned client deliberately derives HASH160 from an already-hashed
+    // preimage as RIPEMD160(SHA256(preimage)); no secret preimage is needed.
+    let expected_preimage = Preimage::from_sha256_str(claim_preimage_sha256).map_err(|error| {
+        SwapManifestError::InvalidField(format!(
+            "claim preimage SHA-256 cannot derive a hashlock: {error}"
+        ))
+    })?;
+
+    let bitcoin_script = BtcSwapScript::chain_from_swap_resp(
+        Side::Lockup,
+        response.lockup_details.clone(),
+        refund_public_key,
+    )
+    .map_err(|error| {
+        SwapManifestError::InvalidField(format!("provider Bitcoin swap tree is invalid: {error}"))
+    })?;
+    let liquid_script = LBtcSwapScript::chain_from_swap_resp(
+        Side::Claim,
+        response.claim_details.clone(),
+        claim_public_key,
+    )
+    .map_err(|error| {
+        SwapManifestError::InvalidField(format!("provider Liquid swap tree is invalid: {error}"))
+    })?;
+
+    if bitcoin_script.hashlock.to_byte_array() != expected_preimage.hash160.to_byte_array()
+        || liquid_script.hashlock.to_byte_array() != expected_preimage.hash160.to_byte_array()
+        || bitcoin_script.hashlock.to_byte_array() != liquid_script.hashlock.to_byte_array()
+    {
+        return invalid("Bitcoin and Liquid hashlocks do not match the claim preimage SHA-256");
+    }
+    if bitcoin_script.sender_pubkey != refund_public_key
+        || bitcoin_script.receiver_pubkey != response.lockup_details.server_public_key
+        || liquid_script.sender_pubkey != response.claim_details.server_public_key
+        || liquid_script.receiver_pubkey != claim_public_key
+    {
+        return invalid("claim/refund allocation keys do not match provider script roles");
+    }
+    if !x_only_role_keys_are_distinct(&[
+        &claim_public_key,
+        &refund_public_key,
+        &response.lockup_details.server_public_key,
+        &response.claim_details.server_public_key,
+    ]) {
+        return invalid("provider and allocation x-only role keys must be distinct");
+    }
+
+    let creation = &manifest.creation;
+    let bitcoin_timeout = response.lockup_details.timeout_block_height;
+    let liquid_timeout = response.claim_details.timeout_block_height;
+    if creation.btc_timeout_height != i64::from(bitcoin_timeout) {
+        return invalid("Bitcoin timeout does not match provider response");
+    }
+    if creation.liquid_timeout_height != i64::from(liquid_timeout) {
+        return invalid("Liquid timeout does not match provider response");
+    }
+    if bitcoin_script.locktime.to_consensus_u32() != bitcoin_timeout {
+        return invalid("Bitcoin refund script does not match provider timeout");
+    }
+    if liquid_script.locktime.to_consensus_u32() != liquid_timeout {
+        return invalid("Liquid refund script does not match provider timeout");
+    }
+
+    let bitcoin_claim_script = expected_claim_script(
+        expected_preimage.hash160,
+        &response.lockup_details.server_public_key,
+    );
+    let bitcoin_refund_script = expected_refund_script(&refund_public_key, bitcoin_timeout);
+    let liquid_claim_script = expected_claim_script(expected_preimage.hash160, &claim_public_key);
+    let liquid_refund_script =
+        expected_refund_script(&response.claim_details.server_public_key, liquid_timeout);
+    validate_exact_leaf_cross_reference(
+        "Bitcoin claim",
+        &response.lockup_details.swap_tree.claim_leaf,
+        BTC_TAPSCRIPT_LEAF_VERSION,
+        &bitcoin_claim_script,
+        &creation.btc_claim_script_sha256,
+    )?;
+    validate_exact_leaf_cross_reference(
+        "Bitcoin refund",
+        &response.lockup_details.swap_tree.refund_leaf,
+        BTC_TAPSCRIPT_LEAF_VERSION,
+        &bitcoin_refund_script,
+        &creation.btc_refund_script_sha256,
+    )?;
+    validate_exact_leaf_cross_reference(
+        "Liquid claim",
+        &response.claim_details.swap_tree.claim_leaf,
+        LIQUID_TAPSCRIPT_LEAF_VERSION,
+        &liquid_claim_script,
+        &creation.liquid_claim_script_sha256,
+    )?;
+    validate_exact_leaf_cross_reference(
+        "Liquid refund",
+        &response.claim_details.swap_tree.refund_leaf,
+        LIQUID_TAPSCRIPT_LEAF_VERSION,
+        &liquid_refund_script,
+        &creation.liquid_refund_script_sha256,
+    )?;
+
+    response
+        .validate(
+            &claim_public_key,
+            &refund_public_key,
+            Chain::Bitcoin(BitcoinChain::Bitcoin),
+            Chain::Liquid(LiquidChain::Liquid),
+        )
+        .map_err(|error| {
+            SwapManifestError::InvalidField(format!(
+                "provider response fails pinned Boltz validation: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn x_only_role_keys_are_distinct(keys: &[&BoltzPublicKey]) -> bool {
+    keys.iter().enumerate().all(|(index, key)| {
+        let x_only = key.inner.x_only_public_key().0;
+        keys[index + 1..]
+            .iter()
+            .all(|other| other.inner.x_only_public_key().0 != x_only)
+    })
+}
+
+fn expected_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn expected_refund_script(sender: &BoltzPublicKey, timeout_height: u32) -> ScriptBuf {
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn validate_exact_leaf_cross_reference(
+    name: &str,
+    actual: &Leaf,
+    expected_version: u8,
+    expected_script: &ScriptBuf,
+    stored_sha256: &str,
+) -> Result<(), SwapManifestError> {
+    if actual.version != expected_version {
+        return invalid(format!(
+            "{name} leaf version is {}, expected {expected_version}",
+            actual.version
+        ));
+    }
+    let actual_script = hex::decode(&actual.output).map_err(|error| {
+        SwapManifestError::InvalidField(format!("{name} leaf is not hex: {error}"))
+    })?;
+    if actual_script != expected_script.as_bytes() {
+        return invalid(format!(
+            "{name} leaf does not match the exact expected template"
+        ));
+    }
+    if sha256_hex(&actual_script) != stored_sha256 {
+        return invalid(format!(
+            "{name} leaf digest does not match creation evidence"
+        ));
     }
     Ok(())
 }
@@ -850,6 +1096,8 @@ fn invalid<T>(reason: impl Into<String>) -> Result<T, SwapManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boltz_client::swaps::boltz::{ChainSwapDetails, SwapTree, SwapType};
+    use boltz_client::{ZKKeyPair, ZKSecp256k1};
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use serde_json::json;
 
@@ -867,59 +1115,202 @@ mod tests {
         Keypair::from_secret_key(&Secp256k1::new(), &secret)
     }
 
+    fn real_shaped_provider_fixture() -> (
+        CreateChainResponse,
+        Preimage,
+        BoltzPublicKey,
+        BoltzPublicKey,
+    ) {
+        const BLINDING_KEY: &str =
+            "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+        let preimage = Preimage::from_str(&"11".repeat(32)).unwrap();
+        let claim_public_key = BoltzPublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let refund_public_key = BoltzPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        let bitcoin_server_key = BoltzPublicKey::from_str(
+            "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+        )
+        .unwrap();
+        let liquid_server_key = BoltzPublicKey::from_str(
+            "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+        )
+        .unwrap();
+        let bitcoin_timeout = 958_033;
+        let liquid_timeout = 3_972_215;
+
+        let bitcoin_tree = SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(expected_claim_script(preimage.hash160, &bitcoin_server_key)),
+                version: BTC_TAPSCRIPT_LEAF_VERSION,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(expected_refund_script(&refund_public_key, bitcoin_timeout)),
+                version: BTC_TAPSCRIPT_LEAF_VERSION,
+            },
+            covenant_claim_leaf: None,
+        };
+        let liquid_tree = SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(expected_claim_script(preimage.hash160, &claim_public_key)),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(expected_refund_script(&liquid_server_key, liquid_timeout)),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            covenant_claim_leaf: None,
+        };
+        let bitcoin_address = BtcSwapScript {
+            swap_type: SwapType::Chain,
+            side: Some(Side::Lockup),
+            funding_addrs: None,
+            hashlock: preimage.hash160,
+            receiver_pubkey: bitcoin_server_key,
+            locktime: LockTime::from_consensus(bitcoin_timeout),
+            sender_pubkey: refund_public_key,
+        }
+        .to_address(BitcoinChain::Bitcoin)
+        .unwrap()
+        .to_string();
+        let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+        let liquid_address = LBtcSwapScript {
+            swap_type: SwapType::Chain,
+            side: Some(Side::Claim),
+            funding_addrs: None,
+            hashlock: preimage.hash160,
+            receiver_pubkey: claim_public_key,
+            locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+            sender_pubkey: liquid_server_key,
+            blinding_key,
+        }
+        .to_address(LiquidChain::Liquid)
+        .unwrap()
+        .to_string();
+
+        (
+            CreateChainResponse {
+                id: "ManifestRealShape01".into(),
+                claim_details: ChainSwapDetails {
+                    swap_tree: liquid_tree,
+                    lockup_address: liquid_address,
+                    server_public_key: liquid_server_key,
+                    timeout_block_height: liquid_timeout,
+                    amount: 25_000,
+                    blinding_key: Some(BLINDING_KEY.into()),
+                    refund_address: None,
+                    claim_address: None,
+                    bip21: None,
+                },
+                lockup_details: ChainSwapDetails {
+                    swap_tree: bitcoin_tree,
+                    lockup_address: bitcoin_address,
+                    server_public_key: bitcoin_server_key,
+                    timeout_block_height: bitcoin_timeout,
+                    amount: 25_431,
+                    blinding_key: None,
+                    refund_address: None,
+                    claim_address: None,
+                    bip21: Some("bitcoin:provider-evidence-only?amount=999".into()),
+                },
+            },
+            preimage,
+            claim_public_key,
+            refund_public_key,
+        )
+    }
+
+    fn leaf_sha256(leaf: &Leaf) -> String {
+        sha256_hex(&hex::decode(&leaf.output).unwrap())
+    }
+
+    fn provider_response(manifest: &SwapManifestV1) -> CreateChainResponse {
+        serde_json::from_str(&manifest.creation.canonical_provider_response_json).unwrap()
+    }
+
+    fn replace_provider_response(manifest: &mut SwapManifestV1, response: &CreateChainResponse) {
+        let canonical = canonical_json(response).unwrap();
+        manifest.creation.creation_response_sha256 = sha256_hex(canonical.as_bytes());
+        manifest.creation.canonical_provider_response_json = canonical;
+    }
+
+    fn assert_invalid(manifest: &SwapManifestV1, expected_reason: &str) {
+        let error = manifest.validate().unwrap_err();
+        assert!(
+            error.to_string().contains(expected_reason),
+            "expected {expected_reason:?}, got {error}"
+        );
+    }
+
     fn fixture() -> SwapManifestV1 {
-        let canonical_response = r#"{"claimDetails":{"amount":10000},"id":"BoltzRestore01","lockupDetails":{"amount":12000,"lockupAddress":"bc1qmanifestlockup000000000000000000000000000"}}"#;
+        let (provider_response, preimage, claim_public_key, refund_public_key) =
+            real_shaped_provider_fixture();
+        let canonical_response = canonical_json(&provider_response).unwrap();
+        let lockup_address = provider_response.lockup_details.lockup_address.clone();
         let liquid_destination = "lq1qqmanifestdestination000000000000000000000000000000000000000";
         let emergency_address = "bc1qmanifestrecovery0000000000000000000000000";
         SwapManifestV1::new(
             SwapRestoreIdentityV1 {
                 manifest_id: Uuid::from_u128(1),
+                manifest_sequence: 2,
+                previous_manifest_id: Some(Uuid::from_u128(7)),
                 chain_swap_id: Uuid::from_u128(2),
-                boltz_swap_id: "BoltzRestore01".into(),
+                boltz_swap_id: provider_response.id.clone(),
                 created_at_unix: 1_784_000_000,
             },
             SwapDerivationLineageV1 {
                 root_fingerprint: "0011223344556677".into(),
                 key_epoch: 1,
                 derivation_scheme_version: 1,
+                allocation_high_water_child_index: 431,
                 claim: ManifestKeyAllocationV1 {
                     allocation_id: Uuid::from_u128(3),
                     child_index: 430,
                     purpose: ManifestKeyPurposeV1::ChainClaim,
-                    public_key_hex:
-                        "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
-                            .into(),
-                    preimage_hash_hex: Some("44".repeat(32)),
+                    public_key_hex: claim_public_key.to_string(),
+                    preimage_hash_hex: Some(preimage.sha256.to_string()),
                 },
                 refund: ManifestKeyAllocationV1 {
                     allocation_id: Uuid::from_u128(4),
                     child_index: 431,
                     purpose: ManifestKeyPurposeV1::ChainRefund,
-                    public_key_hex:
-                        "02466d7fcae563e5cb09a0d1870bb5803448046179f4104a57d43f1c86f8d1f35a"
-                            .into(),
+                    public_key_hex: refund_public_key.to_string(),
                     preimage_hash_hex: None,
                 },
             },
             ImmutableChainSwapCreationV1 {
-                lockup_address: "bc1qmanifestlockup000000000000000000000000000".into(),
-                lockup_bip21: concat!(
-                    "bitcoin:bc1qmanifestlockup000000000000000000000000000?",
-                    "amount=0.00012000&label=Send%20to%20L-BTC%20address"
-                )
-                .into(),
-                user_lock_amount_sat: 12_000,
-                server_lock_amount_sat: 10_000,
-                canonical_provider_response_json: canonical_response.into(),
+                lockup_address: lockup_address.clone(),
+                lockup_bip21: format!(
+                    "bitcoin:{lockup_address}?amount=0.00025431&label=Send%20to%20L-BTC%20address"
+                ),
+                user_lock_amount_sat: 25_431,
+                server_lock_amount_sat: 25_000,
+                canonical_provider_response_json: canonical_response.clone(),
                 pinned_pair_hash: "22".repeat(32),
                 canonical_pair_quote_json: r#"{"hash":"2222222222222222222222222222222222222222222222222222222222222222","rate":1}"#.into(),
                 creation_response_sha256: sha256_hex(canonical_response.as_bytes()),
-                btc_claim_script_sha256: "55".repeat(32),
-                btc_refund_script_sha256: "66".repeat(32),
-                liquid_claim_script_sha256: "77".repeat(32),
-                liquid_refund_script_sha256: "88".repeat(32),
-                btc_timeout_height: 900_000,
-                liquid_timeout_height: 3_500_000,
+                btc_claim_script_sha256: leaf_sha256(
+                    &provider_response.lockup_details.swap_tree.claim_leaf,
+                ),
+                btc_refund_script_sha256: leaf_sha256(
+                    &provider_response.lockup_details.swap_tree.refund_leaf,
+                ),
+                liquid_claim_script_sha256: leaf_sha256(
+                    &provider_response.claim_details.swap_tree.claim_leaf,
+                ),
+                liquid_refund_script_sha256: leaf_sha256(
+                    &provider_response.claim_details.swap_tree.refund_leaf,
+                ),
+                btc_timeout_height: i64::from(
+                    provider_response.lockup_details.timeout_block_height,
+                ),
+                liquid_timeout_height: i64::from(
+                    provider_response.claim_details.timeout_block_height,
+                ),
                 btc_network: "bitcoin".into(),
                 liquid_network: "liquid".into(),
                 liquid_asset_id: "99".repeat(32),
@@ -973,6 +1364,327 @@ mod tests {
     }
 
     #[test]
+    fn real_shaped_provider_response_cross_references_are_accepted() {
+        let manifest = fixture();
+        let response = provider_response(&manifest);
+
+        manifest.validate().unwrap();
+        assert!(response.lockup_details.lockup_address.starts_with("bc1p"));
+        assert!(response.claim_details.lockup_address.starts_with("lq1p"));
+        assert_eq!(
+            response.lockup_details.swap_tree.claim_leaf.version,
+            BTC_TAPSCRIPT_LEAF_VERSION
+        );
+        assert_eq!(
+            response.claim_details.swap_tree.claim_leaf.version,
+            LIQUID_TAPSCRIPT_LEAF_VERSION
+        );
+    }
+
+    #[test]
+    fn genesis_manifest_round_trips_without_a_predecessor() {
+        let mut manifest = fixture();
+        manifest.restore_identity.manifest_sequence = 1;
+        manifest.restore_identity.previous_manifest_id = None;
+        let signer = signing_key();
+        let encoded = manifest
+            .seal_with_nonce("manifest-key-2026-01", &ENCRYPTION_KEY, &signer, &NONCE)
+            .unwrap();
+
+        let restored = SwapManifestV1::open(
+            &encoded,
+            "manifest-key-2026-01",
+            &ENCRYPTION_KEY,
+            &signer_public_key(&signer),
+        )
+        .unwrap();
+        assert_eq!(restored.restore_identity.manifest_sequence, 1);
+        assert_eq!(restored.restore_identity.previous_manifest_id, None);
+    }
+
+    #[test]
+    fn manifest_chain_linkage_is_fail_closed() {
+        let mut zero_sequence = fixture();
+        zero_sequence.restore_identity.manifest_sequence = 0;
+        assert_invalid(&zero_sequence, "manifest sequence must be positive");
+
+        let mut genesis_with_previous = fixture();
+        genesis_with_previous.restore_identity.manifest_sequence = 1;
+        assert_invalid(
+            &genesis_with_previous,
+            "genesis manifest must not name a predecessor",
+        );
+
+        let mut non_genesis_without_previous = fixture();
+        non_genesis_without_previous
+            .restore_identity
+            .previous_manifest_id = None;
+        assert_invalid(
+            &non_genesis_without_previous,
+            "non-genesis manifest must name its predecessor",
+        );
+
+        let mut nil_previous = fixture();
+        nil_previous.restore_identity.previous_manifest_id = Some(Uuid::nil());
+        assert_invalid(&nil_previous, "previous manifest id must not be nil");
+
+        let mut self_previous = fixture();
+        self_previous.restore_identity.previous_manifest_id =
+            Some(self_previous.restore_identity.manifest_id);
+        assert_invalid(
+            &self_previous,
+            "manifest must not name itself as its predecessor",
+        );
+    }
+
+    #[test]
+    fn signed_allocation_high_water_covers_both_allocations() {
+        let mut trailing = fixture();
+        trailing
+            .derivation_lineage
+            .allocation_high_water_child_index = 430;
+        assert_invalid(&trailing, "allocation high-water trails");
+
+        let mut concurrent = fixture();
+        concurrent
+            .derivation_lineage
+            .allocation_high_water_child_index = 450;
+        concurrent.validate().unwrap();
+    }
+
+    #[test]
+    fn every_stored_leaf_digest_must_match_its_provider_leaf() {
+        for (index, name) in [
+            "Bitcoin claim",
+            "Bitcoin refund",
+            "Liquid claim",
+            "Liquid refund",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut manifest = fixture();
+            match index {
+                0 => manifest.creation.btc_claim_script_sha256 = "00".repeat(32),
+                1 => manifest.creation.btc_refund_script_sha256 = "00".repeat(32),
+                2 => manifest.creation.liquid_claim_script_sha256 = "00".repeat(32),
+                3 => manifest.creation.liquid_refund_script_sha256 = "00".repeat(32),
+                _ => unreachable!(),
+            }
+            assert_invalid(&manifest, &format!("{name} leaf digest"));
+        }
+    }
+
+    #[test]
+    fn every_provider_leaf_version_is_pinned() {
+        for (index, name) in [
+            "Bitcoin claim",
+            "Bitcoin refund",
+            "Liquid claim",
+            "Liquid refund",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut manifest = fixture();
+            let mut response = provider_response(&manifest);
+            match index {
+                0 => response.lockup_details.swap_tree.claim_leaf.version ^= 1,
+                1 => response.lockup_details.swap_tree.refund_leaf.version ^= 1,
+                2 => response.claim_details.swap_tree.claim_leaf.version ^= 1,
+                3 => response.claim_details.swap_tree.refund_leaf.version ^= 1,
+                _ => unreachable!(),
+            }
+            replace_provider_response(&mut manifest, &response);
+            assert_invalid(&manifest, &format!("{name} leaf version"));
+        }
+    }
+
+    #[test]
+    fn stored_timeout_fields_must_match_the_provider_response() {
+        let mut bitcoin = fixture();
+        bitcoin.creation.btc_timeout_height += 1;
+        assert_invalid(&bitcoin, "Bitcoin timeout does not match");
+
+        let mut liquid = fixture();
+        liquid.creation.liquid_timeout_height += 1;
+        assert_invalid(&liquid, "Liquid timeout does not match");
+    }
+
+    #[test]
+    fn advertised_timeouts_must_match_both_refund_scripts() {
+        let mut bitcoin = fixture();
+        let mut bitcoin_response = provider_response(&bitcoin);
+        bitcoin_response.lockup_details.timeout_block_height += 1;
+        bitcoin.creation.btc_timeout_height += 1;
+        replace_provider_response(&mut bitcoin, &bitcoin_response);
+        assert_invalid(
+            &bitcoin,
+            "Bitcoin refund script does not match provider timeout",
+        );
+
+        let mut liquid = fixture();
+        let mut liquid_response = provider_response(&liquid);
+        liquid_response.claim_details.timeout_block_height += 1;
+        liquid.creation.liquid_timeout_height += 1;
+        replace_provider_response(&mut liquid, &liquid_response);
+        assert_invalid(
+            &liquid,
+            "Liquid refund script does not match provider timeout",
+        );
+    }
+
+    #[test]
+    fn allocation_public_keys_must_match_their_exact_script_roles() {
+        let alternate_claim = secp256k1::PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &secp256k1::SecretKey::from_slice(&[0x13; 32]).unwrap(),
+        );
+        let alternate_refund = secp256k1::PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &secp256k1::SecretKey::from_slice(&[0x14; 32]).unwrap(),
+        );
+
+        let mut claim = fixture();
+        claim.derivation_lineage.claim.public_key_hex = alternate_claim.to_string();
+        assert_invalid(&claim, "Liquid claim leaf does not match");
+
+        let mut refund = fixture();
+        refund.derivation_lineage.refund.public_key_hex = alternate_refund.to_string();
+        assert_invalid(&refund, "Bitcoin refund leaf does not match");
+    }
+
+    #[test]
+    fn allocation_purposes_must_match_claim_and_refund_roles() {
+        let mut claim = fixture();
+        claim.derivation_lineage.claim.purpose = ManifestKeyPurposeV1::ChainRefund;
+        assert_invalid(&claim, "derivation allocation purpose is incorrect");
+
+        let mut refund = fixture();
+        refund.derivation_lineage.refund.purpose = ManifestKeyPurposeV1::ChainClaim;
+        assert_invalid(&refund, "derivation allocation purpose is incorrect");
+    }
+
+    #[test]
+    fn stored_preimage_sha256_must_derive_both_provider_hashlocks() {
+        let mut manifest = fixture();
+        manifest.derivation_lineage.claim.preimage_hash_hex = Some("42".repeat(32));
+        assert_invalid(
+            &manifest,
+            "hashlocks do not match the claim preimage SHA-256",
+        );
+    }
+
+    #[test]
+    fn each_provider_leaf_must_match_its_exact_template_even_if_rehashed() {
+        for (index, name) in [
+            "Bitcoin claim",
+            "Bitcoin refund",
+            "Liquid claim",
+            "Liquid refund",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut manifest = fixture();
+            let mut response = provider_response(&manifest);
+            let digest = match index {
+                0 => {
+                    response
+                        .lockup_details
+                        .swap_tree
+                        .claim_leaf
+                        .output
+                        .push_str("61");
+                    leaf_sha256(&response.lockup_details.swap_tree.claim_leaf)
+                }
+                1 => {
+                    response
+                        .lockup_details
+                        .swap_tree
+                        .refund_leaf
+                        .output
+                        .push_str("61");
+                    leaf_sha256(&response.lockup_details.swap_tree.refund_leaf)
+                }
+                2 => {
+                    response
+                        .claim_details
+                        .swap_tree
+                        .claim_leaf
+                        .output
+                        .push_str("61");
+                    leaf_sha256(&response.claim_details.swap_tree.claim_leaf)
+                }
+                3 => {
+                    response
+                        .claim_details
+                        .swap_tree
+                        .refund_leaf
+                        .output
+                        .push_str("61");
+                    leaf_sha256(&response.claim_details.swap_tree.refund_leaf)
+                }
+                _ => unreachable!(),
+            };
+            match index {
+                0 => manifest.creation.btc_claim_script_sha256 = digest,
+                1 => manifest.creation.btc_refund_script_sha256 = digest,
+                2 => manifest.creation.liquid_claim_script_sha256 = digest,
+                3 => manifest.creation.liquid_refund_script_sha256 = digest,
+                _ => unreachable!(),
+            }
+            replace_provider_response(&mut manifest, &response);
+            assert_invalid(
+                &manifest,
+                &format!("{name} leaf does not match the exact expected template"),
+            );
+        }
+    }
+
+    #[test]
+    fn each_provider_chain_hashlock_must_match_the_stored_preimage_sha256() {
+        for liquid in [false, true] {
+            let mut manifest = fixture();
+            let expected = Preimage::from_sha256_str(
+                manifest
+                    .derivation_lineage
+                    .claim
+                    .preimage_hash_hex
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap()
+            .hash160
+            .to_string();
+            let mut response = provider_response(&manifest);
+            let leaf = if liquid {
+                &mut response.claim_details.swap_tree.claim_leaf
+            } else {
+                &mut response.lockup_details.swap_tree.claim_leaf
+            };
+            leaf.output = leaf.output.replacen(&expected, &"00".repeat(20), 1);
+            replace_provider_response(&mut manifest, &response);
+
+            assert_invalid(
+                &manifest,
+                "hashlocks do not match the claim preimage SHA-256",
+            );
+        }
+    }
+
+    #[test]
+    fn unexpected_covenant_leaf_is_not_a_fifth_manifest_script() {
+        let mut manifest = fixture();
+        let mut response = provider_response(&manifest);
+        response.claim_details.swap_tree.covenant_claim_leaf =
+            Some(response.claim_details.swap_tree.claim_leaf.clone());
+        replace_provider_response(&mut manifest, &response);
+
+        assert_invalid(&manifest, "unexpected covenant leaf");
+    }
+
+    #[test]
     fn fixed_inputs_have_deterministic_canonical_encoding() {
         let first = seal_fixture();
         let second = seal_fixture();
@@ -981,7 +1693,7 @@ mod tests {
         assert!(!first.contains(char::is_whitespace));
         assert_eq!(
             sha256_hex(first.as_bytes()),
-            "419c6e87251a6b0924cdbf8175efa5097ea5daf4ce61874ba1cb020395490513"
+            "0b60637df653cd51b14e4e4c3b59f7aae5e5dad973e40d8eee0617c149ed9ac5"
         );
     }
 
@@ -1203,7 +1915,7 @@ mod tests {
     fn manifest_rejects_opposite_parity_for_one_taproot_role_key() {
         let mut manifest = fixture();
         manifest.derivation_lineage.refund.public_key_hex =
-            "024f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa".into();
+            "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
 
         let error = manifest
             .seal_with_nonce(
@@ -1260,6 +1972,38 @@ mod tests {
                 "merchant_policy",
                 "restore_identity",
                 "version",
+            ]
+        );
+        assert_eq!(
+            object["restore_identity"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "boltz_swap_id",
+                "chain_swap_id",
+                "created_at_unix",
+                "manifest_id",
+                "manifest_sequence",
+                "previous_manifest_id",
+            ]
+        );
+        assert_eq!(
+            object["derivation_lineage"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "allocation_high_water_child_index",
+                "claim",
+                "derivation_scheme_version",
+                "key_epoch",
+                "refund",
+                "root_fingerprint",
             ]
         );
         let encoded = value.to_string();
