@@ -31,9 +31,7 @@ use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
-use crate::fee_decision_record::{
-    FeeConstructionPurpose, FeeDecisionRecord,
-};
+use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
 use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy};
 use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
@@ -2173,7 +2171,8 @@ async fn claim_chain_swap_inner(
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
-        let fee_record = fee_record.expect("unjournaled chain claims require fee decision metadata");
+        let fee_record =
+            fee_record.expect("unjournaled chain claims require fee decision metadata");
         let fee_decision = LiquidBuilderFeeDecision::from(
             fee_decision.expect("unjournaled chain claims require a policy decision"),
         );
@@ -2944,17 +2943,18 @@ fn liquid_fee_record_for_compatibility_seam(
     purpose: FeeConstructionPurpose,
     decision: &LiquidFeeDecision,
 ) -> Result<FeeDecisionRecord, AppError> {
-    let evaluated_at_unix = match decision.freshness() {
-        FeeFreshness::Fresh { age_secs, .. } => decision
-            .observed_at_unix()
-            .checked_add(age_secs)
-            .ok_or_else(|| AppError::ClaimError("fee decision clock overflow".into()))?,
-        _ => {
-            return Err(AppError::ClaimError(
-                LIQUID_FEE_DECISION_PENDING_REASON.into(),
-            ))
-        }
-    };
+    let evaluated_at_unix =
+        match decision.freshness() {
+            FeeFreshness::Fresh { age_secs, .. } => decision
+                .observed_at_unix()
+                .checked_add(age_secs)
+                .ok_or_else(|| AppError::ClaimError("fee decision clock overflow".into()))?,
+            _ => {
+                return Err(AppError::ClaimError(
+                    LIQUID_FEE_DECISION_PENDING_REASON.into(),
+                ))
+            }
+        };
     FeeDecisionRecord::from_liquid(
         purpose,
         decision,

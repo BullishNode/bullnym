@@ -24,8 +24,8 @@ pub enum FeeQuoteTarget {
 impl FeeQuoteTarget {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::BitcoinFastestFee => "bitcoin_fastest_fee",
-            Self::LiquidConfirmationTargetOne => "liquid_confirmation_target_1",
+            Self::BitcoinFastestFee => "fastestFee",
+            Self::LiquidConfirmationTargetOne => "1",
         }
     }
 }
@@ -525,8 +525,8 @@ fn parse_source(value: &str) -> Result<FeeObservationSource, FeeObservationRepos
 
 fn parse_target(value: &str) -> Result<FeeQuoteTarget, FeeObservationRepositoryError> {
     match value {
-        "bitcoin_fastest_fee" => Ok(FeeQuoteTarget::BitcoinFastestFee),
-        "liquid_confirmation_target_1" => Ok(FeeQuoteTarget::LiquidConfirmationTargetOne),
+        "fastestFee" => Ok(FeeQuoteTarget::BitcoinFastestFee),
+        "1" => Ok(FeeQuoteTarget::LiquidConfirmationTargetOne),
         _ => Err(FeeObservationRepositoryError::InvalidStoredText { field: "target" }),
     }
 }

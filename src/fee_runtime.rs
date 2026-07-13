@@ -9,22 +9,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::admission::MoneyAdmission;
 use crate::config::FeePolicyConfig;
-use crate::current_fee_snapshot::{
-    CurrentBitcoinFee, CurrentFeeSnapshot, CurrentLiquidFee,
-};
+use crate::current_fee_snapshot::{CurrentBitcoinFee, CurrentFeeSnapshot, CurrentLiquidFee};
+use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
 use crate::fee_policy::{
     BitcoinFeeDecision, BitcoinFeePolicy, FeeObservationSource, FeePolicyError, FeeRail,
     LiquidFeeDecision, LiquidFeePolicy,
 };
-use crate::fee_decision_record::{
-    FeeConstructionPurpose, FeeDecisionRecord,
-};
 use crate::fee_refresh_cycle::{
     FeeRailRefreshOutcome, FeeRefreshClockError, FeeRefreshCycle, FeeRefreshCycleOutcome,
 };
-use crate::runtime_fee_sources::{
-    RuntimeFeeSourceProjectionError, RuntimeFeeSourceSets,
-};
+use crate::runtime_fee_sources::{RuntimeFeeSourceProjectionError, RuntimeFeeSourceSets};
 
 /// Persistence boundary owned by the runtime coordinator. Implementations must
 /// restore only validated, same-rail LKG evidence and must durably persist an
@@ -238,8 +232,8 @@ impl FeeRuntime {
         config: &FeePolicyConfig,
         persistence: Arc<dyn FeeRuntimePersistence>,
     ) -> Result<Self, FeeRuntimeBuildError> {
-        let source_sets = RuntimeFeeSourceSets::from_config(config)
-            .map_err(FeeRuntimeBuildError::Sources)?;
+        let source_sets =
+            RuntimeFeeSourceSets::from_config(config).map_err(FeeRuntimeBuildError::Sources)?;
         let bitcoin_settings = source_sets.bitcoin_settings();
         let liquid_settings = source_sets.liquid_settings();
         let bitcoin_policy = BitcoinFeePolicy::new(
@@ -297,9 +291,11 @@ impl FeeRuntime {
         );
         let refresh = match now {
             Ok(now_unix) => cycle.refresh_once(|_| Ok(now_unix)).await,
-            Err(_) => cycle
-                .refresh_once(|_| Err(FeeRefreshClockError::Unavailable))
-                .await,
+            Err(_) => {
+                cycle
+                    .refresh_once(|_| Err(FeeRefreshClockError::Unavailable))
+                    .await
+            }
         };
 
         let (bitcoin_persistence, liquid_persistence) = match now {
@@ -353,17 +349,10 @@ impl FeeRuntime {
         purpose: FeeConstructionPurpose,
     ) -> Result<(BitcoinFeeDecision, FeeDecisionRecord), FeeRuntimeUnavailable> {
         let now_unix = unix_now()?;
-        let decision = self
-            .bitcoin_current_at(now_unix)?
-            .decision()
-            .clone();
-        let record = FeeDecisionRecord::from_bitcoin(
-            purpose,
-            &decision,
-            &self.bitcoin_policy,
-            now_unix,
-        )
-        .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
+        let decision = self.bitcoin_current_at(now_unix)?.decision().clone();
+        let record =
+            FeeDecisionRecord::from_bitcoin(purpose, &decision, &self.bitcoin_policy, now_unix)
+                .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
         Ok((decision, record))
     }
 
@@ -373,17 +362,10 @@ impl FeeRuntime {
         purpose: FeeConstructionPurpose,
     ) -> Result<(LiquidFeeDecision, FeeDecisionRecord), FeeRuntimeUnavailable> {
         let now_unix = unix_now()?;
-        let decision = self
-            .liquid_current_at(now_unix)?
-            .decision()
-            .clone();
-        let record = FeeDecisionRecord::from_liquid(
-            purpose,
-            &decision,
-            &self.liquid_policy,
-            now_unix,
-        )
-        .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
+        let decision = self.liquid_current_at(now_unix)?.decision().clone();
+        let record =
+            FeeDecisionRecord::from_liquid(purpose, &decision, &self.liquid_policy, now_unix)
+                .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
         Ok((decision, record))
     }
 
@@ -471,18 +453,18 @@ impl FeeRuntime {
             &self.snapshot,
         );
         let outcome = match (rail, now) {
-            (FeeRail::Bitcoin, Ok(now_unix)) => {
-                cycle.refresh_bitcoin_once(|_| Ok(now_unix)).await
+            (FeeRail::Bitcoin, Ok(now_unix)) => cycle.refresh_bitcoin_once(|_| Ok(now_unix)).await,
+            (FeeRail::Liquid, Ok(now_unix)) => cycle.refresh_liquid_once(|_| Ok(now_unix)).await,
+            (FeeRail::Bitcoin, Err(_)) => {
+                cycle
+                    .refresh_bitcoin_once(|_| Err(FeeRefreshClockError::Unavailable))
+                    .await
             }
-            (FeeRail::Liquid, Ok(now_unix)) => {
-                cycle.refresh_liquid_once(|_| Ok(now_unix)).await
+            (FeeRail::Liquid, Err(_)) => {
+                cycle
+                    .refresh_liquid_once(|_| Err(FeeRefreshClockError::Unavailable))
+                    .await
             }
-            (FeeRail::Bitcoin, Err(_)) => cycle
-                .refresh_bitcoin_once(|_| Err(FeeRefreshClockError::Unavailable))
-                .await,
-            (FeeRail::Liquid, Err(_)) => cycle
-                .refresh_liquid_once(|_| Err(FeeRefreshClockError::Unavailable))
-                .await,
         };
         let persistence = match (rail, now) {
             (FeeRail::Bitcoin, Ok(now_unix)) => {
@@ -532,30 +514,28 @@ impl FeeRuntime {
             return FeeRailPersistenceOutcome::NotUpdated;
         }
         let Ok(current) = self.snapshot.read_bitcoin(&self.bitcoin_policy, now_unix) else {
-            self.bitcoin_persisted_generation.store(0, Ordering::Release);
+            self.bitcoin_persisted_generation
+                .store(0, Ordering::Release);
             let _ = self.snapshot.clear_bitcoin();
             return FeeRailPersistenceOutcome::Failed;
         };
         let decision = current.decision().clone();
         let disposition = match self
             .persistence
-            .persist_accepted_bitcoin(
-                &self.snapshot,
-                &current,
-                &self.bitcoin_policy,
-                now_unix,
-            )
+            .persist_accepted_bitcoin(&self.snapshot, &current, &self.bitcoin_policy, now_unix)
             .await
         {
             Ok(disposition) => disposition,
             Err(_) => {
-                self.bitcoin_persisted_generation.store(0, Ordering::Release);
+                self.bitcoin_persisted_generation
+                    .store(0, Ordering::Release);
                 let _ = self.snapshot.clear_bitcoin();
                 return FeeRailPersistenceOutcome::Failed;
             }
         };
         if disposition == FeePersistenceDisposition::RestoredAuthoritative {
-            self.bitcoin_persisted_generation.store(0, Ordering::Release);
+            self.bitcoin_persisted_generation
+                .store(0, Ordering::Release);
             if self.snapshot.clear_bitcoin().is_err() {
                 return FeeRailPersistenceOutcome::Failed;
             }
@@ -563,8 +543,7 @@ impl FeeRuntime {
                 .snapshot
                 .read_bitcoin(&self.bitcoin_policy, now_unix)
                 .is_ok_and(|current| {
-                    current.decision().source()
-                        == FeeObservationSource::BitcoinLastKnownGood
+                    current.decision().source() == FeeObservationSource::BitcoinLastKnownGood
                 });
             self.bitcoin_lkg_authorized
                 .store(restored, Ordering::Release);
@@ -575,12 +554,14 @@ impl FeeRuntime {
             };
         }
         let Ok(current) = self.snapshot.read_bitcoin(&self.bitcoin_policy, now_unix) else {
-            self.bitcoin_persisted_generation.store(0, Ordering::Release);
+            self.bitcoin_persisted_generation
+                .store(0, Ordering::Release);
             let _ = self.snapshot.clear_bitcoin();
             return FeeRailPersistenceOutcome::Failed;
         };
         if current.decision() != &decision {
-            self.bitcoin_persisted_generation.store(0, Ordering::Release);
+            self.bitcoin_persisted_generation
+                .store(0, Ordering::Release);
             let _ = self.snapshot.clear_bitcoin();
             return FeeRailPersistenceOutcome::Failed;
         }
@@ -606,12 +587,7 @@ impl FeeRuntime {
         let decision = current.decision().clone();
         let disposition = match self
             .persistence
-            .persist_accepted_liquid(
-                &self.snapshot,
-                &current,
-                &self.liquid_policy,
-                now_unix,
-            )
+            .persist_accepted_liquid(&self.snapshot, &current, &self.liquid_policy, now_unix)
             .await
         {
             Ok(disposition) => disposition,
@@ -630,8 +606,7 @@ impl FeeRuntime {
                 .snapshot
                 .read_liquid(&self.liquid_policy, now_unix)
                 .is_ok_and(|current| {
-                    current.decision().source()
-                        == FeeObservationSource::LiquidLastKnownGood
+                    current.decision().source() == FeeObservationSource::LiquidLastKnownGood
                 });
             self.liquid_lkg_authorized
                 .store(restored, Ordering::Release);
@@ -688,10 +663,7 @@ impl FeeRuntime {
         }
     }
 
-    fn liquid_current_at(
-        &self,
-        now_unix: u64,
-    ) -> Result<CurrentLiquidFee, FeeRuntimeUnavailable> {
+    fn liquid_current_at(&self, now_unix: u64) -> Result<CurrentLiquidFee, FeeRuntimeUnavailable> {
         let current = self
             .snapshot
             .read_liquid(&self.liquid_policy, now_unix)
@@ -766,15 +738,13 @@ mod tests {
             ))
             .unwrap();
 
-        runtime.bitcoin_persisted_generation.store(
-            bitcoin_generation.as_u64(),
-            Ordering::Release,
-        );
+        runtime
+            .bitcoin_persisted_generation
+            .store(bitcoin_generation.as_u64(), Ordering::Release);
         assert!(!runtime.readiness_at(now).ready());
-        runtime.liquid_persisted_generation.store(
-            liquid_generation.as_u64(),
-            Ordering::Release,
-        );
+        runtime
+            .liquid_persisted_generation
+            .store(liquid_generation.as_u64(), Ordering::Release);
         assert!(runtime.readiness_at(now).ready());
 
         runtime.snapshot.clear_liquid().unwrap();
@@ -793,10 +763,9 @@ mod tests {
                 FeeProvenance::new("bitcoin-test").unwrap(),
             ))
             .unwrap();
-        runtime.bitcoin_persisted_generation.store(
-            bitcoin_generation.as_u64(),
-            Ordering::Release,
-        );
+        runtime
+            .bitcoin_persisted_generation
+            .store(bitcoin_generation.as_u64(), Ordering::Release);
 
         assert!(runtime.bitcoin_current_at(observed_at).is_ok());
         assert!(runtime
