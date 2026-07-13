@@ -21,6 +21,7 @@ fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
         liquid_asset_id: elements::AssetId::LIQUID_BTC.to_string(),
         merchant_liquid_destination: "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg".into(),
         merchant_emergency_btc_address: None,
+        recovery_address_commitment_id: None,
     }
 }
 

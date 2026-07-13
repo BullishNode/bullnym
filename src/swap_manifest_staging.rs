@@ -285,8 +285,8 @@ pub fn stage_swap_manifest_v1(
             field: "merchant_emergency_btc_address",
         });
     }
-    if merchant_policy.emergency_bitcoin_commitment_id.is_some()
-        != creation_terms.merchant_emergency_btc_address.is_some()
+    if merchant_policy.emergency_bitcoin_commitment_id
+        != creation_terms.recovery_address_commitment_id
     {
         return Err(ManifestStagingError::MerchantPolicyMismatch {
             field: "emergency_bitcoin_commitment_id",
@@ -666,6 +666,7 @@ mod tests {
             liquid_asset_id: boltz_client::elements::AssetId::LIQUID_BTC.to_string(),
             merchant_liquid_destination: LIQUID_DESTINATION.into(),
             merchant_emergency_btc_address: Some(EMERGENCY_ADDRESS.into()),
+            recovery_address_commitment_id: Some(Uuid::from_u128(6)),
         };
         let chain_swap_id = Uuid::from_u128(2);
         let invoice_id = Uuid::from_u128(5);
@@ -813,6 +814,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .merchant_emergency_btc_address = None;
+        fixture
+            .record
+            .creation_terms
+            .as_mut()
+            .unwrap()
+            .recovery_address_commitment_id = None;
         fixture.policy.emergency_bitcoin_commitment_id = None;
         fixture.policy.merchant_emergency_btc_address = None;
 
@@ -1120,7 +1127,42 @@ mod tests {
     fn rejects_invalid_emergency_commitment_even_when_presence_is_paired() {
         let mut fixture = fixture();
         fixture.policy.emergency_bitcoin_commitment_id = Some(Uuid::nil());
+        fixture
+            .record
+            .creation_terms
+            .as_mut()
+            .unwrap()
+            .recovery_address_commitment_id = Some(Uuid::nil());
         assert_eq!(fixture.stage(), Err(ManifestStagingError::InvalidManifest));
+    }
+
+    #[test]
+    fn rejects_a_different_recovery_commitment_id_even_when_both_are_present() {
+        let mut fixture = fixture();
+        fixture.policy.emergency_bitcoin_commitment_id = Some(Uuid::from_u128(7));
+        assert_eq!(
+            fixture.stage(),
+            Err(ManifestStagingError::MerchantPolicyMismatch {
+                field: "emergency_bitcoin_commitment_id"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_recovery_commitment_id_absent_from_creation_terms() {
+        let mut fixture = fixture();
+        fixture
+            .record
+            .creation_terms
+            .as_mut()
+            .unwrap()
+            .recovery_address_commitment_id = None;
+        assert_eq!(
+            fixture.stage(),
+            Err(ManifestStagingError::MerchantPolicyMismatch {
+                field: "emergency_bitcoin_commitment_id"
+            })
+        );
     }
 
     #[test]

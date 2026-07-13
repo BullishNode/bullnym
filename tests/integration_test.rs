@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -12,7 +13,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
@@ -46,19 +48,61 @@ use pay_service::swap_manifest_store::{
 };
 use pay_service::{
     certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
-    registration, AppState,
+    recovery_address_registration, registration, AppState,
 };
 
-use bitcoin::hashes::Hash as BitcoinHash;
-use boltz_client::network::Network;
-use boltz_client::swaps::boltz::{PairMinerFees, ReverseFees, ReverseLimits, ReversePair};
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::{hash160, Hash as BitcoinHash};
+use bitcoin::opcodes::all::{
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_EQUALVERIFY, OP_HASH160, OP_SIZE,
+};
+use bitcoin::script::Builder;
+use bitcoin::ScriptBuf;
+use boltz_client::network::{BitcoinChain, LiquidChain, Network};
+use boltz_client::swaps::boltz::{
+    ChainPair, ChainSwapDetails, CreateChainResponse, HeightResponse, Leaf, PairMinerFees,
+    ReverseFees, ReverseLimits, ReversePair, Side, SwapTree, SwapType,
+};
 use boltz_client::swaps::BtcLikeTransaction;
-use boltz_client::util::secrets::SwapMasterKey;
+use boltz_client::util::secrets::{Preimage, SwapMasterKey};
+use boltz_client::{
+    BtcSwapScript, LBtcSwapScript, PublicKey as BoltzPublicKey, ZKKeyPair, ZKSecp256k1,
+};
 use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
 // --- Test infrastructure ---
+
+#[derive(Clone, Default)]
+struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct CapturedLogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+    type Writer = CapturedLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogSink(self.0.clone())
+    }
+}
+
+impl CapturedLogWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
 
 fn require_test_db() -> String {
     std::env::var("TEST_DATABASE_URL")
@@ -72,6 +116,17 @@ async fn test_pool() -> PgPool {
         .connect(&url)
         .await
         .expect("failed to connect to test database")
+}
+
+async fn named_single_connection_test_pool(application_name: &str) -> PgPool {
+    let options = PgConnectOptions::from_str(&require_test_db())
+        .expect("invalid TEST_DATABASE_URL")
+        .application_name(application_name);
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("failed to connect named test pool")
 }
 
 /// A separate lazy pool for claim-preparation progress proofs. Seeding and
@@ -231,6 +286,12 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 fn test_app(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/api/v1/recovery-address",
+            put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
+                recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
+            )),
+        )
         .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
@@ -619,6 +680,13 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Recovery-address commitments reject ordinary DELETE and are referenced
+    // by post-053 chain rows. Test isolation removes those rows first, then
+    // truncates the append-only policy ledger directly.
+    sqlx::query("TRUNCATE recovery_address_commitments CASCADE")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM swap_records")
         .execute(pool)
         .await
@@ -694,6 +762,32 @@ fn valid_chain_swap_creation_terms_fixture() -> pay_service::db::NewChainSwapCre
         merchant_liquid_destination: "lq1qqintegrationfixturemerchantdestination",
         merchant_emergency_btc_address: None,
     }
+}
+
+async fn insert_test_recovery_commitment(
+    pool: &PgPool,
+    npub: &str,
+    address: &str,
+    commitment_version: i64,
+    signature_byte: u8,
+) -> uuid::Uuid {
+    let commitment_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, $3, $4, $5, $6)",
+    )
+    .bind(commitment_id)
+    .bind(npub)
+    .bind(commitment_version)
+    .bind(address)
+    .bind(format!("{signature_byte:02x}").repeat(64))
+    .bind(1_700_100_000_i64 + commitment_version)
+    .execute(pool)
+    .await
+    .unwrap();
+    commitment_id
 }
 
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -999,7 +1093,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "052_chain_swap_manifest_delivery_ledger"
+        "053_recovery_address_commitments"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -1085,6 +1179,252 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
+}
+
+#[tokio::test]
+async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+
+    sqlx::query(
+        "DO $$ BEGIN \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bullnym_app') THEN \
+                 CREATE ROLE bullnym_app NOLOGIN; \
+             END IF; \
+         END $$",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query("REVOKE ALL ON recovery_address_commitments FROM bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT, INSERT ON recovery_address_commitments TO bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+
+    assert!(readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap());
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_pair_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_pair_check CHECK ( \
+             (recovery_address_commitment_id IS NULL) \
+             OR (merchant_emergency_btc_address IS NULL) \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_pair_expression = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_pair_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_pair_check CHECK ( \
+             (recovery_address_commitment_id IS NULL) \
+             = (merchant_emergency_btc_address IS NULL) \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query("GRANT UPDATE ON recovery_address_commitments TO bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let update_acl_drift = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query("REVOKE UPDATE ON recovery_address_commitments FROM bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    sqlx::query("GRANT SELECT ON recovery_address_commitments TO PUBLIC")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let public_acl_drift = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query("REVOKE SELECT ON recovery_address_commitments FROM PUBLIC")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DISABLE TRIGGER \
+         chain_swap_records_reject_recovery_commitment_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let disabled_trigger = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records ENABLE TRIGGER \
+         chain_swap_records_reject_recovery_commitment_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "DROP TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         ON chain_swap_records",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         BEFORE UPDATE OF status ON chain_swap_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_recovery_commitment_mutation()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_update_columns = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DROP TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         ON chain_swap_records",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         BEFORE UPDATE OF \
+             recovery_address_commitment_id, merchant_emergency_btc_address \
+         ON chain_swap_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_recovery_commitment_mutation()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey \
+         TO chain_swap_records_recovery_commitment_fkey_before_readiness_test",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let missing_foreign_key = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey_before_readiness_test \
+         TO chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_fkey \
+         FOREIGN KEY (recovery_address_commitment_id, merchant_emergency_btc_address) \
+         REFERENCES recovery_address_commitments (commitment_id, canonical_btc_address) \
+         ON UPDATE RESTRICT ON DELETE CASCADE",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_foreign_key = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_fkey \
+         FOREIGN KEY (recovery_address_commitment_id, merchant_emergency_btc_address) \
+         REFERENCES recovery_address_commitments (commitment_id, canonical_btc_address) \
+         ON UPDATE RESTRICT ON DELETE RESTRICT",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let restored = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    runtime.close().await;
+
+    assert!(!update_acl_drift, "runtime UPDATE must close admission");
+    assert!(!public_acl_drift, "PUBLIC read ACL must close admission");
+    assert!(
+        !wrong_pair_expression,
+        "a same-name wrong null-pair expression must close admission"
+    );
+    assert!(
+        !disabled_trigger,
+        "disabled immutability must close admission"
+    );
+    assert!(
+        !wrong_update_columns,
+        "an UPDATE trigger on unrelated columns must close admission"
+    );
+    assert!(
+        !missing_foreign_key,
+        "missing exact FK must close admission"
+    );
+    assert!(!wrong_foreign_key, "wrong FK actions must close admission");
+    assert!(
+        restored,
+        "restored exact migration-053 contract must reopen"
+    );
 }
 
 #[tokio::test]
@@ -1220,6 +1560,8 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     pay_service::db::create_user(&pool, "lineageimmutable", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
+    let recovery_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x71).await;
     let reverse_preimage = "66".repeat(32);
     let reverse_claim_key = "77".repeat(32);
     pay_service::db::record_swap_with_lineage(
@@ -1377,8 +1719,13 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     let chain_preimage = "dd".repeat(32);
     let chain_claim_key = "ee".repeat(32);
     let chain_refund_key = "ff".repeat(32);
-    let chain_creation_terms = valid_chain_swap_creation_terms_fixture();
-    pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let mut chain_creation_terms = valid_chain_swap_creation_terms_fixture();
+    chain_creation_terms.merchant_emergency_btc_address = Some(RECOVERY_COMMITMENT_P2WPKH);
+    let chain_creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms: chain_creation_terms,
+        recovery_address_commitment_id: Some(recovery_commitment_id),
+    };
+    pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1405,7 +1752,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &chain_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap();
@@ -1424,7 +1771,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1451,7 +1798,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &alternate_refund_public,
             preimage_hash_hex: &chain_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap_err();
@@ -1479,7 +1826,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1506,7 +1853,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &alternate_claim_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap_err();
@@ -1908,10 +2255,38 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
     cleanup_db(&pool).await;
 
     let nym = "creationterms";
-    let npub = "80".repeat(32);
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
     pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
+    let recovery_timestamp = auth_timestamp();
+    let first_recovery_commitment = pay_service::db::persist_recovery_address_commitment(
+        &pool,
+        &verified_recovery_commitment(
+            &keypair,
+            &npub,
+            RECOVERY_COMMITMENT_P2WPKH,
+            recovery_timestamp,
+        ),
+    )
+    .await
+    .unwrap();
+    let rotated_recovery_commitment = pay_service::db::persist_recovery_address_commitment(
+        &pool,
+        &verified_recovery_commitment(
+            &keypair,
+            &npub,
+            RECOVERY_COMMITMENT_P2PKH,
+            recovery_timestamp,
+        ),
+    )
+    .await
+    .unwrap();
+    let first_recovery_commitment_id = first_recovery_commitment.commitment_id;
+    let rotated_recovery_commitment_id = rotated_recovery_commitment.commitment_id;
     let invoice = insert_test_invoice(
         &pool,
         nym,
@@ -2010,16 +2385,56 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
         liquid_network: "liquid",
         liquid_asset_id: &"8d".repeat(32),
         merchant_liquid_destination: "lq1qqcreationtermsmerchantdestination",
-        merchant_emergency_btc_address: Some(
-            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
-        ),
+        merchant_emergency_btc_address: Some(RECOVERY_COMMITMENT_P2WPKH),
     };
-    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_terms);
-    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+
+    let missing_commitment = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &swap,
         &lineage,
         &creation_terms,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        missing_commitment
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_pair_check")
+    );
+
+    let mismatched_creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms: pay_service::db::NewChainSwapCreationTerms {
+            merchant_emergency_btc_address: Some(RECOVERY_COMMITMENT_P2PKH),
+            ..creation_terms
+        },
+        recovery_address_commitment_id: Some(first_recovery_commitment_id),
+    };
+    let mismatch = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+        &pool,
+        &swap,
+        &lineage,
+        &mismatched_creation_evidence,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mismatch
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_fkey")
+    );
+
+    let creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms,
+        recovery_address_commitment_id: Some(first_recovery_commitment_id),
+    };
+    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_evidence);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+        &pool,
+        &swap,
+        &lineage,
+        &creation_evidence,
     )
     .await
     .unwrap();
@@ -2037,6 +2452,77 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
             .unwrap()
             .canonical_pair_quote_json,
         pair_quote
+    );
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .recovery_address_commitment_id,
+        Some(first_recovery_commitment_id)
+    );
+
+    // The CHECK remains authoritative even if an owner bypasses ordinary
+    // triggers: no address-only historical shape can be introduced.
+    let mut pair_check_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *pair_check_tx)
+        .await
+        .unwrap();
+    let partial_pair = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET recovery_address_commitment_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&mut *pair_check_tx)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        partial_pair
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_pair_check")
+    );
+    pair_check_tx.rollback().await.unwrap();
+
+    let current_commitment =
+        pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        current_commitment.commitment_id,
+        rotated_recovery_commitment_id
+    );
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .recovery_address_commitment_id,
+        Some(first_recovery_commitment_id),
+        "rotation must not retarget an already-created swap"
+    );
+
+    let recovery_mutation = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET recovery_address_commitment_id = $2, \
+                merchant_emergency_btc_address = $3 \
+          WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .bind(rotated_recovery_commitment_id)
+    .bind(RECOVERY_COMMITMENT_P2PKH)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        recovery_mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
     );
 
     let mutation = sqlx::query(
@@ -16701,6 +17187,1466 @@ async fn manifest_delivery_coordinator_real_postgres_minio_contract() {
     observed_ids.sort_unstable();
     expected_ids.sort_unstable();
     assert_eq!(observed_ids, expected_ids);
+
+    cleanup_db(&pool).await;
+}
+
+const RECOVERY_COMMITMENT_P2WPKH: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+const RECOVERY_COMMITMENT_P2TR: &str =
+    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+const RECOVERY_COMMITMENT_P2PKH: &str = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
+const RECOVERY_COMMITMENT_TESTNET: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+fn signed_recovery_address_registration(
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) -> recovery_address_registration::RecoveryAddressRegistrationRequest {
+    let message = recovery_address_registration::build_recovery_address_registration_message(
+        recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        npub,
+        address,
+        timestamp,
+    )
+    .unwrap();
+    recovery_address_registration::RecoveryAddressRegistrationRequest {
+        version: recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        npub: npub.to_string(),
+        btc_address: address.to_string(),
+        timestamp,
+        signature: sign_with_keypair(keypair, &message),
+    }
+}
+
+fn verified_recovery_commitment(
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) -> pay_service::recovery_address_registration::VerifiedRecoveryAddressRegistration {
+    let request = signed_recovery_address_registration(keypair, npub, address, timestamp);
+    pay_service::recovery_address_registration::verify_recovery_address_registration(&request)
+        .unwrap()
+}
+
+const ISSUE84_CHAIN_AMOUNT_SAT: u64 = 25_000;
+const ISSUE84_SWAP_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
+const ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
+
+#[derive(Clone)]
+struct Issue84ChainProviderState {
+    pair_response: Value,
+    height_response: Value,
+    creation_response: Value,
+    calls: Arc<AtomicUsize>,
+    creation_calls: Arc<AtomicUsize>,
+}
+
+struct Issue84ChainProvider {
+    base_url: String,
+    calls: Arc<AtomicUsize>,
+    creation_calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Issue84ChainProvider {
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+async fn issue84_chain_pairs_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.pair_response)
+}
+
+async fn issue84_chain_heights_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.height_response)
+}
+
+async fn issue84_chain_creation_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+    axum::Json(_request): axum::Json<Value>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    state.creation_calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.creation_response)
+}
+
+fn issue84_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn issue84_refund_script(sender: &BoltzPublicKey, timeout_height: u32) -> ScriptBuf {
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn issue84_chain_pair() -> ChainPair {
+    serde_json::from_value(json!({
+        "hash": "014261b046f2045ddedd49fe291e0255afe002454c65a5aa7d6457a35cd32f19",
+        "rate": 1.0,
+        "limits": {
+            "maximal": 25_000_000,
+            "minimal": 25_000,
+            "maximalZeroConf": 0
+        },
+        "fees": {
+            "percentage": 0.1,
+            "minerFees": {
+                "server": 405,
+                "user": {"claim": 20, "lockup": 385}
+            }
+        }
+    }))
+    .unwrap()
+}
+
+fn issue84_chain_heights() -> HeightResponse {
+    serde_json::from_value(json!({
+        "BTC": 957_817,
+        "L-BTC": 3_970_775
+    }))
+    .unwrap()
+}
+
+fn issue84_chain_user_lock_amount(pair: &ChainPair, server_lock_amount_sat: u64) -> u64 {
+    let numerator = server_lock_amount_sat
+        .checked_add(pair.fees.miner_fees.server)
+        .unwrap();
+    (numerator as f64 / (1.0 - pair.fees.percentage / 100.0)).ceil() as u64
+}
+
+fn issue84_chain_creation_response(
+    claim_key_index: u64,
+    refund_key_index: u64,
+    swap_id: &str,
+) -> (ChainPair, HeightResponse, CreateChainResponse) {
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    let pair = issue84_chain_pair();
+    let heights = issue84_chain_heights();
+    let swap_master_key =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let claim_keypair = swap_master_key.derive_swapkey(claim_key_index).unwrap();
+    let refund_keypair = swap_master_key.derive_swapkey(refund_key_index).unwrap();
+    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+    let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
+    let hashlock = Preimage::from_swap_key(&claim_keypair).hash160;
+    let bitcoin_server_key = BoltzPublicKey::from_str(
+        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+    )
+    .unwrap();
+    let liquid_server_key = BoltzPublicKey::from_str(
+        "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+    )
+    .unwrap();
+    let bitcoin_timeout = heights.btc + 144;
+    let liquid_timeout = heights.lbtc + 720;
+    let bitcoin_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(issue84_claim_script(hashlock, &bitcoin_server_key)),
+            version: ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(issue84_refund_script(&refund_public_key, bitcoin_timeout)),
+            version: ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION,
+        },
+        covenant_claim_leaf: None,
+    };
+    let liquid_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(issue84_claim_script(hashlock, &claim_public_key)),
+            version: ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(issue84_refund_script(&liquid_server_key, liquid_timeout)),
+            version: ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION,
+        },
+        covenant_claim_leaf: None,
+    };
+    let bitcoin_address = BtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Lockup),
+        funding_addrs: None,
+        hashlock,
+        receiver_pubkey: bitcoin_server_key,
+        locktime: LockTime::from_consensus(bitcoin_timeout),
+        sender_pubkey: refund_public_key,
+    }
+    .to_address(BitcoinChain::Bitcoin)
+    .unwrap()
+    .to_string();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let liquid_address = LBtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Claim),
+        funding_addrs: None,
+        hashlock,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+        sender_pubkey: liquid_server_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+    let response = CreateChainResponse {
+        id: swap_id.to_string(),
+        claim_details: ChainSwapDetails {
+            swap_tree: liquid_tree,
+            lockup_address: liquid_address,
+            server_public_key: liquid_server_key,
+            timeout_block_height: liquid_timeout,
+            amount: ISSUE84_CHAIN_AMOUNT_SAT,
+            blinding_key: Some(BLINDING_KEY.to_string()),
+            refund_address: None,
+            claim_address: None,
+            bip21: None,
+        },
+        lockup_details: ChainSwapDetails {
+            swap_tree: bitcoin_tree,
+            lockup_address: bitcoin_address,
+            server_public_key: bitcoin_server_key,
+            timeout_block_height: bitcoin_timeout,
+            amount: issue84_chain_user_lock_amount(&pair, ISSUE84_CHAIN_AMOUNT_SAT),
+            blinding_key: None,
+            refund_address: None,
+            claim_address: None,
+            bip21: Some("bitcoin:provider-controlled-and-never-forwarded?amount=999".into()),
+        },
+    };
+    (pair, heights, response)
+}
+
+async fn spawn_issue84_chain_provider(
+    claim_key_index: u64,
+    refund_key_index: u64,
+    swap_id: &str,
+) -> Issue84ChainProvider {
+    let (pair, heights, response) =
+        issue84_chain_creation_response(claim_key_index, refund_key_index, swap_id);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let creation_calls = Arc::new(AtomicUsize::new(0));
+    let state = Issue84ChainProviderState {
+        pair_response: json!({"BTC": {"L-BTC": pair}, "L-BTC": {}}),
+        height_response: serde_json::to_value(heights).unwrap(),
+        creation_response: serde_json::to_value(response).unwrap(),
+        calls: calls.clone(),
+        creation_calls: creation_calls.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/swap/chain",
+            get(issue84_chain_pairs_handler).post(issue84_chain_creation_handler),
+        )
+        .route("/chain/heights", get(issue84_chain_heights_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Issue84ChainProvider {
+        base_url: format!("http://{address}"),
+        calls,
+        creation_calls,
+        task,
+    }
+}
+
+async fn issue84_test_merchant(pool: &PgPool, nym: &str) -> (String, Keypair) {
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    (npub, keypair)
+}
+
+async fn issue84_chain_invoice(
+    pool: &PgPool,
+    nym: &str,
+    npub: &str,
+    liquid_address_index: u32,
+) -> pay_service::db::Invoice {
+    let liquid_address =
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, liquid_address_index).unwrap();
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some(nym),
+            public_slug: None,
+            npub_owner: npub,
+            origin: "checkout",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: i64::try_from(ISSUE84_CHAIN_AMOUNT_SAT).unwrap(),
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: Some("11".repeat(32).as_str()),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn issue84_persist_recovery_commitment(
+    pool: &PgPool,
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) -> Uuid {
+    let evidence = verified_recovery_commitment(keypair, npub, address, timestamp);
+    pay_service::db::persist_recovery_address_commitment(pool, &evidence)
+        .await
+        .unwrap()
+        .commitment_id
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84missing";
+    let (npub, _) = issue84_test_merchant(&pool, nym).await;
+    let mut invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let chain_high_water_before =
+        pay_service::db::max_persisted_chain_key_index(&pool, "0000000000000000")
+            .await
+            .unwrap();
+    let allocations_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some("issue84differentowner"),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(mismatched.is_none());
+
+    invoice.npub_owner =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
+    let recipient_mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(recipient_mismatched.is_none());
+    invoice.npub_owner.clone_from(&npub);
+
+    let missing = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(missing.is_none());
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    let inactive = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(inactive.is_none());
+
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before,
+        "merchant recovery gating consumed a swap-key sequence value"
+    );
+    assert_eq!(
+        pay_service::db::max_persisted_chain_key_index(&pool, "0000000000000000")
+            .await
+            .unwrap(),
+        chain_high_water_before,
+        "merchant recovery gating changed the persisted chain-key high water"
+    );
+    let allocations_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(allocations_after, allocations_before);
+    let chain_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chain_rows, 0);
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "merchant recovery gating reached the provider"
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_copies_commitment_durably_before_return() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84durable";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    let invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        "Issue84Durable1",
+    )
+    .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let state = test_state_with_config(pool.clone(), config);
+
+    let returned = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("registered merchant should receive a chain offer");
+
+    let recorded: (Uuid, String, String, i64, i64) = sqlx::query_as(
+        "SELECT recovery_address_commitment_id, merchant_emergency_btc_address, lockup_address, \
+                claim_key_index, refund_key_index \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.0, recovery_commitment_id);
+    assert_eq!(recorded.1, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(recorded.2, returned.0);
+    assert_eq!(recorded.3, next_key);
+    assert_eq!(recorded.4, next_key + 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84rotation";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let first_commitment_timestamp = auth_timestamp();
+    let first_recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        first_commitment_timestamp,
+    )
+    .await;
+    let first_invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let first_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let first_provider = spawn_issue84_chain_provider(
+        u64::try_from(first_key).unwrap(),
+        u64::try_from(first_key + 1).unwrap(),
+        "Issue84RotationOld1",
+    )
+    .await;
+    let mut first_config = test_config();
+    first_config.boltz.api_url = first_provider.base_url.clone();
+    let first_state = test_state_with_config(pool.clone(), first_config);
+    pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &first_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &first_invoice,
+    )
+    .await
+    .unwrap()
+    .expect("first registered commitment should admit creation");
+    first_provider.shutdown().await;
+
+    let second_recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2TR,
+        first_commitment_timestamp + 1,
+    )
+    .await;
+    let first_after_rotation: (Uuid, String) = sqlx::query_as(
+        "SELECT recovery_address_commitment_id, merchant_emergency_btc_address \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(first_invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first_after_rotation.0, first_recovery_commitment_id);
+    assert_eq!(first_after_rotation.1, RECOVERY_COMMITMENT_P2WPKH);
+
+    let second_invoice = issue84_chain_invoice(&pool, nym, &npub, 1).await;
+    let second_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let second_provider = spawn_issue84_chain_provider(
+        u64::try_from(second_key).unwrap(),
+        u64::try_from(second_key + 1).unwrap(),
+        "Issue84RotationNew1",
+    )
+    .await;
+    let mut second_config = test_config();
+    second_config.boltz.api_url = second_provider.base_url.clone();
+    let second_state = test_state_with_config(pool.clone(), second_config);
+    pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &second_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &second_invoice,
+    )
+    .await
+    .unwrap()
+    .expect("rotated commitment should admit future creation");
+
+    let recorded: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT invoice_id, recovery_address_commitment_id, merchant_emergency_btc_address \
+           FROM chain_swap_records \
+          WHERE invoice_id = ANY($1) \
+          ORDER BY created_at, invoice_id",
+    )
+    .bind(vec![first_invoice.id, second_invoice.id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.len(), 2);
+    let first_evidence = recorded
+        .iter()
+        .find_map(|(invoice_id, commitment_id, address)| {
+            (*invoice_id == first_invoice.id).then_some((*commitment_id, address.as_str()))
+        })
+        .unwrap();
+    let second_evidence = recorded
+        .iter()
+        .find_map(|(invoice_id, commitment_id, address)| {
+            (*invoice_id == second_invoice.id).then_some((*commitment_id, address.as_str()))
+        })
+        .unwrap();
+    assert_eq!(first_evidence.0, first_recovery_commitment_id);
+    assert_eq!(first_evidence.1, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(second_evidence.0, second_recovery_commitment_id);
+    assert_eq!(second_evidence.1, RECOVERY_COMMITMENT_P2TR);
+    assert_eq!(second_provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(second_provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    second_provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+async fn observe_recovery_lock_wait(
+    pool: &PgPool,
+    backend_pid: i32,
+    query_pattern: &str,
+) -> Result<bool, sqlx::Error> {
+    match tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let observed = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                     SELECT 1 \
+                      FROM pg_stat_activity \
+                      WHERE datname = current_database() \
+                        AND pid = $1 \
+                        AND wait_event_type = 'Lock' \
+                        AND query LIKE $2\
+                 )",
+            )
+            .bind(backend_pid)
+            .bind(query_pattern)
+            .fetch_one(pool)
+            .await?;
+            if observed {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn join_recovery_task_bounded<T>(mut task: tokio::task::JoinHandle<T>, label: &str) -> T {
+    match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => panic!("{label} task failed: {error}"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            panic!("{label} task did not finish within 10 seconds");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_address_registration_endpoint_first_retry_rotation_and_privacy() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryendpoint", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let timestamp = auth_timestamp();
+    let first_request = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        timestamp,
+    );
+    let first_signature = first_request.signature.clone();
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let expected_response = json!({
+        "version": recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        "recovery_address_registered": true,
+        "signed_at_unix": timestamp,
+    });
+    let (first_status, first_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&first_request).unwrap(),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_body, expected_response);
+
+    let first = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.commitment_version, 1);
+
+    let (retry_status, retry_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&first_request).unwrap(),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK);
+    assert_eq!(retry_body, expected_response);
+    let exact_retry = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_retry, first);
+
+    let rotation_request =
+        signed_recovery_address_registration(&keypair, &npub, RECOVERY_COMMITMENT_P2TR, timestamp);
+    let rotation_signature = rotation_request.signature.clone();
+    let (rotation_status, rotation_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&rotation_request).unwrap(),
+    )
+    .await;
+    assert_eq!(rotation_status, StatusCode::OK);
+    assert_eq!(rotation_body, expected_response);
+    let rotated = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.commitment_version, 2);
+    assert_ne!(rotated.commitment_id, first.commitment_id);
+    assert_eq!(rotated.canonical_btc_address(), RECOVERY_COMMITMENT_P2TR);
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 2);
+
+    let response_text = format!("{first_body} {retry_body} {rotation_body}");
+    let response_debug = format!("{first_body:?} {retry_body:?} {rotation_body:?}");
+    let logs = log_writer.contents();
+    let first_commitment_id = first.commitment_id.to_string();
+    let rotated_commitment_id = rotated.commitment_id.to_string();
+    for forbidden in [
+        npub.as_str(),
+        RECOVERY_COMMITMENT_P2WPKH,
+        RECOVERY_COMMITMENT_P2TR,
+        first_signature.as_str(),
+        rotation_signature.as_str(),
+        first_commitment_id.as_str(),
+        rotated_commitment_id.as_str(),
+    ] {
+        assert!(!response_text.contains(forbidden));
+        assert!(!response_debug.contains(forbidden));
+        assert!(!logs.contains(forbidden));
+    }
+    for forbidden_field in ["npub", "btc_address", "signature", "commitment_id"] {
+        assert!(!response_text.contains(forbidden_field));
+        assert!(!response_debug.contains(forbidden_field));
+    }
+
+    let (read_status, _, _) = get_json_with_headers(&app, "/api/v1/recovery-address").await;
+    assert_eq!(read_status, StatusCode::METHOD_NOT_ALLOWED);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_address_registration_endpoint_refuses_missing_and_inactive_identically() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    let request = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+    let signature = request.signature.clone();
+    let app = test_app(test_state(pool.clone()));
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let (missing_status, missing_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&request).unwrap(),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+
+    pay_service::db::create_user(&pool, "recoveryinactiveendpoint", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let (inactive_status, inactive_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&request).unwrap(),
+    )
+    .await;
+    assert_eq!(inactive_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(inactive_body, missing_body);
+    assert_eq!(
+        missing_body,
+        json!({
+            "status": "ERROR",
+            "code": "AuthError",
+            "reason": "Wallet signature did not verify.",
+        })
+    );
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+    let public_output = format!(
+        "{missing_body:?} {inactive_body:?} {}",
+        log_writer.contents()
+    );
+    for forbidden in [
+        npub.as_str(),
+        RECOVERY_COMMITMENT_P2WPKH,
+        signature.as_str(),
+        "missing",
+        "inactive",
+        "SourceIdentityNotActive",
+    ] {
+        assert!(!public_output.contains(forbidden));
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_registration_endpoint_rejects_signature_address_and_oversize_body() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverynegative", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let timestamp = auth_timestamp();
+
+    let mut bad_signature = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        timestamp,
+    );
+    bad_signature.signature = "00".repeat(64);
+    let (signature_status, signature_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&bad_signature).unwrap(),
+    )
+    .await;
+    assert_eq!(signature_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(signature_body["code"], "AuthError");
+
+    let invalid_address_message = pay_service::auth::build_la_v2_message(
+        recovery_address_registration::ACTION_RECOVERY_ADDRESS_SET,
+        &npub,
+        "",
+        &["1", RECOVERY_COMMITMENT_TESTNET],
+        timestamp,
+    );
+    let invalid_address_request =
+        recovery_address_registration::RecoveryAddressRegistrationRequest {
+            version: recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+            npub: npub.clone(),
+            btc_address: RECOVERY_COMMITMENT_TESTNET.to_string(),
+            timestamp,
+            signature: sign_with_keypair(&keypair, &invalid_address_message),
+        };
+    let (address_status, address_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&invalid_address_request).unwrap(),
+    )
+    .await;
+    assert_eq!(address_status, StatusCode::OK);
+    assert_eq!(address_body["code"], "RecoveryAddressInvalid");
+
+    let oversized_body = json!({
+        "version": recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        "npub": npub.clone(),
+        "btc_address": RECOVERY_COMMITMENT_P2WPKH,
+        "timestamp": timestamp,
+        "signature": "a".repeat(
+            recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES + 1
+        ),
+    })
+    .to_string();
+    let oversized_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/recovery-address")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_refuses_missing_and_inactive_sources() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+
+    let missing_error = pay_service::db::persist_recovery_address_commitment(&pool, &evidence)
+        .await
+        .unwrap_err();
+    let missing_debug = format!("{missing_error:?}");
+    assert_eq!(missing_debug, "SourceIdentityNotActive");
+    assert!(!missing_debug.contains(&npub));
+    assert!(matches!(
+        missing_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    pay_service::db::create_user(&pool, "recoveryinactive", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let inactive_error = pay_service::db::persist_recovery_address_commitment(&pool, &evidence)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        inactive_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_deactivation_serializes_before_acceptance() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverylockorder", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+
+    // Hold the deactivation row update open. A correct acceptance check uses a
+    // conflicting row lock and must wait; FOR KEY SHARE would incorrectly run
+    // concurrently with this non-key is_active update.
+    let mut deactivation = pool.begin().await.unwrap();
+    let deactivated =
+        sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1 AND is_active = TRUE")
+            .bind(&npub)
+            .execute(&mut *deactivation)
+            .await
+            .unwrap();
+    assert_eq!(deactivated.rows_affected(), 1);
+
+    let persist_pool = named_single_connection_test_pool("recovery-persistence-lock-test").await;
+    let persist_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&persist_pool)
+        .await
+        .unwrap();
+    let persistence_task_pool = persist_pool.clone();
+    let persist_evidence = evidence.clone();
+    let persistence = tokio::spawn(async move {
+        pay_service::db::persist_recovery_address_commitment(
+            &persistence_task_pool,
+            &persist_evidence,
+        )
+        .await
+    });
+
+    let observed_row_lock_wait =
+        match observe_recovery_lock_wait(&pool, persist_backend_pid, "%FROM users%FOR UPDATE%")
+            .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                deactivation.rollback().await.unwrap();
+                let task_result = join_recovery_task_bounded(persistence, "persistence").await;
+                persist_pool.close().await;
+                cleanup_db(&pool).await;
+                panic!("persistence lock probe failed: {error}; task result: {task_result:?}");
+            }
+        };
+
+    if !observed_row_lock_wait {
+        deactivation.rollback().await.unwrap();
+        let premature = join_recovery_task_bounded(persistence, "persistence").await;
+        persist_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("persistence did not wait for deactivation row lock: {premature:?}");
+    }
+
+    deactivation.commit().await.unwrap();
+    let error = join_recovery_task_bounded(persistence, "persistence")
+        .await
+        .unwrap_err();
+    persist_pool.close().await;
+    assert!(matches!(
+        error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_trigger_serializes_deactivation_before_direct_insert() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverytriggerlock", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let mut deactivation = pool.begin().await.unwrap();
+    let deactivated =
+        sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1 AND is_active = TRUE")
+            .bind(&npub)
+            .execute(&mut *deactivation)
+            .await
+            .unwrap();
+    assert_eq!(deactivated.rows_affected(), 1);
+
+    let insert_pool = named_single_connection_test_pool("recovery-trigger-lock-test").await;
+    let insert_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&insert_pool)
+        .await
+        .unwrap();
+    let insertion_task_pool = insert_pool.clone();
+    let insert_npub = npub.clone();
+    let insertion = tokio::spawn(async move {
+        sqlx::query(
+            "INSERT INTO recovery_address_commitments (\
+                 commitment_id, npub, contract_format_version, commitment_version, \
+                 canonical_btc_address, original_signature, signed_at_unix\
+             ) VALUES ($1, $2, 1, 1, $3, $4, $5)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(insert_npub)
+        .bind(RECOVERY_COMMITMENT_P2WPKH)
+        .bind("22".repeat(64))
+        .bind(i64::try_from(auth_timestamp()).unwrap())
+        .execute(&insertion_task_pool)
+        .await
+    });
+
+    let observed_row_lock_wait = match observe_recovery_lock_wait(
+        &pool,
+        insert_backend_pid,
+        "%INSERT INTO recovery_address_commitments%",
+    )
+    .await
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            deactivation.rollback().await.unwrap();
+            let task_result = join_recovery_task_bounded(insertion, "trigger insertion").await;
+            insert_pool.close().await;
+            cleanup_db(&pool).await;
+            panic!("trigger lock probe failed: {error}; task result: {task_result:?}");
+        }
+    };
+
+    if !observed_row_lock_wait {
+        deactivation.rollback().await.unwrap();
+        let premature = join_recovery_task_bounded(insertion, "trigger insertion").await;
+        insert_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("trigger insert did not wait for deactivation row lock: {premature:?}");
+    }
+
+    deactivation.commit().await.unwrap();
+    let error = join_recovery_task_bounded(insertion, "trigger insertion")
+        .await
+        .unwrap_err();
+    insert_pool.close().await;
+    assert_sqlstate(&error, "23503");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.constraint()),
+        Some("recovery_address_commitment_source_exists")
+    );
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_exact_retry_preserves_identity_and_selects_current() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverycurrent", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let timestamp = auth_timestamp();
+    let first_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2WPKH, timestamp);
+
+    let first = pay_service::db::persist_recovery_address_commitment(&pool, &first_evidence)
+        .await
+        .unwrap();
+    let exact_retry = pay_service::db::persist_recovery_address_commitment(&pool, &first_evidence)
+        .await
+        .unwrap();
+    assert_eq!(first, exact_retry);
+    assert!(!first.commitment_id.is_nil());
+    assert_eq!(first.npub, npub);
+    assert_eq!(
+        first.contract_format_version,
+        pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION
+    );
+    assert_eq!(first.commitment_version, 1);
+    assert_eq!(first.canonical_btc_address(), RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(
+        first.original_signature(),
+        first_evidence.original_signature()
+    );
+    assert_eq!(first.signed_at_unix, timestamp);
+    assert!(first.registered_at_unix > 0);
+    let debug = format!("{first:?}");
+    assert!(debug.contains("npub: \"<redacted>\""));
+    assert!(debug.contains("canonical_btc_address: \"<redacted>\""));
+    assert!(debug.contains("original_signature: \"<redacted>\""));
+    assert!(!debug.contains(&npub));
+    assert!(!debug.contains(RECOVERY_COMMITMENT_P2WPKH));
+    assert!(!debug.contains(first_evidence.original_signature()));
+
+    let signature_reuse_error = sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, 2, $3, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&npub)
+    .bind(RECOVERY_COMMITMENT_P2PKH)
+    .bind(first_evidence.original_signature())
+    .bind(i64::try_from(timestamp).unwrap() + 1)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&signature_reuse_error, "23505");
+    assert_eq!(
+        signature_reuse_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("recovery_address_commitment_signature_once_key")
+    );
+    let raw_database_debug = format!("{signature_reuse_error:?}");
+    assert!(raw_database_debug.contains(&npub));
+    assert!(raw_database_debug.contains(first_evidence.original_signature()));
+    let wrapped_database_error =
+        pay_service::db::RecoveryAddressCommitmentError::Database(signature_reuse_error);
+    let wrapped_database_debug = format!("{wrapped_database_error:?}");
+    assert_eq!(wrapped_database_debug, "Database(<redacted>)");
+    assert!(std::error::Error::source(&wrapped_database_error).is_none());
+    assert!(!wrapped_database_debug.contains(&npub));
+    assert!(!wrapped_database_debug.contains(RECOVERY_COMMITMENT_P2PKH));
+    assert!(!wrapped_database_debug.contains(first_evidence.original_signature()));
+
+    let second_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2TR, timestamp);
+    let second = pay_service::db::persist_recovery_address_commitment(&pool, &second_evidence)
+        .await
+        .unwrap();
+    assert_eq!(second.commitment_version, 2);
+    assert_ne!(second.commitment_id, first.commitment_id);
+
+    let current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, second);
+    let mut tx = pool.begin().await.unwrap();
+    let transactional_current =
+        pay_service::db::select_current_recovery_address_commitment(&mut *tx, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(transactional_current, second);
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 2);
+
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let retained_current =
+        pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained_current, second);
+    let inactive_retry_error =
+        pay_service::db::persist_recovery_address_commitment(&pool, &second_evidence)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        inactive_retry_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_concurrent_exact_retries_collapse_to_one_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryretry", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+    let start = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_start = start.clone();
+    let first_evidence = evidence.clone();
+    let first = tokio::spawn(async move {
+        first_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&first_pool, &first_evidence).await
+    });
+    let second_pool = pool.clone();
+    let second_start = start.clone();
+    let second_evidence = evidence.clone();
+    let second = tokio::spawn(async move {
+        second_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&second_pool, &second_evidence).await
+    });
+    start.wait().await;
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.commitment_version, 1);
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_concurrent_rotations_are_contiguous_and_immutable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryrotate", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let timestamp = auth_timestamp();
+    let first_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2WPKH, timestamp);
+    let second_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2PKH, timestamp);
+    let start = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_start = start.clone();
+    let first = tokio::spawn(async move {
+        first_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&first_pool, &first_evidence).await
+    });
+    let second_pool = pool.clone();
+    let second_start = start.clone();
+    let second = tokio::spawn(async move {
+        second_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&second_pool, &second_evidence).await
+    });
+    start.wait().await;
+
+    let mut rotations = [
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    ];
+    rotations.sort_by_key(|row| row.commitment_version);
+    assert_eq!(
+        rotations
+            .iter()
+            .map(|row| row.commitment_version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_ne!(rotations[0].commitment_id, rotations[1].commitment_id);
+    let current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, rotations[1]);
+
+    let gap_error = sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, 4, $3, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&npub)
+    .bind(RECOVERY_COMMITMENT_P2TR)
+    .bind("11".repeat(64))
+    .bind(i64::try_from(timestamp).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&gap_error, "23514");
+
+    let update_error = sqlx::query(
+        "UPDATE recovery_address_commitments \
+            SET canonical_btc_address = $2 \
+          WHERE commitment_id = $1",
+    )
+    .bind(rotations[1].commitment_id)
+    .bind(RECOVERY_COMMITMENT_P2TR)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&update_error, "55000");
+    let delete_error =
+        sqlx::query("DELETE FROM recovery_address_commitments WHERE commitment_id = $1")
+            .bind(rotations[1].commitment_id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_sqlstate(&delete_error, "55000");
+
+    let still_current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_current, rotations[1]);
 
     cleanup_db(&pool).await;
 }

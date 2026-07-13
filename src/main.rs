@@ -22,7 +22,8 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db,
     derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr,
-    og_image, pricer, qr, rate_limit, readiness, reconciler, registration,
+    og_image, pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration,
+    registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -120,6 +121,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema_marker = version::EXPECTED_SCHEMA_MARKER,
         "database schema and recovery journal verified"
     );
+    let recovery_commitment_ready = match readiness::recovery_commitment_ready(&pool).await {
+        Ok(true) => {
+            tracing::info!(
+                event = "recovery_commitment_foundation_ready",
+                "private append-only recovery commitment binding verified"
+            );
+            true
+        }
+        Ok(false) => {
+            tracing::error!(
+                event = "recovery_commitment_foundation_unsafe",
+                "recovery commitment schema, ACL, foreign key, or trigger verification failed; new chain admission remains closed"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                event = "recovery_commitment_foundation_check_failed",
+                error = %error,
+                "recovery commitment foundation could not be verified; new chain admission remains closed"
+            );
+            false
+        }
+    };
 
     let swap_master_key =
         SwapMasterKey::from_mnemonic(&config.swap_mnemonic, None, Network::Mainnet)
@@ -398,8 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // #64 owns live fee observation and persistence. Until it lands,
             // new reverse and chain swaps deliberately remain fail-closed.
             fee_policy_ready: false,
-            // #84 owns the signed, merchant-specific recovery commitment.
-            recovery_commitment_ready: false,
+            recovery_commitment_ready,
         },
         admission::WorkerCadences::from_runtime(
             Duration::from_secs(config.reconciler.interval_secs),
@@ -680,6 +704,12 @@ fn build_router(state: AppState) -> Router {
     let pwa_dist_dir = state.config.pwa.dist_dir.clone();
 
     let mut router: Router<AppState> = Router::new()
+        .route(
+            "/api/v1/recovery-address",
+            put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
+                recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
+            )),
+        )
         .route(
             "/api/v1/supported-currencies",
             get(pricer::supported_currencies),

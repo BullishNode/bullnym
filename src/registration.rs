@@ -27,12 +27,14 @@ fn caller_ip(state: &AppState, peer: Option<SocketAddr>, headers: &HeaderMap) ->
     )
 }
 
-/// Apply the per-IP register rate limit. Whitelisted callers bypass.
-/// Called at the top of every `/register*` handler before any sig work.
-async fn gate_register_per_ip(
+/// Apply the shared registration-setup per-IP rate limit. Whitelisted callers
+/// and explicitly certified registration-setup probes bypass. Call this before
+/// any signature verification on every authenticated registration surface.
+pub(crate) async fn gate_registration_setup_per_ip(
     state: &AppState,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
+    route: &'static str,
 ) -> Result<Option<IpAddr>, AppError> {
     let ip = caller_ip(state, peer, headers);
     let is_certification_allowed = certification::allows_scope(
@@ -40,7 +42,7 @@ async fn gate_register_per_ip(
         CertificationScope::RegistrationSetup,
         peer,
         headers,
-        "register",
+        route,
         None,
     );
     if let Some(ip) = ip {
@@ -137,7 +139,7 @@ pub async fn register(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
 
     // Gate before any CPU-expensive work (sig verify, descriptor parse).
-    let ip = gate_register_per_ip(&state, peer, &headers).await?;
+    let ip = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
@@ -262,7 +264,7 @@ pub async fn update_registration(
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<UpdateResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let _ = gate_register_per_ip(&state, peer, &headers).await?;
+    let _ = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
 
     auth::verify_la_v2(
         "update",
@@ -327,7 +329,7 @@ pub async fn delete_registration(
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let _ = gate_register_per_ip(&state, peer, &headers).await?;
+    let _ = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
 
     let action = if req.purge { "purge" } else { "delete" };
     auth::verify_la_v2(
@@ -411,7 +413,7 @@ pub async fn lookup_by_npub(
     Query(params): Query<LookupParams>,
 ) -> Result<Json<LookupResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
-    let ip = gate_register_per_ip(&state, peer, &headers).await?;
+    let ip = gate_registration_setup_per_ip(&state, peer, &headers, "register").await?;
 
     // Bound how many distinct npubs one IP can probe. The per-IP
     // register rate caps query speed; this caps total enumeration

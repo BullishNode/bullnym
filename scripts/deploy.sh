@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# bullnym deploy: git pull → build → install. Run as debian on the prod VM.
+# Generic Bullnym self-build layout: git pull → build → install. Current
+# production uses the hosted-artifact runbook and different filesystem/unit
+# paths; see docs/operations/deployment.md. Do not use this script there.
 #   ./deploy.sh           verified binary + PWA deploy, migrations check, restart
 # Pre-push gate: run `cd pwa && npm run check:dist`. This script deploys the
 # committed dist only; it does not rebuild the PWA on the VM. nginx changes
@@ -15,6 +17,9 @@ fi
 
 REPO=$HOME/src/bullnym
 APP=/opt/payservice
+RUNTIME_ENV_FILE=/etc/bullnym/bullnym.env
+RUNTIME_DB_ROLE=bullnym_app
+RUNTIME_DATABASE=bullnym
 source "$HOME/.cargo/env"
 
 cd "$REPO"
@@ -53,36 +58,138 @@ PY
 }
 
 direct_transition_history_count() {
-  local relation count password
-  password="$(<"$HOME/.pgpass_payservice")"
-  relation="$(
-    PGPASSWORD="$password" psql --no-psqlrc --set ON_ERROR_STOP=1 \
-      --host 127.0.0.1 --username payservice --dbname payservice \
-      --tuples-only --no-align \
-      --command "SELECT COALESCE(to_regclass('public.invoice_direct_payment_transitions')::TEXT, '')"
-  )" || return 1
-  if [[ -z "$relation" ]]; then
-    echo 0
-    return 0
+  sudo -n bash -s -- \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE" <<'ROOT'
+set -euo pipefail
+env_file="$1"
+expected_role="$2"
+expected_database="$3"
+[[ -f "$env_file" && ! -L "$env_file" && -O "$env_file" && -r "$env_file" ]]
+env_mode="$(stat --format='%a' "$env_file")"
+(( (8#$env_mode & 077) == 0 ))
+safe_home="${HOME:-/root}"
+safe_path="$PATH"
+psql_bin="$(command -v psql)"
+python_bin="$(command -v python3)"
+# shellcheck disable=SC1090
+source "$env_file"
+[[ -n "${DATABASE_URL:-}" ]]
+database_url="$DATABASE_URL"
+unset DATABASE_URL
+
+connection_fields=()
+mapfile -d '' -t connection_fields < <(
+  env -i DATABASE_URL="$database_url" "$python_bin" <<'PY'
+import os
+import sys
+import urllib.parse
+
+url = urllib.parse.urlsplit(os.environ["DATABASE_URL"])
+if url.scheme not in {"postgres", "postgresql"} or url.hostname is None or url.username is None:
+    raise SystemExit("invalid DATABASE_URL authority")
+port = str(url.port or 5432)
+database = urllib.parse.unquote(url.path.removeprefix("/"))
+if not database:
+    raise SystemExit("DATABASE_URL has no database")
+allowed = {
+    "sslmode": "", "sslrootcert": "", "sslcert": "", "sslkey": "",
+    "channel_binding": "", "target_session_attrs": "",
+}
+query = urllib.parse.parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
+if set(query) - set(allowed) or any(len(values) != 1 for values in query.values()):
+    raise SystemExit("unsupported DATABASE_URL parameters")
+for key, values in query.items():
+    allowed[key] = values[0]
+values = [
+    url.hostname, port, urllib.parse.unquote(url.username),
+    urllib.parse.unquote(url.password or ""), database, allowed["sslmode"],
+    allowed["sslrootcert"], allowed["sslcert"], allowed["sslkey"],
+    allowed["channel_binding"], allowed["target_session_attrs"],
+]
+if any("\n" in value or "\x00" in value for value in values):
+    raise SystemExit("invalid DATABASE_URL value")
+sys.stdout.buffer.write(b"\x00".join(value.encode() for value in values) + b"\x00")
+PY
+)
+unset database_url
+(( ${#connection_fields[@]} == 11 ))
+libpq_environment=(
+  "PGHOST=${connection_fields[0]}" "PGPORT=${connection_fields[1]}"
+  "PGUSER=${connection_fields[2]}" "PGPASSWORD=${connection_fields[3]}"
+  "PGDATABASE=${connection_fields[4]}"
+)
+optional_libpq_names=(
+  PGSSLMODE PGSSLROOTCERT PGSSLCERT PGSSLKEY PGCHANNELBINDING
+  PGTARGETSESSIONATTRS
+)
+for index in {5..10}; do
+  if [[ -n "${connection_fields[$index]}" ]]; then
+    libpq_environment+=(
+      "${optional_libpq_names[$((index - 5))]}=${connection_fields[$index]}"
+    )
   fi
-  count="$(
-    PGPASSWORD="$password" psql --no-psqlrc --set ON_ERROR_STOP=1 \
-      --host 127.0.0.1 --username payservice --dbname payservice \
-      --tuples-only --no-align \
-      --command "SELECT COUNT(*) FROM public.invoice_direct_payment_transitions"
-  )" || return 1
-  [[ "$count" =~ ^[0-9]+$ ]] || return 1
-  echo "$count"
+done
+
+clean_psql() {
+  env -i \
+    HOME="$safe_home" \
+    PATH="$safe_path" \
+    PGCONNECT_TIMEOUT=5 \
+    "${libpq_environment[@]}" \
+    "$psql_bin" "$@"
+}
+
+identity="$(
+  clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+    --tuples-only --no-align --field-separator='|' \
+    --command 'SELECT current_user, current_database()'
+)"
+IFS='|' read -r actual_role actual_database extra <<<"$identity"
+[[ -z "${extra:-}" && "$actual_role" == "$expected_role" \
+   && "$actual_database" == "$expected_database" ]]
+
+relation="$(
+  clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+    --tuples-only --no-align \
+    --command "SELECT COALESCE(to_regclass('public.invoice_direct_payment_transitions')::TEXT, '')"
+)"
+if [[ -z "$relation" ]]; then
+  echo 0
+  exit 0
+fi
+count="$(
+  clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+    --tuples-only --no-align \
+    --command 'SELECT COUNT(*) FROM public.invoice_direct_payment_transitions'
+)"
+[[ "$count" =~ ^[0-9]+$ ]]
+echo "$count"
+ROOT
+}
+
+migration_053_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-053-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
 automatic_binary_rollback_allowed() {
-  local previous_schema candidate_schema transition_count
+  local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
     echo "automatic rollback refused: missing previous/candidate build-info evidence" >&2
     return 1
   }
   previous_schema="$(build_info_schema_marker "$previous_build_info")" || return 1
   candidate_schema="$(build_info_schema_marker "$candidate_build_info")" || return 1
+  previous_version="${previous_schema%%_*}"
+  candidate_version="${candidate_schema%%_*}"
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 53)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 53)); }; then
+    echo "automatic rollback refused: migration 053 is a stopped-writer, roll-forward-only recovery-commitment boundary" >&2
+    return 1
+  fi
 
   if [[ "$previous_schema" == "$candidate_schema" ]]; then
     transition_count=0
@@ -151,8 +258,22 @@ rollback_on_failure() {
 }
 trap rollback_on_failure EXIT
 
-echo "NOTE: migrations are applied manually and deliberately:"
-echo "  PGPASSWORD=\$(cat ~/.pgpass_payservice) psql -h 127.0.0.1 -U payservice -d payservice -f migrations/NNN_*.sql"
+if [[ -f "$REPO/migrations/053_recovery_address_commitments.sql" ]]; then
+  if ! migration_053_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 053 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, then apply migration 053 with
+psql --no-psqlrc --set ON_ERROR_STOP=1 --set runtime_role=bullnym_app as a
+distinct privileged schema owner. Never apply migration 053 as bullnym_app.
+Follow
+docs/operations/deployment.md, including its pre- and post-migration checks,
+then rerun this script.
+EOF
+    exit 1
+  fi
+  echo "migration 053 privileged-owner ACL/FK/trigger boundary verified through bullnym_app on bullnym"
+fi
+echo "NOTE: all migrations are applied manually using their documented ownership and stopped-writer boundaries."
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'
 
 export CARGO_BUILD_JOBS=2

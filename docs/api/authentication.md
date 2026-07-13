@@ -12,7 +12,9 @@ fixed-position optionals are empty strings, and the timestamp must be within
 300 seconds of server time. Boolean encoding is endpoint-specific: surface
 fields (`enabled` and legacy `pos_mode`) use `"1"`/`"0"`, while the three
 invoice-creation acceptance fields use `"true"`/`"false"`. The 64-byte Schnorr
-signature is lowercase or uppercase hex in the JSON `signature` field.
+signature is lowercase or uppercase hex in the JSON `signature` field except
+for recovery-address registration, whose evidence-preserving v1 contract
+requires canonical lowercase hex.
 
 Pseudocode:
 
@@ -40,6 +42,7 @@ unlinked invoice operations it is the empty string.
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
 | recover chain swap | `invoice-recover` | `invoice_id`, `btc_address` |
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
+| register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
 
 Invoice optionals always occupy their fixed signing position as `""`. Amounts
 and timestamps use decimal strings. This distinction from the surface API's
@@ -55,5 +58,6 @@ reuse the request; after that, rebuild the timestamp and signature. Registration
 reactivation, cancellation, same-address completed recovery, and most reads are
 safe to retry. Invoice creation can create another receivable if the first
 response was lost; clients should reconcile through the signed list endpoint
-before creating a replacement.
-
+before creating a replacement. Recovery-address registration is idempotent only
+for the exact signed request: rebuilding its timestamp or signature appends a
+new immutable policy version, even when the address is unchanged.

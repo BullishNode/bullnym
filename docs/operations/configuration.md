@@ -32,10 +32,14 @@ request's merchant-specific committed recovery destination. Invalid
 rail-specific client configuration closes only that rail; it does not make
 generic `/ready` fail or stop existing-obligation workers.
 
-The current release deliberately keeps reverse and chain offer creation closed
-until the follow-up fee-policy and recovery-commitment issues supply those
-facts. Do not work around this boundary with certification, an IP whitelist, or
-a temporary runtime override.
+The recovery-commitment schema, private registration endpoint, and
+merchant-specific chain binding are present. Reverse and chain offer creation
+nevertheless remain closed because issue #64 has not yet supplied the
+persisted live fee-policy decision; `fee_policy_ready` therefore stays false.
+Chain creation also fails closed for an individual merchant until that active
+identity has registered a current recovery commitment. Do not work around
+either boundary with certification, an IP whitelist, or a temporary runtime
+override.
 
 Do not enable broad IP or certification bypasses for ordinary internet traffic.
 After every configuration change, call `/ready` and exercise a non-monetary
