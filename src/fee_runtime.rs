@@ -36,7 +36,7 @@ pub trait FeeRuntimePersistence: Send + Sync {
         current: &CurrentBitcoinFee,
         policy: &BitcoinFeePolicy,
         accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError>;
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError>;
 
     async fn persist_accepted_liquid(
         &self,
@@ -44,7 +44,7 @@ pub trait FeeRuntimePersistence: Send + Sync {
         current: &CurrentLiquidFee,
         policy: &LiquidFeePolicy,
         accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError>;
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError>;
 }
 
 /// Standalone composition placeholder. It deliberately fails every operation,
@@ -65,7 +65,7 @@ impl FeeRuntimePersistence for UnavailableFeeRuntimePersistence {
         _current: &CurrentBitcoinFee,
         _policy: &BitcoinFeePolicy,
         _accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError> {
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError> {
         Err(FeePersistenceError::Unavailable)
     }
 
@@ -75,7 +75,7 @@ impl FeeRuntimePersistence for UnavailableFeeRuntimePersistence {
         _current: &CurrentLiquidFee,
         _policy: &LiquidFeePolicy,
         _accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError> {
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError> {
         Err(FeePersistenceError::Unavailable)
     }
 }
@@ -98,6 +98,14 @@ impl fmt::Display for FeePersistenceError {
 }
 
 impl Error for FeePersistenceError {}
+
+/// Whether the just-observed live candidate became durable or lost a
+/// cross-process ordering race to a newer row that the adapter restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeePersistenceDisposition {
+    AcceptedLive,
+    RestoredAuthoritative,
+}
 
 #[derive(Debug)]
 pub enum FeeRuntimeBuildError {
@@ -173,6 +181,7 @@ impl FeeRuntimeReadiness {
 pub enum FeeRailPersistenceOutcome {
     NotUpdated,
     Persisted,
+    AuthoritativeRetained,
     Failed,
 }
 
@@ -466,7 +475,7 @@ impl FeeRuntime {
             return FeeRailPersistenceOutcome::Failed;
         };
         let decision = current.decision().clone();
-        if self
+        let disposition = match self
             .persistence
             .persist_accepted_bitcoin(
                 &self.snapshot,
@@ -475,11 +484,33 @@ impl FeeRuntime {
                 now_unix,
             )
             .await
-            .is_err()
         {
+            Ok(disposition) => disposition,
+            Err(_) => {
+                self.bitcoin_persisted_generation.store(0, Ordering::Release);
+                let _ = self.snapshot.clear_bitcoin();
+                return FeeRailPersistenceOutcome::Failed;
+            }
+        };
+        if disposition == FeePersistenceDisposition::RestoredAuthoritative {
             self.bitcoin_persisted_generation.store(0, Ordering::Release);
-            let _ = self.snapshot.clear_bitcoin();
-            return FeeRailPersistenceOutcome::Failed;
+            if self.snapshot.clear_bitcoin().is_err() {
+                return FeeRailPersistenceOutcome::Failed;
+            }
+            let restored = self
+                .snapshot
+                .read_bitcoin(&self.bitcoin_policy, now_unix)
+                .is_ok_and(|current| {
+                    current.decision().source()
+                        == FeeObservationSource::BitcoinLastKnownGood
+                });
+            self.bitcoin_lkg_authorized
+                .store(restored, Ordering::Release);
+            return if restored {
+                FeeRailPersistenceOutcome::AuthoritativeRetained
+            } else {
+                FeeRailPersistenceOutcome::Failed
+            };
         }
         let Ok(current) = self.snapshot.read_bitcoin(&self.bitcoin_policy, now_unix) else {
             self.bitcoin_persisted_generation.store(0, Ordering::Release);
@@ -511,7 +542,7 @@ impl FeeRuntime {
             return FeeRailPersistenceOutcome::Failed;
         };
         let decision = current.decision().clone();
-        if self
+        let disposition = match self
             .persistence
             .persist_accepted_liquid(
                 &self.snapshot,
@@ -520,11 +551,33 @@ impl FeeRuntime {
                 now_unix,
             )
             .await
-            .is_err()
         {
+            Ok(disposition) => disposition,
+            Err(_) => {
+                self.liquid_persisted_generation.store(0, Ordering::Release);
+                let _ = self.snapshot.clear_liquid();
+                return FeeRailPersistenceOutcome::Failed;
+            }
+        };
+        if disposition == FeePersistenceDisposition::RestoredAuthoritative {
             self.liquid_persisted_generation.store(0, Ordering::Release);
-            let _ = self.snapshot.clear_liquid();
-            return FeeRailPersistenceOutcome::Failed;
+            if self.snapshot.clear_liquid().is_err() {
+                return FeeRailPersistenceOutcome::Failed;
+            }
+            let restored = self
+                .snapshot
+                .read_liquid(&self.liquid_policy, now_unix)
+                .is_ok_and(|current| {
+                    current.decision().source()
+                        == FeeObservationSource::LiquidLastKnownGood
+                });
+            self.liquid_lkg_authorized
+                .store(restored, Ordering::Release);
+            return if restored {
+                FeeRailPersistenceOutcome::AuthoritativeRetained
+            } else {
+                FeeRailPersistenceOutcome::Failed
+            };
         }
         let Ok(current) = self.snapshot.read_liquid(&self.liquid_policy, now_unix) else {
             self.liquid_persisted_generation.store(0, Ordering::Release);
