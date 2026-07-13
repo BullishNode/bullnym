@@ -309,6 +309,51 @@ fn runtime_settlement_recovery_requires_the_refunding_record_branch() {
 }
 
 #[test]
+fn runtime_rebroadcast_composition_preserves_unconfirmed_eviction_and_demotion() {
+    use AppliedMerchantSettlementAction::{Demoted, Finalized, Watching};
+
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Watching, false, false),
+        Some(false)
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Watching, true, true),
+        Some(true),
+        "unconfirmed eviction remains Watching but must persist exact-byte replay"
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Demoted, false, true),
+        Some(true),
+        "accounting demotion always requires journal replay"
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Finalized, false, false),
+        Some(false)
+    );
+
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Watching, true, false),
+        None,
+        "repository cannot discard the service replay request"
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Watching, false, true),
+        None,
+        "repository cannot invent a Watching replay transition"
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Demoted, false, false),
+        None,
+        "repository cannot demote without publishing replay"
+    );
+    assert_eq!(
+        compose_merchant_settlement_rebroadcast(Finalized, true, true),
+        None,
+        "finalized accounting cannot request another broadcast"
+    );
+}
+
+#[test]
 fn runtime_worker_selects_journal_owned_active_and_finalized_paths() {
     use crate::{
         merchant_settlement_adoption::MerchantSettlementPath,

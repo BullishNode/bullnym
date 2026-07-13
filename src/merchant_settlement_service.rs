@@ -159,9 +159,20 @@ impl MerchantSettlementAdoptionService {
 
         let mut retained = BTreeMap::new();
         for record in snapshot.retained {
+            let evidence_is_original = record.evidence.txid() == lifecycle.journal_txid().as_str()
+                && !record.evidence.is_linked_replacement();
+            let evidence_is_active_replacement =
+                lifecycle
+                    .linked_replacement()
+                    .is_some_and(|(parent, child)| {
+                        parent == lifecycle.journal_txid()
+                            && record.evidence.txid() == child.as_str()
+                            && record.evidence.is_linked_replacement()
+                    });
             if !record.recorded
                 || record.finalized && !record.active
                 || record.evidence.journal_txid() != lifecycle.journal_txid().as_str()
+                || !(evidence_is_original || evidence_is_active_replacement)
                 || record
                     .evidence
                     .accounting_intent(&snapshot.context)
@@ -212,6 +223,7 @@ impl MerchantSettlementAdoptionService {
                     || snapshot.active_event_key.as_deref()
                         != Some(active_records[0].0.as_str())
                     || active_records[0].1.evidence.txid() != lifecycle.active_txid().as_str()
+                    || !active_confirmation_matches_lifecycle(active_records[0].1, &lifecycle)
                     || active_records[0].1.finalized
                         != matches!(
                             lifecycle.accounting_state(),
@@ -501,10 +513,17 @@ impl MerchantSettlementAdoptionService {
 
             match self.retained.get_mut(&event_key) {
                 Some(retained) => {
-                    if retained.intent != intent {
+                    if retained.intent != intent
+                        || !same_verified_output(&retained.evidence, &evidence)
+                    {
                         return Err(MerchantSettlementProcessingError::ImmutableEvidenceConflict);
                     }
-                    retained.evidence = evidence;
+                    let same_block = retained.evidence.block_height() == evidence.block_height()
+                        && retained.evidence.block_hash() == evidence.block_hash();
+                    if !same_block || evidence.confirmations() >= retained.evidence.confirmations()
+                    {
+                        retained.evidence = evidence;
+                    }
                 }
                 None if needs_activation => {
                     self.retained.insert(
@@ -598,6 +617,42 @@ impl MerchantSettlementAdoptionService {
     pub const fn blocks_value_changing_fallback(&self) -> bool {
         true
     }
+}
+
+fn active_confirmation_matches_lifecycle(
+    retained: &RetainedMerchantOutput,
+    lifecycle: &MerchantSettlementLifecycle,
+) -> bool {
+    let (block, confirmations) = match lifecycle.state() {
+        crate::merchant_settlement_lifecycle::SettlementState::Confirmed {
+            block,
+            confirmations,
+            ..
+        }
+        | crate::merchant_settlement_lifecycle::SettlementState::Finalized {
+            block,
+            confirmations,
+            ..
+        } => (block, confirmations),
+        _ => return false,
+    };
+    retained.evidence.confirmations() == *confirmations
+        && retained.evidence.block_height() == block.height()
+        && retained.evidence.block_hash() == block.hash()
+}
+
+fn same_verified_output(
+    existing: &ConfirmedMerchantOutputEvidence,
+    observed: &ConfirmedMerchantOutputEvidence,
+) -> bool {
+    existing.journal_txid() == observed.journal_txid()
+        && existing.txid() == observed.txid()
+        && existing.destination_address() == observed.destination_address()
+        && existing.destination_script_hex() == observed.destination_script_hex()
+        && existing.asset() == observed.asset()
+        && existing.actual_amount_sat() == observed.actual_amount_sat()
+        && existing.vout() == observed.vout()
+        && existing.is_linked_replacement() == observed.is_linked_replacement()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1218,6 +1273,130 @@ mod tests {
     }
 
     #[test]
+    fn stale_same_block_confirmation_cannot_regress_retained_finality_evidence() {
+        let mut service = service(MerchantSettlementPath::LiquidClaim);
+        let finalized = verified(
+            MerchantSettlementPath::LiquidClaim,
+            ORIGINAL_TXID,
+            false,
+            73_219,
+            2,
+            900_000,
+            BLOCK_A,
+        );
+        service.apply_verified_confirmation(&finalized).unwrap();
+
+        let stale = verified(
+            MerchantSettlementPath::LiquidClaim,
+            ORIGINAL_TXID,
+            false,
+            73_219,
+            1,
+            900_000,
+            BLOCK_A,
+        );
+        let duplicate = service.apply_verified_confirmation(&stale).unwrap();
+        assert!(duplicate.commands.is_empty());
+
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.retained.len(), 1);
+        assert_eq!(snapshot.retained[0].evidence.confirmations(), 2);
+        assert!(snapshot.retained[0].finalized);
+        assert_eq!(
+            MerchantSettlementAdoptionService::restore(
+                snapshot.clone(),
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            )
+            .unwrap()
+            .snapshot(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn restore_rejects_retained_outputs_outside_the_lifecycle_journal_family() {
+        let mut service = service(MerchantSettlementPath::LiquidClaim);
+        let original = verified(
+            MerchantSettlementPath::LiquidClaim,
+            ORIGINAL_TXID,
+            false,
+            73_219,
+            1,
+            900_000,
+            BLOCK_A,
+        );
+        service.apply_verified_confirmation(&original).unwrap();
+        let mut snapshot = service.snapshot();
+
+        let unlinked_checkpoint_record = verified(
+            MerchantSettlementPath::LiquidClaim,
+            REPLACEMENT_TXID,
+            true,
+            72_000,
+            1,
+            900_001,
+            BLOCK_B,
+        );
+        let evidence = ConfirmedMerchantOutputEvidence::from_verified(
+            &snapshot.context,
+            &unlinked_checkpoint_record,
+        )
+        .unwrap();
+        let intent = evidence.accounting_intent(&snapshot.context).unwrap();
+        snapshot.retained.push(RetainedMerchantOutputSnapshot {
+            evidence,
+            intent,
+            recorded: true,
+            active: false,
+            finalized: false,
+        });
+
+        assert_eq!(
+            MerchantSettlementAdoptionService::restore(
+                snapshot,
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            ),
+            Err(MerchantSettlementProcessingError::InvalidCheckpoint)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_active_evidence_below_the_lifecycle_confirmation_high_water() {
+        let mut service = service(MerchantSettlementPath::LiquidClaim);
+        let finalized = verified(
+            MerchantSettlementPath::LiquidClaim,
+            ORIGINAL_TXID,
+            false,
+            73_219,
+            2,
+            900_000,
+            BLOCK_A,
+        );
+        service.apply_verified_confirmation(&finalized).unwrap();
+        let mut snapshot = service.snapshot();
+
+        let stale = verified(
+            MerchantSettlementPath::LiquidClaim,
+            ORIGINAL_TXID,
+            false,
+            73_219,
+            1,
+            900_000,
+            BLOCK_A,
+        );
+        snapshot.retained[0].evidence =
+            ConfirmedMerchantOutputEvidence::from_verified(&snapshot.context, &stale).unwrap();
+
+        assert_eq!(
+            MerchantSettlementAdoptionService::restore(
+                snapshot,
+                SettlementFinalityPolicy::new(2, 3).unwrap(),
+            ),
+            Err(MerchantSettlementProcessingError::InvalidCheckpoint)
+        );
+    }
+
+    #[test]
     fn linked_bitcoin_replacement_demotes_original_and_records_distinct_output() {
         let mut service = service(MerchantSettlementPath::BitcoinRecovery);
         let mut sink = DeterministicAccountingSink::default();
@@ -1295,6 +1474,30 @@ mod tests {
         sink.apply(&service.apply_verified_confirmation(&confirmed).unwrap());
         assert_eq!(sink.active_value_sat(), 51_000);
         assert_eq!(sink.total_records(), 1);
+    }
+
+    #[test]
+    fn unconfirmed_eviction_requests_exact_rebroadcast_without_accounting_demotion() {
+        for path in [
+            MerchantSettlementPath::LiquidClaim,
+            MerchantSettlementPath::BitcoinRecovery,
+        ] {
+            let mut service = service(path);
+            service.mark_mempool().unwrap();
+
+            let eviction = service.apply_eviction().unwrap();
+            assert!(eviction.commands.is_empty());
+            assert!(eviction.redrive_observation);
+            assert!(eviction.rebroadcast_journaled);
+            assert_eq!(
+                service.lifecycle().accounting_state(),
+                SettlementAccountingState::Unrecorded
+            );
+            assert!(matches!(
+                service.lifecycle().state(),
+                SettlementState::Evicted
+            ));
+        }
     }
 
     #[test]

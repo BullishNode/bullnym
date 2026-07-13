@@ -478,6 +478,23 @@ enum JournaledMerchantSettlementTick {
     },
 }
 
+/// Require the repository to durably publish the service's exact-byte replay
+/// request as well as every accounting demotion. An eviction before first
+/// confirmation remains `Watching` for accounting, but still has to mark and
+/// redrive the immutable journal. Finalized accounting can never request
+/// another broadcast.
+const fn compose_merchant_settlement_rebroadcast(
+    action: AppliedMerchantSettlementAction,
+    service_requested: bool,
+    repository_required: bool,
+) -> Option<bool> {
+    if service_requested && matches!(action, AppliedMerchantSettlementAction::Finalized) {
+        return None;
+    }
+    let expected = service_requested || matches!(action, AppliedMerchantSettlementAction::Demoted);
+    (repository_required == expected).then_some(expected)
+}
+
 /// Execute one exact-output settlement observation from a single validated
 /// repository work packet. The packet's checkpoint version is the CAS token;
 /// no database read is reopened between chain observation and persistence.
@@ -582,6 +599,7 @@ async fn process_journaled_merchant_settlement(
         }
     };
     let snapshot = work.service.snapshot();
+    let service_rebroadcast_requested = processing.rebroadcast_journaled;
     let persisted = db::persist_merchant_settlement_outcome(
         &state.db,
         work.checkpoint_version,
@@ -603,9 +621,13 @@ async fn process_journaled_merchant_settlement(
         (MerchantSettlementPath::LiquidClaim, _) => "claiming",
         (MerchantSettlementPath::BitcoinRecovery, _) => "refunding",
     };
+    let journal_rebroadcast_required = compose_merchant_settlement_rebroadcast(
+        action,
+        service_rebroadcast_requested,
+        persisted.journal_rebroadcast_required,
+    );
     if persisted.parent_transition.current_status != expected_parent_status
-        || persisted.journal_rebroadcast_required
-            != matches!(action, AppliedMerchantSettlementAction::Demoted)
+        || journal_rebroadcast_required.is_none()
     {
         return Err(AppError::ClaimError(format!(
             "merchant settlement persistence returned incoherent parent/journal transition for {}",
@@ -617,7 +639,8 @@ async fn process_journaled_merchant_settlement(
         action,
         checkpoint_version: persisted.checkpoint_version,
         projection_changed: persisted.projection_changed,
-        journal_rebroadcast_required: persisted.journal_rebroadcast_required,
+        journal_rebroadcast_required: journal_rebroadcast_required
+            .expect("coherence checked immediately above"),
     })
 }
 
@@ -1352,7 +1375,7 @@ async fn run_one_chain_tick(
                                 | AppliedMerchantSettlementAction::Finalized),
                             checkpoint_version,
                             projection_changed,
-                            journal_rebroadcast_required: _,
+                            journal_rebroadcast_required,
                         }) => {
                             tracing::info!(
                                 event = "chain_swap_merchant_settlement_applied",
@@ -1363,8 +1386,18 @@ async fn run_one_chain_tick(
                                 projection_changed,
                                 "persisted exact Bitcoin recovery merchant-output observation"
                             );
-                            cursors[0].visit(swap.id);
-                            continue;
+                            if !journal_rebroadcast_required {
+                                cursors[0].visit(swap.id);
+                                continue;
+                            }
+                            tracing::warn!(
+                                event = "chain_swap_merchant_settlement_unconfirmed_eviction",
+                                swap_id = %swap.boltz_swap_id,
+                                path = "bitcoin_recovery",
+                                checkpoint_version,
+                                projection_changed,
+                                "persisted unconfirmed Bitcoin recovery eviction; redriving exact journal bytes"
+                            );
                         }
                         Ok(JournaledMerchantSettlementTick::Applied {
                             action: AppliedMerchantSettlementAction::Demoted,
@@ -1471,7 +1504,7 @@ async fn run_one_chain_tick(
                         | AppliedMerchantSettlementAction::Finalized),
                     checkpoint_version,
                     projection_changed,
-                    journal_rebroadcast_required: _,
+                    journal_rebroadcast_required,
                 }) => {
                     tracing::info!(
                         event = "chain_swap_merchant_settlement_applied",
@@ -1482,6 +1515,28 @@ async fn run_one_chain_tick(
                         projection_changed,
                         "persisted exact Liquid claim merchant-output observation"
                     );
+                    if journal_rebroadcast_required {
+                        tracing::warn!(
+                            event = "chain_swap_merchant_settlement_unconfirmed_eviction",
+                            swap_id = %swap.boltz_swap_id,
+                            path = "liquid_claim",
+                            checkpoint_version,
+                            projection_changed,
+                            "persisted unconfirmed Liquid claim eviction; redriving exact journal bytes"
+                        );
+                        if let Err(error) =
+                            crate::claimer::redrive_journaled_chain_claim(state, swap.id).await
+                        {
+                            health.observe_app_error(&error);
+                            tracing::warn!(
+                                event = "chain_swap_merchant_settlement_rebroadcast_deferred",
+                                swap_id = %swap.boltz_swap_id,
+                                path = "liquid_claim",
+                                error = %error,
+                                "unconfirmed Liquid claim exact-byte rebroadcast deferred"
+                            );
+                        }
+                    }
                     cursors[1].visit(swap.id);
                     continue;
                 }
