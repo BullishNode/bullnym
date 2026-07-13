@@ -5,12 +5,39 @@
 // running server. NOT a production tool — a manual E2E aid for SPEC-RECOVER.
 //
 //   DATABASE_URL=... PROBE_TS=<unix> cargo run --example recover_probe
-use pay_service::{auth, db};
+use pay_service::{auth, db, recovery_address_registration};
 use secp256k1::{Keypair, Message, Secp256k1};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 
 const DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
+const RECOVERY_ADDRESS: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+fn signed_recovery_address_registration(
+    keypair: &Keypair,
+    npub: &str,
+    timestamp: u64,
+) -> recovery_address_registration::RecoveryAddressRegistrationRequest {
+    let version = recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION;
+    let message = recovery_address_registration::build_recovery_address_registration_message(
+        version,
+        npub,
+        RECOVERY_ADDRESS,
+        timestamp,
+    )
+    .unwrap();
+    let digest = Sha256::digest(message);
+    let message = Message::from_digest(*digest.as_ref());
+    let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&message, keypair);
+
+    recovery_address_registration::RecoveryAddressRegistrationRequest {
+        version,
+        npub: npub.to_string(),
+        btc_address: RECOVERY_ADDRESS.to_string(),
+        timestamp,
+        signature: signature.to_string(),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -34,6 +61,13 @@ async fn main() {
 
     // Seed: merchant + checkout invoice + funded refund_due chain swap.
     db::create_user(&pool, &nym, &npub, DESCRIPTOR).await.ok();
+    let recovery_registration = signed_recovery_address_registration(&kp, &npub, ts);
+    let verified_recovery =
+        recovery_address_registration::verify_recovery_address_registration(&recovery_registration)
+            .unwrap();
+    let recovery_commitment = db::persist_recovery_address_commitment(&pool, &verified_recovery)
+        .await
+        .unwrap();
     let invoice = db::insert_invoice(
         &pool,
         &db::NewInvoice {
@@ -125,9 +159,9 @@ async fn main() {
         liquid_network: "liquid",
         liquid_asset_id: "6f0279e9ed041c3d710a9f57d0c02928416413f827c37bf6833e2407092ff84d",
         merchant_liquid_destination: "lq1probe",
-        merchant_emergency_btc_address: None,
+        merchant_emergency_btc_address: Some(recovery_commitment.canonical_btc_address()),
     };
-    let swap = db::record_chain_swap_with_lineage_and_creation_terms(
+    let swap = db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &db::NewChainSwapRecord {
             claim_key_index: Some(claim_index as i64),
@@ -154,7 +188,10 @@ async fn main() {
             refund_public_key_hex: &refund_public_key,
             preimage_hash_hex: &preimage_hash,
         },
-        &creation_terms,
+        &db::NewChainSwapCreationEvidence {
+            creation_terms,
+            recovery_address_commitment_id: Some(recovery_commitment.commitment_id),
+        },
     )
     .await
     .unwrap();
@@ -173,4 +210,26 @@ async fn main() {
     println!("INVOICE_ID={}", invoice.id);
     println!("TS={ts}");
     println!("SIG={sig}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_registration_signature_is_deterministic() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[0x11_u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let npub = xonly.to_string();
+        let timestamp = 1_700_000_000;
+
+        let first = signed_recovery_address_registration(&keypair, &npub, timestamp);
+        let second = signed_recovery_address_registration(&keypair, &npub, timestamp);
+
+        assert!(first == second);
+        assert_eq!(first.npub, npub);
+        assert_eq!(first.btc_address, RECOVERY_ADDRESS);
+        assert_eq!(first.timestamp, timestamp);
+    }
 }
