@@ -928,7 +928,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "051_chain_swap_creation_terms"
+        "052_chain_swap_manifest_delivery_ledger"
     );
 
     let app = test_app(test_state(pool.clone()));
