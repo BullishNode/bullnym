@@ -2216,6 +2216,9 @@ async fn create_bitcoin_chain_offer(
         .admission
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    let manifest_runtime = state
+        .recovery_manifest_runtime_v1()
+        .ok_or(AppError::MoneyAdmissionUnavailable)?;
 
     pause_at_invoice_integration_test_hook(
         InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
@@ -2282,6 +2285,18 @@ async fn create_bitcoin_chain_offer(
     .await
     .map_err(|e| AppError::DbError(format!("chain refund key reservation failed: {e}")))?;
 
+    // Allocate retry identity before the mutating provider call. The exact ID
+    // follows this provider result through canonical persistence and durable
+    // delivery; it is never regenerated after Boltz has accepted the swap.
+    let manifest_id = Uuid::new_v4();
+    let merchant_policy = crate::swap_manifest::MerchantPolicyReferencesV1::new(
+        invoice.id,
+        swap_nym.expect("chain-swap nym presence checked before allocation"),
+        &merchant_liquid_destination,
+        // #84 owns the append-only emergency-address commitment. Until it
+        // composes, absence must remain explicit rather than defaulted later.
+        None,
+    );
     let result = state
         .boltz
         .create_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
@@ -2302,67 +2317,27 @@ async fn create_bitcoin_chain_offer(
         &public_url,
     );
 
-    let preimage_hex = hex::encode(&result.preimage);
-    let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
-    let refund_key_hex = hex::encode(result.refund_keypair.secret_bytes());
-    let user_lock_amount_sat = i64::try_from(result.user_lock_amount_sat)
-        .map_err(|_| AppError::BoltzError("chain user-lock amount exceeds i64".into()))?;
-    let server_lock_amount_sat = i64::try_from(result.server_lock_amount_sat)
-        .map_err(|_| AppError::BoltzError("chain server-lock amount exceeds i64".into()))?;
-    db::record_chain_swap_with_lineage_and_creation_terms(
+    crate::swap_manifest_persistence::persist_created_chain_swap(
         &state.db,
-        &db::NewChainSwapRecord {
-            invoice_id: invoice.id,
-            nym: swap_nym,
-            boltz_swap_id: &result.swap_id,
-            lockup_address: &result.lockup_address,
-            lockup_bip21: Some(&lockup_bip21),
-            user_lock_amount_sat,
-            server_lock_amount_sat,
-            preimage_hex: &preimage_hex,
-            claim_key_hex: &claim_key_hex,
-            refund_key_hex: &refund_key_hex,
-            boltz_response_json: &result.canonical_response_json,
-            claim_key_index: Some(claim_key_index as i64),
-            refund_key_index: Some(refund_key_index as i64),
-            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
-        },
-        &db::ChainSwapLineage {
-            claim_allocation_id: claim_key_allocation_id,
-            refund_allocation_id: refund_key_allocation_id,
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            claim_public_key_hex: &claim_public_key_hex,
-            refund_public_key_hex: &refund_public_key_hex,
-            preimage_hash_hex: &preimage_hash_hex,
-        },
-        &db::NewChainSwapCreationTerms {
-            pinned_pair_hash: &result.creation_terms.pinned_pair_hash,
-            canonical_pair_quote_json: &result.creation_terms.canonical_pair_quote_json,
-            creation_response_sha256: &result.creation_terms.creation_response_sha256,
-            btc_claim_script_sha256: &result.creation_terms.btc_claim_script_sha256,
-            btc_refund_script_sha256: &result.creation_terms.btc_refund_script_sha256,
-            liquid_claim_script_sha256: &result.creation_terms.liquid_claim_script_sha256,
-            liquid_refund_script_sha256: &result.creation_terms.liquid_refund_script_sha256,
-            btc_timeout_height: i64::from(result.creation_terms.btc_timeout_height),
-            liquid_timeout_height: i64::from(result.creation_terms.liquid_timeout_height),
-            btc_network: result.creation_terms.btc_network,
-            liquid_network: result.creation_terms.liquid_network,
-            liquid_asset_id: &result.creation_terms.liquid_asset_id,
-            merchant_liquid_destination: &merchant_liquid_destination,
-            // #84 owns signed emergency-address registration. Until that
-            // append-only registry exists, creation is valid but explicitly
-            // legacy/manual-recovery rather than v3-complete.
-            merchant_emergency_btc_address: None,
+        manifest_runtime,
+        crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
+            chain_swap: &result,
+            lockup_bip21: &lockup_bip21,
+            lineage: crate::swap_manifest_persistence::CreatedChainSwapLineage {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                claim_allocation_id: claim_key_allocation_id,
+                refund_allocation_id: refund_key_allocation_id,
+                claim_child_index: claim_key_index as i64,
+                refund_child_index: refund_key_index as i64,
+            },
+            merchant_policy: &merchant_policy,
+            manifest_id,
         },
     )
     .await
-    .map_err(|e| {
-        AppError::DbError(format!(
-            "failed to record chain swap {}: {e}",
-            result.swap_id
-        ))
-    })?;
+    .map_err(|error| AppError::DbError(error.to_string()))?;
 
     let offer = BitcoinChainOffer {
         lockup_address: result.lockup_address,
