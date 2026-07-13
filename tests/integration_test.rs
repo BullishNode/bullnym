@@ -542,6 +542,12 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    // Manifest delivery rows reject ordinary DELETE. Isolated test ownership
+    // uses DDL before removing their operational source rows.
+    sqlx::query("TRUNCATE chain_swap_manifest_deliveries")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM watcher_lane_progress")
         .execute(pool)
         .await
@@ -14757,6 +14763,681 @@ async fn recoverable_list_skips_nymless_swap() {
     assert_eq!(body["count"], 1, "NULL-nym swap must be skipped: {body}");
     assert_eq!(body["items"][0]["nym"], "recnymless");
     assert_eq!(body["items"][0]["lockup_address"], "bc1qgood");
+
+    cleanup_db(&pool).await;
+}
+
+// =====================================================================
+// #87: append-only recovery-manifest delivery ledger.
+// =====================================================================
+
+fn manifest_envelope_sha256(envelope: &str) -> String {
+    hex::encode(Sha256::digest(envelope.as_bytes()))
+}
+
+fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
+    let database = error
+        .as_database_error()
+        .unwrap_or_else(|| panic!("expected database error {expected}, got {error}"));
+    assert_eq!(
+        database.code().as_deref(),
+        Some(expected),
+        "unexpected database error: {database}"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn raw_insert_manifest_delivery(
+    pool: &PgPool,
+    manifest_id: uuid::Uuid,
+    chain_swap_id: uuid::Uuid,
+    manifest_sequence: i64,
+    previous_manifest_id: Option<uuid::Uuid>,
+    encrypted_envelope: &str,
+    envelope_sha256: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO chain_swap_manifest_deliveries (\
+             manifest_id, chain_swap_id, manifest_sequence, previous_manifest_id, \
+             encrypted_envelope, envelope_sha256\
+         ) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(manifest_id)
+    .bind(chain_swap_id)
+    .bind(manifest_sequence)
+    .bind(previous_manifest_id)
+    .bind(encrypted_envelope)
+    .bind(envelope_sha256)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn race_manifest_delivery_insert(
+    pool: PgPool,
+    start: Arc<Barrier>,
+    manifest_id: uuid::Uuid,
+    chain_swap_id: uuid::Uuid,
+    encrypted_envelope: &'static str,
+) -> Result<pay_service::db::ChainSwapManifestDelivery, pay_service::db::ManifestDeliveryError> {
+    let mut tx = pool.begin().await?;
+    start.wait().await;
+    let reservation = match pay_service::db::lock_manifest_delivery_tail(&mut tx).await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(error);
+        }
+    };
+    let identity = reservation.identity(manifest_id, chain_swap_id)?;
+    let row =
+        pay_service::db::insert_manifest_delivery(&mut tx, &identity, encrypted_envelope).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+#[tokio::test]
+async fn manifest_delivery_ledger_api_resumes_marks_exactly_and_survives_source_cleanup() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, _, _, swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgerapi",
+        "manifest-ledger-api",
+        "bc1qmanifestledgerapi",
+        1_010,
+        1_000,
+    )
+    .await;
+
+    let envelope = r#"{"ciphertext_hex":"opaque-ledger-envelope-a"}"#;
+    let manifest_id = uuid::Uuid::new_v4();
+    let mut tx = pool.begin().await.unwrap();
+    let reservation = pay_service::db::lock_manifest_delivery_tail(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(reservation.manifest_sequence(), 1);
+    assert_eq!(reservation.previous_manifest_id(), None);
+    let identity = reservation.identity(manifest_id, swap.id).unwrap();
+    let inserted = pay_service::db::insert_manifest_delivery(&mut tx, &identity, envelope)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(inserted.identity(), identity);
+    assert_eq!(inserted.encrypted_envelope(), envelope);
+    assert_eq!(inserted.envelope_sha256, manifest_envelope_sha256(envelope));
+    assert_eq!(inserted.delivery_state, "pending");
+    assert_eq!(inserted.delivered_at_unix, None);
+    let debug = format!("{inserted:?}");
+    assert!(debug.contains("encrypted_envelope: \"<redacted>\""));
+    assert!(!debug.contains(envelope));
+
+    let pending = pay_service::db::list_pending_manifest_deliveries(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].identity(), identity);
+    assert_eq!(pending[0].encrypted_envelope(), envelope);
+
+    let mut blocked = pool.begin().await.unwrap();
+    let error = pay_service::db::lock_manifest_delivery_tail(&mut blocked)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        pay_service::db::ManifestDeliveryError::PendingDelivery {
+            manifest_id: pending_id,
+            chain_swap_id: pending_swap,
+            manifest_sequence: 1,
+        } if pending_id == manifest_id && pending_swap == swap.id
+    ));
+    blocked.rollback().await.unwrap();
+
+    assert!(
+        pay_service::db::mark_manifest_delivered(&pool, &identity, &"00".repeat(32),)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let wrong_identity = pay_service::db::ManifestDeliveryIdentity {
+        chain_swap_id: uuid::Uuid::new_v4(),
+        ..identity
+    };
+    assert!(pay_service::db::mark_manifest_delivered(
+        &pool,
+        &wrong_identity,
+        &inserted.envelope_sha256,
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    let delivered =
+        pay_service::db::mark_manifest_delivered(&pool, &identity, &inserted.envelope_sha256)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(delivered.delivery_state, "delivered");
+    let delivered_at = delivered.delivered_at_unix.expect("delivery timestamp");
+    let retry =
+        pay_service::db::mark_manifest_delivered(&pool, &identity, &inserted.envelope_sha256)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retry.delivered_at_unix, Some(delivered_at));
+    assert!(pay_service::db::list_pending_manifest_deliveries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let audit = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].identity(), identity);
+    assert!(matches!(
+        pay_service::db::list_manifest_delivery_audit(&pool, 0, 0).await,
+        Err(pay_service::db::ManifestDeliveryError::InvalidAuditLimit { .. })
+    ));
+
+    let deleted = sqlx::query("DELETE FROM chain_swap_records WHERE id = $1")
+        .bind(swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
+    let preserved = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved.identity(), identity);
+    assert_eq!(preserved.encrypted_envelope(), envelope);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_ledger_concurrency_serializes_genesis_and_pending_barrier() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, _, _, first_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgerracea",
+        "manifest-ledger-race-a",
+        "bc1qmanifestledgerracea",
+        1_010,
+        1_000,
+    )
+    .await;
+    let (_, _, _, second_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgerraceb",
+        "manifest-ledger-race-b",
+        "bc1qmanifestledgerraceb",
+        1_010,
+        1_000,
+    )
+    .await;
+
+    let start = Arc::new(Barrier::new(2));
+    let first = tokio::spawn(race_manifest_delivery_insert(
+        pool.clone(),
+        start.clone(),
+        uuid::Uuid::new_v4(),
+        first_swap.id,
+        r#"{"ciphertext_hex":"race-a"}"#,
+    ));
+    let second = tokio::spawn(race_manifest_delivery_insert(
+        pool.clone(),
+        start,
+        uuid::Uuid::new_v4(),
+        second_swap.id,
+        r#"{"ciphertext_hex":"race-b"}"#,
+    ));
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(pay_service::db::ManifestDeliveryError::PendingDelivery { .. })
+            ))
+            .count(),
+        1
+    );
+
+    let rows = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].manifest_sequence, 1);
+    assert_eq!(rows[0].previous_manifest_id, None);
+    assert_eq!(rows[0].delivery_state, "pending");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_ledger_refuses_gaps_branches_and_duplicate_predecessors() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, _, _, first_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgertopa",
+        "manifest-ledger-top-a",
+        "bc1qmanifestledgertopa",
+        1_010,
+        1_000,
+    )
+    .await;
+    let (_, _, _, second_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgertopb",
+        "manifest-ledger-top-b",
+        "bc1qmanifestledgertopb",
+        1_010,
+        1_000,
+    )
+    .await;
+    let (_, _, _, third_swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgertopc",
+        "manifest-ledger-top-c",
+        "bc1qmanifestledgertopc",
+        1_010,
+        1_000,
+    )
+    .await;
+
+    let first_manifest = uuid::Uuid::new_v4();
+    let first_envelope = r#"{"ciphertext_hex":"topology-a"}"#;
+    let mut first_tx = pool.begin().await.unwrap();
+    let first_reservation = pay_service::db::lock_manifest_delivery_tail(&mut first_tx)
+        .await
+        .unwrap();
+    let first_identity = first_reservation
+        .identity(first_manifest, first_swap.id)
+        .unwrap();
+    let first_row =
+        pay_service::db::insert_manifest_delivery(&mut first_tx, &first_identity, first_envelope)
+            .await
+            .unwrap();
+    first_tx.commit().await.unwrap();
+    pay_service::db::mark_manifest_delivered(&pool, &first_identity, &first_row.envelope_sha256)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let second_manifest = uuid::Uuid::new_v4();
+    let second_envelope = r#"{"ciphertext_hex":"topology-b"}"#;
+    let second_digest = manifest_envelope_sha256(second_envelope);
+    let gap = raw_insert_manifest_delivery(
+        &pool,
+        second_manifest,
+        second_swap.id,
+        3,
+        Some(first_manifest),
+        second_envelope,
+        &second_digest,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&gap, "23514");
+
+    let wrong_predecessor = raw_insert_manifest_delivery(
+        &pool,
+        second_manifest,
+        second_swap.id,
+        2,
+        Some(uuid::Uuid::new_v4()),
+        second_envelope,
+        &second_digest,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&wrong_predecessor, "23514");
+
+    let mut second_tx = pool.begin().await.unwrap();
+    let second_reservation = pay_service::db::lock_manifest_delivery_tail(&mut second_tx)
+        .await
+        .unwrap();
+    assert_eq!(second_reservation.manifest_sequence(), 2);
+    assert_eq!(
+        second_reservation.previous_manifest_id(),
+        Some(first_manifest)
+    );
+    let second_identity = second_reservation
+        .identity(second_manifest, second_swap.id)
+        .unwrap();
+    let second_row = pay_service::db::insert_manifest_delivery(
+        &mut second_tx,
+        &second_identity,
+        second_envelope,
+    )
+    .await
+    .unwrap();
+    second_tx.commit().await.unwrap();
+    pay_service::db::mark_manifest_delivered(&pool, &second_identity, &second_row.envelope_sha256)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let third_envelope = r#"{"ciphertext_hex":"topology-c"}"#;
+    let third_digest = manifest_envelope_sha256(third_envelope);
+    let branch = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        third_swap.id,
+        3,
+        Some(first_manifest),
+        third_envelope,
+        &third_digest,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&branch, "23514");
+
+    let third_manifest = uuid::Uuid::new_v4();
+    raw_insert_manifest_delivery(
+        &pool,
+        third_manifest,
+        third_swap.id,
+        3,
+        Some(second_manifest),
+        third_envelope,
+        &third_digest,
+    )
+    .await
+    .unwrap();
+
+    // Even a test-owner trigger bypass cannot create two successors for one
+    // predecessor; the unique predecessor constraint is independent.
+    let mut bypass = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *bypass)
+        .await
+        .unwrap();
+    let duplicate_predecessor = sqlx::query(
+        "INSERT INTO chain_swap_manifest_deliveries (\
+             manifest_id, chain_swap_id, manifest_sequence, previous_manifest_id, \
+             encrypted_envelope, envelope_sha256, delivery_state, delivered_at\
+         ) VALUES ($1, $2, 4, $3, $4, $5, 'delivered', NOW())",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(uuid::Uuid::new_v4())
+    .bind(second_manifest)
+    .bind(r#"{"ciphertext_hex":"duplicate-branch"}"#)
+    .bind(manifest_envelope_sha256(
+        r#"{"ciphertext_hex":"duplicate-branch"}"#,
+    ))
+    .execute(&mut *bypass)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&duplicate_predecessor, "23505");
+    assert_eq!(
+        duplicate_predecessor
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_manifest_deliveries_previous_manifest_id_key")
+    );
+    bypass.rollback().await.unwrap();
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_ledger_enforces_bounds_digest_immutability_and_delete_refusal() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, _, _, swap) = seed_merchant_invoice_swap(
+        &pool,
+        "manifestledgerguard",
+        "manifest-ledger-guard",
+        "bc1qmanifestledgerguard",
+        1_010,
+        1_000,
+    )
+    .await;
+
+    let envelope = r#"{"ciphertext_hex":"guarded-envelope"}"#;
+    let digest = manifest_envelope_sha256(envelope);
+    let nonexistent = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        1,
+        None,
+        envelope,
+        &digest,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&nonexistent, "23503");
+
+    let empty = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        1,
+        None,
+        "",
+        &manifest_envelope_sha256(""),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&empty, "23514");
+
+    let oversized = "x".repeat(pay_service::db::MAX_MANIFEST_ENVELOPE_BYTES + 1);
+    let oversized_error = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        1,
+        None,
+        &oversized,
+        &manifest_envelope_sha256(&oversized),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&oversized_error, "23514");
+
+    let uppercase_digest = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        1,
+        None,
+        envelope,
+        &digest.to_uppercase(),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&uppercase_digest, "23514");
+    let mismatch = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        1,
+        None,
+        envelope,
+        &"ab".repeat(32),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&mismatch, "23514");
+    let non_positive = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        -1,
+        None,
+        envelope,
+        &digest,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&non_positive, "23514");
+
+    let manifest_id = uuid::Uuid::new_v4();
+    let mut tx = pool.begin().await.unwrap();
+    let reservation = pay_service::db::lock_manifest_delivery_tail(&mut tx)
+        .await
+        .unwrap();
+    let identity = reservation.identity(manifest_id, swap.id).unwrap();
+    assert!(matches!(
+        pay_service::db::insert_manifest_delivery(&mut tx, &identity, "").await,
+        Err(pay_service::db::ManifestDeliveryError::InvalidEnvelopeSize { actual: 0, .. })
+    ));
+    assert!(matches!(
+        pay_service::db::insert_manifest_delivery(&mut tx, &identity, &oversized).await,
+        Err(pay_service::db::ManifestDeliveryError::InvalidEnvelopeSize { .. })
+    ));
+    let inserted = pay_service::db::insert_manifest_delivery(&mut tx, &identity, envelope)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    for mutation_sql in [
+        "UPDATE chain_swap_manifest_deliveries SET manifest_id = gen_random_uuid() WHERE manifest_id = $1",
+        "UPDATE chain_swap_manifest_deliveries SET chain_swap_id = gen_random_uuid() WHERE manifest_id = $1",
+        "UPDATE chain_swap_manifest_deliveries SET manifest_sequence = manifest_sequence + 1 WHERE manifest_id = $1",
+        "UPDATE chain_swap_manifest_deliveries SET previous_manifest_id = gen_random_uuid() WHERE manifest_id = $1",
+        "UPDATE chain_swap_manifest_deliveries SET envelope_sha256 = repeat('0', 64) WHERE manifest_id = $1",
+        "UPDATE chain_swap_manifest_deliveries SET created_at = created_at + INTERVAL '1 second' WHERE manifest_id = $1",
+    ] {
+        let immutable = sqlx::query(mutation_sql)
+            .bind(manifest_id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_sqlstate(&immutable, "55000");
+    }
+
+    let mutation = sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET encrypted_envelope = $2, envelope_sha256 = $3 \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .bind(r#"{"ciphertext_hex":"mutated"}"#)
+    .bind(manifest_envelope_sha256(r#"{"ciphertext_hex":"mutated"}"#))
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&mutation, "55000");
+
+    let missing_timestamp = sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET delivery_state = 'delivered' \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&missing_timestamp, "55000");
+    let delete = sqlx::query("DELETE FROM chain_swap_manifest_deliveries WHERE manifest_id = $1")
+        .bind(manifest_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_sqlstate(&delete, "55000");
+
+    pay_service::db::mark_manifest_delivered(&pool, &identity, &inserted.envelope_sha256)
+        .await
+        .unwrap()
+        .unwrap();
+    let backwards = sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET delivery_state = 'pending', delivered_at = NULL \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&backwards, "55000");
+
+    // Static uniqueness remains enforced even for the isolated test owner
+    // with ordinary row triggers disabled.
+    let duplicate_envelope = r#"{"ciphertext_hex":"duplicate-static"}"#;
+    let duplicate_digest = manifest_envelope_sha256(duplicate_envelope);
+    let mut duplicate_manifest_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *duplicate_manifest_tx)
+        .await
+        .unwrap();
+    let duplicate_manifest = sqlx::query(
+        "INSERT INTO chain_swap_manifest_deliveries (\
+             manifest_id, chain_swap_id, manifest_sequence, previous_manifest_id, \
+             encrypted_envelope, envelope_sha256, delivery_state, delivered_at\
+         ) VALUES ($1, $2, 2, $3, $4, $5, 'delivered', NOW())",
+    )
+    .bind(manifest_id)
+    .bind(uuid::Uuid::new_v4())
+    .bind(uuid::Uuid::new_v4())
+    .bind(duplicate_envelope)
+    .bind(&duplicate_digest)
+    .execute(&mut *duplicate_manifest_tx)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&duplicate_manifest, "23505");
+    assert_eq!(
+        duplicate_manifest
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_manifest_deliveries_pkey")
+    );
+    duplicate_manifest_tx.rollback().await.unwrap();
+
+    let mut duplicate_sequence_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *duplicate_sequence_tx)
+        .await
+        .unwrap();
+    let duplicate_sequence = sqlx::query(
+        "INSERT INTO chain_swap_manifest_deliveries (\
+             manifest_id, chain_swap_id, manifest_sequence, \
+             encrypted_envelope, envelope_sha256, delivery_state, delivered_at\
+         ) VALUES ($1, $2, 1, $3, $4, 'delivered', NOW())",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(uuid::Uuid::new_v4())
+    .bind(duplicate_envelope)
+    .bind(&duplicate_digest)
+    .execute(&mut *duplicate_sequence_tx)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&duplicate_sequence, "23505");
+    assert_eq!(
+        duplicate_sequence
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_manifest_deliveries_manifest_sequence_key")
+    );
+    duplicate_sequence_tx.rollback().await.unwrap();
+
+    let duplicate_chain_envelope = r#"{"ciphertext_hex":"same-chain-second"}"#;
+    let duplicate_chain = raw_insert_manifest_delivery(
+        &pool,
+        uuid::Uuid::new_v4(),
+        swap.id,
+        2,
+        Some(manifest_id),
+        duplicate_chain_envelope,
+        &manifest_envelope_sha256(duplicate_chain_envelope),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&duplicate_chain, "23505");
+    assert_eq!(
+        duplicate_chain
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_manifest_deliveries_chain_swap_id_key")
+    );
 
     cleanup_db(&pool).await;
 }
