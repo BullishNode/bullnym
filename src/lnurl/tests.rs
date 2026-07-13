@@ -29,9 +29,12 @@ fn rl_gate_rate_limited_becomes_soft() {
         AppError::RateLimitedNetwork,
         AppError::BackendThrottled,
     ] {
+        let expected_code = variant.code();
         let r: Result<(), AppError> = Err(variant);
         match rl_gate(r) {
-            Err(LiquidOutcome::SoftRateLimited) => (),
+            Err(LiquidOutcome::SoftRateLimited(error)) => {
+                assert_eq!(error.code(), expected_code)
+            }
             _ => panic!("rate-limit variant should map to SoftRateLimited"),
         }
     }
@@ -43,7 +46,7 @@ fn rl_gate_too_many_pending_becomes_soft() {
     // graceful response when Liquid cannot reserve another address.
     let r: Result<(), AppError> = Err(AppError::TooManyPendingReservations);
     match rl_gate(r) {
-        Err(LiquidOutcome::SoftRateLimited) => (),
+        Err(LiquidOutcome::SoftRateLimited(AppError::TooManyPendingReservations)) => (),
         _ => panic!("TooManyPendingReservations should map to SoftRateLimited"),
     }
 }

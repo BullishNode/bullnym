@@ -6520,20 +6520,63 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let secp = Secp256k1::new();
     let cached_key = SecretKey::from_slice(&[7; 32]).unwrap();
     let cached_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &cached_key).to_string();
+    let stored_cached_pubkey = cached_pubkey.to_ascii_uppercase();
     let cached_outpoint = format!("{}:0", "11".repeat(32));
-    let cached_index =
-        pay_service::db::allocate_outpoint_address(&pool, nym, &cached_outpoint, &cached_pubkey)
-            .await
-            .unwrap();
+    let cached_index = pay_service::db::allocate_outpoint_address(
+        &pool,
+        nym,
+        &cached_outpoint,
+        &stored_cached_pubkey,
+    )
+    .await
+    .unwrap();
     let expected_address =
         pay_service::descriptor::derive_address(TEST_DESCRIPTOR, cached_index as u32).unwrap();
 
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
     config.boltz.api_url = boltz_url;
+    config.rate_limit.per_ip_limit = 1;
+    config.rate_limit.per_pubkey_limit = 1;
+    config.rate_limit.distinct_nyms_per_ip_limit = 1;
+    config.rate_limit.distinct_nyms_per_outpoint_limit = 1;
+    config.rate_limit.max_pending_reservations_per_nym = 1;
     let proof_tag = config.proof.message_tag.clone();
-    let state = test_state_with_config(pool.clone(), config);
+    let rate_limit_config = config.rate_limit.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), rate_limit_config));
+    state.rate_limiter = rate_limiter.clone();
     state.admission.set_workers_enabled(false);
+
+    let caller = SocketAddr::from(([203, 0, 113, 31], 31_031));
+    let pubkey_bucket = format!("pubkey:{cached_pubkey}");
+    let caller_source = pay_service::ip_whitelist::source_key(caller.ip());
+    let outpoint_source = format!("outpoint:{cached_outpoint}");
+    sqlx::query("DELETE FROM rate_limit_events WHERE bucket = $1")
+        .bind(&pubkey_bucket)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for source in [&caller_source, &outpoint_source] {
+        sqlx::query("DELETE FROM nym_access_events WHERE source_key = $1")
+            .bind(source)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    rate_limiter.check_per_pubkey(&cached_pubkey).await.unwrap();
+    rate_limiter
+        .check_distinct_nyms_per_ip(caller.ip(), "other-nym")
+        .await
+        .unwrap();
+    rate_limiter
+        .check_distinct_nyms_per_outpoint(&cached_outpoint, "other-nym")
+        .await
+        .unwrap();
+    assert!(
+        state.utxo_backend.is_none(),
+        "fixture must prove replay without any configured Liquid backend"
+    );
     let app = test_app(state);
 
     let cursor_before: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
@@ -6562,13 +6605,10 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     };
     let (cached_pubkey, cached_sig) = sign_proof(&cached_key, &cached_outpoint);
     let proof_blinder = "01".repeat(32);
-    let (status, body) = get_path(
-        &app,
-        &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
-        ),
-    )
-    .await;
+    let cached_replay_path = format!(
+        "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+    );
+    let (status, body) = get_path_from(&app, &cached_replay_path, caller).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({"L-BTC": {"address": expected_address}}));
@@ -6594,6 +6634,92 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
         reservations_after_cached, reservations_before,
         "cached Liquid proof changed its reservation"
     );
+    let pubkey_events_after_cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_events WHERE bucket = $1")
+            .bind(&pubkey_bucket)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let caller_fanout_after_cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nym_access_events WHERE source_key = $1")
+            .bind(&caller_source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let outpoint_fanout_after_cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nym_access_events WHERE source_key = $1")
+            .bind(&outpoint_source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pubkey_events_after_cached, 1, "replay spent pubkey budget");
+    assert_eq!(
+        caller_fanout_after_cached, 1,
+        "replay spent caller fanout budget"
+    );
+    assert_eq!(
+        outpoint_fanout_after_cached, 1,
+        "replay spent outpoint fanout budget"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    // The cache fast path remains inside the callback's outer source gate.
+    let (status, body) = get_path_from(&app, &cached_replay_path, caller).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "RateLimitedSender", "{body}");
+
+    // A fresh, cryptographically valid signature by a different key cannot
+    // adopt the cached mapping and must fail before any later gate or mutation.
+    let mismatched_key = SecretKey::from_slice(&[9; 32]).unwrap();
+    let (mismatched_pubkey, mismatched_sig) = sign_proof(&mismatched_key, &cached_outpoint);
+    let mismatched_bucket = format!("pubkey:{mismatched_pubkey}");
+    sqlx::query("DELETE FROM rate_limit_events WHERE bucket = $1")
+        .bind(&mismatched_bucket)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let user_before_mismatch: (i32, Option<String>, bool) = sqlx::query_as(
+        "SELECT next_addr_idx, last_callback_at::TEXT, has_been_used FROM users WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={mismatched_pubkey}&sig={mismatched_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "PubkeyUtxoMismatch", "{body}");
+
+    let user_after_mismatch: (i32, Option<String>, bool) = sqlx::query_as(
+        "SELECT next_addr_idx, last_callback_at::TEXT, has_been_used FROM users WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let reservations_after_mismatch: Vec<(String, i32, Option<String>, bool)> = sqlx::query_as(
+        "SELECT outpoint, addr_index, pubkey, fulfilled FROM outpoint_addresses \
+         WHERE nym = $1 ORDER BY outpoint",
+    )
+    .bind(nym)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mismatched_pubkey_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_events WHERE bucket = $1")
+            .bind(&mismatched_bucket)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(user_after_mismatch, user_before_mismatch);
+    assert_eq!(reservations_after_mismatch, reservations_after_cached);
+    assert_eq!(mismatched_pubkey_events, 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
 
     let uncached_key = SecretKey::from_slice(&[8; 32]).unwrap();
     let uncached_outpoint = format!("{}:1", "22".repeat(32));
@@ -6640,6 +6766,120 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     provider_task.abort();
     let _ = provider_task.await;
 
+    for bucket in [
+        pubkey_bucket,
+        mismatched_bucket,
+        format!("pubkey:{uncached_pubkey}"),
+    ] {
+        sqlx::query("DELETE FROM rate_limit_events WHERE bucket = $1")
+            .bind(bucket)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for source in [caller_source, outpoint_source] {
+        sqlx::query("DELETE FROM nym_access_events WHERE source_key = $1")
+            .bind(source)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn failed_lightning_fallback_returns_original_liquid_throttle_without_retry() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "liquidthrottletruth";
+    create_test_user(&pool, nym).await;
+
+    let secp = Secp256k1::new();
+    let proof_key = SecretKey::from_slice(&[10; 32]).unwrap();
+    let proof_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &proof_key).to_string();
+    let proof_outpoint = format!("{}:0", "33".repeat(32));
+
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    config.rate_limit.per_pubkey_limit = 1;
+    let proof_tag = config.proof.message_tag.clone();
+    let rate_limit_config = config.rate_limit.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), rate_limit_config));
+    state.rate_limiter = rate_limiter.clone();
+    assert!(state.utxo_backend.is_none());
+
+    let pubkey_bucket = format!("pubkey:{proof_pubkey}");
+    sqlx::query("DELETE FROM rate_limit_events WHERE bucket = $1")
+        .bind(&pubkey_bucket)
+        .execute(&pool)
+        .await
+        .unwrap();
+    rate_limiter.check_per_pubkey(&proof_pubkey).await.unwrap();
+    let app = test_app(state);
+
+    let digest =
+        pay_service::utxo::ownership_message_digest(proof_tag.as_bytes(), nym, &proof_outpoint);
+    let proof_sig = hex::encode(
+        secp.sign_ecdsa(&Message::from_digest(digest), &proof_key)
+            .serialize_der(),
+    );
+    let proof_blinder = "01".repeat(32);
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={proof_outpoint}&pubkey={proof_pubkey}&sig={proof_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "status": "ERROR",
+            "code": "RateLimitedSender",
+            "reason": "Request rate limit exceeded for this source. Retry later."
+        }),
+        "failed fallback did not return the original Liquid throttle"
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        1,
+        "Lightning fallback should make exactly one provider attempt"
+    );
+    let pubkey_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_events WHERE bucket = $1")
+            .bind(&pubkey_bucket)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outpoint_addresses WHERE nym = $1")
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let swaps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_records WHERE nym = $1")
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pubkey_events, 2,
+        "expected only the seed and first rejected Liquid attempt; Liquid was retried"
+    );
+    assert_eq!(reservations, 0);
+    assert_eq!(swaps, 0);
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    sqlx::query("DELETE FROM rate_limit_events WHERE bucket = $1")
+        .bind(pubkey_bucket)
+        .execute(&pool)
+        .await
+        .unwrap();
     cleanup_db(&pool).await;
 }
 
