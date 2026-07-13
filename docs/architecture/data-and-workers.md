@@ -14,6 +14,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `invoice_payment_observations` | Non-accounting evidence | Durable exact Bitcoin and Liquid direct-output identity, confirmation, block, verification, and lifecycle evidence written by both live watchers. |
 | `invoice_direct_scan_heads` | Direct-payment ordering | One bounded generation row per invoice/source so an older network completion cannot overwrite a newer-started scan. |
 | `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence written atomically by the live direct-payment reducer and by compatibility-safe Boltz supersession. |
+| `watcher_lane_progress` | Direct-watcher scheduling | Last fully visited `(created_at, invoice id)` rotation offset per direct worker and recent/historical lane. It is never worker-health evidence. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
 | `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
@@ -131,6 +132,16 @@ fail make the worker cycle unhealthy.
 
 Watcher startup covers both active and idle tiers. Each tier freezes a snapshot
 from the database clock and advances through deterministic keyset pages. The
+direct invoice watchers persist their most recently completed row after every
+fully applied or explicitly isolated obligation. A new epoch starts after that
+offset, wraps once through the beginning up to its frozen starting offset, and
+only then completes. A crash before the offset write repeats an idempotent
+obligation; it cannot skip one. The recent lane prioritizes age-new invoices,
+`presentation_status = partial`, and direct settlement that is pending or in
+resolution. Historical is the exact complement inside the eligible set, so the
+lanes are disjoint and old cancelled/expired destinations remain eligible.
+The persisted offset controls rotation only: every new process starts with
+unknown tier health and must complete its own tail-and-wrap traversal. The
 Liquid watcher completes and latches its nym phase before advancing through
 invoice pages, so a large nym set cannot continually restart and starve a large
 invoice set. Each nym also freezes one bounded descriptor/lookahead range and

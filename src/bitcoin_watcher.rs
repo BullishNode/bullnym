@@ -6,11 +6,15 @@
 //! follow-up. Every positive or explicit-regression view is applied through the
 //! direct-payment generation/reducer transaction.
 //!
-//! Two-tier polling balances responsiveness with API budget:
-//! - Active tier (default 30s): invoices created in the last
-//!   `active_window_secs` (default 1h). Most pays land within this window.
-//! - Idle tier (default 5min): older still-unpaid invoices, in case a payer
-//!   broadcasts late or our polls get rate-limited mid-window.
+//! Two persisted scheduling lanes balance responsiveness with restart-safe
+//! fairness and API budget:
+//! - Recent lane (active cadence, default 30s): invoices created in the last
+//!   `active_window_secs` (default 1h), plus partial or direct-settling invoices.
+//! - Historical lane (idle cadence, default 5min): the exact eligible complement,
+//!   including old closed and evidence-bearing invoices.
+//!
+//! Each lane resumes after its durable last-completed row and wraps once through
+//! the beginning before the current process may report that lane healthy.
 //!
 //! Token-bucket guards against runaway requests when many invoices are open
 //! at once: at the configured rate (default 5 RPS) the watcher stops issuing
@@ -36,24 +40,7 @@ use crate::config::BitcoinWatcherConfig;
 use crate::db;
 use crate::rate_limit::TokenBucket;
 
-/// Compact projection of an unpaid/in_progress BTC-accepting invoice — only
-/// the fields the watcher needs to decide and act.
-#[derive(sqlx::FromRow, Debug)]
-struct InvoiceForBtcPoll {
-    id: Uuid,
-    bitcoin_address: String,
-    amount_sat: i64,
-    created_at_cursor: String,
-}
-
-impl InvoiceForBtcPoll {
-    fn scan_cursor(&self) -> db::WatcherScanCursor {
-        db::WatcherScanCursor {
-            created_at: self.created_at_cursor.clone(),
-            id: self.id,
-        }
-    }
-}
+type InvoiceForBtcPoll = db::BitcoinWatcherInvoicePageRow;
 
 /// Minimal subset of the mempool.space `/address/<addr>/txs` response
 /// shape. Fields outside this subset are ignored.
@@ -163,50 +150,6 @@ const MAX_KNOWN_DIRECT_OBSERVATIONS: usize = 128;
 const MAX_KNOWN_DIRECT_TXIDS: usize = 64;
 const MAX_REDUCER_OBSERVATIONS: usize = 128;
 
-const BITCOIN_WATCHER_PAGE_SQL: &str = "SELECT id, bitcoin_address, amount_sat, \
-            created_at::TEXT AS created_at_cursor \
-     FROM invoices \
-     WHERE bitcoin_address IS NOT NULL \
-       AND ( \
-             ( \
-               status IN ('unpaid', 'in_progress', 'partially_paid') \
-               AND accept_btc = TRUE \
-               AND expires_at + ($2 || ' seconds')::interval > $3::timestamptz \
-             ) \
-             OR status IN ('cancelled', 'expired') \
-             OR EXISTS ( \
-               SELECT 1 FROM invoice_payment_observations o \
-               WHERE o.invoice_id = invoices.id \
-                 AND o.source = 'bitcoin_direct' \
-                 AND o.last_seen_state <> 'superseded' \
-             ) \
-             OR EXISTS ( \
-               SELECT 1 FROM invoice_payment_events e \
-               WHERE e.invoice_id = invoices.id \
-                 AND e.source = 'bitcoin_direct' \
-                 AND e.accounting_state <> 'superseded' \
-             ) \
-           ) \
-       AND created_at {cmp} $3::timestamptz - ($1 || ' seconds')::interval \
-       AND created_at <= $3::timestamptz \
-       AND ( \
-             $4::timestamptz IS NULL \
-             OR (created_at, id) > ($4::timestamptz, $5::uuid) \
-           ) \
-     ORDER BY created_at ASC, id ASC \
-     LIMIT $6";
-
-struct InvoicePollBatch {
-    invoices: Vec<InvoiceForBtcPoll>,
-    has_more: bool,
-}
-
-fn truncate_to_watcher_batch<T>(rows: &mut Vec<T>, limit: usize) -> bool {
-    let has_more = rows.len() > limit;
-    rows.truncate(limit);
-    has_more
-}
-
 fn bitcoin_known_evidence_is_hard_bound(known: &[db::BitcoinDirectWatchEvidence]) -> bool {
     known.len() > MAX_KNOWN_DIRECT_OBSERVATIONS
         || known
@@ -230,29 +173,97 @@ enum CycleOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchTier {
-    Active,
-    Idle,
+    Recent,
+    Historical,
+}
+
+impl WatchTier {
+    const fn lane(self) -> db::WatcherLane {
+        match self {
+            Self::Recent => db::WatcherLane::Recent,
+            Self::Historical => db::WatcherLane::Historical,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        self.lane().as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RotationPhase {
+    #[default]
+    AfterSaved,
+    ThroughSaved,
 }
 
 #[derive(Debug, Default)]
 struct BitcoinTierScanEpoch {
-    scan: db::WatcherScanEpoch,
+    snapshot: Option<String>,
+    starting_offset: Option<db::WatcherScanCursor>,
+    cursor: Option<db::WatcherScanCursor>,
+    phase: RotationPhase,
     hard_bound_failure: bool,
 }
 
 impl BitcoinTierScanEpoch {
-    fn note_hard_bound(&mut self, cursor: db::WatcherScanCursor) {
-        self.hard_bound_failure = true;
-        self.scan.advance(cursor);
+    fn snapshot(&self) -> Option<&str> {
+        self.snapshot.as_deref()
     }
 
-    fn finish_outcome(&mut self) -> CycleOutcome {
-        self.scan.finish();
-        if std::mem::take(&mut self.hard_bound_failure) {
-            CycleOutcome::Failed
-        } else {
-            CycleOutcome::Healthy
+    fn cursor(&self) -> Option<&db::WatcherScanCursor> {
+        self.cursor.as_ref()
+    }
+
+    fn wrap_limit(&self) -> Option<&db::WatcherScanCursor> {
+        (self.phase == RotationPhase::ThroughSaved)
+            .then_some(self.starting_offset.as_ref())
+            .flatten()
+    }
+
+    fn begin(&mut self, snapshot: String, starting_offset: Option<db::WatcherScanCursor>) {
+        if self.snapshot.is_some() {
+            return;
         }
+        self.snapshot = Some(snapshot);
+        self.cursor = starting_offset.clone();
+        self.starting_offset = starting_offset;
+        self.phase = RotationPhase::AfterSaved;
+    }
+
+    fn advance(&mut self, cursor: db::WatcherScanCursor) {
+        self.cursor = Some(cursor);
+    }
+
+    fn note_hard_bound(&mut self, cursor: db::WatcherScanCursor) {
+        self.hard_bound_failure = true;
+        self.advance(cursor);
+    }
+
+    /// Finish one bounded keyset phase. A saved offset requires a second phase
+    /// through the beginning up to that frozen boundary before this process can
+    /// report the lane healthy.
+    fn finish_page_range(&mut self) -> Option<CycleOutcome> {
+        if self.phase == RotationPhase::AfterSaved && self.starting_offset.is_some() {
+            self.phase = RotationPhase::ThroughSaved;
+            self.cursor = None;
+            return None;
+        }
+
+        if std::mem::take(&mut self.hard_bound_failure) {
+            self.finish();
+            Some(CycleOutcome::Failed)
+        } else {
+            self.finish();
+            Some(CycleOutcome::Healthy)
+        }
+    }
+
+    fn finish(&mut self) {
+        self.snapshot = None;
+        self.starting_offset = None;
+        self.cursor = None;
+        self.phase = RotationPhase::AfterSaved;
     }
 }
 
@@ -280,8 +291,8 @@ struct TierHealth {
 impl TierHealth {
     fn observe(&mut self, tier: WatchTier, outcome: CycleOutcome) -> ReportAction {
         let (current, other) = match tier {
-            WatchTier::Active => (&mut self.active, self.idle),
-            WatchTier::Idle => (&mut self.idle, self.active),
+            WatchTier::Recent => (&mut self.active, self.idle),
+            WatchTier::Historical => (&mut self.idle, self.active),
         };
         match outcome {
             CycleOutcome::Incomplete => ReportAction::ProgressOnly,
@@ -371,11 +382,11 @@ impl BitcoinWatcher {
             return;
         }
 
-        for (tier, is_active, epoch) in [
-            (WatchTier::Active, true, &mut active_epoch),
-            (WatchTier::Idle, false, &mut idle_epoch),
+        for (tier, epoch) in [
+            (WatchTier::Recent, &mut active_epoch),
+            (WatchTier::Historical, &mut idle_epoch),
         ] {
-            let startup_outcome = self.poll_tier(is_active, &cancel, &reporter, epoch).await;
+            let startup_outcome = self.poll_tier(tier, &cancel, &reporter, epoch).await;
             if cancel.is_cancelled() {
                 reporter.intentional_shutdown();
                 return;
@@ -399,7 +410,7 @@ impl BitcoinWatcher {
                 }
                 _ = active.tick() => {
                     let healthy = self
-                        .poll_tier(true, &cancel, &reporter, &mut active_epoch)
+                        .poll_tier(WatchTier::Recent, &cancel, &reporter, &mut active_epoch)
                         .await;
                     if cancel.is_cancelled() {
                         reporter.intentional_shutdown();
@@ -408,13 +419,13 @@ impl BitcoinWatcher {
                     report_outcome(
                         &reporter,
                         &mut tier_health,
-                        WatchTier::Active,
+                        WatchTier::Recent,
                         healthy,
                     );
                 }
                 _ = idle.tick() => {
                     let healthy = self
-                        .poll_tier(false, &cancel, &reporter, &mut idle_epoch)
+                        .poll_tier(WatchTier::Historical, &cancel, &reporter, &mut idle_epoch)
                         .await;
                     if cancel.is_cancelled() {
                         reporter.intentional_shutdown();
@@ -423,7 +434,7 @@ impl BitcoinWatcher {
                     report_outcome(
                         &reporter,
                         &mut tier_health,
-                        WatchTier::Idle,
+                        WatchTier::Historical,
                         healthy,
                     );
                 }
@@ -431,12 +442,11 @@ impl BitcoinWatcher {
         }
     }
 
-    /// Run one tier's tick. `is_active` selects the active vs idle window
-    /// predicate against `created_at`. The same SQL projects only the
-    /// rows needed for the watcher's hot path.
+    /// Run one scheduling-lane tick. `tier` selects either the canonical
+    /// recent priority predicate or its exact eligible historical complement.
     async fn poll_tier(
         &self,
-        is_active: bool,
+        tier: WatchTier,
         cancel: &CancellationToken,
         reporter: &WorkerReporter,
         epoch: &mut BitcoinTierScanEpoch,
@@ -461,37 +471,75 @@ impl BitcoinWatcher {
             }
         };
 
-        if epoch.scan.snapshot().is_none() {
-            match db::watcher_scan_snapshot(&self.pool).await {
-                Ok(snapshot) => epoch.scan.begin(snapshot),
+        if epoch.snapshot().is_none() {
+            let snapshot = match db::watcher_scan_snapshot(&self.pool).await {
+                Ok(snapshot) => snapshot,
                 Err(e) => {
                     tracing::warn!(
                         event = "bitcoin_watcher_db_error",
-                        is_active = is_active,
+                        lane = tier.label(),
                         "bitcoin_watcher: scan snapshot query failed: {e}"
                     );
                     return CycleOutcome::Failed;
                 }
+            };
+            let starting_offset = match db::load_watcher_lane_cursor(
+                &self.pool,
+                db::WatcherLaneWorker::BitcoinDirect,
+                tier.lane(),
+            )
+            .await
+            {
+                Ok(cursor) => cursor,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "bitcoin_watcher_lane_progress_load_failed",
+                        lane = tier.label(),
+                        "bitcoin_watcher: durable lane offset query failed: {e}"
+                    );
+                    return CycleOutcome::Failed;
+                }
+            };
+            epoch.begin(snapshot, starting_offset);
+
+            match self.fetch_lane_lag(tier, epoch).await {
+                Ok((backlog, oldest_due, oldest_due_lag_secs)) => {
+                    tracing::info!(
+                        event = "bitcoin_watcher_lane_backlog",
+                        lane = tier.label(),
+                        backlog,
+                        oldest_due = ?oldest_due,
+                        oldest_due_lag_secs,
+                        "bitcoin_watcher: frozen lane backlog"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    event = "bitcoin_watcher_lane_backlog_query_failed",
+                    lane = tier.label(),
+                    "bitcoin_watcher: lane lag observation failed: {e}"
+                ),
             }
         }
 
-        let batch = match self.fetch_invoices(is_active, epoch).await {
+        let batch = match self.fetch_invoices(tier, epoch).await {
             Ok(batch) => batch,
             Err(e) => {
                 tracing::warn!(
                     event = "bitcoin_watcher_db_error",
-                    is_active = is_active,
+                    lane = tier.label(),
                     "bitcoin_watcher: invoice list query failed: {e}"
                 );
                 return CycleOutcome::Failed;
             }
         };
-        if batch.invoices.is_empty() {
-            return epoch.finish_outcome();
+        if batch.rows.is_empty() {
+            return epoch
+                .finish_page_range()
+                .unwrap_or(CycleOutcome::Incomplete);
         }
 
         let mut processed_any = false;
-        for inv in batch.invoices {
+        for inv in batch.rows {
             if !should_start_next_invoice(processed_any, self.token_available().await) {
                 // Waiting is reserved for an already-started atomic invoice.
                 // Yield between rows so a large active page cannot monopolize
@@ -507,6 +555,15 @@ impl BitcoinWatcher {
                 .await
             {
                 InvoiceCheckOutcome::Complete => {
+                    if let Err(e) = self.persist_completed_invoice(tier, epoch, &inv).await {
+                        tracing::warn!(
+                            event = "bitcoin_watcher_lane_progress_write_failed",
+                            lane = tier.label(),
+                            invoice_id = %inv.id,
+                            "bitcoin_watcher: completed invoice offset was not persisted: {e}"
+                        );
+                        return CycleOutcome::Failed;
+                    }
                     processed_any = true;
                 }
                 InvoiceCheckOutcome::Incomplete => {
@@ -520,7 +577,25 @@ impl BitcoinWatcher {
                     // this epoch. Retire only its keyset position so later
                     // obligations remain observable, but remember the epoch
                     // failure and never apply its truncated generation.
-                    epoch.note_hard_bound(inv.scan_cursor());
+                    let cursor = inv.scan_cursor();
+                    if let Err(e) = db::persist_watcher_lane_cursor(
+                        &self.pool,
+                        db::WatcherLaneWorker::BitcoinDirect,
+                        tier.lane(),
+                        &cursor,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            event = "bitcoin_watcher_lane_progress_write_failed",
+                            lane = tier.label(),
+                            invoice_id = %inv.id,
+                            hard_bound = true,
+                            "bitcoin_watcher: isolated invoice offset was not persisted: {e}"
+                        );
+                        return CycleOutcome::Failed;
+                    }
+                    epoch.note_hard_bound(cursor);
                     processed_any = true;
                     continue;
                 }
@@ -530,43 +605,75 @@ impl BitcoinWatcher {
                     return CycleOutcome::Failed;
                 }
             }
-            epoch.scan.advance(inv.scan_cursor());
         }
 
         if batch.has_more {
             CycleOutcome::Incomplete
         } else {
-            epoch.finish_outcome()
+            epoch
+                .finish_page_range()
+                .unwrap_or(CycleOutcome::Incomplete)
         }
+    }
+
+    async fn persist_completed_invoice(
+        &self,
+        tier: WatchTier,
+        epoch: &mut BitcoinTierScanEpoch,
+        invoice: &InvoiceForBtcPoll,
+    ) -> Result<(), sqlx::Error> {
+        let cursor = invoice.scan_cursor();
+        db::persist_watcher_lane_cursor(
+            &self.pool,
+            db::WatcherLaneWorker::BitcoinDirect,
+            tier.lane(),
+            &cursor,
+        )
+        .await?;
+        epoch.advance(cursor);
+        Ok(())
     }
 
     async fn fetch_invoices(
         &self,
-        is_active: bool,
+        tier: WatchTier,
         epoch: &BitcoinTierScanEpoch,
-    ) -> Result<InvoicePollBatch, sqlx::Error> {
-        // Active tier: created within last `active_window_secs`.
-        // Idle tier:   created earlier than that. Closed rows remain in their
-        //              age tier because expiry/cancellation suppresses new
-        //              instructions, not late chain evidence.
-        let cmp = if is_active { ">" } else { "<=" };
+    ) -> Result<db::BitcoinWatcherInvoicePage, sqlx::Error> {
+        // The recent lane combines age-new, partial, and direct-settling work.
+        // Historical is the exact eligible complement, retaining old closed
+        // rows because cancellation suppresses instructions, not evidence.
         let snapshot = epoch
-            .scan
             .snapshot()
             .expect("watcher epoch snapshot initialized before page query");
-        let cursor = epoch.scan.cursor();
-        let sql = BITCOIN_WATCHER_PAGE_SQL.replace("{cmp}", cmp);
-        let mut invoices = sqlx::query_as::<_, InvoiceForBtcPoll>(&sql)
-            .bind(self.cfg.active_window_secs)
-            .bind(self.tolerances.payment_grace_secs as i64)
-            .bind(snapshot)
-            .bind(cursor.map(|cursor| cursor.created_at.as_str()))
-            .bind(cursor.map(|cursor| cursor.id))
-            .bind((WATCHER_BATCH_SIZE + 1) as i64)
-            .fetch_all(&self.pool)
-            .await?;
-        let has_more = truncate_to_watcher_batch(&mut invoices, WATCHER_BATCH_SIZE);
-        Ok(InvoicePollBatch { invoices, has_more })
+        db::list_bitcoin_watcher_invoice_page(
+            &self.pool,
+            self.cfg.active_window_secs,
+            self.tolerances.payment_grace_secs as i64,
+            snapshot,
+            tier.lane(),
+            epoch.cursor(),
+            epoch.wrap_limit(),
+            WATCHER_BATCH_SIZE,
+        )
+        .await
+    }
+
+    async fn fetch_lane_lag(
+        &self,
+        tier: WatchTier,
+        epoch: &BitcoinTierScanEpoch,
+    ) -> Result<(i64, Option<String>, i64), sqlx::Error> {
+        let snapshot = epoch
+            .snapshot()
+            .expect("watcher epoch snapshot initialized before lag query");
+        db::bitcoin_watcher_lane_lag(
+            &self.pool,
+            self.cfg.active_window_secs,
+            self.tolerances.payment_grace_secs as i64,
+            snapshot,
+            tier.lane(),
+        )
+        .await
     }
 
     /// Fetch the chain tip from a single endpoint. Transport/non-2xx/parse
@@ -1867,17 +1974,6 @@ mod tests {
         (admission, reporter, TierHealth::default())
     }
 
-    #[test]
-    fn bitcoin_watcher_expiry_membership_is_frozen_at_the_scan_epoch() {
-        assert!(BITCOIN_WATCHER_PAGE_SQL
-            .contains("expires_at + ($2 || ' seconds')::interval > $3::timestamptz"));
-        assert!(BITCOIN_WATCHER_PAGE_SQL.contains("invoice_payment_observations"));
-        assert!(BITCOIN_WATCHER_PAGE_SQL.contains("invoice_payment_events"));
-        assert!(BITCOIN_WATCHER_PAGE_SQL.contains("OR status IN ('cancelled', 'expired')"));
-        assert!(!BITCOIN_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
-        assert!(!BITCOIN_WATCHER_PAGE_SQL.contains("NOW()"));
-    }
-
     fn tx(txid: &str, confirmed: bool, block_height: Option<u32>) -> MempoolTx {
         MempoolTx {
             txid: txid.to_string(),
@@ -3035,23 +3131,6 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_watcher_batch_detects_only_the_sentinel_boundary() {
-        for (fetched, expected_more) in [
-            (WATCHER_BATCH_SIZE - 1, false),
-            (WATCHER_BATCH_SIZE, false),
-            (WATCHER_BATCH_SIZE + 1, true),
-        ] {
-            let mut rows = vec![(); fetched];
-            assert_eq!(
-                truncate_to_watcher_batch(&mut rows, WATCHER_BATCH_SIZE),
-                expected_more,
-                "unexpected has_more for {fetched} fetched rows"
-            );
-            assert_eq!(rows.len(), fetched.min(WATCHER_BATCH_SIZE));
-        }
-    }
-
-    #[test]
     fn invoice_boundary_waits_only_inside_the_first_atomic_obligation() {
         assert!(should_start_next_invoice(false, false));
         assert!(should_start_next_invoice(false, true));
@@ -3059,36 +3138,117 @@ mod tests {
         assert!(should_start_next_invoice(true, true));
     }
 
+    fn rotation_cursor(minute: u32, id: u128) -> db::WatcherScanCursor {
+        db::WatcherScanCursor {
+            created_at: format!("2026-07-12 11:{minute:02}:00+00"),
+            id: Uuid::from_u128(id),
+        }
+    }
+
+    #[test]
+    fn saved_offset_resumes_then_wraps_before_current_process_health() {
+        let saved = rotation_cursor(20, 20);
+        let tail = rotation_cursor(30, 30);
+        let head = rotation_cursor(10, 10);
+        let mut epoch = BitcoinTierScanEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string(), Some(saved.clone()));
+
+        assert_eq!(epoch.cursor(), Some(&saved), "resume after saved offset");
+        assert!(epoch.wrap_limit().is_none());
+        epoch.advance(tail.clone());
+        assert_eq!(epoch.cursor(), Some(&tail));
+
+        assert_eq!(
+            epoch.finish_page_range(),
+            None,
+            "tail completion is progress, not inherited health"
+        );
+        assert!(epoch.cursor().is_none(), "wrap restarts at lane beginning");
+        assert_eq!(epoch.wrap_limit(), Some(&saved));
+        epoch.advance(head);
+
+        assert_eq!(
+            epoch.finish_page_range(),
+            Some(CycleOutcome::Healthy),
+            "only the current process's full tail-and-wrap traversal is healthy"
+        );
+        assert!(epoch.snapshot().is_none());
+    }
+
+    #[test]
+    fn empty_lane_finishes_once_without_offset_and_wraps_once_with_offset() {
+        let mut fresh = BitcoinTierScanEpoch::default();
+        fresh.begin("2026-07-12 12:00:00+00".to_string(), None);
+        assert_eq!(fresh.finish_page_range(), Some(CycleOutcome::Healthy));
+
+        let saved = rotation_cursor(20, 20);
+        let mut resumed = BitcoinTierScanEpoch::default();
+        resumed.begin("2026-07-12 12:00:00+00".to_string(), Some(saved.clone()));
+        assert_eq!(resumed.finish_page_range(), None);
+        assert_eq!(resumed.wrap_limit(), Some(&saved));
+        assert_eq!(resumed.finish_page_range(), Some(CycleOutcome::Healthy));
+    }
+
+    #[test]
+    fn crash_before_progress_write_repeats_without_skipping_later_rows() {
+        let saved = rotation_cursor(10, 10);
+        let applied_but_not_persisted = rotation_cursor(20, 20);
+        let later = rotation_cursor(30, 30);
+
+        // The obligation at :20 committed, but the process crashed before its
+        // separate cursor upsert. A replacement process therefore reloads :10.
+        let mut restarted = BitcoinTierScanEpoch::default();
+        restarted.begin("2026-07-12 12:00:00+00".to_string(), Some(saved.clone()));
+        assert_eq!(restarted.cursor(), Some(&saved));
+        restarted.advance(applied_but_not_persisted.clone());
+        restarted.advance(later.clone());
+        assert_eq!(restarted.cursor(), Some(&later));
+
+        // After persisting :30, another restart begins after it and must wrap
+        // through both :10 and :20 before health. Repetition is permitted;
+        // omission is not.
+        let mut after_persist = BitcoinTierScanEpoch::default();
+        after_persist.begin("2026-07-12 12:05:00+00".to_string(), Some(later.clone()));
+        assert_eq!(after_persist.finish_page_range(), None);
+        assert_eq!(after_persist.wrap_limit(), Some(&later));
+        after_persist.advance(saved);
+        after_persist.advance(applied_but_not_persisted);
+        after_persist.advance(later);
+        assert_eq!(
+            after_persist.finish_page_range(),
+            Some(CycleOutcome::Healthy)
+        );
+    }
+
     #[test]
     fn hard_bound_epoch_visits_later_rows_fails_health_and_retries_next_epoch() {
-        let hard_bound = db::WatcherScanCursor {
-            created_at: "2026-07-12 11:00:00+00".to_string(),
-            id: Uuid::from_u128(1),
-        };
-        let later = db::WatcherScanCursor {
-            created_at: "2026-07-12 11:01:00+00".to_string(),
-            id: Uuid::from_u128(2),
-        };
+        let hard_bound = rotation_cursor(0, 1);
+        let later = rotation_cursor(1, 2);
         let mut epoch = BitcoinTierScanEpoch::default();
-        epoch.scan.begin("2026-07-12 12:00:00+00".to_string());
+        epoch.begin("2026-07-12 12:00:00+00".to_string(), None);
 
         epoch.note_hard_bound(hard_bound.clone());
-        assert_eq!(epoch.scan.cursor(), Some(&hard_bound));
-        epoch.scan.advance(later.clone());
-        assert_eq!(epoch.scan.cursor(), Some(&later));
+        assert_eq!(epoch.cursor(), Some(&hard_bound));
+        epoch.advance(later.clone());
+        assert_eq!(epoch.cursor(), Some(&later));
 
-        let outcome = epoch.finish_outcome();
+        let outcome = epoch.finish_page_range().unwrap();
         assert_eq!(outcome, CycleOutcome::Failed);
-        assert!(epoch.scan.snapshot().is_none());
-        assert!(epoch.scan.cursor().is_none());
+        assert!(epoch.snapshot().is_none());
+        assert!(epoch.cursor().is_none());
         assert!(!epoch.hard_bound_failure);
 
         let (admission, reporter, mut tier_health) = admission_fixture();
-        report_outcome(&reporter, &mut tier_health, WatchTier::Active, outcome);
+        report_outcome(&reporter, &mut tier_health, WatchTier::Recent, outcome);
         assert!(!admission.decision(Rail::DirectBitcoin).allowed());
 
-        epoch.scan.begin("2026-07-12 12:05:00+00".to_string());
-        assert!(epoch.scan.cursor().is_none(), "hard row retries next epoch");
+        // The next epoch starts at the durable final row and wraps through the
+        // hard-bound row; persisted rotation cannot turn isolation into skip.
+        epoch.begin("2026-07-12 12:05:00+00".to_string(), Some(later.clone()));
+        assert_eq!(epoch.cursor(), Some(&later));
+        assert_eq!(epoch.finish_page_range(), None);
+        assert!(epoch.cursor().is_none());
+        assert_eq!(epoch.wrap_limit(), Some(&later));
     }
 
     #[test]
@@ -3096,14 +3256,14 @@ mod tests {
         let (admission, reporter, mut tier_health) = admission_fixture();
 
         assert_eq!(
-            TierHealth::default().observe(WatchTier::Active, CycleOutcome::Incomplete),
+            TierHealth::default().observe(WatchTier::Recent, CycleOutcome::Incomplete),
             ReportAction::ProgressOnly
         );
 
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Incomplete,
         );
 
@@ -3117,7 +3277,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
         assert_eq!(tier_health.active, TierState::Healthy);
@@ -3127,7 +3287,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Idle,
+            WatchTier::Historical,
             CycleOutcome::Healthy,
         );
         assert!(admission.decision(Rail::DirectBitcoin).allowed());
@@ -3137,13 +3297,13 @@ mod tests {
     fn incomplete_page_does_not_mutate_tier_failure_or_recovery_latch() {
         let mut tier_health = TierHealth::default();
         assert_eq!(
-            tier_health.observe(WatchTier::Idle, CycleOutcome::Failed),
+            tier_health.observe(WatchTier::Historical, CycleOutcome::Failed),
             ReportAction::Failure
         );
         assert_eq!(tier_health.idle, TierState::Failed);
 
         assert_eq!(
-            tier_health.observe(WatchTier::Idle, CycleOutcome::Incomplete),
+            tier_health.observe(WatchTier::Historical, CycleOutcome::Incomplete),
             ReportAction::ProgressOnly
         );
         assert_eq!(tier_health.idle, TierState::Failed);
@@ -3196,13 +3356,13 @@ mod tests {
         // The lazy pool has no server behind it. The tip probe must run before
         // any empty/page lookup can short-circuit the tier as healthy.
         let outcome = watcher
-            .poll_tier(true, &cancel, &reporter, &mut epoch)
+            .poll_tier(WatchTier::Recent, &cancel, &reporter, &mut epoch)
             .await;
         server.await.expect("counting tip server");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(outcome, CycleOutcome::Failed);
-        report_outcome(&reporter, &mut tier_health, WatchTier::Active, outcome);
+        report_outcome(&reporter, &mut tier_health, WatchTier::Recent, outcome);
         assert_eq!(tier_health.active, TierState::Failed);
         assert!(!admission.decision(Rail::DirectBitcoin).allowed());
     }
@@ -3280,7 +3440,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
 
@@ -3288,14 +3448,14 @@ mod tests {
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Idle,
+                WatchTier::Historical,
                 CycleOutcome::Failed,
             );
             if attempt < 3 {
                 report_outcome(
                     &reporter,
                     &mut tier_health,
-                    WatchTier::Active,
+                    WatchTier::Recent,
                     CycleOutcome::Healthy,
                 );
             }
@@ -3310,20 +3470,20 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
         for _ in 0..3 {
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Idle,
+                WatchTier::Historical,
                 CycleOutcome::Failed,
             );
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Active,
+                WatchTier::Recent,
                 CycleOutcome::Healthy,
             );
         }
@@ -3332,14 +3492,14 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Idle,
+            WatchTier::Historical,
             CycleOutcome::Healthy,
         );
         assert!(!admission.decision(Rail::DirectBitcoin).allowed());
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
 
