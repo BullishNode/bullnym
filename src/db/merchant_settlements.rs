@@ -1525,3 +1525,160 @@ fn parse_path(path: &str) -> Result<MerchantSettlementPath, MerchantSettlementRe
 fn parse_txid(txid: &str) -> Result<SettlementTxid, MerchantSettlementRepositoryError> {
     SettlementTxid::parse(txid).map_err(|_| MerchantSettlementRepositoryError::InvalidCheckpoint)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merchant_settlement_lifecycle::{
+        apply_settlement_evidence, MerchantSettlementLifecycle, SettlementEvidence,
+    };
+
+    const TXID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BLOCK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BLOCK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ASSET: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const BLINDING_KEY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    fn journal(purpose: &str, txid: &str) -> MerchantSettlementJournalRow {
+        MerchantSettlementJournalRow {
+            id: Uuid::from_u128(if purpose == "liquid_claim_replacement" {
+                2
+            } else {
+                1
+            }),
+            chain_swap_id: Uuid::from_u128(3),
+            purpose: purpose.to_owned(),
+            replaces_txid: (purpose == "liquid_claim_replacement").then(|| TXID.to_owned()),
+            raw_transaction: vec![1, 2, 3],
+            txid: txid.to_owned(),
+            source_prevouts: Vec::new(),
+            destination_address: "el1qqmerchant".to_owned(),
+            destination_script_hex: "0014abcd".to_owned(),
+            asset: MerchantAsset::Liquid(ASSET.to_owned()),
+            destination_amount_sat: 50_000,
+            destination_vout: 0,
+            fee_amount_sat: 200,
+            fee_rate_sat_vb: 1.5,
+            liquid_blinding_key_hex: Some(BLINDING_KEY.to_owned()),
+            status: "constructed".to_owned(),
+        }
+    }
+
+    #[test]
+    fn select_journals_rejects_cross_path_families() {
+        let liquid = journal("liquid_claim", TXID);
+        let bitcoin = journal(
+            "btc_recovery",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        );
+
+        assert!(matches!(
+            select_journals(
+                MerchantSettlementPath::LiquidClaim,
+                vec![liquid.clone(), bitcoin.clone()]
+            ),
+            Err(MerchantSettlementRepositoryError::MissingJournal)
+        ));
+        assert!(matches!(
+            select_journals(
+                MerchantSettlementPath::BitcoinRecovery,
+                vec![bitcoin, liquid]
+            ),
+            Err(MerchantSettlementRepositoryError::MissingJournal)
+        ));
+    }
+
+    #[test]
+    fn select_journals_rejects_replacement_destination_and_confidential_identity_changes() {
+        let original = journal("liquid_claim", TXID);
+        let replacement_txid = "2222222222222222222222222222222222222222222222222222222222222222";
+        let valid_replacement = journal("liquid_claim_replacement", replacement_txid);
+        assert!(select_journals(
+            MerchantSettlementPath::LiquidClaim,
+            vec![original.clone(), valid_replacement.clone()]
+        )
+        .is_ok());
+
+        let mut mismatches = Vec::new();
+        let mut address = valid_replacement.clone();
+        address.destination_address = "el1qqdifferent".to_owned();
+        mismatches.push(address);
+        let mut script = valid_replacement.clone();
+        script.destination_script_hex = "0014dcba".to_owned();
+        mismatches.push(script);
+        let mut asset = valid_replacement.clone();
+        asset.asset = MerchantAsset::Liquid(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+        );
+        mismatches.push(asset);
+        let mut blinding = valid_replacement;
+        blinding.liquid_blinding_key_hex =
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned());
+        mismatches.push(blinding);
+
+        for replacement in mismatches {
+            assert!(matches!(
+                select_journals(
+                    MerchantSettlementPath::LiquidClaim,
+                    vec![original.clone(), replacement]
+                ),
+                Err(MerchantSettlementRepositoryError::MissingJournal)
+            ));
+        }
+    }
+
+    #[test]
+    fn previous_confirmation_uses_new_block_after_reconfirmation() {
+        let policy = SettlementFinalityPolicy::new(2, 3).unwrap();
+        let txid = SettlementTxid::parse(TXID).unwrap();
+        let lifecycle = MerchantSettlementLifecycle::new(SettlementChain::Liquid, txid.clone());
+        let block_a = SettlementBlock::new(100, BLOCK_A).unwrap();
+        let confirmed = apply_settlement_evidence(
+            &lifecycle,
+            &SettlementEvidence::Confirmed {
+                txid: txid.clone(),
+                block: block_a.clone(),
+                confirmations: 1,
+            },
+            policy,
+        )
+        .unwrap()
+        .lifecycle;
+        let reorged = apply_settlement_evidence(
+            &confirmed,
+            &SettlementEvidence::Reorged {
+                txid: txid.clone(),
+                previous_block: block_a,
+            },
+            policy,
+        )
+        .unwrap()
+        .lifecycle;
+        assert_eq!(
+            previous_confirmation(reorged.snapshot()),
+            MerchantSettlementPreviousConfirmation::Reorged {
+                previous_block_height: 100,
+                previous_block_hash: BLOCK_A.to_owned(),
+            }
+        );
+
+        let reconfirmed = apply_settlement_evidence(
+            &reorged,
+            &SettlementEvidence::Confirmed {
+                txid,
+                block: SettlementBlock::new(101, BLOCK_B).unwrap(),
+                confirmations: 1,
+            },
+            policy,
+        )
+        .unwrap()
+        .lifecycle;
+        assert_eq!(
+            previous_confirmation(reconfirmed.snapshot()),
+            MerchantSettlementPreviousConfirmation::Confirmed {
+                block_height: 101,
+                block_hash: BLOCK_B.to_owned(),
+            }
+        );
+    }
+}
