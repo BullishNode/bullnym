@@ -163,6 +163,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Boltz client URL is invalid; new swap admission is closed"
         );
     }
+    match boltz_service.refresh_provider_limits().await {
+        pay_service::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated => {
+            tracing::info!(event = "provider_limits_startup_updated");
+        }
+        pay_service::provider_limits_runtime::ProviderLimitRefreshOutcome::Invalid(error) => {
+            tracing::error!(
+                event = "provider_limits_startup_invalid",
+                reason = %error,
+                "Lightning Address provider-limit snapshot is invalid"
+            );
+        }
+        pay_service::provider_limits_runtime::ProviderLimitRefreshOutcome::FetchFailed => {
+            tracing::warn!(
+                event = "provider_limits_startup_failed",
+                "Lightning Address starts unavailable until a refresh succeeds"
+            );
+        }
+    }
 
     // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
     let whitelist = ip_whitelist::IpWhitelist::parse(&config.rate_limit.ip_whitelist)
@@ -410,6 +428,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
+    let _provider_limits_refresh_task = boltz.spawn_provider_limits_refresh(cancel.clone());
+    tracing::info!(
+        event = "provider_limits_refresh_started",
+        cadence_secs =
+            pay_service::provider_limits_runtime::PROVIDER_LIMIT_REFRESH_CADENCE.as_secs(),
+        maximum_age_secs =
+            pay_service::provider_limits_runtime::PROVIDER_LIMIT_MAXIMUM_AGE.as_secs(),
+        "provider-limit refresh started"
+    );
     {
         let pool = pool.clone();
         let fingerprint = swap_key_root_fingerprint.clone();

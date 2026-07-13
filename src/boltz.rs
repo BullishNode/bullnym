@@ -452,6 +452,7 @@ pub struct BoltzService {
     api: Option<BoltzApiClientV2>,
     swap_master_key: SwapMasterKey,
     webhook_url: Option<String>,
+    provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime,
     /// Fast-fails user-facing swap creation during a Boltz outage instead of
     /// letting every call stall to the client timeout. See issue #31.
     breaker: crate::boltz_breaker::BoltzBreaker,
@@ -480,12 +481,62 @@ impl BoltzService {
             api,
             swap_master_key,
             webhook_url,
+            provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime::new(),
             breaker: crate::boltz_breaker::BoltzBreaker::default(),
         }
     }
 
     pub fn client_ready(&self) -> bool {
         self.api.is_some()
+    }
+
+    /// Shared provider-limit reader. Calls on this value are in-memory only.
+    pub fn provider_limits(&self) -> &crate::provider_limits_runtime::ProviderLimitsRuntime {
+        &self.provider_limits
+    }
+
+    async fn fetch_btc_to_lbtc_reverse_pair(
+        &self,
+    ) -> Result<Option<boltz_client::swaps::boltz::ReversePair>, ()> {
+        let Some(api) = self.api.as_ref() else {
+            return Err(());
+        };
+        api.get_reverse_pairs()
+            .await
+            .map(|pairs| pairs.get_btc_to_lbtc_pair())
+            .map_err(|_| ())
+    }
+
+    /// Perform the startup refresh and timestamp it only after the response
+    /// future has completed. Error details are deliberately not retained.
+    pub async fn refresh_provider_limits(
+        &self,
+    ) -> crate::provider_limits_runtime::ProviderLimitRefreshOutcome {
+        let result = self.fetch_btc_to_lbtc_reverse_pair().await;
+        self.provider_limits
+            .record_fetch_result(result, std::time::Instant::now())
+    }
+
+    /// Spawn the sole periodic reverse-pair refresh loop for this service.
+    pub fn spawn_provider_limits_refresh(
+        self: &std::sync::Arc<Self>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = std::sync::Arc::clone(self);
+        let runtime = self.provider_limits.clone();
+        tokio::spawn(async move {
+            let fetch_service = std::sync::Arc::clone(&service);
+            crate::provider_limits_runtime::run_periodic_refresh(
+                runtime,
+                cancel,
+                move || {
+                    let service = std::sync::Arc::clone(&fetch_service);
+                    async move { service.fetch_btc_to_lbtc_reverse_pair().await }
+                },
+                std::time::Instant::now,
+            )
+            .await;
+        })
     }
 
     /// Private in-process operations snapshot for #68. This state is not part
@@ -767,6 +818,7 @@ mod tests {
     use boltz_client::swaps::boltz::{ChainSwapDetails, SwapTree, SwapType};
     use boltz_client::{ZKKeyPair, ZKSecp256k1};
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     const TEST_MNEMONIC: &str =
@@ -883,6 +935,112 @@ mod tests {
             request,
             task,
         }
+    }
+
+    #[derive(Clone)]
+    struct ReversePairsFixtureState {
+        response: Value,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct ReversePairsFixture {
+        base_url: String,
+        calls: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ReversePairsFixture {
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    async fn reverse_pairs_handler(State(state): State<ReversePairsFixtureState>) -> Json<Value> {
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        Json(state.response)
+    }
+
+    async fn spawn_reverse_pairs_fixture(response: Value) -> ReversePairsFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/swap/reverse", get(reverse_pairs_handler))
+            .with_state(ReversePairsFixtureState {
+                response,
+                calls: calls.clone(),
+            });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ReversePairsFixture {
+            base_url: format!("http://{address}"),
+            calls,
+            task,
+        }
+    }
+
+    fn reverse_pair_response() -> Value {
+        json!({
+            "BTC": {
+                "L-BTC": {
+                    "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "rate": 1.0,
+                    "limits": {"minimal": 100, "maximal": 1_000},
+                    "fees": {
+                        "percentage": 0.25,
+                        "minerFees": {"lockup": 27, "claim": 20}
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn reverse_pair_refresh_uses_exact_pinned_sdk_adapter_once() {
+        let fixture = spawn_reverse_pairs_fixture(reverse_pair_response()).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        let before = std::time::Instant::now();
+
+        let outcome = service.refresh_provider_limits().await;
+        let after = std::time::Instant::now();
+
+        assert_eq!(
+            outcome,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let range = service
+            .provider_limits()
+            .lightning_address_range(50_000, 2_000_000)
+            .unwrap();
+        assert_eq!(range.limits_msat(), (100_000, 1_000_000));
+        let observed_at = range.snapshot_evidence().2;
+        assert!(observed_at >= before);
+        assert!(observed_at <= after);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn successful_reverse_response_without_exact_pair_is_invalid() {
+        let fixture = spawn_reverse_pairs_fixture(json!({"BTC": {}})).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Invalid(
+                crate::provider_limits::ReversePairValidationError::ExactPairMissing
+            )
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            service.provider_limits().snapshot(),
+            crate::provider_limits::ReversePairSnapshotState::Invalid(
+                crate::provider_limits::ReversePairValidationError::ExactPairMissing
+            )
+        ));
+        fixture.shutdown().await;
     }
 
     fn dynamic_chain_creation_response(

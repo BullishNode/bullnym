@@ -140,6 +140,7 @@ fn is_lower_hex_32(value: &str) -> bool {
 /// Stable reasons a provider observation cannot safely drive an offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReversePairValidationError {
+    ExactPairMissing,
     WrongPair,
     InvalidPairHash,
     InvalidPairRate,
@@ -154,6 +155,7 @@ pub enum ReversePairValidationError {
 impl fmt::Display for ReversePairValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code = match self {
+            Self::ExactPairMissing => "exact_pair_missing",
             Self::WrongPair => "wrong_pair",
             Self::InvalidPairHash => "invalid_pair_hash",
             Self::InvalidPairRate => "invalid_pair_rate",
