@@ -7,12 +7,13 @@ use uuid::Uuid;
 
 use pay_service::db::{
     load_local_chain_swap_recovery_snapshot_v1, ChainSwapLineage, ChainSwapRecord,
-    LocalRecoverySnapshotReadErrorV1, NewChainSwapCreationTerms, NewChainSwapRecord,
-    NewSwapKeyAllocation, SwapKeyPurpose, DERIVATION_SCHEME_VERSION,
+    LocalRecoverySnapshotReadErrorV1, NewChainSwapCreationEvidence, NewChainSwapCreationTerms,
+    NewChainSwapRecord, NewSwapKeyAllocation, SwapKeyPurpose, DERIVATION_SCHEME_VERSION,
 };
 
 use super::{
-    cleanup_db, create_test_user, insert_test_invoice, record_pre_050_chain_fixture, test_pool,
+    cleanup_db, create_test_user, insert_test_invoice, insert_test_recovery_commitment,
+    record_pre_050_chain_fixture, test_pool, RECOVERY_COMMITMENT_P2WPKH,
 };
 
 #[derive(Clone)]
@@ -113,7 +114,7 @@ fn creation_terms(creation_response_sha256: &str) -> NewChainSwapCreationTerms<'
         liquid_network: "liquid",
         liquid_asset_id: "6f0279e9ed041c3d710a9f57d0c02928416413f827c37bf6833e2407092ff84d",
         merchant_liquid_destination: "lq1qqsnapshotfixturemerchantdestination",
-        merchant_emergency_btc_address: None,
+        merchant_emergency_btc_address: Some(RECOVERY_COMMITMENT_P2WPKH),
     }
 }
 
@@ -124,12 +125,13 @@ async fn insert_modern_chain_swap(
     boltz_swap_id: &str,
     pair: &AllocationPair,
     creation_response_sha256: &str,
+    recovery_address_commitment_id: Uuid,
 ) -> ChainSwapRecord {
     let preimage_hex = lower_hash(0xc1);
     let claim_key_hex = lower_hash(0xc2);
     let refund_key_hex = lower_hash(0xc3);
     let response = format!(r#"{{"id":"{boltz_swap_id}"}}"#);
-    pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         pool,
         &NewChainSwapRecord {
             invoice_id,
@@ -156,7 +158,10 @@ async fn insert_modern_chain_swap(
             refund_public_key_hex: &pair.refund_public_key_hex,
             preimage_hash_hex: &pair.claim_preimage_sha256,
         },
-        &creation_terms(creation_response_sha256),
+        &NewChainSwapCreationEvidence {
+            creation_terms: creation_terms(creation_response_sha256),
+            recovery_address_commitment_id: Some(recovery_address_commitment_id),
+        },
     )
     .await
     .unwrap()
@@ -195,6 +200,8 @@ async fn local_chain_swap_recovery_snapshot_projects_complete_rows_and_allocator
 
     let nym = "snapshotadapter";
     let npub = create_test_user(&pool, nym).await;
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0xa1).await;
     let first_invoice = insert_test_invoice(&pool, nym, &npub, "lq1snapshotfirst", 3_600).await;
     let second_invoice = insert_test_invoice(&pool, nym, &npub, "lq1snapshotsecond", 3_600).await;
     let legacy_invoice = insert_test_invoice(&pool, nym, &npub, "lq1snapshotlegacy", 3_600).await;
@@ -209,6 +216,7 @@ async fn local_chain_swap_recovery_snapshot_projects_complete_rows_and_allocator
         "SNAPSHOTSECOND",
         &second_pair,
         &lower_hash(0xb2),
+        recovery_address_commitment_id,
     )
     .await;
     let first_pair = reserve_pair(&pool, "1111111111111111", 1, 10, 11, 0xa1).await;
@@ -219,6 +227,7 @@ async fn local_chain_swap_recovery_snapshot_projects_complete_rows_and_allocator
         "SNAPSHOTFIRST",
         &first_pair,
         &lower_hash(0xb1),
+        recovery_address_commitment_id,
     )
     .await;
 
@@ -323,6 +332,7 @@ async fn insert_replica_chain_swap(
     boltz_swap_id: &str,
     pair: &AllocationPair,
     creation_response_sha256: &str,
+    recovery_address_commitment_id: Uuid,
 ) {
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
@@ -341,14 +351,15 @@ async fn insert_replica_chain_swap(
              btc_claim_script_sha256, btc_refund_script_sha256, \
              liquid_claim_script_sha256, liquid_refund_script_sha256, \
              btc_timeout_height, liquid_timeout_height, btc_network, liquid_network, \
-             liquid_asset_id, merchant_liquid_destination \
+             liquid_asset_id, merchant_liquid_destination, \
+             merchant_emergency_btc_address, recovery_address_commitment_id \
          ) VALUES ( \
              $1, $2, $3, 'BTC', 'L-BTC', 'bc1qreplicasnapshot', 25431, 25000, \
              repeat('a', 64), repeat('b', 64), repeat('c', 64), '{}', \
              $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, repeat('1', 64), '{}', \
              $13, repeat('3', 64), repeat('4', 64), repeat('5', 64), repeat('6', 64), \
              958033, 3972215, 'bitcoin', 'liquid', repeat('7', 64), \
-             'lq1qqreplicasnapshotdestination' \
+             'lq1qqreplicasnapshotdestination', $14, $15 \
          )",
     )
     .bind(invoice_id)
@@ -364,6 +375,8 @@ async fn insert_replica_chain_swap(
     .bind(&pair.refund_public_key_hex)
     .bind(&pair.claim_preimage_sha256)
     .bind(creation_response_sha256)
+    .bind(RECOVERY_COMMITMENT_P2WPKH)
+    .bind(recovery_address_commitment_id)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -377,6 +390,8 @@ async fn local_chain_swap_recovery_snapshot_is_one_repeatable_read_view() {
 
     let nym = "snapshotcoherent";
     let npub = create_test_user(&pool, nym).await;
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0xa2).await;
     let first_invoice = insert_test_invoice(&pool, nym, &npub, "lq1coherentfirst", 3_600).await;
     let second_invoice = insert_test_invoice(&pool, nym, &npub, "lq1coherentsecond", 3_600).await;
     let first_pair = reserve_pair(&pool, "3333333333333333", 1, 100, 31, 0xe1).await;
@@ -387,6 +402,7 @@ async fn local_chain_swap_recovery_snapshot_is_one_repeatable_read_view() {
         "SNAPSHOTCOHERENTFIRST",
         &first_pair,
         &lower_hash(0xf1),
+        recovery_address_commitment_id,
     )
     .await;
     let second_pair = reserve_pair(&pool, "3333333333333333", 1, 102, 33, 0xe2).await;
@@ -440,6 +456,7 @@ async fn local_chain_swap_recovery_snapshot_is_one_repeatable_read_view() {
             "SNAPSHOTCOHERENTSECOND",
             &second_pair,
             &lower_hash(0xf2),
+            recovery_address_commitment_id,
         ),
     )
     .await
@@ -552,6 +569,8 @@ async fn local_chain_swap_recovery_snapshot_rejects_corrupt_registry_without_lea
 
     let nym = "snapshotcorrupt";
     let npub = create_test_user(&pool, nym).await;
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0xa3).await;
     let invoice = insert_test_invoice(&pool, nym, &npub, "lq1snapshotcorrupt", 3_600).await;
     let pair = reserve_pair(&pool, "5555555555555555", 1, 200, 41, 0xd1).await;
     const SENTINEL: &str = "OperationalProviderIdentifierMustNotEscape";
@@ -562,6 +581,7 @@ async fn local_chain_swap_recovery_snapshot_rejects_corrupt_registry_without_lea
         "SNAPSHOT-CORRUPT",
         &pair,
         &lower_hash(0xd2),
+        recovery_address_commitment_id,
     )
     .await;
 

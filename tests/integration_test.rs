@@ -981,8 +981,15 @@ fn test_recovery_manifest_runtime() -> Arc<RecoveryManifestRuntimeV1> {
     )
 }
 
+fn in_memory_recovery_manifest_runtime() -> Arc<RecoveryManifestRuntimeV1> {
+    Arc::new(RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    ))
+}
+
 async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
-    create_test_user(pool, nym).await;
+    let npub = create_test_user(pool, nym).await;
+    insert_test_recovery_commitment(pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x84).await;
     pay_service::db::upsert_donation_page(
         pool,
         &pay_service::db::UpsertDonationPage {
@@ -2769,8 +2776,11 @@ async fn manifest_staging_evidence_reads_exact_public_lineage_and_fails_on_dangl
     const PRIVATE_REFUND_KEY_CANARY: &str =
         "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
     const PROVIDER_RESPONSE_CANARY: &str = "{\"private_provider_response\":\"must-not-load\"}";
-    let creation_terms = valid_chain_swap_creation_terms_fixture();
-    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x97).await;
+    let mut creation_terms = valid_chain_swap_creation_terms_fixture();
+    creation_terms.merchant_emergency_btc_address = Some(RECOVERY_COMMITMENT_P2WPKH);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: invoice.id,
@@ -2797,7 +2807,10 @@ async fn manifest_staging_evidence_reads_exact_public_lineage_and_fails_on_dangl
             refund_public_key_hex: &refund_public_key,
             preimage_hash_hex: &preimage_hash,
         },
-        &creation_terms,
+        &pay_service::db::NewChainSwapCreationEvidence {
+            creation_terms,
+            recovery_address_commitment_id: Some(recovery_address_commitment_id),
+        },
     )
     .await
     .unwrap();
@@ -19476,7 +19489,8 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
-    let state = test_state_with_config(pool.clone(), config);
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
 
     let returned = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
@@ -19536,7 +19550,8 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .await;
     let mut first_config = test_config();
     first_config.boltz.api_url = first_provider.base_url.clone();
-    let first_state = test_state_with_config(pool.clone(), first_config);
+    let mut first_state = test_state_with_config(pool.clone(), first_config);
+    first_state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &first_state,
         Some(nym),
@@ -19579,7 +19594,8 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .await;
     let mut second_config = test_config();
     second_config.boltz.api_url = second_provider.base_url.clone();
-    let second_state = test_state_with_config(pool.clone(), second_config);
+    let mut second_state = test_state_with_config(pool.clone(), second_config);
+    second_state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &second_state,
         Some(nym),
