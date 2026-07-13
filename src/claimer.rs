@@ -2439,15 +2439,19 @@ async fn claim_chain_swap_inner(
     let claim_clients = claim_clients.ok_or_else(|| {
         AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
     })?;
+    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
+        .map_err(|error| {
+            AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
+        })?;
+    // Malformed persisted provider evidence remains diagnosable without a
+    // chain backend, but every valid claim path must have authoritative source
+    // evidence before invoice loading, transaction construction, or a provider
+    // interaction can occur.
     let backend = utxo_backend.ok_or_else(|| {
         AppError::ClaimError(
             "Liquid source-evidence backend is unavailable for pre-broadcast journaling".into(),
         )
     })?;
-    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
-        .map_err(|error| {
-            AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
-        })?;
     let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
         .await
         .map_err(|error| AppError::DbError(error.to_string()))?
