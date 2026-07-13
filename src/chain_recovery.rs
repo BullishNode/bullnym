@@ -278,14 +278,15 @@ pub(crate) async fn execute_journaled_recovery(
         .fee_runtime
         .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
         .ok();
+    let construction_fee = match fee_decision.as_ref() {
+        Some((decision, record)) => RecoveryConstructionFee::new(decision, record),
+        None => RecoveryConstructionFee::unavailable(),
+    };
     execute_journaled_recovery_with_builder_fee(
         &state.db,
         chain_swap_id,
         &builder,
-        fee_decision
-            .as_ref()
-            .map(|(decision, _)| BitcoinBuilderFeeDecision::from(decision)),
-        fee_decision.as_ref().map(|(_, record)| record),
+        construction_fee,
         evidence,
         &broadcaster,
         &NoRecoveryFaults,
@@ -335,12 +336,15 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
     let fee_record = fee_decision
         .map(bitcoin_fee_record_for_compatibility_seam)
         .transpose()?;
+    let construction_fee = match fee_decision.zip(fee_record.as_ref()) {
+        Some((decision, record)) => RecoveryConstructionFee::new(decision, record),
+        None => RecoveryConstructionFee::unavailable(),
+    };
     execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
         builder,
-        fee_decision.map(BitcoinBuilderFeeDecision::from),
-        fee_record.as_ref(),
+        construction_fee,
         evidence,
         broadcaster,
         faults,
@@ -348,12 +352,32 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
     .await
 }
 
+struct RecoveryConstructionFee<'a> {
+    builder_decision: Option<BitcoinBuilderFeeDecision>,
+    record: Option<&'a FeeDecisionRecord>,
+}
+
+impl<'a> RecoveryConstructionFee<'a> {
+    fn new(decision: &BitcoinFeeDecision, record: &'a FeeDecisionRecord) -> Self {
+        Self {
+            builder_decision: Some(BitcoinBuilderFeeDecision::from(decision)),
+            record: Some(record),
+        }
+    }
+
+    const fn unavailable() -> Self {
+        Self {
+            builder_decision: None,
+            record: None,
+        }
+    }
+}
+
 async fn execute_journaled_recovery_with_builder_fee(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
-    fee_decision: Option<BitcoinBuilderFeeDecision>,
-    fee_record: Option<&FeeDecisionRecord>,
+    construction_fee: RecoveryConstructionFee<'_>,
     evidence: &dyn BitcoinRecoveryEvidence,
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
@@ -362,8 +386,8 @@ async fn execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
         builder,
-        fee_decision,
-        fee_record,
+        construction_fee.builder_decision,
+        construction_fee.record,
         evidence,
         faults,
     )
