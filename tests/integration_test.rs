@@ -16127,7 +16127,7 @@ async fn manifest_delivery_coordinator_real_postgres_minio_contract() {
             .await
             .unwrap()
             .as_slice(),
-        &[retry.clone()]
+        std::slice::from_ref(&retry)
     );
     assert_eq!(
         resume_pending_manifest_delivery(&pool, &store)
