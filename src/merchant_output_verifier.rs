@@ -10,7 +10,14 @@ use std::{fmt, str::FromStr};
 use bitcoin::{consensus::deserialize, Address, Network, Transaction};
 use lwk_wollet::elements::{self, Address as LiquidAddress, AddressParams};
 
-use crate::db::ChainSwapTxAttempt;
+use crate::{
+    db::ChainSwapTxAttempt,
+    error::AppError,
+    utxo::{
+        LiquidHistoryEntry, LiquidHistorySnapshot, LiquidHistorySnapshotLimits,
+        LiquidHistorySnapshotOutcome, UtxoBackend,
+    },
+};
 
 /// The chain asset paid by the candidate transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -756,6 +763,366 @@ pub fn adapt_liquid_merchant_output(
     )
 }
 
+/// Last durable lifecycle identity for the candidate transaction. A prior
+/// confirmed block is fed back into the same-authority snapshot so absence can
+/// never be mistaken for a reorg without a canonical replacement anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousLiquidMerchantConfirmation<'a> {
+    NeverObserved,
+    Mempool,
+    Confirmed {
+        block_height: u32,
+        block_hash: &'a str,
+    },
+    /// The lifecycle has already durably applied the demotion for this old
+    /// block. The source must keep anchoring it, but must not emit the same
+    /// demotion again while it discovers the candidate's new chain position.
+    Reorged {
+        previous_block_height: u32,
+        previous_block_hash: &'a str,
+    },
+}
+
+/// Production observation delivered to the settlement lifecycle. Positive
+/// chain evidence carries the adapter packet that can produce a
+/// `VerifiedMerchantOutput`; explicit negative evidence carries only the
+/// candidate identity and the prior canonical block needed by the lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiquidMerchantOutputObservation {
+    Observed(AdaptedMerchantOutputEvidence),
+    Evicted {
+        txid: String,
+    },
+    ReorgDemoted {
+        txid: String,
+        previous_block_height: u32,
+        previous_block_hash: String,
+    },
+}
+
+/// Fail-closed production-source failures. An incomplete or contradictory
+/// backend view is deliberately distinct from positive eviction/reorg proof.
+#[derive(Debug)]
+pub enum LiquidMerchantObservationError {
+    Backend(AppError),
+    SnapshotIncomplete,
+    InvalidSnapshot,
+    CandidateNotObserved,
+    InvalidBlindingKey,
+    Adapter(MerchantOutputAdapterError),
+}
+
+impl fmt::Display for LiquidMerchantObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Backend(_) => "merchant-output Liquid backend observation failed",
+            Self::SnapshotIncomplete => "merchant-output Liquid snapshot is incomplete",
+            Self::InvalidSnapshot => "merchant-output Liquid snapshot is contradictory",
+            Self::CandidateNotObserved => {
+                "merchant-output Liquid candidate is not authoritatively observed"
+            }
+            Self::InvalidBlindingKey => "merchant-output stored Liquid blinding key is invalid",
+            Self::Adapter(_) => "merchant-output Liquid adapter rejected chain evidence",
+        })
+    }
+}
+
+impl std::error::Error for LiquidMerchantObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Adapter(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+const LIQUID_MERCHANT_OBSERVATION_LIMITS: LiquidHistorySnapshotLimits =
+    LiquidHistorySnapshotLimits {
+        max_history_entries: MAX_MERCHANT_OUTPUT_TRANSACTION_ITEMS,
+        max_block_heights: MAX_MERCHANT_OUTPUT_TRANSACTION_ITEMS,
+    };
+
+/// Fetch one same-authority Liquid history/tip/block snapshot plus the exact
+/// raw candidate transaction and construct the adapter evidence consumed by
+/// the merchant-settlement lifecycle. This is the production vertical entry
+/// point: callers do not manufacture `MerchantTransactionObservation` from
+/// provider hints.
+pub async fn observe_liquid_merchant_output<B: UtxoBackend + ?Sized>(
+    backend: &B,
+    original: &MerchantTransactionJournalEvidence<'_>,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    stored_blinding_key_hex: &str,
+    previous: PreviousLiquidMerchantConfirmation<'_>,
+) -> Result<LiquidMerchantOutputObservation, LiquidMerchantObservationError> {
+    let candidate = replacement
+        .map(|linked| &linked.replacement)
+        .unwrap_or(original);
+    let candidate_txid = canonical_hash(candidate.txid).ok_or(
+        LiquidMerchantObservationError::Adapter(MerchantOutputAdapterError::JournalTxidMismatch),
+    )?;
+    let candidate_script = validate_output_commitment(&candidate.merchant)
+        .map_err(LiquidMerchantObservationError::Adapter)?;
+    if !matches!(candidate.merchant.asset, MerchantAsset::Liquid(_)) {
+        return Err(LiquidMerchantObservationError::Adapter(
+            MerchantOutputAdapterError::InvalidCommitment,
+        ));
+    }
+    let blinding_key = elements::secp256k1_zkp::SecretKey::from_str(stored_blinding_key_hex)
+        .map_err(|_| LiquidMerchantObservationError::InvalidBlindingKey)?;
+    let script = elements::Script::from(candidate_script);
+    let previous_block = previous_liquid_block(previous)?;
+    let prior_block_heights = previous_block
+        .as_ref()
+        .map(|block| vec![block.height])
+        .unwrap_or_default();
+    let snapshot = match backend
+        .liquid_history_snapshot(
+            &script,
+            &prior_block_heights,
+            LIQUID_MERCHANT_OBSERVATION_LIMITS,
+        )
+        .await
+        .map_err(LiquidMerchantObservationError::Backend)?
+    {
+        LiquidHistorySnapshotOutcome::Complete(snapshot) => snapshot,
+        LiquidHistorySnapshotOutcome::Incomplete(_) => {
+            return Err(LiquidMerchantObservationError::SnapshotIncomplete);
+        }
+    };
+    validate_liquid_snapshot_shape(&snapshot)?;
+
+    let prior_anchor_status = previous_block
+        .as_ref()
+        .map(|block| prior_liquid_anchor_status(&snapshot, block.height, &block.hash))
+        .transpose()?;
+    if let Some(block) = previous_block.as_ref() {
+        match (block.already_reorged, prior_anchor_status) {
+            (false, Some(PriorLiquidAnchorStatus::Reorged)) => {
+                return Ok(LiquidMerchantOutputObservation::ReorgDemoted {
+                    txid: candidate_txid,
+                    previous_block_height: block.public_height,
+                    previous_block_hash: block.hash.clone(),
+                });
+            }
+            (true, Some(PriorLiquidAnchorStatus::Reorged))
+            | (false, Some(PriorLiquidAnchorStatus::Canonical)) => {}
+            // A previously demoted block becoming canonical again is a new
+            // contradictory view, never permission to replay old authority.
+            (true, Some(PriorLiquidAnchorStatus::Canonical))
+            | (_, Some(PriorLiquidAnchorStatus::Unavailable))
+            | (_, None) => return Err(LiquidMerchantObservationError::InvalidSnapshot),
+        }
+    }
+
+    let mut entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.txid.eq_ignore_ascii_case(&candidate_txid));
+    let entry = entries.next();
+    if entries.next().is_some() {
+        return Err(LiquidMerchantObservationError::InvalidSnapshot);
+    }
+    let Some(entry) = entry else {
+        return match previous {
+            PreviousLiquidMerchantConfirmation::Mempool => {
+                Ok(LiquidMerchantOutputObservation::Evicted {
+                    txid: candidate_txid,
+                })
+            }
+            PreviousLiquidMerchantConfirmation::NeverObserved
+            | PreviousLiquidMerchantConfirmation::Confirmed { .. }
+            | PreviousLiquidMerchantConfirmation::Reorged { .. } => {
+                Err(LiquidMerchantObservationError::CandidateNotObserved)
+            }
+        };
+    };
+
+    if let Some(block) = previous_block.as_ref() {
+        let matches_old_block = entry_matches_previous_block(entry, block);
+        if (!block.already_reorged && !matches_old_block)
+            || (block.already_reorged && matches_old_block)
+        {
+            return Err(LiquidMerchantObservationError::InvalidSnapshot);
+        }
+    }
+    let confirmation = liquid_confirmation_from_snapshot(entry, &snapshot)?;
+    let raw_transaction = backend
+        .get_raw_tx(&candidate_txid)
+        .await
+        .map_err(LiquidMerchantObservationError::Backend)?;
+    let observation = MerchantTransactionObservation {
+        raw_transaction: &raw_transaction,
+        txid: &candidate_txid,
+        confirmation,
+    };
+    let adapted = adapt_liquid_merchant_output(original, replacement, &observation, &blinding_key)
+        .map_err(LiquidMerchantObservationError::Adapter)?;
+    Ok(LiquidMerchantOutputObservation::Observed(adapted))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorLiquidAnchorStatus {
+    Canonical,
+    Reorged,
+    Unavailable,
+}
+
+struct PreviousLiquidBlock {
+    height: i32,
+    hash: String,
+    public_height: u32,
+    already_reorged: bool,
+}
+
+fn previous_liquid_block(
+    previous: PreviousLiquidMerchantConfirmation<'_>,
+) -> Result<Option<PreviousLiquidBlock>, LiquidMerchantObservationError> {
+    let (block_height, block_hash, already_reorged) = match previous {
+        PreviousLiquidMerchantConfirmation::NeverObserved
+        | PreviousLiquidMerchantConfirmation::Mempool => return Ok(None),
+        PreviousLiquidMerchantConfirmation::Confirmed {
+            block_height,
+            block_hash,
+        } => (block_height, block_hash, false),
+        PreviousLiquidMerchantConfirmation::Reorged {
+            previous_block_height,
+            previous_block_hash,
+        } => (previous_block_height, previous_block_hash, true),
+    };
+    let height = i32::try_from(block_height)
+        .ok()
+        .filter(|height| *height > 0)
+        .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    let hash = canonical_hash(block_hash).ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    Ok(Some(PreviousLiquidBlock {
+        height,
+        hash,
+        public_height: block_height,
+        already_reorged,
+    }))
+}
+
+fn validate_liquid_snapshot_shape(
+    snapshot: &LiquidHistorySnapshot,
+) -> Result<(), LiquidMerchantObservationError> {
+    if snapshot.tip_height <= 0
+        || snapshot.authority.is_empty()
+        || snapshot.authority.len() > 200
+        || snapshot.authority.chars().any(char::is_whitespace)
+        || snapshot.entries.len() > LIQUID_MERCHANT_OBSERVATION_LIMITS.max_history_entries
+        || snapshot.anchored_block_hashes.len()
+            > LIQUID_MERCHANT_OBSERVATION_LIMITS.max_block_heights
+    {
+        return Err(LiquidMerchantObservationError::InvalidSnapshot);
+    }
+    let mut seen_txids = std::collections::BTreeSet::new();
+    for entry in &snapshot.entries {
+        let txid =
+            canonical_hash(&entry.txid).ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+        if !seen_txids.insert(txid) || entry.height > snapshot.tip_height {
+            return Err(LiquidMerchantObservationError::InvalidSnapshot);
+        }
+        if entry.height <= 0 {
+            if entry.block_hash.is_some() {
+                return Err(LiquidMerchantObservationError::InvalidSnapshot);
+            }
+            continue;
+        }
+        let entry_hash = entry
+            .block_hash
+            .as_deref()
+            .and_then(canonical_hash)
+            .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+        let anchor_hash = snapshot
+            .anchored_block_hashes
+            .get(&entry.height)
+            .and_then(|hash| canonical_hash(hash))
+            .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+        if entry_hash != anchor_hash {
+            return Err(LiquidMerchantObservationError::InvalidSnapshot);
+        }
+    }
+    for (height, hash) in &snapshot.anchored_block_hashes {
+        if *height <= 0 || *height > snapshot.tip_height || canonical_hash(hash).is_none() {
+            return Err(LiquidMerchantObservationError::InvalidSnapshot);
+        }
+    }
+    Ok(())
+}
+
+fn prior_liquid_anchor_status(
+    snapshot: &LiquidHistorySnapshot,
+    height: i32,
+    previous_hash: &str,
+) -> Result<PriorLiquidAnchorStatus, LiquidMerchantObservationError> {
+    if height > snapshot.tip_height {
+        return Ok(PriorLiquidAnchorStatus::Unavailable);
+    }
+    let Some(current_hash) = snapshot.anchored_block_hashes.get(&height) else {
+        return Ok(PriorLiquidAnchorStatus::Unavailable);
+    };
+    let current_hash =
+        canonical_hash(current_hash).ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    Ok(if current_hash == previous_hash {
+        PriorLiquidAnchorStatus::Canonical
+    } else {
+        PriorLiquidAnchorStatus::Reorged
+    })
+}
+
+fn entry_matches_previous_block(
+    entry: &LiquidHistoryEntry,
+    previous_block: &PreviousLiquidBlock,
+) -> bool {
+    entry.height == previous_block.height
+        && entry
+            .block_hash
+            .as_deref()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(&previous_block.hash))
+}
+
+fn liquid_confirmation_from_snapshot<'a>(
+    entry: &'a LiquidHistoryEntry,
+    snapshot: &'a LiquidHistorySnapshot,
+) -> Result<MerchantConfirmationEvidence<'a>, LiquidMerchantObservationError> {
+    if entry.height <= 0 {
+        if entry.block_hash.is_some() {
+            return Err(LiquidMerchantObservationError::InvalidSnapshot);
+        }
+        return Ok(MerchantConfirmationEvidence::Mempool);
+    }
+    if entry.height > snapshot.tip_height {
+        return Err(LiquidMerchantObservationError::InvalidSnapshot);
+    }
+    let block_hash_text = entry
+        .block_hash
+        .as_deref()
+        .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    let block_hash =
+        canonical_hash(block_hash_text).ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    let anchored_hash = snapshot
+        .anchored_block_hashes
+        .get(&entry.height)
+        .and_then(|hash| canonical_hash(hash))
+        .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    if block_hash != anchored_hash {
+        return Err(LiquidMerchantObservationError::InvalidSnapshot);
+    }
+    let confirmations = snapshot
+        .tip_height
+        .checked_sub(entry.height)
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|confirmations| u32::try_from(confirmations).ok())
+        .ok_or(LiquidMerchantObservationError::InvalidSnapshot)?;
+    let block_height =
+        u32::try_from(entry.height).map_err(|_| LiquidMerchantObservationError::InvalidSnapshot)?;
+    Ok(MerchantConfirmationEvidence::Confirmed {
+        confirmations,
+        block_height,
+        block_hash: block_hash_text,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum MerchantRail {
     Bitcoin,
@@ -1311,6 +1678,7 @@ mod tests {
         absolute, consensus::serialize, transaction, Amount, OutPoint, ScriptBuf, Sequence, TxIn,
         TxOut, Txid, Witness,
     };
+    use std::{collections::BTreeMap, sync::Mutex};
     use uuid::Uuid;
 
     const APPROVED_ADDRESS: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
@@ -1377,6 +1745,212 @@ mod tests {
             finalized_at_unix: None,
             integrity_hold_at_unix: None,
             updated_at_unix: 2,
+        }
+    }
+
+    struct LiquidBackendFixture {
+        raw_transaction: Vec<u8>,
+        txid: String,
+        source_txid: String,
+        destination_address: String,
+        destination_script_hex: String,
+        asset: MerchantAsset,
+        blinding_key_hex: String,
+    }
+
+    impl LiquidBackendFixture {
+        fn journal<'a>(
+            &'a self,
+            source_prevouts: &'a [MerchantSourcePrevout<'a>],
+        ) -> MerchantTransactionJournalEvidence<'a> {
+            MerchantTransactionJournalEvidence {
+                raw_transaction: &self.raw_transaction,
+                txid: &self.txid,
+                source_prevouts,
+                merchant: MerchantOutputCommitment {
+                    destination_address: &self.destination_address,
+                    destination_script_hex: &self.destination_script_hex,
+                    asset: &self.asset,
+                    amount_sat: 88_000,
+                    vout: 0,
+                },
+            }
+        }
+
+        fn approved_destination(&self) -> ApprovedMerchantDestination {
+            ApprovedMerchantDestination::liquid(
+                &self.destination_address,
+                &self.destination_script_hex,
+                LIQUID_ASSET,
+            )
+        }
+    }
+
+    fn liquid_backend_fixture() -> LiquidBackendFixture {
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let mut rng = secp256k1::rand::thread_rng();
+        let blinding_key = elements::secp256k1_zkp::SecretKey::new(&mut rng);
+        let blinding_pubkey =
+            elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+        let destination_address = LiquidAddress::from_str(LIQUID_ADDRESS)
+            .unwrap()
+            .to_unconfidential()
+            .to_confidential(blinding_pubkey);
+        let script = destination_address.script_pubkey();
+        let source_txid = elements::Txid::from_str(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let liquid_asset = elements::AssetId::from_str(LIQUID_ASSET).unwrap();
+        let input_secrets = elements::TxOutSecrets::new(
+            liquid_asset,
+            elements::confidential::AssetBlindingFactor::new(&mut rng),
+            88_000,
+            elements::confidential::ValueBlindingFactor::new(&mut rng),
+        );
+        let confidential_output = elements::TxOut::new_last_confidential(
+            &mut rng,
+            &secp,
+            88_000,
+            liquid_asset,
+            script.clone(),
+            blinding_pubkey,
+            &[input_secrets],
+            &[],
+        )
+        .unwrap()
+        .0;
+        let transaction = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(source_txid, 4),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::MAX,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![confidential_output],
+        };
+        LiquidBackendFixture {
+            raw_transaction: elements::encode::serialize(&transaction),
+            txid: transaction.txid().to_string(),
+            source_txid: source_txid.to_string(),
+            destination_address: destination_address.to_string(),
+            destination_script_hex: hex::encode(script.as_bytes()),
+            asset: MerchantAsset::Liquid(LIQUID_ASSET.into()),
+            blinding_key_hex: blinding_key.display_secret().to_string(),
+        }
+    }
+
+    fn liquid_backend_sources(fixture: &LiquidBackendFixture) -> [MerchantSourcePrevout<'_>; 1] {
+        [MerchantSourcePrevout {
+            txid: &fixture.source_txid,
+            vout: 4,
+            amount_sat: 91_000,
+            script_pubkey_hex: "51",
+        }]
+    }
+
+    struct MockLiquidMerchantBackend {
+        snapshot: Option<LiquidHistorySnapshotOutcome>,
+        snapshot_failure: bool,
+        raw_transaction: Option<Vec<u8>>,
+        raw_failure: bool,
+        raw_requests: Mutex<Vec<String>>,
+        prior_height_requests: Mutex<Vec<Vec<i32>>>,
+    }
+
+    impl MockLiquidMerchantBackend {
+        fn successful(snapshot: LiquidHistorySnapshot, raw_transaction: Option<Vec<u8>>) -> Self {
+            Self {
+                snapshot: Some(LiquidHistorySnapshotOutcome::Complete(snapshot)),
+                snapshot_failure: false,
+                raw_transaction,
+                raw_failure: false,
+                raw_requests: Mutex::new(Vec::new()),
+                prior_height_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UtxoBackend for MockLiquidMerchantBackend {
+        async fn get_raw_tx(&self, txid_hex: &str) -> Result<Vec<u8>, AppError> {
+            self.raw_requests.lock().unwrap().push(txid_hex.to_owned());
+            if self.raw_failure {
+                return Err(AppError::ElectrumError(
+                    "mock raw transaction failure".into(),
+                ));
+            }
+            self.raw_transaction.clone().ok_or(AppError::UtxoNotFound)
+        }
+
+        async fn is_unspent(
+            &self,
+            _script_pubkey: &elements::Script,
+            _txid_hex: &str,
+            _vout: u32,
+        ) -> Result<bool, AppError> {
+            unreachable!("merchant observation does not query unspent state")
+        }
+
+        async fn script_history(
+            &self,
+            _script_pubkey: &elements::Script,
+        ) -> Result<crate::utxo::LiquidScriptHistory, AppError> {
+            unreachable!("merchant observation uses the authoritative snapshot")
+        }
+
+        async fn history_txids(
+            &self,
+            _script_pubkey: &elements::Script,
+        ) -> Result<Vec<String>, AppError> {
+            unreachable!("merchant observation uses the authoritative snapshot")
+        }
+
+        async fn liquid_history_snapshot(
+            &self,
+            _script_pubkey: &elements::Script,
+            prior_block_heights: &[i32],
+            _limits: LiquidHistorySnapshotLimits,
+        ) -> Result<LiquidHistorySnapshotOutcome, AppError> {
+            self.prior_height_requests
+                .lock()
+                .unwrap()
+                .push(prior_block_heights.to_vec());
+            if self.snapshot_failure {
+                return Err(AppError::ElectrumError("mock snapshot failure".into()));
+            }
+            self.snapshot
+                .clone()
+                .ok_or_else(|| AppError::ElectrumError("mock snapshot missing".into()))
+        }
+
+        async fn find_spending_txid(
+            &self,
+            _script_pubkey: &elements::Script,
+            _txid_hex: &str,
+            _vout: u32,
+        ) -> Result<Option<String>, AppError> {
+            unreachable!("merchant observation does not search arbitrary spenders")
+        }
+    }
+
+    fn liquid_snapshot(
+        tip_height: i32,
+        entries: Vec<LiquidHistoryEntry>,
+        anchors: &[(i32, &str)],
+    ) -> LiquidHistorySnapshot {
+        LiquidHistorySnapshot {
+            authority: "mock-liquid-authority".into(),
+            tip_height,
+            entries,
+            anchored_block_hashes: anchors
+                .iter()
+                .map(|(height, hash)| (*height, (*hash).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
         }
     }
 
@@ -2367,5 +2941,325 @@ mod tests {
             adapt_liquid_merchant_output(&journal, None, &observation, &wrong_key),
             Err(MerchantOutputAdapterError::ConfidentialOutputUnverified)
         );
+    }
+
+    #[tokio::test]
+    async fn production_liquid_source_returns_confirmed_actual_output_evidence() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let journal = fixture.journal(&sources);
+        let snapshot = liquid_snapshot(
+            700_001,
+            vec![LiquidHistoryEntry {
+                txid: fixture.txid.clone(),
+                height: 700_000,
+                block_hash: Some(BLOCK_HASH.into()),
+            }],
+            &[(700_000, BLOCK_HASH)],
+        );
+        let backend =
+            MockLiquidMerchantBackend::successful(snapshot, Some(fixture.raw_transaction.clone()));
+
+        let result = observe_liquid_merchant_output(
+            &backend,
+            &journal,
+            None,
+            &fixture.blinding_key_hex,
+            PreviousLiquidMerchantConfirmation::NeverObserved,
+        )
+        .await
+        .unwrap();
+        let LiquidMerchantOutputObservation::Observed(adapted) = result else {
+            panic!("confirmed snapshot must return positive adapter evidence");
+        };
+
+        assert_eq!(adapted.observed().txid(), fixture.txid);
+        assert_eq!(adapted.observed().amount_sat(), 88_000);
+        assert_eq!(adapted.observed().confirmations(), 2);
+        assert_eq!(adapted.observed().block_height(), Some(700_000));
+        assert_eq!(adapted.observed().block_hash(), Some(BLOCK_HASH));
+        assert_eq!(
+            adapted
+                .verify(&fixture.approved_destination(), 2)
+                .unwrap()
+                .amount_sat(),
+            88_000
+        );
+        assert_eq!(
+            backend.raw_requests.lock().unwrap().as_slice(),
+            &[fixture.txid]
+        );
+        assert_eq!(
+            backend.prior_height_requests.lock().unwrap().as_slice(),
+            &[Vec::<i32>::new()]
+        );
+    }
+
+    #[tokio::test]
+    async fn production_liquid_source_keeps_mempool_evidence_non_accounting() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let journal = fixture.journal(&sources);
+        let snapshot = liquid_snapshot(
+            700_001,
+            vec![LiquidHistoryEntry {
+                txid: fixture.txid.clone(),
+                height: 0,
+                block_hash: None,
+            }],
+            &[],
+        );
+        let backend =
+            MockLiquidMerchantBackend::successful(snapshot, Some(fixture.raw_transaction.clone()));
+
+        let result = observe_liquid_merchant_output(
+            &backend,
+            &journal,
+            None,
+            &fixture.blinding_key_hex,
+            PreviousLiquidMerchantConfirmation::Mempool,
+        )
+        .await
+        .unwrap();
+        let LiquidMerchantOutputObservation::Observed(adapted) = result else {
+            panic!("present mempool transaction must remain positive observation evidence");
+        };
+
+        assert_eq!(adapted.observed().confirmations(), 0);
+        assert_eq!(adapted.observed().block_height(), None);
+        assert_eq!(adapted.observed().block_hash(), None);
+        assert_eq!(
+            adapted.verify(&fixture.approved_destination(), 1),
+            Err(MerchantOutputVerificationError::InsufficientConfirmations)
+        );
+    }
+
+    #[tokio::test]
+    async fn production_liquid_source_proves_mempool_eviction_without_raw_fetch() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let journal = fixture.journal(&sources);
+        let backend =
+            MockLiquidMerchantBackend::successful(liquid_snapshot(700_001, Vec::new(), &[]), None);
+
+        let result = observe_liquid_merchant_output(
+            &backend,
+            &journal,
+            None,
+            &fixture.blinding_key_hex,
+            PreviousLiquidMerchantConfirmation::Mempool,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            LiquidMerchantOutputObservation::Evicted {
+                txid: fixture.txid.clone(),
+            }
+        );
+        assert!(backend.raw_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_liquid_source_reorg_demotion_redrives_to_new_block_without_loop() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let journal = fixture.journal(&sources);
+        let previous_hash = "bb".repeat(32);
+        let backend = MockLiquidMerchantBackend::successful(
+            liquid_snapshot(700_001, Vec::new(), &[(700_000, BLOCK_HASH)]),
+            None,
+        );
+
+        let result = observe_liquid_merchant_output(
+            &backend,
+            &journal,
+            None,
+            &fixture.blinding_key_hex,
+            PreviousLiquidMerchantConfirmation::Confirmed {
+                block_height: 700_000,
+                block_hash: &previous_hash,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            LiquidMerchantOutputObservation::ReorgDemoted {
+                txid: fixture.txid.clone(),
+                previous_block_height: 700_000,
+                previous_block_hash: previous_hash.clone(),
+            }
+        );
+        assert_eq!(
+            backend.prior_height_requests.lock().unwrap().as_slice(),
+            &[vec![700_000]]
+        );
+        assert!(backend.raw_requests.lock().unwrap().is_empty());
+
+        let new_block_hash = "cc".repeat(32);
+        let redrive_backend = MockLiquidMerchantBackend::successful(
+            liquid_snapshot(
+                700_002,
+                vec![LiquidHistoryEntry {
+                    txid: fixture.txid.clone(),
+                    height: 700_001,
+                    block_hash: Some(new_block_hash.clone()),
+                }],
+                &[(700_000, BLOCK_HASH), (700_001, &new_block_hash)],
+            ),
+            Some(fixture.raw_transaction.clone()),
+        );
+        let redriven = observe_liquid_merchant_output(
+            &redrive_backend,
+            &journal,
+            None,
+            &fixture.blinding_key_hex,
+            PreviousLiquidMerchantConfirmation::Reorged {
+                previous_block_height: 700_000,
+                previous_block_hash: &previous_hash,
+            },
+        )
+        .await
+        .unwrap();
+        let LiquidMerchantOutputObservation::Observed(adapted) = redriven else {
+            panic!("already-applied demotion must redrive current positive evidence");
+        };
+        assert_eq!(adapted.observed().block_height(), Some(700_001));
+        assert_eq!(
+            adapted.observed().block_hash(),
+            Some(new_block_hash.as_str())
+        );
+        assert_eq!(adapted.observed().confirmations(), 2);
+        assert_eq!(
+            redrive_backend
+                .prior_height_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[vec![700_000]]
+        );
+
+        let old_block_again = MockLiquidMerchantBackend::successful(
+            liquid_snapshot(
+                700_002,
+                vec![LiquidHistoryEntry {
+                    txid: fixture.txid.clone(),
+                    height: 700_000,
+                    block_hash: Some(previous_hash.clone()),
+                }],
+                &[(700_000, &previous_hash)],
+            ),
+            Some(fixture.raw_transaction.clone()),
+        );
+        assert!(matches!(
+            observe_liquid_merchant_output(
+                &old_block_again,
+                &journal,
+                None,
+                &fixture.blinding_key_hex,
+                PreviousLiquidMerchantConfirmation::Reorged {
+                    previous_block_height: 700_000,
+                    previous_block_hash: &previous_hash,
+                },
+            )
+            .await,
+            Err(LiquidMerchantObservationError::InvalidSnapshot)
+        ));
+        assert!(old_block_again.raw_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_liquid_source_defers_backend_incomplete_and_raw_failures() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let journal = fixture.journal(&sources);
+        let mempool_snapshot = liquid_snapshot(
+            700_001,
+            vec![LiquidHistoryEntry {
+                txid: fixture.txid.clone(),
+                height: -1,
+                block_hash: None,
+            }],
+            &[],
+        );
+
+        let mut snapshot_failure = MockLiquidMerchantBackend::successful(
+            mempool_snapshot.clone(),
+            Some(fixture.raw_transaction.clone()),
+        );
+        snapshot_failure.snapshot_failure = true;
+        assert!(matches!(
+            observe_liquid_merchant_output(
+                &snapshot_failure,
+                &journal,
+                None,
+                &fixture.blinding_key_hex,
+                PreviousLiquidMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(LiquidMerchantObservationError::Backend(_))
+        ));
+
+        let mut raw_failure = MockLiquidMerchantBackend::successful(
+            mempool_snapshot.clone(),
+            Some(fixture.raw_transaction.clone()),
+        );
+        raw_failure.raw_failure = true;
+        assert!(matches!(
+            observe_liquid_merchant_output(
+                &raw_failure,
+                &journal,
+                None,
+                &fixture.blinding_key_hex,
+                PreviousLiquidMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(LiquidMerchantObservationError::Backend(_))
+        ));
+
+        let malformed_raw =
+            MockLiquidMerchantBackend::successful(mempool_snapshot, Some(vec![0x00]));
+        assert!(matches!(
+            observe_liquid_merchant_output(
+                &malformed_raw,
+                &journal,
+                None,
+                &fixture.blinding_key_hex,
+                PreviousLiquidMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(LiquidMerchantObservationError::Adapter(
+                MerchantOutputAdapterError::MalformedObservedTransaction
+            ))
+        ));
+
+        let incomplete = MockLiquidMerchantBackend {
+            snapshot: Some(LiquidHistorySnapshotOutcome::Incomplete(
+                crate::utxo::LiquidHistorySnapshotLimit::HistoryEntries {
+                    observed: 257,
+                    limit: 256,
+                },
+            )),
+            snapshot_failure: false,
+            raw_transaction: Some(fixture.raw_transaction.clone()),
+            raw_failure: false,
+            raw_requests: Mutex::new(Vec::new()),
+            prior_height_requests: Mutex::new(Vec::new()),
+        };
+        assert!(matches!(
+            observe_liquid_merchant_output(
+                &incomplete,
+                &journal,
+                None,
+                &fixture.blinding_key_hex,
+                PreviousLiquidMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(LiquidMerchantObservationError::SnapshotIncomplete)
+        ));
+        assert!(incomplete.raw_requests.lock().unwrap().is_empty());
     }
 }
