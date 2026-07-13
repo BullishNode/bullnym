@@ -290,7 +290,8 @@ ALTER TABLE invoice_payment_events
             'bitcoin_boltz_recovery'
         )
         OR (
-            txid ~ '^[0-9a-fA-F]{64}$'
+            txid IS NOT NULL
+            AND txid ~ '^[0-9a-fA-F]{64}$'
             AND boltz_swap_id IS NOT NULL
             AND (
                 (source = 'lightning_boltz_reverse' AND vout IS NULL)
