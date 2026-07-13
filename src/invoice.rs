@@ -48,6 +48,7 @@ use uuid::Uuid;
 use crate::admission::Rail;
 use crate::auth;
 use crate::certification::{self, CertificationScope};
+use crate::chain_swap_creation_permit::{ChainSwapCreationPermit, ChainSwapCreationPermitError};
 use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
@@ -66,6 +67,7 @@ pub enum InvoiceIntegrationTestHookPoint {
     StatusAfterInvoiceRead,
     ListAfterInvoiceRead,
     OfferBeforeCommit,
+    ChainOfferBeforeRecoveryGate,
 }
 
 #[derive(Debug)]
@@ -2157,6 +2159,20 @@ struct BitcoinChainOffer {
     lockup_bip21: Option<String>,
 }
 
+fn retain_persisted_offer_after_permit_release(
+    offer: BitcoinChainOffer,
+    release: Result<(), ChainSwapCreationPermitError>,
+) -> BitcoinChainOffer {
+    if let Err(error) = release {
+        tracing::error!(
+            event = "chain_swap_creation_permit_release_failed_after_persistence",
+            error = %error,
+            "chain-swap creation permit release failed after durable local persistence; returning the persisted payer offer"
+        );
+    }
+    offer
+}
+
 /// Internal: create a Boltz BTC-to-LBTC chain swap for a Donation Page
 /// checkout invoice. The payer sees a Bitcoin lockup address; after
 /// Boltz locks LBTC on the server side, the chain-swap claimer spends
@@ -2200,6 +2216,30 @@ async fn create_bitcoin_chain_offer(
         .admission
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    )
+    .await;
+    let Some(recovery_runtime) = state.recovery_manifest_runtime_v1() else {
+        tracing::warn!(
+            event = "chain_swap_creation_recovery_runtime_unavailable",
+            "chain-swap creation refused before key allocation because protected recovery runtime is unavailable"
+        );
+        return Err(AppError::ServiceUnavailable(
+            "chain-swap recovery capability is unavailable".into(),
+        ));
+    };
+    let creation_permit = ChainSwapCreationPermit::acquire(&state.db, recovery_runtime.store())
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                event = "chain_swap_creation_permit_refused",
+                error = %error,
+                "chain-swap creation refused before key allocation"
+            );
+            AppError::ServiceUnavailable("chain-swap creation boundary is unavailable".into())
+        })?;
 
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -2324,10 +2364,14 @@ async fn create_bitcoin_chain_offer(
         ))
     })?;
 
-    Ok(Some(BitcoinChainOffer {
+    let offer = BitcoinChainOffer {
         lockup_address: result.lockup_address,
         lockup_bip21: Some(lockup_bip21),
-    }))
+    };
+    let release = creation_permit.release().await;
+    Ok(Some(retain_persisted_offer_after_permit_release(
+        offer, release,
+    )))
 }
 
 // =====================================================================

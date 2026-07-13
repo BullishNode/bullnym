@@ -234,6 +234,23 @@ fn chain_bip21_formats_whole_bitcoin_without_rounding() {
 }
 
 #[test]
+fn permit_release_failure_keeps_the_persisted_chain_offer_visible() {
+    let retained = retain_persisted_offer_after_permit_release(
+        BitcoinChainOffer {
+            lockup_address: "bc1qpersistedoffer".to_owned(),
+            lockup_bip21: Some("bitcoin:bc1qpersistedoffer?amount=0.00001000".to_owned()),
+        },
+        Err(ChainSwapCreationPermitError::ReleaseFailed),
+    );
+
+    assert_eq!(retained.lockup_address, "bc1qpersistedoffer");
+    assert_eq!(
+        retained.lockup_bip21.as_deref(),
+        Some("bitcoin:bc1qpersistedoffer?amount=0.00001000")
+    );
+}
+
+#[test]
 fn partially_paid_template_remains_payable_for_remaining_amount() {
     let mut tpl = InvoicePaymentTpl {
         nym: "alice",

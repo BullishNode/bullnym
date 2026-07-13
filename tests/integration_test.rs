@@ -25,6 +25,7 @@ use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
 
 use pay_service::boltz::BoltzService;
+use pay_service::chain_swap_creation_permit::ChainSwapCreationPermit;
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
     ElectrumConfig, FeaturesConfig, InvoiceAccountingConfig, LimitsConfig, LiquidWatcherConfig,
@@ -40,6 +41,7 @@ use pay_service::swap_manifest_delivery::{
     resume_pending_manifest_delivery, ManifestDeliveryCoordinatorError,
     ManifestDeliveryResumeOutcome,
 };
+use pay_service::swap_manifest_runtime::{self, RecoveryManifestRuntimeV1};
 use pay_service::swap_manifest_store::{
     ManifestObjectId, ManifestWriteOutcome, RecoveryManifestStore, S3ManifestCredentials,
     S3ManifestStoreConfig,
@@ -824,6 +826,83 @@ async fn m11_creation_mutation_snapshot(pool: &PgPool) -> M11CreationMutationSna
             .await
             .unwrap(),
     }
+}
+
+fn test_recovery_manifest_runtime() -> Arc<RecoveryManifestRuntimeV1> {
+    let signing_secret = [0x31; 32];
+    let signing_key = Keypair::from_secret_key(
+        &Secp256k1::new(),
+        &SecretKey::from_slice(&signing_secret).unwrap(),
+    );
+    let values = HashMap::from([
+        (
+            swap_manifest_runtime::S3_ENDPOINT_ENV,
+            "http://127.0.0.1:1".to_owned(),
+        ),
+        (swap_manifest_runtime::S3_REGION_ENV, "us-east-1".to_owned()),
+        (
+            swap_manifest_runtime::S3_BUCKET_ENV,
+            "bullnym-recovery-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::S3_PREFIX_ENV,
+            "bullnym/tests".to_owned(),
+        ),
+        (swap_manifest_runtime::S3_PATH_STYLE_ENV, "true".to_owned()),
+        (swap_manifest_runtime::S3_ALLOW_HTTP_ENV, "true".to_owned()),
+        (
+            swap_manifest_runtime::S3_ACCESS_KEY_ID_ENV,
+            "ACCESSKEYTEST".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::S3_SECRET_ACCESS_KEY_ENV,
+            "secret-access-key-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::ENCRYPTION_KEY_ID_ENV,
+            "manifest-key-route-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::ENCRYPTION_KEY_HEX_ENV,
+            hex::encode([0x42; 32]),
+        ),
+        (
+            swap_manifest_runtime::SIGNING_SECRET_KEY_HEX_ENV,
+            hex::encode(signing_secret),
+        ),
+        (
+            swap_manifest_runtime::EXPECTED_SIGNER_XONLY_HEX_ENV,
+            signing_key.x_only_public_key().0.to_string(),
+        ),
+    ]);
+    Arc::new(
+        RecoveryManifestRuntimeV1::from_lookup(|name| values.get(name).cloned())
+            .expect("valid route-test recovery runtime"),
+    )
+}
+
+async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
+    create_test_user(pool, nym).await;
+    pay_service::db::upsert_donation_page(
+        pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Recovery-gated checkout",
+            description: "Chain creation must remain behind recovery readiness",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[derive(Clone)]
@@ -5822,6 +5901,126 @@ async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
     provider_task.abort();
     let _ = provider_task.await;
 
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_offer_missing_runtime_refuses_before_key_or_provider_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    seed_chain_offer_checkout_surface(&pool, "chainruntimemissing").await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    assert!(state.recovery_manifest_runtime_v1().is_none());
+    let app = test_app(state);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    );
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        post_json(
+            &request_app,
+            "/chainruntimemissing/invoice",
+            json!({"amount_sat": 1_000}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), hook.wait_until_reached())
+        .await
+        .expect("chain offer did not reach its recovery gate");
+    let mutation_at_gate = m11_creation_mutation_snapshot(&pool).await;
+    let provider_calls_at_gate = provider_calls.load(Ordering::SeqCst);
+    assert_eq!(mutation_at_gate.key_allocations, 1);
+    assert_eq!(mutation_at_gate.chain_swaps, 0);
+    assert_eq!(provider_calls_at_gate, 1);
+    hook.release();
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("runtime-refused checkout did not finish")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lightning_pr"], "");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert_eq!(
+        m11_creation_mutation_snapshot(&pool).await,
+        mutation_at_gate
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        provider_calls_at_gate
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_offer_permit_contention_refuses_before_key_or_provider_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    seed_chain_offer_checkout_surface(&pool, "chainpermitbusy").await;
+    let runtime = test_recovery_manifest_runtime();
+    let held_permit = ChainSwapCreationPermit::acquire(&pool, runtime.store())
+        .await
+        .expect("hold competing chain-creation permit");
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(runtime);
+    let app = test_app(state);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    );
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        post_json(
+            &request_app,
+            "/chainpermitbusy/invoice",
+            json!({"amount_sat": 1_000}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), hook.wait_until_reached())
+        .await
+        .expect("chain offer did not reach its permit gate");
+    let mutation_at_gate = m11_creation_mutation_snapshot(&pool).await;
+    let provider_calls_at_gate = provider_calls.load(Ordering::SeqCst);
+    assert_eq!(mutation_at_gate.key_allocations, 1);
+    assert_eq!(mutation_at_gate.chain_swaps, 0);
+    assert_eq!(provider_calls_at_gate, 1);
+    hook.release();
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("permit-refused checkout did not finish")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lightning_pr"], "");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert_eq!(
+        m11_creation_mutation_snapshot(&pool).await,
+        mutation_at_gate
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        provider_calls_at_gate
+    );
+
+    held_permit
+        .release()
+        .await
+        .expect("release competing chain-creation permit");
+    provider_task.abort();
+    let _ = provider_task.await;
     cleanup_db(&pool).await;
 }
 
