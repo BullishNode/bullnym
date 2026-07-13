@@ -2216,9 +2216,6 @@ async fn create_bitcoin_chain_offer(
         .admission
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
-    let manifest_runtime = state
-        .recovery_manifest_runtime_v1()
-        .ok_or(AppError::MoneyAdmissionUnavailable)?;
 
     pause_at_invoice_integration_test_hook(
         InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
@@ -2319,7 +2316,7 @@ async fn create_bitcoin_chain_offer(
 
     crate::swap_manifest_persistence::persist_created_chain_swap(
         &state.db,
-        manifest_runtime,
+        recovery_runtime,
         crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
             chain_swap: &result,
             lockup_bip21: &lockup_bip21,
