@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use pay_service::boltz::BoltzService;
 use pay_service::config::{
@@ -49,11 +50,23 @@ use pay_service::{
     registration, AppState,
 };
 
-use bitcoin::hashes::Hash as BitcoinHash;
-use boltz_client::network::Network;
-use boltz_client::swaps::boltz::{PairMinerFees, ReverseFees, ReverseLimits, ReversePair};
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::{hash160, Hash as BitcoinHash};
+use bitcoin::opcodes::all::{
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_EQUALVERIFY, OP_HASH160, OP_SIZE,
+};
+use bitcoin::script::Builder;
+use bitcoin::ScriptBuf;
+use boltz_client::network::{BitcoinChain, LiquidChain, Network};
+use boltz_client::swaps::boltz::{
+    ChainPair, ChainSwapDetails, CreateChainResponse, HeightResponse, Leaf, PairMinerFees,
+    ReverseFees, ReverseLimits, ReversePair, Side, SwapTree, SwapType,
+};
 use boltz_client::swaps::BtcLikeTransaction;
-use boltz_client::util::secrets::SwapMasterKey;
+use boltz_client::util::secrets::{Preimage, SwapMasterKey};
+use boltz_client::{
+    BtcSwapScript, LBtcSwapScript, PublicKey as BoltzPublicKey, ZKKeyPair, ZKSecp256k1,
+};
 use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
@@ -16750,6 +16763,589 @@ fn verified_recovery_commitment(
     };
     pay_service::recovery_address_registration::verify_recovery_address_registration(&request)
         .unwrap()
+}
+
+const ISSUE84_CHAIN_AMOUNT_SAT: u64 = 25_000;
+const ISSUE84_SWAP_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
+const ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
+
+#[derive(Clone)]
+struct Issue84ChainProviderState {
+    pair_response: Value,
+    height_response: Value,
+    creation_response: Value,
+    calls: Arc<AtomicUsize>,
+    creation_calls: Arc<AtomicUsize>,
+}
+
+struct Issue84ChainProvider {
+    base_url: String,
+    calls: Arc<AtomicUsize>,
+    creation_calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Issue84ChainProvider {
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+async fn issue84_chain_pairs_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.pair_response)
+}
+
+async fn issue84_chain_heights_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.height_response)
+}
+
+async fn issue84_chain_creation_handler(
+    axum::extract::State(state): axum::extract::State<Issue84ChainProviderState>,
+    axum::Json(_request): axum::Json<Value>,
+) -> axum::Json<Value> {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    state.creation_calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.creation_response)
+}
+
+fn issue84_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn issue84_refund_script(sender: &BoltzPublicKey, timeout_height: u32) -> ScriptBuf {
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn issue84_chain_pair() -> ChainPair {
+    serde_json::from_value(json!({
+        "hash": "014261b046f2045ddedd49fe291e0255afe002454c65a5aa7d6457a35cd32f19",
+        "rate": 1.0,
+        "limits": {
+            "maximal": 25_000_000,
+            "minimal": 25_000,
+            "maximalZeroConf": 0
+        },
+        "fees": {
+            "percentage": 0.1,
+            "minerFees": {
+                "server": 405,
+                "user": {"claim": 20, "lockup": 385}
+            }
+        }
+    }))
+    .unwrap()
+}
+
+fn issue84_chain_heights() -> HeightResponse {
+    serde_json::from_value(json!({
+        "BTC": 957_817,
+        "L-BTC": 3_970_775
+    }))
+    .unwrap()
+}
+
+fn issue84_chain_user_lock_amount(pair: &ChainPair, server_lock_amount_sat: u64) -> u64 {
+    let numerator = server_lock_amount_sat
+        .checked_add(pair.fees.miner_fees.server)
+        .unwrap();
+    (numerator as f64 / (1.0 - pair.fees.percentage / 100.0)).ceil() as u64
+}
+
+fn issue84_chain_creation_response(
+    claim_key_index: u64,
+    refund_key_index: u64,
+    swap_id: &str,
+) -> (ChainPair, HeightResponse, CreateChainResponse) {
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    let pair = issue84_chain_pair();
+    let heights = issue84_chain_heights();
+    let swap_master_key =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let claim_keypair = swap_master_key.derive_swapkey(claim_key_index).unwrap();
+    let refund_keypair = swap_master_key.derive_swapkey(refund_key_index).unwrap();
+    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+    let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
+    let hashlock = Preimage::from_swap_key(&claim_keypair).hash160;
+    let bitcoin_server_key = BoltzPublicKey::from_str(
+        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+    )
+    .unwrap();
+    let liquid_server_key = BoltzPublicKey::from_str(
+        "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+    )
+    .unwrap();
+    let bitcoin_timeout = heights.btc + 144;
+    let liquid_timeout = heights.lbtc + 720;
+    let bitcoin_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(issue84_claim_script(hashlock, &bitcoin_server_key)),
+            version: ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(issue84_refund_script(&refund_public_key, bitcoin_timeout)),
+            version: ISSUE84_BTC_TAPSCRIPT_LEAF_VERSION,
+        },
+        covenant_claim_leaf: None,
+    };
+    let liquid_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(issue84_claim_script(hashlock, &claim_public_key)),
+            version: ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(issue84_refund_script(&liquid_server_key, liquid_timeout)),
+            version: ISSUE84_LIQUID_TAPSCRIPT_LEAF_VERSION,
+        },
+        covenant_claim_leaf: None,
+    };
+    let bitcoin_address = BtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Lockup),
+        funding_addrs: None,
+        hashlock,
+        receiver_pubkey: bitcoin_server_key,
+        locktime: LockTime::from_consensus(bitcoin_timeout),
+        sender_pubkey: refund_public_key,
+    }
+    .to_address(BitcoinChain::Bitcoin)
+    .unwrap()
+    .to_string();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let liquid_address = LBtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Claim),
+        funding_addrs: None,
+        hashlock,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+        sender_pubkey: liquid_server_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+    let response = CreateChainResponse {
+        id: swap_id.to_string(),
+        claim_details: ChainSwapDetails {
+            swap_tree: liquid_tree,
+            lockup_address: liquid_address,
+            server_public_key: liquid_server_key,
+            timeout_block_height: liquid_timeout,
+            amount: ISSUE84_CHAIN_AMOUNT_SAT,
+            blinding_key: Some(BLINDING_KEY.to_string()),
+            refund_address: None,
+            claim_address: None,
+            bip21: None,
+        },
+        lockup_details: ChainSwapDetails {
+            swap_tree: bitcoin_tree,
+            lockup_address: bitcoin_address,
+            server_public_key: bitcoin_server_key,
+            timeout_block_height: bitcoin_timeout,
+            amount: issue84_chain_user_lock_amount(&pair, ISSUE84_CHAIN_AMOUNT_SAT),
+            blinding_key: None,
+            refund_address: None,
+            claim_address: None,
+            bip21: Some("bitcoin:provider-controlled-and-never-forwarded?amount=999".into()),
+        },
+    };
+    (pair, heights, response)
+}
+
+async fn spawn_issue84_chain_provider(
+    claim_key_index: u64,
+    refund_key_index: u64,
+    swap_id: &str,
+) -> Issue84ChainProvider {
+    let (pair, heights, response) =
+        issue84_chain_creation_response(claim_key_index, refund_key_index, swap_id);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let creation_calls = Arc::new(AtomicUsize::new(0));
+    let state = Issue84ChainProviderState {
+        pair_response: json!({"BTC": {"L-BTC": pair}, "L-BTC": {}}),
+        height_response: serde_json::to_value(heights).unwrap(),
+        creation_response: serde_json::to_value(response).unwrap(),
+        calls: calls.clone(),
+        creation_calls: creation_calls.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/swap/chain",
+            get(issue84_chain_pairs_handler).post(issue84_chain_creation_handler),
+        )
+        .route("/chain/heights", get(issue84_chain_heights_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Issue84ChainProvider {
+        base_url: format!("http://{address}"),
+        calls,
+        creation_calls,
+        task,
+    }
+}
+
+async fn issue84_test_merchant(pool: &PgPool, nym: &str) -> (String, Keypair) {
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    (npub, keypair)
+}
+
+async fn issue84_chain_invoice(
+    pool: &PgPool,
+    nym: &str,
+    npub: &str,
+    liquid_address_index: u32,
+) -> pay_service::db::Invoice {
+    let liquid_address =
+        pay_service::descriptor::derive_address(TEST_DESCRIPTOR, liquid_address_index).unwrap();
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some(nym),
+            public_slug: None,
+            npub_owner: npub,
+            origin: "checkout",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: i64::try_from(ISSUE84_CHAIN_AMOUNT_SAT).unwrap(),
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(&liquid_address),
+            liquid_blinding_key_hex: Some("11".repeat(32).as_str()),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn issue84_persist_recovery_commitment(
+    pool: &PgPool,
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) {
+    let evidence = verified_recovery_commitment(keypair, npub, address, timestamp);
+    pay_service::db::persist_recovery_address_commitment(pool, &evidence)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84missing";
+    let (npub, _) = issue84_test_merchant(&pool, nym).await;
+    let mut invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let chain_high_water_before =
+        pay_service::db::max_persisted_chain_key_index(&pool, "0000000000000000")
+            .await
+            .unwrap();
+    let allocations_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some("issue84differentowner"),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(mismatched.is_none());
+
+    invoice.npub_owner =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
+    let recipient_mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(recipient_mismatched.is_none());
+    invoice.npub_owner.clone_from(&npub);
+
+    let missing = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(missing.is_none());
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    let inactive = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap();
+    assert!(inactive.is_none());
+
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before,
+        "merchant recovery gating consumed a swap-key sequence value"
+    );
+    assert_eq!(
+        pay_service::db::max_persisted_chain_key_index(&pool, "0000000000000000")
+            .await
+            .unwrap(),
+        chain_high_water_before,
+        "merchant recovery gating changed the persisted chain-key high water"
+    );
+    let allocations_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(allocations_after, allocations_before);
+    let chain_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chain_rows, 0);
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "merchant recovery gating reached the provider"
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_copies_commitment_durably_before_return() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84durable";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    let invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        "Issue84Durable1",
+    )
+    .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let state = test_state_with_config(pool.clone(), config);
+
+    let returned = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("registered merchant should receive a chain offer");
+
+    let recorded: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT merchant_emergency_btc_address, lockup_address, \
+                claim_key_index, refund_key_index \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.0, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(recorded.1, returned.0);
+    assert_eq!(recorded.2, next_key);
+    assert_eq!(recorded.3, next_key + 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84rotation";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let first_commitment_timestamp = auth_timestamp();
+    issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        first_commitment_timestamp,
+    )
+    .await;
+    let first_invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let first_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let first_provider = spawn_issue84_chain_provider(
+        u64::try_from(first_key).unwrap(),
+        u64::try_from(first_key + 1).unwrap(),
+        "Issue84RotationOld1",
+    )
+    .await;
+    let mut first_config = test_config();
+    first_config.boltz.api_url = first_provider.base_url.clone();
+    let first_state = test_state_with_config(pool.clone(), first_config);
+    pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &first_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &first_invoice,
+    )
+    .await
+    .unwrap()
+    .expect("first registered commitment should admit creation");
+    first_provider.shutdown().await;
+
+    issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2TR,
+        first_commitment_timestamp + 1,
+    )
+    .await;
+    let first_after_rotation: String = sqlx::query_scalar(
+        "SELECT merchant_emergency_btc_address \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(first_invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first_after_rotation, RECOVERY_COMMITMENT_P2WPKH);
+
+    let second_invoice = issue84_chain_invoice(&pool, nym, &npub, 1).await;
+    let second_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let second_provider = spawn_issue84_chain_provider(
+        u64::try_from(second_key).unwrap(),
+        u64::try_from(second_key + 1).unwrap(),
+        "Issue84RotationNew1",
+    )
+    .await;
+    let mut second_config = test_config();
+    second_config.boltz.api_url = second_provider.base_url.clone();
+    let second_state = test_state_with_config(pool.clone(), second_config);
+    pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &second_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &second_invoice,
+    )
+    .await
+    .unwrap()
+    .expect("rotated commitment should admit future creation");
+
+    let recorded: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT invoice_id, merchant_emergency_btc_address \
+           FROM chain_swap_records \
+          WHERE invoice_id = ANY($1) \
+          ORDER BY created_at, invoice_id",
+    )
+    .bind(vec![first_invoice.id, second_invoice.id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.len(), 2);
+    let first_address = recorded
+        .iter()
+        .find_map(|(invoice_id, address)| {
+            (*invoice_id == first_invoice.id).then_some(address.as_str())
+        })
+        .unwrap();
+    let second_address = recorded
+        .iter()
+        .find_map(|(invoice_id, address)| {
+            (*invoice_id == second_invoice.id).then_some(address.as_str())
+        })
+        .unwrap();
+    assert_eq!(first_address, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(second_address, RECOVERY_COMMITMENT_P2TR);
+    assert_eq!(second_provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(second_provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    second_provider.shutdown().await;
+    cleanup_db(&pool).await;
 }
 
 async fn observe_recovery_lock_wait(

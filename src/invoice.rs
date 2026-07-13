@@ -2183,7 +2183,7 @@ async fn create_bitcoin_chain_offer(
     // chain offers are created from nym-owned checkout, so this only guards a
     // future caller (e.g. a lazy wallet-invoice chain offer) from silently
     // minting unrecoverable swaps. Refuse to create the offer instead.
-    if swap_nym.is_none() || invoice.nym_owner.is_none() {
+    let (Some(swap_nym), Some(nym_owner)) = (swap_nym, invoice.nym_owner.as_deref()) else {
         tracing::error!(
             event = "chain_swap_offer_without_nym_refused",
             invoice_id = %invoice.id,
@@ -2192,12 +2192,56 @@ async fn create_bitcoin_chain_offer(
             "refusing to create a chain-swap offer without an owning nym — its BTC would be unrecoverable via the merchant recovery endpoint (operator P1)"
         );
         return Ok(None);
+    };
+    if swap_nym != nym_owner {
+        tracing::error!(
+            event = "chain_swap_offer_nym_owner_mismatch_refused",
+            invoice_id = %invoice.id,
+            "refusing to create a chain-swap offer with mismatched swap and invoice ownership"
+        );
+        return Ok(None);
     }
 
     state
         .admission
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
+    let Some(active_owner) = db::get_active_user_by_nym(&state.db, nym_owner).await? else {
+        tracing::warn!(
+            event = "chain_swap_offer_inactive_recovery_owner_refused",
+            invoice_id = %invoice.id,
+            "refusing to create a chain-swap offer because its merchant identity is inactive"
+        );
+        return Ok(None);
+    };
+    if active_owner.npub != invoice.npub_owner {
+        tracing::error!(
+            event = "chain_swap_offer_recipient_identity_mismatch_refused",
+            invoice_id = %invoice.id,
+            "refusing to create a chain-swap offer whose active nym and invoice recipient identities differ"
+        );
+        return Ok(None);
+    }
+    let Some(recovery_commitment) =
+        db::select_current_recovery_address_commitment(&state.db, &active_owner.npub)
+            .await
+            .map_err(|error| {
+                AppError::DbError(format!(
+                    "failed to resolve chain-swap recovery commitment: {error}"
+                ))
+            })?
+    else {
+        tracing::warn!(
+            event = "chain_swap_offer_missing_recovery_commitment_refused",
+            invoice_id = %invoice.id,
+            "refusing to create a chain-swap offer without a current merchant recovery commitment"
+        );
+        return Ok(None);
+    };
+    // Keep the selected immutable record in scope through the durable swap
+    // insert. The composed #84 slice can bind its `commitment_id` beside this
+    // exact address without performing a second, rotation-sensitive lookup.
 
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -2271,7 +2315,7 @@ async fn create_bitcoin_chain_offer(
         &state.db,
         &db::NewChainSwapRecord {
             invoice_id: invoice.id,
-            nym: swap_nym,
+            nym: Some(swap_nym),
             boltz_swap_id: &result.swap_id,
             lockup_address: &result.lockup_address,
             lockup_bip21: Some(&lockup_bip21),
@@ -2308,10 +2352,7 @@ async fn create_bitcoin_chain_offer(
             liquid_network: result.creation_terms.liquid_network,
             liquid_asset_id: &result.creation_terms.liquid_asset_id,
             merchant_liquid_destination: &merchant_liquid_destination,
-            // #84 owns signed emergency-address registration. Until that
-            // append-only registry exists, creation is valid but explicitly
-            // legacy/manual-recovery rather than v3-complete.
-            merchant_emergency_btc_address: None,
+            merchant_emergency_btc_address: Some(recovery_commitment.canonical_btc_address()),
         },
     )
     .await
@@ -2326,6 +2367,25 @@ async fn create_bitcoin_chain_offer(
         lockup_address: result.lockup_address,
         lockup_bip21: Some(lockup_bip21),
     }))
+}
+
+/// Focused integration seam for the chain-offer creation boundary.
+///
+/// It executes the exact production path while avoiding checkout's separate
+/// eager Lightning attempt, so integration tests can attribute key and
+/// provider mutations solely to chain-offer creation.
+#[doc(hidden)]
+pub async fn exercise_bitcoin_chain_offer_creation(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<Option<(String, Option<String>)>, AppError> {
+    Ok(
+        create_bitcoin_chain_offer(state, swap_nym, amount_sat, invoice)
+            .await?
+            .map(|offer| (offer.lockup_address, offer.lockup_bip21)),
+    )
 }
 
 // =====================================================================
