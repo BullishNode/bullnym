@@ -13,6 +13,7 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::provider_limits::{LightningAddressCreationError, LightningAddressUnavailable};
 use crate::utxo::{script_matches_pubkey, verify_ownership_sig, ParsedOutpoint};
 use crate::AppState;
 
@@ -117,6 +118,27 @@ fn requests_method(payment_method: Option<&str>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn lightning_address_unavailable(_error: LightningAddressUnavailable) -> AppError {
+    AppError::MoneyAdmissionUnavailable
+}
+
+fn lightning_address_creation_error(error: LightningAddressCreationError) -> AppError {
+    match error {
+        LightningAddressCreationError::TemporarilyUnavailable(error) => {
+            lightning_address_unavailable(error)
+        }
+        LightningAddressCreationError::AmountNotWholeSatoshi => {
+            AppError::InvalidAmount("amount must be a multiple of 1000 msat".to_string())
+        }
+        LightningAddressCreationError::BelowCurrentMinimum { minimum_msat } => {
+            AppError::InvalidAmount(format!("minimum is {minimum_msat} msat"))
+        }
+        LightningAddressCreationError::AboveCurrentMaximum { maximum_msat } => {
+            AppError::InvalidAmount(format!("maximum is {maximum_msat} msat"))
+        }
+    }
+}
+
 /// Resolve caller IP and apply the per-IP metadata rate-limit + (when a nym
 /// is being queried) the distinct-nyms-per-IP cap. Whitelisted callers
 /// bypass. Shared by `metadata` and `nostr::nostr_json`.
@@ -172,12 +194,34 @@ pub async fn metadata(
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
 
+    // Cheap, in-process read only. Keep it after abuse/certification and nym
+    // existence gates so rejected metadata requests cannot probe provider
+    // readiness. Standard Lightning does not require a zero-conf limit.
+    let lightning_range = state.boltz.provider_limits().lightning_address_range(
+        state.config.limits.min_sendable_msat,
+        state.config.limits.max_sendable_msat,
+    );
+    let (min_sendable, max_sendable) = match lightning_range {
+        Ok(range) => range.limits_msat(),
+        Err(_) => {
+            // LUD-22 uses this response to discover independent alternative
+            // payment methods, while minSendable/maxSendable apply only to
+            // implicit Lightning. The extension has no method-specific
+            // availability flag, so keep Liquid discoverable and let the
+            // Lightning callback's pre-allocation revalidation fail closed.
+            (
+                state.config.limits.min_sendable_msat,
+                state.config.limits.max_sendable_msat,
+            )
+        }
+    };
+
     let callback = format!("https://{}/lnurlp/callback/{}", state.config.domain, nym);
 
     Ok(Json(LnurlPayMetadata {
         callback,
-        max_sendable: state.config.limits.max_sendable_msat,
-        min_sendable: state.config.limits.min_sendable_msat,
+        max_sendable,
+        min_sendable,
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
         comment_allowed: 144,
@@ -368,7 +412,7 @@ async fn serve_liquid(
 async fn serve_lightning(
     state: &AppState,
     nym: &str,
-    amount_sat: u64,
+    amount_msat: u64,
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
 ) -> Result<axum::response::Response, AppError> {
@@ -378,7 +422,7 @@ async fn serve_lightning(
         }
     }
 
-    let (resp, _swap_id) = create_lightning_swap(state, nym, amount_sat).await?;
+    let (resp, _swap_id) = create_lightning_swap(state, nym, amount_msat).await?;
     Ok(Json(resp).into_response())
 }
 
@@ -391,12 +435,25 @@ async fn serve_lightning(
 pub(crate) async fn create_lightning_swap(
     state: &AppState,
     nym: &str,
-    amount_sat: u64,
+    amount_msat: u64,
 ) -> Result<(LightningResponse, String), AppError> {
     state
         .admission
         .enforce(Rail::LightningReverse)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
+    // Re-read the shared snapshot after admission and before the first key
+    // allocation. Provider changes since metadata therefore fail without
+    // consuming an index, reserving lineage, or calling the provider.
+    let (amount_sat, _lightning_range) = state
+        .boltz
+        .provider_limits()
+        .revalidate_lightning_address_creation(
+            state.config.limits.min_sendable_msat,
+            state.config.limits.max_sendable_msat,
+            amount_msat,
+        )
+        .map_err(lightning_address_creation_error)?;
 
     let swap_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -557,7 +614,7 @@ pub async fn callback(
     };
 
     // Lightning path — default rail AND fallback destination.
-    match serve_lightning(&state, &nym, amount_sat, caller_ip, is_whitelisted).await {
+    match serve_lightning(&state, &nym, params.amount, caller_ip, is_whitelisted).await {
         Ok(response) => Ok(response),
         Err(fallback_error) => {
             if let Some(liquid_throttle) = liquid_throttle {

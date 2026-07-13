@@ -76,6 +76,64 @@ fn rl_gate_ok_passes_through() {
 }
 
 #[test]
+fn provider_snapshot_unavailability_uses_existing_temporary_service_error() {
+    for unavailable in [
+        LightningAddressUnavailable::SnapshotMissing,
+        LightningAddressUnavailable::SnapshotInvalid(
+            crate::provider_limits::ReversePairValidationError::WrongPair,
+        ),
+        LightningAddressUnavailable::SnapshotObservedInFuture,
+        LightningAddressUnavailable::SnapshotStale,
+        LightningAddressUnavailable::ZeroConfUnavailable,
+        LightningAddressUnavailable::NoExecutableRange,
+    ] {
+        let error = lightning_address_unavailable(unavailable);
+        assert!(matches!(&error, AppError::MoneyAdmissionUnavailable));
+        assert_eq!(error.code(), "ServiceUnavailable");
+    }
+}
+
+#[test]
+fn creation_unavailability_uses_existing_temporary_service_error() {
+    let error =
+        lightning_address_creation_error(LightningAddressCreationError::TemporarilyUnavailable(
+            LightningAddressUnavailable::SnapshotStale,
+        ));
+    assert!(matches!(&error, AppError::MoneyAdmissionUnavailable));
+    assert_eq!(error.code(), "ServiceUnavailable");
+}
+
+#[test]
+fn creation_amount_errors_keep_existing_lnurl_contract() {
+    let cases = [
+        (
+            LightningAddressCreationError::AmountNotWholeSatoshi,
+            "amount must be a multiple of 1000 msat",
+        ),
+        (
+            LightningAddressCreationError::BelowCurrentMinimum {
+                minimum_msat: 250_000,
+            },
+            "minimum is 250000 msat",
+        ),
+        (
+            LightningAddressCreationError::AboveCurrentMaximum {
+                maximum_msat: 500_000,
+            },
+            "maximum is 500000 msat",
+        ),
+    ];
+
+    for (creation_error, expected_message) in cases {
+        let error = lightning_address_creation_error(creation_error);
+        match error {
+            AppError::InvalidAmount(message) => assert_eq!(message, expected_message),
+            other => panic!("expected InvalidAmount, got {}", other.code()),
+        }
+    }
+}
+
+#[test]
 fn liquid_response_addr_index_uses_current_cursor_without_reservation() {
     assert_eq!(liquid_response_addr_index(7, None).unwrap(), 7);
 }

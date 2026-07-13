@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
@@ -51,6 +51,7 @@ use pay_service::{
 
 use bitcoin::hashes::Hash as BitcoinHash;
 use boltz_client::network::Network;
+use boltz_client::swaps::boltz::{PairMinerFees, ReverseFees, ReverseLimits, ReversePair};
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::SwapMasterKey;
 use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
@@ -104,6 +105,24 @@ fn constrained_test_pool(
         .expect("constrained test pool URL must parse")
 }
 
+fn test_reverse_pair(minimum_sat: u64, maximum_sat: u64) -> ReversePair {
+    ReversePair {
+        hash: "11".repeat(32),
+        rate: 1.0,
+        limits: ReverseLimits {
+            minimal: minimum_sat,
+            maximal: maximum_sat,
+        },
+        fees: ReverseFees {
+            percentage: 0.25,
+            miner_fees: PairMinerFees {
+                lockup: 27,
+                claim: 20,
+            },
+        },
+    }
+}
+
 fn test_config() -> Config {
     Config {
         domain: "test.example.com".to_string(),
@@ -141,6 +160,24 @@ fn test_state(pool: PgPool) -> AppState {
 }
 
 fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
+    test_state_with_provider_limits(
+        pool,
+        config,
+        Some((Some(test_reverse_pair(100, 25_000_000)), Instant::now())),
+    )
+}
+
+/// Build a test state with an explicit provider-limit refresh result.
+///
+/// The outer `None` preserves the runtime's initial missing state. An inner
+/// `None` records a successful response that omitted the exact reverse pair.
+/// Ordinary integration fixtures use a fresh safe snapshot so M11 does not
+/// accidentally close unrelated pre-existing Lightning tests.
+fn test_state_with_provider_limits(
+    pool: PgPool,
+    config: Config,
+    refresh: Option<(Option<ReversePair>, Instant)>,
+) -> AppState {
     let swap_master_key = SwapMasterKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         None,
@@ -150,6 +187,12 @@ fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
     let rate_limiter = Arc::new(RateLimiter::new(pool.clone(), RateLimitConfig::default()));
     let pricer = Arc::new(PricerClient::new(PricerConfig::default()).unwrap());
     let boltz_api_url = config.boltz.api_url.clone();
+    let boltz = Arc::new(BoltzService::new(&boltz_api_url, swap_master_key, None));
+    if let Some((pair, completed_at)) = refresh {
+        let _ = boltz
+            .provider_limits()
+            .record_successful_refresh(pair, completed_at);
+    }
     let liquid_claim_client_factory = Arc::new(
         pay_service::claimer::LiquidClaimClientFactory::try_new(
             config.claim_liquid_electrum_urls(),
@@ -167,7 +210,7 @@ fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
         db: pool,
         config: Arc::new(config),
         admission: pay_service::admission::MoneyAdmission::healthy_test_fixture(),
-        boltz: Arc::new(BoltzService::new(&boltz_api_url, swap_master_key, None)),
+        boltz,
         ip_whitelist: Arc::new(IpWhitelist::default()),
         certification: Arc::new(certification::CertificationAllowlist::default()),
         rate_limiter,
@@ -749,6 +792,34 @@ async fn spawn_counting_http_server() -> (String, Arc<AtomicUsize>, tokio::task:
         }
     });
     (format!("http://{address}"), calls, task)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct M11CreationMutationSnapshot {
+    next_key_index: i64,
+    key_allocations: i64,
+    reverse_swaps: i64,
+    chain_swaps: i64,
+}
+
+async fn m11_creation_mutation_snapshot(pool: &PgPool) -> M11CreationMutationSnapshot {
+    M11CreationMutationSnapshot {
+        next_key_index: pay_service::db::swap_key_seq_next_value(pool)
+            .await
+            .unwrap(),
+        key_allocations: sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        reverse_swaps: sqlx::query_scalar("SELECT COUNT(*) FROM swap_records")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        chain_swaps: sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+    }
 }
 
 #[derive(Clone)]
@@ -5269,6 +5340,205 @@ async fn callback_rejects_invalid_amounts() {
     let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=99000000000000").await;
     assert_eq!(body["status"], "ERROR");
 
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn m11_fresh_provider_range_is_cached_and_callback_revalidates_before_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "m11freshlimits").await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_provider_limits(
+        pool.clone(),
+        config,
+        Some((Some(test_reverse_pair(250, 2_000)), Instant::now())),
+    );
+    let boltz = state.boltz.clone();
+    let app = test_app(state);
+
+    for request in 1..=3 {
+        let (status, body) = get_path(&app, "/.well-known/lnurlp/m11freshlimits").await;
+        assert_eq!(status, StatusCode::OK, "metadata request {request}: {body}");
+        assert_eq!(
+            body["minSendable"], 250_000,
+            "metadata request {request}: {body}"
+        );
+        assert_eq!(
+            body["maxSendable"], 2_000_000,
+            "metadata request {request}: {body}"
+        );
+    }
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "metadata reads performed provider I/O"
+    );
+
+    let _ = boltz
+        .provider_limits()
+        .record_successful_refresh(Some(test_reverse_pair(500, 1_500)), Instant::now());
+    let before = m11_creation_mutation_snapshot(&pool).await;
+    let (status, body) = get_path(&app, "/lnurlp/callback/m11freshlimits?amount=250000").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "status": "ERROR",
+            "code": "InvalidAmount",
+            "reason": "minimum is 500000 msat"
+        })
+    );
+    assert_eq!(
+        m11_creation_mutation_snapshot(&pool).await,
+        before,
+        "changed provider limits mutated a key, reservation, or swap row"
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "changed-limit refusal reached the provider"
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn m11_unsafe_provider_snapshots_disable_only_lightning() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let now = Instant::now();
+    let cases = [
+        ("missing", None),
+        ("exactmissing", Some((None, now))),
+        ("malformed", Some((Some(test_reverse_pair(0, 1_000)), now))),
+        (
+            "stale",
+            Some((
+                Some(test_reverse_pair(100, 1_000)),
+                now.checked_sub(Duration::from_secs(91)).unwrap(),
+            )),
+        ),
+        (
+            "future",
+            Some((
+                Some(test_reverse_pair(100, 1_000)),
+                now.checked_add(Duration::from_secs(300)).unwrap(),
+            )),
+        ),
+    ];
+
+    for (case, refresh) in cases {
+        let nym = format!("m11unsafe{case}");
+        create_test_user(&pool, &nym).await;
+        let mut config = test_config();
+        config.boltz.api_url = boltz_url.clone();
+        let product_min_sendable = config.limits.min_sendable_msat;
+        let product_max_sendable = config.limits.max_sendable_msat;
+        let metadata_origin = format!("https://{}", config.domain);
+        let mut state = test_state_with_provider_limits(pool.clone(), config, refresh);
+        state.ip_whitelist =
+            Arc::new(IpWhitelist::parse(&["127.0.0.1".to_string()]).expect("parse test whitelist"));
+        let app = test_app(state);
+        let before = m11_creation_mutation_snapshot(&pool).await;
+
+        let (metadata_status, metadata_body) =
+            get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+        assert_eq!(
+            metadata_status,
+            StatusCode::OK,
+            "case {case}: {metadata_body}"
+        );
+        assert_eq!(metadata_body["tag"], "payRequest", "case {case}");
+        assert_eq!(
+            metadata_body["minSendable"],
+            json!(product_min_sendable),
+            "case {case}"
+        );
+        assert_eq!(
+            metadata_body["maxSendable"],
+            json!(product_max_sendable),
+            "case {case}"
+        );
+        assert_eq!(
+            metadata_body["payment_methods"],
+            json!(["L-BTC"]),
+            "case {case}"
+        );
+        let callback = metadata_body["callback"]
+            .as_str()
+            .expect("metadata callback string");
+        let expected_callback = format!("{metadata_origin}/lnurlp/callback/{nym}");
+        assert_eq!(callback, expected_callback, "case {case}");
+        let callback_path = callback
+            .strip_prefix(&metadata_origin)
+            .expect("callback on configured metadata origin");
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: metadata performed provider I/O"
+        );
+
+        let (liquid_status, liquid_body) = get_path_from(
+            &app,
+            &format!("{callback_path}?amount=100000&payment_method=L-BTC"),
+            "127.0.0.1:42111".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(liquid_status, StatusCode::OK, "case {case}: {liquid_body}");
+        assert!(
+            liquid_body["L-BTC"]["address"]
+                .as_str()
+                .is_some_and(|address| !address.is_empty()),
+            "case {case}: {liquid_body}"
+        );
+        assert_eq!(
+            m11_creation_mutation_snapshot(&pool).await,
+            before,
+            "case {case}: direct Liquid touched provider-creation state"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: direct Liquid caused provider I/O"
+        );
+
+        let (lightning_status, lightning_body) =
+            get_path(&app, &format!("{callback_path}?amount=100000")).await;
+        assert_eq!(
+            lightning_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "case {case}: {lightning_body}"
+        );
+        assert_eq!(
+            lightning_body,
+            json!({
+                "status": "ERROR",
+                "code": "ServiceUnavailable",
+                "reason": "This payment method is temporarily unavailable. Try again later."
+            }),
+            "case {case}"
+        );
+        assert_eq!(
+            m11_creation_mutation_snapshot(&pool).await,
+            before,
+            "case {case}: unavailable Lightning mutated creation state"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "case {case}: unavailable Lightning reached the provider"
+        );
+    }
+
+    provider_task.abort();
+    let _ = provider_task.await;
     cleanup_db(&pool).await;
 }
 
