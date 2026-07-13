@@ -219,6 +219,20 @@ fn chain_claim_rejects_corrupt_creation_destination_policy() {
 }
 
 #[test]
+fn chain_claim_journal_mode_rejects_orphan_parent_state() {
+    assert_eq!(
+        persisted_chain_claim_journal_mode(None, None).unwrap(),
+        PersistedChainClaimJournalMode::ConstructAndInsert
+    );
+    assert_eq!(
+        persisted_chain_claim_journal_mode(Some("00"), Some("11")).unwrap(),
+        PersistedChainClaimJournalMode::DecodeAndLoadExact
+    );
+    assert!(persisted_chain_claim_journal_mode(Some("00"), None).is_err());
+    assert!(persisted_chain_claim_journal_mode(None, Some("11")).is_err());
+}
+
+#[test]
 fn url_secret_matches_current() {
     assert_eq!(
         match_url_secret_pair("s3cr3t-current", "s3cr3t-current", ""),
@@ -454,6 +468,138 @@ impl UtxoBackend for MockUtxoBackend {
             .push((txid_hex.to_string(), vout));
         Ok(self.spender.clone())
     }
+}
+
+struct ChainClaimJournalFixture {
+    claim_tx: BtcLikeTransaction,
+    source_address: String,
+    source_blinding_key_hex: String,
+    merchant_address: String,
+    merchant_blinding_key_hex: String,
+    source_txid: String,
+    backend: Arc<dyn UtxoBackend>,
+}
+
+fn chain_claim_journal_fixture() -> ChainClaimJournalFixture {
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = boltz_elements::secp256k1_zkp::rand::thread_rng();
+    let asset = boltz_elements::AssetId::LIQUID_BTC;
+    let address_template = boltz_elements::Address::from_str(
+        &valid_chain_creation_terms().merchant_liquid_destination,
+    )
+    .unwrap()
+    .to_unconfidential();
+
+    let source_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::new(&mut rng);
+    let source_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &source_blinding_key);
+    let source_address = address_template
+        .clone()
+        .to_confidential(source_blinding_pubkey);
+    let source_input_secrets = boltz_elements::TxOutSecrets::new(
+        asset,
+        boltz_elements::confidential::AssetBlindingFactor::new(&mut rng),
+        91_000,
+        boltz_elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+    let (source_output, source_abf, source_vbf, _) = boltz_elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        91_000,
+        asset,
+        source_address.script_pubkey(),
+        source_blinding_pubkey,
+        &[source_input_secrets],
+        &[],
+    )
+    .unwrap();
+    let source_secrets = boltz_elements::TxOutSecrets::new(asset, source_abf, 91_000, source_vbf);
+    let source_transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![source_output],
+    };
+    let source_txid = source_transaction.txid();
+
+    let merchant_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::new(&mut rng);
+    let merchant_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &merchant_blinding_key);
+    let merchant_address = address_template.to_confidential(merchant_blinding_pubkey);
+    let (merchant_output, _, _, _) = boltz_elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        90_000,
+        asset,
+        merchant_address.script_pubkey(),
+        merchant_blinding_pubkey,
+        &[source_secrets],
+        &[],
+    )
+    .unwrap();
+    let claim_transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: vec![boltz_elements::TxIn {
+            previous_output: boltz_elements::OutPoint::new(source_txid, 0),
+            is_pegin: false,
+            script_sig: boltz_elements::Script::new(),
+            sequence: boltz_elements::Sequence::MAX,
+            asset_issuance: boltz_elements::AssetIssuance::default(),
+            witness: boltz_elements::TxInWitness::default(),
+        }],
+        output: vec![
+            merchant_output,
+            boltz_elements::TxOut::new_fee(1_000, asset),
+        ],
+    };
+    let backend = Arc::new(MockUtxoBackend {
+        raw_txs: HashMap::from([(
+            source_txid.to_string(),
+            boltz_elements::encode::serialize(&source_transaction),
+        )]),
+        find_calls: Mutex::new(vec![]),
+        spender: None,
+    });
+
+    ChainClaimJournalFixture {
+        claim_tx: BtcLikeTransaction::Liquid(claim_transaction),
+        source_address: source_address.to_string(),
+        source_blinding_key_hex: source_blinding_key.display_secret().to_string(),
+        merchant_address: merchant_address.to_string(),
+        merchant_blinding_key_hex: merchant_blinding_key.display_secret().to_string(),
+        source_txid: source_txid.to_string(),
+        backend,
+    }
+}
+
+#[tokio::test]
+async fn chain_claim_journal_preparation_binds_raw_sources_output_and_fee() {
+    let fixture = chain_claim_journal_fixture();
+    let prepared = prepare_chain_claim_settlement_journal(
+        &fixture.claim_tx,
+        &fixture.merchant_address,
+        &boltz_elements::AssetId::LIQUID_BTC.to_string(),
+        &fixture.merchant_blinding_key_hex,
+        &fixture.source_address,
+        &fixture.source_blinding_key_hex,
+        &fixture.backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(prepared.journal.amount_sat, 90_000);
+    assert_eq!(prepared.journal.vout, 0);
+    assert_eq!(prepared.fee_amount_sat, 1_000);
+    assert!(prepared.fee_rate_sat_vb.is_finite());
+    assert!(prepared.fee_rate_sat_vb > 0.0);
+    assert_eq!(prepared.journal.source_prevouts.len(), 1);
+    assert_eq!(
+        prepared.journal.source_prevouts[0].txid,
+        fixture.source_txid
+    );
+    assert_eq!(prepared.journal.source_prevouts[0].vout, 0);
+    assert_eq!(prepared.journal.source_prevouts[0].amount_sat, 91_000);
 }
 
 fn test_liquid_tx(
