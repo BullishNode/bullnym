@@ -14,6 +14,8 @@ use boltz_client::util::secrets::SwapMasterKey;
 use sqlx::PgPool;
 
 use crate::boltz_restore_fetch::BoltzRestoreFetcher;
+use crate::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1;
+use crate::chain_lockup_witness_audit::audit_manifest_set_against_chain_lockup_witness_v1;
 use crate::chain_swap_creation_permit::{ChainSwapCreationPermit, ChainSwapCreationPermitError};
 use crate::recovery_shadow_audit::{
     RecoveryShadowAuditCoordinatorV1, RecoveryShadowBoltzFetcherV1, RecoveryShadowClassificationV1,
@@ -34,13 +36,33 @@ const MAX_STARTUP_CREATION_PERMIT_ACQUISITIONS_V1: usize = MAX_RECOVERY_WITNESS_
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupProviderReconciliationFactV1 {
     report: RecoveryShadowReportV1,
+    chain_witness: StartupChainLockupWitnessReportV1,
     repaired_obligation_count: usize,
+}
+
+/// Identity-free summary of the complete Bitcoin-mainnet witness audit used
+/// to initialize the provider-recovery admission fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupChainLockupWitnessReportV1 {
+    pub manifest_count: usize,
+    pub observation_count: usize,
+    pub missing_manifest_count: usize,
+    pub unconfirmed_manifest_count: usize,
+    pub confirmed_manifest_count: usize,
+    pub spent_manifest_count: usize,
+    pub conflicting_manifest_count: usize,
+}
+
+impl StartupChainLockupWitnessReportV1 {
+    fn exact_agreement(self) -> bool {
+        self.conflicting_manifest_count == 0
+    }
 }
 
 impl StartupProviderReconciliationFactV1 {
     /// Only complete, exact agreement opens the new Bitcoin chain-swap rail.
     pub fn exact_agreement(&self) -> bool {
-        self.report.classification == RecoveryShadowClassificationV1::Consistent
+        startup_sources_exact(self.report.classification, self.chain_witness)
     }
 
     /// Bounded, identity-free evidence for structured startup diagnostics.
@@ -48,10 +70,21 @@ impl StartupProviderReconciliationFactV1 {
         self.report
     }
 
+    pub fn chain_witness(&self) -> StartupChainLockupWitnessReportV1 {
+        self.chain_witness
+    }
+
     /// Number of interrupted obligations drained before the clean audit.
     pub fn repaired_obligation_count(&self) -> usize {
         self.repaired_obligation_count
     }
+}
+
+fn startup_sources_exact(
+    recovery: RecoveryShadowClassificationV1,
+    chain: StartupChainLockupWitnessReportV1,
+) -> bool {
+    recovery == RecoveryShadowClassificationV1::Consistent && chain.exact_agreement()
 }
 
 /// Fixed startup failures. Lower-layer SQL, object-store, provider, URL,
@@ -61,6 +94,7 @@ pub enum StartupProviderReconciliationErrorV1 {
     CreationBoundaryUnavailable,
     RepairLimitExceeded,
     ThreeSourceAuditFailed,
+    ChainWitnessAuditFailed,
     CreationBoundaryReleaseFailed,
 }
 
@@ -72,6 +106,7 @@ impl fmt::Display for StartupProviderReconciliationErrorV1 {
             }
             Self::RepairLimitExceeded => "startup recovery repair limit was reached",
             Self::ThreeSourceAuditFailed => "startup recovery three-source audit failed",
+            Self::ChainWitnessAuditFailed => "startup recovery chain witness audit failed",
             Self::CreationBoundaryReleaseFailed => {
                 "startup recovery creation boundary release failed"
             }
@@ -97,6 +132,7 @@ pub async fn reconcile_startup_provider_state_v1(
     runtime: &RecoveryManifestRuntimeV1,
     fetcher: &BoltzRestoreFetcher,
     swap_master_key: &SwapMasterKey,
+    chain_witness_adapter: &BitcoinLockupWitnessAdapterV1,
 ) -> Result<StartupProviderReconciliationFactV1, StartupProviderReconciliationErrorV1> {
     let witness_open_secrets = runtime
         .witness_open_secrets_v1()
@@ -110,18 +146,43 @@ pub async fn reconcile_startup_provider_state_v1(
     let witness =
         RecoveryManifestWitnessLoaderV1::new(runtime.store().clone(), witness_open_secrets);
     let provider = RecoveryShadowBoltzFetcherV1::new(fetcher, swap_master_key);
-    let audit = RecoveryShadowAuditCoordinatorV1::new(witness, pool.clone(), provider)
-        .run_once()
-        .await
-        .map_err(|_| StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed);
+    let audit = async {
+        let (report, manifests) =
+            RecoveryShadowAuditCoordinatorV1::new(witness, pool.clone(), provider)
+                .run_once_with_manifests()
+                .await
+                .map_err(|_| StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed)?;
+        let snapshot = chain_witness_adapter
+            .load_snapshot(&manifests)
+            .await
+            .map_err(|_| StartupProviderReconciliationErrorV1::ChainWitnessAuditFailed)?;
+        let chain =
+            audit_manifest_set_against_chain_lockup_witness_v1(&manifests, &snapshot.observations)
+                .map_err(|_| StartupProviderReconciliationErrorV1::ChainWitnessAuditFailed)?;
+        Ok::<_, StartupProviderReconciliationErrorV1>((
+            report,
+            StartupChainLockupWitnessReportV1 {
+                manifest_count: chain.manifests.len(),
+                observation_count: chain.observation_count,
+                missing_manifest_count: chain.missing_manifest_count,
+                unconfirmed_manifest_count: chain.unconfirmed_manifest_count,
+                confirmed_manifest_count: chain.confirmed_manifest_count,
+                spent_manifest_count: chain.spent_manifest_count,
+                conflicting_manifest_count: chain.conflicting_manifest_count,
+            },
+        ))
+    }
+    .await;
 
     permit
         .release()
         .await
         .map_err(|_| StartupProviderReconciliationErrorV1::CreationBoundaryReleaseFailed)?;
 
+    let (report, chain_witness) = audit?;
     Ok(StartupProviderReconciliationFactV1 {
-        report: audit?,
+        report,
+        chain_witness,
         repaired_obligation_count,
     })
 }
@@ -161,6 +222,7 @@ mod tests {
             StartupProviderReconciliationErrorV1::CreationBoundaryUnavailable,
             StartupProviderReconciliationErrorV1::RepairLimitExceeded,
             StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
+            StartupProviderReconciliationErrorV1::ChainWitnessAuditFailed,
             StartupProviderReconciliationErrorV1::CreationBoundaryReleaseFailed,
         ] {
             let rendered = format!("{error:?} {error}");
@@ -212,5 +274,35 @@ mod tests {
             StartupProviderReconciliationErrorV1::RepairLimitExceeded
         );
         assert_eq!(never_clean.len(), 1, "the cap performed no extra repair");
+    }
+
+    #[test]
+    fn startup_chain_witness_success_opens_and_conflict_fails_closed() {
+        let complete_non_conflicting = StartupChainLockupWitnessReportV1 {
+            manifest_count: 3,
+            observation_count: 2,
+            missing_manifest_count: 1,
+            unconfirmed_manifest_count: 0,
+            confirmed_manifest_count: 1,
+            spent_manifest_count: 1,
+            conflicting_manifest_count: 0,
+        };
+        assert!(startup_sources_exact(
+            RecoveryShadowClassificationV1::Consistent,
+            complete_non_conflicting,
+        ));
+
+        let conflicting = StartupChainLockupWitnessReportV1 {
+            conflicting_manifest_count: 1,
+            ..complete_non_conflicting
+        };
+        assert!(!startup_sources_exact(
+            RecoveryShadowClassificationV1::Consistent,
+            conflicting,
+        ));
+        assert!(!startup_sources_exact(
+            RecoveryShadowClassificationV1::DifferencesClassified,
+            complete_non_conflicting,
+        ));
     }
 }

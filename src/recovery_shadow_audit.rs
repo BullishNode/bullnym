@@ -300,6 +300,17 @@ where
     B: RecoveryShadowBoltzSourceV1,
 {
     pub async fn run_once(self) -> Result<RecoveryShadowReportV1, RecoveryShadowAuditErrorV1> {
+        self.run_once_with_manifests()
+            .await
+            .map(|(report, _)| report)
+    }
+
+    /// Startup-only handoff of the exact authenticated manifest vector used by
+    /// both existing cross-source comparisons. Keeping this crate-local avoids
+    /// a second witness read before the public-chain audit.
+    pub(crate) async fn run_once_with_manifests(
+        self,
+    ) -> Result<(RecoveryShadowReportV1, Vec<SwapManifestV1>), RecoveryShadowAuditErrorV1> {
         let manifests = self
             .witness
             .load_validated_witness()
@@ -345,7 +356,8 @@ where
             audit_manifest_set_against_local_recovery_snapshot_v1(&manifests, &local_snapshot)
                 .map_err(collapse_manifest_local_error)?;
 
-        Ok(build_report(&boltz_restore, &boltz_audit, &local_audit))
+        let report = build_report(&boltz_restore, &boltz_audit, &local_audit);
+        Ok((report, manifests))
     }
 }
 
