@@ -609,7 +609,7 @@ mod tests {
                 );
                 assert_eq!(
                     current.decision().provenance().expose_for_persistence(),
-                    "mempool_recommended_fastest_fee:fast-bitcoin"
+                    "mempool_precise_fastest_fee:fast-bitcoin"
                 );
                 let held = snapshot.read_liquid(&liquid_policy, u64::MAX).unwrap_err();
                 assert_eq!(held.generation().unwrap().as_u64(), 0);
@@ -646,7 +646,7 @@ mod tests {
                 .decision()
                 .provenance()
                 .expose_for_persistence(),
-            "mempool_recommended_fastest_fee:fast-bitcoin"
+            "mempool_precise_fastest_fee:fast-bitcoin"
         );
         let liquid_current = snapshot.read_liquid(&liquid_policy, u64::MAX).unwrap();
         assert_eq!(liquid_current.decision().rate(), rate(0.9));
@@ -715,7 +715,7 @@ mod tests {
 
         let bitcoin_request = bitcoin.finish().await;
         let liquid_request = liquid.finish().await;
-        assert!(bitcoin_request.starts_with("GET /fees/v1/fees/recommended HTTP/1.1\r\n"));
+        assert!(bitcoin_request.starts_with("GET /fees/v1/fees/precise HTTP/1.1\r\n"));
         assert!(liquid_request.starts_with("GET /fees/fee-estimates HTTP/1.1\r\n"));
     }
 
@@ -814,7 +814,7 @@ mod tests {
                 .decision()
                 .provenance()
                 .expose_for_persistence(),
-            "mempool_recommended_fastest_fee:btc-3"
+            "mempool_precise_fastest_fee:btc-3"
         );
         let liquid_current = snapshot.read_liquid(&liquid_policy, u64::MAX).unwrap();
         assert_eq!(liquid_current.decision().rate(), rate(0.5));

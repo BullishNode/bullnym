@@ -486,8 +486,8 @@ never a terminal claim failure.
 
 Complete [#64](https://github.com/BullishNode/bullnym/issues/64) phase 1:
 
-- Bitcoin construction fetches `fastestFee` from the configured mempool-style
-  primary with a 1-2 second timeout;
+- Bitcoin construction fetches `fastestFee` from each configured mempool-style
+  API base's `/v1/fees/precise` endpoint with a 1-2 second per-source timeout;
 - invalid estimates use a validated fallback; valid estimates are clamped to a
   configured floor and maximum rather than replaced by a low fallback;
 - Liquid uses a validated configured rate unless live estimation proves useful;

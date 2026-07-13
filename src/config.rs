@@ -100,9 +100,10 @@ impl fmt::Debug for FeeSourceConfig {
     }
 }
 
-/// Bitcoin-specific live-fee discovery settings. These are validation,
-/// freshness, and economic bounds only; there is deliberately no configured
-/// fee quote or default construction rate.
+/// Bitcoin-specific live-fee discovery settings. Each configured API base is
+/// queried only at `/v1/fees/precise`. These are validation, freshness, and
+/// economic bounds only; there is deliberately no configured fee quote or
+/// default construction rate.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BitcoinFeeConfig {
@@ -292,6 +293,9 @@ pub fn valid_fee_https_base_endpoint(raw: &str) -> bool {
 }
 
 fn default_bitcoin_fee_sources() -> Vec<FeeSourceConfig> {
+    // The Bitcoin fee adapter appends `/v1/fees/precise` to each base. In
+    // particular, the public fallback resolves to the operator-requested
+    // `https://mempool.space/api/v1/fees/precise` endpoint.
     vec![
         FeeSourceConfig {
             id: "bull-bitcoin".to_string(),

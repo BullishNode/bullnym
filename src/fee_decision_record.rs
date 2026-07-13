@@ -308,7 +308,7 @@ mod tests {
                 Some(&LiveBitcoin::new(
                     rate(12.5),
                     1_000,
-                    provenance("mempool_recommended_fastest_fee:primary"),
+                    provenance("mempool_precise_fastest_fee:primary"),
                 )),
                 None,
                 1_007,

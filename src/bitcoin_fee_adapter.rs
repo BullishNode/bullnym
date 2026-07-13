@@ -61,19 +61,20 @@ impl fmt::Debug for MempoolFeeSourceIdentity {
     }
 }
 
-/// A narrow client for the mempool-compatible recommended-fees endpoint.
+/// A narrow client for the mempool-compatible Recommended Fees (Precise)
+/// endpoint.
 ///
 /// Construction accepts only a credential-free HTTPS base endpoint. The
 /// adapter deliberately does not choose fallbacks or make spending decisions.
 #[derive(Clone)]
 pub struct MempoolFastestFeeAdapter {
     client: reqwest::Client,
-    recommended_fees_url: Url,
+    precise_fees_url: Url,
     source_identity: MempoolFeeSourceIdentity,
 }
 
 impl MempoolFastestFeeAdapter {
-    /// Builds an adapter for `<configured_https_endpoint>/v1/fees/recommended`.
+    /// Builds an adapter for `<configured_https_endpoint>/v1/fees/precise`.
     pub fn new(configured_https_endpoint: &str) -> Result<Self, MempoolFeeAdapterError> {
         Self::new_with_source_identity(DEFAULT_SOURCE_ID, configured_https_endpoint)
     }
@@ -96,7 +97,7 @@ impl MempoolFastestFeeAdapter {
     pub async fn observe(&self) -> Result<MempoolFastestFeeObservation, MempoolFeeAdapterError> {
         let mut response = self
             .client
-            .get(self.recommended_fees_url.clone())
+            .get(self.precise_fees_url.clone())
             .header(ACCEPT, "application/json")
             .send()
             .await
@@ -140,7 +141,7 @@ impl MempoolFastestFeeAdapter {
             body.extend_from_slice(&chunk);
         }
 
-        let response: RecommendedFeesResponse =
+        let response: PreciseFeesResponse =
             serde_json::from_slice(&body).map_err(|_| MempoolFeeAdapterError::MalformedResponse)?;
         let fastest_fee_sat_per_vbyte = validate_representable_fee(
             response.fastest_fee,
@@ -151,7 +152,7 @@ impl MempoolFastestFeeAdapter {
             MempoolFeeAdapterError::InvalidMinimumFee,
         )?;
         if fastest_fee_sat_per_vbyte < minimum_fee_sat_per_vbyte {
-            return Err(MempoolFeeAdapterError::InconsistentRecommendedFees);
+            return Err(MempoolFeeAdapterError::InconsistentPreciseFees);
         }
 
         let observed_at_unix = SystemTime::now()
@@ -163,7 +164,7 @@ impl MempoolFastestFeeAdapter {
             fastest_fee_sat_per_vbyte,
             minimum_fee_sat_per_vbyte,
             observed_at: ObservedAtUnixSeconds(observed_at_unix),
-            source: MempoolFeeObservationSource::ConfiguredRecommendedFees,
+            source: MempoolFeeObservationSource::ConfiguredPreciseFees,
             source_identity: self.source_identity.clone(),
         })
     }
@@ -202,8 +203,8 @@ impl MempoolFastestFeeAdapter {
             .pop_if_empty()
             .push("v1")
             .push("fees")
-            .push("recommended");
-        let recommended_fees_url = endpoint;
+            .push("precise");
+        let precise_fees_url = endpoint;
 
         let client = reqwest::Client::builder()
             .connect_timeout(timeout)
@@ -214,7 +215,7 @@ impl MempoolFastestFeeAdapter {
 
         Ok(Self {
             client,
-            recommended_fees_url,
+            precise_fees_url,
             source_identity,
         })
     }
@@ -247,7 +248,7 @@ impl MempoolFastestFeeAdapter {
 }
 
 #[derive(Debug, Deserialize)]
-struct RecommendedFeesResponse {
+struct PreciseFeesResponse {
     #[serde(rename = "fastestFee")]
     fastest_fee: serde_json::Number,
     #[serde(rename = "minimumFee")]
@@ -278,13 +279,13 @@ impl ObservedAtUnixSeconds {
 /// Non-secret provenance for the validated observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MempoolFeeObservationSource {
-    ConfiguredRecommendedFees,
+    ConfiguredPreciseFees,
 }
 
 impl MempoolFeeObservationSource {
     pub const fn stable_label(self) -> &'static str {
         match self {
-            Self::ConfiguredRecommendedFees => "mempool_recommended_fastest_fee",
+            Self::ConfiguredPreciseFees => "mempool_precise_fastest_fee",
         }
     }
 }
@@ -340,7 +341,7 @@ impl MempoolFastestFeeObservation {
     }
 }
 
-/// A bounded ordered set of explicitly configured recommended-fee sources.
+/// A bounded ordered set of explicitly configured precise-fee sources.
 ///
 /// This helper performs one construction-time acquisition attempt. It neither
 /// polls nor persists, and it has no constant or last-known-good fallback.
@@ -445,7 +446,7 @@ pub enum MempoolFeeAdapterError {
     MalformedResponse,
     InvalidFastestFee,
     InvalidMinimumFee,
-    InconsistentRecommendedFees,
+    InconsistentPreciseFees,
     InvalidObservationTime,
     AllConfiguredSourcesFailed,
     AcquisitionBudgetExhausted,
@@ -468,9 +469,7 @@ impl fmt::Display for MempoolFeeAdapterError {
             Self::MalformedResponse => "fee endpoint response was malformed",
             Self::InvalidFastestFee => "fee endpoint returned an invalid fastest fee",
             Self::InvalidMinimumFee => "fee endpoint returned an invalid minimum fee",
-            Self::InconsistentRecommendedFees => {
-                "fee endpoint returned inconsistent recommended fees"
-            }
+            Self::InconsistentPreciseFees => "fee endpoint returned inconsistent precise fees",
             Self::InvalidObservationTime => "fee observation time was invalid",
             Self::AllConfiguredSourcesFailed => "all configured fee sources failed",
             Self::AcquisitionBudgetExhausted => "fee acquisition budget was exhausted",
@@ -657,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn observes_fastest_fee_with_explicit_units_time_and_source() {
         let server = spawn_fake_http_server(FakeHttpResponse::json(
-            br#"{"fastestFee":12.5,"halfHourFee":10,"minimumFee":1.25}"#,
+            br#"{"fastestFee":12.5,"halfHourFee":10.125,"hourFee":8.75,"economyFee":0.2,"minimumFee":0.1}"#,
         ))
         .await;
         let adapter = server.adapter(TEST_TIMEOUT);
@@ -667,15 +666,15 @@ mod tests {
         let after = unix_now();
 
         assert_eq!(observation.fastest_fee_sat_per_vbyte(), 12.5);
-        assert_eq!(observation.minimum_fee_sat_per_vbyte(), 1.25);
+        assert_eq!(observation.minimum_fee_sat_per_vbyte(), 0.1);
         assert!((before..=after).contains(&observation.observed_at().as_u64()));
         assert_eq!(
             observation.source(),
-            MempoolFeeObservationSource::ConfiguredRecommendedFees
+            MempoolFeeObservationSource::ConfiguredPreciseFees
         );
         assert_eq!(
             observation.source().stable_label(),
-            "mempool_recommended_fastest_fee"
+            "mempool_precise_fastest_fee"
         );
         assert_eq!(
             observation.source_identity().expose_for_persistence(),
@@ -691,7 +690,7 @@ mod tests {
         );
         assert_eq!(
             policy_observation.provenance().expose_for_persistence(),
-            "mempool_recommended_fastest_fee:configured"
+            "mempool_precise_fastest_fee:configured"
         );
         let policy_decision = crate::fee_policy::BitcoinFeePolicy::default()
             .decide(
@@ -702,10 +701,39 @@ mod tests {
             .unwrap();
         assert_eq!(policy_decision.rate(), policy_observation.rate());
         let request = server.finish().await;
-        assert!(request.starts_with("GET /api/v1/fees/recommended HTTP/1.1\r\n"));
+        assert!(request.starts_with("GET /api/v1/fees/precise HTTP/1.1\r\n"));
         assert!(request
             .to_ascii_lowercase()
             .contains("accept: application/json\r\n"));
+    }
+
+    #[test]
+    fn configured_production_bases_append_only_the_exact_precise_route() {
+        let configured = crate::config::FeePolicyConfig::default().bitcoin.sources;
+        let expected = [
+            (
+                "bull-bitcoin",
+                "https://mempool.bullbitcoin.com/api",
+                "https://mempool.bullbitcoin.com/api/v1/fees/precise",
+            ),
+            (
+                "mempool-space",
+                "https://mempool.space/api",
+                "https://mempool.space/api/v1/fees/precise",
+            ),
+        ];
+        assert_eq!(configured.len(), expected.len());
+
+        for (source, (expected_id, expected_base, expected_precise_url)) in
+            configured.iter().zip(expected)
+        {
+            assert_eq!(source.id, expected_id);
+            assert_eq!(source.endpoint, expected_base);
+            let adapter = MempoolFastestFeeAdapter::new(&source.endpoint)
+                .expect("configured production API base must be valid");
+            assert_eq!(adapter.precise_fees_url.as_str(), expected_precise_url);
+            assert!(!adapter.precise_fees_url.path().contains("recommended"));
+        }
     }
 
     #[tokio::test]
@@ -777,7 +805,7 @@ mod tests {
         );
         assert_eq!(
             observe_error(r#"{"fastestFee":1.5,"minimumFee":2}"#).await,
-            MempoolFeeAdapterError::InconsistentRecommendedFees
+            MempoolFeeAdapterError::InconsistentPreciseFees
         );
 
         let boundary = spawn_fake_http_server(FakeHttpResponse::json(
@@ -950,7 +978,7 @@ mod tests {
             assert_eq!(live.rate().as_f64(), quoted_rate);
             assert_eq!(
                 live.provenance().expose_for_persistence(),
-                "mempool_recommended_fastest_fee:configured"
+                "mempool_precise_fastest_fee:configured"
             );
             assert!(matches!(
                 policy.decide_typed(Some(&typed_live), None, observed_at_unix),
@@ -1077,7 +1105,7 @@ mod tests {
             .expect("accepted source must map losslessly");
         assert_eq!(
             policy_observation.provenance().expose_for_persistence(),
-            "mempool_recommended_fastest_fee:primary"
+            "mempool_precise_fastest_fee:primary"
         );
         assert!(!format!("{policy_observation:?}").contains("primary"));
         primary.finish().await;
@@ -1319,7 +1347,7 @@ mod tests {
         let decision = BitcoinFeePolicy::default()
             .decide(Some(&live), None, live.observed_at_unix())
             .expect("fresh live evidence must decide");
-        let stable_label = "mempool_recommended_fastest_fee:configured";
+        let stable_label = "mempool_precise_fastest_fee:configured";
 
         assert_eq!(live.provenance().expose_for_persistence(), stable_label);
         assert_eq!(decision.provenance().expose_for_persistence(), stable_label);
