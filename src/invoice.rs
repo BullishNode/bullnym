@@ -1023,6 +1023,37 @@ fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
     }
 }
 
+struct PublicDirectPaymentAddresses<'a> {
+    bitcoin: Option<&'a str>,
+    liquid: Option<&'a str>,
+}
+
+/// Direct addresses are payment instructions on public invoice surfaces, not
+/// reconciliation data. Only publish an address when that direct rail was
+/// explicitly accepted and the invoice remains payable. In particular, an
+/// LN-only invoice may store a Liquid claim destination internally without
+/// accepting direct Liquid. Authenticated merchant history keeps the raw
+/// stored values for reconciliation.
+fn public_direct_payment_addresses(inv: &db::Invoice) -> PublicDirectPaymentAddresses<'_> {
+    if invoice_payment_rails_are_payable(inv) {
+        PublicDirectPaymentAddresses {
+            bitcoin: inv
+                .accept_btc
+                .then_some(inv.bitcoin_address.as_deref())
+                .flatten(),
+            liquid: inv
+                .accept_liquid
+                .then_some(inv.liquid_address.as_deref())
+                .flatten(),
+        }
+    } else {
+        PublicDirectPaymentAddresses {
+            bitcoin: None,
+            liquid: None,
+        }
+    }
+}
+
 /// Public invoice projections combine several tables. Keep every field in one
 /// PostgreSQL snapshot so a reducer commit cannot mix an old invoice row with
 /// new event sums or payment offers in the same response/render/list item.
@@ -1128,7 +1159,8 @@ async fn render_invoice_template(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
-    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
+    let rails_payable = invoice_payment_rails_are_payable(&inv);
+    let bitcoin_chain_offer = if rails_payable {
         db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
     } else {
         None
@@ -1148,6 +1180,7 @@ async fn render_invoice_template(
     let bitcoin_chain_bip21 = bitcoin_chain_offer
         .as_ref()
         .and_then(|offer| offer.lockup_bip21.as_deref());
+    let direct_addresses = public_direct_payment_addresses(&inv);
     let tpl = InvoicePaymentTpl {
         nym,
         is_unlinked,
@@ -1161,7 +1194,7 @@ async fn render_invoice_template(
             Some("unpaid" | "partial" | "payment_received" | "overpaid")
         ),
         settlement_status: &inv.settlement_status,
-        rails_payable: invoice_payment_rails_are_payable(&inv),
+        rails_payable,
         amount_sat: inv.amount_sat,
         remaining_amount_sat: remaining_sat,
         fiat_display,
@@ -1172,10 +1205,10 @@ async fn render_invoice_template(
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
         bitcoin_chain_address,
-        bitcoin_address_js: js_string_literal(inv.bitcoin_address.as_deref())?,
+        bitcoin_address_js: js_string_literal(direct_addresses.bitcoin)?,
         bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
         bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
-        liquid_address_js: js_string_literal(inv.liquid_address.as_deref())?,
+        liquid_address_js: js_string_literal(direct_addresses.liquid)?,
         liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
     };
     tpl.render()
@@ -1279,8 +1312,9 @@ pub async fn status(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
+    let rails_payable = invoice_payment_rails_are_payable(&inv);
     let lightning_pr = latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
-    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
+    let bitcoin_chain_offer = if rails_payable {
         db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
     } else {
         None
@@ -1308,6 +1342,9 @@ pub async fn status(
             })
             .collect();
     snapshot.commit().await?;
+    let direct_addresses = public_direct_payment_addresses(&inv);
+    let bitcoin_address = direct_addresses.bitcoin.map(str::to_owned);
+    let liquid_address = direct_addresses.liquid.map(str::to_owned);
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -1326,8 +1363,8 @@ pub async fn status(
         paid_at_unix: inv.paid_at_unix,
         paid_amount_sat: inv.paid_amount_sat,
         lightning_pr,
-        liquid_address: inv.liquid_address,
-        bitcoin_address: inv.bitcoin_address,
+        liquid_address,
+        bitcoin_address,
         bitcoin_direct_observations,
         bitcoin_chain_address: bitcoin_chain_offer
             .as_ref()

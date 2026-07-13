@@ -617,6 +617,18 @@ async fn get_path(app: &Router, uri: &str) -> (StatusCode, Value) {
     (status, body)
 }
 
+async fn get_text_path(app: &Router, uri: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    (status, body)
+}
+
 async fn get_path_from(app: &Router, uri: &str, peer: SocketAddr) -> (StatusCode, Value) {
     let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
     request
@@ -7391,6 +7403,91 @@ async fn cancelled_invoice_records_late_boltz_settlement_once() {
 }
 
 #[tokio::test]
+async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) = sign_registration_with_keypair("lnonlyprivate", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "lnonlyprivate", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some("lnonlyprivate"),
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "wallet",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 3_600,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: true,
+            accept_liquid: false,
+            bitcoin_address: None,
+            liquid_address: Some("lq1internalclaimdestination"),
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        invoice.liquid_address.as_deref(),
+        Some("lq1internalclaimdestination")
+    );
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "unpaid");
+    assert_eq!(body["accept_ln"], true);
+    assert_eq!(body["accept_liquid"], false);
+    assert_eq!(body["liquid_address"], Value::Null);
+    assert_eq!(body["bitcoin_address"], Value::Null);
+
+    for path in [
+        format!("/lnonlyprivate/i/{}", invoice.id),
+        format!("/invoice/{}", invoice.id),
+    ] {
+        let (status, html) = get_text_path(&app, &path).await;
+        assert_eq!(status, StatusCode::OK, "path: {path}");
+        assert!(
+            !html.contains("lq1internalclaimdestination"),
+            "path: {path}"
+        );
+        assert!(
+            html.contains("const INITIAL_LIQUID_ADDRESS = \"\";"),
+            "path: {path}"
+        );
+        assert!(!html.contains("id=\"rail-liquid\""), "path: {path}");
+    }
+
+    let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={npub}&page=1&pageSize=10&timestamp={timestamp}&signature={sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["invoices"][0]["accept_ln"], true);
+    assert_eq!(body["invoices"][0]["accept_liquid"], false);
+    assert_eq!(
+        body["invoices"][0]["liquid_address"],
+        "lq1internalclaimdestination"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -7480,14 +7577,50 @@ async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible(
     assert_eq!(cancelled.settlement_status, "pending");
     assert!(cancelled.paid_at_unix.is_some());
 
+    let finalized = [liquid_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "lq1cancellatedirect",
+        1_000,
+        2,
+        pay_service::db::DirectObservationPhase::Finalized,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &finalized,
+    )
+    .await;
+
     let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "cancelled");
     assert_eq!(body["presentation_status"], "payment_received");
+    assert_eq!(body["settlement_status"], "settled");
     assert_eq!(body["paid_amount_sat"], 1_000);
     assert_eq!(body["remaining_amount_sat"], 0);
     assert_eq!(body["lightning_pr"], Value::Null);
+    assert_eq!(body["liquid_address"], Value::Null);
+    assert_eq!(body["bitcoin_address"], Value::Null);
     assert_eq!(body["bitcoin_chain_address"], Value::Null);
+
+    let (status, html) = get_text_path(&app, &format!("/cancellatedirect/i/{}", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html.contains("lq1cancellatedirect"));
+    assert!(html.contains("const INITIAL_LIQUID_ADDRESS = \"\";"));
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/lightning", invoice.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["code"], "InvalidAmount");
+    assert!(body.get("pr").is_none());
 
     let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");
     let (status, body) = get_path(
@@ -7505,6 +7638,8 @@ async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible(
     );
     assert_eq!(body["invoices"][0]["paid_amount_sat"], 1_000);
     assert_eq!(body["invoices"][0]["remaining_amount_sat"], 0);
+    assert_eq!(body["invoices"][0]["settlement_status"], "settled");
+    assert_eq!(body["invoices"][0]["liquid_address"], "lq1cancellatedirect");
 
     cleanup_db(&pool).await;
 }
