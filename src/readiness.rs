@@ -256,19 +256,22 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
 }
 
-async fn merchant_settlement_privileges_present(
-    pool: &sqlx::PgPool,
-) -> Result<bool, sqlx::Error> {
+async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "WITH required(table_name) AS (VALUES \
+             ('chain_swap_tx_attempts'), \
              ('invoice_payment_events'), \
              ('merchant_settlement_checkpoints'), \
              ('merchant_settlement_retained_outputs') \
          ) \
-         SELECT COUNT(*) = 3 \
+         SELECT COUNT(*) = 4 \
             AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'SELECT')) \
             AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'INSERT')) \
             AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'UPDATE')) \
+            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'DELETE')) \
+            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')) \
+            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')) \
+            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')) \
            FROM required \
            JOIN pg_class relation ON relation.relname = required.table_name \
            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \

@@ -697,9 +697,9 @@ async fn cleanup_db(pool: &PgPool) {
     // The exact merchant-event trigger rejects both direct and cascaded DELETE;
     // the isolated test database owner must therefore use DDL cleanup.
     sqlx::query("TRUNCATE invoice_payment_events RESTART IDENTITY CASCADE")
-    .execute(pool)
-    .await
-    .ok();
+        .execute(pool)
+        .await
+        .ok();
     // Manifest delivery rows reject ordinary DELETE. Isolated test ownership
     // uses DDL before removing their operational source rows.
     sqlx::query("TRUNCATE chain_swap_manifest_deliveries")
@@ -711,21 +711,6 @@ async fn cleanup_db(pool: &PgPool) {
         .await
         .ok();
     sqlx::query("DELETE FROM processed_webhook_events")
-        .execute(pool)
-        .await
-        .ok();
-    // Migration 055 makes merchant evidence append-only to the runtime role.
-    // The isolated database owner uses DDL, in dependency order, before
-    // deleting the parent swap/invoice fixtures.
-    sqlx::query("TRUNCATE merchant_settlement_retained_outputs")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("TRUNCATE merchant_settlement_checkpoints")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("TRUNCATE invoice_payment_events CASCADE")
         .execute(pool)
         .await
         .ok();
