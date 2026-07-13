@@ -15310,6 +15310,43 @@ fn midrange_bitcoin_fee_decision() -> pay_service::fee_policy::BitcoinFeeDecisio
     bitcoin_fee_decision(2.0)
 }
 
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+struct PersistedRecoveryFeeDecision {
+    fee_decision_purpose: String,
+    fee_decision_rail: String,
+    fee_decision_target: String,
+    fee_decision_source: String,
+    fee_decision_rate_sat_vb: f64,
+    fee_decision_quoted_at_unix: i64,
+    fee_decision_evaluated_at_unix: i64,
+    fee_decision_freshness_age_secs: i64,
+    fee_decision_freshness_max_age_secs: i64,
+    fee_decision_provenance: String,
+    fee_decision_policy_floor_sat_vb: f64,
+    fee_decision_policy_cap_sat_vb: f64,
+    fee_decision_policy_version: String,
+}
+
+async fn persisted_recovery_fee_decision(
+    pool: &PgPool,
+    chain_swap_id: uuid::Uuid,
+) -> PersistedRecoveryFeeDecision {
+    sqlx::query_as(
+        "SELECT fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+                fee_decision_source, fee_decision_rate_sat_vb, \
+                fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+                fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+                fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+                fee_decision_policy_cap_sat_vb, fee_decision_policy_version \
+           FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND purpose = 'btc_recovery'",
+    )
+    .bind(chain_swap_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 struct FakeRecoveryBuilder {
     transaction: BtcLikeTransaction,
     calls: AtomicUsize,
@@ -15892,7 +15929,50 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
         expected_fee_sat as f64 / committed_transaction.vsize() as f64
     );
     assert!((committed.fee_rate_sat_vb - 500.0).abs() < f64::EPSILON);
+    let expected_fee_decision = PersistedRecoveryFeeDecision {
+        fee_decision_purpose: "bitcoin_recovery".into(),
+        fee_decision_rail: "bitcoin".into(),
+        fee_decision_target: "fastestFee".into(),
+        fee_decision_source: "bitcoin_live".into(),
+        fee_decision_rate_sat_vb: 500.0,
+        fee_decision_quoted_at_unix: 1_000,
+        fee_decision_evaluated_at_unix: 1_000,
+        fee_decision_freshness_age_secs: 0,
+        fee_decision_freshness_max_age_secs: 120,
+        fee_decision_provenance: "integration-test".into(),
+        fee_decision_policy_floor_sat_vb: 1.0,
+        fee_decision_policy_cap_sat_vb: 500.0,
+        fee_decision_policy_version: "review25-v1".into(),
+    };
+    let committed_fee_decision = persisted_recovery_fee_decision(&pool, harness.swap.id).await;
+    assert_eq!(&committed_fee_decision, &expected_fee_decision);
     drop(raw_transactions);
+
+    // Estimator movement after the journal commit cannot authorize new bytes
+    // or rewrite the decision evidence bound to the committed transaction.
+    let moved_estimator_decision = bitcoin_fee_decision(7.0);
+    let replay_fault =
+        OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
+    let replay_result = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        &builder,
+        &moved_estimator_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &replay_fault,
+    )
+    .await;
+    assert!(matches!(
+        replay_result,
+        Err(AppError::ClaimError(message))
+            if message.contains("AfterJournalCommitBeforeBroadcast")
+    ));
+    assert_eq!(builder.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        persisted_recovery_fee_decision(&pool, harness.swap.id).await,
+        expected_fee_decision
+    );
 
     // No new quote is required after the write-ahead commit: the executor
     // reuses the committed maximum-rate bytes and their actual fee evidence
@@ -15917,6 +15997,10 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
     assert_eq!(finalized.raw_tx_hex, committed.raw_tx_hex);
     assert_eq!(finalized.fee_amount_sat, committed.fee_amount_sat);
     assert_eq!(finalized.fee_rate_sat_vb, committed.fee_rate_sat_vb);
+    assert_eq!(
+        persisted_recovery_fee_decision(&pool, harness.swap.id).await,
+        committed_fee_decision
+    );
     assert_eq!(
         harness.broadcaster.calls.lock().await.as_slice(),
         &[committed.raw_tx_hex]
