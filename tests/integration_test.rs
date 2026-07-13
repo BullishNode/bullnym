@@ -605,6 +605,32 @@ async fn record_pre_050_chain_fixture(
     Ok(row)
 }
 
+/// Complete database-valid creation evidence for tests whose assertions target
+/// an invariant other than provider-response validation.
+fn valid_chain_swap_creation_terms_fixture() -> pay_service::db::NewChainSwapCreationTerms<'static>
+{
+    pay_service::db::NewChainSwapCreationTerms {
+        pinned_pair_hash: "1111111111111111111111111111111111111111111111111111111111111111",
+        canonical_pair_quote_json: r#"{"hash":"fixture","rate":1}"#,
+        creation_response_sha256:
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        btc_claim_script_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        btc_refund_script_sha256:
+            "4444444444444444444444444444444444444444444444444444444444444444",
+        liquid_claim_script_sha256:
+            "5555555555555555555555555555555555555555555555555555555555555555",
+        liquid_refund_script_sha256:
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        btc_timeout_height: 958_033,
+        liquid_timeout_height: 3_972_215,
+        btc_network: "bitcoin",
+        liquid_network: "liquid",
+        liquid_asset_id: "6f0279e9ed041c3d710a9f57d0c02928416413f827c37bf6833e2407092ff84d",
+        merchant_liquid_destination: "lq1qqintegrationfixturemerchantdestination",
+        merchant_emergency_btc_address: None,
+    }
+}
+
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -880,7 +906,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "050_swap_key_lineage"
+        "051_chain_swap_creation_terms"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -909,6 +935,60 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(missing_delete_guard_body["ready"], false);
 
     let app = test_app(test_state(pool.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
+    assert_eq!(restored_body["ready"], true);
+
+    // Migration 051 is incomplete if its all-or-none creation-evidence shape
+    // constraint is missing, even when every column happens to be present.
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_creation_terms_shape_check \
+         TO chain_swap_records_creation_terms_shape_check_before_readiness_test",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let (missing_shape_guard_status, missing_shape_guard_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_creation_terms_shape_check_before_readiness_test \
+         TO chain_swap_records_creation_terms_shape_check",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(missing_shape_guard_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_shape_guard_body["ready"], false);
+
+    let app = test_app(test_state(pool.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
+    assert_eq!(restored_body["ready"], true);
+
+    // The immutable creation packet is also part of the deployed schema
+    // boundary: disabling its update guard must remove the service from ready.
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DISABLE TRIGGER \
+         chain_swap_records_reject_creation_terms_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let (mutable_terms_status, mutable_terms_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_records ENABLE TRIGGER \
+         chain_swap_records_reject_creation_terms_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mutable_terms_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_terms_body["ready"], false);
+
+    let app = test_app(test_state(pool));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1204,7 +1284,8 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     let chain_preimage = "dd".repeat(32);
     let chain_claim_key = "ee".repeat(32);
     let chain_refund_key = "ff".repeat(32);
-    pay_service::db::record_chain_swap_with_lineage(
+    let chain_creation_terms = valid_chain_swap_creation_terms_fixture();
+    pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1231,6 +1312,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &chain_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap();
@@ -1249,7 +1331,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_claim = pay_service::db::record_chain_swap_with_lineage(
+    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1276,6 +1358,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &alternate_refund_public,
             preimage_hash_hex: &chain_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap_err();
@@ -1303,7 +1386,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_refund = pay_service::db::record_chain_swap_with_lineage(
+    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1330,6 +1413,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &alternate_claim_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap_err();
@@ -1721,6 +1805,223 @@ async fn derivation_guard_does_not_false_positive_during_concurrent_allocation()
             .unwrap(),
         "a normal concurrent allocation was misclassified as sequence rollback"
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "creationterms";
+    let npub = "80".repeat(32);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(
+        &pool,
+        nym,
+        &npub,
+        "lq1creationtermsmerchantdestination",
+        3_600,
+    )
+    .await;
+
+    let root = "8080808080808080";
+    let claim_public_key = format!("02{}", "81".repeat(32));
+    let refund_public_key = format!("03{}", "82".repeat(32));
+    let preimage_hash = "83".repeat(32);
+    let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_001,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_002,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let preimage = "84".repeat(32);
+    let claim_key = "85".repeat(32);
+    let refund_key = "86".repeat(32);
+    let response_json = r#"{"id":"CHAIN_CREATION_TERMS"}"#;
+    let swap = pay_service::db::NewChainSwapRecord {
+        invoice_id: invoice.id,
+        nym: Some(nym),
+        boltz_swap_id: "CHAIN_CREATION_TERMS",
+        lockup_address: "bc1qcreationtermslockup",
+        lockup_bip21: Some("bitcoin:bc1qcreationtermslockup?amount=0.00025431"),
+        user_lock_amount_sat: 25_431,
+        server_lock_amount_sat: 25_000,
+        preimage_hex: &preimage,
+        claim_key_hex: &claim_key,
+        refund_key_hex: &refund_key,
+        boltz_response_json: response_json,
+        claim_key_index: Some(8_001),
+        refund_key_index: Some(8_002),
+        root_fingerprint: Some(root),
+    };
+    let lineage = pay_service::db::ChainSwapLineage {
+        claim_allocation_id,
+        refund_allocation_id,
+        key_epoch: 1,
+        derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+        claim_public_key_hex: &claim_public_key,
+        refund_public_key_hex: &refund_public_key,
+        preimage_hash_hex: &preimage_hash,
+    };
+
+    let missing_terms = pay_service::db::record_chain_swap_with_lineage(&pool, &swap, &lineage)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing_terms
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    let pair_quote = r#"{"fees":{"minerFees":{"server":405},"percentage":0.1},"hash":"014261","limits":{"maximal":25000000,"minimal":25000},"rate":1}"#;
+    let creation_terms = pay_service::db::NewChainSwapCreationTerms {
+        pinned_pair_hash: &"87".repeat(32),
+        canonical_pair_quote_json: pair_quote,
+        creation_response_sha256: &"88".repeat(32),
+        btc_claim_script_sha256: &"89".repeat(32),
+        btc_refund_script_sha256: &"8a".repeat(32),
+        liquid_claim_script_sha256: &"8b".repeat(32),
+        liquid_refund_script_sha256: &"8c".repeat(32),
+        btc_timeout_height: 958_033,
+        liquid_timeout_height: 3_972_215,
+        btc_network: "bitcoin",
+        liquid_network: "liquid",
+        liquid_asset_id: &"8d".repeat(32),
+        merchant_liquid_destination: "lq1qqcreationtermsmerchantdestination",
+        merchant_emergency_btc_address: Some(
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+        ),
+    };
+    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_terms);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+        &pool,
+        &swap,
+        &lineage,
+        &creation_terms,
+    )
+    .await
+    .unwrap();
+    assert_eq!(inserted.creation_terms.as_ref(), Some(&expected_terms));
+
+    let fetched = pay_service::db::get_chain_swap_by_boltz_id(&pool, "CHAIN_CREATION_TERMS")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.creation_terms.as_ref(), Some(&expected_terms));
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .canonical_pair_quote_json,
+        pair_quote
+    );
+
+    let mutation = sqlx::query(
+        "UPDATE chain_swap_records SET btc_timeout_height = btc_timeout_height + 1 WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    let response_mutation = sqlx::query(
+        "UPDATE chain_swap_records SET boltz_response_json = '{\"id\":\"mutated\"}' WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        response_mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        inserted.id,
+        pay_service::db::ChainSwapStatus::UserLockMempool,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let legacy_preimage = "8e".repeat(32);
+    let legacy_claim_key = "8f".repeat(32);
+    let legacy_refund_key = "90".repeat(32);
+    let legacy = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id: "CHAIN_CREATION_TERMS_LEGACY",
+            lockup_address: "bc1qcreationtermslegacy",
+            lockup_bip21: None,
+            user_lock_amount_sat: 26_000,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: &legacy_preimage,
+            claim_key_hex: &legacy_claim_key,
+            refund_key_hex: &legacy_refund_key,
+            boltz_response_json: "{}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(legacy.creation_terms.is_none());
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        legacy.id,
+        pay_service::db::ChainSwapStatus::UserLockMempool,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(pay_service::db::get_chain_swap_by_id(&pool, legacy.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .creation_terms
+        .is_none());
 
     cleanup_db(&pool).await;
 }

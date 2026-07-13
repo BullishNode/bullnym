@@ -19,6 +19,7 @@ type DirectLifecyclePrivileges = (
 
 type WatcherLanePrivileges = (Option<bool>, Option<bool>, Option<bool>);
 type SwapKeyLineagePrivileges = (Option<bool>, Option<bool>, Option<bool>);
+type ChainSwapRecordPrivileges = (Option<bool>, Option<bool>, Option<bool>);
 
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
@@ -214,10 +215,32 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     .fetch_one(pool)
     .await?;
 
+    let chain_swap_record_privileges = sqlx::query_as::<_, ChainSwapRecordPrivileges>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'UPDATE' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
     Ok(journal_privileges_ready(privileges)
         && direct_lifecycle_privileges_ready(direct_lifecycle_privileges)
         && watcher_lane_privileges_ready(watcher_lane_privileges)
-        && swap_key_lineage_privileges_ready(swap_key_lineage_privileges))
+        && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
+        && chain_swap_record_privileges_ready(chain_swap_record_privileges))
 }
 
 /// Migration 050 is a safety boundary, not merely an additive table marker.
@@ -363,6 +386,15 @@ fn swap_key_lineage_privileges_ready(
 ) -> bool {
     matches!(
         (allocation_select, allocation_insert, high_water_select),
+        (Some(true), Some(true), Some(true))
+    )
+}
+
+fn chain_swap_record_privileges_ready(
+    (select, insert, update): ChainSwapRecordPrivileges,
+) -> bool {
+    matches!(
+        (select, insert, update),
         (Some(true), Some(true), Some(true))
     )
 }
@@ -671,7 +703,67 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND t.tgname = 'swap_key_allocations_reject_update' \
                   AND NOT t.tgisinternal \
                   AND t.tgenabled IN ('O', 'A') \
-            )",
+            ) \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name IN ( \
+                      'pinned_pair_hash', \
+                      'canonical_pair_quote_json', \
+                      'creation_response_sha256', \
+                      'btc_claim_script_sha256', \
+                      'btc_refund_script_sha256', \
+                      'liquid_claim_script_sha256', \
+                      'liquid_refund_script_sha256', \
+                      'btc_timeout_height', \
+                      'liquid_timeout_height', \
+                      'btc_network', \
+                      'liquid_network', \
+                      'liquid_asset_id', \
+                      'merchant_liquid_destination', \
+                      'merchant_emergency_btc_address' \
+                  ) \
+            ) = 14 \
+            AND ( \
+                SELECT COUNT(*) FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'chain_swap_records' \
+                  AND c.conname IN ( \
+                      'chain_swap_records_creation_terms_shape_check', \
+                      'chain_swap_records_pinned_pair_hash_check', \
+                      'chain_swap_records_pair_quote_json_check', \
+                      'chain_swap_records_creation_response_sha256_check', \
+                      'chain_swap_records_btc_claim_script_sha256_check', \
+                      'chain_swap_records_btc_refund_script_sha256_check', \
+                      'chain_swap_records_liquid_claim_script_sha256_check', \
+                      'chain_swap_records_liquid_refund_script_sha256_check', \
+                      'chain_swap_records_btc_timeout_height_check', \
+                      'chain_swap_records_liquid_timeout_height_check', \
+                      'chain_swap_records_btc_network_check', \
+                      'chain_swap_records_liquid_network_check', \
+                      'chain_swap_records_liquid_asset_id_check', \
+                      'chain_swap_records_merchant_liquid_destination_check', \
+                      'chain_swap_records_merchant_emergency_btc_address_check' \
+                  ) \
+                  AND c.contype = 'c' \
+                  AND c.convalidated \
+            ) = 15 \
+            AND ( \
+                SELECT COUNT(*) FROM pg_trigger t \
+                JOIN pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND c.relname = 'chain_swap_records' \
+                  AND t.tgname IN ( \
+                      'chain_swap_records_require_creation_terms', \
+                      'chain_swap_records_reject_creation_terms_update' \
+                  ) \
+                  AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
+            ) = 2",
     )
     .fetch_one(pool)
     .await
@@ -680,8 +772,8 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_lifecycle_privileges_ready, journal_privileges_ready,
-        swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
+        chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
+        journal_privileges_ready, swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
     };
 
     #[test]
@@ -773,5 +865,24 @@ mod tests {
             Some(true),
             Some(true),
         )));
+    }
+
+    #[test]
+    fn chain_swap_creation_requires_record_read_write_privileges() {
+        assert!(chain_swap_record_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+        for privileges in [
+            (Some(false), Some(true), Some(true)),
+            (Some(true), Some(false), Some(true)),
+            (Some(true), Some(true), Some(false)),
+            (None, Some(true), Some(true)),
+            (Some(true), None, Some(true)),
+            (Some(true), Some(true), None),
+        ] {
+            assert!(!chain_swap_record_privileges_ready(privileges));
+        }
     }
 }

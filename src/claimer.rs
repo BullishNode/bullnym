@@ -33,6 +33,7 @@ use crate::error::AppError;
 use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
+use crate::validators;
 use crate::AppState;
 
 const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
@@ -40,6 +41,38 @@ const REVERSE_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed reverse response without persisted claim bytes";
 const CHAIN_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed chain response without persisted claim bytes";
+
+fn validated_chain_creation_destination(
+    terms: &db::ChainSwapCreationTerms,
+) -> Result<String, AppError> {
+    if terms.btc_network != "bitcoin" || terms.liquid_network != "liquid" {
+        return Err(AppError::ClaimError(format!(
+            "chain swap creation packet has unsupported networks: {}/{}",
+            terms.btc_network, terms.liquid_network
+        )));
+    }
+    let expected_asset = elements::AssetId::LIQUID_BTC.to_string();
+    if terms.liquid_asset_id != expected_asset {
+        return Err(AppError::ClaimError(format!(
+            "chain swap creation packet has unexpected Liquid asset {}",
+            terms.liquid_asset_id
+        )));
+    }
+    let canonical = validators::canonical_liquid_mainnet_address(
+        &terms.merchant_liquid_destination,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "invalid immutable chain-swap Liquid destination: {error}"
+        ))
+    })?;
+    if canonical != terms.merchant_liquid_destination {
+        return Err(AppError::ClaimError(
+            "immutable chain-swap Liquid destination is not canonical".into(),
+        ));
+    }
+    Ok(canonical)
+}
 
 #[derive(Deserialize)]
 struct WebhookEnvelope {
@@ -1770,6 +1803,8 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
 
     let status = swap
         .parsed_status()
@@ -1793,16 +1828,26 @@ async fn claim_chain_swap_inner(
         return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
     }
 
-    let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id)))?;
-    let output_address = invoice.liquid_address.ok_or_else(|| {
-        AppError::ClaimError(format!(
-            "invoice {} has no liquid_address for chain-swap claim",
-            swap.invoice_id
-        ))
-    })?;
+    // Post-051 swaps claim only to the immutable destination committed before
+    // the payer saw the Bitcoin address. Never re-resolve it through the
+    // mutable invoice relationship. Historical rows have no creation packet,
+    // so they retain the explicit legacy fallback.
+    let output_address = if let Some(terms) = swap.creation_terms.as_ref() {
+        validated_chain_creation_destination(terms)?
+    } else {
+        let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?
+            .ok_or_else(|| {
+                AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id))
+            })?;
+        invoice.liquid_address.ok_or_else(|| {
+            AppError::ClaimError(format!(
+                "legacy invoice {} has no liquid_address for chain-swap claim",
+                swap.invoice_id
+            ))
+        })?
+    };
 
     let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
         match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)

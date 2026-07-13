@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -112,6 +114,67 @@ pub struct NewChainSwapRecord<'a> {
     pub root_fingerprint: Option<&'a str>,
 }
 
+/// Complete non-secret evidence approved before a chain-swap payer instruction
+/// is exposed. Migration 051 requires this packet on every new row and makes
+/// it immutable. Historical rows decode as `None` because these facts cannot
+/// be reconstructed safely after creation.
+#[derive(Debug, Clone, Copy)]
+pub struct NewChainSwapCreationTerms<'a> {
+    pub pinned_pair_hash: &'a str,
+    pub canonical_pair_quote_json: &'a str,
+    pub creation_response_sha256: &'a str,
+    pub btc_claim_script_sha256: &'a str,
+    pub btc_refund_script_sha256: &'a str,
+    pub liquid_claim_script_sha256: &'a str,
+    pub liquid_refund_script_sha256: &'a str,
+    pub btc_timeout_height: i64,
+    pub liquid_timeout_height: i64,
+    pub btc_network: &'a str,
+    pub liquid_network: &'a str,
+    pub liquid_asset_id: &'a str,
+    pub merchant_liquid_destination: &'a str,
+    pub merchant_emergency_btc_address: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSwapCreationTerms {
+    pub pinned_pair_hash: String,
+    pub canonical_pair_quote_json: String,
+    pub creation_response_sha256: String,
+    pub btc_claim_script_sha256: String,
+    pub btc_refund_script_sha256: String,
+    pub liquid_claim_script_sha256: String,
+    pub liquid_refund_script_sha256: String,
+    pub btc_timeout_height: i64,
+    pub liquid_timeout_height: i64,
+    pub btc_network: String,
+    pub liquid_network: String,
+    pub liquid_asset_id: String,
+    pub merchant_liquid_destination: String,
+    pub merchant_emergency_btc_address: Option<String>,
+}
+
+impl From<&NewChainSwapCreationTerms<'_>> for ChainSwapCreationTerms {
+    fn from(terms: &NewChainSwapCreationTerms<'_>) -> Self {
+        Self {
+            pinned_pair_hash: terms.pinned_pair_hash.to_owned(),
+            canonical_pair_quote_json: terms.canonical_pair_quote_json.to_owned(),
+            creation_response_sha256: terms.creation_response_sha256.to_owned(),
+            btc_claim_script_sha256: terms.btc_claim_script_sha256.to_owned(),
+            btc_refund_script_sha256: terms.btc_refund_script_sha256.to_owned(),
+            liquid_claim_script_sha256: terms.liquid_claim_script_sha256.to_owned(),
+            liquid_refund_script_sha256: terms.liquid_refund_script_sha256.to_owned(),
+            btc_timeout_height: terms.btc_timeout_height,
+            liquid_timeout_height: terms.liquid_timeout_height,
+            btc_network: terms.btc_network.to_owned(),
+            liquid_network: terms.liquid_network.to_owned(),
+            liquid_asset_id: terms.liquid_asset_id.to_owned(),
+            merchant_liquid_destination: terms.merchant_liquid_destination.to_owned(),
+            merchant_emergency_btc_address: terms.merchant_emergency_btc_address.map(str::to_owned),
+        }
+    }
+}
+
 pub struct ChainSwapLineage<'a> {
     pub claim_allocation_id: Uuid,
     pub refund_allocation_id: Uuid,
@@ -144,6 +207,10 @@ pub struct ChainSwapRecord {
     pub claim_attempts: i32,
     pub last_claim_error: Option<String>,
     pub cooperative_refused: bool,
+    /// Immutable creation evidence, absent only for rows created before
+    /// migration 051.
+    #[sqlx(json(nullable))]
+    pub creation_terms: Option<ChainSwapCreationTerms>,
     /// Server-lockup amount Boltz accepted after a Phase 3 quote renegotiation
     /// (get_quote/accept_quote), or NULL when the swap was never renegotiated.
     pub renegotiated_server_lock_amount_sat: Option<i64>,
@@ -171,6 +238,46 @@ impl ChainSwapRecord {
         self.renegotiated_server_lock_amount_sat
             .unwrap_or(self.server_lock_amount_sat)
     }
+
+    /// New swaps persist the exact canonical provider response alongside an
+    /// immutable digest. Verify that evidence before any signing path parses
+    /// or acts on it. Historical rows have no creation packet and retain their
+    /// explicit legacy behavior.
+    pub fn verify_creation_response_integrity(&self) -> Result<(), String> {
+        let Some(terms) = self.creation_terms.as_ref() else {
+            return Ok(());
+        };
+        let actual = creation_response_sha256(&self.boltz_response_json);
+        if actual != terms.creation_response_sha256 {
+            return Err(format!(
+                "chain swap {} canonical creation response digest mismatch",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn creation_response_sha256(canonical_response_json: &str) -> String {
+    hex::encode(Sha256::digest(canonical_response_json.as_bytes()))
+}
+
+#[cfg(test)]
+mod creation_integrity_tests {
+    use super::creation_response_sha256;
+
+    #[test]
+    fn response_digest_commits_exact_canonical_bytes() {
+        let canonical = r#"{"a":1,"b":2}"#;
+        assert_eq!(
+            creation_response_sha256(canonical),
+            "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+        );
+        assert_ne!(
+            creation_response_sha256(canonical),
+            creation_response_sha256(r#"{"a":1, "b":2}"#)
+        );
+    }
 }
 
 const CHAIN_SWAP_RECORD_COLUMNS: &str =
@@ -178,6 +285,22 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
      claim_tx_hex, claim_attempts, last_claim_error, cooperative_refused, \
+     CASE WHEN pinned_pair_hash IS NULL THEN NULL ELSE jsonb_build_object( \
+         'pinned_pair_hash', pinned_pair_hash, \
+         'canonical_pair_quote_json', canonical_pair_quote_json, \
+         'creation_response_sha256', creation_response_sha256, \
+         'btc_claim_script_sha256', btc_claim_script_sha256, \
+         'btc_refund_script_sha256', btc_refund_script_sha256, \
+         'liquid_claim_script_sha256', liquid_claim_script_sha256, \
+         'liquid_refund_script_sha256', liquid_refund_script_sha256, \
+         'btc_timeout_height', btc_timeout_height, \
+         'liquid_timeout_height', liquid_timeout_height, \
+         'btc_network', btc_network, \
+         'liquid_network', liquid_network, \
+         'liquid_asset_id', liquid_asset_id, \
+         'merchant_liquid_destination', merchant_liquid_destination, \
+         'merchant_emergency_btc_address', merchant_emergency_btc_address \
+     ) END AS creation_terms, \
      renegotiated_server_lock_amount_sat, refund_address, refund_txid, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
      EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
@@ -209,7 +332,7 @@ pub async fn record_chain_swap(
     pool: &PgPool,
     swap: &NewChainSwapRecord<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, None).await
+    insert_chain_swap(pool, swap, None, None).await
 }
 
 pub async fn record_chain_swap_with_lineage(
@@ -217,20 +340,34 @@ pub async fn record_chain_swap_with_lineage(
     swap: &NewChainSwapRecord<'_>,
     lineage: &ChainSwapLineage<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, Some(lineage)).await
+    insert_chain_swap(pool, swap, Some(lineage), None).await
+}
+
+/// Persist a fully validated chain swap and its immutable creation packet.
+/// This is the only insertion API compatible with migration 051. The legacy
+/// insertion functions remain available solely so pre-051 fixtures and a
+/// rolling caller migration can compile; the database rejects their new rows.
+pub async fn record_chain_swap_with_lineage_and_creation_terms(
+    pool: &PgPool,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_terms: &NewChainSwapCreationTerms<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(pool, swap, Some(lineage), Some(creation_terms)).await
 }
 
 pub async fn record_chain_swap_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &NewChainSwapRecord<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(&mut **tx, swap, None).await
+    insert_chain_swap(&mut **tx, swap, None, None).await
 }
 
 async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     swap: &NewChainSwapRecord<'_>,
     lineage: Option<&ChainSwapLineage<'_>>,
+    creation_terms: Option<&NewChainSwapCreationTerms<'_>>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "INSERT INTO chain_swap_records \
@@ -239,9 +376,16 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
               refund_key_hex, boltz_response_json, claim_key_index, refund_key_index, \
               root_fingerprint, claim_key_allocation_id, refund_key_allocation_id, \
               key_epoch, derivation_scheme_version, claim_public_key_hex, \
-              refund_public_key_hex, preimage_hash_hex) \
+              refund_public_key_hex, preimage_hash_hex, pinned_pair_hash, \
+              canonical_pair_quote_json, creation_response_sha256, \
+              btc_claim_script_sha256, btc_refund_script_sha256, \
+              liquid_claim_script_sha256, liquid_refund_script_sha256, \
+              btc_timeout_height, liquid_timeout_height, btc_network, liquid_network, \
+              liquid_asset_id, merchant_liquid_destination, \
+              merchant_emergency_btc_address) \
          VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                 $15, $16, $17, $18, $19, $20, $21) \
+                 $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
+                 $30, $31, $32, $33, $34, $35) \
          RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
     ))
     .bind(swap.invoice_id)
@@ -265,6 +409,20 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     .bind(lineage.map(|lineage| lineage.claim_public_key_hex))
     .bind(lineage.map(|lineage| lineage.refund_public_key_hex))
     .bind(lineage.map(|lineage| lineage.preimage_hash_hex))
+    .bind(creation_terms.map(|terms| terms.pinned_pair_hash))
+    .bind(creation_terms.map(|terms| terms.canonical_pair_quote_json))
+    .bind(creation_terms.map(|terms| terms.creation_response_sha256))
+    .bind(creation_terms.map(|terms| terms.btc_claim_script_sha256))
+    .bind(creation_terms.map(|terms| terms.btc_refund_script_sha256))
+    .bind(creation_terms.map(|terms| terms.liquid_claim_script_sha256))
+    .bind(creation_terms.map(|terms| terms.liquid_refund_script_sha256))
+    .bind(creation_terms.map(|terms| terms.btc_timeout_height))
+    .bind(creation_terms.map(|terms| terms.liquid_timeout_height))
+    .bind(creation_terms.map(|terms| terms.btc_network))
+    .bind(creation_terms.map(|terms| terms.liquid_network))
+    .bind(creation_terms.map(|terms| terms.liquid_asset_id))
+    .bind(creation_terms.map(|terms| terms.merchant_liquid_destination))
+    .bind(creation_terms.and_then(|terms| terms.merchant_emergency_btc_address))
     .fetch_one(executor)
     .await
 }

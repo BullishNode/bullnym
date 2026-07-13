@@ -5,6 +5,49 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
+fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
+    db::ChainSwapCreationTerms {
+        pinned_pair_hash: "11".repeat(32),
+        canonical_pair_quote_json: "{}".into(),
+        creation_response_sha256: "22".repeat(32),
+        btc_claim_script_sha256: "33".repeat(32),
+        btc_refund_script_sha256: "44".repeat(32),
+        liquid_claim_script_sha256: "55".repeat(32),
+        liquid_refund_script_sha256: "66".repeat(32),
+        btc_timeout_height: 958_033,
+        liquid_timeout_height: 3_972_215,
+        btc_network: "bitcoin".into(),
+        liquid_network: "liquid".into(),
+        liquid_asset_id: elements::AssetId::LIQUID_BTC.to_string(),
+        merchant_liquid_destination: "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg".into(),
+        merchant_emergency_btc_address: None,
+    }
+}
+
+#[test]
+fn chain_claim_uses_validated_immutable_creation_destination() {
+    let terms = valid_chain_creation_terms();
+    assert_eq!(
+        validated_chain_creation_destination(&terms).unwrap(),
+        terms.merchant_liquid_destination
+    );
+}
+
+#[test]
+fn chain_claim_rejects_corrupt_creation_destination_policy() {
+    let mut wrong_network = valid_chain_creation_terms();
+    wrong_network.liquid_network = "liquidtestnet".into();
+    assert!(validated_chain_creation_destination(&wrong_network).is_err());
+
+    let mut wrong_asset = valid_chain_creation_terms();
+    wrong_asset.liquid_asset_id = "00".repeat(32);
+    assert!(validated_chain_creation_destination(&wrong_asset).is_err());
+
+    let mut wrong_address = valid_chain_creation_terms();
+    wrong_address.merchant_liquid_destination = "not-a-liquid-address".into();
+    assert!(validated_chain_creation_destination(&wrong_address).is_err());
+}
+
 #[test]
 fn url_secret_matches_current() {
     assert_eq!(

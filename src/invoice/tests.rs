@@ -212,24 +212,24 @@ fn boltz_invoice_description_hashes_url_when_too_long() {
 }
 
 #[test]
-fn append_bip21_message_adds_encoded_invoice_url() {
-    let bip21 = "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address";
+fn chain_bip21_is_built_locally_with_exact_amount_and_encoded_invoice_url() {
+    let address = "bc1qboltzlockup";
     let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
 
     assert_eq!(
-            append_bip21_message(bip21, url),
+            build_bitcoin_chain_bip21(address, 10_000, url),
             "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address&message=https%3A%2F%2Fbullpay.ca%2Falice%2Fi%2F00000000-0000-0000-0000-000000000000"
         );
 }
 
 #[test]
-fn append_bip21_message_replaces_existing_message() {
-    let bip21 = "bitcoin:bc1qboltzlockup?amount=0.00010000&message=old";
+fn chain_bip21_formats_whole_bitcoin_without_rounding() {
+    let address = "bc1qboltzlockup";
     let url = "https://bullpay.ca/invoice/00000000-0000-0000-0000-000000000000";
 
     assert_eq!(
-            append_bip21_message(bip21, url),
-            "bitcoin:bc1qboltzlockup?amount=0.00010000&message=https%3A%2F%2Fbullpay.ca%2Finvoice%2F00000000-0000-0000-0000-000000000000"
+            build_bitcoin_chain_bip21(address, 100_000_001, url),
+            "bitcoin:bc1qboltzlockup?amount=1.00000001&label=Send%20to%20L-BTC%20address&message=https%3A%2F%2Fbullpay.ca%2Finvoice%2F00000000-0000-0000-0000-000000000000"
         );
 }
 

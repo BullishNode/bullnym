@@ -821,6 +821,8 @@ async fn construct_live_refund(
     swap: &ChainSwapRecord,
     refund_address: &str,
 ) -> Result<BtcLikeTransaction, AppError> {
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
     let refund_key_bytes = hex::decode(&swap.refund_key_hex)
         .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?;
     let secp = Secp256k1::new();
