@@ -65,6 +65,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "support/chain_swap_transaction_insert.rs"]
 mod chain_swap_transaction_insert;
+#[path = "support/local_chain_swap_recovery_snapshot.rs"]
+mod local_chain_swap_recovery_snapshot;
 
 // --- Test infrastructure ---
 
