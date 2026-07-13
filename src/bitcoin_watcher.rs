@@ -147,9 +147,13 @@ struct RequestPermit<'a> {
 
 const WATCHER_BATCH_SIZE: usize = 1_000;
 const ESPLORA_CONFIRMED_PAGE_SIZE: usize = 25;
-/// One initial address page plus at most fifteen older confirmed pages. A full
-/// final page is deliberately incomplete: the watcher retains the invoice and
-/// never applies a truncated generation.
+/// Bull's Esplora-compatible address route and the public failover currently
+/// return up to fifty confirmed transactions on the initial route. Cursor
+/// continuation pages retain the canonical Esplora size of twenty-five.
+const EXTENDED_FIRST_CONFIRMED_PAGE_SIZE: usize = 50;
+/// One bounded initial address response plus at most fifteen canonical older
+/// confirmed pages. A full final page is deliberately incomplete: the watcher
+/// retains the invoice and never applies a truncated generation.
 const MAX_CONFIRMED_HISTORY_PAGES: usize = 16;
 const MAX_RBF_TREE_NODES: usize = 256;
 const MAX_FIRST_ADDRESS_TRANSACTIONS: usize = 64;
@@ -807,9 +811,10 @@ impl BitcoinWatcher {
 
     /// Fetch one complete, bounded address-history snapshot from a single
     /// Esplora authority. The first route contains mempool transactions plus
-    /// the newest 25 confirmed transactions; older confirmed pages use the
-    /// documented last-seen cursor. No caller may apply the returned prefix
-    /// until the terminal short page has proved completeness.
+    /// either the canonical newest 25 confirmed transactions or the observed
+    /// extended first response of 50. Older confirmed pages always use the
+    /// documented 25-item last-seen cursor contract. No caller may apply the
+    /// returned prefix until the terminal short page has proved completeness.
     async fn fetch_complete_address_history(
         &self,
         inv: &InvoiceForBtcPoll,
@@ -855,13 +860,17 @@ impl BitcoinWatcher {
         }
 
         let first_confirmed = first.iter().filter(|tx| tx.status.confirmed).count();
-        if first_confirmed > ESPLORA_CONFIRMED_PAGE_SIZE {
+        if first_confirmed > ESPLORA_CONFIRMED_PAGE_SIZE
+            && first_confirmed != EXTENDED_FIRST_CONFIRMED_PAGE_SIZE
+        {
             tracing::warn!(
                 event = "bitcoin_watcher_invalid_address_history",
                 invoice_id = %inv.id,
                 endpoint = %endpoint,
                 first_confirmed,
-                "bitcoin_watcher: first address page exceeded Esplora's confirmed-page bound"
+                canonical_limit = ESPLORA_CONFIRMED_PAGE_SIZE,
+                extended_first_limit = EXTENDED_FIRST_CONFIRMED_PAGE_SIZE,
+                "bitcoin_watcher: first address page had an unsupported confirmed transaction count"
             );
             return AddressHistoryFetch::Retry;
         }
@@ -875,7 +884,10 @@ impl BitcoinWatcher {
             .map(|tx| tx.txid.clone());
         let mut pages = 1usize;
 
-        while confirmed_in_page == ESPLORA_CONFIRMED_PAGE_SIZE {
+        while matches!(
+            confirmed_in_page,
+            ESPLORA_CONFIRMED_PAGE_SIZE | EXTENDED_FIRST_CONFIRMED_PAGE_SIZE
+        ) {
             let Some(cursor) = last_seen_txid.as_deref() else {
                 return AddressHistoryFetch::Retry;
             };
@@ -2054,7 +2066,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_history_pagination_discovers_the_twenty_sixth_payment() {
+    async fn extended_fifty_confirmed_first_page_revalidates_all_known_transactions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind extended first-page Esplora fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let address = "bc1qtarget";
+        let first_page = (0..EXTENDED_FIRST_CONFIRMED_PAGE_SIZE)
+            .map(|index| {
+                serde_json::json!({
+                    "txid": format!("{index:064x}"),
+                    "vout": [{"scriptpubkey_address": address, "value": 1_000}],
+                    "status": {
+                        "confirmed": true,
+                        "block_height": 799_900 + index,
+                        "block_hash": format!("{:064x}", 30_000 + index)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut bodies = vec![
+            serde_json::to_string(&first_page).unwrap(),
+            "[]".to_string(),
+        ];
+        bodies.extend(
+            first_page
+                .iter()
+                .map(|transaction| serde_json::to_string(transaction).unwrap()),
+        );
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_paths = paths.clone();
+        let server = tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2_048];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                server_paths
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/bullnym_bitcoin_watcher_unit_test")
+            .unwrap();
+        let watcher = BitcoinWatcher::new(
+            BitcoinWatcherConfig {
+                endpoint: endpoint.clone(),
+                endpoints: Vec::new(),
+                rate_per_sec: 1_000,
+                ..BitcoinWatcherConfig::default()
+            },
+            db::InvoiceAccountingTolerances::default(),
+            pool,
+        )
+        .unwrap();
+        let known = (0..EXTENDED_FIRST_CONFIRMED_PAGE_SIZE)
+            .map(|index| watch_evidence(&format!("{index:064x}"), 0, 1_000))
+            .collect::<Vec<_>>();
+        let (_, reporter, _) = admission_fixture();
+        let cancel = CancellationToken::new();
+        let inv = InvoiceForBtcPoll {
+            id: Uuid::new_v4(),
+            bitcoin_address: address.to_string(),
+            amount_sat: 50_000,
+            created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
+        };
+
+        let evidence = watcher
+            .collect_endpoint_evidence(
+                &inv,
+                &known,
+                800_000,
+                &endpoint,
+                RequestPermit {
+                    cancel: &cancel,
+                    reporter: &reporter,
+                },
+            )
+            .await;
+        server.await.unwrap();
+
+        let EndpointEvidence::Ready(observations) = evidence else {
+            panic!("extended first-page evidence was not complete");
+        };
+        assert_eq!(observations.len(), EXTENDED_FIRST_CONFIRMED_PAGE_SIZE);
+        assert!(observations.iter().all(|observation| {
+            observation.phase == db::DirectObservationPhase::Finalized
+                && observation.block_hash.is_some()
+        }));
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.len(), EXTENDED_FIRST_CONFIRMED_PAGE_SIZE + 2);
+        assert_eq!(paths[0], "GET /address/bc1qtarget/txs HTTP/1.1");
+        assert!(paths[1].starts_with(&format!(
+            "GET /address/bc1qtarget/txs/chain/{:064x} ",
+            EXTENDED_FIRST_CONFIRMED_PAGE_SIZE - 1
+        )));
+        assert_eq!(paths[2], format!("GET /tx/{:064x} HTTP/1.1", 0));
+        assert_eq!(
+            paths.last().unwrap(),
+            &format!(
+                "GET /tx/{:064x} HTTP/1.1",
+                EXTENDED_FIRST_CONFIRMED_PAGE_SIZE - 1
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_twenty_five_item_pagination_discovers_the_twenty_sixth_payment() {
+        assert_eq!(ESPLORA_CONFIRMED_PAGE_SIZE, 25);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind paginated Esplora fixture");
@@ -2155,6 +2283,89 @@ mod tests {
             "GET /address/bc1qtarget/txs/chain/{:064x} ",
             ESPLORA_CONFIRMED_PAGE_SIZE - 1
         )));
+    }
+
+    #[tokio::test]
+    async fn unsupported_first_confirmed_page_shapes_fail_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind invalid first-page Esplora fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let unsupported_counts = [26usize, 49, 51, MAX_FIRST_ADDRESS_TRANSACTIONS];
+        let bodies = unsupported_counts.map(|count| {
+            serde_json::to_string(
+                &(0..count)
+                    .map(|index| {
+                        serde_json::json!({
+                            "txid": format!("{index:064x}"),
+                            "vout": [{"scriptpubkey_address": "bc1qother", "value": 1_000}],
+                            "status": {
+                                "confirmed": true,
+                                "block_height": 799_900 + index,
+                                "block_hash": format!("{:064x}", 40_000 + index)
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        });
+        let server = tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2_048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/bullnym_bitcoin_watcher_unit_test")
+            .unwrap();
+        let watcher = BitcoinWatcher::new(
+            BitcoinWatcherConfig {
+                endpoint: endpoint.clone(),
+                endpoints: Vec::new(),
+                rate_per_sec: 1_000,
+                ..BitcoinWatcherConfig::default()
+            },
+            db::InvoiceAccountingTolerances::default(),
+            pool,
+        )
+        .unwrap();
+        let (_, reporter, _) = admission_fixture();
+        let cancel = CancellationToken::new();
+        let inv = InvoiceForBtcPoll {
+            id: Uuid::new_v4(),
+            bitcoin_address: "bc1qtarget".to_string(),
+            amount_sat: 6_000,
+            created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
+        };
+
+        for count in unsupported_counts {
+            let evidence = watcher
+                .collect_endpoint_evidence(
+                    &inv,
+                    &[],
+                    800_000,
+                    &endpoint,
+                    RequestPermit {
+                        cancel: &cancel,
+                        reporter: &reporter,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(evidence, EndpointEvidence::Retry),
+                "unsupported first confirmed count {count} must fail closed"
+            );
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]
