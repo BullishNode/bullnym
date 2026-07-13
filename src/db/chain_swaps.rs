@@ -952,6 +952,51 @@ pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecut
     .await
 }
 
+/// Whether one complete issue-#80 chain-swap creation record lacks any
+/// migration-052 manifest-ledger obligation.
+///
+/// Migration 051 constrains its thirteen mandatory creation-term columns to
+/// an all-or-none shape. Testing that exact shape distinguishes canonical
+/// post-#80 records from historical/incomplete rows without selecting an
+/// identity, provider response, address, key, or other row value. `EXISTS`
+/// stops at the first uncovered record, keeping this creation-boundary probe
+/// bounded regardless of table size. The emergency destination is deliberately
+/// absent from the shape because migration 051 makes it optional.
+pub async fn has_manifestless_complete_chain_swap<'e, E>(executor: E) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 \
+               FROM chain_swap_records chain_swap \
+              WHERE num_nonnulls( \
+                        chain_swap.pinned_pair_hash, \
+                        chain_swap.canonical_pair_quote_json, \
+                        chain_swap.creation_response_sha256, \
+                        chain_swap.btc_claim_script_sha256, \
+                        chain_swap.btc_refund_script_sha256, \
+                        chain_swap.liquid_claim_script_sha256, \
+                        chain_swap.liquid_refund_script_sha256, \
+                        chain_swap.btc_timeout_height, \
+                        chain_swap.liquid_timeout_height, \
+                        chain_swap.btc_network, \
+                        chain_swap.liquid_network, \
+                        chain_swap.liquid_asset_id, \
+                        chain_swap.merchant_liquid_destination \
+                    ) = 13 \
+                AND NOT EXISTS ( \
+                      SELECT 1 \
+                        FROM chain_swap_manifest_deliveries delivery \
+                       WHERE delivery.chain_swap_id = chain_swap.id \
+                ) \
+              LIMIT 1 \
+         )",
+    )
+    .fetch_one(executor)
+    .await
+}
+
 /// Atomically fold one webhook/reconciliation provider status into the
 /// persisted chain-swap lifecycle.
 ///

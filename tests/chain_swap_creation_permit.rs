@@ -11,6 +11,7 @@ use pay_service::db::{self, ChainSwapManifestDelivery, NewChainSwapRecord, NewIn
 use pay_service::swap_manifest::EncryptedSwapManifestV1;
 use pay_service::swap_manifest_store::{ManifestObjectId, RecoveryManifestStore};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -33,7 +34,8 @@ async fn test_pool() -> PgPool {
 
 async fn cleanup(pool: &PgPool) {
     sqlx::query(
-        "TRUNCATE chain_swap_manifest_deliveries, chain_swap_records, invoices, users CASCADE",
+        "TRUNCATE chain_swap_manifest_deliveries, chain_swap_records, invoices, users, \
+         swap_key_allocations CASCADE",
     )
     .execute(pool)
     .await
@@ -75,10 +77,10 @@ fn manifest_envelope(byte: u8) -> EncryptedSwapManifestV1 {
     EncryptedSwapManifestV1::parse(encoded).expect("parse structural manifest envelope")
 }
 
-async fn insert_pending_delivery(pool: &PgPool, byte: u8) -> ChainSwapManifestDelivery {
+async fn insert_invoice_fixture(pool: &PgPool, label: &str) -> (String, db::Invoice) {
     let suffix = Uuid::new_v4().simple().to_string();
-    let nym = format!("permit{}", &suffix[..12]);
-    let npub = "11".repeat(32);
+    let nym = format!("{label}{}", &suffix[..10]);
+    let npub = hex::encode(Sha256::digest(nym.as_bytes()));
     db::create_user(pool, &nym, &npub, "ct-permit-test")
         .await
         .expect("insert permit test user");
@@ -113,6 +115,13 @@ async fn insert_pending_delivery(pool: &PgPool, byte: u8) -> ChainSwapManifestDe
     .await
     .expect("insert permit test invoice");
 
+    (nym, invoice)
+}
+
+async fn insert_legacy_manifestless_swap(pool: &PgPool) -> db::ChainSwapRecord {
+    let (nym, invoice) = insert_invoice_fixture(pool, "legacypermit").await;
+    let suffix = Uuid::new_v4().simple().to_string();
+
     let boltz_swap_id = format!("permit-{suffix}");
     let lockup_address = format!("bc1q{nym}");
     let preimage = "21".repeat(32);
@@ -146,19 +155,138 @@ async fn insert_pending_delivery(pool: &PgPool, byte: u8) -> ChainSwapManifestDe
     .expect("insert permit test chain swap");
     tx.commit().await.expect("commit permit source fixture");
 
+    swap
+}
+
+fn fixture_sha256(label: &str, suffix: &str) -> String {
+    hex::encode(Sha256::digest(format!("{label}:{suffix}").as_bytes()))
+}
+
+async fn insert_complete_manifestless_swap(pool: &PgPool) -> db::ChainSwapRecord {
+    let (nym, invoice) = insert_invoice_fixture(pool, "completepermit").await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let root_fingerprint_hex = fixture_sha256("root", &suffix);
+    let root_fingerprint = &root_fingerprint_hex[..16];
+    let claim_public_key_hex = format!("02{}", fixture_sha256("claim-key", &suffix));
+    let refund_public_key_hex = format!("03{}", fixture_sha256("refund-key", &suffix));
+    let preimage_hash_hex = fixture_sha256("preimage", &suffix);
+    let claim_allocation_id = db::reserve_swap_key_allocation(
+        pool,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: 100,
+            purpose: db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: Some(&preimage_hash_hex),
+        },
+    )
+    .await
+    .expect("reserve complete permit claim allocation");
+    let refund_allocation_id = db::reserve_swap_key_allocation(
+        pool,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: 101,
+            purpose: db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key_hex,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .expect("reserve complete permit refund allocation");
+
+    let boltz_swap_id = format!("complete-permit-{suffix}");
+    let lockup_address = format!("bc1qcompletepermit{suffix}");
+    let lockup_bip21 = format!("bitcoin:{lockup_address}?amount=0.00001010");
+    let canonical_response = format!(r#"{{"id":"{boltz_swap_id}"}}"#);
+    let preimage = fixture_sha256("private-preimage", &suffix);
+    let claim_key = fixture_sha256("private-claim", &suffix);
+    let refund_key = fixture_sha256("private-refund", &suffix);
+    let pinned_pair_hash = fixture_sha256("pair", &suffix);
+    let canonical_pair_quote_json = format!(r#"{{"hash":"{pinned_pair_hash}"}}"#);
+    let creation_response_sha256 = hex::encode(Sha256::digest(canonical_response.as_bytes()));
+    let btc_claim_script_sha256 = fixture_sha256("btc-claim", &suffix);
+    let btc_refund_script_sha256 = fixture_sha256("btc-refund", &suffix);
+    let liquid_claim_script_sha256 = fixture_sha256("liquid-claim", &suffix);
+    let liquid_refund_script_sha256 = fixture_sha256("liquid-refund", &suffix);
+    let liquid_asset_id = fixture_sha256("asset", &suffix);
+    let merchant_liquid_destination = format!("lq1completepermit{suffix}");
+
+    db::record_chain_swap_with_lineage_and_creation_terms(
+        pool,
+        &NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some(&nym),
+            boltz_swap_id: &boltz_swap_id,
+            lockup_address: &lockup_address,
+            lockup_bip21: Some(&lockup_bip21),
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: &preimage,
+            claim_key_hex: &claim_key,
+            refund_key_hex: &refund_key,
+            boltz_response_json: &canonical_response,
+            claim_key_index: Some(100),
+            refund_key_index: Some(101),
+            root_fingerprint: Some(root_fingerprint),
+        },
+        &db::ChainSwapLineage {
+            claim_allocation_id,
+            refund_allocation_id,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            refund_public_key_hex: &refund_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
+        },
+        &db::NewChainSwapCreationTerms {
+            pinned_pair_hash: &pinned_pair_hash,
+            canonical_pair_quote_json: &canonical_pair_quote_json,
+            creation_response_sha256: &creation_response_sha256,
+            btc_claim_script_sha256: &btc_claim_script_sha256,
+            btc_refund_script_sha256: &btc_refund_script_sha256,
+            liquid_claim_script_sha256: &liquid_claim_script_sha256,
+            liquid_refund_script_sha256: &liquid_refund_script_sha256,
+            btc_timeout_height: 900_000,
+            liquid_timeout_height: 3_000_000,
+            btc_network: "bitcoin",
+            liquid_network: "liquid",
+            liquid_asset_id: &liquid_asset_id,
+            merchant_liquid_destination: &merchant_liquid_destination,
+            merchant_emergency_btc_address: None,
+        },
+    )
+    .await
+    .expect("insert complete manifest-less chain swap")
+}
+
+async fn insert_pending_delivery_for_swap(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    byte: u8,
+) -> ChainSwapManifestDelivery {
     let envelope = manifest_envelope(byte);
     let mut tx = pool.begin().await.expect("begin pending delivery fixture");
     let reservation = db::lock_manifest_delivery_tail(&mut tx)
         .await
         .expect("reserve manifest delivery tail");
     let identity = reservation
-        .identity(Uuid::new_v4(), swap.id)
+        .identity(Uuid::new_v4(), chain_swap_id)
         .expect("build manifest delivery identity");
     let delivery = db::insert_manifest_delivery(&mut tx, &identity, &envelope)
         .await
         .expect("insert pending manifest delivery");
     tx.commit().await.expect("commit pending delivery fixture");
     delivery
+}
+
+async fn insert_pending_delivery(pool: &PgPool, byte: u8) -> ChainSwapManifestDelivery {
+    let swap = insert_legacy_manifestless_swap(pool).await;
+    insert_pending_delivery_for_swap(pool, swap.id, byte).await
 }
 
 async fn pending_state(pool: &PgPool, manifest_id: Uuid) -> String {
@@ -173,14 +301,24 @@ async fn acquire_after_drop(
     pool: &PgPool,
     store: &RecoveryManifestStore,
 ) -> ChainSwapCreationPermit {
+    match acquire_after_session_release(pool, store).await {
+        Ok(permit) => permit,
+        Err(error) => panic!("unexpected permit acquisition failure: {error}"),
+    }
+}
+
+async fn acquire_after_session_release(
+    pool: &PgPool,
+    store: &RecoveryManifestStore,
+) -> Result<ChainSwapCreationPermit, ChainSwapCreationPermitError> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match ChainSwapCreationPermit::acquire(pool, store).await {
-                Ok(permit) => return permit,
+                result @ Ok(_) => return result,
                 Err(ChainSwapCreationPermitError::Busy) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                Err(error) => panic!("unexpected permit acquisition failure: {error}"),
+                error @ Err(_) => return error,
             }
         }
     })
@@ -228,6 +366,110 @@ async fn dropping_permit_closes_session_and_releases_lock() {
     drop(permit);
     let next = acquire_after_drop(&pool, &store).await;
     next.release().await.expect("release permit after drop");
+    cleanup(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+async fn complete_manifestless_swap_refuses_permit_and_releases_session_lock() {
+    let _serial = TEST_SERIAL.lock().await;
+    let pool = test_pool().await;
+    cleanup(&pool).await;
+    let swap = insert_complete_manifestless_swap(&pool).await;
+    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+
+    assert!(db::has_manifestless_complete_chain_swap(&pool)
+        .await
+        .expect("probe complete manifest-less row"));
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &store)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestObligationMissing
+    );
+    assert_eq!(
+        db::get_chain_swap_by_id(&pool, swap.id)
+            .await
+            .expect("read retained complete row")
+            .expect("complete row remains")
+            .status,
+        "pending"
+    );
+
+    // The next non-busy result must be the same bounded refusal, not a stuck
+    // advisory lock. The caller never receives a permit and therefore cannot
+    // cross into key allocation or a provider call.
+    assert_eq!(
+        acquire_after_session_release(&pool, &store)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestObligationMissing
+    );
+    cleanup(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+async fn legacy_manifestless_swap_is_structurally_nonblocking() {
+    let _serial = TEST_SERIAL.lock().await;
+    let pool = test_pool().await;
+    cleanup(&pool).await;
+    let legacy = insert_legacy_manifestless_swap(&pool).await;
+    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+
+    assert!(legacy.creation_terms.is_none());
+    assert!(!db::has_manifestless_complete_chain_swap(&pool)
+        .await
+        .expect("probe legacy manifest-less row"));
+    let permit = ChainSwapCreationPermit::acquire(&pool, &store)
+        .await
+        .expect("legacy row must not block new creation");
+    permit.release().await.expect("release legacy-row permit");
+    cleanup(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+async fn complete_manifestless_refusal_recovers_after_ledger_obligation_is_created() {
+    let _serial = TEST_SERIAL.lock().await;
+    let pool = test_pool().await;
+    cleanup(&pool).await;
+    let swap = insert_complete_manifestless_swap(&pool).await;
+    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &store)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestObligationMissing
+    );
+    let delivery = insert_pending_delivery_for_swap(&pool, swap.id, 0x61).await;
+    assert_eq!(pending_state(&pool, delivery.manifest_id).await, "pending");
+
+    // Acquisition first resumes the newly created pending obligation, then
+    // re-runs coverage while still holding the session creation lock.
+    let permit = acquire_after_drop(&pool, &store).await;
+    assert_eq!(
+        pending_state(&pool, delivery.manifest_id).await,
+        "delivered"
+    );
+    assert!(!db::has_manifestless_complete_chain_swap(&pool)
+        .await
+        .expect("probe resolved manifest obligation"));
+    let object_id = ManifestObjectId::new(swap.id, delivery.manifest_id)
+        .expect("valid recovered object identity");
+    assert_eq!(
+        store
+            .get_v1(object_id)
+            .await
+            .expect("read recovered manifest object")
+            .encoded(),
+        delivery.encrypted_envelope().encoded()
+    );
+    permit
+        .release()
+        .await
+        .expect("release recovered creation permit");
     cleanup(&pool).await;
 }
 

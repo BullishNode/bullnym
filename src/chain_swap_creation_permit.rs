@@ -28,6 +28,8 @@ pub enum ChainSwapCreationPermitError {
     LockCheckFailed,
     Busy,
     PendingDeliveryFailed,
+    ManifestCoverageCheckFailed,
+    ManifestObligationMissing,
     ReleaseFailed,
 }
 
@@ -41,6 +43,10 @@ impl fmt::Display for ChainSwapCreationPermitError {
             Self::Busy => "another chain-swap creation boundary is active",
             Self::PendingDeliveryFailed => {
                 "prior recovery-manifest delivery could not be completed"
+            }
+            Self::ManifestCoverageCheckFailed => "chain-swap manifest coverage check failed",
+            Self::ManifestObligationMissing => {
+                "canonical chain swap lacks a recovery manifest obligation"
             }
             Self::ReleaseFailed => "chain-swap creation permit release failed",
         })
@@ -93,6 +99,21 @@ impl ChainSwapCreationPermit {
         resume_pending_manifest_delivery(pool, store)
             .await
             .map_err(|_| ChainSwapCreationPermitError::PendingDeliveryFailed)?;
+
+        // A staging/ledger refusal after a mutating provider call deliberately
+        // retains the complete canonical chain-swap row. That row is a
+        // blocking obligation: do not let the next caller cross the provider
+        // boundary until a migration-052 ledger row exists for it. Historical
+        // rows without the complete #80 creation packet remain nonblocking.
+        let missing_obligation = crate::db::has_manifestless_complete_chain_swap(&mut connection)
+            .await
+            .map_err(|_| ChainSwapCreationPermitError::ManifestCoverageCheckFailed)?;
+        if missing_obligation {
+            // `connection` is detached and still owns the session advisory
+            // lock. Returning drops/closes it, so PostgreSQL releases the lock
+            // before any later acquisition can succeed.
+            return Err(ChainSwapCreationPermitError::ManifestObligationMissing);
+        }
 
         Ok(Self {
             connection: Some(connection),
@@ -151,6 +172,8 @@ mod tests {
             ChainSwapCreationPermitError::LockCheckFailed,
             ChainSwapCreationPermitError::Busy,
             ChainSwapCreationPermitError::PendingDeliveryFailed,
+            ChainSwapCreationPermitError::ManifestCoverageCheckFailed,
+            ChainSwapCreationPermitError::ManifestObligationMissing,
             ChainSwapCreationPermitError::ReleaseFailed,
         ] {
             assert!(error.to_string().len() <= 72);
