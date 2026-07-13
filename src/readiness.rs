@@ -19,6 +19,7 @@ type DirectLifecyclePrivileges = (
 
 type WatcherLanePrivileges = (Option<bool>, Option<bool>, Option<bool>);
 type SwapKeyLineagePrivileges = (Option<bool>, Option<bool>, Option<bool>);
+type ChainSwapRecordPrivileges = (Option<bool>, Option<bool>, Option<bool>);
 
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
@@ -214,10 +215,32 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     .fetch_one(pool)
     .await?;
 
+    let chain_swap_record_privileges = sqlx::query_as::<_, ChainSwapRecordPrivileges>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.chain_swap_records'), \
+                'UPDATE' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
     Ok(journal_privileges_ready(privileges)
         && direct_lifecycle_privileges_ready(direct_lifecycle_privileges)
         && watcher_lane_privileges_ready(watcher_lane_privileges)
-        && swap_key_lineage_privileges_ready(swap_key_lineage_privileges))
+        && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
+        && chain_swap_record_privileges_ready(chain_swap_record_privileges))
 }
 
 /// Migration 050 is a safety boundary, not merely an additive table marker.
@@ -363,6 +386,15 @@ fn swap_key_lineage_privileges_ready(
 ) -> bool {
     matches!(
         (allocation_select, allocation_insert, high_water_select),
+        (Some(true), Some(true), Some(true))
+    )
+}
+
+fn chain_swap_record_privileges_ready(
+    (select, insert, update): ChainSwapRecordPrivileges,
+) -> bool {
+    matches!(
+        (select, insert, update),
         (Some(true), Some(true), Some(true))
     )
 }
@@ -740,8 +772,8 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_lifecycle_privileges_ready, journal_privileges_ready,
-        swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
+        chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
+        journal_privileges_ready, swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
     };
 
     #[test]
@@ -833,5 +865,24 @@ mod tests {
             Some(true),
             Some(true),
         )));
+    }
+
+    #[test]
+    fn chain_swap_creation_requires_record_read_write_privileges() {
+        assert!(chain_swap_record_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+        for privileges in [
+            (Some(false), Some(true), Some(true)),
+            (Some(true), Some(false), Some(true)),
+            (Some(true), Some(true), Some(false)),
+            (None, Some(true), Some(true)),
+            (Some(true), None, Some(true)),
+            (Some(true), Some(true), None),
+        ] {
+            assert!(!chain_swap_record_privileges_ready(privileges));
+        }
     }
 }
