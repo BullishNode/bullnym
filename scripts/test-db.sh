@@ -89,7 +89,7 @@ cleanup() {
     if ((KEEP == 1)); then
       echo "test-db: kept container $CONTAINER (host port ${HOST_PORT:-unknown})"
     else
-      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
       echo "test-db: removed container $CONTAINER"
     fi
   fi
