@@ -156,7 +156,7 @@ const MAX_FIRST_ADDRESS_TRANSACTIONS: usize = 64;
 const MAX_ADDRESS_HISTORY_TRANSACTIONS: usize = MAX_FIRST_ADDRESS_TRANSACTIONS
     + (MAX_CONFIRMED_HISTORY_PAGES - 1) * ESPLORA_CONFIRMED_PAGE_SIZE;
 const MAX_KNOWN_DIRECT_OBSERVATIONS: usize = 128;
-const MAX_KNOWN_DIRECT_TXIDS: usize = 32;
+const MAX_KNOWN_DIRECT_TXIDS: usize = 64;
 const MAX_REDUCER_OBSERVATIONS: usize = 128;
 
 const BITCOIN_WATCHER_PAGE_SQL: &str = "SELECT id, bitcoin_address, amount_sat, \
@@ -2415,9 +2415,17 @@ mod tests {
             amount_sat: 6_000,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
+        assert_eq!(MAX_KNOWN_DIRECT_TXIDS, 64);
+        for accepted_txid_count in [50, MAX_KNOWN_DIRECT_TXIDS] {
+            let accepted = (0..accepted_txid_count)
+                .map(|index| watch_evidence(&format!("{index:064x}"), 0, 1_000))
+                .collect::<Vec<_>>();
+            assert!(!bitcoin_known_evidence_is_hard_bound(&accepted));
+        }
         let known = (0..=MAX_KNOWN_DIRECT_TXIDS)
             .map(|index| watch_evidence(&format!("{index:064x}"), 0, 1_000))
             .collect::<Vec<_>>();
+        assert!(bitcoin_known_evidence_is_hard_bound(&known));
 
         assert!(matches!(
             watcher
