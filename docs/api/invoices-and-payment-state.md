@@ -186,6 +186,13 @@ are. Treat invoice URLs as shareable secrets.
 }
 ```
 
+`lightning_pr`, `liquid_address`, `bitcoin_address`,
+`bitcoin_chain_address`, and `bitcoin_chain_bip21` are payment instructions.
+Each direct address is `null` when that direct rail was not accepted, and all
+instructions are `null` whenever the server projection says that no payment
+rail is payable, including terminal and cancelled invoices. The authenticated
+invoice list retains the stored direct addresses for merchant reconciliation.
+
 `payment_tolerance_sat` is a conservative display value: the minimum configured
 tolerance among all enabled rails, capped at one percent of the invoice amount
 with a one-sat floor. With the shipped BTC/Liquid/Lightning tolerances and all

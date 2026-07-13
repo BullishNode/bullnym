@@ -517,6 +517,46 @@ fn presentation_projection_controls_new_payment_instructions() {
 }
 
 #[test]
+fn public_direct_addresses_are_withheld_when_invoice_is_closed() {
+    let mut inv = invoice_fixture();
+    inv.bitcoin_address = Some("bc1qexample".to_string());
+    inv.liquid_address = Some("lq1qqexample".to_string());
+    inv.accept_btc = true;
+    inv.accept_liquid = true;
+
+    let payable = public_direct_payment_addresses(&inv);
+    assert_eq!(payable.bitcoin, Some("bc1qexample"));
+    assert_eq!(payable.liquid, Some("lq1qqexample"));
+
+    inv.status = "cancelled".to_string();
+    inv.presentation_status = Some("payment_received".to_string());
+    inv.settlement_status = "settled".to_string();
+    let closed = public_direct_payment_addresses(&inv);
+    assert_eq!(closed.bitcoin, None);
+    assert_eq!(closed.liquid, None);
+
+    assert_eq!(inv.bitcoin_address.as_deref(), Some("bc1qexample"));
+    assert_eq!(inv.liquid_address.as_deref(), Some("lq1qqexample"));
+}
+
+#[test]
+fn public_direct_addresses_require_explicit_direct_rail_acceptance() {
+    let mut inv = invoice_fixture();
+    inv.liquid_address = Some("lq1internalclaimdestination".to_string());
+    assert!(inv.accept_ln);
+    assert!(!inv.accept_liquid);
+    assert!(invoice_payment_rails_are_payable(&inv));
+
+    let public = public_direct_payment_addresses(&inv);
+    assert_eq!(public.bitcoin, None);
+    assert_eq!(public.liquid, None);
+    assert_eq!(
+        inv.liquid_address.as_deref(),
+        Some("lq1internalclaimdestination")
+    );
+}
+
+#[test]
 fn template_presentation_precedes_accounting_terminality() {
     let html = payment_template_fixture("paid", "payment_received", "pending", false)
         .render()
