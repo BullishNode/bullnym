@@ -605,6 +605,32 @@ async fn record_pre_050_chain_fixture(
     Ok(row)
 }
 
+/// Complete database-valid creation evidence for tests whose assertions target
+/// an invariant other than provider-response validation.
+fn valid_chain_swap_creation_terms_fixture() -> pay_service::db::NewChainSwapCreationTerms<'static>
+{
+    pay_service::db::NewChainSwapCreationTerms {
+        pinned_pair_hash: "1111111111111111111111111111111111111111111111111111111111111111",
+        canonical_pair_quote_json: r#"{"hash":"fixture","rate":1}"#,
+        creation_response_sha256:
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        btc_claim_script_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        btc_refund_script_sha256:
+            "4444444444444444444444444444444444444444444444444444444444444444",
+        liquid_claim_script_sha256:
+            "5555555555555555555555555555555555555555555555555555555555555555",
+        liquid_refund_script_sha256:
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        btc_timeout_height: 958_033,
+        liquid_timeout_height: 3_972_215,
+        btc_network: "bitcoin",
+        liquid_network: "liquid",
+        liquid_asset_id: "6f0279e9ed041c3d710a9f57d0c02928416413f827c37bf6833e2407092ff84d",
+        merchant_liquid_destination: "lq1qqintegrationfixturemerchantdestination",
+        merchant_emergency_btc_address: None,
+    }
+}
+
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -880,7 +906,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "050_swap_key_lineage"
+        "051_chain_swap_creation_terms"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -1204,7 +1230,8 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     let chain_preimage = "dd".repeat(32);
     let chain_claim_key = "ee".repeat(32);
     let chain_refund_key = "ff".repeat(32);
-    pay_service::db::record_chain_swap_with_lineage(
+    let chain_creation_terms = valid_chain_swap_creation_terms_fixture();
+    pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1231,6 +1258,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &chain_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap();
@@ -1249,7 +1277,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_claim = pay_service::db::record_chain_swap_with_lineage(
+    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1276,6 +1304,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &alternate_refund_public,
             preimage_hash_hex: &chain_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap_err();
@@ -1303,7 +1332,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_refund = pay_service::db::record_chain_swap_with_lineage(
+    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1330,6 +1359,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &alternate_claim_hash,
         },
+        &chain_creation_terms,
     )
     .await
     .unwrap_err();
