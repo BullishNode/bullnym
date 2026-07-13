@@ -34,8 +34,9 @@ use pay_service::chain_swap_creation_permit::{
 };
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
-    ElectrumConfig, FeaturesConfig, InvoiceAccountingConfig, LimitsConfig, LiquidWatcherConfig,
-    PricerConfig, ProofConfig, PwaConfig, RateLimitConfig, ReconcilerConfig, WorkersConfig,
+    ElectrumConfig, FeaturesConfig, FeePolicyConfig, InvoiceAccountingConfig, LimitsConfig,
+    LiquidWatcherConfig, PricerConfig, ProofConfig, PwaConfig, RateLimitConfig, ReconcilerConfig,
+    WorkersConfig,
 };
 use pay_service::donation_render::PwaShells;
 use pay_service::error::AppError;
@@ -212,6 +213,7 @@ fn test_config() -> Config {
         reconciler: ReconcilerConfig::default(),
         bitcoin_watcher: BitcoinWatcherConfig::default(),
         liquid_watcher: LiquidWatcherConfig::default(),
+        fee_policy: FeePolicyConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: String::new(),
@@ -4466,6 +4468,22 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     .expect("invoice-bound reverse claim must progress with one connection");
 
     assert_eq!(status, StatusCode::OK, "{body}");
+    let pending = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_WEBHOOK_CLOSED_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, "lockup_confirmed");
+    assert_eq!(pending.address, None);
+    assert_eq!(pending.claim_attempts, 0);
+
+    // Claim construction deliberately has no implicit fee fallback. The
+    // webhook records funding evidence but must wait without allocating or
+    // attempting construction until the worker has an accepted typed decision.
+    let claim_error = reverse_claim_pool_error(&pool, pending.id).await;
+    assert!(claim_error
+        .to_string()
+        .contains("invalid boltz response json"));
+
     let swap = pay_service::db::get_swap_by_boltz_id(&pool, "REVERSE_WEBHOOK_CLOSED_1")
         .await
         .unwrap()
@@ -4591,10 +4609,71 @@ async fn seed_claimable_chain_pool_swap(
     swap.id
 }
 
+fn accepted_live_liquid_fee_decision() -> pay_service::fee_policy::LiquidFeeDecision {
+    use pay_service::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
+
+    let observation = LiveLiquid::new(
+        SatPerVbyte::try_from(0.5).unwrap(),
+        1_000,
+        FeeProvenance::new("claim-integration-test").unwrap(),
+    );
+    LiquidFeePolicy::default()
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap()
+}
+
+async fn attach_post_051_creation_terms(
+    pool: &PgPool,
+    chain_swap_id: uuid::Uuid,
+    canonical_response_json: &str,
+) {
+    let terms = valid_chain_swap_creation_terms_fixture();
+    let response_digest = hex::encode(Sha256::digest(canonical_response_json.as_bytes()));
+    let liquid_asset_id = boltz_client::elements::AssetId::LIQUID_BTC.to_string();
+    let merchant_destination = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records SET \
+             pinned_pair_hash = $2, canonical_pair_quote_json = $3, \
+             creation_response_sha256 = $4, btc_claim_script_sha256 = $5, \
+             btc_refund_script_sha256 = $6, liquid_claim_script_sha256 = $7, \
+             liquid_refund_script_sha256 = $8, btc_timeout_height = $9, \
+             liquid_timeout_height = $10, btc_network = $11, liquid_network = $12, \
+             liquid_asset_id = $13, merchant_liquid_destination = $14 \
+         WHERE id = $1",
+    )
+    .bind(chain_swap_id)
+    .bind(terms.pinned_pair_hash)
+    .bind(terms.canonical_pair_quote_json)
+    .bind(response_digest)
+    .bind(terms.btc_claim_script_sha256)
+    .bind(terms.btc_refund_script_sha256)
+    .bind(terms.liquid_claim_script_sha256)
+    .bind(terms.liquid_refund_script_sha256)
+    .bind(terms.btc_timeout_height)
+    .bind(terms.liquid_timeout_height)
+    .bind(terms.btc_network)
+    .bind(terms.liquid_network)
+    .bind(liquid_asset_id)
+    .bind(merchant_destination)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 async fn reverse_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        claimer::exercise_reverse_claim_with_malformed_response(pool, swap_id),
+        claimer::exercise_reverse_claim_with_malformed_response(
+            pool,
+            swap_id,
+            &accepted_live_liquid_fee_decision(),
+        ),
     )
     .await
     .expect("reverse claim preparation must complete within its bounded timeout");
@@ -4605,9 +4684,48 @@ async fn reverse_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppErro
 }
 
 async fn chain_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError {
+    let fee_decision = accepted_live_liquid_fee_decision();
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        claimer::exercise_chain_claim_with_malformed_response(pool, swap_id),
+        async {
+            match claimer::exercise_chain_claim_with_malformed_response(
+                pool,
+                swap_id,
+                &fee_decision,
+            )
+            .await
+            {
+                Ok(claimer::ClaimOutcome::SkippedLockHeld) => {}
+                result => return result,
+            }
+
+            // Dropping the preceding no-fee SQLx transaction schedules its
+            // rollback, so the webhook can return just before its transaction
+            // advisory lock is released. Block on that exact lock once; when
+            // this acquisition succeeds the rollback handoff is complete.
+            // Commit releases our handoff lock before one final seam attempt.
+            let lock_key = format!("chain-claim:{swap_id}");
+            let mut handoff = pool
+                .begin()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(&lock_key)
+                .execute(&mut *handoff)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            handoff
+                .commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+
+            claimer::exercise_chain_claim_with_malformed_response(
+                pool,
+                swap_id,
+                &fee_decision,
+            )
+            .await
+        },
     )
     .await
     .expect("chain claim preparation must complete within its bounded timeout");
@@ -4615,6 +4733,195 @@ async fn chain_claim_pool_error(pool: &PgPool, swap_id: uuid::Uuid) -> AppError 
         Err(error) => error,
         Ok(outcome) => panic!("expected deterministic chain construction error, got {outcome:?}"),
     }
+}
+
+#[tokio::test]
+async fn provider_ready_claims_without_a_liquid_quote_stay_pending_without_construction() {
+    use pay_service::claimer::LIQUID_FEE_DECISION_PENDING_REASON;
+    use pay_service::db::{ChainSwapProviderStatusInput, ChainSwapStatus, SwapStatus};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    create_test_user(&pool, "nofeereverse").await;
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("nofeereverse"),
+            boltz_swap_id: "NO_FEE_REVERSE",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-no-fee-reverse",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{",
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let reverse = pay_service::db::get_swap_by_boltz_id(&pool, "NO_FEE_REVERSE")
+        .await
+        .unwrap()
+        .unwrap();
+    pay_service::db::update_swap_status(&pool, reverse.id, SwapStatus::LockupConfirmed, None)
+        .await
+        .unwrap();
+
+    let legacy_npub = create_test_user(&pool, "nofeelegacy").await;
+    let legacy_invoice =
+        insert_test_invoice(&pool, "nofeelegacy", &legacy_npub, "lq1nofeelegacy", 3_600).await;
+    let legacy_response = r#"{"id":"NO_FEE_CHAIN_LEGACY"}"#;
+    let legacy = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: legacy_invoice.id,
+            nym: Some("nofeelegacy"),
+            boltz_swap_id: "NO_FEE_CHAIN_LEGACY",
+            lockup_address: "bc1qnofeelegacy",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: legacy_response,
+        },
+    )
+    .await
+    .unwrap();
+    let post_npub = create_test_user(&pool, "nofeepost").await;
+    let post_invoice =
+        insert_test_invoice(&pool, "nofeepost", &post_npub, "lq1nofeepost", 3_600).await;
+    let post_response = r#"{"id":"NO_FEE_CHAIN_POST_051"}"#;
+    let post = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: post_invoice.id,
+            nym: Some("nofeepost"),
+            boltz_swap_id: "NO_FEE_CHAIN_POST_051",
+            lockup_address: "bc1qnofeepost",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_010,
+            server_lock_amount_sat: 1_000,
+            preimage_hex: "44".repeat(32).as_str(),
+            claim_key_hex: "55".repeat(32).as_str(),
+            refund_key_hex: "66".repeat(32).as_str(),
+            boltz_response_json: post_response,
+        },
+    )
+    .await
+    .unwrap();
+    attach_post_051_creation_terms(&pool, post.id, post_response).await;
+
+    for swap_id in [legacy.id, post.id] {
+        let delivered = pay_service::db::apply_chain_swap_provider_status(
+            &pool,
+            swap_id,
+            ChainSwapProviderStatusInput::ServerLockConfirmed,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(delivered.changed);
+        assert_eq!(
+            delivered.current_status,
+            ChainSwapStatus::ServerLockConfirmed
+        );
+    }
+
+    let reverse_outcome = claimer::exercise_reverse_claim_without_fee(&pool, reverse.id)
+        .await
+        .unwrap();
+    let legacy_outcome = claimer::exercise_chain_claim_without_fee(&pool, legacy.id)
+        .await
+        .unwrap();
+    let post_outcome = claimer::exercise_chain_claim_without_fee(&pool, post.id)
+        .await
+        .unwrap();
+    for outcome in [reverse_outcome, legacy_outcome, post_outcome] {
+        assert!(matches!(
+            outcome,
+            claimer::ClaimOutcome::PendingFeeUnavailable { reason }
+                if reason == LIQUID_FEE_DECISION_PENDING_REASON
+        ));
+    }
+
+    let reverse = pay_service::db::get_swap_by_boltz_id(&pool, "NO_FEE_REVERSE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reverse.status, "lockup_confirmed");
+    assert_eq!(reverse.claim_attempts, 0);
+    assert!(reverse.claim_tx_hex.is_none());
+    assert!(reverse.address.is_none());
+    assert!(reverse.address_index.is_none());
+    let reverse_cursor: i32 =
+        sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = 'nofeereverse'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reverse_cursor, 0);
+
+    for (swap_id, post_051) in [(legacy.id, false), (post.id, true)] {
+        let row = pay_service::db::get_chain_swap_by_id(&pool, swap_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "server_lock_confirmed");
+        assert_eq!(row.claim_attempts, 0);
+        assert!(row.claim_tx_hex.is_none());
+        assert_eq!(row.creation_terms.is_some(), post_051);
+
+        let duplicate = pay_service::db::apply_chain_swap_provider_status(
+            &pool,
+            swap_id,
+            ChainSwapProviderStatusInput::ServerLockConfirmed,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!duplicate.changed);
+        assert_eq!(
+            duplicate.current_status,
+            ChainSwapStatus::ServerLockConfirmed
+        );
+    }
+
+    // Supplying an accepted live decision on a later retry re-enters the
+    // ordinary construction path. The deliberately malformed fixtures fail
+    // locally there, proving the no-quote outcome did not terminalize either
+    // obligation or consume an attempt.
+    let reverse_error = reverse_claim_pool_error(&pool, reverse.id).await;
+    assert_local_claim_error(&reverse_error, "invalid boltz response json");
+    let post_error = chain_claim_pool_error(&pool, post.id).await;
+    assert_local_claim_error(&post_error, "invalid chain boltz response json");
+
+    let reverse = pay_service::db::get_swap_by_boltz_id(&pool, "NO_FEE_REVERSE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reverse.status, "lockup_confirmed");
+    assert_eq!(reverse.claim_attempts, 1);
+    assert!(reverse.claim_tx_hex.is_none());
+    let post = pay_service::db::get_chain_swap_by_id(&pool, post.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(post.status, "server_lock_confirmed");
+    assert_eq!(post.claim_attempts, 1);
+    assert!(post.claim_tx_hex.is_none());
+
+    cleanup_db(&pool).await;
 }
 
 fn assert_local_claim_error(error: &AppError, expected: &str) {
@@ -4731,7 +5038,11 @@ async fn advisory_locked_chain_claim_skips_without_preparation() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        claimer::exercise_chain_claim_with_malformed_response(&constrained, swap_id),
+        claimer::exercise_chain_claim_with_malformed_response(
+            &constrained,
+            swap_id,
+            &accepted_live_liquid_fee_decision(),
+        ),
     )
     .await
     .expect("advisory-lock loser must return promptly")
@@ -4788,13 +5099,20 @@ async fn malformed_claim_test_seams_reject_persisted_bytes_without_mutation() {
         .unwrap();
 
     let constrained = constrained_test_pool(1, None);
-    let reverse_error =
-        claimer::exercise_reverse_claim_with_malformed_response(&constrained, reverse_id)
-            .await
-            .expect_err("persisted reverse bytes must close the malformed-only seam");
-    let chain_error = claimer::exercise_chain_claim_with_malformed_response(&constrained, chain_id)
-        .await
-        .expect_err("persisted chain bytes must close the malformed-only seam");
+    let reverse_error = claimer::exercise_reverse_claim_with_malformed_response(
+        &constrained,
+        reverse_id,
+        &accepted_live_liquid_fee_decision(),
+    )
+    .await
+    .expect_err("persisted reverse bytes must close the malformed-only seam");
+    let chain_error = claimer::exercise_chain_claim_with_malformed_response(
+        &constrained,
+        chain_id,
+        &accepted_live_liquid_fee_decision(),
+    )
+    .await
+    .expect_err("persisted chain bytes must close the malformed-only seam");
     assert!(reverse_error
         .to_string()
         .contains("without persisted claim bytes"));
@@ -4907,7 +5225,11 @@ async fn concurrent_same_reverse_swap_has_one_locked_preparation() {
         attempts.spawn(async move {
             tokio::time::timeout(
                 Duration::from_secs(3),
-                claimer::exercise_reverse_claim_with_malformed_response(&pool, swap_id),
+                claimer::exercise_reverse_claim_with_malformed_response(
+                    &pool,
+                    swap_id,
+                    &accepted_live_liquid_fee_decision(),
+                ),
             )
             .await
             .expect("same-swap claim attempt must remain bounded")
@@ -5166,13 +5488,18 @@ async fn terminal_and_unsupported_claims_do_not_prepare_or_allocate() {
     .await
     .unwrap();
     let constrained = constrained_test_pool(1, None);
-    let reverse = claimer::exercise_reverse_claim_with_malformed_response(&constrained, reverse_id)
-        .await
-        .unwrap();
+    let reverse = claimer::exercise_reverse_claim_with_malformed_response(
+        &constrained,
+        reverse_id,
+        &accepted_live_liquid_fee_decision(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(reverse, claimer::ClaimOutcome::AlreadyTerminal));
     let reverse_unsupported = claimer::exercise_reverse_claim_with_malformed_response(
         &constrained,
         unsupported_reverse.id,
+        &accepted_live_liquid_fee_decision(),
     )
     .await
     .unwrap();
@@ -5180,10 +5507,13 @@ async fn terminal_and_unsupported_claims_do_not_prepare_or_allocate() {
         reverse_unsupported,
         claimer::ClaimOutcome::AlreadyTerminal
     ));
-    let chain_outcome =
-        claimer::exercise_chain_claim_with_malformed_response(&constrained, chain.id)
-            .await
-            .unwrap();
+    let chain_outcome = claimer::exercise_chain_claim_with_malformed_response(
+        &constrained,
+        chain.id,
+        &accepted_live_liquid_fee_decision(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         chain_outcome,
         claimer::ClaimOutcome::AlreadyTerminal
@@ -5891,6 +6221,23 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
     )
     .await;
     assert_eq!(server_status, StatusCode::OK);
+    let pending_without_quote = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending_without_quote.status, "server_lock_confirmed");
+    assert_eq!(pending_without_quote.claim_attempts, 0);
+    assert_eq!(pending_without_quote.last_claim_error, None);
+
+    // Review-25 deliberately removed the implicit Liquid fee fallback. The
+    // webhook therefore preserves the forward transition while construction
+    // waits for accepted same-rail evidence. Inject that typed test evidence
+    // through the guarded production claim seam so each delivery can exercise
+    // action redrive without weakening the fail-closed runtime path.
+    let first_claim_error = chain_claim_pool_error(&pool, row.id).await;
+    assert!(first_claim_error
+        .to_string()
+        .contains("invalid chain boltz response json"));
     let claimed_branch = pay_service::db::get_chain_swap_by_id(&pool, row.id)
         .await
         .unwrap()
@@ -5912,6 +6259,10 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
     )
     .await;
     assert_eq!(repeat_status, StatusCode::OK);
+    let repeat_claim_error = chain_claim_pool_error(&pool, row.id).await;
+    assert!(repeat_claim_error
+        .to_string()
+        .contains("invalid chain boltz response json"));
     let repeated = pay_service::db::get_chain_swap_by_id(&pool, row.id)
         .await
         .unwrap()
@@ -5932,6 +6283,10 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
     )
     .await;
     assert_eq!(reordered_failure_status, StatusCode::OK);
+    let reordered_claim_error = chain_claim_pool_error(&pool, row.id).await;
+    assert!(reordered_claim_error
+        .to_string()
+        .contains("invalid chain boltz response json"));
     let after_reordered_failure = pay_service::db::get_chain_swap_by_id(&pool, row.id)
         .await
         .unwrap()
@@ -14942,9 +15297,27 @@ const JOURNAL_LOCKUP_ADDRESS: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
 const JOURNAL_DESTINATION_ADDRESS: &str =
     "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 
+fn bitcoin_fee_decision(rate: f64) -> pay_service::fee_policy::BitcoinFeeDecision {
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    let observation = LiveBitcoin::new(
+        SatPerVbyte::try_from(rate).unwrap(),
+        1_000,
+        FeeProvenance::new("integration-test").unwrap(),
+    );
+    BitcoinFeePolicy::default()
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap()
+}
+
+fn midrange_bitcoin_fee_decision() -> pay_service::fee_policy::BitcoinFeeDecision {
+    bitcoin_fee_decision(2.0)
+}
+
 struct FakeRecoveryBuilder {
     transaction: BtcLikeTransaction,
     calls: AtomicUsize,
+    fee_rates: Mutex<Vec<f64>>,
 }
 
 #[async_trait]
@@ -14953,9 +15326,58 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FakeRecoveryBuilder
         &self,
         _swap: &pay_service::db::ChainSwapRecord,
         _destination_address: &str,
+        fee_decision: pay_service::builder_fee::BitcoinBuilderFeeDecision,
     ) -> Result<BtcLikeTransaction, AppError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.fee_rates
+            .lock()
+            .await
+            .push(fee_decision.rate().as_f64());
         Ok(self.transaction.clone())
+    }
+}
+
+struct FeeSensitiveRecoveryBuilder {
+    template: bitcoin::Transaction,
+    source_amount_sat: u64,
+    calls: AtomicUsize,
+    fee_rates: Mutex<Vec<f64>>,
+    raw_transactions: Mutex<Vec<String>>,
+}
+
+impl FeeSensitiveRecoveryBuilder {
+    fn construct_for_rate(&self, rate: f64) -> Result<bitcoin::Transaction, AppError> {
+        let mut transaction = self.template.clone();
+        let fee_sat = (rate * transaction.vsize() as f64).ceil() as u64;
+        let destination_sat = self
+            .source_amount_sat
+            .checked_sub(fee_sat)
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| {
+                AppError::ClaimError("scripted fee consumes the recovery output".into())
+            })?;
+        transaction.output[0].value = bitcoin::Amount::from_sat(destination_sat);
+        Ok(transaction)
+    }
+}
+
+#[async_trait]
+impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FeeSensitiveRecoveryBuilder {
+    async fn construct(
+        &self,
+        _swap: &pay_service::db::ChainSwapRecord,
+        _destination_address: &str,
+        fee_decision: pay_service::builder_fee::BitcoinBuilderFeeDecision,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let rate = fee_decision.rate().as_f64();
+        self.fee_rates.lock().await.push(rate);
+        let transaction = self.construct_for_rate(rate)?;
+        self.raw_transactions
+            .lock()
+            .await
+            .push(hex::encode(bitcoin::consensus::serialize(&transaction)));
+        Ok(BtcLikeTransaction::Bitcoin(transaction))
     }
 }
 
@@ -15093,6 +15515,7 @@ impl pay_service::chain_recovery::RecoveryFaultInjector for OneShotRecoveryFault
 struct RecoveryJournalHarness {
     swap: pay_service::db::ChainSwapRecord,
     builder: Arc<FakeRecoveryBuilder>,
+    fee_decision: pay_service::fee_policy::BitcoinFeeDecision,
     chain: Arc<FakeBitcoinChain>,
     broadcaster: Arc<FakeRecoveryBroadcaster>,
     source_txid: String,
@@ -15159,6 +15582,7 @@ async fn seed_recovery_journal_harness(
     let builder = Arc::new(FakeRecoveryBuilder {
         transaction: BtcLikeTransaction::Bitcoin(recovery_tx),
         calls: AtomicUsize::new(0),
+        fee_rates: Mutex::new(Vec::new()),
     });
     let broadcaster = Arc::new(FakeRecoveryBroadcaster::new(
         chain.clone(),
@@ -15191,6 +15615,7 @@ async fn seed_recovery_journal_harness(
     RecoveryJournalHarness {
         swap,
         builder,
+        fee_decision: midrange_bitcoin_fee_decision(),
         chain,
         broadcaster,
         source_txid,
@@ -15221,6 +15646,7 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
         &state.db,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15273,6 +15699,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             &pool,
             harness.swap.id,
             harness.builder.as_ref(),
+            &harness.fee_decision,
             harness.chain.as_ref(),
             harness.broadcaster.as_ref(),
             &fault,
@@ -15314,6 +15741,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
                 &pool,
                 harness.swap.id,
                 harness.builder.as_ref(),
+                &harness.fee_decision,
                 harness.chain.as_ref(),
                 harness.broadcaster.as_ref(),
                 &NoRecoveryFaults,
@@ -15374,6 +15802,196 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
 }
 
 #[tokio::test]
+async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes() {
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_optional_fee_services,
+        execute_journaled_recovery_with_services, NoRecoveryFaults, RecoveryFaultPoint,
+    };
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "feeretry", [FakeBroadcastResult::Accept]).await;
+    let BtcLikeTransaction::Bitcoin(template) = harness.builder.transaction.clone() else {
+        unreachable!()
+    };
+    let builder = FeeSensitiveRecoveryBuilder {
+        template,
+        source_amount_sat: 100_000,
+        calls: AtomicUsize::new(0),
+        fee_rates: Mutex::new(Vec::new()),
+        raw_transactions: Mutex::new(Vec::new()),
+    };
+
+    // The first construction uses the policy minimum but stops before a
+    // journal exists. A later eligible attempt is therefore allowed to use a
+    // changed decision and construct different bytes.
+    let minimum_decision = bitcoin_fee_decision(1.0);
+    let before_journal =
+        OneShotRecoveryFault::at(RecoveryFaultPoint::AfterConstructionBeforeJournal);
+    assert!(execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        &builder,
+        &minimum_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &before_journal,
+    )
+    .await
+    .is_err());
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Retry only transient advisory-lock handoff while proving the changed
+    // maximum decision reaches construction and commits before broadcast.
+    let after_commit =
+        OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
+    let maximum_decision = bitcoin_fee_decision(500.0);
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match execute_journaled_recovery_with_services(
+            &pool,
+            harness.swap.id,
+            &builder,
+            &maximum_decision,
+            harness.chain.as_ref(),
+            harness.broadcaster.as_ref(),
+            &after_commit,
+        )
+        .await
+        {
+            Err(AppError::ClaimError(message))
+                if message == "chain swap is busy (claim/recovery in progress); retry shortly" =>
+            {
+                assert!(tokio::time::Instant::now() < retry_deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(AppError::ClaimError(message)) => {
+                assert!(message.contains("AfterJournalCommitBeforeBroadcast"));
+                break;
+            }
+            result => panic!("changed construction did not stop after journal commit: {result:?}"),
+        }
+    }
+
+    let committed = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let raw_transactions = builder.raw_transactions.lock().await.clone();
+    assert_eq!(raw_transactions.len(), 2);
+    assert_ne!(raw_transactions[0], raw_transactions[1]);
+    assert_eq!(committed.raw_tx_hex, raw_transactions[1]);
+    let committed_transaction: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&committed.raw_tx_hex).unwrap()).unwrap();
+    let expected_fee_sat = 100_000 - committed_transaction.output[0].value.to_sat();
+    assert_eq!(committed.fee_amount_sat, expected_fee_sat as i64);
+    assert_eq!(
+        committed.fee_rate_sat_vb,
+        expected_fee_sat as f64 / committed_transaction.vsize() as f64
+    );
+    assert!((committed.fee_rate_sat_vb - 500.0).abs() < f64::EPSILON);
+    drop(raw_transactions);
+
+    // No new quote is required after the write-ahead commit: the executor
+    // reuses the committed maximum-rate bytes and their actual fee evidence
+    // without invoking the builder again.
+    execute_journaled_recovery_with_optional_fee_services(
+        &pool,
+        harness.swap.id,
+        &builder,
+        None,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .unwrap();
+    assert_eq!(builder.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*builder.fee_rates.lock().await, vec![1.0, 500.0]);
+    let finalized = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finalized.raw_tx_hex, committed.raw_tx_hex);
+    assert_eq!(finalized.fee_amount_sat, committed.fee_amount_sat);
+    assert_eq!(finalized.fee_rate_sat_vb, committed.fee_rate_sat_vb);
+    assert_eq!(
+        harness.broadcaster.calls.lock().await.as_slice(),
+        &[committed.raw_tx_hex]
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_bytes() {
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_optional_fee_services,
+        execute_journaled_recovery_with_services, NoRecoveryFaults,
+        BITCOIN_FEE_DECISION_PENDING_REASON,
+    };
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "nofee", [FakeBroadcastResult::Accept]).await;
+
+    let result = execute_journaled_recovery_with_optional_fee_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        None,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(AppError::RecoveryNotAvailable(reason))
+            if reason == BITCOIN_FEE_DECISION_PENDING_REASON
+    ));
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 0);
+    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let swap = pay_service::db::get_chain_swap_by_id(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "refund_due");
+    assert!(swap.refund_txid.is_none());
+
+    let txid = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &harness.fee_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .expect("a later accepted live decision must resume recovery construction");
+    assert_eq!(txid, harness.expected_txid);
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast() {
     use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
@@ -15390,6 +16008,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15404,6 +16023,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15433,6 +16053,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15449,6 +16070,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15480,6 +16102,7 @@ async fn recovery_journal_preserves_systemic_broadcast_failure_scope() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15508,6 +16131,7 @@ async fn recovery_journal_rejects_a_phantom_success_txid() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15547,12 +16171,14 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
     let bad_builder = FakeRecoveryBuilder {
         transaction: BtcLikeTransaction::Bitcoin(transaction),
         calls: AtomicUsize::new(0),
+        fee_rates: Mutex::new(Vec::new()),
     };
 
     let result = execute_journaled_recovery_with_services(
         &pool,
         harness.swap.id,
         &bad_builder,
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15589,6 +16215,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &fault,
@@ -15607,6 +16234,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15636,6 +16264,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15644,6 +16273,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15659,6 +16289,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -15704,6 +16335,7 @@ async fn legacy_refunding_without_journal_is_never_reconstructed() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
+        &harness.fee_decision,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,

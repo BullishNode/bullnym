@@ -23,14 +23,25 @@ use boltz_client::{Keypair, PublicKey, Secp256k1};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::builder_fee::BitcoinBuilderFeeDecision;
 use crate::db::{
     self, ChainSwapRecord, ChainSwapStatus, ChainSwapTxAttempt, NewBitcoinRecoveryAttempt,
     RecoverySourcePrevout,
 };
 use crate::error::AppError;
+use crate::fee_policy::BitcoinFeeDecision;
 use crate::AppState;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Stable, non-secret reason returned when a new recovery cannot be built
+/// without accepted live or recent same-rail fee evidence.
+#[doc(hidden)]
+pub const BITCOIN_FEE_DECISION_PENDING_REASON: &str =
+    "Bitcoin fee decision unavailable; retry after accepted live or recent same-rail evidence";
+
+fn bitcoin_recovery_fee(decision: BitcoinBuilderFeeDecision) -> Fee {
+    Fee::Relative(decision.rate().as_f64())
+}
 
 /// Deterministic failure points used by the first incremental #88 harness.
 /// Production uses [`NoRecoveryFaults`]; integration tests stop a worker at
@@ -60,10 +71,13 @@ impl RecoveryFaultInjector for NoRecoveryFaults {
 
 #[async_trait]
 pub trait BitcoinRecoveryBuilder: Send + Sync {
+    /// Construct a new attempt with the caller's already-validated decision.
+    /// The write-ahead executor never calls this method once an attempt exists.
     async fn construct(
         &self,
         swap: &ChainSwapRecord,
         destination_address: &str,
+        fee_decision: BitcoinBuilderFeeDecision,
     ) -> Result<BtcLikeTransaction, AppError>;
 }
 
@@ -98,8 +112,9 @@ impl BitcoinRecoveryBuilder for LiveRecoveryBuilder<'_> {
         &self,
         swap: &ChainSwapRecord,
         destination_address: &str,
+        fee_decision: BitcoinBuilderFeeDecision,
     ) -> Result<BtcLikeTransaction, AppError> {
-        construct_live_refund(self.state, swap, destination_address).await
+        construct_live_refund(self.state, swap, destination_address, fee_decision).await
     }
 }
 
@@ -256,10 +271,11 @@ pub(crate) async fn execute_journaled_recovery(
     let endpoints = evidence.endpoints().to_vec();
     let builder = LiveRecoveryBuilder { state };
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
-    execute_journaled_recovery_with_services(
+    execute_journaled_recovery_with_builder_fee(
         &state.db,
         chain_swap_id,
         &builder,
+        None,
         evidence,
         &broadcaster,
         &NoRecoveryFaults,
@@ -269,17 +285,65 @@ pub(crate) async fn execute_journaled_recovery(
 
 /// Testable write-ahead executor.  This is public only to let the external DB
 /// integration target supply deterministic boundary fakes; normal application
-/// code calls [`execute_journaled_recovery`].
+/// code calls [`execute_journaled_recovery`]. `fee_decision` applies only when
+/// no journaled attempt exists; retries always reuse the committed bytes and
+/// their immutable actual-fee evidence.
 #[doc(hidden)]
 pub async fn execute_journaled_recovery_with_services(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
+    fee_decision: &BitcoinFeeDecision,
     evidence: &dyn BitcoinRecoveryEvidence,
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<String, AppError> {
-    prepare_or_reload_attempt(pool, chain_swap_id, builder, evidence, faults).await?;
+    execute_journaled_recovery_with_optional_fee_services(
+        pool,
+        chain_swap_id,
+        builder,
+        Some(fee_decision),
+        evidence,
+        broadcaster,
+        faults,
+    )
+    .await
+}
+
+/// Optional-fee integration seam used to prove that committed bytes can be
+/// resumed without a fresh quote while new construction remains pending.
+#[doc(hidden)]
+pub async fn execute_journaled_recovery_with_optional_fee_services(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    builder: &dyn BitcoinRecoveryBuilder,
+    fee_decision: Option<&BitcoinFeeDecision>,
+    evidence: &dyn BitcoinRecoveryEvidence,
+    broadcaster: &dyn BitcoinRecoveryBroadcaster,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<String, AppError> {
+    execute_journaled_recovery_with_builder_fee(
+        pool,
+        chain_swap_id,
+        builder,
+        fee_decision.map(BitcoinBuilderFeeDecision::from),
+        evidence,
+        broadcaster,
+        faults,
+    )
+    .await
+}
+
+async fn execute_journaled_recovery_with_builder_fee(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    builder: &dyn BitcoinRecoveryBuilder,
+    fee_decision: Option<BitcoinBuilderFeeDecision>,
+    evidence: &dyn BitcoinRecoveryEvidence,
+    broadcaster: &dyn BitcoinRecoveryBroadcaster,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<String, AppError> {
+    prepare_or_reload_attempt(pool, chain_swap_id, builder, fee_decision, evidence, faults).await?;
 
     faults.check(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast)?;
 
@@ -377,6 +441,7 @@ async fn prepare_or_reload_attempt(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
+    fee_decision: Option<BitcoinBuilderFeeDecision>,
     evidence: &dyn BitcoinRecoveryEvidence,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<ChainSwapTxAttempt, AppError> {
@@ -472,9 +537,12 @@ async fn prepare_or_reload_attempt(
     let destination = swap.refund_address.clone().ok_or_else(|| {
         AppError::ClaimError("chain swap recovery has no committed destination".into())
     })?;
+    let fee_decision = fee_decision.ok_or_else(|| {
+        AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
+    })?;
 
     faults.check(RecoveryFaultPoint::BeforeConstruction)?;
-    let transaction = builder.construct(&swap, &destination).await?;
+    let transaction = builder.construct(&swap, &destination, fee_decision).await?;
     let prepared =
         validate_constructed_attempt(&swap, &destination, &transaction, evidence).await?;
     faults.check(RecoveryFaultPoint::AfterConstructionBeforeJournal)?;
@@ -820,6 +888,7 @@ async fn construct_live_refund(
     state: &AppState,
     swap: &ChainSwapRecord,
     refund_address: &str,
+    fee_decision: BitcoinBuilderFeeDecision,
 ) -> Result<BtcLikeTransaction, AppError> {
     swap.verify_creation_response_integrity()
         .map_err(AppError::ClaimError)?;
@@ -860,10 +929,7 @@ async fn construct_live_refund(
             let params = SwapTransactionParams {
                 keys: refund_keypair,
                 output_address: refund_address.to_string(),
-                // Issue #64 replaces this legacy value with the persisted live
-                // priority quote.  #62 records the actual resulting fee and
-                // never rebuilds already-journaled bytes when policy changes.
-                fee: Fee::Relative(2.0),
+                fee: bitcoin_recovery_fee(fee_decision),
                 swap_id: swap.boltz_swap_id.clone(),
                 chain_client: &chain_client,
                 boltz_client: &boltz_api,
@@ -910,7 +976,40 @@ async fn construct_live_refund(
 
 #[cfg(test)]
 mod tests {
-    use super::BitcoinRecoveryBackend;
+    use boltz_client::util::fees::Fee;
+
+    use super::{bitcoin_recovery_fee, BitcoinRecoveryBackend};
+    use crate::builder_fee::BitcoinBuilderFeeDecision;
+    use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    fn bitcoin_builder_fee(rate: f64) -> BitcoinBuilderFeeDecision {
+        let observation = LiveBitcoin::new(
+            SatPerVbyte::try_from(rate).unwrap(),
+            1_000,
+            FeeProvenance::new("recovery-test").unwrap(),
+        );
+        let decision = BitcoinFeePolicy::default()
+            .decide_typed(Some(&observation), None, 1_000)
+            .unwrap();
+        BitcoinBuilderFeeDecision::from(&decision)
+    }
+
+    fn relative_fee_rate(fee: Fee) -> f64 {
+        match fee {
+            Fee::Relative(rate) => rate,
+            Fee::Absolute(_) => panic!("recovery builder must use a sat/vByte decision"),
+        }
+    }
+
+    #[test]
+    fn bitcoin_recovery_preserves_upstream_min_midrange_and_max_rates() {
+        // Representative upstream policy boundary values. This construction
+        // seam must not clamp or reinterpret the policy's selected rate.
+        for rate in [1.0, 2.0, 500.0] {
+            let decision = bitcoin_builder_fee(rate);
+            assert_eq!(relative_fee_rate(bitcoin_recovery_fee(decision)), rate);
+        }
+    }
 
     #[test]
     fn recovery_backend_requires_a_valid_http_endpoint() {

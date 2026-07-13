@@ -5,6 +5,20 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
+use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
+
+fn liquid_builder_fee(rate: f64) -> LiquidBuilderFeeDecision {
+    let observation = LiveLiquid::new(
+        SatPerVbyte::try_from(rate).unwrap(),
+        1_000,
+        FeeProvenance::new("claimer-test").unwrap(),
+    );
+    let decision = LiquidFeePolicy::default()
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap();
+    LiquidBuilderFeeDecision::from(&decision)
+}
+
 fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
     db::ChainSwapCreationTerms {
         pinned_pair_hash: "11".repeat(32),
@@ -22,6 +36,46 @@ fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
         merchant_liquid_destination: "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg".into(),
         merchant_emergency_btc_address: None,
         recovery_address_commitment_id: None,
+    }
+}
+
+fn relative_fee_rate(fee: Fee) -> f64 {
+    match fee {
+        Fee::Relative(rate) => rate,
+        Fee::Absolute(_) => panic!("claim builder must use a sat/vByte decision"),
+    }
+}
+
+#[test]
+fn reverse_and_chain_claim_paths_preserve_upstream_min_midrange_and_max_rates() {
+    // Representative policy boundary values. The policy package owns their
+    // actual configuration; this builder test proves all four construction
+    // paths receive the exact selected sat/vByte rate without reclamping it.
+    for rate in [0.1, 2.0, 10.0] {
+        let decision = liquid_builder_fee(rate);
+        for cooperative in [true, false] {
+            assert_eq!(
+                relative_fee_rate(liquid_claim_fee(&decision, cooperative)),
+                rate
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_liquid_decision_changes_each_next_claim_construction_path() {
+    let previous = liquid_builder_fee(0.1);
+    let changed = liquid_builder_fee(5.0);
+
+    for cooperative in [true, false] {
+        assert_eq!(
+            relative_fee_rate(liquid_claim_fee(&previous, cooperative)),
+            0.1
+        );
+        assert_eq!(
+            relative_fee_rate(liquid_claim_fee(&changed, cooperative)),
+            5.0
+        );
     }
 }
 

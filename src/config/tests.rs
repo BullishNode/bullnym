@@ -186,6 +186,7 @@ fn production_base_config() -> Config {
         reconciler: ReconcilerConfig::default(),
         bitcoin_watcher: BitcoinWatcherConfig::default(),
         liquid_watcher: LiquidWatcherConfig::default(),
+        fee_policy: FeePolicyConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: "postgres://payservice@example/payservice".to_string(),
@@ -193,6 +194,345 @@ fn production_base_config() -> Config {
         boltz_webhook_url_secret: "webhook-secret".to_string(),
         boltz_webhook_url_secret_previous: String::new(),
     }
+}
+
+fn fee_source(id: &str, endpoint: &str) -> FeeSourceConfig {
+    FeeSourceConfig {
+        id: id.to_string(),
+        endpoint: endpoint.to_string(),
+    }
+}
+
+#[test]
+fn fee_policy_defaults_are_complete_bounded_and_quote_free() {
+    let parsed: FeePolicyConfig = toml::from_str("").unwrap();
+    let defaults = FeePolicyConfig::default();
+
+    assert_eq!(parsed, defaults);
+    assert!(defaults.validation_facts().all_valid());
+    assert_eq!(defaults.bitcoin.sources.len(), 2);
+    assert_eq!(defaults.liquid.sources.len(), 1);
+    assert!(defaults.bitcoin.sources.len() <= MAX_FEE_SOURCES_PER_RAIL);
+    assert!(defaults.liquid.sources.len() <= MAX_FEE_SOURCES_PER_RAIL);
+    assert_eq!(defaults.bitcoin.refresh_interval_secs, 30);
+    assert_eq!(defaults.bitcoin.live_max_age_secs, 120);
+    assert_eq!(defaults.bitcoin.last_known_good_max_age_secs, 900);
+    assert_eq!(defaults.bitcoin.floor_sat_per_vbyte, 1.0);
+    assert_eq!(defaults.bitcoin.cap_sat_per_vbyte, 500.0);
+    assert_eq!(defaults.liquid.refresh_interval_secs, 30);
+    assert_eq!(defaults.liquid.live_max_age_secs, 120);
+    assert_eq!(defaults.liquid.last_known_good_max_age_secs, 900);
+    assert_eq!(defaults.liquid.floor_sat_per_vbyte, 0.1);
+    assert_eq!(defaults.liquid.cap_sat_per_vbyte, 10.0);
+
+    for forbidden_quote_key in [
+        "default_sat_per_vbyte",
+        "fee_rate_sat_per_vbyte",
+        "fallback_sat_per_vbyte",
+        "configured_quote_sat_per_vbyte",
+    ] {
+        let input = format!("[bitcoin]\n{forbidden_quote_key} = 2.0\n");
+        assert!(
+            toml::from_str::<FeePolicyConfig>(&input).is_err(),
+            "accepted forbidden quote authority {forbidden_quote_key}"
+        );
+    }
+}
+
+#[test]
+fn fee_policy_toml_preserves_explicit_order_windows_and_bounds() {
+    let config: FeePolicyConfig = toml::from_str(
+        r#"
+        [bitcoin]
+        refresh_interval_secs = 15
+        live_max_age_secs = 45
+        last_known_good_max_age_secs = 600
+        floor_sat_per_vbyte = 1.25
+        cap_sat_per_vbyte = 250.5
+
+        [[bitcoin.sources]]
+        id = "bitcoin-primary"
+        endpoint = "https://btc-primary.example/api"
+
+        [[bitcoin.sources]]
+        id = "bitcoin-secondary"
+        endpoint = "https://btc-secondary.example/mempool"
+
+        [liquid]
+        refresh_interval_secs = 20
+        live_max_age_secs = 70
+        last_known_good_max_age_secs = 700
+        floor_sat_per_vbyte = 0.15
+        cap_sat_per_vbyte = 5.75
+
+        [[liquid.sources]]
+        id = "liquid-primary"
+        endpoint = "https://liquid-primary.example/api"
+
+        [[liquid.sources]]
+        id = "liquid-secondary"
+        endpoint = "https://liquid-secondary.example/esplora"
+        "#,
+    )
+    .unwrap();
+
+    assert!(config.validation_facts().all_valid());
+    assert_eq!(config.bitcoin.refresh_interval_secs, 15);
+    assert_eq!(config.bitcoin.live_max_age_secs, 45);
+    assert_eq!(config.bitcoin.last_known_good_max_age_secs, 600);
+    assert_eq!(config.bitcoin.floor_sat_per_vbyte, 1.25);
+    assert_eq!(config.bitcoin.cap_sat_per_vbyte, 250.5);
+    assert_eq!(config.bitcoin.sources[0].id, "bitcoin-primary");
+    assert_eq!(config.bitcoin.sources[1].id, "bitcoin-secondary");
+    assert_eq!(config.liquid.refresh_interval_secs, 20);
+    assert_eq!(config.liquid.live_max_age_secs, 70);
+    assert_eq!(config.liquid.last_known_good_max_age_secs, 700);
+    assert_eq!(config.liquid.floor_sat_per_vbyte, 0.15);
+    assert_eq!(config.liquid.cap_sat_per_vbyte, 5.75);
+    assert_eq!(config.liquid.sources[0].id, "liquid-primary");
+    assert_eq!(config.liquid.sources[1].id, "liquid-secondary");
+}
+
+#[test]
+fn fee_source_lists_are_nonempty_max_four_and_uniquely_named_per_rail() {
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.sources.clear();
+    let facts = config.validation_facts();
+    assert!(!facts.bitcoin.sources_valid);
+    assert!(facts.liquid.all_valid());
+
+    config = FeePolicyConfig::default();
+    config.liquid.sources = (0..=MAX_FEE_SOURCES_PER_RAIL)
+        .map(|index| {
+            fee_source(
+                &format!("liquid-{index}"),
+                &format!("https://liquid-{index}.example/api"),
+            )
+        })
+        .collect();
+    let facts = config.validation_facts();
+    assert!(facts.bitcoin.all_valid());
+    assert!(!facts.liquid.sources_valid);
+
+    for rail in ["bitcoin", "liquid"] {
+        let mut config = FeePolicyConfig::default();
+        let duplicate = vec![
+            fee_source("same-source", "https://one.example/api"),
+            fee_source("same-source", "https://two.example/api"),
+        ];
+        if rail == "bitcoin" {
+            config.bitcoin.sources = duplicate;
+        } else {
+            config.liquid.sources = duplicate;
+        }
+        let facts = config.validation_facts();
+        assert_eq!(facts.bitcoin.sources_valid, rail != "bitcoin");
+        assert_eq!(facts.liquid.sources_valid, rail != "liquid");
+    }
+
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.sources = (0..MAX_FEE_SOURCES_PER_RAIL)
+        .map(|index| {
+            fee_source(
+                &format!("bitcoin-{index}"),
+                &format!("https://bitcoin-{index}.example/api"),
+            )
+        })
+        .collect();
+    config.liquid.sources = (0..MAX_FEE_SOURCES_PER_RAIL)
+        .map(|index| {
+            fee_source(
+                &format!("liquid-{index}"),
+                &format!("https://liquid-{index}.example/api"),
+            )
+        })
+        .collect();
+    assert!(config.validation_facts().all_valid());
+}
+
+#[test]
+fn fee_source_ids_are_strictly_sanitized_and_bounded() {
+    for invalid in [
+        "",
+        "UPPERCASE",
+        "-leading",
+        "_leading",
+        "has.dot",
+        "has/slash",
+        "has space",
+        "has\nnewline",
+    ] {
+        assert!(!valid_fee_source_id(invalid), "accepted {invalid:?}");
+        let mut config = FeePolicyConfig::default();
+        config.bitcoin.sources[0].id = invalid.to_string();
+        assert!(!config.validation_facts().bitcoin.sources_valid);
+    }
+
+    let maximum = "x".repeat(MAX_FEE_SOURCE_ID_BYTES);
+    assert!(valid_fee_source_id(&maximum));
+    assert!(!valid_fee_source_id(&format!("{maximum}x")));
+    for valid in ["source0", "source-1", "source_2", "source-", "source_"] {
+        assert!(valid_fee_source_id(valid), "rejected {valid}");
+        let mut config = FeePolicyConfig::default();
+        config.bitcoin.sources[0].id = valid.to_string();
+        assert!(config.validation_facts().bitcoin.sources_valid);
+    }
+}
+
+#[test]
+fn fee_endpoints_require_credential_free_https_bases() {
+    for valid in [
+        "https://fees.example",
+        "https://fees.example/api",
+        "https://fees.example:443/api/",
+        "https://[2001:db8::1]/api",
+    ] {
+        assert!(valid_fee_https_base_endpoint(valid), "rejected {valid}");
+    }
+
+    for invalid in [
+        "",
+        "not-a-url",
+        "http://fees.example/api",
+        "ftp://fees.example/api",
+        "https://user@fees.example/api",
+        "https://user:secret@fees.example/api",
+        "https://fees.example:0/api",
+        "https://fees.example/api?token=secret",
+        "https://fees.example/api#fragment",
+        "data:text/plain,fees",
+    ] {
+        assert!(
+            !valid_fee_https_base_endpoint(invalid),
+            "accepted {invalid}"
+        );
+        let mut config = FeePolicyConfig::default();
+        config.liquid.sources[0].endpoint = invalid.to_string();
+        assert!(!config.validation_facts().liquid.sources_valid);
+    }
+}
+
+#[test]
+fn fee_refresh_and_freshness_windows_fail_closed_independently() {
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.refresh_interval_secs = 0;
+    let facts = config.validation_facts();
+    assert!(!facts.bitcoin.refresh_interval_valid);
+    assert!(facts.bitcoin.live_freshness_window_valid);
+    assert!(facts.bitcoin.last_known_good_freshness_window_valid);
+    assert!(facts.liquid.all_valid());
+
+    config = FeePolicyConfig::default();
+    config.bitcoin.live_max_age_secs = 0;
+    let facts = config.validation_facts();
+    assert!(facts.bitcoin.refresh_interval_valid);
+    assert!(!facts.bitcoin.live_freshness_window_valid);
+    assert!(facts.bitcoin.last_known_good_freshness_window_valid);
+
+    config = FeePolicyConfig::default();
+    config.liquid.last_known_good_max_age_secs = 0;
+    let facts = config.validation_facts();
+    assert!(facts.liquid.refresh_interval_valid);
+    assert!(facts.liquid.live_freshness_window_valid);
+    assert!(!facts.liquid.last_known_good_freshness_window_valid);
+    assert!(facts.bitcoin.all_valid());
+
+    let parsed: FeePolicyConfig = toml::from_str(
+        r#"
+        [bitcoin]
+        refresh_interval_secs = 1
+        live_max_age_secs = 2
+        last_known_good_max_age_secs = 3
+        [liquid]
+        refresh_interval_secs = 4
+        live_max_age_secs = 5
+        last_known_good_max_age_secs = 6
+        "#,
+    )
+    .unwrap();
+    assert!(parsed.validation_facts().all_valid());
+}
+
+#[test]
+fn fee_bounds_require_finite_positive_ordered_values_per_rail() {
+    for (floor, cap) in [
+        (f64::NAN, 10.0),
+        (1.0, f64::NAN),
+        (f64::INFINITY, 10.0),
+        (1.0, f64::INFINITY),
+        (f64::NEG_INFINITY, 10.0),
+        (1.0, f64::NEG_INFINITY),
+        (0.0, 10.0),
+        (-1.0, 10.0),
+        (1.0, 0.0),
+        (1.0, -10.0),
+        (10.0, 1.0),
+    ] {
+        let mut config = FeePolicyConfig::default();
+        config.bitcoin.floor_sat_per_vbyte = floor;
+        config.bitcoin.cap_sat_per_vbyte = cap;
+        let facts = config.validation_facts();
+        assert!(!facts.bitcoin.bounds_valid, "accepted {floor}..={cap}");
+        assert!(facts.liquid.bounds_valid);
+    }
+
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.floor_sat_per_vbyte = 2.5;
+    config.bitcoin.cap_sat_per_vbyte = 2.5;
+    config.liquid.floor_sat_per_vbyte = 0.125;
+    config.liquid.cap_sat_per_vbyte = 0.125;
+    assert!(config.validation_facts().all_valid());
+
+    for literal in ["nan", "inf", "-inf", "0.0", "-1.0"] {
+        let input =
+            format!("[liquid]\nfloor_sat_per_vbyte = {literal}\ncap_sat_per_vbyte = 10.0\n");
+        let parsed: FeePolicyConfig = toml::from_str(&input).unwrap();
+        assert!(!parsed.validation_facts().liquid.bounds_valid);
+    }
+}
+
+#[test]
+fn fee_config_debug_redacts_valid_and_invalid_endpoint_values() {
+    let mut config = FeePolicyConfig::default();
+    config.bitcoin.sources = vec![fee_source(
+        "private-primary",
+        "https://credential-like-value.example/api?token=private-token",
+    )];
+    config.liquid.sources = vec![fee_source(
+        "invalid\nidentity",
+        "https://other-private.example/api",
+    )];
+
+    let diagnostic = format!("{config:?}");
+    assert!(diagnostic.contains("<redacted>"));
+    for secret in [
+        "private-primary",
+        "credential-like-value.example",
+        "private-token",
+        "other-private.example",
+        "invalid\nidentity",
+    ] {
+        assert!(!diagnostic.contains(secret));
+    }
+
+    let mut root = production_base_config();
+    root.fee_policy = config;
+    let root_diagnostic = format!("{root:?}");
+    assert!(!root_diagnostic.contains("credential-like-value.example"));
+    assert!(!root_diagnostic.contains("other-private.example"));
+}
+
+#[test]
+fn invalid_fee_config_exposes_false_facts_without_changing_startup_validation() {
+    let mut config = production_base_config();
+    config.fee_policy.bitcoin.sources.clear();
+    config.fee_policy.liquid.refresh_interval_secs = 0;
+
+    config.validate_for_runtime("development", false).unwrap();
+    let facts = config.fee_policy.validation_facts();
+    assert!(!facts.bitcoin.sources_valid);
+    assert!(!facts.liquid.refresh_interval_valid);
+    assert!(!facts.all_valid());
 }
 
 #[test]

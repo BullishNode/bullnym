@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::fmt;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -34,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub liquid_watcher: LiquidWatcherConfig,
     #[serde(default)]
+    pub fee_policy: FeePolicyConfig,
+    #[serde(default)]
     pub workers: WorkersConfig,
     #[serde(default)]
     pub invoice_accounting: InvoiceAccountingConfig,
@@ -60,6 +63,280 @@ pub struct Config {
     /// swaps register the new URL). Empty = no overlap.
     #[serde(skip)]
     pub boltz_webhook_url_secret_previous: String,
+}
+
+// --- Construction-time fee discovery config ---
+
+pub const MAX_FEE_SOURCES_PER_RAIL: usize = 4;
+pub const MAX_FEE_SOURCE_ID_BYTES: usize = 64;
+
+const DEFAULT_FEE_REFRESH_INTERVAL_SECS: u64 = 30;
+const DEFAULT_FEE_LIVE_MAX_AGE_SECS: u64 = 120;
+const DEFAULT_FEE_LAST_KNOWN_GOOD_MAX_AGE_SECS: u64 = 900;
+const DEFAULT_BITCOIN_FEE_FLOOR_SAT_PER_VBYTE: f64 = 1.0;
+const DEFAULT_BITCOIN_FEE_CAP_SAT_PER_VBYTE: f64 = 500.0;
+const DEFAULT_LIQUID_FEE_FLOOR_SAT_PER_VBYTE: f64 = 0.1;
+const DEFAULT_LIQUID_FEE_CAP_SAT_PER_VBYTE: f64 = 10.0;
+
+/// One explicitly configured, API-compatible fee source.
+///
+/// The ID is a non-secret persistence key. Both fields are intentionally
+/// redacted from Debug so a future operational diagnostic cannot disclose
+/// operator-controlled source details.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FeeSourceConfig {
+    pub id: String,
+    pub endpoint: String,
+}
+
+impl fmt::Debug for FeeSourceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FeeSourceConfig")
+            .field("id", &"<redacted>")
+            .field("endpoint", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Bitcoin-specific live-fee discovery settings. These are validation,
+/// freshness, and economic bounds only; there is deliberately no configured
+/// fee quote or default construction rate.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinFeeConfig {
+    #[serde(default = "default_bitcoin_fee_sources")]
+    pub sources: Vec<FeeSourceConfig>,
+    #[serde(default = "default_fee_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+    #[serde(default = "default_fee_live_max_age_secs")]
+    pub live_max_age_secs: u64,
+    #[serde(default = "default_fee_last_known_good_max_age_secs")]
+    pub last_known_good_max_age_secs: u64,
+    #[serde(default = "default_bitcoin_fee_floor_sat_per_vbyte")]
+    pub floor_sat_per_vbyte: f64,
+    #[serde(default = "default_bitcoin_fee_cap_sat_per_vbyte")]
+    pub cap_sat_per_vbyte: f64,
+}
+
+impl Default for BitcoinFeeConfig {
+    fn default() -> Self {
+        Self {
+            sources: default_bitcoin_fee_sources(),
+            refresh_interval_secs: default_fee_refresh_interval_secs(),
+            live_max_age_secs: default_fee_live_max_age_secs(),
+            last_known_good_max_age_secs: default_fee_last_known_good_max_age_secs(),
+            floor_sat_per_vbyte: default_bitcoin_fee_floor_sat_per_vbyte(),
+            cap_sat_per_vbyte: default_bitcoin_fee_cap_sat_per_vbyte(),
+        }
+    }
+}
+
+/// Liquid-specific live-fee discovery settings. The configured sources must
+/// expose the Esplora fee-estimates shape; ordinary Liquid transaction-data
+/// endpoints are not implicitly added here.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidFeeConfig {
+    #[serde(default = "default_liquid_fee_sources")]
+    pub sources: Vec<FeeSourceConfig>,
+    #[serde(default = "default_fee_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
+    #[serde(default = "default_fee_live_max_age_secs")]
+    pub live_max_age_secs: u64,
+    #[serde(default = "default_fee_last_known_good_max_age_secs")]
+    pub last_known_good_max_age_secs: u64,
+    #[serde(default = "default_liquid_fee_floor_sat_per_vbyte")]
+    pub floor_sat_per_vbyte: f64,
+    #[serde(default = "default_liquid_fee_cap_sat_per_vbyte")]
+    pub cap_sat_per_vbyte: f64,
+}
+
+impl Default for LiquidFeeConfig {
+    fn default() -> Self {
+        Self {
+            sources: default_liquid_fee_sources(),
+            refresh_interval_secs: default_fee_refresh_interval_secs(),
+            live_max_age_secs: default_fee_live_max_age_secs(),
+            last_known_good_max_age_secs: default_fee_last_known_good_max_age_secs(),
+            floor_sat_per_vbyte: default_liquid_fee_floor_sat_per_vbyte(),
+            cap_sat_per_vbyte: default_liquid_fee_cap_sat_per_vbyte(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FeePolicyConfig {
+    #[serde(default)]
+    pub bitcoin: BitcoinFeeConfig,
+    #[serde(default)]
+    pub liquid: LiquidFeeConfig,
+}
+
+/// Rail-local validation facts. They are observations about static config,
+/// not readiness and not evidence that a source answered in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeRailConfigValidationFacts {
+    pub sources_valid: bool,
+    pub refresh_interval_valid: bool,
+    pub live_freshness_window_valid: bool,
+    pub last_known_good_freshness_window_valid: bool,
+    pub bounds_valid: bool,
+}
+
+impl FeeRailConfigValidationFacts {
+    pub const fn all_valid(self) -> bool {
+        self.sources_valid
+            && self.refresh_interval_valid
+            && self.live_freshness_window_valid
+            && self.last_known_good_freshness_window_valid
+            && self.bounds_valid
+    }
+}
+
+/// Static configuration facts for each rail. Future startup wiring may consume
+/// these facts, but constructing them never opens admission or calls a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeePolicyConfigValidationFacts {
+    pub bitcoin: FeeRailConfigValidationFacts,
+    pub liquid: FeeRailConfigValidationFacts,
+}
+
+impl FeePolicyConfigValidationFacts {
+    pub const fn all_valid(self) -> bool {
+        self.bitcoin.all_valid() && self.liquid.all_valid()
+    }
+}
+
+impl FeePolicyConfig {
+    pub fn validation_facts(&self) -> FeePolicyConfigValidationFacts {
+        FeePolicyConfigValidationFacts {
+            bitcoin: fee_rail_config_validation_facts(
+                &self.bitcoin.sources,
+                self.bitcoin.refresh_interval_secs,
+                self.bitcoin.live_max_age_secs,
+                self.bitcoin.last_known_good_max_age_secs,
+                self.bitcoin.floor_sat_per_vbyte,
+                self.bitcoin.cap_sat_per_vbyte,
+            ),
+            liquid: fee_rail_config_validation_facts(
+                &self.liquid.sources,
+                self.liquid.refresh_interval_secs,
+                self.liquid.live_max_age_secs,
+                self.liquid.last_known_good_max_age_secs,
+                self.liquid.floor_sat_per_vbyte,
+                self.liquid.cap_sat_per_vbyte,
+            ),
+        }
+    }
+}
+
+fn fee_rail_config_validation_facts(
+    sources: &[FeeSourceConfig],
+    refresh_interval_secs: u64,
+    live_max_age_secs: u64,
+    last_known_good_max_age_secs: u64,
+    floor_sat_per_vbyte: f64,
+    cap_sat_per_vbyte: f64,
+) -> FeeRailConfigValidationFacts {
+    FeeRailConfigValidationFacts {
+        sources_valid: fee_sources_valid(sources),
+        refresh_interval_valid: refresh_interval_secs > 0,
+        live_freshness_window_valid: live_max_age_secs > 0,
+        last_known_good_freshness_window_valid: last_known_good_max_age_secs > 0,
+        bounds_valid: fee_bounds_valid(floor_sat_per_vbyte, cap_sat_per_vbyte),
+    }
+}
+
+fn fee_sources_valid(sources: &[FeeSourceConfig]) -> bool {
+    !sources.is_empty()
+        && sources.len() <= MAX_FEE_SOURCES_PER_RAIL
+        && sources.iter().enumerate().all(|(index, source)| {
+            valid_fee_source_id(&source.id)
+                && valid_fee_https_base_endpoint(&source.endpoint)
+                && sources[..index].iter().all(|prior| prior.id != source.id)
+        })
+}
+
+fn fee_bounds_valid(floor_sat_per_vbyte: f64, cap_sat_per_vbyte: f64) -> bool {
+    floor_sat_per_vbyte.is_finite()
+        && floor_sat_per_vbyte > 0.0
+        && cap_sat_per_vbyte.is_finite()
+        && cap_sat_per_vbyte > 0.0
+        && floor_sat_per_vbyte <= cap_sat_per_vbyte
+}
+
+pub fn valid_fee_source_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_FEE_SOURCE_ID_BYTES
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'-' | b'_' => index > 0,
+            _ => false,
+        })
+}
+
+pub fn valid_fee_https_base_endpoint(raw: &str) -> bool {
+    reqwest::Url::parse(raw).is_ok_and(|url| {
+        url.scheme() == "https"
+            && !url.cannot_be_a_base()
+            && url.host_str().is_some()
+            && url.port() != Some(0)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn default_bitcoin_fee_sources() -> Vec<FeeSourceConfig> {
+    vec![
+        FeeSourceConfig {
+            id: "bull-bitcoin".to_string(),
+            endpoint: "https://mempool.bullbitcoin.com/api".to_string(),
+        },
+        FeeSourceConfig {
+            id: "mempool-space".to_string(),
+            endpoint: "https://mempool.space/api".to_string(),
+        },
+    ]
+}
+
+fn default_liquid_fee_sources() -> Vec<FeeSourceConfig> {
+    vec![FeeSourceConfig {
+        id: "liquid-network".to_string(),
+        endpoint: "https://liquid.network/api".to_string(),
+    }]
+}
+
+fn default_fee_refresh_interval_secs() -> u64 {
+    DEFAULT_FEE_REFRESH_INTERVAL_SECS
+}
+
+fn default_fee_live_max_age_secs() -> u64 {
+    DEFAULT_FEE_LIVE_MAX_AGE_SECS
+}
+
+fn default_fee_last_known_good_max_age_secs() -> u64 {
+    DEFAULT_FEE_LAST_KNOWN_GOOD_MAX_AGE_SECS
+}
+
+fn default_bitcoin_fee_floor_sat_per_vbyte() -> f64 {
+    DEFAULT_BITCOIN_FEE_FLOOR_SAT_PER_VBYTE
+}
+
+fn default_bitcoin_fee_cap_sat_per_vbyte() -> f64 {
+    DEFAULT_BITCOIN_FEE_CAP_SAT_PER_VBYTE
+}
+
+fn default_liquid_fee_floor_sat_per_vbyte() -> f64 {
+    DEFAULT_LIQUID_FEE_FLOOR_SAT_PER_VBYTE
+}
+
+fn default_liquid_fee_cap_sat_per_vbyte() -> f64 {
+    DEFAULT_LIQUID_FEE_CAP_SAT_PER_VBYTE
 }
 
 const DEFAULT_BTC_SHORTFALL_TOLERANCE_SAT: i64 = 300;
