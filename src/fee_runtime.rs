@@ -16,6 +16,9 @@ use crate::fee_policy::{
     BitcoinFeeDecision, BitcoinFeePolicy, FeeObservationSource, FeePolicyError, FeeRail,
     LiquidFeeDecision, LiquidFeePolicy,
 };
+use crate::fee_decision_record::{
+    FeeConstructionPurpose, FeeDecisionRecord,
+};
 use crate::fee_refresh_cycle::{
     FeeRailRefreshOutcome, FeeRefreshClockError, FeeRefreshCycle, FeeRefreshCycleOutcome,
 };
@@ -137,6 +140,7 @@ pub enum FeeRuntimeUnavailable {
     Bitcoin,
     Liquid,
     NotDurable(FeeRail),
+    DecisionRecord,
 }
 
 impl fmt::Display for FeeRuntimeUnavailable {
@@ -151,6 +155,7 @@ impl fmt::Display for FeeRuntimeUnavailable {
             Self::NotDurable(FeeRail::Liquid) => {
                 "current Liquid fee decision is not durably accepted"
             }
+            Self::DecisionRecord => "current fee decision metadata is unavailable",
         })
     }
 }
@@ -340,6 +345,46 @@ impl FeeRuntime {
         let now_unix = unix_now()?;
         self.liquid_current_at(now_unix)
             .map(|current| current.decision().clone())
+    }
+
+    /// Read and bind a Bitcoin construction decision at one clock instant.
+    pub fn bitcoin_construction_decision_now(
+        &self,
+        purpose: FeeConstructionPurpose,
+    ) -> Result<(BitcoinFeeDecision, FeeDecisionRecord), FeeRuntimeUnavailable> {
+        let now_unix = unix_now()?;
+        let decision = self
+            .bitcoin_current_at(now_unix)?
+            .decision()
+            .clone();
+        let record = FeeDecisionRecord::from_bitcoin(
+            purpose,
+            &decision,
+            &self.bitcoin_policy,
+            now_unix,
+        )
+        .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
+        Ok((decision, record))
+    }
+
+    /// Read and bind a Liquid construction decision at one clock instant.
+    pub fn liquid_construction_decision_now(
+        &self,
+        purpose: FeeConstructionPurpose,
+    ) -> Result<(LiquidFeeDecision, FeeDecisionRecord), FeeRuntimeUnavailable> {
+        let now_unix = unix_now()?;
+        let decision = self
+            .liquid_current_at(now_unix)?
+            .decision()
+            .clone();
+        let record = FeeDecisionRecord::from_liquid(
+            purpose,
+            &decision,
+            &self.liquid_policy,
+            now_unix,
+        )
+        .map_err(|_| FeeRuntimeUnavailable::DecisionRecord)?;
+        Ok((decision, record))
     }
 
     pub fn spawn_background(

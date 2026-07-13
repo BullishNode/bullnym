@@ -29,7 +29,10 @@ use crate::db::{
     RecoverySourcePrevout,
 };
 use crate::error::AppError;
-use crate::fee_policy::BitcoinFeeDecision;
+use crate::fee_decision_record::{
+    FeeConstructionPurpose, FeeDecisionRecord,
+};
+use crate::fee_policy::{BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness};
 use crate::AppState;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -273,12 +276,18 @@ pub(crate) async fn execute_journaled_recovery(
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
     // A missing current decision is passed through deliberately: an existing
     // journal replays without it, while a new attempt remains pending.
-    let fee_decision = state.fee_runtime.bitcoin_decision_now().ok();
+    let fee_decision = state
+        .fee_runtime
+        .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+        .ok();
     execute_journaled_recovery_with_builder_fee(
         &state.db,
         chain_swap_id,
         &builder,
-        fee_decision.as_ref().map(BitcoinBuilderFeeDecision::from),
+        fee_decision
+            .as_ref()
+            .map(|(decision, _)| BitcoinBuilderFeeDecision::from(decision)),
+        fee_decision.as_ref().map(|(_, record)| record),
         evidence,
         &broadcaster,
         &NoRecoveryFaults,
@@ -325,11 +334,15 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<String, AppError> {
+    let fee_record = fee_decision
+        .map(bitcoin_fee_record_for_compatibility_seam)
+        .transpose()?;
     execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
         builder,
         fee_decision.map(BitcoinBuilderFeeDecision::from),
+        fee_record.as_ref(),
         evidence,
         broadcaster,
         faults,
@@ -342,11 +355,21 @@ async fn execute_journaled_recovery_with_builder_fee(
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
     fee_decision: Option<BitcoinBuilderFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     evidence: &dyn BitcoinRecoveryEvidence,
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<String, AppError> {
-    prepare_or_reload_attempt(pool, chain_swap_id, builder, fee_decision, evidence, faults).await?;
+    prepare_or_reload_attempt(
+        pool,
+        chain_swap_id,
+        builder,
+        fee_decision,
+        fee_record,
+        evidence,
+        faults,
+    )
+    .await?;
 
     faults.check(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast)?;
 
@@ -445,6 +468,7 @@ async fn prepare_or_reload_attempt(
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
     fee_decision: Option<BitcoinBuilderFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     evidence: &dyn BitcoinRecoveryEvidence,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<ChainSwapTxAttempt, AppError> {
@@ -543,6 +567,9 @@ async fn prepare_or_reload_attempt(
     let fee_decision = fee_decision.ok_or_else(|| {
         AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
     })?;
+    let fee_record = fee_record.ok_or_else(|| {
+        AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
+    })?;
 
     faults.check(RecoveryFaultPoint::BeforeConstruction)?;
     let transaction = builder.construct(&swap, &destination, fee_decision).await?;
@@ -550,7 +577,7 @@ async fn prepare_or_reload_attempt(
         validate_constructed_attempt(&swap, &destination, &transaction, evidence).await?;
     faults.check(RecoveryFaultPoint::AfterConstructionBeforeJournal)?;
 
-    let new_attempt = prepared.as_new(swap.id);
+    let new_attempt = prepared.as_new(swap.id, fee_record);
     let attempt = db::insert_bitcoin_recovery_attempt(&mut tx, &new_attempt)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -711,7 +738,11 @@ struct PreparedAttempt {
 }
 
 impl PreparedAttempt {
-    fn as_new(&self, chain_swap_id: Uuid) -> NewBitcoinRecoveryAttempt<'_> {
+    fn as_new<'a>(
+        &'a self,
+        chain_swap_id: Uuid,
+        fee_decision: &'a FeeDecisionRecord,
+    ) -> NewBitcoinRecoveryAttempt<'a> {
         NewBitcoinRecoveryAttempt {
             chain_swap_id,
             raw_tx_hex: &self.raw_tx_hex,
@@ -723,8 +754,32 @@ impl PreparedAttempt {
             destination_amount_sat: self.destination_amount_sat,
             fee_amount_sat: self.fee_amount_sat,
             fee_rate_sat_vb: self.fee_rate_sat_vb,
+            fee_decision,
         }
     }
+}
+
+fn bitcoin_fee_record_for_compatibility_seam(
+    decision: &BitcoinFeeDecision,
+) -> Result<FeeDecisionRecord, AppError> {
+    let evaluated_at_unix = match decision.freshness() {
+        FeeFreshness::Fresh { age_secs, .. } => decision
+            .observed_at_unix()
+            .checked_add(age_secs)
+            .ok_or_else(|| AppError::ClaimError("fee decision clock overflow".into()))?,
+        _ => {
+            return Err(AppError::RecoveryNotAvailable(
+                BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+            ))
+        }
+    };
+    FeeDecisionRecord::from_bitcoin(
+        FeeConstructionPurpose::BitcoinRecovery,
+        decision,
+        &BitcoinFeePolicy::default(),
+        evaluated_at_unix,
+    )
+    .map_err(|error| AppError::ClaimError(format!("invalid Bitcoin fee decision record: {error}")))
 }
 
 fn validate_reloaded_attempt(attempt: &ChainSwapTxAttempt) -> Result<(), AppError> {
