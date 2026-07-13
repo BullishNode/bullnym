@@ -190,8 +190,11 @@ impl UtxoBackend for MockUtxoBackend {
         Ok(false)
     }
 
-    async fn has_history(&self, _script_pubkey: &elements::Script) -> Result<bool, AppError> {
-        Ok(false)
+    async fn script_history(
+        &self,
+        _script_pubkey: &elements::Script,
+    ) -> Result<crate::utxo::LiquidScriptHistory, AppError> {
+        Ok(crate::utxo::LiquidScriptHistory::Empty)
     }
 
     async fn history_txids(

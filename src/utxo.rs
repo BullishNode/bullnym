@@ -185,6 +185,16 @@ pub struct LiquidHistoryEntry {
     pub block_hash: Option<String>,
 }
 
+/// Confirmation-aware summary for the lightweight Lightning Address scan.
+/// A non-empty Electrum history is not sufficient to burn a durable wallet
+/// index: non-positive heights are still mempool-only and may be evicted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidScriptHistory {
+    Empty,
+    MempoolOnly,
+    Confirmed,
+}
+
 /// A complete Liquid history view obtained through one Electrum connection.
 /// `authority` is a stable digest of the configured endpoint, never the URL
 /// itself, so credentials embedded in an operator URL cannot reach the DB.
@@ -246,10 +256,14 @@ pub trait UtxoBackend: Send + Sync {
         vout: u32,
     ) -> Result<bool, AppError>;
 
-    /// Check whether the given script has any history (mempool + confirmed)
-    /// on the Liquid network. Used by the chain watcher to detect payments
-    /// landing at a nym's next-unused address.
-    async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
+    /// Summarize whether the given Liquid script has no history, only
+    /// non-confirmed history, or at least one confirmed transaction. The
+    /// Lightning Address watcher may observe mempool activity, but only the
+    /// confirmed state may advance its durable descriptor cursor.
+    async fn script_history(
+        &self,
+        script_pubkey: &elements::Script,
+    ) -> Result<LiquidScriptHistory, AppError>;
 
     /// Return txids touching this script (mempool + confirmed), newest/oldest
     /// ordering is backend-defined. Callers must use idempotency keys when
@@ -619,11 +633,15 @@ impl UtxoBackend for ElectrumClient {
         }))
     }
 
-    async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError> {
+    async fn script_history(
+        &self,
+        script_pubkey: &elements::Script,
+    ) -> Result<LiquidScriptHistory, AppError> {
         // Use raw_call (parallel to is_unspent) so we avoid any Liquid-specific
         // deserialization quirks in the high-level electrum-client wrapper.
-        // The history response shape is `[{tx_hash, height, [fee]}, ...]`; we
-        // only care whether the array is non-empty.
+        // The history response shape is `[{tx_hash, height, [fee]}, ...]`.
+        // Preserve signed height semantics: zero/negative entries are not
+        // durable evidence that can advance a descriptor cursor.
         let scripthash_hex = electrum_scripthash_hex(script_pubkey);
 
         let state = self.state.clone();
@@ -641,11 +659,7 @@ impl UtxoBackend for ElectrumClient {
         .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
         .map_err(|e| AppError::ElectrumError(format!("scripthash.get_history: {e}")))?;
 
-        let history = result.as_array().ok_or_else(|| {
-            AppError::ElectrumError("scripthash.get_history: expected JSON array response".into())
-        })?;
-
-        Ok(!history.is_empty())
+        liquid_script_history(&result)
     }
 
     async fn history_txids(
@@ -800,6 +814,17 @@ fn liquid_history_entries(
         });
     }
     Ok(entries)
+}
+
+fn liquid_script_history(history: &serde_json::Value) -> Result<LiquidScriptHistory, AppError> {
+    let entries = liquid_history_entries(history)?;
+    if entries.iter().any(|entry| entry.height > 0) {
+        Ok(LiquidScriptHistory::Confirmed)
+    } else if entries.is_empty() {
+        Ok(LiquidScriptHistory::Empty)
+    } else {
+        Ok(LiquidScriptHistory::MempoolOnly)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

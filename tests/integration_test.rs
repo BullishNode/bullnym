@@ -7700,6 +7700,65 @@ async fn liquid_outpoint_reservation_reuses_original_index_after_cursor_advances
     cleanup_db(&pool).await;
 }
 
+#[tokio::test]
+async fn confirmed_lightning_address_history_advances_cursor_and_fulfills_once() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let _npub = create_test_user(&pool, "confirmedcursor").await;
+    let outpoint = "22".repeat(32);
+    let pubkey = "02".repeat(33);
+
+    let index =
+        pay_service::db::allocate_outpoint_address(&pool, "confirmedcursor", &outpoint, &pubkey)
+            .await
+            .unwrap();
+    assert_eq!(index, 0);
+
+    assert_eq!(
+        pay_service::db::mark_reservations_fulfilled_at_idx(
+            &pool,
+            "confirmedcursor",
+            index as u32,
+        )
+        .await
+        .unwrap(),
+        1,
+    );
+    pay_service::db::advance_next_addr_idx(&pool, "confirmedcursor", index as u32)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pay_service::db::mark_reservations_fulfilled_at_idx(
+            &pool,
+            "confirmedcursor",
+            index as u32,
+        )
+        .await
+        .unwrap(),
+        0,
+        "replayed confirmation must not fulfill the reservation twice",
+    );
+    pay_service::db::advance_next_addr_idx(&pool, "confirmedcursor", index as u32)
+        .await
+        .unwrap();
+
+    let (next_addr_idx, fulfilled): (i32, bool) = sqlx::query_as(
+        "SELECT users.next_addr_idx, outpoint_addresses.fulfilled \
+         FROM users JOIN outpoint_addresses USING (nym) \
+         WHERE users.nym = $1 AND outpoint_addresses.outpoint = $2",
+    )
+    .bind("confirmedcursor")
+    .bind(&outpoint)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(next_addr_idx, 1);
+    assert!(fulfilled);
+
+    cleanup_db(&pool).await;
+}
+
 // --- Invoice lifecycle / watcher database coverage ---
 
 #[tokio::test]

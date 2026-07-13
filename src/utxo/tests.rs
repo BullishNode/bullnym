@@ -177,6 +177,45 @@ fn liquid_history_entries_reject_incomplete_or_ambiguous_evidence() {
 }
 
 #[test]
+fn liquid_script_history_requires_a_positive_confirmation_height() {
+    let txid_a = "a".repeat(64);
+    let txid_b = "b".repeat(64);
+
+    assert_eq!(
+        liquid_script_history(&json!([])).unwrap(),
+        LiquidScriptHistory::Empty
+    );
+    assert_eq!(
+        liquid_script_history(&json!([
+            {"tx_hash": txid_a, "height": 0},
+            {"tx_hash": txid_b, "height": -1}
+        ]))
+        .unwrap(),
+        LiquidScriptHistory::MempoolOnly
+    );
+    assert_eq!(
+        liquid_script_history(&json!([
+            {"tx_hash": "a".repeat(64), "height": 0},
+            {"tx_hash": "b".repeat(64), "height": 42}
+        ]))
+        .unwrap(),
+        LiquidScriptHistory::Confirmed
+    );
+}
+
+#[test]
+fn liquid_script_history_rejects_untyped_confirmation_evidence() {
+    assert!(matches!(
+        liquid_script_history(&json!([{
+            "tx_hash": "a".repeat(64),
+            "height": "1"
+        }])),
+        Err(AppError::ElectrumError(message))
+            if message.contains("invalid signed height")
+    ));
+}
+
+#[test]
 fn liquid_snapshot_plan_bounds_history_before_header_fanout() {
     let entries = (0..3)
         .map(|index| LiquidHistoryEntry {
