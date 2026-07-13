@@ -1994,25 +1994,13 @@ fn boltz_invoice_description_for_url(url: &str) -> BoltzInvoiceDescription {
     }
 }
 
-fn append_bip21_message(bip21: &str, message: &str) -> String {
-    let encoded = percent_encode_query_value(message);
-    let (base, query) = match bip21.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (bip21, None),
-    };
-    let mut params: Vec<&str> = query
-        .into_iter()
-        .flat_map(|query| query.split('&'))
-        .filter(|part| !part.is_empty())
-        .filter(|part| {
-            let key = part.split_once('=').map_or(*part, |(key, _)| key);
-            key != "message"
-        })
-        .collect();
-    let message_param = format!("message={encoded}");
-    params.push(&message_param);
-
-    format!("{base}?{}", params.join("&"))
+fn build_bitcoin_chain_bip21(address: &str, amount_sat: u64, message: &str) -> String {
+    let whole_btc = amount_sat / 100_000_000;
+    let fractional_sat = amount_sat % 100_000_000;
+    let message = percent_encode_query_value(message);
+    format!(
+        "bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}&label=Send%20to%20L-BTC%20address&message={message}"
+    )
 }
 
 fn percent_encode_query_value(value: &str) -> String {
@@ -2177,9 +2165,15 @@ async fn create_bitcoin_chain_offer(
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<Option<BitcoinChainOffer>, AppError> {
-    if invoice.liquid_address.is_none() {
+    let Some(liquid_address) = invoice.liquid_address.as_deref() else {
         return Ok(None);
-    }
+    };
+    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
+        .map_err(|error| {
+            AppError::BoltzError(format!(
+                "chain swap invoice has an invalid Liquid destination: {error}"
+            ))
+        })?;
 
     // Recovery invariant (SF1, #44): a chain swap MUST belong to a nym-owned
     // invoice, because the only API path to recover its stuck BTC — the signed
@@ -2256,32 +2250,37 @@ async fn create_bitcoin_chain_offer(
         invoice.public_slug.as_deref(),
         invoice.id,
     );
-    let lockup_bip21 = result
-        .lockup_bip21
-        .as_deref()
-        .map(|bip21| append_bip21_message(bip21, &public_url));
+    // Never forward the provider's BIP21. Its address and amount are merely
+    // response fields until the complete response passes local validation;
+    // this URI is constructed from those validated values under our own fixed
+    // parameter policy.
+    let lockup_bip21 = build_bitcoin_chain_bip21(
+        &result.lockup_address,
+        result.user_lock_amount_sat,
+        &public_url,
+    );
 
     let preimage_hex = hex::encode(&result.preimage);
     let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
     let refund_key_hex = hex::encode(result.refund_keypair.secret_bytes());
-    let boltz_response_json = serde_json::to_string(&result.boltz_response).map_err(|e| {
-        AppError::BoltzError(format!("failed to serialize chain-swap response: {e}"))
-    })?;
-
-    db::record_chain_swap_with_lineage(
+    let user_lock_amount_sat = i64::try_from(result.user_lock_amount_sat)
+        .map_err(|_| AppError::BoltzError("chain user-lock amount exceeds i64".into()))?;
+    let server_lock_amount_sat = i64::try_from(result.server_lock_amount_sat)
+        .map_err(|_| AppError::BoltzError("chain server-lock amount exceeds i64".into()))?;
+    db::record_chain_swap_with_lineage_and_creation_terms(
         &state.db,
         &db::NewChainSwapRecord {
             invoice_id: invoice.id,
             nym: swap_nym,
             boltz_swap_id: &result.swap_id,
             lockup_address: &result.lockup_address,
-            lockup_bip21: lockup_bip21.as_deref(),
-            user_lock_amount_sat: result.user_lock_amount_sat as i64,
-            server_lock_amount_sat: result.server_lock_amount_sat as i64,
+            lockup_bip21: Some(&lockup_bip21),
+            user_lock_amount_sat,
+            server_lock_amount_sat,
             preimage_hex: &preimage_hex,
             claim_key_hex: &claim_key_hex,
             refund_key_hex: &refund_key_hex,
-            boltz_response_json: &boltz_response_json,
+            boltz_response_json: &result.canonical_response_json,
             claim_key_index: Some(claim_key_index as i64),
             refund_key_index: Some(refund_key_index as i64),
             root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
@@ -2295,6 +2294,25 @@ async fn create_bitcoin_chain_offer(
             refund_public_key_hex: &refund_public_key_hex,
             preimage_hash_hex: &preimage_hash_hex,
         },
+        &db::NewChainSwapCreationTerms {
+            pinned_pair_hash: &result.creation_terms.pinned_pair_hash,
+            canonical_pair_quote_json: &result.creation_terms.canonical_pair_quote_json,
+            creation_response_sha256: &result.creation_terms.creation_response_sha256,
+            btc_claim_script_sha256: &result.creation_terms.btc_claim_script_sha256,
+            btc_refund_script_sha256: &result.creation_terms.btc_refund_script_sha256,
+            liquid_claim_script_sha256: &result.creation_terms.liquid_claim_script_sha256,
+            liquid_refund_script_sha256: &result.creation_terms.liquid_refund_script_sha256,
+            btc_timeout_height: i64::from(result.creation_terms.btc_timeout_height),
+            liquid_timeout_height: i64::from(result.creation_terms.liquid_timeout_height),
+            btc_network: result.creation_terms.btc_network,
+            liquid_network: result.creation_terms.liquid_network,
+            liquid_asset_id: &result.creation_terms.liquid_asset_id,
+            merchant_liquid_destination: &merchant_liquid_destination,
+            // #84 owns signed emergency-address registration. Until that
+            // append-only registry exists, creation is valid but explicitly
+            // legacy/manual-recovery rather than v3-complete.
+            merchant_emergency_btc_address: None,
+        },
     )
     .await
     .map_err(|e| {
@@ -2306,7 +2324,7 @@ async fn create_bitcoin_chain_offer(
 
     Ok(Some(BitcoinChainOffer {
         lockup_address: result.lockup_address,
-        lockup_bip21,
+        lockup_bip21: Some(lockup_bip21),
     }))
 }
 
