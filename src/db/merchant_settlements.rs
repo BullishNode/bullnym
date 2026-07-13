@@ -825,7 +825,8 @@ pub async fn persist_merchant_settlement_outcome(
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
-    let journal_rebroadcast_required = transition_attempt_locked(&mut tx, snapshot).await?;
+    let journal_rebroadcast_required =
+        transition_attempt_locked(&mut tx, snapshot, outcome.rebroadcast_journaled).await?;
     let parent_transition = transition_parent_locked(&mut tx, snapshot).await?;
     let swap_status = if snapshot.lifecycle.accounting == SettlementAccountingState::Finalized {
         "settled"
@@ -851,10 +852,16 @@ pub async fn persist_merchant_settlement_outcome(
 async fn transition_attempt_locked(
     tx: &mut Transaction<'_, Postgres>,
     snapshot: &MerchantSettlementAdoptionSnapshot,
+    rebroadcast_journaled: bool,
 ) -> Result<bool, MerchantSettlementRepositoryError> {
     let accounting = snapshot.lifecycle.accounting;
-    if accounting == SettlementAccountingState::Unrecorded {
+    if accounting == SettlementAccountingState::Unrecorded && !rebroadcast_journaled {
         return Ok(false);
+    }
+    if accounting == SettlementAccountingState::Unrecorded
+        && !matches!(&snapshot.lifecycle.state, SettlementState::Evicted)
+    {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
     }
     let active_txid = snapshot.lifecycle.active_txid.as_str();
     let attempt: Option<(Uuid, String, String)> = sqlx::query_as(
@@ -944,7 +951,48 @@ async fn transition_attempt_locked(
             }
             Ok(false)
         }
-        SettlementAccountingState::Unrecorded => Ok(false),
+        SettlementAccountingState::Unrecorded => {
+            let Some(update_required) =
+                unrecorded_rebroadcast_update_required(rebroadcast_journaled, &status)?
+            else {
+                return Ok(false);
+            };
+            if update_required {
+                let rows = sqlx::query(
+                    "UPDATE chain_swap_tx_attempts SET status = 'broadcast_ambiguous', \
+                         last_broadcast_result = 'merchant settlement evicted before accounting; exact journal replay required', \
+                         updated_at = NOW() \
+                      WHERE id = $1 AND txid = $2 AND status = $3",
+                )
+                .bind(attempt_id)
+                .bind(active_txid)
+                .bind(&status)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if rows != 1 {
+                    return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// `None` means an ordinary unrecorded observation must not even rewrite the
+/// attempt. `Some(false)` means an eviction already left the exact attempt in
+/// its replay-safe ambiguous state; the caller still reports a redrive.
+fn unrecorded_rebroadcast_update_required(
+    rebroadcast_journaled: bool,
+    status: &str,
+) -> Result<Option<bool>, MerchantSettlementRepositoryError> {
+    if !rebroadcast_journaled {
+        return Ok(None);
+    }
+    match status {
+        "constructed" | "broadcast" => Ok(Some(true)),
+        "broadcast_ambiguous" => Ok(Some(false)),
+        _ => Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict),
     }
 }
 
@@ -1918,6 +1966,34 @@ mod tests {
         let mut changed = authority.clone();
         changed.provenance.push_str("-changed");
         assert!(!fee_authority_matches(&authority, &changed));
+    }
+
+    #[test]
+    fn unrecorded_eviction_requests_exact_journal_rebroadcast() {
+        for status in ["constructed", "broadcast"] {
+            assert!(matches!(
+                unrecorded_rebroadcast_update_required(true, status),
+                Ok(Some(true))
+            ));
+            assert!(matches!(
+                unrecorded_rebroadcast_update_required(false, status),
+                Ok(None)
+            ));
+        }
+        assert!(matches!(
+            unrecorded_rebroadcast_update_required(true, "broadcast_ambiguous"),
+            Ok(Some(false))
+        ));
+        assert!(matches!(
+            unrecorded_rebroadcast_update_required(false, "broadcast_ambiguous"),
+            Ok(None)
+        ));
+        for status in ["confirmed", "finalized", "integrity_hold"] {
+            assert!(matches!(
+                unrecorded_rebroadcast_update_required(true, status),
+                Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+            ));
+        }
     }
 
     #[test]
