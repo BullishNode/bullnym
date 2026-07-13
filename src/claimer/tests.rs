@@ -233,6 +233,21 @@ fn chain_claim_journal_mode_rejects_orphan_parent_state() {
 }
 
 #[test]
+fn persisted_chain_claim_without_exact_journal_fails_before_broadcast() {
+    let broadcast_calls = Cell::new(0usize);
+    let result = (|| -> Result<(), AppError> {
+        require_exact_persisted_chain_claim_journal::<()>(Err(
+            db::MerchantSettlementRepositoryError::MissingJournal,
+        ))?;
+        broadcast_calls.set(broadcast_calls.get() + 1);
+        Ok(())
+    })();
+
+    assert!(result.is_err());
+    assert_eq!(broadcast_calls.get(), 0);
+}
+
+#[test]
 fn url_secret_matches_current() {
     assert_eq!(
         match_url_secret_pair("s3cr3t-current", "s3cr3t-current", ""),
