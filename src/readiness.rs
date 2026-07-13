@@ -364,6 +364,22 @@ async fn recovery_commitment_invariants_present(pool: &sqlx::PgPool) -> Result<b
             ) \
             AND EXISTS ( \
                 SELECT 1 \
+                FROM pg_constraint pair_constraint \
+                JOIN pg_class relation ON relation.oid = pair_constraint.conrelid \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                WHERE namespace.nspname = 'public' \
+                  AND relation.relname = 'chain_swap_records' \
+                  AND pair_constraint.conname = 'chain_swap_records_recovery_commitment_pair_check' \
+                  AND pair_constraint.contype = 'c' \
+                  AND pair_constraint.convalidated \
+                  AND pg_get_expr( \
+                      pair_constraint.conbin, \
+                      pair_constraint.conrelid, \
+                      TRUE \
+                  ) = '(recovery_address_commitment_id IS NULL) = (merchant_emergency_btc_address IS NULL)' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
                 FROM pg_constraint unique_constraint \
                 JOIN pg_class relation ON relation.oid = unique_constraint.conrelid \
                 JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \

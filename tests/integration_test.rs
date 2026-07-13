@@ -1223,6 +1223,44 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
         .await
         .unwrap());
 
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_pair_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_pair_check CHECK ( \
+             (recovery_address_commitment_id IS NULL) \
+             OR (merchant_emergency_btc_address IS NULL) \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_pair_expression = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_pair_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_pair_check CHECK ( \
+             (recovery_address_commitment_id IS NULL) \
+             = (merchant_emergency_btc_address IS NULL) \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
     sqlx::query("GRANT UPDATE ON recovery_address_commitments TO payservice")
         .execute(&admin)
         .await
@@ -1366,6 +1404,10 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
 
     assert!(!update_acl_drift, "runtime UPDATE must close admission");
     assert!(!public_acl_drift, "PUBLIC read ACL must close admission");
+    assert!(
+        !wrong_pair_expression,
+        "a same-name wrong null-pair expression must close admission"
+    );
     assert!(
         !disabled_trigger,
         "disabled immutability must close admission"
