@@ -684,6 +684,22 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    // Migration-055 evidence rejects ordinary DELETE and holds restrictive
+    // parent FKs. Test ownership removes it before operational parent rows.
+    sqlx::query("TRUNCATE merchant_settlement_retained_outputs")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("TRUNCATE merchant_settlement_checkpoints")
+        .execute(pool)
+        .await
+        .ok();
+    // The exact merchant-event trigger rejects both direct and cascaded DELETE;
+    // the isolated test database owner must therefore use DDL cleanup.
+    sqlx::query("TRUNCATE invoice_payment_events RESTART IDENTITY CASCADE")
+    .execute(pool)
+    .await
+    .ok();
     // Manifest delivery rows reject ordinary DELETE. Isolated test ownership
     // uses DDL before removing their operational source rows.
     sqlx::query("TRUNCATE chain_swap_manifest_deliveries")

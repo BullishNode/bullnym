@@ -172,6 +172,11 @@ migration_053_boundary_ready() {
     "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
+migration_055_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-055-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
 automatic_binary_rollback_allowed() {
   local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
@@ -188,6 +193,14 @@ automatic_binary_rollback_allowed() {
       && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
            || ((10#$previous_version < 53)); }; then
     echo "automatic rollback refused: migration 053 is a stopped-writer, roll-forward-only recovery-commitment boundary" >&2
+    return 1
+  fi
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 55)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 55)); }; then
+    echo "automatic rollback refused: migration 055 is a roll-forward-only exact-settlement boundary" >&2
     return 1
   fi
 
@@ -272,6 +285,18 @@ EOF
     exit 1
   fi
   echo "migration 053 privileged-owner ACL/FK/trigger boundary verified through bullnym_app on bullnym"
+fi
+if [[ -f "$REPO/migrations/055_merchant_settlement_lifecycle.sql" ]]; then
+  if ! migration_055_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 055 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, apply migration 055 with
+--set runtime_role=bullnym_app as the distinct privileged schema owner, and
+resolve every zero-legacy claim-journal blocker without fabricating evidence.
+Then rerun this script.
+EOF
+    exit 1
+  fi
 fi
 echo "NOTE: all migrations are applied manually using their documented ownership and stopped-writer boundaries."
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'

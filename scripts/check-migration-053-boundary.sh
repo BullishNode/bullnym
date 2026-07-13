@@ -12,6 +12,12 @@ fi
 env_file="${1:-/etc/bullnym/bullnym.env}"
 expected_runtime_role="${2:-bullnym_app}"
 expected_database="${3:-bullnym}"
+require_migration_055="${REQUIRE_MIGRATION_055:-0}"
+
+[[ "$require_migration_055" == "0" || "$require_migration_055" == "1" ]] || {
+  echo "migration boundary: REQUIRE_MIGRATION_055 must be 0 or 1" >&2
+  exit 2
+}
 
 [[ -f "$env_file" && ! -L "$env_file" && -O "$env_file" && -r "$env_file" ]] || {
   echo "migration-053 boundary: runtime environment is not a protected owned file: $env_file" >&2
@@ -311,4 +317,140 @@ IFS='|' read -r actual_runtime_role actual_database ready extra <<<"$result"
   exit 1
 }
 
+if [[ "$require_migration_055" == "1" ]]; then
+  migration_055_ready="$(
+    clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+      --tuples-only --no-align <<'SQL'
+SELECT (
+    NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_tx_attempts', 'replaces_txid'),
+              ('chain_swap_tx_attempts', 'destination_asset_id'),
+              ('chain_swap_tx_attempts', 'liquid_blinding_key_hex'),
+              ('invoice_payment_events', 'merchant_settlement_family_key'),
+              ('invoice_payment_events', 'merchant_chain_swap_id'),
+              ('invoice_payment_events', 'merchant_settlement_finalized')
+          ) required(table_name, column_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = required.table_name
+                AND column_name = required.column_name
+         )
+    )
+    AND to_regclass('public.merchant_settlement_checkpoints') IS NOT NULL
+    AND to_regclass('public.merchant_settlement_retained_outputs') IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_replaces_fkey'),
+              ('invoice_payment_events', 'invoice_payment_events_merchant_chain_swap_fkey'),
+              ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_journal_fkey'),
+              ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_event_fkey'),
+              ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_journal_fkey'),
+              ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_checkpoint_fkey')
+          ) required(table_name, constraint_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+               JOIN pg_class relation ON relation.oid = constraint_info.conrelid
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relname = required.table_name
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.convalidated
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_tx_attempts_validate_replacement'),
+              ('invoice_payment_event_reject_merchant_settlement_delete'),
+              ('merchant_settlement_checkpoint_validate_write'),
+              ('merchant_settlement_checkpoint_reject_delete'),
+              ('merchant_settlement_retained_validate_update'),
+              ('merchant_settlement_retained_reject_delete')
+          ) required(trigger_name)
+         WHERE NOT EXISTS (
+             SELECT 1 FROM pg_trigger
+              WHERE tgname = required.trigger_name
+                AND NOT tgisinternal
+                AND tgenabled IN ('O', 'A')
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_tx_attempts'),
+              ('invoice_payment_events'),
+              ('merchant_settlement_checkpoints'),
+              ('merchant_settlement_retained_outputs')
+          ) required(table_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_class relation
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relname = required.table_name
+                AND relation.relkind = 'r'
+                AND pg_get_userbyid(relation.relowner) <> current_user
+                AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'MEMBER')
+                AND has_table_privilege(current_user, relation.oid, 'SELECT')
+                AND has_table_privilege(current_user, relation.oid, 'INSERT')
+                AND has_table_privilege(current_user, relation.oid, 'UPDATE')
+                AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+                AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+                AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+                AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+              relation.relacl,
+              acldefault('r', relation.relowner)
+          )) acl
+         WHERE namespace.nspname = 'public'
+           AND relation.relname IN (
+               'chain_swap_tx_attempts', 'invoice_payment_events',
+               'merchant_settlement_checkpoints',
+               'merchant_settlement_retained_outputs'
+           )
+           AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM chain_swap_records
+         WHERE status IN (
+             'server_lock_mempool', 'server_lock_confirmed',
+             'claiming', 'claim_failed'
+         )
+           AND (claim_tx_hex IS NOT NULL OR claim_txid IS NOT NULL)
+           AND (
+               claim_tx_hex IS NULL OR claim_txid IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM chain_swap_tx_attempts attempt
+                    WHERE attempt.chain_swap_id = chain_swap_records.id
+                      AND attempt.purpose = 'liquid_claim'
+                      AND attempt.replaces_txid IS NULL
+                      AND attempt.raw_tx_hex = chain_swap_records.claim_tx_hex
+                      AND attempt.txid = chain_swap_records.claim_txid
+               )
+           )
+    )
+)::INT;
+SQL
+  )"
+  [[ "$migration_055_ready" == "1" ]] || {
+    echo "migration-055 boundary: schema, ACL, journal, or zero-legacy invariant failed" >&2
+    exit 1
+  }
+fi
+
 echo "migration 053 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+if [[ "$require_migration_055" == "1" ]]; then
+  echo "migration 055 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+fi
