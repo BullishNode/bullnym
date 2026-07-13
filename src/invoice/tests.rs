@@ -235,14 +235,17 @@ fn append_bip21_message_replaces_existing_message() {
 
 #[test]
 fn partially_paid_template_remains_payable_for_remaining_amount() {
-    let tpl = InvoicePaymentTpl {
+    let mut tpl = InvoicePaymentTpl {
         nym: "alice",
         is_unlinked: false,
         hide_owner: false,
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "partially_paid",
+        presentation_status: "partial",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 2_500,
         fiat_display: None,
@@ -265,6 +268,23 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
     assert!(html.contains("2500 sat remaining"));
     assert!(html.contains("id=\"rail-lightning\""));
     assert!(html.contains("let currentAmountSat = 2500;"));
+
+    tpl.settlement_status = "settled";
+    let settled_html = tpl.render().expect("settled partial template renders");
+    assert!(settled_html.contains("id=\"rail-lightning\""));
+    assert!(settled_html.contains("initialStatus === 'underpaid'"));
+    assert!(settled_html
+        .contains("return data.presentation_status !== 'partial' || data.status === 'underpaid';"));
+    assert!(settled_html.contains("setRail(currentRail)"));
+
+    tpl.status = "underpaid";
+    tpl.rails_payable = false;
+    let underpaid_html = tpl
+        .render()
+        .expect("settled terminal partial template renders");
+    assert!(underpaid_html.contains(">Underpaid</div>"));
+    assert!(!underpaid_html.contains("id=\"rail-lightning\""));
+    assert!(underpaid_html.contains("initialStatus === 'underpaid'"));
 }
 
 #[test]
@@ -276,7 +296,10 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
+        presentation_status: "unpaid",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -310,7 +333,10 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
+        presentation_status: "unpaid",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -336,7 +362,8 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
     assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
     assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000\\u0026label=Send%20to%20L-BTC%20address\""));
     assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS"));
+    assert!(html.contains("currentBitcoinChainAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || null"));
+    assert!(html.contains("return currentBitcoinChainAddress || currentBitcoinDirectAddress;"));
 }
 
 #[test]
@@ -348,7 +375,10 @@ fn template_liquid_uri_pins_lbtc_asset() {
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
+        presentation_status: "unpaid",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -383,7 +413,10 @@ fn invoice_template_escapes_user_text_and_js_literals() {
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
+        presentation_status: "unpaid",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -418,7 +451,10 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
         invoice_id: Uuid::nil().to_string(),
         domain: "bullpay.ca",
         status: "unpaid",
+        presentation_status: "unpaid",
+        presentation_known: true,
         settlement_status: "none",
+        rails_payable: true,
         amount_sat: 10_000,
         remaining_amount_sat: 10_000,
         fiat_display: None,
@@ -454,6 +490,111 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
 }
 
 #[test]
+fn presentation_projection_controls_new_payment_instructions() {
+    let mut inv = invoice_fixture();
+    assert!(invoice_payment_rails_are_payable(&inv));
+
+    inv.presentation_status = None;
+    assert!(!invoice_payment_rails_are_payable(&inv));
+
+    inv.status = "in_progress".to_string();
+    inv.presentation_status = Some("partial".to_string());
+    inv.settlement_status = "pending".to_string();
+    assert!(invoice_payment_rails_are_payable(&inv));
+
+    inv.status = "partially_paid".to_string();
+    inv.presentation_status = Some("payment_received".to_string());
+    assert!(!invoice_payment_rails_are_payable(&inv));
+
+    inv.presentation_status = Some("partial".to_string());
+    for incident in ["resolution_pending", "claim_stuck", "refunded", "failed"] {
+        inv.settlement_status = incident.to_string();
+        assert!(
+            !invoice_payment_rails_are_payable(&inv),
+            "{incident} must suppress payment instructions"
+        );
+    }
+}
+
+#[test]
+fn template_presentation_precedes_accounting_terminality() {
+    let html = payment_template_fixture("paid", "payment_received", "pending", false)
+        .render()
+        .expect("template renders");
+    assert!(html.contains(">Payment received</div>"));
+    assert!(html.contains(">Settlement pending</div>"));
+
+    let partial = payment_template_fixture("in_progress", "partial", "pending", true)
+        .render()
+        .expect("template renders");
+    assert!(partial.contains("Partially paid — remaining amount due"));
+    assert!(partial.contains("id=\"rail-lightning\""));
+    assert!(partial.contains("id=\"settlement-support\">Settlement pending"));
+}
+
+#[test]
+fn template_renders_resolution_and_existing_swap_incidents() {
+    let resolution = payment_template_fixture(
+        "in_progress",
+        "payment_received",
+        "resolution_pending",
+        false,
+    )
+    .render()
+    .expect("template renders");
+    assert!(resolution.contains(">Payment issue</div>"));
+    assert!(resolution.contains(">Settlement problem — being checked</div>"));
+
+    for incident in ["refunded", "failed"] {
+        let html = payment_template_fixture("in_progress", "payment_received", incident, false)
+            .render()
+            .expect("template renders");
+        assert!(html.contains(">Settlement failed</div>"), "{incident}");
+    }
+    let stuck = payment_template_fixture("in_progress", "payment_received", "claim_stuck", false)
+        .render()
+        .expect("template renders");
+    assert!(stuck.contains(">Payment needs review</div>"));
+}
+
+#[test]
+fn template_status_poll_replaces_nullable_bitcoin_offer_state() {
+    let html = payment_template_fixture("in_progress", "partial", "pending", true)
+        .render()
+        .expect("template renders");
+
+    assert!(html.contains("currentBitcoinDirectAddress = data.bitcoin_address || null;"));
+    assert!(html.contains("currentBitcoinChainAddress = data.bitcoin_chain_address || null;"));
+    assert!(html.contains("currentBitcoinChainBip21 = currentBitcoinChainAddress"));
+    assert!(html
+        .contains("const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null;"));
+    assert!(!html.contains("const nextBitcoinAddress ="));
+    let adopt = html
+        .find("adoptStatusPayloads(data);")
+        .expect("status payloads are adopted");
+    let pending_branch = html
+        .find("if (data.settlement_status === 'pending')")
+        .expect("pending branch exists");
+    assert!(
+        adopt < pending_branch,
+        "nullable offers must be replaced before partial+pending returns"
+    );
+    assert!(html.contains(
+        "if (data.presentation_status === 'partial') {\n                            if (statusAllowsPaymentRails(data))"
+    ));
+    assert!(html.contains("renderUnknownState();"));
+}
+
+#[test]
+fn template_never_maps_unknown_presentation_to_paid_or_unpaid() {
+    let mut template = payment_template_fixture("paid", "", "none", false);
+    template.presentation_known = false;
+    let html = template.render().expect("template renders");
+    assert!(html.contains(">Checking payment status</div>"));
+    assert!(html.contains(">Payment status is being checked</div>"));
+}
+
+#[test]
 fn api_tolerance_uses_configured_values() {
     let mut inv = invoice_fixture();
     inv.accept_btc = false;
@@ -467,6 +608,41 @@ fn api_tolerance_uses_configured_values() {
     };
 
     assert_eq!(payment_tolerance_sat(&inv, tolerances), 42);
+}
+
+fn payment_template_fixture(
+    status: &'static str,
+    presentation_status: &'static str,
+    settlement_status: &'static str,
+    rails_payable: bool,
+) -> InvoicePaymentTpl<'static> {
+    InvoicePaymentTpl {
+        nym: "alice",
+        is_unlinked: false,
+        hide_owner: false,
+        invoice_id: Uuid::nil().to_string(),
+        domain: "bullpay.ca",
+        status,
+        presentation_status,
+        presentation_known: true,
+        settlement_status,
+        rails_payable,
+        amount_sat: 10_000,
+        remaining_amount_sat: 2_500,
+        fiat_display: None,
+        public_description: None,
+        recipient_name: None,
+        invoice_number: None,
+        accept_btc: true,
+        accept_ln: true,
+        accept_liquid: true,
+        bitcoin_chain_address: None,
+        bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
+        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+    }
 }
 
 #[test]

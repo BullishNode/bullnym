@@ -27,15 +27,19 @@
   import { settings } from '$lib/stores/settings.svelte'
   import { scanForLnurl, payViaBoltCard } from '$lib/bolt-card/reader'
   import {
-    KNOWN_STATUSES,
+    bitcoinPaymentPayloadFromStatus,
     derivePayView,
     isTerminalView,
+    isCancelableStatus,
+    shouldPollDetail,
     showsRails,
     payViewLabel,
+    payViewSupport,
     payViewTone,
     payViewToTerminal,
     shouldRefreshLightning,
     nextLightningPr,
+    payViewBeforeFirstStatus,
     type PayView,
     type TerminalState,
   } from '$lib/status'
@@ -43,10 +47,8 @@
   import { liquidUri, bitcoinPayload } from '$lib/payloads'
   import { watchLiquidAddress } from '$lib/liquid-ws'
 
-  // See poll()/giveUpAsNotFound() below: a 200 OK with a status value
-  // outside KNOWN_STATUSES, or MAX_NOT_FOUND_STREAK consecutive 404s, means
-  // the id never resolved to a real invoice server-side even though the
-  // request itself succeeded.
+  // Only repeated explicit not-found responses terminalize this view. Future
+  // wire values are valid-but-unknown states and stay visible/polling.
   const MAX_NOT_FOUND_STREAK = 5
 
   let {
@@ -54,12 +56,16 @@
     nym,
     amountLabel,
     onTerminal,
+    onCancelableChange,
   }: {
     invoice: CreateInvoiceResponse
     nym: string
     amountLabel: string
     /** Fires exactly once, the first time the invoice reaches a terminal PayView (see lib/status.ts's TerminalState / CONTRACT 5). */
     onTerminal: (t: TerminalState) => void
+    /** Enables the outer Cancel/Back affordance only for a positively known
+     * no-evidence state. */
+    onCancelableChange?: (cancelable: boolean) => void
   } = $props()
 
   type Rail = 'lightning' | 'liquid' | 'bitcoin' | 'boltcard'
@@ -72,24 +78,21 @@
   }
 
   // ---------------------------------------------------------------------
-  // Live status. `invoice` only SEEDS the initial rail payloads (its
-  // lightning_pr can be '' on the reconstruction path — see
-  // maybeRefreshLightning's mount call below); every poll updates `latest`,
-  // and payloads/countdown/accept-flags come from `latest` once it exists.
-  // This mirrors invoice_payment.html:562-596 exactly.
+  // Live status. The create response remains a cache seed only; until the
+  // first successful detail poll, the conservative `unknown` view hides every
+  // instruction. Each successful poll replaces nullable payload state rather
+  // than merging it, because null withdraws a stale/amount-mismatched offer.
   // ---------------------------------------------------------------------
   let latest = $state<InvoiceStatus | null>(null)
   let currentLightningPr = $state<string | null>(untrack(() => invoice.lightning_pr || null))
   let currentLiquidAddress = $state<string | null>(untrack(() => invoice.liquid_address || null))
-  let currentBitcoinAddress = $state<string | null>(untrack(() => invoice.bitcoin_chain_address))
-  let currentBitcoinBip21 = $state<string | null>(untrack(() => invoice.bitcoin_chain_bip21))
-  // Tracked apart from currentBitcoinAddress (which merges chain + direct BTC
-  // for the QR): the chain-swap rail is payable regardless of accept_btc, so
-  // availableRails needs to know when the current bitcoin payload is a chain
-  // swap vs a direct address it must gate on accept_btc.
+  let currentBitcoinDirectAddress = $state<string | null>(null)
   let currentBitcoinChainAddress = $state<string | null>(untrack(() => invoice.bitcoin_chain_address))
+  let currentBitcoinChainBip21 = $state<string | null>(untrack(() => invoice.bitcoin_chain_bip21))
+  const currentBitcoinAddress = $derived(currentBitcoinChainAddress ?? currentBitcoinDirectAddress)
 
-  const view = $derived<PayView>(latest ? derivePayView(latest) : { kind: 'waiting' })
+  const view = $derived<PayView>(latest ? derivePayView(latest) : payViewBeforeFirstStatus())
+  const support = $derived(payViewSupport(view))
   // Amount for payloads/Bolt Card. Deliberately NOT `?? invoice.amount_sat`
   // — remaining_amount_sat is always present on InvoiceStatus once polled;
   // null here means "haven't polled yet", not "unknown remaining amount".
@@ -97,9 +100,8 @@
   // Offers can be re-issued with a later expiry; prefer the polled value.
   const expiresAtUnix = $derived(latest?.expires_at_unix ?? invoice.expires_at_unix)
 
-  // Rail-tab gating (review item 1) — accept flags are unknown before the
-  // first poll, so `undefined` reads as accepted (availableRails' default);
-  // the payload-presence check still gates the seed itself.
+  // Rail-tab gating (review item 1). `showsRails(view)` is the outer authority;
+  // these flags decide which payloads are selectable after status is known.
   const rails = $derived(
     availableRails({
       acceptLn: latest?.accept_ln,
@@ -107,7 +109,7 @@
       acceptLiquid: latest?.accept_liquid,
       liquidAddress: currentLiquidAddress,
       acceptBtc: latest?.accept_btc,
-      bitcoinAddress: currentBitcoinAddress,
+      bitcoinAddress: currentBitcoinDirectAddress,
       bitcoinChainAddress: currentBitcoinChainAddress,
     }),
   )
@@ -201,7 +203,9 @@
   // amount isn't known yet, Tap Card must not start a scan (don't throw on
   // a null amount like the pre-rewrite version did) — show a waiting state
   // instead.
-  const boltCardReady = $derived(!!currentLightningPr && !lnRefreshing && remainingAmountSat !== null)
+  const boltCardReady = $derived(
+    showsRails(view) && !!currentLightningPr && !lnRefreshing && remainingAmountSat !== null,
+  )
 
   function stopCardScan() {
     cardAbort?.abort()
@@ -278,8 +282,24 @@
 
   function stopPolling() {
     stopped = true
-    if (pollHandle) clearInterval(pollHandle)
+    clearPollInterval()
     if (tickHandle) clearInterval(tickHandle)
+    onCancelableChange?.(false)
+  }
+
+  function clearPollInterval() {
+    if (pollHandle) clearInterval(pollHandle)
+    pollHandle = undefined
+  }
+
+  function ensurePollInterval() {
+    if (stopped || pollHandle) return
+    pollHandle = setInterval(poll, 3000)
+  }
+
+  function reconcilePollInterval(status: InvoiceStatus, currentView: PayView) {
+    if (shouldPollDetail(status, currentView)) ensurePollInterval()
+    else clearPollInterval()
   }
 
   function giveUpAsNotFound() {
@@ -297,42 +317,34 @@
       // stopped polling while this request was in flight — onTerminal must
       // fire exactly once (CONTRACT 5), so don't let a late response race it.
       if (stopped) return
-      if (!KNOWN_STATUSES.has(status.status)) {
-        notFoundStreak += 1
-        if (notFoundStreak >= MAX_NOT_FOUND_STREAK) giveUpAsNotFound()
-        return
-      }
       notFoundStreak = 0
-      latest = status
 
       // Adopt a fresh Lightning offer, or clear a stale one so it gets
       // re-requested (review item 6 / finding #2 — a partial payment
       // invalidates the full-amount BOLT11 and the server returns
       // lightning_pr=null until POST /lightning issues a new one).
       currentLightningPr = nextLightningPr(currentLightningPr, status)
-      if (status.liquid_address && status.liquid_address !== currentLiquidAddress) {
-        currentLiquidAddress = status.liquid_address
-      }
-      const nextBitcoinAddress = status.bitcoin_chain_address ?? status.bitcoin_address
-      if (nextBitcoinAddress && nextBitcoinAddress !== currentBitcoinAddress) {
-        currentBitcoinAddress = nextBitcoinAddress
-      }
-      if (status.bitcoin_chain_address && status.bitcoin_chain_address !== currentBitcoinChainAddress) {
-        currentBitcoinChainAddress = status.bitcoin_chain_address
-      }
-      const nextBip21 = status.bitcoin_chain_bip21 ?? null
-      if (nextBip21 !== currentBitcoinBip21) {
-        currentBitcoinBip21 = nextBip21
-      }
+      currentLiquidAddress = status.liquid_address
+      const bitcoin = bitcoinPaymentPayloadFromStatus(status)
+      currentBitcoinDirectAddress = bitcoin.directAddress
+      currentBitcoinChainAddress = bitcoin.chainAddress
+      currentBitcoinChainBip21 = bitcoin.chainBip21
+      // Publish the new view only after every payload has been replaced, so a
+      // payable render cannot observe the prior snapshot for one frame.
+      latest = status
+      onCancelableChange?.(isCancelableStatus(status))
 
       void maybeRefreshLightning()
 
       const v = derivePayView(status)
+      if (!showsRails(v)) stopCardScan()
       if (isTerminalView(v)) {
         stopPolling()
         stopCardScan()
         const t = payViewToTerminal(v, status)
         if (t) onTerminal(t)
+      } else {
+        reconcilePollInterval(status, v)
       }
     } catch (err) {
       if (stopped) return
@@ -373,7 +385,7 @@
   // resets, silently killing all polling after the first tick (finding #1).
   $effect(() => {
     untrack(() => {
-      pollHandle = setInterval(poll, 3000)
+      ensurePollInterval()
       // Countdown is DISPLAY ONLY. Expiry is server-authoritative — the poller
       // terminalizes on status==='expired'; we never stop locally on the clock
       // (a fast device clock or an in-progress/settling payment near expiry
@@ -383,9 +395,9 @@
         remainingMs = expiresAtUnix * 1000 - Date.now()
       }, 1000)
       void poll()
-      // Reconstructed invoices seed lightning_pr as '' — fetch immediately
-      // rather than waiting for the first poll's adoption check (fixes
-      // "Lightning blank after reload").
+      // This is intentionally a no-op for the conservative pre-status view.
+      // Once poll() establishes payability, it calls the same helper again and
+      // requests a missing/expired offer without exposing cached instructions.
       void maybeRefreshLightning()
     })
     return () => stopPolling()
@@ -408,10 +420,10 @@
   })
 
   // ---------------------------------------------------------------------
-  // Rail QR payload (CONTRACT 2 builders). Prefers the polled
-  // bitcoin_chain_bip21 over the fallback btcUri — the server re-issues
-  // bip21 with the remaining amount after a partial payment
-  // (src/invoice.rs:925-929).
+  // Rail QR payload (CONTRACT 2 builders). A server-supplied chain BIP21 is
+  // bound to its chain lockup. If the chain offer is withdrawn, direct BTC may
+  // remain, but the old chain address/BIP21 must never be reused or synthesized
+  // with the new remaining amount.
   // ---------------------------------------------------------------------
   const qrValue = $derived.by(() => {
     if (activeTab === 'lightning') return currentLightningPr ?? ''
@@ -420,7 +432,8 @@
       return currentLiquidAddress ? liquidUri(currentLiquidAddress, remainingAmountSat, config.liquid_btc_asset_id) : ''
     }
     if (activeTab === 'bitcoin') {
-      return currentBitcoinAddress ? bitcoinPayload(currentBitcoinAddress, currentBitcoinBip21, remainingAmountSat) : ''
+      const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null
+      return currentBitcoinAddress ? bitcoinPayload(currentBitcoinAddress, bip21, remainingAmountSat) : ''
     }
     return ''
   })
@@ -431,9 +444,12 @@
   // display switches to the remaining amount due (finding #5 / review item 5,
   // mirroring invoice_payment.html:597-600's "{remaining} sat remaining").
   const mainAmount = $derived(
-    view.kind === 'partially_paid' && remainingAmountSat !== null
+    (view.kind === 'partially_paid' || view.kind === 'partially_paid_pending') && remainingAmountSat !== null
       ? `${new Intl.NumberFormat().format(remainingAmountSat)} sat`
       : amountLabel,
+  )
+  const problemView = $derived(
+    view.kind === 'needs_review' || view.kind === 'resolution_pending' || view.kind === 'unknown',
   )
 </script>
 
@@ -455,6 +471,9 @@
         <RefreshCw size={12} class={refreshing ? 'animate-spin' : ''} />
       </button>
     </div>
+    {#if showsRails(view) && support}
+      <p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">{support}</p>
+    {/if}
   </div>
 
   {#if showsRails(view)}
@@ -507,21 +526,21 @@
     <div class="flex flex-col items-center gap-3 py-10 text-center">
       <div
         class={`grid h-16 w-16 place-items-center rounded-full text-3xl ${
-          view.kind === 'needs_review'
+          problemView
             ? 'bg-[#fff0c7] text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]'
             : 'bg-[#d9f3df] text-[#14522d] dark:bg-[#1f3d2a] dark:text-[#8bc8a4]'
         }`}
       >
-        {view.kind === 'needs_review' ? '!' : '✓'}
+        {problemView ? '!' : '✓'}
       </div>
-      {#if view.kind !== 'needs_review'}
+      {#if !problemView}
         <p class="font-display text-5xl tabular-nums tracking-display leading-none text-[#211f1a] dark:text-[#fff6e8]">
           {amountLabel}
         </p>
       {/if}
       <p class={`text-lg font-semibold ${payViewTone(view)}`}>{payViewLabel(view, remainingAmountSat)}</p>
       <p class="text-sm text-[#776b5a] dark:text-[#b9aa91]">
-        {view.kind === 'needs_review' ? 'Settlement is delayed. The operator has been alerted.' : 'Settlement is in progress'}
+        {support ?? 'Settlement status is being checked'}
       </p>
     </div>
   {/if}

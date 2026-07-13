@@ -14,7 +14,7 @@ Review these policy groups before deployment:
 
 - Boltz and Electrum endpoints;
 - claim retry and reconciler/slow-recovery intervals;
-- Bitcoin watcher confirmations and mempool API;
+- Bitcoin and Liquid direct-payment finality thresholds and upstream APIs;
 - accounting tolerances and checkout expiry/grace periods;
 - rate limits, trusted proxies, IP whitelist, and certification scopes;
 - feature gates, especially merchant chain-swap recovery;
@@ -40,3 +40,13 @@ a temporary runtime override.
 Do not enable broad IP or certification bypasses for ordinary internet traffic.
 After every configuration change, call `/ready` and exercise a non-monetary
 preflight before allowing payment traffic.
+
+Direct Bitcoin and Liquid accounting begins at exactly one confirmation. The
+`bitcoin_watcher.confirmations_required` setting (default `3`) and
+`liquid_watcher.finality_confirmations` setting (default `2`) control when the
+already-accounted payment becomes final; both must be nonzero. They do not move
+the accounting boundary and must not be used to infer ambiguous transaction
+absence or eviction.
+An invalid zero threshold closes new admission only for the affected direct
+rail; it does not prevent the process, other rails, status, or recovery paths
+from starting.

@@ -267,8 +267,8 @@ pub async fn get_chain_swap_by_id_for_update<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
-pub async fn latest_payable_chain_swap_for_invoice(
-    pool: &PgPool,
+pub async fn latest_payable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     invoice_id: Uuid,
     amount_sat: i64,
 ) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
@@ -287,7 +287,7 @@ pub async fn latest_payable_chain_swap_for_invoice(
     ))
     .bind(invoice_id)
     .bind(amount_sat)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

@@ -21,6 +21,16 @@ max_sendable_msat = 25000000000
 # Bull's own Liquid Electrum — has been more reliable than Blockstream's.
 liquid_url = "les.bullbitcoin.com:995"
 
+[bitcoin_watcher]
+# Direct Bitcoin accounting starts at one confirmation. This threshold controls
+# when that accounted value becomes final.
+confirmations_required = 3
+
+[liquid_watcher]
+# Direct Liquid accounting starts at one confirmation. This threshold controls
+# when that accounted value becomes final.
+finality_confirmations = 2
+
 [workers]
 enabled = true
 

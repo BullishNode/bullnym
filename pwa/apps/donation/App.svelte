@@ -145,12 +145,14 @@
   const payId = $derived(router.match('/pay/:id')?.id)
 </script>
 
-{#snippet payHeader()}
+{#snippet payHeader(canCancel: boolean)}
   <div class="mb-6 flex w-full justify-start">
     <button
       type="button"
       class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold"
       onclick={backToEntry}
+      disabled={!canCancel}
+      aria-label={canCancel ? 'Back' : 'Back unavailable after payment evidence'}
     >
       ← Back
     </button>

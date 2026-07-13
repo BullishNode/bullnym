@@ -1,4 +1,6 @@
-use sqlx::PgPool;
+use std::collections::HashMap;
+
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 // =====================================================================
@@ -129,6 +131,68 @@ pub struct NewInvoice<'a> {
     pub expires_in_secs: i64,
 }
 
+/// Exact server-owned value used by `presentation_status` and payable top-up
+/// instructions. Active/legacy accounting events contribute, as do verified
+/// provisional direct observations. Superseded or unverified evidence never
+/// contributes. A missing map entry means the invoice has no event rows; the
+/// caller may fall back to its accounting cache for legacy compatibility.
+pub async fn invoice_presentation_received_sats<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_ids: &[Uuid],
+) -> Result<HashMap<Uuid, i64>, sqlx::Error> {
+    if invoice_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT e.invoice_id, COALESCE(SUM(e.amount_sat), 0)::BIGINT \
+         FROM invoice_payment_events e \
+         LEFT JOIN invoice_payment_observations o ON o.id = e.observation_id \
+         WHERE e.invoice_id = ANY($1::UUID[]) \
+           AND e.accounting_state <> 'superseded' \
+           AND ( \
+             e.accounting_state IN ('active', 'legacy_unverified') \
+             OR ( \
+               e.source IN ('bitcoin_direct', 'liquid_direct') \
+               AND e.verification_state = 'verified' \
+               AND o.last_seen_state = 'seen_unconfirmed' \
+             ) \
+           ) \
+         GROUP BY e.invoice_id",
+    )
+    .bind(invoice_ids)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Single-invoice transaction-aware counterpart used while an offer creator
+/// owns the invoice projection advisory boundary. `None` means no contributing
+/// event row exists, preserving the legacy cached-value fallback at callers.
+pub async fn invoice_presentation_received_sat<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(e.amount_sat), 0)::BIGINT \
+         FROM invoice_payment_events e \
+         LEFT JOIN invoice_payment_observations o ON o.id = e.observation_id \
+         WHERE e.invoice_id = $1 \
+           AND e.accounting_state <> 'superseded' \
+           AND ( \
+             e.accounting_state IN ('active', 'legacy_unverified') \
+             OR ( \
+               e.source IN ('bitcoin_direct', 'liquid_direct') \
+               AND e.verification_state = 'verified' \
+               AND o.last_seen_state = 'seen_unconfirmed' \
+             ) \
+           ) \
+         GROUP BY e.invoice_id",
+    )
+    .bind(invoice_id)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Insert a new invoice row. The caller is responsible for populating
 /// `liquid_address` when `accept_ln` or `accept_liquid` is TRUE — the
 /// `invoices_ln_or_liquid_addr_chk` constraint requires it at INSERT
@@ -155,12 +219,12 @@ pub async fn insert_invoice(
              public_description, invoice_number, \
              accept_btc, accept_ln, accept_liquid, \
              bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
-             public_slug, expires_at) \
+             public_slug, expires_at, presentation_status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  NOW() + ($8 || ' seconds')::interval, $9, $10, \
                  $11, $12, $13, $14, $15, $16, $17, \
                  CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
-                 $20, NOW() + ($19 || ' seconds')::interval) \
+                 $20, NOW() + ($19 || ' seconds')::interval, 'unpaid') \
          RETURNING {INVOICE_COLUMNS}"
     ))
     .bind(invoice.nym_owner)
@@ -251,8 +315,8 @@ pub async fn delete_unpaid_invoice_without_swaps(
 /// Predicate uses `($p::TYPE IS NULL OR ...)` so the planner can skip the
 /// filter entirely when not provided. The composite index
 /// `invoices_npub_owner_status_created_idx` services the ORDER BY.
-pub async fn list_invoices_by_npub(
-    pool: &PgPool,
+pub async fn list_invoices_by_npub<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     npub_owner: &str,
     status_filter: Option<&str>,
     page: i64,
@@ -270,14 +334,15 @@ pub async fn list_invoices_by_npub(
     .bind(status_filter)
     .bind(page_size)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
-/// Address-keyed scan for the chain watcher: every unpaid/in_progress
-/// invoice with a settable Liquid address, regardless of nym_owner (so
-/// linked + unlinked are covered uniformly) and regardless of how the
-/// address was sourced (descriptor allocator OR wallet-supplied).
+/// Address-keyed scan for the chain watcher: every payable invoice plus every
+/// non-superseded direct-Liquid observation/event that still needs permanent
+/// reorg monitoring. Cancelled/expired rows remain outside this #28 lifecycle.
+/// Linked and unlinked invoices are covered uniformly regardless of whether
+/// the address came from the descriptor allocator or the wallet.
 ///
 /// Watchers page deterministically through a process-local scan epoch. The
 /// epoch captures PostgreSQL time once, then keysets on `(created_at, id)` so
@@ -290,12 +355,31 @@ pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
             GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
             liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
      FROM invoices \
-     WHERE (status IN ('unpaid', 'in_progress', 'partially_paid') \
-            OR (origin = 'checkout' AND status = 'underpaid')) \
+     WHERE status NOT IN ('cancelled', 'expired') \
+       AND ( \
+             ( \
+               (status IN ('unpaid', 'in_progress', 'partially_paid') \
+                OR (origin = 'checkout' AND status = 'underpaid')) \
+               AND expires_at + ($1 || ' seconds')::interval > $2::timestamptz \
+             ) \
+             OR direct_settlement_status IN ('pending', 'resolution_pending') \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_observations direct_observation \
+                  WHERE direct_observation.invoice_id = invoices.id \
+                    AND direct_observation.source = 'liquid_direct' \
+                    AND direct_observation.last_seen_state <> 'superseded' \
+             ) \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_events direct_event \
+                  WHERE direct_event.invoice_id = invoices.id \
+                    AND direct_event.source = 'liquid_direct' \
+                    AND direct_event.accounting_state <> 'superseded' \
+                    AND direct_event.superseded_by_event_id IS NULL \
+             ) \
+           ) \
        AND accept_liquid = TRUE \
        AND liquid_address IS NOT NULL \
        AND liquid_blinding_key_hex IS NOT NULL \
-       AND expires_at + ($1 || ' seconds')::interval > $2::timestamptz \
        AND created_at <= $2::timestamptz \
        AND ( \
              $3::timestamptz IS NULL \
@@ -668,8 +752,8 @@ pub async fn mark_missing_bitcoin_payment_observations_not_seen(
     .map(|r| r.rows_affected())
 }
 
-pub async fn list_invoice_payment_observations(
-    pool: &PgPool,
+pub async fn list_invoice_payment_observations<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     invoice_id: Uuid,
     limit: i64,
 ) -> Result<Vec<InvoicePaymentObservation>, sqlx::Error> {
@@ -687,7 +771,7 @@ pub async fn list_invoice_payment_observations(
     )
     .bind(invoice_id)
     .bind(limit.clamp(0, 50))
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
@@ -794,6 +878,62 @@ fn resolve_invoice_status(
     }
 }
 
+fn resolve_invoice_presentation_status(
+    amount_sat: i64,
+    events: &[(String, i64)],
+    tolerances: InvoiceAccountingTolerances,
+) -> &'static str {
+    let mut received_sat = 0_i64;
+    let mut status = "unpaid";
+    for (rail, event_amount_sat) in events {
+        received_sat = received_sat.saturating_add(*event_amount_sat);
+        let tolerance_sat = payment_tolerance_sat_for_amount(amount_sat, rail, tolerances);
+        let computed = if received_sat > amount_sat {
+            "overpaid"
+        } else if amount_sat.saturating_sub(received_sat) <= tolerance_sat {
+            "payment_received"
+        } else {
+            "partial"
+        };
+        status = if matches!(status, "payment_received" | "overpaid") && computed == "partial" {
+            status
+        } else {
+            computed
+        };
+    }
+    status
+}
+
+fn compose_invoice_settlement_status(direct: &str, swap: &str) -> &'static str {
+    if swap == "claim_stuck" {
+        "claim_stuck"
+    } else if swap == "failed" {
+        "failed"
+    } else if swap == "refunded" {
+        "refunded"
+    } else if direct == "resolution_pending" {
+        "resolution_pending"
+    } else if direct == "pending" || swap == "pending" {
+        "pending"
+    } else if direct == "settled" || swap == "settled" {
+        "settled"
+    } else {
+        "none"
+    }
+}
+
+async fn lock_invoice_lightning_projection(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let key = super::invoice_lightning_lock_key(invoice_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub async fn record_invoice_payment(
     pool: &PgPool,
     id: Uuid,
@@ -803,6 +943,7 @@ pub async fn record_invoice_payment(
     evidence.validate()?;
 
     let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, id).await?;
     let inv = sqlx::query_as::<_, Invoice>(&format!(
         "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1 FOR UPDATE"
     ))
@@ -968,6 +1109,28 @@ pub async fn record_invoice_payment(
     .fetch_one(&mut *tx)
     .await?;
 
+    let presentation_events: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT e.rail, e.amount_sat \
+         FROM invoice_payment_events e \
+         LEFT JOIN invoice_payment_observations o ON o.id = e.observation_id \
+         WHERE e.invoice_id = $1 \
+           AND e.accounting_state <> 'superseded' \
+           AND ( \
+             e.accounting_state IN ('active', 'legacy_unverified') \
+             OR ( \
+               e.source IN ('bitcoin_direct', 'liquid_direct') \
+               AND e.verification_state = 'verified' \
+               AND o.last_seen_state = 'seen_unconfirmed' \
+             ) \
+           ) \
+         ORDER BY e.accounting_sequence",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let presentation_status =
+        resolve_invoice_presentation_status(inv.amount_sat, &presentation_events, tolerances);
+
     let rails: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT rail FROM invoice_payment_events \
          WHERE invoice_id = $1 \
@@ -997,12 +1160,12 @@ pub async fn record_invoice_payment(
     } else {
         "none"
     };
-    let countable_direct_remains: bool = sqlx::query_scalar(
+    let direct_evidence_remains: bool = sqlx::query_scalar(
         "SELECT EXISTS ( \
             SELECT 1 FROM invoice_payment_events \
             WHERE invoice_id = $1 \
               AND source IN ('bitcoin_direct', 'liquid_direct') \
-              AND accounting_state IN ('active', 'legacy_unverified') \
+              AND accounting_state <> 'superseded' \
         )",
     )
     .bind(id)
@@ -1011,33 +1174,39 @@ pub async fn record_invoice_payment(
     let direct_settlement_status = if matches!(evidence.source, "bitcoin_direct" | "liquid_direct")
     {
         payment_settlement_status
-    } else if is_boltz_settlement && !countable_direct_remains {
+    } else if is_boltz_settlement && !direct_evidence_remains {
         "none"
     } else {
         inv.direct_settlement_status.as_str()
     };
     let swap_settlement_status = if is_boltz_settlement {
-        payment_settlement_status
+        // `record_invoice_payment` is reached only after the merchant-side
+        // Boltz claim boundary succeeds. That component is settled even when
+        // this payment is only a partial contribution to the invoice total.
+        "settled"
     } else {
         inv.swap_settlement_status.as_str()
     };
-    let settlement_status = payment_settlement_status;
+    let settlement_status =
+        compose_invoice_settlement_status(direct_settlement_status, swap_settlement_status);
 
     sqlx::query(
         "UPDATE invoices SET \
             status = $2, \
-            paid_via = $3, \
-            paid_amount_sat = $4, \
-            settlement_status = $5, \
-            direct_settlement_status = $6, \
-            swap_settlement_status = $7, \
+            presentation_status = $3, \
+            paid_via = $4, \
+            paid_amount_sat = $5, \
+            settlement_status = $6, \
+            direct_settlement_status = $7, \
+            swap_settlement_status = $8, \
             direct_payment_projection_version = direct_payment_projection_version + \
-                CASE WHEN $8 OR direct_settlement_status IS DISTINCT FROM $6 THEN 1 ELSE 0 END, \
+                CASE WHEN $9 OR direct_settlement_status IS DISTINCT FROM $7 THEN 1 ELSE 0 END, \
             paid_at = CASE WHEN $2 IN ('paid', 'overpaid') THEN COALESCE(paid_at, NOW()) ELSE paid_at END \
          WHERE id = $1",
     )
     .bind(id)
     .bind(new_status)
+    .bind(presentation_status)
     .bind(paid_via)
     .bind(received_sat)
     .bind(settlement_status)
@@ -1065,9 +1234,9 @@ pub async fn record_invoice_payment(
                   from_invoice_status, to_invoice_status, \
                   from_paid_amount_sat, to_paid_amount_sat, metadata) \
              VALUES ($1, $2, $3, $4, $5, 0, 'superseded', $6, $7, $8, $8, \
-                     $9, 'superseded', 'boltz_supersession', $10, $10, \
-                     $11, $12, $13, $14, $15, $16, \
-                     jsonb_build_object('superseded_by_payment_event_id', $17::TEXT)) \
+                     $9, 'superseded', 'boltz_supersession', $10, $11, \
+                     $12, $13, $14, $15, $16, $17, \
+                     jsonb_build_object('superseded_by_payment_event_id', $18::TEXT)) \
              ON CONFLICT (idempotency_key) DO NOTHING",
         )
         .bind(idempotency_key)
@@ -1080,6 +1249,7 @@ pub async fn record_invoice_payment(
         .bind(observation_verification)
         .bind(&superseded.from_event_state)
         .bind(inv.presentation_status.as_deref())
+        .bind(presentation_status)
         .bind(&inv.settlement_status)
         .bind(settlement_status)
         .bind(&inv.status)
@@ -1112,6 +1282,27 @@ pub async fn invoice_payment_event_exists(
     .await
 }
 
+/// Transaction ids already accounted through a Boltz settlement for this
+/// invoice. A Liquid claim can pay the same invoice address and therefore also
+/// appear in direct script history; watcher discovery must exclude that tx
+/// before constructing direct observations or it can double count the claim.
+pub async fn invoice_boltz_settlement_txids(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT LOWER(txid) \
+         FROM invoice_payment_events \
+         WHERE invoice_id = $1 \
+           AND source IN ('lightning_boltz_reverse', 'bitcoin_boltz_chain') \
+           AND txid IS NOT NULL \
+         ORDER BY LOWER(txid)",
+    )
+    .bind(invoice_id)
+    .fetch_all(pool)
+    .await
+}
+
 fn chrono_like_unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1134,33 +1325,54 @@ pub async fn mark_invoice_in_progress_for_component(
     component: InvoiceInProgressComponent,
 ) -> Result<bool, sqlx::Error> {
     let is_direct = component == InvoiceInProgressComponent::Direct;
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, id).await?;
     let flipped: Option<bool> = sqlx::query_scalar(
         "WITH locked AS MATERIALIZED ( \
-             SELECT status FROM invoices WHERE id = $1 FOR UPDATE \
+             SELECT status, direct_settlement_status, swap_settlement_status \
+             FROM invoices WHERE id = $1 FOR UPDATE \
+         ), next_components AS MATERIALIZED ( \
+             SELECT status, \
+                    CASE WHEN $2 THEN 'pending' ELSE direct_settlement_status END \
+                        AS direct_status, \
+                    CASE WHEN $2 THEN swap_settlement_status ELSE 'pending' END \
+                        AS swap_status \
+             FROM locked \
          ), updated AS ( \
              UPDATE invoices i SET \
-                 status = CASE WHEN locked.status = 'unpaid' THEN 'in_progress' ELSE i.status END, \
-                 settlement_status = 'pending', \
-                 direct_settlement_status = CASE \
-                     WHEN $2 THEN 'pending' ELSE i.direct_settlement_status END, \
-                 swap_settlement_status = CASE \
-                     WHEN $2 THEN i.swap_settlement_status ELSE 'pending' END, \
+                 status = CASE WHEN next_components.status = 'unpaid' \
+                               THEN 'in_progress' ELSE i.status END, \
+                 settlement_status = CASE \
+                     WHEN next_components.swap_status IN ('claim_stuck', 'failed', 'refunded') \
+                         THEN next_components.swap_status \
+                     WHEN next_components.direct_status = 'resolution_pending' \
+                         THEN 'resolution_pending' \
+                     WHEN next_components.direct_status = 'pending' \
+                          OR next_components.swap_status = 'pending' THEN 'pending' \
+                     WHEN next_components.direct_status = 'settled' \
+                          OR next_components.swap_status = 'settled' THEN 'settled' \
+                     ELSE 'none' END, \
+                 direct_settlement_status = next_components.direct_status, \
+                 swap_settlement_status = next_components.swap_status, \
                  direct_payment_projection_version = i.direct_payment_projection_version + \
                      CASE WHEN $2 AND i.direct_settlement_status IS DISTINCT FROM 'pending' \
                           THEN 1 ELSE 0 END \
-             FROM locked \
+             FROM next_components \
              WHERE i.id = $1 \
-               AND i.status NOT IN ( \
-                   'paid', 'underpaid', 'overpaid', 'expired', 'cancelled' \
+               AND i.status NOT IN ('expired', 'cancelled') \
+               AND ( \
+                   NOT $2 \
+                   OR i.status NOT IN ('paid', 'underpaid', 'overpaid') \
                ) \
-             RETURNING locked.status = 'unpaid' \
+             RETURNING next_components.status = 'unpaid' \
          ) \
          SELECT * FROM updated",
     )
     .bind(id)
     .bind(is_direct)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(flipped.unwrap_or(false))
 }
 
@@ -1180,15 +1392,27 @@ pub async fn mark_invoice_settlement_status(
             "unknown invoice settlement_status: {settlement_status}"
         )));
     }
-    sqlx::query(
-        "UPDATE invoices SET settlement_status = $2, swap_settlement_status = $2 \
-         WHERE id = $1 AND status NOT IN ('paid', 'underpaid', 'overpaid', 'expired', 'cancelled')",
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, id).await?;
+    let rows = sqlx::query(
+        "UPDATE invoices SET \
+             settlement_status = CASE \
+                 WHEN $2 IN ('claim_stuck', 'failed', 'refunded') THEN $2 \
+                 WHEN direct_settlement_status = 'resolution_pending' \
+                     THEN 'resolution_pending' \
+                 WHEN direct_settlement_status = 'pending' OR $2 = 'pending' THEN 'pending' \
+                 WHEN direct_settlement_status = 'settled' OR $2 = 'settled' THEN 'settled' \
+                 ELSE 'none' END, \
+             swap_settlement_status = $2 \
+         WHERE id = $1 AND status NOT IN ('expired', 'cancelled')",
     )
     .bind(id)
     .bind(settlement_status)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map(|r| r.rows_affected())
+    .map(|result| result.rows_affected())?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 pub async fn mark_invoice_settlement_status_for_swap(
@@ -1204,41 +1428,72 @@ pub async fn mark_invoice_settlement_status_for_swap(
             "unknown invoice settlement_status: {settlement_status}"
         )));
     }
-    sqlx::query(
-        "UPDATE invoices i SET settlement_status = $2, swap_settlement_status = $2 \
+    let mut tx = pool.begin().await?;
+    let invoice_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT invoice_id FROM swap_records WHERE id = $1 AND invoice_id IS NOT NULL",
+    )
+    .bind(swap_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let Some(invoice_id) = invoice_id else {
+        tx.commit().await?;
+        return Ok(0);
+    };
+    lock_invoice_lightning_projection(&mut tx, invoice_id).await?;
+    let rows = sqlx::query(
+        "UPDATE invoices i SET \
+             settlement_status = CASE \
+                 WHEN $2 IN ('claim_stuck', 'failed', 'refunded') THEN $2 \
+                 WHEN i.direct_settlement_status = 'resolution_pending' \
+                     THEN 'resolution_pending' \
+                 WHEN i.direct_settlement_status = 'pending' OR $2 = 'pending' THEN 'pending' \
+                 WHEN i.direct_settlement_status = 'settled' OR $2 = 'settled' THEN 'settled' \
+                 ELSE 'none' END, \
+             swap_settlement_status = $2 \
          FROM swap_records s \
          WHERE s.id = $1 \
            AND s.invoice_id = i.id \
-           AND i.status NOT IN ('paid', 'underpaid', 'overpaid', 'expired', 'cancelled')",
+           AND i.status NOT IN ('expired', 'cancelled')",
     )
     .bind(swap_id)
     .bind(settlement_status)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map(|r| r.rows_affected())
+    .map(|result| result.rows_affected())?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
-/// Cancel an unpaid invoice (recipient-initiated via signed
-/// `invoice-cancel`). Idempotent: re-call on a row that's already
-/// non-unpaid returns 0 rows affected. Caller verifies the Schnorr
+/// Cancel an invoice only while every server-owned projection proves that it
+/// is fresh and unpaid (recipient-initiated via signed `invoice-cancel`).
+/// Idempotent: re-call on a row that's already non-cancellable returns 0 rows
+/// affected. Caller verifies the Schnorr
 /// signature AND that the invoice's nym maps to the verifying npub
 /// upstream — this fn does not re-check ownership.
 pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<(u64, String), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, id).await?;
     let result = sqlx::query(
         "UPDATE invoices SET status = 'cancelled', cancelled_at = NOW() \
-         WHERE id = $1 AND status = 'unpaid'",
+         WHERE id = $1 \
+           AND status = 'unpaid' \
+           AND presentation_status = 'unpaid' \
+           AND settlement_status = 'none'",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let rows = result.rows_affected();
     if rows == 1 {
+        tx.commit().await?;
         return Ok((rows, "cancelled".to_string()));
     }
     let status = sqlx::query_scalar::<_, String>("SELECT status FROM invoices WHERE id = $1")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok((rows, status))
 }
 
@@ -1411,24 +1666,29 @@ where
     )))
 }
 
-/// Read the most recent BOLT11 for an invoice (latest swap_records row
-/// whose `invoice_id = $1`). Returns the invoice/BOLT11 string, or None
-/// if no Lightning offer has been created yet for this invoice.
+/// Read the most recent BOLT11 for an invoice only while that newest reverse
+/// swap is still pending. A terminal newest row deliberately returns `None`;
+/// filtering pending rows before ordering would incorrectly resurrect an older
+/// offer after the provider terminalized its replacement.
 ///
 /// Service path: the status endpoint surfaces this so the page can render
 /// a fresh QR after a rate refresh creates a new swap.
-pub async fn latest_lightning_pr_for_invoice(
-    pool: &PgPool,
+pub async fn latest_lightning_pr_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     invoice_id: Uuid,
 ) -> Result<Option<(String, i64)>, sqlx::Error> {
     let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT invoice, amount_sat FROM swap_records \
-         WHERE invoice_id = $1 \
-         ORDER BY created_at DESC \
-         LIMIT 1",
+        "SELECT invoice, amount_sat FROM ( \
+             SELECT invoice, amount_sat, status \
+             FROM swap_records \
+             WHERE invoice_id = $1 \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1 \
+         ) latest \
+         WHERE status = 'pending'",
     )
     .bind(invoice_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row)
 }
@@ -1449,6 +1709,20 @@ mod status_tests {
         assert!(LIQUID_WATCHER_PAGE_SQL
             .contains("expires_at + ($1 || ' seconds')::interval > $2::timestamptz"));
         assert!(!LIQUID_WATCHER_PAGE_SQL.contains("NOW()"));
+    }
+
+    #[test]
+    fn liquid_watcher_keeps_all_live_direct_evidence_in_cohort() {
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
+        assert!(LIQUID_WATCHER_PAGE_SQL
+            .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_observation.source = 'liquid_direct'"));
+        assert!(
+            LIQUID_WATCHER_PAGE_SQL.contains("direct_observation.last_seen_state <> 'superseded'")
+        );
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.source = 'liquid_direct'"));
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.accounting_state <> 'superseded'"));
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.superseded_by_event_id IS NULL"));
     }
 
     #[test]

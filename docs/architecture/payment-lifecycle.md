@@ -191,21 +191,26 @@ Payment observations are non-accounting evidence. They exist so users and
 operators can distinguish "nothing seen" from "payment seen, waiting for
 confirmations."
 
-Current observation scope:
+Current observation scope covers exact direct Bitcoin and Liquid invoice
+outputs:
 
-- direct Bitcoin invoice outputs only
-- source: `bitcoin_direct`
-- rail: `bitcoin`
-- event key: `bitcoin_direct:<txid>:<vout>`
+- sources: `bitcoin_direct` and `liquid_direct`
+- rails: `bitcoin` and `liquid`
+- event keys: `<source>:<txid>:<vout>`
 
 Observation states:
 
 - `seen_unconfirmed`: the output is in mempool and has zero confirmations.
-- `awaiting_confirmations`: the output is confirmed but below the configured
-  confirmation threshold.
-- `counted`: the watcher saw enough confirmations and recorded the accounting
-  event through `invoice_payment_events`.
-- `not_seen`: a later watcher poll no longer saw a previously uncounted output.
+- `awaiting_confirmations`: the output has at least one confirmation, activates
+  its exact accounting event, and remains below configured finality.
+- `counted`: the same active accounting event reached configured finality.
+- `resolution_pending`: explicit authoritative regression invalidated prior
+  evidence and requires visible resolution.
+
+The live watchers do not create a `not_seen` transition from address-history
+omission, tx 404, timeout, incomplete data, cancellation, or failover. Legacy
+rows can retain that historical token, but ambiguous absence awaits its
+separately approved policy.
 
 Observations must never be summed into `paid_amount_sat`, must never set
 `paid_via`, and must never set `paid_at`. They are status evidence only.
@@ -227,6 +232,13 @@ Payment status is the product/accounting state of the session.
 Payment Page and POS can present simpler copy, but they should not discard the
 underlying accounting state.
 
+`presentation_status` is an independent server-computed money projection:
+`unpaid`, `partial`, `payment_received`, or `overpaid`. It combines active and
+verified provisional value using server tolerances. Clients must not reproduce
+the amount or tolerance calculation. Unknown/null rollout values hide payment
+instructions, disable cancellation, remain non-final, and continue detail
+polling.
+
 Lightning Address does not expose invoice payment statuses.
 
 ## Settlement Status
@@ -236,21 +248,19 @@ gap between payer payment and merchant receipt.
 
 - `none`: no settlement workflow is active or needed.
 - `pending`: payment is detected and a claim/settlement workflow is in flight.
-- `settled`: Bullnym successfully broadcast the merchant-side claim or recorded
-  a direct payment under the rail's current detection policy.
-- `resolution_pending`: durable direct-payment evidence was invalidated and the
-  dormant lifecycle projection has not yet resolved it. Live watcher adoption
-  and public presentation ship in the follow-up issue-#28 slice.
+- `settled`: a direct payment reached configured finality, or a swap reached
+  its separately documented current settlement boundary.
+- `resolution_pending`: explicit durable direct-payment evidence regressed and
+  the outcome is visibly being resolved.
 - `claim_stuck`: the fast claim retry budget was exhausted. Slow recovery
   continues for funded swaps; operators must still alert and investigate.
 - `refunded`: Boltz refunded the lockup before merchant claim; incident.
 - `failed`: unrecoverable or explicitly failed settlement path.
 
-Direct Bitcoin is credited after its configured confirmation policy. Direct
-Liquid is currently credited when the output appears in Electrum scripthash
-history; there is no configurable Liquid confirmation gate. Boltz claim paths
-currently mark settlement after a successful broadcast, before confirmation.
-These implementation boundaries must not be described as stronger finality.
+Direct Bitcoin and Liquid activate accounting at exactly one confirmation and
+reach finality at configurable nonzero thresholds (defaults three and two).
+Boltz claim paths still mark settlement after successful broadcast, before
+confirmation. These distinct boundaries must not be described as equivalent.
 
 ## Tolerance Policy
 
@@ -374,11 +384,11 @@ Clients must use invoice-scoped Liquid addresses. Address reuse is a client
 hygiene issue, but server documentation and tests should make the expected
 usage clear.
 
-The current watcher credits a matching output returned by Liquid Electrum
-scripthash history, including mempool history. It does not maintain a
-confirmation observation state comparable to direct Bitcoin. Clients and
-operators must therefore treat direct Liquid credit as pre-confirmation state
-until a future confirmation policy is implemented.
+The Liquid watcher preserves signed Electrum height and canonical block
+identity, decodes and unblinds the exact matching L-BTC output, and retains a
+durable reversible observation. A verified mempool output contributes only to
+presentation; one confirmation activates exact accounting; the configurable
+nonzero threshold (two by default) controls finality.
 
 ## Direct Bitcoin
 
@@ -393,7 +403,9 @@ Requirements:
 - multiple txs can pay one invoice
 - duplicate old events must not block later events
 - mempool sightings can mark `in_progress`
-- configured confirmations are required before recording payment events
+- zero-confirmation evidence contributes only to presentation
+- one confirmation activates the exact payment event
+- the configurable nonzero threshold (three by default) controls finality
 
 ## Cancellation
 

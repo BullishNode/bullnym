@@ -34,8 +34,21 @@ export interface CreateInvoiceResponse {
 }
 
 /** Response of GET /api/v1/invoices/:id/status (InvoiceStatusResponse). */
+export type PresentationStatus = 'unpaid' | 'partial' | 'payment_received' | 'overpaid' | string
+export type SettlementStatus =
+  | 'none'
+  | 'pending'
+  | 'settled'
+  | 'resolution_pending'
+  | 'claim_stuck'
+  | 'refunded'
+  | 'failed'
+  | string
+
 export interface InvoiceStatus {
   status:
+    | 'unpaid'
+    | 'in_progress'
     | 'pending'
     | 'partially_paid'
     | 'paid'
@@ -44,8 +57,11 @@ export interface InvoiceStatus {
     | 'expired'
     | 'cancelled'
     | string
+  /** Server-computed amount/tolerance projection. Null is a conservative
+   * rollout/unknown state, never an alias for `unpaid`. */
+  presentation_status: PresentationStatus | null
   pricing_mode: string
-  settlement_status: string
+  settlement_status: SettlementStatus
   amount_sat: number
   fiat_amount_minor: number | null
   fiat_currency: string | null

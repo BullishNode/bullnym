@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::mark_user_used;
@@ -82,9 +82,11 @@ impl FromStr for SwapStatus {
 
 // --- Address & swap key allocation ---
 
-pub async fn next_swap_key_index(pool: &PgPool) -> Result<u64, sqlx::Error> {
+pub async fn next_swap_key_index<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+) -> Result<u64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as("SELECT nextval('swap_key_seq')")
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     Ok(row.0 as u64)
 }
@@ -161,6 +163,19 @@ pub struct NewSwapRecord<'a> {
 
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    record_swap_in_tx(&mut tx, swap).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Transaction-aware swap insert used when the caller already owns an invoice
+/// serialization boundary. Keeping allocation, provider result persistence,
+/// and invoice revalidation on that one connection avoids nested-pool
+/// starvation under concurrent lazy offer creation.
+pub async fn record_swap_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    swap: &NewSwapRecord<'_>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
@@ -180,12 +195,11 @@ pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), 
     .bind(swap.invoice_id)
     .bind(swap.key_index)
     .bind(swap.root_fingerprint)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if let Some(nym) = swap.nym {
-        mark_user_used(&mut *tx, nym).await?;
+        mark_user_used(&mut **tx, nym).await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 

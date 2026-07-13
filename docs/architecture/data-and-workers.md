@@ -11,9 +11,9 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, legacy read-only media hashes, descriptor, address cursor, alias, and archive state. |
 | `invoices` | Payment sessions | Stores checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
 | `invoice_payment_events` | Accounting | Idempotent payment evidence keyed by rail-specific event keys, with explicit countable/inactive/superseded state and stable accounting order. |
-| `invoice_payment_observations` | Non-accounting evidence | Durable direct-output identity and lifecycle evidence. The live watcher currently writes Bitcoin observations; migration 047 also prepares exact Liquid evidence for the later watcher-adoption slice. |
+| `invoice_payment_observations` | Non-accounting evidence | Durable exact Bitcoin and Liquid direct-output identity, confirmation, block, verification, and lifecycle evidence written by both live watchers. |
 | `invoice_direct_scan_heads` | Direct-payment ordering | One bounded generation row per invoice/source so an older network completion cannot overwrite a newer-started scan. |
-| `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence for direct observation/accounting changes. The dormant reducer writes test/future-adoption transitions, while the live compatibility writer records Boltz supersession immediately. |
+| `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence written atomically by the live direct-payment reducer and by compatibility-safe Boltz supersession. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
 | `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
@@ -58,11 +58,11 @@ Bitcoin chain-swap claims.
 
 Migration 047 adds separate `direct_settlement_status` and
 `swap_settlement_status` component caches. The existing top-level
-`settlement_status` remains the live compatibility projection until watcher
-adoption; compatibility writers preserve their existing last-writer behavior.
-The dormant reducer computes the future aggregate from `none`, `pending`,
-`settled`, `resolution_pending`, `claim_stuck`, `refunded`, and `failed`, with
-existing swap incident tokens taking priority.
+`settlement_status` is their live public aggregate. Direct watcher writes run
+through the transactional reducer; swap compatibility writers maintain their
+own component. The aggregate uses `none`, `pending`, `settled`,
+`resolution_pending`, `claim_stuck`, `refunded`, and `failed`, with existing
+swap incident tokens taking priority.
 
 ## Payment Evidence
 
@@ -74,10 +74,11 @@ status evidence only and must never update `paid_amount_sat`, `paid_via`, or
 
 Migration 047 separates direct-payment presentation, accounting activation, and
 operational finality in durable schema. Existing direct events remain countable
-as `legacy_unverified`; the compatibility writers tag new direct events the
-same way until the follow-up watcher slice positively revalidates them through
-the dormant transactional reducer. The migration does not by itself change the
-public invoice contract or activate promotion/demotion workers.
+as `legacy_unverified` until a live watcher positively revalidates them. Both
+direct watchers reserve a database generation before chain I/O and atomically
+apply verified observation, event, transition, presentation, settlement, and
+accounting projections. Omission from address history is not invalidation
+evidence; the unresolved ambiguous-absence policy remains disabled.
 
 ## Worker responsibilities
 
@@ -89,8 +90,8 @@ public invoice contract or activate promotion/demotion workers.
 | Slow recovery | funded `claim_stuck` rows | Revive claims on a long exponential backoff after the fast budget is exhausted. |
 | Settlement repair | claimed reverse and chain swaps | Idempotently recreate a missing invoice payment event after a crash between claim and invoice updates. |
 | Payment Page OG reconciler | live `payment_page` rows | Generate versioned, content-addressed social cards; backfill legacy rows; retry render/write failures; and verify referenced files exist on the serving host. |
-| Liquid watcher | persisted blinded destinations | Detect matching Liquid outputs and advance descriptor observations. |
-| Bitcoin watcher | direct-Bitcoin invoice destinations | Persist observations, count outputs after the configured confirmation threshold, and detect disappearance before credit. |
+| Liquid watcher | persisted blinded destinations | Preserve signed Electrum heights and block identity, verify exact LBTC outputs, present at zero confirmations, account at one, and track configured finality or explicit reorg evidence. |
+| Bitcoin watcher | direct-Bitcoin invoice destinations and known observations | Use address history for discovery plus tx-specific follow-up, present at zero confirmations, account at one, and track configured finality or explicit block regression. |
 | GC | terminal and rate-limit rows | Apply retention and partial-checkout expiry policies. |
 
 Provider webhooks are latency hints, not the only recovery trigger. Reconciler
@@ -163,6 +164,9 @@ evidence proves an outcome.
 
 The claim paths mark swaps claimed and update invoice accounting after a
 successful transaction broadcast; they do not wait for a confirmation. Direct
-Liquid is credited from Electrum history, including mempool transactions.
-Direct Bitcoin alone has a modeled confirmation threshold and non-accounting
-observations. See the [trust model](trust-model.md) for the residual risk.
+Bitcoin and Liquid instead present verified mempool outputs without accounting,
+activate exact accounting at one confirmation, and remain settlement-pending
+until configured finality (defaults: three Bitcoin, two Liquid). Explicit block
+regression can atomically demote or re-observe the same evidence while retaining
+append-only audit history. Ambiguous absence does nothing until its separate
+threshold is approved. See the [trust model](trust-model.md) for residual risk.

@@ -7,7 +7,7 @@
 //! - `script_matches_pubkey` — P2WPKH match against the tx output scriptpubkey
 //! - `ElectrumClient` — raw-tx fetch (cached) + unspent check (uncached)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -174,6 +174,53 @@ impl ParsedOutpoint {
 
 // --- Electrum backend ---
 
+/// One tx-specific result from an authoritative Liquid script-history read.
+/// Electrum uses non-positive signed heights for mempool entries; preserving
+/// that sign is required so the watcher cannot accidentally count mempool
+/// evidence as confirmed accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiquidHistoryEntry {
+    pub txid: String,
+    pub height: i32,
+    pub block_hash: Option<String>,
+}
+
+/// A complete Liquid history view obtained through one Electrum connection.
+/// `authority` is a stable digest of the configured endpoint, never the URL
+/// itself, so credentials embedded in an operator URL cannot reach the DB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiquidHistorySnapshot {
+    pub authority: String,
+    pub tip_height: i32,
+    pub entries: Vec<LiquidHistoryEntry>,
+    /// Current canonical hashes for every history height and every stored
+    /// prior-positive height requested by the caller that was still available
+    /// at this tip. The map is anchored by the same authority/history/tip
+    /// consistency check as `entries`.
+    pub anchored_block_hashes: BTreeMap<i32, String>,
+}
+
+/// Hard per-invoice bounds for the high-level authoritative snapshot. The
+/// snapshot is all-or-nothing: exceeding either cap returns `Incomplete`
+/// before header fanout, and callers must not apply a scan generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiquidHistorySnapshotLimits {
+    pub max_history_entries: usize,
+    pub max_block_heights: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidHistorySnapshotLimit {
+    HistoryEntries { observed: usize, limit: usize },
+    BlockHeights { observed: usize, limit: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiquidHistorySnapshotOutcome {
+    Complete(LiquidHistorySnapshot),
+    Incomplete(LiquidHistorySnapshotLimit),
+}
+
 /// Minimal interface the LNURL handler needs from a blockchain backend.
 #[async_trait::async_trait]
 pub trait UtxoBackend: Send + Sync {
@@ -211,6 +258,21 @@ pub trait UtxoBackend: Send + Sync {
         &self,
         script_pubkey: &elements::Script,
     ) -> Result<Vec<String>, AppError>;
+
+    /// Return complete tx-specific Liquid history and confirmation evidence
+    /// from one backend authority. The production implementation retries the
+    /// entire operation after transport failure, rather than mixing history,
+    /// tip, or block headers from different failover endpoints.
+    async fn liquid_history_snapshot(
+        &self,
+        _script_pubkey: &elements::Script,
+        _prior_block_heights: &[i32],
+        _limits: LiquidHistorySnapshotLimits,
+    ) -> Result<LiquidHistorySnapshotOutcome, AppError> {
+        Err(AppError::ElectrumError(
+            "backend does not provide authoritative Liquid history snapshots".into(),
+        ))
+    }
 
     /// Find the transaction that spends `(txid:vout)` for a known Liquid
     /// script. Used by claim recovery when a rebroadcast says already-spent
@@ -380,6 +442,22 @@ fn run_op_blocking<T, F>(
 where
     F: Fn(&electrum_client::Client) -> Result<T, electrum_client::Error>,
 {
+    run_op_with_authority_blocking(state, urls, op_name, op).map(|(value, _)| value)
+}
+
+/// Variant of [`run_op_blocking`] that also returns the endpoint index which
+/// produced the complete successful result. The operation closure may issue
+/// multiple RPCs; a transport failure discards every partial result and reruns
+/// the whole closure after failover.
+fn run_op_with_authority_blocking<T, F>(
+    state: &AsyncMutex<ConnState>,
+    urls: &[String],
+    op_name: &str,
+    op: F,
+) -> Result<(T, usize), electrum_client::Error>
+where
+    F: Fn(&electrum_client::Client) -> Result<T, electrum_client::Error>,
+{
     let mut guard = state.blocking_lock();
     // urls.len() attempts gives every server one shot; minimum 2 so a
     // single-URL config still gets one reconnect retry on a stale TCP.
@@ -419,7 +497,7 @@ where
             .as_ref()
             .expect("client present after reconnect");
         match op(client) {
-            Ok(v) => return Ok(v),
+            Ok(v) => return Ok((v, guard.url_idx)),
             Err(electrum_client::Error::Protocol(p)) => {
                 // Server-side error (e.g. "no such mempool/blockchain tx").
                 // The connection is still healthy — keep it.
@@ -470,13 +548,20 @@ impl UtxoBackend for ElectrumClient {
 
         let txid = electrum_client::bitcoin::Txid::from_str(txid_hex)
             .map_err(|e| AppError::ProofOfFundsInvalid(format!("txid parse: {e}")))?;
+        let requested_txid = txid_hex.to_string();
 
         let state = self.state.clone();
         let urls = self.urls.clone();
         let bytes = tokio::task::spawn_blocking(move || {
             run_op_blocking(&state, &urls, "transaction_get_raw", |client| {
                 use electrum_client::ElectrumApi;
-                client.transaction_get_raw(&txid)
+                let bytes = client.transaction_get_raw(&txid)?;
+                verify_liquid_raw_tx(&requested_txid, &bytes).map_err(|error| {
+                    electrum_client::Error::Message(format!(
+                        "raw transaction integrity check failed: {error}"
+                    ))
+                })?;
+                Ok(bytes)
             })
         })
         .await
@@ -485,22 +570,6 @@ impl UtxoBackend for ElectrumClient {
             electrum_client::Error::Protocol(_) => AppError::UtxoNotFound,
             other => AppError::ElectrumError(format!("transaction_get_raw: {other}")),
         })?;
-
-        // Verify the backend returned bytes for the transaction we asked for
-        // BEFORE caching or returning them (#66). A backend/proxy/cache/failover
-        // bug can hand back valid bytes for a different txid; using those would
-        // corrupt outpoint selection, script verification, claim construction,
-        // and recovery evidence. A mismatch must never be cached.
-        if let Err(e) = verify_liquid_raw_tx(txid_hex, &bytes) {
-            tracing::error!(
-                event = "raw_tx_integrity_mismatch",
-                backend = "liquid_electrum",
-                requested_txid = %txid_hex,
-                error = %e,
-                "backend returned a raw tx failing txid verification; rejecting (failover retries on the next call)"
-            );
-            return Err(e);
-        }
 
         {
             let mut cache = self.cache.lock().await;
@@ -603,6 +672,36 @@ impl UtxoBackend for ElectrumClient {
         history_txids(&result)
     }
 
+    async fn liquid_history_snapshot(
+        &self,
+        script_pubkey: &elements::Script,
+        prior_block_heights: &[i32],
+        limits: LiquidHistorySnapshotLimits,
+    ) -> Result<LiquidHistorySnapshotOutcome, AppError> {
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
+        let state = self.state.clone();
+        let urls = self.urls.clone();
+        let authority_urls = self.urls.clone();
+        let prior_block_heights = prior_block_heights.to_vec();
+
+        let (mut outcome, authority_idx) = tokio::task::spawn_blocking(move || {
+            run_op_with_authority_blocking(&state, &urls, "liquid_history_snapshot", |client| {
+                fetch_liquid_history_snapshot(client, &scripthash_hex, &prior_block_heights, limits)
+            })
+        })
+        .await
+        .map_err(|e| AppError::ElectrumError(format!("liquid history snapshot join: {e}")))?
+        .map_err(|e| AppError::ElectrumError(format!("liquid history snapshot: {e}")))?;
+
+        if let LiquidHistorySnapshotOutcome::Complete(snapshot) = &mut outcome {
+            let authority_url = authority_urls.get(authority_idx).ok_or_else(|| {
+                AppError::ElectrumError("Liquid snapshot authority index out of range".into())
+            })?;
+            snapshot.authority = sanitized_liquid_authority(authority_url);
+        }
+        Ok(outcome)
+    }
+
     async fn find_spending_txid(
         &self,
         script_pubkey: &elements::Script,
@@ -657,6 +756,202 @@ fn history_txids(history: &serde_json::Value) -> Result<Vec<String>, AppError> {
                 })
         })
         .collect()
+}
+
+fn liquid_history_entries(
+    history: &serde_json::Value,
+) -> Result<Vec<LiquidHistoryEntry>, AppError> {
+    let history = history.as_array().ok_or_else(|| {
+        AppError::ElectrumError("scripthash.get_history: expected JSON array response".into())
+    })?;
+    let mut seen = HashSet::with_capacity(history.len());
+    let mut entries = Vec::with_capacity(history.len());
+    for entry in history {
+        let txid = entry
+            .get("tx_hash")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                AppError::ElectrumError("scripthash.get_history: entry missing tx_hash".into())
+            })?;
+        if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::ElectrumError(
+                "scripthash.get_history: entry has invalid tx_hash".into(),
+            ));
+        }
+        let height = entry
+            .get("height")
+            .and_then(|value| value.as_i64())
+            .and_then(|height| i32::try_from(height).ok())
+            .ok_or_else(|| {
+                AppError::ElectrumError(
+                    "scripthash.get_history: entry has invalid signed height".into(),
+                )
+            })?;
+        let txid = txid.to_ascii_lowercase();
+        if !seen.insert(txid.clone()) {
+            return Err(AppError::ElectrumError(
+                "scripthash.get_history: duplicate tx_hash".into(),
+            ));
+        }
+        entries.push(LiquidHistoryEntry {
+            txid,
+            height,
+            block_hash: None,
+        });
+    }
+    Ok(entries)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LiquidSnapshotPlan {
+    Ready(std::collections::BTreeSet<i32>),
+    Incomplete(LiquidHistorySnapshotLimit),
+}
+
+fn liquid_snapshot_plan(
+    entries: &[LiquidHistoryEntry],
+    prior_block_heights: &[i32],
+    tip_height: i32,
+    limits: LiquidHistorySnapshotLimits,
+) -> Result<LiquidSnapshotPlan, AppError> {
+    if entries.len() > limits.max_history_entries {
+        return Ok(LiquidSnapshotPlan::Incomplete(
+            LiquidHistorySnapshotLimit::HistoryEntries {
+                observed: entries.len(),
+                limit: limits.max_history_entries,
+            },
+        ));
+    }
+    if prior_block_heights.iter().any(|height| *height <= 0) {
+        return Err(AppError::ElectrumError(
+            "Liquid prior block anchor height must be positive".into(),
+        ));
+    }
+    if let Some(entry) = entries.iter().find(|entry| entry.height > tip_height) {
+        return Err(AppError::ElectrumError(format!(
+            "Liquid history height {} exceeds snapshot tip {tip_height}",
+            entry.height
+        )));
+    }
+    let block_heights = entries
+        .iter()
+        .filter_map(|entry| (entry.height > 0).then_some(entry.height))
+        .chain(
+            prior_block_heights
+                .iter()
+                .copied()
+                // A stored height above this authority's current tip cannot be
+                // anchored. It remains an unavailable/no-op proof rather than
+                // manufacturing a regression from a possibly lagging node.
+                .filter(|height| *height <= tip_height),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    if block_heights.len() > limits.max_block_heights {
+        return Ok(LiquidSnapshotPlan::Incomplete(
+            LiquidHistorySnapshotLimit::BlockHeights {
+                observed: block_heights.len(),
+                limit: limits.max_block_heights,
+            },
+        ));
+    }
+    Ok(LiquidSnapshotPlan::Ready(block_heights))
+}
+
+fn fetch_liquid_history_snapshot(
+    client: &electrum_client::Client,
+    scripthash_hex: &str,
+    prior_block_heights: &[i32],
+    limits: LiquidHistorySnapshotLimits,
+) -> Result<LiquidHistorySnapshotOutcome, electrum_client::Error> {
+    use electrum_client::ElectrumApi;
+
+    let tip = client.block_headers_subscribe_raw()?;
+    let tip_height = i32::try_from(tip.height)
+        .map_err(|_| electrum_client::Error::Message("Liquid tip height overflow".into()))?;
+    let tip_header = decode_liquid_header(&tip.header, tip_height)?;
+    let tip_hash = tip_header.block_hash().to_string();
+
+    let history_json = client.raw_call(
+        "blockchain.scripthash.get_history",
+        vec![electrum_client::Param::String(scripthash_hex.to_string())],
+    )?;
+    let mut entries = liquid_history_entries(&history_json)
+        .map_err(|error| electrum_client::Error::Message(error.to_string()))?;
+    let block_heights =
+        match liquid_snapshot_plan(&entries, prior_block_heights, tip_height, limits)
+            .map_err(|error| electrum_client::Error::Message(error.to_string()))?
+        {
+            LiquidSnapshotPlan::Ready(block_heights) => block_heights,
+            LiquidSnapshotPlan::Incomplete(limit) => {
+                return Ok(LiquidHistorySnapshotOutcome::Incomplete(limit));
+            }
+        };
+
+    let mut block_hashes = BTreeMap::new();
+    for height in block_heights {
+        let header_bytes = client.block_header_raw(height as usize)?;
+        let header = decode_liquid_header(&header_bytes, height)?;
+        block_hashes.insert(height, header.block_hash().to_string());
+    }
+
+    // Re-read both the history and the original tip-height header before
+    // accepting the snapshot. A concurrent reorg, endpoint inconsistency, or
+    // incomplete response discards the whole attempt instead of manufacturing
+    // a mixed block identity.
+    let final_history_json = client.raw_call(
+        "blockchain.scripthash.get_history",
+        vec![electrum_client::Param::String(scripthash_hex.to_string())],
+    )?;
+    let final_entries = liquid_history_entries(&final_history_json)
+        .map_err(|error| electrum_client::Error::Message(error.to_string()))?;
+    if entries != final_entries {
+        return Err(electrum_client::Error::Message(
+            "Liquid history changed during authoritative snapshot".into(),
+        ));
+    }
+    let final_tip_header = decode_liquid_header(&client.block_header_raw(tip.height)?, tip_height)?;
+    if final_tip_header.block_hash().to_string() != tip_hash {
+        return Err(electrum_client::Error::Message(
+            "Liquid tip anchor changed during authoritative snapshot".into(),
+        ));
+    }
+
+    for entry in &mut entries {
+        if entry.height > 0 {
+            entry.block_hash = block_hashes.get(&entry.height).cloned();
+        }
+    }
+    Ok(LiquidHistorySnapshotOutcome::Complete(
+        LiquidHistorySnapshot {
+            authority: String::new(),
+            tip_height,
+            entries,
+            anchored_block_hashes: block_hashes,
+        },
+    ))
+}
+
+fn decode_liquid_header(
+    bytes: &[u8],
+    expected_height: i32,
+) -> Result<elements::BlockHeader, electrum_client::Error> {
+    let header: elements::BlockHeader = elements::encode::deserialize(bytes).map_err(|error| {
+        electrum_client::Error::Message(format!("Liquid block header decode: {error}"))
+    })?;
+    if i64::from(header.height) != i64::from(expected_height) {
+        return Err(electrum_client::Error::Message(format!(
+            "Liquid block header height {} does not match requested {expected_height}",
+            header.height
+        )));
+    }
+    Ok(header)
+}
+
+fn sanitized_liquid_authority(url: &str) -> String {
+    format!(
+        "liquid-electrum:{}",
+        hex::encode(Sha256::digest(url.as_bytes()))
+    )
 }
 
 /// Decode raw Liquid transaction bytes and confirm they are the transaction

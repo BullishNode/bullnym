@@ -70,9 +70,12 @@ Bullnym still represents a single operational and policy failure domain. The
 database contains sensitive linkage and recovery secrets. Some successful
 broadcasts are currently recorded as terminal settlement before confirmation;
 an interrupted or replaced transaction therefore requires monitoring and
-reconciliation. Direct Liquid detection currently accepts a transaction found
-in Electrum history without a configurable confirmation threshold. These are
-documented limitations, not guarantees supplied by the architecture.
+reconciliation. Direct Bitcoin and Liquid present verified mempool evidence
+immediately, activate exact accounting at one confirmation, and retain
+reversible evidence through configurable finality (three Bitcoin, two Liquid
+by default). The explicitly accepted zero-confirmation display still carries
+rare conflict/reorg risk and is not a financial guarantee. These are documented
+boundaries, not guarantees supplied by the architecture.
 
 No design can promise zero loss under simultaneous server compromise,
 destruction of all durable state, invalid merchant configuration, or failures

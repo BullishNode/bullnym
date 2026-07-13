@@ -26,6 +26,7 @@ afterEach(() => {
 
 const fiatStatus = {
   status: 'unpaid',
+  presentation_status: 'unpaid',
   pricing_mode: 'fiat',
   settlement_status: 'none',
   amount_sat: 10_800,
@@ -108,14 +109,14 @@ describe('reconstructInvoice — not found', () => {
     expect(res.error).toBe('invoice not found: xyz')
   })
 
-  it('a 200 OK with an unrecognized status value resolves not-ok (belt-and-suspenders)', async () => {
+  it('a 200 OK with an unrecognized status value reconstructs for conservative live handling', async () => {
     mockSequence([
       { status: 200, body: { ...fiatStatus, status: 'some_future_status' } },
       { status: 200, body: currenciesBody },
     ])
     const res = await reconstructInvoice('weird')
-    expect(res.ok).toBe(false)
-    if (res.ok) return
-    expect(res.error).toBe('Invoice not found')
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.data.invoice.invoice_id).toBe('weird')
   })
 })

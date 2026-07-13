@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub bitcoin_watcher: BitcoinWatcherConfig,
     #[serde(default)]
+    pub liquid_watcher: LiquidWatcherConfig,
+    #[serde(default)]
     pub workers: WorkersConfig,
     #[serde(default)]
     pub invoice_accounting: InvoiceAccountingConfig,
@@ -552,7 +554,7 @@ const DEFAULT_BTC_WATCHER_ENDPOINT: &str = "https://mempool.bullbitcoin.com/api"
 const DEFAULT_BTC_WATCHER_ACTIVE_TICK_SECS: u64 = 30;
 const DEFAULT_BTC_WATCHER_IDLE_TICK_SECS: u64 = 300;
 const DEFAULT_BTC_WATCHER_ACTIVE_WINDOW_SECS: i64 = 3600;
-const DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED: u32 = 1;
+const DEFAULT_BTC_WATCHER_CONFIRMATIONS_REQUIRED: u32 = 3;
 const DEFAULT_BTC_WATCHER_RATE_PER_SEC: u32 = 5;
 const DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS: u64 = 10_000;
 
@@ -583,8 +585,9 @@ pub struct BitcoinWatcherConfig {
     /// An invoice is "active" if `created_at > NOW() - active_window_secs`.
     #[serde(default = "default_btc_watcher_active_window_secs")]
     pub active_window_secs: i64,
-    /// Confirmation depth at which a tx counts as "paid". 1 is plan
-    /// default; deployment-tunable.
+    /// Confirmation depth at which an already-accounted transaction becomes
+    /// final. Accounting always starts at exactly one confirmation; this
+    /// deployment-tunable threshold controls settlement finality only.
     #[serde(default = "default_btc_watcher_confirmations_required")]
     pub confirmations_required: u32,
     /// Token-bucket refill rate against the mempool endpoint.
@@ -605,6 +608,10 @@ pub const BUILTIN_BTC_ESPLORA_ENDPOINTS: [&str; 2] = [
 ];
 
 impl BitcoinWatcherConfig {
+    pub fn finality_valid(&self) -> bool {
+        self.confirmations_required > 0
+    }
+
     /// Validate only operator-visible settings. Built-in failovers remain
     /// available to existing observation/recovery work, but they must not hide
     /// malformed explicit configuration from money admission.
@@ -674,6 +681,36 @@ fn default_btc_watcher_rate_per_sec() -> u32 {
 }
 fn default_btc_watcher_request_timeout_ms() -> u64 {
     DEFAULT_BTC_WATCHER_REQUEST_TIMEOUT_MS
+}
+
+// --- Liquid direct-payment watcher config ---
+
+const DEFAULT_LIQUID_WATCHER_FINALITY_CONFIRMATIONS: u32 = 2;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiquidWatcherConfig {
+    /// Confirmation depth at which an already-accounted Liquid transaction
+    /// becomes final. Accounting always starts at exactly one confirmation.
+    #[serde(default = "default_liquid_watcher_finality_confirmations")]
+    pub finality_confirmations: u32,
+}
+
+impl Default for LiquidWatcherConfig {
+    fn default() -> Self {
+        Self {
+            finality_confirmations: default_liquid_watcher_finality_confirmations(),
+        }
+    }
+}
+
+impl LiquidWatcherConfig {
+    pub fn finality_valid(&self) -> bool {
+        self.finality_confirmations > 0
+    }
+}
+
+fn default_liquid_watcher_finality_confirmations() -> u32 {
+    DEFAULT_LIQUID_WATCHER_FINALITY_CONFIRMATIONS
 }
 
 // --- Rate limit config ---
