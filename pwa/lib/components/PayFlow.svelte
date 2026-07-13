@@ -39,7 +39,7 @@
   }: {
     id: string
     /** Single header row for every screen state (loading/error/live/terminal) — each caller supplies its own so it's never duplicated (the old bug: POS's PayScreen wrapped PaymentScreen, which used to render its own header too). */
-    header: Snippet
+    header: Snippet<[boolean]>
     successActionLabel: string
     onSuccessAction: () => void
     successSecondaryLabel?: string
@@ -61,6 +61,7 @@
   let amountLabel = $state('')
   let loadError = $state<string | null>(null)
   let terminal = $state<TerminalState | null>(null)
+  let canCancel = $state(false)
 
   $effect(() => {
     // Both callers wrap PayFlow in {#key id}, so an id change remounts us —
@@ -69,6 +70,7 @@
     let cancelled = false
     loadState = 'loading'
     terminal = null
+    canCancel = false
     const cached = getCachedInvoice(id)
     if (cached) {
       loaded = cached
@@ -103,6 +105,7 @@
   })
 
   function handleTerminal(t: TerminalState) {
+    canCancel = false
     terminal = t
     if ((t.kind === 'paid' || t.kind === 'overpaid') && loaded) {
       onPaid?.(t.status, loaded)
@@ -214,7 +217,7 @@
 <main bind:this={containerEl} class="min-h-screen bg-[#f5f0e8] text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
   <div class="mx-auto grid min-h-screen max-w-4xl grid-rows-1">
     <section class="px-5 py-5 sm:px-8">
-      {@render header()}
+      {@render header(canCancel)}
 
       {#if pullY > 0 || ptrRefreshing}
         <div
@@ -277,11 +280,20 @@
           {@render terminalPanel('×', 'err', 'Cancelled', 'The recipient cancelled this invoice.', 'Back')}
         {:else if terminal.kind === 'refunded'}
           {@render terminalPanel('!', 'err', 'Settlement failed', 'The payment could not be settled.', 'Back')}
+        {:else if terminal.kind === 'failed'}
+          {@render terminalPanel('!', 'err', 'Settlement failed', 'The payment could not be settled.', 'Back')}
         {:else if terminal.kind === 'not_found'}
           {@render terminalPanel('×', 'err', 'Not found', 'This invoice could not be found.', 'Try Again')}
         {/if}
       {:else}
-        <PaymentScreen bind:this={paymentScreen} invoice={loaded.invoice} nym={config.page_key} {amountLabel} onTerminal={handleTerminal} />
+        <PaymentScreen
+          bind:this={paymentScreen}
+          invoice={loaded.invoice}
+          nym={config.page_key}
+          {amountLabel}
+          onTerminal={handleTerminal}
+          onCancelableChange={(value) => (canCancel = value)}
+        />
       {/if}
     </section>
   </div>

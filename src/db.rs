@@ -20,5 +20,12 @@ pub use swaps::*;
 pub use users::*;
 pub use watcher::*;
 
+/// Shared advisory-lock namespace for exact invoice presentation value versus
+/// Lightning offer creation. Direct reducers take the blocking form; offer
+/// handlers use the try-lock form and retry rather than serving stale value.
+pub fn invoice_lightning_lock_key(invoice_id: uuid::Uuid) -> String {
+    format!("invoice-lightning:{invoice_id}")
+}
+
 #[cfg(test)]
 mod tests;

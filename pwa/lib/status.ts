@@ -19,30 +19,6 @@ import type { InvoiceStatus } from '$lib/api/client'
 // 4's headline bug), and settlement incidents (pending/claim_stuck/refunded
 // on settlement_status) weren't represented at all.
 
-// The full set of status values our server can return for a real invoice.
-// InvoiceStatus.status is typed with a `| string` fallback (lib/api/client.ts)
-// precisely because the server can return values outside this set — notably
-// for an id that doesn't resolve to a real invoice, where the endpoint can
-// come back 200 OK with a status we don't recognize rather than 404. Used
-// to detect that case (see lib/components/PaymentScreen.svelte's poll() and
-// apps/pos/screens/PayScreen.svelte's reconstruction effect) instead of
-// treating an unrecognized status as "still waiting for payment" forever.
-// Verified against src/db/invoices.rs: 'unpaid' and 'in_progress' are the
-// live pre-payment states — omitting them made PayScreen's deep-link
-// reconstruction reject every fresh invoice as "Invoice not found".
-// ('pending' kept defensively.)
-export const KNOWN_STATUSES = new Set([
-  'unpaid',
-  'in_progress',
-  'pending',
-  'partially_paid',
-  'paid',
-  'overpaid',
-  'underpaid',
-  'expired',
-  'cancelled',
-])
-
 export function isTerminalPaid(status: string): boolean {
   return status === 'paid' || status === 'overpaid'
 }
@@ -105,35 +81,101 @@ export type PayView =
   | { kind: 'waiting' }
   | { kind: 'in_progress' }
   | { kind: 'partially_paid' }
+  | { kind: 'partially_paid_pending' }
   | { kind: 'settling' }
+  | { kind: 'overpaid_pending' }
+  | { kind: 'resolution_pending' }
+  | { kind: 'unknown' }
   | { kind: 'needs_review' }
   | { kind: 'refunded' }
+  | { kind: 'failed' }
   | { kind: 'paid' }
   | { kind: 'overpaid' }
   | { kind: 'underpaid' }
   | { kind: 'expired' }
   | { kind: 'cancelled' }
 
-const TERMINAL_LIVE_STATUSES = new Set(['paid', 'overpaid', 'underpaid', 'expired', 'cancelled'])
+/** Before the first successful detail response, cached create-response
+ * payloads are not proof that the invoice is still payable. Keep the live
+ * screen conservative and rail-free until current server state arrives. */
+export function payViewBeforeFirstStatus(): PayView {
+  return { kind: 'unknown' }
+}
+
+const KNOWN_PRESENTATION_STATUSES = new Set(['unpaid', 'partial', 'payment_received', 'overpaid'])
+const KNOWN_ACCOUNTING_STATUSES = new Set([
+  'unpaid',
+  'in_progress',
+  'pending',
+  'partially_paid',
+  'paid',
+  'overpaid',
+  'underpaid',
+  'expired',
+  'cancelled',
+])
+const KNOWN_SETTLEMENT_STATUSES = new Set([
+  'none',
+  'pending',
+  'settled',
+  'resolution_pending',
+  'claim_stuck',
+  'refunded',
+  'failed',
+])
 
 /**
- * Priority order, EXACTLY (see status.test.ts for the pinned cases):
- *   1. terminal `status` (paid/overpaid/underpaid/expired/cancelled) — wins
- *      over everything, including a stale/racing settlement_status.
- *   2. `settlement_status` (pending/claim_stuck/refunded) — a settlement
- *      incident on an otherwise-live invoice overrides the live status.
- *   3. live `status` (in_progress/partially_paid, else waiting).
+ * The server-owned presentation and settlement projections win over cached
+ * accounting terminality. Amounts, tolerances, mixed rails, and fiat rules are
+ * deliberately absent from this function.
  */
 export function derivePayView(status: InvoiceStatus): PayView {
-  if (TERMINAL_LIVE_STATUSES.has(status.status)) {
-    return { kind: status.status as 'paid' | 'overpaid' | 'underpaid' | 'expired' | 'cancelled' }
-  }
-  if (status.settlement_status === 'pending') return { kind: 'settling' }
+  const presentation = status.presentation_status
+  if (!KNOWN_SETTLEMENT_STATUSES.has(status.settlement_status)) return { kind: 'unknown' }
+
   if (status.settlement_status === 'claim_stuck') return { kind: 'needs_review' }
   if (status.settlement_status === 'refunded') return { kind: 'refunded' }
-  if (status.status === 'in_progress') return { kind: 'in_progress' }
-  if (status.status === 'partially_paid') return { kind: 'partially_paid' }
-  return { kind: 'waiting' }
+  if (status.settlement_status === 'failed') return { kind: 'failed' }
+  if (status.settlement_status === 'resolution_pending') return { kind: 'resolution_pending' }
+  if (presentation == null || !KNOWN_PRESENTATION_STATUSES.has(presentation)) return { kind: 'unknown' }
+  if (!KNOWN_ACCOUNTING_STATUSES.has(status.status)) return { kind: 'unknown' }
+
+  if (status.settlement_status === 'pending') {
+    if (presentation === 'partial') {
+      if (status.status === 'unpaid' || status.status === 'in_progress' || status.status === 'partially_paid') {
+        return { kind: 'partially_paid_pending' }
+      }
+      return { kind: 'unknown' }
+    }
+    if (presentation === 'overpaid') return { kind: 'overpaid_pending' }
+    return { kind: 'settling' }
+  }
+
+  if (presentation === 'partial') {
+    if (status.status === 'underpaid') return { kind: 'underpaid' }
+    if (status.status === 'unpaid' || status.status === 'in_progress' || status.status === 'partially_paid') {
+      return { kind: 'partially_paid' }
+    }
+    return { kind: 'unknown' }
+  }
+  if (presentation === 'payment_received') {
+    if (status.status === 'paid' && (status.settlement_status === 'none' || status.settlement_status === 'settled')) {
+      return { kind: 'paid' }
+    }
+    return { kind: 'in_progress' }
+  }
+  if (presentation === 'overpaid') {
+    if (status.status === 'overpaid' && (status.settlement_status === 'none' || status.settlement_status === 'settled')) {
+      return { kind: 'overpaid' }
+    }
+    return { kind: 'overpaid_pending' }
+  }
+
+  if (status.settlement_status !== 'none') return { kind: 'unknown' }
+  if (status.status === 'expired') return { kind: 'expired' }
+  if (status.status === 'cancelled') return { kind: 'cancelled' }
+  if (status.status === 'unpaid' || status.status === 'pending') return { kind: 'waiting' }
+  return { kind: 'unknown' }
 }
 
 export function isTerminalView(v: PayView): boolean {
@@ -143,7 +185,8 @@ export function isTerminalView(v: PayView): boolean {
     v.kind === 'underpaid' ||
     v.kind === 'expired' ||
     v.kind === 'cancelled' ||
-    v.kind === 'refunded'
+    v.kind === 'refunded' ||
+    v.kind === 'failed'
   )
 }
 
@@ -151,7 +194,31 @@ export function isTerminalView(v: PayView): boolean {
  * payment is detected (in_progress / settling) we stop showing the QR and
  * render the "Payment received" panel instead. */
 export function showsRails(v: PayView): boolean {
-  return v.kind === 'waiting' || v.kind === 'partially_paid'
+  return v.kind === 'waiting' || v.kind === 'partially_paid' || v.kind === 'partially_paid_pending'
+}
+
+/** Unknown values and every accepted-evidence state are intentionally
+ * non-cancellable. Only the exact fresh, no-lifecycle projection is safe. */
+export function isCancelableStatus(status: InvoiceStatus): boolean {
+  return status.status === 'unpaid' && status.presentation_status === 'unpaid' && status.settlement_status === 'none'
+}
+
+/** Automatic detail polling continues through payable partials, pending,
+ * resolution, and unknown projections. A settled partial is still payable, so
+ * it must keep observing a later top-up. Settled sufficient/overpaid states and
+ * existing stop-polling incidents remain manually refreshable. */
+export function shouldPollDetail(status: InvoiceStatus, view = derivePayView(status)): boolean {
+  if (view.kind === 'refunded' || view.kind === 'failed') return false
+  if (view.kind === 'needs_review') return false
+  if (view.kind === 'unknown') return true
+  if (
+    status.settlement_status === 'pending' ||
+    status.settlement_status === 'resolution_pending'
+  ) {
+    return true
+  }
+  if (status.settlement_status === 'settled') return view.kind === 'partially_paid'
+  return !isTerminalView(view)
 }
 
 export function payViewLabel(v: PayView, remainingAmountSat: number | null): string {
@@ -161,14 +228,22 @@ export function payViewLabel(v: PayView, remainingAmountSat: number | null): str
     case 'in_progress':
       return 'Payment received'
     case 'partially_paid':
+    case 'partially_paid_pending':
       return remainingAmountSat != null
         ? `Partially paid — ${new Intl.NumberFormat().format(remainingAmountSat)} sat due`
         : 'Partially paid'
     case 'settling':
       return 'Payment received'
+    case 'overpaid_pending':
+      return 'Overpaid'
+    case 'resolution_pending':
+      return 'Payment issue'
+    case 'unknown':
+      return 'Checking payment status'
     case 'needs_review':
       return 'Payment needs review'
     case 'refunded':
+    case 'failed':
       return 'Settlement failed'
     case 'paid':
     case 'overpaid':
@@ -182,6 +257,28 @@ export function payViewLabel(v: PayView, remainingAmountSat: number | null): str
   }
 }
 
+export function payViewSupport(v: PayView): string | null {
+  switch (v.kind) {
+    case 'settling':
+    case 'partially_paid_pending':
+    case 'overpaid_pending':
+      return 'Settlement pending'
+    case 'resolution_pending':
+      return 'Settlement problem — being checked'
+    case 'unknown':
+      return 'Payment status is being checked'
+    case 'in_progress':
+      return 'Settlement status is being checked'
+    case 'needs_review':
+      return 'Settlement is delayed. The operator has been alerted.'
+    case 'refunded':
+    case 'failed':
+      return 'The payment could not be settled.'
+    default:
+      return null
+  }
+}
+
 export function payViewTone(v: PayView): string {
   switch (v.kind) {
     case 'paid':
@@ -189,11 +286,15 @@ export function payViewTone(v: PayView): string {
     // Payment detected renders as success (green) with a settlement note.
     case 'in_progress':
     case 'settling':
+    case 'overpaid_pending':
       return 'text-[#14522d] dark:text-[#8bc8a4]'
     case 'underpaid':
     case 'needs_review':
+    case 'resolution_pending':
+    case 'unknown':
       return 'text-[#a9362f] dark:text-[#e8a49e]'
     case 'refunded':
+    case 'failed':
     case 'cancelled':
     case 'expired':
       return 'text-[#6d5f4e] dark:text-[#b9aa91]'
@@ -219,6 +320,7 @@ export type TerminalState =
   | { kind: 'expired' }
   | { kind: 'cancelled' }
   | { kind: 'refunded' }
+  | { kind: 'failed' }
   | { kind: 'not_found' }
 
 /** Maps a terminal PayView (isTerminalView(v) === true) to the TerminalState PaymentScreen reports. Returns null for a non-terminal view. */
@@ -236,6 +338,8 @@ export function payViewToTerminal(view: PayView, status: InvoiceStatus): Termina
       return { kind: 'cancelled' }
     case 'refunded':
       return { kind: 'refunded' }
+    case 'failed':
+      return { kind: 'failed' }
     default:
       return null
   }
@@ -262,8 +366,32 @@ export const LN_REFRESH_COOLDOWN_MS = 15_000
 export function nextLightningPr(current: string | null, status: InvoiceStatus): string | null {
   if (status.lightning_pr) return status.lightning_pr
   const v = derivePayView(status)
-  if ((v.kind === 'waiting' || v.kind === 'partially_paid') && (status.accept_ln ?? true)) return null
+  if (
+    (v.kind === 'waiting' || v.kind === 'partially_paid' || v.kind === 'partially_paid_pending') &&
+    (status.accept_ln ?? true)
+  ) return null
   return current
+}
+
+export interface BitcoinPaymentPayloadState {
+  directAddress: string | null
+  chainAddress: string | null
+  chainBip21: string | null
+}
+
+/** Replace Bitcoin payment payloads from one authoritative status snapshot.
+ * A null chain offer is meaningful: the prior Boltz lockup may have expired,
+ * left `pending`, or no longer match the exact remaining amount. Never merge
+ * that null with a cached chain address. */
+export function bitcoinPaymentPayloadFromStatus(
+  status: Pick<InvoiceStatus, 'bitcoin_address' | 'bitcoin_chain_address' | 'bitcoin_chain_bip21'>,
+): BitcoinPaymentPayloadState {
+  const chainAddress = status.bitcoin_chain_address ?? null
+  return {
+    directAddress: status.bitcoin_address ?? null,
+    chainAddress,
+    chainBip21: chainAddress ? (status.bitcoin_chain_bip21 ?? null) : null,
+  }
 }
 
 export function shouldRefreshLightning(params: {
@@ -280,7 +408,7 @@ export function shouldRefreshLightning(params: {
 }): boolean {
   const { accept, pr, view, refreshing, lastFailedAt, now } = params
   if (!accept || pr || refreshing) return false
-  if (view.kind !== 'waiting' && view.kind !== 'partially_paid') return false
+  if (view.kind !== 'waiting' && view.kind !== 'partially_paid' && view.kind !== 'partially_paid_pending') return false
   if (lastFailedAt != null && now - lastFailedAt < LN_REFRESH_COOLDOWN_MS) return false
   return true
 }

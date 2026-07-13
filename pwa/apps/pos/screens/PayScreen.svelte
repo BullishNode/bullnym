@@ -40,12 +40,14 @@
   }
 </script>
 
-{#snippet header()}
+{#snippet header(canCancel: boolean)}
   <header class="mb-6 flex items-center justify-between">
     <button
       type="button"
       class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold"
       onclick={newSale}
+      disabled={!canCancel}
+      aria-label={canCancel ? 'Cancel sale' : 'Cancel unavailable after payment evidence'}
     >
       ← Cancel sale
     </button>

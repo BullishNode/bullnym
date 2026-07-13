@@ -205,13 +205,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let direct_liquid_settings_valid = config.electrum.explicit_urls_valid();
+    let direct_liquid_settings_valid =
+        config.electrum.explicit_urls_valid() && config.liquid_watcher.finality_valid();
     let liquid_claim_settings_valid = config.liquid_claim_settings_valid();
-    let bitcoin_backend_settings_valid = config.bitcoin_watcher.explicit_endpoints_valid();
+    let bitcoin_backend_settings_valid = config.bitcoin_watcher.explicit_endpoints_valid()
+        && config.bitcoin_watcher.finality_valid();
     if !direct_liquid_settings_valid {
         tracing::error!(
             event = "direct_liquid_config_invalid",
-            "explicit Liquid backend configuration is invalid; direct Liquid admission is closed"
+            "Liquid backend/finality configuration is invalid; direct Liquid admission is closed"
         );
     }
     if !liquid_claim_settings_valid {
@@ -223,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !bitcoin_backend_settings_valid {
         tracing::error!(
             event = "bitcoin_backend_config_invalid",
-            "explicit Bitcoin backend configuration is invalid; dependent admission is closed"
+            "Bitcoin backend/finality configuration is invalid; dependent admission is closed"
         );
     }
 
@@ -556,8 +558,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pool = state.db.clone();
             let rl = rate_limiter.clone();
             let cancel_watcher = cancel.clone();
-            let watcher_cfg =
-                chain_watcher::ChainWatcherConfig::from_rate_limit_config(&config.rate_limit);
+            let watcher_cfg = chain_watcher::ChainWatcherConfig::from_rate_limit_config(
+                &config.rate_limit,
+                config.liquid_watcher.finality_confirmations,
+            );
             let accounting_tolerances =
                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting);
             let liquid_reporter = state.admission.reporter(admission::Worker::LiquidWatcher);

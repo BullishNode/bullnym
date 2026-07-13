@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::RateLimitConfig;
 use crate::db;
@@ -432,6 +433,33 @@ impl RateLimiter {
         }
     }
 
+    /// Wait for watcher-only capacity while one atomic chain obligation is in
+    /// progress. Returning the partially fetched obligation to the outer loop
+    /// would restart it from zero and can permanently pin every later row when
+    /// its bounded work exceeds one bucketful. No database lock is held while
+    /// this waits, and shutdown remains prompt.
+    pub async fn acquire_electrum_watcher(&self, cancel: &CancellationToken) -> bool {
+        loop {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            let retry_after = {
+                let mut bucket = self.watcher_electrum_bucket.lock().await;
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                if bucket.try_consume() {
+                    return true;
+                }
+                bucket.retry_after()
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => return false,
+                _ = tokio::time::sleep(retry_after) => {}
+            }
+        }
+    }
+
     // --- Internal ---
 
     /// In-memory atomic check-and-record for the hot per-IP-style axes.
@@ -613,6 +641,15 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    pub(crate) fn has_available(&mut self) -> bool {
+        self.refill();
+        self.tokens > 0
+    }
+
+    pub(crate) fn retry_after(&self) -> Duration {
+        Duration::from_secs(1).saturating_sub(self.last_refill.elapsed())
     }
 
     fn refill(&mut self) {

@@ -30,6 +30,8 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use askama::Template;
@@ -52,6 +54,113 @@ use crate::ip_whitelist;
 use crate::pricer;
 use crate::validators;
 use crate::AppState;
+
+// Integration tests need to stop the real handler at exact transaction
+// boundaries; database-only tests cannot prove that handlers keep every read
+// on the same connection. This one-shot seam is inert unless a test installs
+// it and adds only one atomic read to each covered boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceIntegrationTestHookPoint {
+    StatusAfterInvoiceRead,
+    ListAfterInvoiceRead,
+    OfferBeforeCommit,
+}
+
+#[derive(Debug)]
+struct InvoiceIntegrationTestHookState {
+    point: InvoiceIntegrationTestHookPoint,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+static INVOICE_INTEGRATION_TEST_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INVOICE_INTEGRATION_TEST_HOOK: OnceLock<
+    Mutex<Option<Arc<InvoiceIntegrationTestHookState>>>,
+> = OnceLock::new();
+
+fn invoice_integration_test_hook_slot(
+) -> &'static Mutex<Option<Arc<InvoiceIntegrationTestHookState>>> {
+    INVOICE_INTEGRATION_TEST_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// One-shot synchronization guard for DB-backed integration tests. Dropping
+/// the guard releases a paused request so a failed test cannot strand it.
+#[doc(hidden)]
+pub struct InvoiceIntegrationTestHook {
+    state: Arc<InvoiceIntegrationTestHookState>,
+}
+
+impl InvoiceIntegrationTestHook {
+    pub async fn wait_until_reached(&self) {
+        self.state.reached.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for InvoiceIntegrationTestHook {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = invoice_integration_test_hook_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.state))
+        {
+            slot.take();
+            INVOICE_INTEGRATION_TEST_HOOK_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn install_invoice_integration_test_hook(
+    point: InvoiceIntegrationTestHookPoint,
+) -> InvoiceIntegrationTestHook {
+    let state = Arc::new(InvoiceIntegrationTestHookState {
+        point,
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut slot = invoice_integration_test_hook_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.is_none(),
+        "an invoice integration-test hook is already installed"
+    );
+    *slot = Some(state.clone());
+    INVOICE_INTEGRATION_TEST_HOOK_ACTIVE.store(true, Ordering::Release);
+    InvoiceIntegrationTestHook { state }
+}
+
+async fn pause_at_invoice_integration_test_hook(point: InvoiceIntegrationTestHookPoint) {
+    if !INVOICE_INTEGRATION_TEST_HOOK_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let state = {
+        let mut slot = invoice_integration_test_hook_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|installed| installed.point == point)
+        {
+            INVOICE_INTEGRATION_TEST_HOOK_ACTIVE.store(false, Ordering::Release);
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(state) = state {
+        state.reached.notify_one();
+        state.release.notified().await;
+    }
+}
 
 // =====================================================================
 // Action constants (v2 Schnorr signing)
@@ -844,7 +953,12 @@ struct InvoicePaymentTpl<'a> {
     invoice_id: String,
     domain: &'a str,
     status: &'a str,
+    /// Server-computed money presentation. Empty means the projection is
+    /// unknown (for example, an unresolved row from the migration rollout).
+    presentation_status: &'a str,
+    presentation_known: bool,
     settlement_status: &'a str,
+    rails_payable: bool,
     amount_sat: i64,
     remaining_amount_sat: i64,
     fiat_display: Option<String>,
@@ -886,11 +1000,40 @@ fn js_string_literal(value: Option<&str>) -> Result<String, AppError> {
 }
 
 fn invoice_payment_rails_are_payable(inv: &db::Invoice) -> bool {
-    matches!(inv.status.as_str(), "unpaid" | "partially_paid")
-        && !matches!(
-            inv.settlement_status.as_str(),
-            "pending" | "claim_stuck" | "refunded"
-        )
+    if !matches!(
+        inv.status.as_str(),
+        "unpaid" | "in_progress" | "partially_paid"
+    ) {
+        return false;
+    }
+
+    match (
+        inv.presentation_status.as_deref(),
+        inv.settlement_status.as_str(),
+    ) {
+        // No accepted evidence: the normal fresh-invoice state.
+        (Some("unpaid"), "none") => true,
+        // A partial direct payment remains payable while it confirms and even
+        // after that contribution reaches finality. The server projection is
+        // authoritative; clients must not reproduce amount/tolerance rules.
+        (Some("partial"), "none" | "pending" | "settled") => true,
+        // Sufficient/overpaid evidence, incidents, and unknown projections all
+        // suppress new instructions and provider-side offer creation.
+        _ => false,
+    }
+}
+
+/// Public invoice projections combine several tables. Keep every field in one
+/// PostgreSQL snapshot so a reducer commit cannot mix an old invoice row with
+/// new event sums or payment offers in the same response/render/list item.
+async fn begin_invoice_read_snapshot(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
 }
 
 pub async fn render_payment(
@@ -973,16 +1116,24 @@ async fn render_invoice_template(
     inv: &db::Invoice,
     hide_owner: bool,
 ) -> Result<String, AppError> {
+    let mut snapshot = begin_invoice_read_snapshot(&state.db).await?;
+    let inv = db::get_invoice_by_id(&mut *snapshot, inv.id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string()))?;
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
     };
-    let remaining_sat = remaining_amount_sat(inv);
-    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(inv) {
-        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+    let received_sat = db::invoice_presentation_received_sat(&mut *snapshot, inv.id)
+        .await?
+        .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
+    let remaining_sat = remaining_amount_from_received(&inv, received_sat);
+    let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
+        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
     } else {
         None
     };
+    snapshot.commit().await?;
     // Suppress the nym in the served page when rendering under an alias path,
     // even though the invoice is nym-linked internally.
     let nym = if hide_owner {
@@ -1004,7 +1155,13 @@ async fn render_invoice_template(
         invoice_id: inv.id.to_string(),
         domain: &state.config.domain,
         status: &inv.status,
+        presentation_status: inv.presentation_status.as_deref().unwrap_or(""),
+        presentation_known: matches!(
+            inv.presentation_status.as_deref(),
+            Some("unpaid" | "partial" | "payment_received" | "overpaid")
+        ),
         settlement_status: &inv.settlement_status,
+        rails_payable: invoice_payment_rails_are_payable(&inv),
         amount_sat: inv.amount_sat,
         remaining_amount_sat: remaining_sat,
         fiat_display,
@@ -1047,6 +1204,7 @@ pub struct BitcoinDirectObservationResponse {
 #[derive(Serialize)]
 pub struct InvoiceStatusResponse {
     pub status: String,
+    pub presentation_status: Option<String>,
     pub pricing_mode: String,
     pub settlement_status: String,
     pub amount_sat: i64,
@@ -1110,14 +1268,20 @@ pub async fn status(
             .checkout_partial_terminal_grace_secs,
     )
     .await?;
-    let inv = db::get_invoice_by_id(&state.db, id)
+    let mut snapshot = begin_invoice_read_snapshot(&state.db).await?;
+    let inv = db::get_invoice_by_id(&mut *snapshot, id)
         .await?
         .ok_or(AppError::InvoiceNotFound(id_str))?;
+    pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::StatusAfterInvoiceRead)
+        .await;
 
-    let remaining_sat = remaining_amount_sat(&inv);
-    let lightning_pr = latest_reusable_lightning_offer(&state.db, &inv).await?;
+    let received_sat = db::invoice_presentation_received_sat(&mut *snapshot, inv.id)
+        .await?
+        .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
+    let remaining_sat = remaining_amount_from_received(&inv, received_sat);
+    let lightning_pr = latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
     let bitcoin_chain_offer = if invoice_payment_rails_are_payable(&inv) {
-        db::latest_payable_chain_swap_for_invoice(&state.db, inv.id, remaining_sat).await?
+        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
     } else {
         None
     };
@@ -1125,26 +1289,29 @@ pub async fn status(
         &inv,
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
     );
-    let bitcoin_direct_observations = db::list_invoice_payment_observations(&state.db, inv.id, 10)
-        .await?
-        .into_iter()
-        .map(|obs| BitcoinDirectObservationResponse {
-            source: obs.source,
-            rail: obs.rail,
-            txid: obs.txid,
-            vout: obs.vout,
-            address: obs.address,
-            amount_sat: obs.amount_sat,
-            confirmations: obs.confirmations,
-            block_height: obs.block_height,
-            state: obs.last_seen_state,
-            first_seen_at_unix: obs.first_seen_at_unix,
-            last_seen_at_unix: obs.last_seen_at_unix,
-        })
-        .collect();
+    let bitcoin_direct_observations =
+        db::list_invoice_payment_observations(&mut *snapshot, inv.id, 10)
+            .await?
+            .into_iter()
+            .map(|obs| BitcoinDirectObservationResponse {
+                source: obs.source,
+                rail: obs.rail,
+                txid: obs.txid,
+                vout: obs.vout,
+                address: obs.address,
+                amount_sat: obs.amount_sat,
+                confirmations: obs.confirmations,
+                block_height: obs.block_height,
+                state: obs.last_seen_state,
+                first_seen_at_unix: obs.first_seen_at_unix,
+                last_seen_at_unix: obs.last_seen_at_unix,
+            })
+            .collect();
+    snapshot.commit().await?;
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
+        presentation_status: inv.presentation_status,
         pricing_mode: inv.pricing_mode,
         settlement_status: inv.settlement_status,
         amount_sat: inv.amount_sat,
@@ -1426,7 +1593,7 @@ pub async fn fetch_lightning_offer(
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
-    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") {
+    if !invoice_payment_rails_are_payable(&inv) {
         return Err(AppError::InvalidAmount(format!(
             "invoice is {} (not payable); no Lightning offer available",
             inv.status
@@ -1447,41 +1614,20 @@ pub async fn fetch_lightning_offer(
 }
 
 /// Return the latest still-payable BOLT11 for an invoice, refreshing it
-/// through Boltz when the previous offer has expired. Only fully unpaid
-/// invoices can create a replacement offer; `in_progress` may still
-/// surface an existing reusable BOLT11, but it does not open a new swap.
+/// through Boltz when the previous offer has expired. The server presentation
+/// projection decides payability: unpaid and partial may create a replacement,
+/// while sufficient, incident, and unknown evidence cannot.
 /// The outer invoice `expires_at` remains the hard merchant lifetime;
 /// after that deadline, this helper will not create another swap.
 async fn ensure_reusable_lightning_offer(
     state: &AppState,
     inv: &db::Invoice,
 ) -> Result<Option<String>, AppError> {
-    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") || !inv.accept_ln {
+    if !invoice_payment_rails_are_payable(inv) || !inv.accept_ln {
         return Ok(None);
     }
 
-    let now = unix_now();
-    let amount_sat = remaining_amount_sat(inv);
-    if amount_sat <= 0 {
-        return Ok(None);
-    }
-    if let Some((pr, pr_amount_sat)) =
-        db::latest_lightning_pr_for_invoice(&state.db, inv.id).await?
-    {
-        if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
-            return Ok(Some(pr));
-        }
-        tracing::info!(
-            invoice_id = %inv.id,
-            "latest BOLT11 expired or amount changed; requesting replacement offer from Boltz",
-        );
-    }
-
-    if inv.expires_at_unix <= now {
-        return Ok(None);
-    }
-
-    let lock_key = format!("invoice-lightning:{}", inv.id);
+    let lock_key = db::invoice_lightning_lock_key(inv.id);
     // Serialize concurrent offer creation for this invoice with a
     // TRANSACTION-scoped advisory lock. A session-level `pg_advisory_lock` on a
     // pooled connection leaks if the handler future is dropped (client
@@ -1502,31 +1648,49 @@ async fn ensure_reusable_lightning_offer(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
     if !acquired {
-        // Another request is already minting an offer for this invoice. Never
-        // block on a pooled connection — return the latest still-reusable BOLT11
-        // if present, else signal the caller to retry shortly.
+        // Another offer request or a direct-payment reducer owns the invoice
+        // projection boundary. Never answer from the pre-lock snapshot: the
+        // exact payable amount may be changing. Signal a short retry instead.
         drop(tx);
-        if let Some((pr, pr_amount_sat)) =
-            db::latest_lightning_pr_for_invoice(&state.db, inv.id).await?
-        {
-            if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
-                return Ok(Some(pr));
-            }
-        }
+        return Err(AppError::ServiceUnavailable(
+            "invoice payment state is changing; retry the Lightning offer request".into(),
+        ));
+    }
+
+    // Holding the same advisory boundary as the direct-payment reducer: reload
+    // every mutable projection and recompute exact presentation value. This
+    // prevents a pre-lock partial/sufficient payment from minting a stale
+    // full-value offer.
+    let current = db::get_invoice_by_id(&mut *tx, inv.id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string()))?;
+    if !invoice_payment_rails_are_payable(&current) || !current.accept_ln {
+        tx.rollback()
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        return Ok(None);
+    }
+    let now = unix_now();
+    if current.expires_at_unix <= now {
+        tx.rollback()
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
+        return Ok(None);
+    }
+    let received_sat = db::invoice_presentation_received_sat(&mut *tx, current.id)
+        .await?
+        .unwrap_or_else(|| current.paid_amount_sat.unwrap_or(0));
+    let amount_sat = remaining_amount_from_received(&current, received_sat);
+    if amount_sat <= 0 {
+        tx.rollback()
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
         return Ok(None);
     }
 
-    // Holding the xact lock: double-check the latest offer, create only if needed.
-    let latest: Option<(String, i64)> = sqlx::query_as(
-        "SELECT invoice, amount_sat FROM swap_records \
-         WHERE invoice_id = $1 \
-         ORDER BY created_at DESC \
-         LIMIT 1",
-    )
-    .bind(inv.id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| AppError::DbError(e.to_string()))?;
+    // Double-check the latest offer under the serialization boundary and
+    // create only when its amount/expiry no longer matches.
+    let latest = db::latest_lightning_pr_for_invoice(&mut *tx, inv.id).await?;
     if let Some((pr, pr_amount_sat)) = latest {
         if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
             tx.commit()
@@ -1534,24 +1698,80 @@ async fn ensure_reusable_lightning_offer(
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             return Ok(Some(pr));
         }
+        tracing::info!(
+            invoice_id = %current.id,
+            "latest BOLT11 expired or presentation amount changed; requesting replacement offer from Boltz",
+        );
     }
 
-    // create_lightning_offer performs its own writes on a separate pooled
-    // connection; the xact lock (held on `tx`) serializes creation and releases
-    // when `tx` is committed/rolled back below or dropped on cancellation.
-    let pr = match create_lightning_offer(state, lightning_swap_nym(inv), amount_sat as u64, inv)
+    // Keep every database operation on the connection that owns the advisory
+    // boundary. Otherwise N concurrent offers can each hold one pooled
+    // connection here and deadlock while waiting for a second connection.
+    state
+        .admission
+        .enforce(Rail::LightningReverse)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    let swap_key_index = db::next_swap_key_index(&mut *tx)
         .await
-    {
-        Ok(pr) => pr,
-        Err(e) => {
-            let _ = tx.rollback().await;
-            return Err(e);
-        }
-    };
+        .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
+    let prepared =
+        match request_lightning_offer(state, swap_key_index, amount_sat as u64, &current).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+
+    db::record_swap_in_tx(
+        &mut tx,
+        &prepared.as_new_swap_record(
+            lightning_swap_nym(&current),
+            amount_sat as u64,
+            current.id,
+            swap_key_index,
+            state.swap_key_root_fingerprint.as_str(),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
+
+    // Expiry/partial terminalization does not use this offer advisory lock.
+    // Re-read after the remote call and after durable result persistence. A
+    // provider-created offer is always retained for recovery, but it is never
+    // surfaced when payability, exact remaining amount, or the hard deadline
+    // changed while the request was in flight.
+    let _: Uuid = sqlx::query_scalar("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+        .bind(current.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let final_invoice = db::get_invoice_by_id(&mut *tx, current.id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(current.id.to_string()))?;
+    let final_received_sat = db::invoice_presentation_received_sat(&mut *tx, current.id)
+        .await?
+        .unwrap_or_else(|| final_invoice.paid_amount_sat.unwrap_or(0));
+    let final_amount_sat = remaining_amount_from_received(&final_invoice, final_received_sat);
+    let still_payable = invoice_payment_rails_are_payable(&final_invoice)
+        && final_invoice.accept_ln
+        && final_invoice.expires_at_unix > unix_now()
+        && final_amount_sat == amount_sat;
+    pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::OfferBeforeCommit)
+        .await;
+
     tx.commit()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
-    Ok(Some(pr))
+    if let Some(nym) = lightning_swap_nym(&current) {
+        db::touch_user_callback(&state.db, nym).await;
+    }
+    if !still_payable {
+        return Err(AppError::ServiceUnavailable(
+            "invoice payment state changed while creating the Lightning offer; refresh and retry"
+                .into(),
+        ));
+    }
+    Ok(Some(prepared.lightning_pr))
 }
 
 /// Read-only counterpart to `ensure_reusable_lightning_offer`.
@@ -1560,20 +1780,21 @@ async fn ensure_reusable_lightning_offer(
 /// still-payable BOLT11, but if the latest offer is expired, the wrong
 /// amount, or absent, callers must explicitly hit
 /// `POST /api/v1/invoices/:id/lightning` to create/refresh the offer.
-async fn latest_reusable_lightning_offer(
-    pool: &sqlx::PgPool,
+async fn latest_reusable_lightning_offer<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     inv: &db::Invoice,
+    amount_sat: i64,
 ) -> Result<Option<String>, AppError> {
-    if !matches!(inv.status.as_str(), "unpaid" | "partially_paid") || !inv.accept_ln {
+    if !invoice_payment_rails_are_payable(inv) || !inv.accept_ln {
         return Ok(None);
     }
 
-    let amount_sat = remaining_amount_sat(inv);
     if amount_sat <= 0 || inv.expires_at_unix <= unix_now() {
         return Ok(None);
     }
 
-    let Some((pr, pr_amount_sat)) = db::latest_lightning_pr_for_invoice(pool, inv.id).await? else {
+    let Some((pr, pr_amount_sat)) = db::latest_lightning_pr_for_invoice(executor, inv.id).await?
+    else {
         return Ok(None);
     };
     if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, unix_now()) {
@@ -1583,10 +1804,8 @@ async fn latest_reusable_lightning_offer(
     }
 }
 
-fn remaining_amount_sat(inv: &db::Invoice) -> i64 {
-    inv.amount_sat
-        .saturating_sub(inv.paid_amount_sat.unwrap_or(0))
-        .max(0)
+fn remaining_amount_from_received(inv: &db::Invoice, received_sat: i64) -> i64 {
+    inv.amount_sat.saturating_sub(received_sat).max(0)
 }
 
 fn payment_tolerance_sat(inv: &db::Invoice, tolerances: db::InvoiceAccountingTolerances) -> i64 {
@@ -1695,25 +1914,48 @@ fn percent_encode_query_value(value: &str) -> String {
     encoded
 }
 
-/// Internal: create a Boltz reverse swap and record it as the Lightning
-/// offer for `invoice`. The `invoice_id` association is what lets the
-/// claimer's invoice-flip hook pair the Boltz settlement back to this
-/// invoice on payment.
-async fn create_lightning_offer(
+struct PreparedLightningOffer {
+    swap_id: String,
+    lightning_pr: String,
+    preimage_hex: String,
+    claim_key_hex: String,
+    boltz_response_json: String,
+}
+
+impl PreparedLightningOffer {
+    fn as_new_swap_record<'a>(
+        &'a self,
+        swap_nym: Option<&'a str>,
+        amount_sat: u64,
+        invoice_id: Uuid,
+        swap_key_index: u64,
+        root_fingerprint: &'a str,
+    ) -> db::NewSwapRecord<'a> {
+        db::NewSwapRecord {
+            nym: swap_nym,
+            boltz_swap_id: &self.swap_id,
+            // Claim destination is resolved from invoices.liquid_address at
+            // claim time and cached into swap_records.address.
+            address: None,
+            address_index: None,
+            amount_sat,
+            invoice: &self.lightning_pr,
+            preimage_hex: &self.preimage_hex,
+            claim_key_hex: &self.claim_key_hex,
+            boltz_response_json: &self.boltz_response_json,
+            invoice_id: Some(invoice_id),
+            key_index: Some(swap_key_index as i64),
+            root_fingerprint: Some(root_fingerprint),
+        }
+    }
+}
+
+async fn request_lightning_offer(
     state: &AppState,
-    swap_nym: Option<&str>,
+    swap_key_index: u64,
     amount_sat: u64,
     invoice: &db::Invoice,
-) -> Result<String, AppError> {
-    state
-        .admission
-        .enforce(Rail::LightningReverse)
-        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
-
-    let swap_key_index = db::next_swap_key_index(&state.db)
-        .await
-        .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
-
+) -> Result<PreparedLightningOffer, AppError> {
     let public_url = invoice_public_url(
         &state.config.domain,
         invoice.nym_owner.as_deref(),
@@ -1732,38 +1974,54 @@ async fn create_lightning_offer(
         )
         .await?;
 
-    let lightning_pr = result.invoice.clone();
-    let preimage_hex = hex::encode(&result.preimage);
-    let claim_key_hex = hex::encode(result.claim_keypair.secret_bytes());
-    let boltz_response_json = serde_json::to_string(&result.boltz_response)
-        .map_err(|e| AppError::BoltzError(format!("failed to serialize boltz response: {e}")))?;
+    Ok(PreparedLightningOffer {
+        swap_id: result.swap_id,
+        lightning_pr: result.invoice,
+        preimage_hex: hex::encode(&result.preimage),
+        claim_key_hex: hex::encode(result.claim_keypair.secret_bytes()),
+        boltz_response_json: serde_json::to_string(&result.boltz_response).map_err(|e| {
+            AppError::BoltzError(format!("failed to serialize boltz response: {e}"))
+        })?,
+    })
+}
+
+/// Internal: create a Boltz reverse swap and record it as the Lightning
+/// offer for `invoice`. The `invoice_id` association is what lets the
+/// claimer's invoice-flip hook pair the Boltz settlement back to this
+/// invoice on payment.
+async fn create_lightning_offer(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<String, AppError> {
+    state
+        .admission
+        .enforce(Rail::LightningReverse)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+
+    let swap_key_index = db::next_swap_key_index(&state.db)
+        .await
+        .map_err(|e| AppError::BoltzError(format!("swap key allocation failed: {e}")))?;
+    let prepared = request_lightning_offer(state, swap_key_index, amount_sat, invoice).await?;
 
     db::record_swap(
         &state.db,
-        &db::NewSwapRecord {
-            nym: swap_nym,
-            boltz_swap_id: &result.swap_id,
-            // Claim destination is resolved from invoices.liquid_address
-            // at claim time and cached into swap_records.address.
-            address: None,
-            address_index: None,
+        &prepared.as_new_swap_record(
+            swap_nym,
             amount_sat,
-            invoice: &lightning_pr,
-            preimage_hex: &preimage_hex,
-            claim_key_hex: &claim_key_hex,
-            boltz_response_json: &boltz_response_json,
-            invoice_id: Some(invoice.id),
-            key_index: Some(swap_key_index as i64),
-            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
-        },
+            invoice.id,
+            swap_key_index,
+            state.swap_key_root_fingerprint.as_str(),
+        ),
     )
     .await
-    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
+    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", prepared.swap_id)))?;
 
     if let Some(nym) = swap_nym {
         db::touch_user_callback(&state.db, nym).await;
     }
-    Ok(lightning_pr)
+    Ok(prepared.lightning_pr)
 }
 
 struct BitcoinChainOffer {
@@ -2464,6 +2722,7 @@ pub struct InvoiceListItem {
     pub nym_owner: Option<String>,
     pub origin: String,
     pub status: String,
+    pub presentation_status: Option<String>,
     pub pricing_mode: String,
     pub settlement_status: String,
     pub amount_sat: i64,
@@ -2579,24 +2838,36 @@ pub async fn list_signed(
     // `params.npub` and we filter the DB on the same value. A mismatch
     // would require a forged signature — unreachable past verify_la_v2.
 
+    let mut snapshot = begin_invoice_read_snapshot(&state.db).await?;
     let rows = db::list_invoices_by_npub(
-        &state.db,
+        &mut *snapshot,
         &params.npub,
         status_filter,
         params.page,
         page_size,
     )
     .await?;
+    pause_at_invoice_integration_test_hook(InvoiceIntegrationTestHookPoint::ListAfterInvoiceRead)
+        .await;
     let has_more = rows.len() >= page_size as usize;
+    let invoice_ids = rows.iter().map(|invoice| invoice.id).collect::<Vec<_>>();
+    let presentation_received =
+        db::invoice_presentation_received_sats(&mut *snapshot, &invoice_ids).await?;
+    snapshot.commit().await?;
     let invoices = rows
         .into_iter()
         .map(|inv| {
-            let remaining = remaining_amount_sat(&inv);
+            let received = presentation_received
+                .get(&inv.id)
+                .copied()
+                .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
+            let remaining = remaining_amount_from_received(&inv, received);
             InvoiceListItem {
                 id: inv.id,
                 nym_owner: inv.nym_owner,
                 origin: inv.origin,
                 status: inv.status,
+                presentation_status: inv.presentation_status,
                 pricing_mode: inv.pricing_mode,
                 settlement_status: inv.settlement_status,
                 amount_sat: inv.amount_sat,

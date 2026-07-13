@@ -47,6 +47,24 @@ The service worker has three rules:
 This prevents private invoice pages from being stored offline while still
 allowing installed Payment Page and POS shells to reopen without network.
 
+## Payment-state truth
+
+The live payment screen combines server-owned `presentation_status` with
+`settlement_status`; accounting `status` remains available but cannot declare a
+payment final by itself. Verified partial evidence keeps top-up rails visible.
+Sufficient or overpaid pending evidence hides rails and shows calm settlement
+support. `resolution_pending` shows a visible payment issue. Unknown wire values
+are non-final, non-cancellable, hide rails, and keep polling rather than being
+treated as not-found or unpaid.
+
+One idempotently managed detail interval polls through pending, resolution,
+unknown, and settled-partial states because the latter remains payable. It
+stops on settled sufficient/overpaid projections or existing stop-polling
+incidents. Network failure retains the last trustworthy state, and only a real
+not-found response contributes to the not-found streak. The Liquid WebSocket
+remains a refresh trigger; it is not chain authority. History remains local
+load/manual/route-return refresh and does not gain background list polling.
+
 ## Proxy Requirements
 
 The reverse proxy must serve `/pwa-assets/*` and `/sw.js` with correct content

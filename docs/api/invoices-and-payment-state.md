@@ -32,8 +32,8 @@ Rail choices have these implications:
 
 | Choice | Required destination | Settlement behavior |
 |---|---|---|
-| `accept_btc` | unique mainnet `bitcoin_address` | Direct BTC; credited only after configured confirmations. Reorg observations can change before final credit. |
-| `accept_liquid` | unique `liquid_address` and blinding key | Direct Liquid observation and unblinding. Bullnym learns payment amounts. |
+| `accept_btc` | unique mainnet `bitcoin_address` | Direct BTC is presented at zero confirmations, activates accounting at one, and reaches configured finality at three by default. |
+| `accept_liquid` | unique `liquid_address` and blinding key | Exact verified L-BTC is presented at zero confirmations, activates accounting at one, and reaches configured finality at two by default. |
 | `accept_ln` | unique Liquid address; no blinding key required unless `accept_liquid` is also true | Boltz reverse swap settles Lightning receipts to that Liquid address. |
 | multiple rails | all corresponding fields | First and partial payments across rails are aggregated; `paid_via` may become `mixed`. Do not reuse any receive address. |
 
@@ -107,6 +107,7 @@ Each `invoices` item contains:
 | `nym_owner` | Owning nym, or `null` for an unlinked invoice |
 | `origin` | `wallet` or `checkout` |
 | `status` | Invoice status from the table below |
+| `presentation_status` | Server-computed `unpaid`, `partial`, `payment_received`, or `overpaid`; nullable/unknown rollout values are conservative |
 | `pricing_mode` | `sat_fixed` or `fiat_fixed` |
 | `settlement_status` | Settlement state from the table below |
 | `amount_sat` | Locked invoice amount in sats |
@@ -132,6 +133,8 @@ at 100; sign the capped value if requesting more than 100. Supported status
 filters are listed below. `has_more` is not based on a look-ahead query: an
 exactly full final page still reports `true`. Continue until the API returns a
 short or empty page. Use this endpoint to reconcile a timed-out create request.
+The optional `status` filter remains accounting-based; provisional
+`payment_received` does not enter the `paid` filter before one confirmation.
 
 ## Cancel
 
@@ -157,6 +160,7 @@ are. Treat invoice URLs as shareable secrets.
 ```json
 {
   "status": "unpaid",
+  "presentation_status": "unpaid",
   "pricing_mode": "sat_fixed",
   "settlement_status": "none",
   "amount_sat": 10000,
@@ -202,6 +206,23 @@ Invoice `status` values:
 | `expired` | Payment window ended. Do not pay cached offers. |
 | `cancelled` | Recipient cancelled. Do not pay cached offers. |
 
+`presentation_status` is independent from confirmed-accounting `status` and
+`paid_amount_sat`:
+
+| Value | Client interpretation |
+|---|---|
+| `unpaid` | No valid active or provisional direct value contributes. |
+| `partial` | Active plus verified provisional value remains below the server tolerance; top-up rails remain payable. |
+| `payment_received` | Active plus verified provisional value satisfies the invoice; hide new instructions. |
+| `overpaid` | Active plus verified provisional value exceeds the target; hide new instructions. |
+
+The server owns value, mixed-rail, fiat, and tolerance calculations. A null or
+unknown presentation value is non-final and non-cancellable, hides payment
+instructions, and must not be mapped to `unpaid`.
+`remaining_amount_sat` is likewise server-owned: it subtracts exact active plus
+verified provisional presentation value so partial top-up instructions and new
+Lightning offers cannot request the already-observed amount again.
+
 Settlement status is independent:
 
 | Value | Meaning |
@@ -209,6 +230,7 @@ Settlement status is independent:
 | `none` | No separate swap settlement is pending. |
 | `pending` | A swap/payment exists but funds are not yet settled. |
 | `settled` | The current settlement boundary completed. For swap claims this currently means successful broadcast, not confirmation. |
+| `resolution_pending` | Previously accepted direct evidence regressed and is visibly being checked. |
 | `claim_stuck` | Fast claim retries were exhausted; slow automated recovery continues on a longer backoff and operators should investigate. |
 | `refunded` | Chain-swap lockup was refunded. |
 | `failed` | Settlement failed terminally. |
@@ -216,24 +238,31 @@ Settlement status is independent:
 Do not interpret `settlement_status: settled` as confirmed finality for swap
 rails. Merchant fulfillment policy must account for the current broadcast
 boundary and verify chain confirmation when finality is required. Direct
-Bitcoin observations expose txid/vout,
-amount, confirmations, block height, state, and observation timestamps; only
-the configured confirmation threshold creates the accounting event.
+Bitcoin and Liquid accounting begins at one confirmation; configured finality
+defaults to three Bitcoin and two Liquid confirmations. Zero-confirmation
+evidence changes only presentation and settlement. Bitcoin observation details
+expose txid/vout, amount, confirmations, block height, state, and timestamps.
 
 ## `POST /api/v1/invoices/:id/lightning`
 
 Returns `{ "pr": "lnbc..." }`. It lazily creates or refreshes the current
-BOLT11 and is public/rate-limited. The invoice must accept Lightning and have
-status `unpaid` or `partially_paid`. Call it only when the cached offer is
-absent or expired. A new BOLT11 does not create a new invoice.
+BOLT11 and is public/rate-limited. The invoice must accept Lightning and the
+combined server projection must remain payable: known `unpaid` with no
+settlement evidence, or known `partial` presentation. Sufficient, overpaid,
+incident, terminal, and unknown projections cannot mint a new offer. Call it
+only when a payable invoice's cached offer is absent or expired. A new BOLT11
+does not create a new invoice.
 
 Offer creation uses a non-blocking per-invoice advisory lock. If another request
-is creating the offer and no reusable BOLT11 is visible yet, this endpoint can
-return the normal HTTP `200` `InvalidAmount` error envelope with reason
-`invoice expired; no Lightning offer available`. The same envelope is used when
-the invoice deadline has actually passed. If status remains payable and local
-time is before `expires_at_unix`, refresh status and retry after a short
-backoff; do not treat that reason alone as proof of permanent expiry.
+or a payment-state reducer currently owns that lock, this endpoint returns HTTP
+`503` with the normal error envelope and code `ServiceUnavailable`. Treat this
+as transient: refresh status, then retry with a short backoff only if the fresh
+projection remains payable and local time is before `expires_at_unix`.
+
+A non-payable invoice or one whose deadline has passed instead returns the
+normal HTTP `200` `InvalidAmount` error envelope. Do not treat lock contention
+as invoice expiry, and do not retry either response from cached state alone.
+The integration suite exercises the offer-lock contention response.
 
 ## `POST /api/v1/invoices/:id/liquid`
 
@@ -243,7 +272,12 @@ route rather than retrying it.
 
 ## Polling and expiry
 
-Use bounded polling with backoff and stop at a terminal status. A reasonable UI
+Use bounded polling with backoff and stop only when the combined presentation
+and settlement projection is final. Accounting `paid` with settlement
+`pending` continues polling; `resolution_pending`, unknown values, and a
+settled-but-partial payable projection also keep polling. Settled
+sufficient/overpaid projections plus `claim_stuck`, `refunded`, and `failed`
+stop the automatic detail loop under the current contract. A reasonable UI
 starts at 2-3 seconds while visible, backs off, and suspends in the background.
 `expires_at_unix` is the immediate payability boundary, but the stored status is
 terminalized asynchronously by periodic GC (every 10 minutes with the shipped

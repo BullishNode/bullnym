@@ -79,19 +79,76 @@ impl DirectRegressionReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectObservationPhase {
+pub enum DirectPositivePhase {
     Provisional,
     Confirmed,
     Finalized,
-    ResolutionPending(DirectRegressionReason),
 }
 
-impl DirectObservationPhase {
+impl DirectPositivePhase {
     fn observation_state(self) -> &'static str {
         match self {
             Self::Provisional => "seen_unconfirmed",
             Self::Confirmed => "awaiting_confirmations",
             Self::Finalized => "counted",
+        }
+    }
+
+    fn activates_accounting(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Finalized)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectObservationPhase {
+    Provisional,
+    Confirmed,
+    Finalized,
+    /// The same authoritative view proved that a prior inclusion block
+    /// regressed and supplied the current positive state. This preserves the
+    /// prior block identity in the append-only transition without exposing a
+    /// transient invoice incident between demotion and reappearance.
+    ReobservedAfterBlockRegression {
+        phase: DirectPositivePhase,
+        prior_block_height: i32,
+        prior_block_hash: [u8; 32],
+        reason: DirectRegressionReason,
+    },
+    ResolutionPending(DirectRegressionReason),
+}
+
+impl DirectObservationPhase {
+    pub fn reobserved_after_block_regression(
+        phase: DirectPositivePhase,
+        prior_block_height: i32,
+        prior_block_hash: &str,
+        reason: DirectRegressionReason,
+    ) -> Result<Self, String> {
+        if prior_block_height <= 0 {
+            return Err("prior direct-payment block height must be positive".to_string());
+        }
+        if reason != DirectRegressionReason::Reorged {
+            return Err("block-regression reobservation requires a reorg reason".to_string());
+        }
+        let decoded = hex::decode(prior_block_hash)
+            .map_err(|_| "prior direct-payment block hash must be hexadecimal".to_string())?;
+        let prior_block_hash: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| "prior direct-payment block hash must be 32 bytes".to_string())?;
+        Ok(Self::ReobservedAfterBlockRegression {
+            phase,
+            prior_block_height,
+            prior_block_hash,
+            reason,
+        })
+    }
+
+    fn observation_state(self) -> &'static str {
+        match self {
+            Self::Provisional => "seen_unconfirmed",
+            Self::Confirmed => "awaiting_confirmations",
+            Self::Finalized => "counted",
+            Self::ReobservedAfterBlockRegression { phase, .. } => phase.observation_state(),
             Self::ResolutionPending(_) => "resolution_pending",
         }
     }
@@ -103,14 +160,40 @@ impl DirectObservationPhase {
         }
     }
 
+    fn transition_reason(self) -> Option<&'static str> {
+        match self {
+            Self::ReobservedAfterBlockRegression { reason, .. }
+            | Self::ResolutionPending(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    fn block_regression(
+        self,
+    ) -> Option<(DirectPositivePhase, i32, [u8; 32], DirectRegressionReason)> {
+        match self {
+            Self::ReobservedAfterBlockRegression {
+                phase,
+                prior_block_height,
+                prior_block_hash,
+                reason,
+            } => Some((phase, prior_block_height, prior_block_hash, reason)),
+            _ => None,
+        }
+    }
+
     fn activates_accounting(self, verification: DirectEvidenceVerification) -> bool {
-        verification.is_verified() && matches!(self, Self::Confirmed | Self::Finalized)
+        verification.is_verified()
+            && match self {
+                Self::Confirmed | Self::Finalized => true,
+                Self::ReobservedAfterBlockRegression { phase, .. } => phase.activates_accounting(),
+                Self::Provisional | Self::ResolutionPending(_) => false,
+            }
     }
 
     #[cfg(test)]
     fn contributes_to_presentation(self, verification: DirectEvidenceVerification) -> bool {
-        verification.is_verified()
-            && matches!(self, Self::Provisional | Self::Confirmed | Self::Finalized)
+        verification.is_verified() && !matches!(self, Self::ResolutionPending(_))
     }
 }
 
@@ -160,6 +243,13 @@ impl DirectOutputObservation<'_> {
         }) {
             return protocol_error("direct block hash must be 64 hexadecimal characters");
         }
+        if let Some((_, prior_height, _, reason)) = self.phase.block_regression() {
+            if prior_height <= 0 || reason != DirectRegressionReason::Reorged {
+                return protocol_error(
+                    "positive block-regression evidence requires a prior block and reorg reason",
+                );
+            }
+        }
         match source {
             DirectPaymentSource::Bitcoin if self.asset_id.is_some() => {
                 return protocol_error("Bitcoin direct evidence must not carry an asset id");
@@ -177,7 +267,11 @@ impl DirectOutputObservation<'_> {
             DirectPaymentSource::Bitcoin => {}
         }
         match self.phase {
-            DirectObservationPhase::Provisional => {
+            DirectObservationPhase::Provisional
+            | DirectObservationPhase::ReobservedAfterBlockRegression {
+                phase: DirectPositivePhase::Provisional,
+                ..
+            } => {
                 if self.confirmations != 0
                     || self.block_height.is_some()
                     || self.block_hash.is_some()
@@ -187,7 +281,12 @@ impl DirectOutputObservation<'_> {
                     );
                 }
             }
-            DirectObservationPhase::Confirmed | DirectObservationPhase::Finalized => {
+            DirectObservationPhase::Confirmed
+            | DirectObservationPhase::Finalized
+            | DirectObservationPhase::ReobservedAfterBlockRegression {
+                phase: DirectPositivePhase::Confirmed | DirectPositivePhase::Finalized,
+                ..
+            } => {
                 if self.verification != DirectEvidenceVerification::Verified {
                     return protocol_error("confirmed direct evidence must be positively verified");
                 }
@@ -238,6 +337,66 @@ pub enum ApplyDirectObservationOutcome {
     AlreadyApplied,
     Stale { current_generation: i64 },
     Closed,
+}
+
+/// Immutable Bitcoin-direct evidence that still needs authoritative tx-specific
+/// follow-up. Rows may come from the pre-047 observation writer or from a
+/// legacy countable event that has not yet been linked to a verified
+/// observation.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct BitcoinDirectWatchEvidence {
+    pub event_key: String,
+    pub txid: String,
+    pub vout: i32,
+    pub address: String,
+    pub amount_sat: i64,
+    pub confirmations: i32,
+    pub block_height: Option<i32>,
+    pub block_hash: Option<String>,
+    pub last_seen_state: Option<String>,
+}
+
+/// Load a caller-bounded prefix of non-superseded Bitcoin-direct identities for
+/// one invoice. The watcher requests one sentinel beyond its hard limit so an
+/// oversized obligation fails closed without loading unbounded evidence.
+pub async fn list_bitcoin_direct_watch_evidence(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    limit: i64,
+) -> Result<Vec<BitcoinDirectWatchEvidence>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM ( \
+         SELECT o.event_key, o.txid, o.vout, o.address, o.amount_sat, \
+                o.confirmations, o.block_height, \
+                o.inclusion_block_hash AS block_hash, \
+                o.last_seen_state::TEXT AS last_seen_state \
+         FROM invoice_payment_observations o \
+         WHERE o.invoice_id = $1 \
+           AND o.source = 'bitcoin_direct' \
+           AND o.last_seen_state <> 'superseded' \
+         UNION ALL \
+         SELECT e.event_key, e.txid, e.vout, e.address, e.amount_sat, \
+                0::INTEGER AS confirmations, NULL::INTEGER AS block_height, \
+                NULL::TEXT AS block_hash, NULL::TEXT AS last_seen_state \
+         FROM invoice_payment_events e \
+         WHERE e.invoice_id = $1 \
+           AND e.source = 'bitcoin_direct' \
+           AND e.accounting_state <> 'superseded' \
+           AND e.txid IS NOT NULL \
+           AND e.vout IS NOT NULL \
+           AND e.address IS NOT NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM invoice_payment_observations o \
+               WHERE o.event_key = e.event_key \
+             ) \
+         ) evidence \
+         ORDER BY event_key \
+         LIMIT $2",
+    )
+    .bind(invoice_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +499,7 @@ struct PendingDirectTransition {
     from_event_state: Option<String>,
     to_event_state: &'static str,
     reason: Option<&'static str>,
+    metadata: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -448,10 +608,7 @@ fn presentation_status_for(
                 event.source.as_deref(),
                 Some("bitcoin_direct" | "liquid_direct")
             ) && event.verification_state == "verified"
-                && matches!(
-                    event.observation_state.as_deref(),
-                    Some("seen_unconfirmed" | "resolution_pending")
-                )
+                && matches!(event.observation_state.as_deref(), Some("seen_unconfirmed"))
         })
         .map(|event| AccountingReplayEvent {
             rail: match event.rail.as_str() {
@@ -668,6 +825,11 @@ pub async fn apply_direct_observation_batch(
     validate_observation_batch(batch.source, batch.observations)?;
 
     let mut tx = pool.begin().await?;
+    let offer_lock_key = super::invoice_lightning_lock_key(batch.invoice_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&offer_lock_key)
+        .execute(&mut *tx)
+        .await?;
     let invoice = sqlx::query_as::<_, LockedInvoice>(
         "SELECT amount_sat, status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
@@ -710,9 +872,34 @@ pub async fn apply_direct_observation_batch(
         return Ok(ApplyDirectObservationOutcome::Closed);
     }
 
+    // Serialize Liquid discovery against the compatibility/Boltz settlement
+    // writer. The watcher may have fetched its exclusion set before a Boltz
+    // claim committed; rechecking under the shared advisory boundary makes
+    // either ordering safe: Boltz-first observations are ignored here, while
+    // direct-first observations are superseded by the later Boltz writer.
+    let boltz_settlement_txids: HashSet<String> = if batch.source == DirectPaymentSource::Liquid {
+        sqlx::query_scalar(
+            "SELECT DISTINCT LOWER(txid) \
+                 FROM invoice_payment_events \
+                 WHERE invoice_id = $1 \
+                   AND source IN ('lightning_boltz_reverse', 'bitcoin_boltz_chain') \
+                   AND txid IS NOT NULL",
+        )
+        .bind(batch.invoice_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        HashSet::new()
+    };
+
     let mut changed = false;
     let mut pending_transitions = Vec::new();
     for observation in batch.observations {
+        if boltz_settlement_txids.contains(&observation.txid.to_ascii_lowercase()) {
+            continue;
+        }
         let observation_mutation =
             upsert_direct_observation_locked(&mut tx, &batch, observation).await?;
         changed |= observation_mutation.changed;
@@ -859,6 +1046,16 @@ async fn upsert_direct_observation_locked(
     .bind(observation.event_key)
     .fetch_optional(&mut **tx)
     .await?;
+    validate_block_regression_prior(
+        stored.as_ref().map(|stored| {
+            (
+                stored.last_seen_state.as_str(),
+                stored.block_height,
+                stored.inclusion_block_hash.as_deref(),
+            )
+        }),
+        observation.phase,
+    )?;
     let next_state = observation.phase.observation_state();
     let next_verification = observation.verification.as_str();
     if let Some(stored) = stored {
@@ -878,6 +1075,7 @@ async fn upsert_direct_observation_locked(
             next_state,
             observation.block_height,
             observation.block_hash,
+            observation.phase,
         ) {
             return protocol_error(
                 "confirmed direct block identity requires an explicit regression before replacement",
@@ -934,7 +1132,9 @@ async fn upsert_direct_observation_locked(
                 observation_state: Some(stored.last_seen_state),
                 verification_state: Some(stored.verification_state),
             },
-            should_append_transition: transition_change || invalidation_reason_change,
+            should_append_transition: transition_change
+                || invalidation_reason_change
+                || observation.phase.block_regression().is_some(),
         })
     } else {
         let id: Uuid = sqlx::query_scalar(
@@ -1000,6 +1200,30 @@ fn validate_stored_observation(
     Ok(())
 }
 
+fn validate_block_regression_prior(
+    stored: Option<(&str, Option<i32>, Option<&str>)>,
+    phase: DirectObservationPhase,
+) -> Result<(), sqlx::Error> {
+    let Some((_, prior_height, prior_hash, _)) = phase.block_regression() else {
+        return Ok(());
+    };
+    let Some((stored_state, stored_height, stored_hash)) = stored else {
+        return protocol_error(
+            "positive block-regression evidence requires a stored prior observation",
+        );
+    };
+    let prior_hash = hex::encode(prior_hash);
+    if !matches!(stored_state, "awaiting_confirmations" | "counted")
+        || stored_height != Some(prior_height)
+        || !stored_hash.is_some_and(|hash| hash.eq_ignore_ascii_case(&prior_hash))
+    {
+        return protocol_error(
+            "positive block-regression proof does not match stored block identity",
+        );
+    }
+    Ok(())
+}
+
 fn confirmed_block_identity_conflicts(
     stored_state: &str,
     stored_block_height: Option<i32>,
@@ -1007,12 +1231,14 @@ fn confirmed_block_identity_conflicts(
     next_state: &str,
     next_block_height: Option<i32>,
     next_block_hash: Option<&str>,
+    phase: DirectObservationPhase,
 ) -> bool {
     let stored_has_positive_block = matches!(stored_state, "awaiting_confirmations" | "counted");
     let next_has_positive_block = matches!(next_state, "awaiting_confirmations" | "counted");
     stored_has_positive_block
         && next_has_positive_block
         && (stored_block_height != next_block_height || stored_block_hash != next_block_hash)
+        && phase.block_regression().is_none()
 }
 
 fn direct_transition_kind(
@@ -1030,16 +1256,32 @@ fn direct_transition_kind(
         return "legacy_revalidated";
     }
     match observation.phase {
-        DirectObservationPhase::Provisional => "observed_provisional",
-        DirectObservationPhase::Confirmed
+        DirectObservationPhase::Provisional
+        | DirectObservationPhase::Confirmed
+        | DirectObservationPhase::Finalized
             if before.observation_state.as_deref() == Some("resolution_pending") =>
         {
             "reactivated"
         }
+        DirectObservationPhase::Provisional => "observed_provisional",
         DirectObservationPhase::Confirmed => "accounting_activated",
         DirectObservationPhase::Finalized => "finalized",
+        DirectObservationPhase::ReobservedAfterBlockRegression { .. } => "reactivated",
         DirectObservationPhase::ResolutionPending(_) => "resolution_pending",
     }
+}
+
+fn direct_transition_metadata(observation: &DirectOutputObservation<'_>) -> serde_json::Value {
+    let Some((_, prior_height, prior_hash, reason)) = observation.phase.block_regression() else {
+        return serde_json::json!({});
+    };
+    serde_json::json!({
+        "block_regression_reason": reason.as_str(),
+        "prior_block_height": prior_height,
+        "prior_block_hash": hex::encode(prior_hash),
+        "current_block_height": observation.block_height,
+        "current_block_hash": observation.block_hash,
+    })
 }
 
 fn pending_direct_transition(
@@ -1064,7 +1306,8 @@ fn pending_direct_transition(
             "inactive" => "inactive",
             _ => unreachable!("direct reducer produced an unsupported event state"),
         },
-        reason: observation.phase.regression_reason(),
+        reason: observation.phase.transition_reason(),
+        metadata: direct_transition_metadata(observation),
     }
 }
 
@@ -1088,9 +1331,9 @@ async fn append_transitions_locked(
                   from_presentation_status, to_presentation_status, \
                   from_settlement_status, to_settlement_status, \
                   from_invoice_status, to_invoice_status, \
-                  from_paid_amount_sat, to_paid_amount_sat) \
+                  from_paid_amount_sat, to_paid_amount_sat, metadata) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
+                     $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
              ON CONFLICT (observation_id, generation) DO NOTHING",
         )
         .bind(idempotency_key)
@@ -1115,6 +1358,7 @@ async fn append_transitions_locked(
         .bind(projection.status)
         .bind(invoice.paid_amount_sat)
         .bind(paid_amount_sat)
+        .bind(&transition.metadata)
         .execute(&mut **tx)
         .await?;
     }
@@ -1139,6 +1383,8 @@ async fn ensure_direct_event_locked(
     };
     let desired_reason = if should_activate {
         None
+    } else if let Some((_, _, _, reason)) = observation.phase.block_regression() {
+        Some(reason.as_str())
     } else {
         observation
             .phase
@@ -1340,6 +1586,7 @@ async fn supersede_direct_event_locked(
             from_event_state: Some(old_event.accounting_state),
             to_event_state: "superseded",
             reason: Some("replaced"),
+            metadata: serde_json::json!({}),
         }),
     })
 }
@@ -1394,6 +1641,7 @@ mod tests {
 
     const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BLOCK_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NEW_BLOCK_HASH: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     fn tolerances() -> InvoiceAccountingTolerances {
         InvoiceAccountingTolerances {
@@ -1443,8 +1691,8 @@ mod tests {
         supersedes_event_key: Option<&'a str>,
     ) -> DirectOutputObservation<'a> {
         let has_block = matches!(
-            phase,
-            DirectObservationPhase::Confirmed | DirectObservationPhase::Finalized
+            phase.observation_state(),
+            "awaiting_confirmations" | "counted"
         );
         DirectOutputObservation {
             event_key,
@@ -1523,14 +1771,14 @@ mod tests {
     }
 
     #[test]
-    fn resolution_pending_preserves_partial_presentation_amount() {
+    fn resolution_pending_excludes_invalidated_value_from_presentation() {
         let projection = reduce_projection(
             &invoice(),
             &[projection_event("inactive", "resolution_pending", 40_000)],
             tolerances(),
         );
         assert_eq!(projection.status, "in_progress");
-        assert_eq!(projection.presentation_status, "partial");
+        assert_eq!(projection.presentation_status, "unpaid");
         assert_eq!(projection.direct_settlement_status, "resolution_pending");
         assert_eq!(projection.received_sat, 0);
     }
@@ -1583,7 +1831,7 @@ mod tests {
             tolerances(),
         );
         assert_eq!(projection.status, "in_progress");
-        assert_eq!(projection.presentation_status, "payment_received");
+        assert_eq!(projection.presentation_status, "unpaid");
         assert_eq!(projection.direct_settlement_status, "resolution_pending");
         assert_eq!(projection.received_sat, 0);
     }
@@ -1854,6 +2102,7 @@ mod tests {
             "counted",
             Some(900_000),
             Some(BLOCK_HASH),
+            DirectObservationPhase::Finalized,
         ));
         assert!(confirmed_block_identity_conflicts(
             "awaiting_confirmations",
@@ -1862,6 +2111,7 @@ mod tests {
             "awaiting_confirmations",
             Some(900_001),
             Some(&"c".repeat(64)),
+            DirectObservationPhase::Confirmed,
         ));
         assert!(!confirmed_block_identity_conflicts(
             "awaiting_confirmations",
@@ -1870,6 +2120,87 @@ mod tests {
             "seen_unconfirmed",
             None,
             None,
+            DirectObservationPhase::Provisional,
         ));
+
+        let atomic_reobservation = DirectObservationPhase::reobserved_after_block_regression(
+            DirectPositivePhase::Confirmed,
+            900_000,
+            BLOCK_HASH,
+            DirectRegressionReason::Reorged,
+        )
+        .unwrap();
+        assert!(!confirmed_block_identity_conflicts(
+            "awaiting_confirmations",
+            Some(900_000),
+            Some(BLOCK_HASH),
+            "awaiting_confirmations",
+            Some(900_001),
+            Some(&"c".repeat(64)),
+            atomic_reobservation,
+        ));
+    }
+
+    #[test]
+    fn atomic_block_regression_requires_and_audits_matching_prior_identity() {
+        assert!(DirectObservationPhase::reobserved_after_block_regression(
+            DirectPositivePhase::Confirmed,
+            900_000,
+            BLOCK_HASH,
+            DirectRegressionReason::Conflict,
+        )
+        .is_err());
+        let phase = DirectObservationPhase::reobserved_after_block_regression(
+            DirectPositivePhase::Confirmed,
+            900_000,
+            BLOCK_HASH,
+            DirectRegressionReason::Reorged,
+        )
+        .unwrap();
+        assert!(validate_block_regression_prior(None, phase).is_err());
+        assert!(validate_block_regression_prior(
+            Some(("awaiting_confirmations", Some(900_001), Some(BLOCK_HASH))),
+            phase,
+        )
+        .is_err());
+        assert!(validate_block_regression_prior(
+            Some(("awaiting_confirmations", Some(900_000), Some(BLOCK_HASH))),
+            phase,
+        )
+        .is_ok());
+
+        let observation = DirectOutputObservation {
+            event_key:
+                "bitcoin_direct:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+            txid: TXID,
+            vout: 0,
+            address: "bc1qreducerfoundation",
+            amount_sat: 100_000,
+            asset_id: None,
+            confirmations: 1,
+            block_height: Some(900_001),
+            block_hash: Some(NEW_BLOCK_HASH),
+            verification: DirectEvidenceVerification::Verified,
+            phase,
+            supersedes_event_key: None,
+        };
+        observation.validate(DirectPaymentSource::Bitcoin).unwrap();
+        let transition = pending_direct_transition(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &ObservationTransitionBefore {
+                observation_state: Some("awaiting_confirmations".into()),
+                verification_state: Some("verified".into()),
+            },
+            Some("active"),
+            "active",
+            &observation,
+        );
+        assert_eq!(transition.transition_kind, "reactivated");
+        assert_eq!(transition.reason, Some("reorged"));
+        assert_eq!(transition.metadata["prior_block_height"], 900_000);
+        assert_eq!(transition.metadata["prior_block_hash"], BLOCK_HASH);
+        assert_eq!(transition.metadata["current_block_height"], 900_001);
+        assert_eq!(transition.metadata["current_block_hash"], NEW_BLOCK_HASH);
     }
 }

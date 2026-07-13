@@ -184,6 +184,7 @@ fn production_base_config() -> Config {
         claim: ClaimConfig::default(),
         reconciler: ReconcilerConfig::default(),
         bitcoin_watcher: BitcoinWatcherConfig::default(),
+        liquid_watcher: LiquidWatcherConfig::default(),
         workers: WorkersConfig::default(),
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: "postgres://payservice@example/payservice".to_string(),
@@ -191,6 +192,35 @@ fn production_base_config() -> Config {
         boltz_webhook_url_secret: "webhook-secret".to_string(),
         boltz_webhook_url_secret_previous: String::new(),
     }
+}
+
+#[test]
+fn direct_payment_finality_defaults_and_overrides_are_explicit() {
+    assert_eq!(BitcoinWatcherConfig::default().confirmations_required, 3);
+    assert_eq!(LiquidWatcherConfig::default().finality_confirmations, 2);
+
+    let bitcoin: BitcoinWatcherConfig = toml::from_str("confirmations_required = 4").unwrap();
+    let liquid: LiquidWatcherConfig = toml::from_str("finality_confirmations = 5").unwrap();
+    assert_eq!(bitcoin.confirmations_required, 4);
+    assert_eq!(liquid.finality_confirmations, 5);
+}
+
+#[test]
+fn direct_payment_finality_zero_is_rail_local_without_aborting_config() {
+    let mut cfg = production_base_config();
+    cfg.bitcoin_watcher.confirmations_required = 0;
+    assert!(!cfg.bitcoin_watcher.finality_valid());
+    cfg.validate_for_runtime("unknown", false).unwrap();
+
+    cfg.bitcoin_watcher.confirmations_required = 1;
+    cfg.liquid_watcher.finality_confirmations = 0;
+    assert!(cfg.bitcoin_watcher.finality_valid());
+    assert!(!cfg.liquid_watcher.finality_valid());
+    cfg.validate_for_runtime("unknown", false).unwrap();
+
+    cfg.liquid_watcher.finality_confirmations = 1;
+    assert!(cfg.liquid_watcher.finality_valid());
+    cfg.validate_for_runtime("unknown", false).unwrap();
 }
 
 #[test]

@@ -10,7 +10,6 @@
 // PayScreen version only ever handled fiat, since POS never created
 // anything else.
 import { ApiError, getInvoiceStatus, getSupportedCurrencies, type CreateInvoiceResponse } from '$lib/api/client'
-import { KNOWN_STATUSES } from '$lib/status'
 import { formatFiat, formatCryptoAmount } from '$lib/money'
 import { config } from '$lib/config'
 
@@ -32,12 +31,9 @@ export async function reconstructInvoice(id: string): Promise<ReconstructResult>
     // True root cause of the "/#/pay/undefined polls forever with a bare
     // ERROR state" bug: the server deliberately returns HTTP 200 with an
     // LNURL-style (LUD-06) error envelope for most failures (src/error.rs).
-    // request() already converts that into a thrown ApiError (caught
-    // below); KNOWN_STATUSES stays as belt-and-suspenders in case a
-    // genuinely-200 response ever carries a status value we don't model.
-    if (!KNOWN_STATUSES.has(status.status)) {
-      return { ok: false, error: 'Invoice not found' }
-    }
+    // request() already converts that into a thrown ApiError (caught below).
+    // Future status/presentation tokens remain reconstructable; the live
+    // state machine treats them conservatively instead of inventing a 404.
 
     const invoice: CreateInvoiceResponse = {
       invoice_id: id,

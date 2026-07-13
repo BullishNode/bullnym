@@ -12,11 +12,12 @@ use uuid::Uuid;
 /// returned; it must serialize the field.
 #[test]
 fn signed_list_item_exposes_memo() {
-    let item = InvoiceListItem {
+    let mut item = InvoiceListItem {
         id: Uuid::nil(),
         nym_owner: Some("alice".to_string()),
         origin: "checkout".to_string(),
         status: "paid".to_string(),
+        presentation_status: Some("payment_received".to_string()),
         pricing_mode: "sat_fixed".to_string(),
         settlement_status: "none".to_string(),
         amount_sat: 1000,
@@ -45,6 +46,14 @@ fn signed_list_item_exposes_memo() {
         "signed invoice list item must carry the private memo"
     );
     assert_eq!(obj["memo"], "table 5 — decaf");
+    assert_eq!(obj["presentation_status"], "payment_received");
+
+    item.presentation_status = None;
+    let rollout_json = serde_json::to_value(&item).unwrap();
+    assert!(
+        rollout_json["presentation_status"].is_null(),
+        "unresolved migrated presentation must remain an explicit nullable field"
+    );
 }
 
 /// The public per-invoice status response drives the payer's page and any
@@ -52,8 +61,9 @@ fn signed_list_item_exposes_memo() {
 /// `memo` field to `InvoiceStatusResponse`, this fails.
 #[test]
 fn public_status_response_hides_memo() {
-    let status = InvoiceStatusResponse {
+    let mut status = InvoiceStatusResponse {
         status: "unpaid".to_string(),
+        presentation_status: Some("unpaid".to_string()),
         pricing_mode: "sat_fixed".to_string(),
         settlement_status: "none".to_string(),
         amount_sat: 1000,
@@ -82,5 +92,13 @@ fn public_status_response_hides_memo() {
     assert!(
         !obj.contains_key("memo"),
         "public invoice status must NOT expose the private memo"
+    );
+    assert_eq!(obj["presentation_status"], "unpaid");
+
+    status.presentation_status = None;
+    let rollout_json = serde_json::to_value(&status).unwrap();
+    assert!(
+        rollout_json["presentation_status"].is_null(),
+        "public status must preserve the additive nullable rollout contract"
     );
 }

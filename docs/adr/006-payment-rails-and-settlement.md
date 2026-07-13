@@ -20,9 +20,10 @@ descriptors:
   Liquid destination.
 
 Swap settlement is currently recorded after a successful claim broadcast, not
-after confirmation. Direct Liquid is currently credited from Electrum history,
-including mempool history. These are current implementation boundaries rather
-than finality guarantees.
+after confirmation. Direct Bitcoin and Liquid instead separate verified
+zero-confirmation presentation from accounting at one confirmation and
+configurable finality (three Bitcoin, two Liquid by default). These are current
+implementation boundaries rather than guarantees against arbitrary reorgs.
 
 The current server does not use the mempool API for Liquid detection. Liquid
 watching needs Electrum-style history/raw-transaction access and unblinding

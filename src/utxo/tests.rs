@@ -2,6 +2,7 @@ use super::*;
 use lwk_wollet::elements::hashes::Hash;
 use secp256k1::SecretKey;
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn test_keypair() -> (SecretKey, PublicKey) {
     let secp = Secp256k1::new();
@@ -141,6 +142,148 @@ fn history_txids_rejects_malformed_shape() {
     ));
 }
 
+#[test]
+fn liquid_history_entries_preserve_signed_heights_and_normalize_txids() {
+    let upper = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let confirmed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let entries = liquid_history_entries(&json!([
+        {"tx_hash": upper, "height": -1},
+        {"tx_hash": confirmed, "height": 42}
+    ]))
+    .unwrap();
+
+    assert_eq!(entries[0].txid, upper.to_ascii_lowercase());
+    assert_eq!(entries[0].height, -1);
+    assert_eq!(entries[0].block_hash, None);
+    assert_eq!(entries[1].height, 42);
+}
+
+#[test]
+fn liquid_history_entries_reject_incomplete_or_ambiguous_evidence() {
+    let txid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for malformed in [
+        json!([{"tx_hash": txid}]),
+        json!([{"tx_hash": "short", "height": 0}]),
+        json!([
+            {"tx_hash": txid, "height": 0},
+            {"tx_hash": txid, "height": 1}
+        ]),
+    ] {
+        assert!(matches!(
+            liquid_history_entries(&malformed),
+            Err(AppError::ElectrumError(_))
+        ));
+    }
+}
+
+#[test]
+fn liquid_snapshot_plan_bounds_history_before_header_fanout() {
+    let entries = (0..3)
+        .map(|index| LiquidHistoryEntry {
+            txid: format!("{index:064x}"),
+            height: 100 + index,
+            block_hash: None,
+        })
+        .collect::<Vec<_>>();
+    let plan = liquid_snapshot_plan(
+        &entries,
+        &[],
+        200,
+        LiquidHistorySnapshotLimits {
+            max_history_entries: 2,
+            max_block_heights: 10,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan,
+        LiquidSnapshotPlan::Incomplete(LiquidHistorySnapshotLimit::HistoryEntries {
+            observed: 3,
+            limit: 2,
+        })
+    );
+}
+
+#[test]
+fn liquid_snapshot_plan_deduplicates_current_and_prior_anchor_heights() {
+    let entries = vec![LiquidHistoryEntry {
+        txid: "a".repeat(64),
+        height: 100,
+        block_hash: None,
+    }];
+    let plan = liquid_snapshot_plan(
+        &entries,
+        &[99, 100, 100, 250],
+        200,
+        LiquidHistorySnapshotLimits {
+            max_history_entries: 10,
+            max_block_heights: 2,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan,
+        LiquidSnapshotPlan::Ready([99, 100].into_iter().collect())
+    );
+}
+
+#[test]
+fn liquid_snapshot_plan_bounds_unique_current_and_prior_heights() {
+    let entries = vec![LiquidHistoryEntry {
+        txid: "a".repeat(64),
+        height: 100,
+        block_hash: None,
+    }];
+    let plan = liquid_snapshot_plan(
+        &entries,
+        &[99, 98],
+        200,
+        LiquidHistorySnapshotLimits {
+            max_history_entries: 10,
+            max_block_heights: 2,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan,
+        LiquidSnapshotPlan::Incomplete(LiquidHistorySnapshotLimit::BlockHeights {
+            observed: 3,
+            limit: 2,
+        })
+    );
+}
+
+#[test]
+fn liquid_snapshot_plan_rejects_invalid_prior_height() {
+    let error = liquid_snapshot_plan(
+        &[],
+        &[0],
+        200,
+        LiquidHistorySnapshotLimits {
+            max_history_entries: 10,
+            max_block_heights: 10,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, AppError::ElectrumError(_)));
+}
+
+#[test]
+fn liquid_authority_identity_is_stable_and_does_not_expose_endpoint_credentials() {
+    let endpoint = "ssl://operator:secret@example.com:50002";
+    let authority = sanitized_liquid_authority(endpoint);
+
+    assert_eq!(authority, sanitized_liquid_authority(endpoint));
+    assert!(authority.starts_with("liquid-electrum:"));
+    assert!(!authority.contains("operator"));
+    assert!(!authority.contains("secret"));
+    assert!(!authority.contains("example.com"));
+    assert!(authority.len() <= 200);
+}
+
 /// Build a confidential L-BTC output of `value` sat, returning the output plus
 /// the elements value/asset blinding factors as display-order hex — exactly the
 /// form an Approach-B payer supplies (`TxOutSecrets::to_string()`).
@@ -165,7 +308,14 @@ fn confidential_lbtc_output(value: u64) -> (elements::TxOut, String, String) {
     );
 
     let (txout, abf, vbf, _eph) = elements::TxOut::new_last_confidential(
-        &mut rng, &secp, value, lbtc, spk, bpk, &[in_secrets], &[],
+        &mut rng,
+        &secp,
+        value,
+        lbtc,
+        spk,
+        bpk,
+        &[in_secrets],
+        &[],
     )
     .expect("build confidential output");
 
@@ -178,7 +328,9 @@ fn confidential_lbtc_output(value: u64) -> (elements::TxOut, String, String) {
 /// equal the token generator, so the proof is rejected (no unblinding needed).
 fn asset_masquerade_output(value: u64) -> (elements::TxOut, String, String) {
     use lwk_wollet::elements;
-    use lwk_wollet::elements::confidential::{Asset, AssetBlindingFactor, Value, ValueBlindingFactor};
+    use lwk_wollet::elements::confidential::{
+        Asset, AssetBlindingFactor, Value, ValueBlindingFactor,
+    };
     use lwk_wollet::elements::secp256k1_zkp::Generator;
 
     let secp = elements::secp256k1_zkp::Secp256k1::new();
@@ -234,9 +386,15 @@ fn rand_abf() -> String {
 #[test]
 fn proof_value_passes_when_at_or_above_floor() {
     let (txout, vbf, abf) = confidential_lbtc_output(5000);
-    let got =
-        assert_proof_utxo_value(&txout, 5000, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000)
-            .unwrap();
+    let got = assert_proof_utxo_value(
+        &txout,
+        5000,
+        &vbf,
+        &abf,
+        crate::invoice::LIQUID_BTC_ASSET_ID,
+        1000,
+    )
+    .unwrap();
     assert_eq!(got, 5000, "rebind confirms the committed value");
 }
 
@@ -244,7 +402,14 @@ fn proof_value_passes_when_at_or_above_floor() {
 fn proof_value_rejects_below_floor() {
     let (txout, vbf, abf) = confidential_lbtc_output(500);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 500, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            500,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -263,7 +428,14 @@ fn proof_value_rejects_wrong_asset() {
 fn proof_value_rejects_asset_masquerade() {
     let (txout, vbf, abf) = asset_masquerade_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_)),
     ));
 }
@@ -272,7 +444,14 @@ fn proof_value_rejects_asset_masquerade() {
 fn proof_value_rejects_explicit_asset() {
     let txout = explicit_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &rand_vbf(), &rand_abf(), crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &rand_vbf(),
+            &rand_abf(),
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_)),
     ));
 }
@@ -283,7 +462,14 @@ fn proof_value_rejects_forged_value() {
     // on-chain Pedersen commitment.
     let (txout, vbf, abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 999_999, &vbf, &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            999_999,
+            &vbf,
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -292,7 +478,14 @@ fn proof_value_rejects_forged_value() {
 fn proof_value_rejects_wrong_value_bf() {
     let (txout, _vbf, abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &rand_vbf(), &abf, crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &rand_vbf(),
+            &abf,
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -301,7 +494,14 @@ fn proof_value_rejects_wrong_value_bf() {
 fn proof_value_rejects_wrong_asset_bf() {
     let (txout, vbf, _abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, &rand_abf(), crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            &rand_abf(),
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -310,7 +510,14 @@ fn proof_value_rejects_wrong_asset_bf() {
 fn proof_value_rejects_malformed_factor() {
     let (txout, vbf, _abf) = confidential_lbtc_output(5000);
     assert!(matches!(
-        assert_proof_utxo_value(&txout, 5000, &vbf, "notahex", crate::invoice::LIQUID_BTC_ASSET_ID, 1000),
+        assert_proof_utxo_value(
+            &txout,
+            5000,
+            &vbf,
+            "notahex",
+            crate::invoice::LIQUID_BTC_ASSET_ID,
+            1000
+        ),
         Err(AppError::ProofOfFundsInvalid(_))
     ));
 }
@@ -373,4 +580,85 @@ fn verify_liquid_raw_tx_accepts_matching_and_rejects_mismatch_or_malformed() {
     // Malformed bytes are rejected before any downstream use.
     assert!(super::verify_liquid_raw_tx(&txid, &[0xde, 0xad, 0xbe, 0xef]).is_err());
     assert!(super::verify_liquid_raw_tx(&txid, &[]).is_err());
+}
+
+async fn spawn_raw_tx_electrum_fixture(
+    bytes: Vec<u8>,
+) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Electrum raw-tx fixture");
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request_line).unwrap();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": hex::encode(bytes),
+        });
+        write_half
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        request["method"].as_str().unwrap_or_default().to_string()
+    });
+    (format!("tcp://{address}"), task)
+}
+
+#[tokio::test]
+async fn raw_tx_integrity_mismatch_fails_over_to_the_next_authority() {
+    let requested_tx = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: vec![elements::TxIn {
+            previous_output: elements::OutPoint::new(
+                elements::Txid::from_slice(&[11u8; 32]).unwrap(),
+                0,
+            ),
+            is_pegin: false,
+            script_sig: elements::Script::new(),
+            sequence: elements::Sequence::MAX,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness::default(),
+        }],
+        output: vec![],
+    };
+    let wrong_tx = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: vec![elements::TxIn {
+            previous_output: elements::OutPoint::new(
+                elements::Txid::from_slice(&[12u8; 32]).unwrap(),
+                0,
+            ),
+            is_pegin: false,
+            script_sig: elements::Script::new(),
+            sequence: elements::Sequence::MAX,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness::default(),
+        }],
+        output: vec![],
+    };
+    let requested_bytes = elements::encode::serialize(&requested_tx);
+    let (wrong_url, wrong_server) =
+        spawn_raw_tx_electrum_fixture(elements::encode::serialize(&wrong_tx)).await;
+    let (valid_url, valid_server) = spawn_raw_tx_electrum_fixture(requested_bytes.clone()).await;
+    let client = ElectrumClient::connect(vec![wrong_url, valid_url], 60, 8).unwrap();
+
+    let returned = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get_raw_tx(&requested_tx.txid().to_string()),
+    )
+    .await
+    .expect("raw-tx integrity failover timed out")
+    .expect("second Electrum authority should return the requested transaction");
+
+    assert_eq!(returned, requested_bytes);
+    assert_eq!(wrong_server.await.unwrap(), "blockchain.transaction.get");
+    assert_eq!(valid_server.await.unwrap(), "blockchain.transaction.get");
 }

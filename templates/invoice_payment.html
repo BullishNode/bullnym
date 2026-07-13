@@ -181,7 +181,7 @@
 
         {# Accepted-rails badge. The QR/copy card below reveals only the
            currently selected rail, defaulting to Lightning when available. #}
-        {% if status == "unpaid" || (status == "partially_paid" && settlement_status != "pending" && settlement_status != "claim_stuck" && settlement_status != "refunded") %}
+        {% if rails_payable %}
             <div class="meta">
                 Accepted:
                 {% match bitcoin_chain_address %}
@@ -193,18 +193,19 @@
             </div>
         {% endif %}
 
-        <div class="card" id="root" data-status="{{ status }}">
+        <div class="card" id="root" data-status="{{ status }}" data-presentation-status="{{ presentation_status }}" data-settlement-status="{{ settlement_status }}">
             {# Initial server-render branches. JS replaces this on status
                transitions; for the unpaid case the JS also drives QR/rail
                toggle. For terminal cases, JS polling continues briefly to
                capture late settlements but mostly just confirms state. #}
-            {% if status == "unpaid" || (status == "partially_paid" && settlement_status != "pending" && settlement_status != "claim_stuck" && settlement_status != "refunded") %}
+            {% if rails_payable %}
                 <div class="status-line status-unpaid" id="status-line">
-                    {% if status == "partially_paid" %}Partially paid — remaining amount due{% else %}Waiting for payment…{% endif %}
+                    {% if presentation_status == "partial" %}Partially paid — remaining amount due{% else %}Waiting for payment…{% endif %}
                 </div>
                 <div class="amount" id="amount-display">
-                    {% if status == "partially_paid" %}{{ remaining_amount_sat }} sat remaining{% else %}{{ amount_sat }} sat{% endif %}
+                    {% if presentation_status == "partial" %}{{ remaining_amount_sat }} sat remaining{% else %}{{ amount_sat }} sat{% endif %}
                 </div>
+                <div class="meta" id="settlement-support">{% if settlement_status == "pending" %}Settlement pending{% endif %}</div>
                 {% match fiat_display %}
                     {% when Some with (s) %}
                         <div class="meta">≈ {{ s }} (locked at create)</div>
@@ -230,24 +231,36 @@
                 </div>
 
                 <div class="countdown" id="countdown">…</div>
-            {% else if status == "in_progress" || settlement_status == "pending" %}
-                <div class="terminal-block">
-                    <div class="terminal-icon status-paid">✓</div>
-                    <div class="status-line status-paid">Payment received</div>
-                    <div class="amount">{{ amount_sat }} sat</div>
-                    <div class="meta">Settlement is in progress</div>
-                </div>
             {% else if settlement_status == "claim_stuck" %}
                 <div class="terminal-block">
                     <div class="terminal-icon status-warn">!</div>
                     <div class="status-line status-warn">Payment needs review</div>
                     <div class="meta">Settlement is delayed. The operator has been alerted.</div>
                 </div>
-            {% else if settlement_status == "refunded" %}
+            {% else if settlement_status == "refunded" || settlement_status == "failed" %}
                 <div class="terminal-block">
                     <div class="terminal-icon status-err">!</div>
                     <div class="status-line status-err">Settlement failed</div>
                     <div class="meta">The payment could not be settled.</div>
+                </div>
+            {% else if settlement_status == "resolution_pending" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Payment issue</div>
+                    <div class="meta">Settlement problem — being checked</div>
+                </div>
+            {% else if presentation_known == false %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Checking payment status</div>
+                    <div class="meta">Payment status is being checked</div>
+                </div>
+            {% else if settlement_status == "pending" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-paid">✓</div>
+                    <div class="status-line status-paid">{% if presentation_status == "overpaid" %}Overpaid{% else %}Payment received{% endif %}</div>
+                    <div class="amount">{{ amount_sat }} sat</div>
+                    <div class="meta">Settlement pending</div>
                 </div>
             {% else if status == "paid" %}
                 <div class="terminal-block">
@@ -283,8 +296,18 @@
                     <div class="status-line status-err">Cancelled</div>
                     <div class="meta">The recipient cancelled this invoice.</div>
                 </div>
+            {% else if presentation_status == "payment_received" || presentation_status == "overpaid" %}
+                <div class="terminal-block">
+                    <div class="terminal-icon status-paid">✓</div>
+                    <div class="status-line status-paid">{% if presentation_status == "overpaid" %}Overpaid{% else %}Payment received{% endif %}</div>
+                    <div class="meta">Settlement status is being checked</div>
+                </div>
             {% else %}
-                <div class="status-line">{{ status }}</div>
+                <div class="terminal-block">
+                    <div class="terminal-icon status-warn">!</div>
+                    <div class="status-line status-warn">Checking payment status</div>
+                    <div class="meta">Payment status is being checked</div>
+                </div>
             {% endif %}
         </div>
     </main>
@@ -311,15 +334,46 @@
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
             ]);
+            const KNOWN_PRESENTATION_STATUSES = new Set([
+                "unpaid", "partial", "payment_received", "overpaid"
+            ]);
+            const KNOWN_ACCOUNTING_STATUSES = new Set([
+                "unpaid", "in_progress", "pending", "partially_paid",
+                "paid", "underpaid", "overpaid", "expired", "cancelled"
+            ]);
+            const KNOWN_SETTLEMENT_STATUSES = new Set([
+                "none", "pending", "settled", "resolution_pending",
+                "claim_stuck", "refunded", "failed"
+            ]);
+            const TERMINAL_SETTLEMENT_INCIDENTS = new Set(["refunded", "failed"]);
 
             const root = document.getElementById('root');
             const initialStatus = root.dataset.status;
-            if (TERMINAL_STATUSES.has(initialStatus)) {
+            const initialPresentationStatus = root.dataset.presentationStatus;
+            const initialSettlementStatus = root.dataset.settlementStatus;
+            if (
+                TERMINAL_SETTLEMENT_INCIDENTS.has(initialSettlementStatus) ||
+                initialSettlementStatus === 'claim_stuck' ||
+                (KNOWN_PRESENTATION_STATUSES.has(initialPresentationStatus) &&
+                    (
+                        initialSettlementStatus === 'settled' && (
+                            initialPresentationStatus !== 'partial' ||
+                            initialStatus === 'underpaid'
+                        )
+                    ) ||
+                    (
+                        initialPresentationStatus !== 'partial' &&
+                        TERMINAL_STATUSES.has(initialStatus) &&
+                        initialSettlementStatus === 'none'
+                    )
+                ))
+            ) {
                 // Already terminal — no polling needed.
                 return;
             }
             const statusLine = document.getElementById('status-line');
             const amountDisplay = document.getElementById('amount-display');
+            const settlementSupport = document.getElementById('settlement-support');
             const railLightning = document.getElementById('rail-lightning');
             const railBtc = document.getElementById('rail-btc');
             const railLiquid = document.getElementById('rail-liquid');
@@ -330,9 +384,11 @@
 
             let currentRail = ACCEPT_LN ? 'lightning' : ((ACCEPT_BTC || INITIAL_BITCOIN_CHAIN_ADDRESS) ? 'bitcoin' : 'liquid');
             let currentLightningPr = null;
-            let currentBitcoinAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || INITIAL_BITCOIN_ADDRESS || null;
-            let currentBitcoinBip21 = INITIAL_BITCOIN_CHAIN_BIP21 || null;
+            let currentBitcoinDirectAddress = INITIAL_BITCOIN_ADDRESS || null;
+            let currentBitcoinChainAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || null;
+            let currentBitcoinChainBip21 = INITIAL_BITCOIN_CHAIN_BIP21 || null;
             let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
+            let currentRailsPayable = {{ rails_payable }};
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
             let currentExpiresAtUnix = 0;
@@ -344,6 +400,23 @@
 
             function bitcoinPayload(address, bip21, amountSat) {
                 return bip21 || btcUri(address, amountSat);
+            }
+
+            function activeBitcoinAddress() {
+                return currentBitcoinChainAddress || currentBitcoinDirectAddress;
+            }
+
+            function renderBitcoinPayload() {
+                const address = activeBitcoinAddress();
+                if (!address) {
+                    clearQr('Bitcoin address unavailable');
+                    return;
+                }
+                // A chain BIP21 is valid only with the exact chain offer the
+                // server returned. Direct BTC may synthesize an exact-remaining
+                // URI; a withdrawn chain lockup may not.
+                const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null;
+                setQrPayload(bitcoinPayload(address, bip21, currentAmountSat));
             }
 
             function liquidUri(address, amountSat) {
@@ -376,24 +449,65 @@
                 if (rail === 'lightning') {
                     if (currentLightningPr) {
                         setQrPayload(currentLightningPr);
-                    } else if (root.dataset.status === 'unpaid' || root.dataset.status === 'partially_paid') {
+                    } else if (currentRailsPayable) {
                         clearQr('Loading Lightning offer…');
                         fetchLightning();
                     } else {
                         clearQr('Payment in progress…');
                     }
                 } else if (rail === 'bitcoin') {
-                    if (currentBitcoinAddress) {
-                        setQrPayload(bitcoinPayload(currentBitcoinAddress, currentBitcoinBip21, currentAmountSat));
-                    } else {
-                        clearQr('Bitcoin address unavailable');
-                    }
+                    renderBitcoinPayload();
                 } else {
                     if (currentLiquidAddress) {
                         setQrPayload(liquidUri(currentLiquidAddress, currentAmountSat));
                     } else {
                         clearQr('Liquid address unavailable');
                     }
+                }
+            }
+
+            function statusAllowsPaymentRails(data) {
+                if (!['unpaid', 'in_progress', 'partially_paid'].includes(data.status)) {
+                    return false;
+                }
+                return (
+                    (data.presentation_status === 'unpaid' && data.settlement_status === 'none') ||
+                    (
+                        data.presentation_status === 'partial' &&
+                        ['none', 'pending', 'settled'].includes(data.settlement_status)
+                    )
+                );
+            }
+
+            function adoptStatusPayloads(data) {
+                // Replace the complete nullable snapshot before any status
+                // branch can return. In particular, partial+pending must not
+                // retain a full-amount Lightning or Bitcoin chain offer.
+                currentLightningPr = data.lightning_pr || null;
+                currentLiquidAddress = data.liquid_address || null;
+                currentBitcoinDirectAddress = data.bitcoin_address || null;
+                currentBitcoinChainAddress = data.bitcoin_chain_address || null;
+                currentBitcoinChainBip21 = currentBitcoinChainAddress
+                    ? (data.bitcoin_chain_bip21 || null)
+                    : null;
+
+                if (currentRail === 'lightning') {
+                    if (currentLightningPr) {
+                        setQrPayload(currentLightningPr);
+                    } else if (ACCEPT_LN && statusAllowsPaymentRails(data)) {
+                        clearQr('Refreshing Lightning offer…');
+                        fetchLightning();
+                    } else {
+                        clearQr('Payment in progress…');
+                    }
+                } else if (currentRail === 'liquid') {
+                    if (currentLiquidAddress) {
+                        setQrPayload(liquidUri(currentLiquidAddress, currentAmountSat));
+                    } else {
+                        clearQr('Liquid address unavailable');
+                    }
+                } else if (currentRail === 'bitcoin') {
+                    renderBitcoinPayload();
                 }
             }
 
@@ -454,7 +568,7 @@
 
             function refreshCountdown() {
                 if (TERMINAL_STATUSES.has(root.dataset.status)) return;
-                if (currentExpiresAtUnix > 0) {
+                if (countdown && currentExpiresAtUnix > 0) {
                     countdown.textContent = formatCountdown(
                         currentExpiresAtUnix,
                         'expires'
@@ -464,6 +578,7 @@
 
             function renderTerminalView(status, paidAmountSat, paidVia) {
                 root.dataset.status = status;
+                currentRailsPayable = false;
                 let icon = '';
                 let cls = '';
                 let title = '';
@@ -498,40 +613,92 @@
                 `;
             }
 
-            function renderReceivedState() {
+            function renderReceivedState(primary = 'Payment received', support = 'Settlement pending') {
                 // Payment detected (mempool sighting or settlement claim in
                 // flight). Show success immediately with a small settlement
                 // disclaimer; polling continues so a later terminal state
                 // (paid / underpaid / a settlement incident) still lands.
-                if (root.dataset.status === 'received') return;
+                if (root.dataset.status === 'received' && root.dataset.primary === primary && root.dataset.support === support) return;
                 root.dataset.status = 'received';
+                currentRailsPayable = false;
+                root.dataset.primary = primary;
+                root.dataset.support = support;
                 root.innerHTML = `
                     <div class="terminal-block">
                         <div class="terminal-icon status-paid">✓</div>
-                        <div class="status-line status-paid">Payment received</div>
+                        <div class="status-line status-paid">${primary}</div>
                         <div class="amount">${targetAmountSat} sat</div>
-                        <div class="meta">Settlement is in progress</div>
+                        <div class="meta">${support}</div>
                     </div>
                 `;
             }
 
-            function renderPartiallyPaidState() {
-                root.dataset.status = 'partially_paid';
-                if (statusLine) {
-                    statusLine.textContent = 'Partially paid — remaining amount due';
+            function renderPartiallyPaidState(support = '') {
+                // A prior sufficient/incident view replaced the rail markup.
+                // Reload once so the server can restore the authoritative
+                // partial-payment instructions without rebuilding payloads in
+                // two places.
+                if (!statusLine || !amountDisplay) {
+                    window.location.reload();
+                    return;
                 }
+                root.dataset.status = 'partially_paid';
+                currentRailsPayable = true;
+                statusLine.textContent = 'Partially paid — remaining amount due';
+                amountDisplay.textContent = `${currentAmountSat} sat remaining`;
+                if (settlementSupport) settlementSupport.textContent = support;
             }
 
             function renderSettlementIncidentState(kind) {
-                const refunded = kind === 'refunded';
+                const failed = kind === 'refunded' || kind === 'failed';
                 root.dataset.status = kind;
+                currentRailsPayable = false;
                 root.innerHTML = `
                     <div class="terminal-block">
-                        <div class="terminal-icon ${refunded ? 'status-err' : 'status-warn'}">!</div>
-                        <div class="status-line ${refunded ? 'status-err' : 'status-warn'}">${refunded ? 'Settlement failed' : 'Payment needs review'}</div>
-                        <div class="meta">${refunded ? 'The payment could not be settled.' : 'Settlement is delayed. The operator has been alerted.'}</div>
+                        <div class="terminal-icon ${failed ? 'status-err' : 'status-warn'}">!</div>
+                        <div class="status-line ${failed ? 'status-err' : 'status-warn'}">${failed ? 'Settlement failed' : 'Payment needs review'}</div>
+                        <div class="meta">${failed ? 'The payment could not be settled.' : 'Settlement is delayed. The operator has been alerted.'}</div>
                     </div>
                 `;
+            }
+
+            function renderResolutionPendingState() {
+                root.dataset.status = 'resolution_pending';
+                currentRailsPayable = false;
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon status-warn">!</div>
+                        <div class="status-line status-warn">Payment issue</div>
+                        <div class="meta">Settlement problem — being checked</div>
+                    </div>
+                `;
+            }
+
+            function renderUnknownState() {
+                root.dataset.status = 'unknown';
+                currentRailsPayable = false;
+                root.innerHTML = `
+                    <div class="terminal-block">
+                        <div class="terminal-icon status-warn">!</div>
+                        <div class="status-line status-warn">Checking payment status</div>
+                        <div class="meta">Payment status is being checked</div>
+                    </div>
+                `;
+            }
+
+            function shouldStopPolling(data) {
+                if (TERMINAL_SETTLEMENT_INCIDENTS.has(data.settlement_status)) return true;
+                if (!KNOWN_SETTLEMENT_STATUSES.has(data.settlement_status)) return false;
+                if (data.settlement_status === 'claim_stuck') return true;
+                if (data.settlement_status === 'pending' || data.settlement_status === 'resolution_pending') return false;
+                // A settled contribution can still leave an exact remainder
+                // payable on another rail. Keep watching that partial for the
+                // top-up; settled sufficient/overpaid presentations and a
+                // terminal underpaid partial may stop.
+                if (data.settlement_status === 'settled') {
+                    return data.presentation_status !== 'partial' || data.status === 'underpaid';
+                }
+                return TERMINAL_STATUSES.has(data.status);
             }
 
             async function pollStatus() {
@@ -544,71 +711,74 @@
 
                     currentAmountSat = data.remaining_amount_sat ?? data.amount_sat;
                     currentExpiresAtUnix = data.expires_at_unix || 0;
+                    adoptStatusPayloads(data);
+                    if (!KNOWN_SETTLEMENT_STATUSES.has(data.settlement_status)) {
+                        renderUnknownState();
+                        return;
+                    }
+                    if (data.settlement_status === 'claim_stuck' || TERMINAL_SETTLEMENT_INCIDENTS.has(data.settlement_status)) {
+                        renderSettlementIncidentState(data.settlement_status);
+                        if (shouldStopPolling(data)) clearInterval(pollTimer);
+                        return;
+                    }
+                    if (data.settlement_status === 'resolution_pending') {
+                        renderResolutionPendingState();
+                        return;
+                    }
+                    if (!KNOWN_PRESENTATION_STATUSES.has(data.presentation_status) || !KNOWN_ACCOUNTING_STATUSES.has(data.status)) {
+                        renderUnknownState();
+                        return;
+                    }
+                    if (data.settlement_status === 'pending') {
+                        if (data.presentation_status === 'partial') {
+                            if (statusAllowsPaymentRails(data)) {
+                                renderPartiallyPaidState('Settlement pending');
+                            } else {
+                                // A terminal/unknown accounting state with a
+                                // live swap component is not a payable partial
+                                // invoice. Match the PWA's conservative
+                                // combined-state handling and keep polling.
+                                renderUnknownState();
+                            }
+                        } else {
+                            renderReceivedState(
+                                data.presentation_status === 'overpaid' ? 'Overpaid' : 'Payment received',
+                                'Settlement pending'
+                            );
+                        }
+                        return;
+                    }
+                    if (data.presentation_status === 'unpaid' && data.settlement_status === 'none' && !currentRailsPayable) {
+                        window.location.reload();
+                        return;
+                    }
                     if (TERMINAL_STATUSES.has(data.status)) {
                         renderTerminalView(
                             data.status,
                             data.paid_amount_sat,
                             data.paid_via
                         );
+                        if (shouldStopPolling(data)) clearInterval(pollTimer);
                         return;
                     }
-                    if (data.settlement_status === 'pending') {
-                        renderReceivedState();
+                    if (data.presentation_status === 'payment_received' || data.presentation_status === 'overpaid') {
+                        renderReceivedState(
+                            data.presentation_status === 'overpaid' ? 'Overpaid' : 'Payment received',
+                            'Settlement status is being checked'
+                        );
                         return;
                     }
-                    if (data.settlement_status === 'claim_stuck' || data.settlement_status === 'refunded') {
-                        renderSettlementIncidentState(data.settlement_status);
-                        return;
-                    }
-                    if (data.status === 'in_progress') {
-                        renderReceivedState();
-                        return;
-                    }
-                    if (data.status === 'partially_paid') {
-                        if (root.dataset.status !== 'partially_paid') {
-                            renderPartiallyPaidState();
-                        }
-                    }
-                    if (data.lightning_pr && data.lightning_pr !== currentLightningPr) {
-                        currentLightningPr = data.lightning_pr;
-                        if (currentRail === 'lightning') {
-                            setQrPayload(currentLightningPr);
-                        }
-                    } else if (
-                        ACCEPT_LN &&
-                        !data.lightning_pr &&
-                        currentRail === 'lightning' &&
-                        (data.status === 'unpaid' || data.status === 'partially_paid')
-                    ) {
-                        currentLightningPr = null;
-                        clearQr('Refreshing Lightning offer…');
-                        fetchLightning();
-                    }
-                    if (data.liquid_address && data.liquid_address !== currentLiquidAddress) {
-                        currentLiquidAddress = data.liquid_address;
-                        if (currentRail === 'liquid') {
-                            setQrPayload(liquidUri(data.liquid_address, currentAmountSat));
-                        }
-                    }
-                    const nextBitcoinAddress = data.bitcoin_chain_address || data.bitcoin_address;
-                    const nextBitcoinBip21 = data.bitcoin_chain_bip21 || null;
-                    if (nextBitcoinBip21 !== currentBitcoinBip21) {
-                        currentBitcoinBip21 = nextBitcoinBip21;
-                        if (currentRail === 'bitcoin' && currentBitcoinAddress) {
-                            setQrPayload(bitcoinPayload(currentBitcoinAddress, currentBitcoinBip21, currentAmountSat));
-                        }
-                    }
-                    if (nextBitcoinAddress && nextBitcoinAddress !== currentBitcoinAddress) {
-                        currentBitcoinAddress = nextBitcoinAddress;
-                        if (currentRail === 'bitcoin') {
-                            setQrPayload(bitcoinPayload(nextBitcoinAddress, currentBitcoinBip21, currentAmountSat));
-                        }
+                    if (data.presentation_status === 'partial') {
+                        renderPartiallyPaidState('');
+                        if (shouldStopPolling(data)) clearInterval(pollTimer);
                     }
                     if (amountDisplay) {
-                        amountDisplay.textContent = data.status === 'partially_paid'
+                        amountDisplay.textContent = data.presentation_status === 'partial'
                             ? `${currentAmountSat} sat remaining`
                             : `${currentAmountSat} sat`;
                     }
+
+                    if (shouldStopPolling(data)) clearInterval(pollTimer);
                 } catch (e) {
                     // Network blip — keep polling.
                 }
@@ -617,11 +787,11 @@
             setRail(currentRail);
             // Polling cadence: every 3s while the invoice is non-terminal.
             const pollTimer = setInterval(() => {
-                if (TERMINAL_STATUSES.has(root.dataset.status)) {
+                if (TERMINAL_SETTLEMENT_INCIDENTS.has(root.dataset.status)) {
                     clearInterval(pollTimer);
                     return;
                 }
-                pollStatus();
+                void pollStatus();
                 refreshCountdown();
             }, POLL_INTERVAL_MS);
             refreshCountdown();
