@@ -3442,4 +3442,8 @@ mod tests {
         let error = serde_json::from_value::<SwapManifestV1>(value).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
     }
+
+    mod local_chain_swap_recovery_audit_tests {
+        include!("local_chain_swap_recovery_audit_tests.rs");
+    }
 }

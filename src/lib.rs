@@ -25,6 +25,7 @@ pub mod image_pipeline;
 pub mod invoice;
 pub mod ip_whitelist;
 pub mod lnurl;
+pub mod local_chain_swap_recovery_audit;
 pub mod nostr;
 pub mod og_image;
 pub mod pricer;
