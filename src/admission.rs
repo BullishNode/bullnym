@@ -185,6 +185,16 @@ impl AdmissionDecision {
     }
 }
 
+/// Private in-process operations view: #68's rail decisions plus the landed
+/// provider-creation circuit. This type is intentionally not serializable and
+/// is not part of public `/ready`; existing-obligation availability is not
+/// derived from the creation circuit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationsSnapshot {
+    pub money_admission: [AdmissionDecision; 4],
+    pub provider_creation_circuit: crate::boltz_breaker::CreationCircuitSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionDenied {
     pub rail: Rail,
@@ -375,6 +385,26 @@ impl MoneyAdmission {
         let decision = decide(&state, rail, now);
         emit_if_changed(&mut state, decision.clone());
         decision
+    }
+
+    /// Combine the existing #68 readiness view with the creation breaker's
+    /// immutable snapshot for an in-process operations consumer. This is
+    /// telemetry only: it does not add another admission decision or gate.
+    pub fn operations_snapshot(
+        &self,
+        provider_creation_circuit: crate::boltz_breaker::CreationCircuitSnapshot,
+    ) -> OperationsSnapshot {
+        let now = (self.clock)();
+        let mut state = self.inner.lock().expect("admission mutex poisoned");
+        refresh_stale_workers(&mut state, now);
+        let money_admission = Rail::ALL.map(|rail| decide(&state, rail, now));
+        for decision in &money_admission {
+            emit_if_changed(&mut state, decision.clone());
+        }
+        OperationsSnapshot {
+            money_admission,
+            provider_creation_circuit,
+        }
     }
 
     pub fn enforce(&self, rail: Rail) -> Result<(), AdmissionDenied> {
@@ -761,6 +791,24 @@ fn emit_if_changed(state: &mut State, decision: AdmissionDecision) {
     state.last_emitted.insert(decision.rail, decision);
 }
 
+/// Emit creation-circuit transitions using #68's private, low-cardinality
+/// operations-telemetry convention. The finite transition type makes it
+/// impossible to attach a URL, endpoint, provider body, payment identity, key,
+/// or raw error to these fields.
+pub(crate) fn emit_creation_circuit_transition(
+    transition: crate::boltz_breaker::CreationCircuitTransition,
+) {
+    tracing::warn!(
+        event = "money_admission_creation_circuit_changed",
+        operation = "provider_offer_creation",
+        previous_state = transition.from.as_str(),
+        state = transition.to.as_str(),
+        reason_code = transition.reason.as_str(),
+        transition_count = transition.count,
+        "provider creation circuit state changed"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,5 +1168,27 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(decision.reasons, sorted);
+    }
+
+    #[test]
+    fn operations_snapshot_observes_creation_circuit_without_becoming_a_gate() {
+        let admission = MoneyAdmission::healthy_test_fixture();
+        let before = Rail::ALL.map(|rail| admission.decision(rail));
+        let breaker = crate::boltz_breaker::BoltzBreaker::default();
+        for _ in 0..crate::boltz_breaker::DEFAULT_FAILURE_THRESHOLD {
+            breaker.record(true);
+        }
+
+        let operations = admission.operations_snapshot(breaker.snapshot());
+        assert_eq!(operations.money_admission, before);
+        assert!(operations
+            .money_admission
+            .iter()
+            .all(AdmissionDecision::allowed));
+        assert_eq!(
+            operations.provider_creation_circuit.state,
+            crate::boltz_breaker::CreationCircuitState::Open
+        );
+        assert_eq!(operations.provider_creation_circuit.transition_count, 2);
     }
 }

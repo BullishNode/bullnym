@@ -193,8 +193,9 @@ pub async fn metadata(
 enum LiquidOutcome {
     /// One of the Liquid-specific rate-limit gates fired (per-pubkey,
     /// distinct-nyms-per-ip, distinct-nyms-per-outpoint, pending-cap,
-    /// electrum-bucket). Caller may transparently fall back to Lightning.
-    SoftRateLimited,
+    /// electrum-bucket). Caller may transparently fall back to Lightning, but
+    /// retains the original typed throttle if that fallback also fails.
+    SoftRateLimited(AppError),
     /// Any other error: bad proof, DB failure, descriptor error, etc.
     /// Propagate to the client as-is.
     Hard(AppError),
@@ -220,7 +221,7 @@ impl From<sqlx::Error> for LiquidOutcome {
 fn rl_gate<T>(result: Result<T, AppError>) -> Result<T, LiquidOutcome> {
     match result {
         Ok(v) => Ok(v),
-        Err(e) if e.is_rate_limit() => Err(LiquidOutcome::SoftRateLimited),
+        Err(e) if e.is_rate_limit() => Err(LiquidOutcome::SoftRateLimited(e)),
         Err(other) => Err(LiquidOutcome::Hard(other)),
     }
 }
@@ -258,13 +259,28 @@ async fn serve_liquid(
             &proof.sig,
         )?;
 
-        // Per-pubkey limit (Soft).
-        rl_gate(state.rate_limiter.check_per_pubkey(&proof.pubkey).await)?;
-
-        // Idempotent cache lookup. Cache hits skip all subsequent gates.
+        // Authenticated idempotent replay. A cache hit belongs to the key that
+        // created it; compare parsed keys so equivalent hex encodings retain
+        // the same identity while NULL, malformed, or different stored keys
+        // fail closed. Exact replays do not consume later allocation/backend
+        // capacity or rate-limit budgets.
         let addr_index = match db::get_outpoint_address(&state.db, nym, &proof.outpoint).await? {
-            Some(cached) => cached.addr_index,
+            Some(cached) => {
+                let cached_pubkey_matches = cached
+                    .pubkey
+                    .as_deref()
+                    .and_then(|stored| stored.parse::<secp256k1::PublicKey>().ok())
+                    .is_some_and(|stored| stored == pubkey);
+                if !cached_pubkey_matches {
+                    return Err(AppError::PubkeyUtxoMismatch.into());
+                }
+                cached.addr_index
+            }
             None => {
+                // Per-pubkey limit (Soft). New mappings retain the existing
+                // gate order; only an authenticated exact replay skips it.
+                rl_gate(state.rate_limiter.check_per_pubkey(&proof.pubkey).await)?;
+
                 state
                     .admission
                     .enforce(Rail::DirectLiquid)
@@ -511,7 +527,7 @@ pub async fn callback(
         }
     }
 
-    if requests_method(params.payment_method.as_deref(), "L-BTC") {
+    let liquid_throttle = if requests_method(params.payment_method.as_deref(), "L-BTC") {
         match serve_liquid(
             &state,
             &nym,
@@ -525,7 +541,7 @@ pub async fn callback(
         {
             Ok(resp) => return Ok(resp),
             Err(LiquidOutcome::Hard(e)) => return Err(e),
-            Err(LiquidOutcome::SoftRateLimited) => {
+            Err(LiquidOutcome::SoftRateLimited(error)) => {
                 tracing::info!(
                     event = "liquid_rate_limited_fallback_lightning",
                     nym = %nym,
@@ -533,12 +549,30 @@ pub async fn callback(
                     "Liquid path rate-limited; falling back to Lightning"
                 );
                 // Fall through to Lightning below.
+                Some(error)
+            }
+        }
+    } else {
+        None
+    };
+
+    // Lightning path — default rail AND fallback destination.
+    match serve_lightning(&state, &nym, amount_sat, caller_ip, is_whitelisted).await {
+        Ok(response) => Ok(response),
+        Err(fallback_error) => {
+            if let Some(liquid_throttle) = liquid_throttle {
+                tracing::warn!(
+                    event = "liquid_rate_limited_fallback_failed",
+                    liquid_code = liquid_throttle.code(),
+                    fallback_code = fallback_error.code(),
+                    "Lightning fallback failed; returning original Liquid throttle"
+                );
+                Err(liquid_throttle)
+            } else {
+                Err(fallback_error)
             }
         }
     }
-
-    // Lightning path — default rail AND fallback destination.
-    serve_lightning(&state, &nym, amount_sat, caller_ip, is_whitelisted).await
 }
 
 use axum::response::IntoResponse;

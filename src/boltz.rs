@@ -488,6 +488,13 @@ impl BoltzService {
         self.api.is_some()
     }
 
+    /// Private in-process operations snapshot for #68. This state is not part
+    /// of the public readiness response and remains scoped to new provider-
+    /// dependent offer creation.
+    pub fn creation_circuit_snapshot(&self) -> crate::boltz_breaker::CreationCircuitSnapshot {
+        self.breaker.snapshot()
+    }
+
     fn api(&self) -> Result<&BoltzApiClientV2, AppError> {
         self.api
             .as_ref()
@@ -566,18 +573,14 @@ impl BoltzService {
         };
 
         let response: CreateReverseResponse = {
-            let result = self
-                .api()?
-                .post_reverse_req(request)
-                .await
-                .map_err(|e| AppError::BoltzError(format!("{e}")));
+            let provider_result = self.api()?.post_reverse_req(request).await;
             self.breaker.record(
-                result
+                provider_result
                     .as_ref()
                     .err()
-                    .is_some_and(crate::boltz_breaker::is_transport_failure),
+                    .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
             );
-            result?
+            provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?
         };
 
         let invoice = response
@@ -621,35 +624,30 @@ impl BoltzService {
         // Pin the exact fee/limit quote before creation. Boltz rejects the
         // request if that quote changes between these calls, so no payer can
         // receive an address priced against stale terms.
-        let pairs_result = self
-            .api()?
-            .get_chain_pairs()
-            .await
-            .map_err(|error| AppError::BoltzError(format!("chain pair fetch failed: {error}")));
+        let pairs_result = self.api()?.get_chain_pairs().await;
         self.breaker.record(
             pairs_result
                 .as_ref()
                 .err()
-                .is_some_and(crate::boltz_breaker::is_transport_failure),
+                .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
         );
-        let pair = pairs_result?
+        let pair = pairs_result
+            .map_err(|error| AppError::BoltzError(format!("chain pair fetch failed: {error}")))?
             .get_btc_to_lbtc_pair()
             .ok_or_else(|| AppError::BoltzError("BTC/L-BTC chain pair is unavailable".into()))?;
 
         // Heights are captured before the mutating request and bound the
         // timeout-order validation. A block arriving during the request only
         // makes the resulting windows more conservative by one block.
-        let heights_result =
-            self.api()?.get_height().await.map_err(|error| {
-                AppError::BoltzError(format!("chain height fetch failed: {error}"))
-            });
+        let heights_result = self.api()?.get_height().await;
         self.breaker.record(
             heights_result
                 .as_ref()
                 .err()
-                .is_some_and(crate::boltz_breaker::is_transport_failure),
+                .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
         );
-        let heights = heights_result?;
+        let heights = heights_result
+            .map_err(|error| AppError::BoltzError(format!("chain height fetch failed: {error}")))?;
 
         let request = CreateChainRequest {
             from: "BTC".to_string(),
@@ -690,18 +688,14 @@ impl BoltzService {
         };
 
         let response: CreateChainResponse = {
-            let result = self
-                .api()?
-                .post_chain_req(request)
-                .await
-                .map_err(|e| AppError::BoltzError(format!("{e}")));
+            let provider_result = self.api()?.post_chain_req(request).await;
             self.breaker.record(
-                result
+                provider_result
                     .as_ref()
                     .err()
-                    .is_some_and(crate::boltz_breaker::is_transport_failure),
+                    .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
             );
-            result?
+            provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?
         };
 
         let (creation_terms, canonical_response_json) = validate_chain_creation_response(

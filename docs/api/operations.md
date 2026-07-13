@@ -25,3 +25,5 @@ it refuses new payment instructions. New-money requests for a closed rail
 receive HTTP 503 with the fixed public message `This payment method is
 temporarily unavailable. Try again later.` Operators diagnose the private
 rail/dependency reason codes from `money_admission_changed` transition logs.
+The provider-creation circuit is likewise private operations telemetry under
+`money_admission_creation_circuit_changed`; it is not added to this response.
