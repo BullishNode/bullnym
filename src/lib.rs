@@ -38,6 +38,7 @@ pub mod reserved_nyms;
 pub mod swap_manifest;
 pub mod swap_manifest_delivery;
 pub mod swap_manifest_persistence;
+pub mod swap_manifest_runtime;
 pub mod swap_manifest_staging;
 pub mod swap_manifest_store;
 pub mod swap_manifest_witness;
