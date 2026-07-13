@@ -9,6 +9,14 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+type DirectLifecyclePrivileges = (
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+);
+
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
     pub service: &'static str,
@@ -90,7 +98,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
     match timeout(READINESS_DB_TIMEOUT, schema_and_journal_ready(pool)).await {
         Ok(Ok(true)) => ComponentStatus::ok(),
         Ok(Ok(false)) => ComponentStatus::error(format!(
-            "expected schema marker {EXPECTED_SCHEMA_MARKER} is not present or its recovery journal is not writable"
+            "expected schema marker {EXPECTED_SCHEMA_MARKER} is not present or a required durable journal is not writable"
         )),
         Ok(Err(e)) => {
             tracing::warn!("readiness schema probe failed: {e}");
@@ -130,7 +138,39 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     .fetch_one(pool)
     .await?;
 
-    Ok(journal_privileges_ready(privileges))
+    let direct_lifecycle_privileges = sqlx::query_as::<_, DirectLifecyclePrivileges>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.invoice_direct_scan_heads'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.invoice_direct_scan_heads'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.invoice_direct_scan_heads'), \
+                'UPDATE' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.invoice_direct_payment_transitions'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.invoice_direct_payment_transitions'), \
+                'INSERT' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(journal_privileges_ready(privileges)
+        && direct_lifecycle_privileges_ready(direct_lifecycle_privileges))
 }
 
 fn journal_privileges_ready(
@@ -139,6 +179,21 @@ fn journal_privileges_ready(
     matches!(
         (select, insert, update),
         (Some(true), Some(true), Some(true))
+    )
+}
+
+fn direct_lifecycle_privileges_ready(
+    (scan_select, scan_insert, scan_update, transition_select, transition_insert): DirectLifecyclePrivileges,
+) -> bool {
+    matches!(
+        (
+            scan_select,
+            scan_insert,
+            scan_update,
+            transition_select,
+            transition_insert,
+        ),
+        (Some(true), Some(true), Some(true), Some(true), Some(true),)
     )
 }
 
@@ -289,6 +344,50 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 SELECT 1 FROM information_schema.tables \
                 WHERE table_schema = 'public' \
                   AND table_name = 'chain_swap_tx_attempts' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'invoices' \
+                  AND column_name = 'presentation_status' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'invoice_payment_events' \
+                  AND column_name = 'accounting_state' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'invoice_direct_scan_heads' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'invoice_direct_payment_transitions' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_trigger t \
+                JOIN pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND c.relname = 'invoice_direct_payment_transitions' \
+                  AND t.tgname = 'invoice_direct_payment_transition_history_guard' \
+                  AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_trigger t \
+                JOIN pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND c.relname = 'invoice_payment_events' \
+                  AND t.tgname = 'invoice_payment_event_compatibility_insert_classifier' \
+                  AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
             )",
     )
     .fetch_one(pool)
@@ -297,7 +396,7 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 
 #[cfg(test)]
 mod tests {
-    use super::journal_privileges_ready;
+    use super::{direct_lifecycle_privileges_ready, journal_privileges_ready};
 
     #[test]
     fn recovery_journal_requires_every_privilege() {
@@ -316,6 +415,28 @@ mod tests {
             (Some(true), Some(true), None),
         ] {
             assert!(!journal_privileges_ready(privileges));
+        }
+    }
+
+    #[test]
+    fn direct_lifecycle_requires_scan_and_transition_privileges() {
+        assert!(direct_lifecycle_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+
+        for privileges in [
+            (Some(false), Some(true), Some(true), Some(true), Some(true)),
+            (Some(true), Some(false), Some(true), Some(true), Some(true)),
+            (Some(true), Some(true), Some(false), Some(true), Some(true)),
+            (Some(true), Some(true), Some(true), Some(false), Some(true)),
+            (Some(true), Some(true), Some(true), Some(true), Some(false)),
+            (None, Some(true), Some(true), Some(true), Some(true)),
+        ] {
+            assert!(!direct_lifecycle_privileges_ready(privileges));
         }
     }
 }

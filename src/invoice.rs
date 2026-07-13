@@ -119,8 +119,10 @@ pub async fn flip_invoice_on_lightning_in_progress(
     let Some(id) = invoice_id else {
         return;
     };
-    match db::mark_invoice_in_progress(pool, id).await {
-        Ok(rows) if rows > 0 => {
+    match db::mark_invoice_in_progress_for_component(pool, id, db::InvoiceInProgressComponent::Swap)
+        .await
+    {
+        Ok(true) => {
             tracing::info!(
                 event = "invoice_in_progress_via_lightning",
                 invoice_id = %id,
@@ -128,15 +130,7 @@ pub async fn flip_invoice_on_lightning_in_progress(
                 "lightning mempool flipped invoice to in_progress"
             );
         }
-        Ok(_) => {
-            if let Err(e) = db::mark_invoice_settlement_status(pool, Some(id), "pending").await {
-                tracing::warn!(
-                    event = "invoice_pending_settlement_failed",
-                    invoice_id = %id,
-                    boltz_swap_id = %boltz_swap_id,
-                    "failed to mark invoice settlement pending: {e}"
-                );
-            }
+        Ok(false) => {
             tracing::debug!(
                 event = "invoice_in_progress_noop",
                 invoice_id = %id,
@@ -166,8 +160,10 @@ pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
     let Some(id) = invoice_id else {
         return;
     };
-    match db::mark_invoice_in_progress(pool, id).await {
-        Ok(rows) if rows > 0 => {
+    match db::mark_invoice_in_progress_for_component(pool, id, db::InvoiceInProgressComponent::Swap)
+        .await
+    {
+        Ok(true) => {
             tracing::info!(
                 event = "invoice_in_progress_via_bitcoin_boltz_chain",
                 invoice_id = %id,
@@ -175,15 +171,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
                 "bitcoin chain-swap lockup flipped invoice to in_progress"
             );
         }
-        Ok(_) => {
-            if let Err(e) = db::mark_invoice_settlement_status(pool, Some(id), "pending").await {
-                tracing::warn!(
-                    event = "invoice_bitcoin_boltz_pending_settlement_failed",
-                    invoice_id = %id,
-                    boltz_swap_id = %boltz_swap_id,
-                    "failed to mark invoice settlement pending: {e}"
-                );
-            }
+        Ok(false) => {
             tracing::debug!(
                 event = "invoice_bitcoin_boltz_in_progress_noop",
                 invoice_id = %id,

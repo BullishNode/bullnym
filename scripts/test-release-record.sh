@@ -10,7 +10,7 @@ write_binary() {
     local verification="$2"
     cat >"$path" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' '{"service":"pay-service","crate_version":"0.1.0","build_commit":"1111111111111111111111111111111111111111","build_profile":"release","build_source_state":"clean","boltz_client_repository":"https://github.com/BullishNode/boltz-rust.git","boltz_client_commit":"2222222222222222222222222222222222222222","boltz_client_verification":"$verification","pwa_content_sha256":"3333333333333333333333333333333333333333333333333333333333333333","expected_schema_marker":"046_chain_swap_tx_attempts","rustc_version":"rustc 1.92.0","cargo_version":"cargo 1.92.0","build_target":"x86_64-unknown-linux-gnu"}'
+printf '%s\n' '{"service":"pay-service","crate_version":"0.1.0","build_commit":"1111111111111111111111111111111111111111","build_profile":"release","build_source_state":"clean","boltz_client_repository":"https://github.com/BullishNode/boltz-rust.git","boltz_client_commit":"2222222222222222222222222222222222222222","boltz_client_verification":"$verification","pwa_content_sha256":"3333333333333333333333333333333333333333333333333333333333333333","expected_schema_marker":"047_direct_payment_lifecycle_foundation","rustc_version":"rustc 1.92.0","cargo_version":"cargo 1.92.0","build_target":"x86_64-unknown-linux-gnu"}'
 EOF
     chmod +x "$path"
 }

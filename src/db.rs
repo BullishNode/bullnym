@@ -1,5 +1,6 @@
-mod chain_swaps;
 mod chain_swap_attempts;
+mod chain_swaps;
+mod direct_payments;
 mod donation_pages;
 mod invoices;
 mod rate_limits;
@@ -8,8 +9,9 @@ mod swaps;
 mod users;
 mod watcher;
 
-pub use chain_swaps::*;
 pub use chain_swap_attempts::*;
+pub use chain_swaps::*;
+pub use direct_payments::*;
 pub use donation_pages::*;
 pub use invoices::*;
 pub use rate_limits::*;

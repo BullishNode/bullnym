@@ -155,7 +155,9 @@ Bitcoin merchant receive flows do not need floating fiat rates.
 
 ## Payment Events
 
-All accounting comes from idempotent payment events.
+All accounting comes from idempotent, countable payment events. Migration 047
+keeps inactive and superseded direct evidence in the same table for audit, but
+only `active` and rollout-compatible `legacy_unverified` rows contribute value.
 
 Event fields:
 
@@ -179,6 +181,7 @@ Accounting:
 
 ```text
 received_sat = SUM(payment_events.amount_sat)
+  WHERE accounting_state IN ('active', 'legacy_unverified')
 remaining_sat = max(amount_sat - received_sat, 0)
 ```
 
@@ -235,6 +238,9 @@ gap between payer payment and merchant receipt.
 - `pending`: payment is detected and a claim/settlement workflow is in flight.
 - `settled`: Bullnym successfully broadcast the merchant-side claim or recorded
   a direct payment under the rail's current detection policy.
+- `resolution_pending`: durable direct-payment evidence was invalidated and the
+  dormant lifecycle projection has not yet resolved it. Live watcher adoption
+  and public presentation ship in the follow-up issue-#28 slice.
 - `claim_stuck`: the fast claim retry budget was exhausted. Slow recovery
   continues for funded swaps; operators must still alert and investigate.
 - `refunded`: Boltz refunded the lockup before merchant claim; incident.
