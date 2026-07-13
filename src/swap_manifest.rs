@@ -10,6 +10,7 @@
 //! This module defines the format only. Export-before-exposure, external
 //! storage durability, and restore reconciliation are separate #87 packages.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -244,6 +245,270 @@ pub struct SwapManifestV1 {
     pub derivation_lineage: SwapDerivationLineageV1,
     pub creation: ImmutableChainSwapCreationV1,
     pub merchant_policy: MerchantPolicyReferencesV1,
+}
+
+/// Highest signed allocator position observed for one derivation namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestLineageHighWaterV1 {
+    pub root_fingerprint: String,
+    pub key_epoch: i32,
+    pub derivation_scheme_version: i32,
+    pub child_index: i64,
+}
+
+/// Compact summary of a fully validated append-only manifest set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapManifestSetAuditV1 {
+    pub manifest_count: usize,
+    pub last_manifest_sequence: Option<u64>,
+    pub last_manifest_id: Option<Uuid>,
+    pub lineage_high_waters: Vec<ManifestLineageHighWaterV1>,
+}
+
+/// Cross-object integrity failures that one individually valid record cannot
+/// detect on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapManifestSetError {
+    InvalidManifest {
+        manifest_id: Uuid,
+        source: SwapManifestError,
+    },
+    TooManyManifests,
+    SequenceDiscontinuity {
+        expected: u64,
+        actual: u64,
+    },
+    PredecessorMismatch {
+        sequence: u64,
+        expected: Uuid,
+        actual: Option<Uuid>,
+    },
+    DuplicateManifestId(Uuid),
+    DuplicateChainSwapId(Uuid),
+    DuplicateBoltzSwapId(String),
+    DuplicateAllocationId(Uuid),
+    DuplicateDerivationIdentity {
+        root_fingerprint: String,
+        key_epoch: i32,
+        derivation_scheme_version: i32,
+        child_index: i64,
+    },
+    DuplicatePublicKey(String),
+    DuplicatePreimageHash(String),
+    AllocationHighWaterRewind {
+        root_fingerprint: String,
+        key_epoch: i32,
+        derivation_scheme_version: i32,
+        previous: i64,
+        actual: i64,
+    },
+}
+
+impl fmt::Display for SwapManifestSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidManifest { .. } => {
+                f.write_str("append-only recovery set contains an invalid manifest")
+            }
+            Self::TooManyManifests => {
+                f.write_str("append-only recovery set cannot be indexed by u64")
+            }
+            Self::SequenceDiscontinuity { expected, actual } => write!(
+                f,
+                "append-only recovery sequence is discontinuous: expected {expected}, got {actual}"
+            ),
+            Self::PredecessorMismatch { sequence, .. } => write!(
+                f,
+                "append-only recovery predecessor is incorrect at sequence {sequence}"
+            ),
+            Self::DuplicateManifestId(_) => {
+                f.write_str("append-only recovery set reuses a manifest id")
+            }
+            Self::DuplicateChainSwapId(_) => f.write_str(
+                "append-only recovery set contains more than one record for a chain swap",
+            ),
+            Self::DuplicateBoltzSwapId(_) => {
+                f.write_str("append-only recovery set reuses a Boltz swap id")
+            }
+            Self::DuplicateAllocationId(_) => {
+                f.write_str("append-only recovery set reuses a key-allocation id")
+            }
+            Self::DuplicateDerivationIdentity { .. } => {
+                f.write_str("append-only recovery set reuses a derivation identity")
+            }
+            Self::DuplicatePublicKey(_) => {
+                f.write_str("append-only recovery set reuses a derived public key")
+            }
+            Self::DuplicatePreimageHash(_) => {
+                f.write_str("append-only recovery set reuses a claim preimage hash")
+            }
+            Self::AllocationHighWaterRewind { .. } => {
+                f.write_str("append-only recovery allocator high-water moved backwards")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SwapManifestSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidManifest { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Validate the invariants spanning all records in the one configured passive
+/// witness. Input order is irrelevant; sequence order is reconstructed before
+/// adjacency and high-water checks. An empty set is valid and lets the caller
+/// compare a zero-record witness with an independently empty database.
+pub fn audit_append_only_manifest_set_v1(
+    manifests: &[SwapManifestV1],
+) -> Result<SwapManifestSetAuditV1, SwapManifestSetError> {
+    let mut ordered = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        manifest
+            .validate()
+            .map_err(|source| SwapManifestSetError::InvalidManifest {
+                manifest_id: manifest.restore_identity.manifest_id,
+                source,
+            })?;
+        ordered.push(manifest);
+    }
+    ordered.sort_unstable_by_key(|manifest| manifest.restore_identity.manifest_sequence);
+
+    let mut manifest_ids = BTreeSet::new();
+    let mut chain_swap_ids = BTreeSet::new();
+    let mut boltz_swap_ids = BTreeSet::new();
+    let mut allocation_ids = BTreeSet::new();
+    let mut derivation_identities = BTreeSet::new();
+    let mut public_keys = BTreeSet::new();
+    let mut preimage_hashes = BTreeSet::new();
+    let mut lineage_high_waters: BTreeMap<(String, i32, i32), i64> = BTreeMap::new();
+
+    for (offset, manifest) in ordered.iter().enumerate() {
+        let expected_sequence = u64::try_from(offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(1))
+            .ok_or(SwapManifestSetError::TooManyManifests)?;
+        let identity = &manifest.restore_identity;
+        if identity.manifest_sequence != expected_sequence {
+            return Err(SwapManifestSetError::SequenceDiscontinuity {
+                expected: expected_sequence,
+                actual: identity.manifest_sequence,
+            });
+        }
+        if let Some(previous) = offset.checked_sub(1).map(|index| ordered[index]) {
+            let expected = previous.restore_identity.manifest_id;
+            if identity.previous_manifest_id != Some(expected) {
+                return Err(SwapManifestSetError::PredecessorMismatch {
+                    sequence: identity.manifest_sequence,
+                    expected,
+                    actual: identity.previous_manifest_id,
+                });
+            }
+        }
+
+        if !manifest_ids.insert(identity.manifest_id) {
+            return Err(SwapManifestSetError::DuplicateManifestId(
+                identity.manifest_id,
+            ));
+        }
+        if !chain_swap_ids.insert(identity.chain_swap_id) {
+            return Err(SwapManifestSetError::DuplicateChainSwapId(
+                identity.chain_swap_id,
+            ));
+        }
+        if !boltz_swap_ids.insert(identity.boltz_swap_id.as_str()) {
+            return Err(SwapManifestSetError::DuplicateBoltzSwapId(
+                identity.boltz_swap_id.clone(),
+            ));
+        }
+
+        let lineage = &manifest.derivation_lineage;
+        let lineage_key = (
+            lineage.root_fingerprint.clone(),
+            lineage.key_epoch,
+            lineage.derivation_scheme_version,
+        );
+        if let Some(previous) = lineage_high_waters.get(&lineage_key) {
+            if lineage.allocation_high_water_child_index < *previous {
+                return Err(SwapManifestSetError::AllocationHighWaterRewind {
+                    root_fingerprint: lineage.root_fingerprint.clone(),
+                    key_epoch: lineage.key_epoch,
+                    derivation_scheme_version: lineage.derivation_scheme_version,
+                    previous: *previous,
+                    actual: lineage.allocation_high_water_child_index,
+                });
+            }
+        }
+        lineage_high_waters.insert(
+            lineage_key.clone(),
+            lineage.allocation_high_water_child_index,
+        );
+
+        for allocation in [&lineage.claim, &lineage.refund] {
+            if !allocation_ids.insert(allocation.allocation_id) {
+                return Err(SwapManifestSetError::DuplicateAllocationId(
+                    allocation.allocation_id,
+                ));
+            }
+            let derivation_identity = (
+                lineage_key.0.clone(),
+                lineage_key.1,
+                lineage_key.2,
+                allocation.child_index,
+            );
+            if !derivation_identities.insert(derivation_identity) {
+                return Err(SwapManifestSetError::DuplicateDerivationIdentity {
+                    root_fingerprint: lineage_key.0.clone(),
+                    key_epoch: lineage_key.1,
+                    derivation_scheme_version: lineage_key.2,
+                    child_index: allocation.child_index,
+                });
+            }
+            // Taproot scripts commit to x-only keys. Opposite compressed
+            // parity must therefore not disguise reuse of the same effective
+            // derived key across two externally witnessed allocations.
+            let x_only_public_key = &allocation.public_key_hex[2..];
+            if !public_keys.insert(x_only_public_key) {
+                return Err(SwapManifestSetError::DuplicatePublicKey(
+                    allocation.public_key_hex.clone(),
+                ));
+            }
+            if let Some(preimage_hash) = allocation.preimage_hash_hex.as_deref() {
+                if !preimage_hashes.insert(preimage_hash) {
+                    return Err(SwapManifestSetError::DuplicatePreimageHash(
+                        preimage_hash.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let lineage_high_waters = lineage_high_waters
+        .into_iter()
+        .map(
+            |((root_fingerprint, key_epoch, derivation_scheme_version), child_index)| {
+                ManifestLineageHighWaterV1 {
+                    root_fingerprint,
+                    key_epoch,
+                    derivation_scheme_version,
+                    child_index,
+                }
+            },
+        )
+        .collect();
+    Ok(SwapManifestSetAuditV1 {
+        manifest_count: ordered.len(),
+        last_manifest_sequence: ordered
+            .last()
+            .map(|manifest| manifest.restore_identity.manifest_sequence),
+        last_manifest_id: ordered
+            .last()
+            .map(|manifest| manifest.restore_identity.manifest_id),
+        lineage_high_waters,
+    })
 }
 
 impl SwapManifestV1 {
@@ -1216,7 +1481,21 @@ mod tests {
         Keypair::from_secret_key(&Secp256k1::new(), &secret)
     }
 
-    fn real_shaped_provider_fixture() -> (
+    fn public_key_from_scalar(scalar: u8) -> BoltzPublicKey {
+        let mut bytes = [0_u8; 32];
+        bytes[31] = scalar;
+        let secret = secp256k1::SecretKey::from_slice(&bytes).unwrap();
+        BoltzPublicKey::new(secp256k1::PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &secret,
+        ))
+    }
+
+    fn real_shaped_provider_fixture_with_keys(
+        claim_scalar: u8,
+        refund_scalar: u8,
+        preimage_byte: u8,
+    ) -> (
         CreateChainResponse,
         Preimage,
         BoltzPublicKey,
@@ -1224,15 +1503,9 @@ mod tests {
     ) {
         const BLINDING_KEY: &str =
             "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
-        let preimage = Preimage::from_str(&"11".repeat(32)).unwrap();
-        let claim_public_key = BoltzPublicKey::from_str(
-            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        )
-        .unwrap();
-        let refund_public_key = BoltzPublicKey::from_str(
-            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-        )
-        .unwrap();
+        let preimage = Preimage::from_str(&format!("{preimage_byte:02x}").repeat(32)).unwrap();
+        let claim_public_key = public_key_from_scalar(claim_scalar);
+        let refund_public_key = public_key_from_scalar(refund_scalar);
         let bitcoin_server_key = BoltzPublicKey::from_str(
             "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
         )
@@ -1358,8 +1631,16 @@ mod tests {
     }
 
     fn fixture() -> SwapManifestV1 {
+        fixture_with_key_material(1, 2, 0x11)
+    }
+
+    fn fixture_with_key_material(
+        claim_scalar: u8,
+        refund_scalar: u8,
+        preimage_byte: u8,
+    ) -> SwapManifestV1 {
         let (provider_response, preimage, claim_public_key, refund_public_key) =
-            real_shaped_provider_fixture();
+            real_shaped_provider_fixture_with_keys(claim_scalar, refund_scalar, preimage_byte);
         let canonical_response = canonical_json(&provider_response).unwrap();
         let lockup_address = provider_response.lockup_details.lockup_address.clone();
         let liquid_destination = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
@@ -1438,6 +1719,45 @@ mod tests {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn manifest_set_fixture(
+        sequence: u64,
+        previous_manifest_id: Option<Uuid>,
+        discriminator: u128,
+        claim_child_index: i64,
+        refund_child_index: i64,
+        high_water: i64,
+        claim_scalar: u8,
+        refund_scalar: u8,
+        preimage_byte: u8,
+    ) -> SwapManifestV1 {
+        let mut manifest = fixture_with_key_material(claim_scalar, refund_scalar, preimage_byte);
+        manifest.restore_identity.manifest_id = Uuid::from_u128(1_000 + discriminator);
+        manifest.restore_identity.manifest_sequence = sequence;
+        manifest.restore_identity.previous_manifest_id = previous_manifest_id;
+        manifest.restore_identity.chain_swap_id = Uuid::from_u128(2_000 + discriminator);
+        manifest.restore_identity.boltz_swap_id = format!("ManifestSet{discriminator}");
+        manifest.restore_identity.created_at_unix += i64::try_from(discriminator).unwrap();
+        manifest.derivation_lineage.claim.allocation_id =
+            Uuid::from_u128(3_000 + discriminator * 2);
+        manifest.derivation_lineage.refund.allocation_id =
+            Uuid::from_u128(3_001 + discriminator * 2);
+        manifest.derivation_lineage.claim.child_index = claim_child_index;
+        manifest.derivation_lineage.refund.child_index = refund_child_index;
+        manifest
+            .derivation_lineage
+            .allocation_high_water_child_index = high_water;
+        manifest.merchant_policy.invoice_id = Uuid::from_u128(4_000 + discriminator);
+        manifest.merchant_policy.emergency_bitcoin_commitment_id =
+            Some(Uuid::from_u128(5_000 + discriminator));
+
+        let mut response = provider_response(&manifest);
+        response.id = manifest.restore_identity.boltz_swap_id.clone();
+        replace_provider_response(&mut manifest, &response);
+        manifest.validate().unwrap();
+        manifest
+    }
+
     fn signer_public_key(keypair: &Keypair) -> XOnlyPublicKey {
         keypair.x_only_public_key().0
     }
@@ -1451,6 +1771,227 @@ mod tests {
                 &NONCE,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn append_only_manifest_set_accepts_empty_and_unordered_complete_chains() {
+        assert_eq!(
+            audit_append_only_manifest_set_v1(&[]).unwrap(),
+            SwapManifestSetAuditV1 {
+                manifest_count: 0,
+                last_manifest_sequence: None,
+                last_manifest_id: None,
+                lineage_high_waters: Vec::new(),
+            }
+        );
+
+        let first = manifest_set_fixture(1, None, 1, 430, 431, 435, 20, 21, 0x31);
+        let second = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            2,
+            432,
+            433,
+            435,
+            22,
+            23,
+            0x32,
+        );
+        let third = manifest_set_fixture(
+            3,
+            Some(second.restore_identity.manifest_id),
+            3,
+            434,
+            435,
+            435,
+            24,
+            25,
+            0x33,
+        );
+        let audit =
+            audit_append_only_manifest_set_v1(&[third.clone(), first.clone(), second.clone()])
+                .unwrap();
+
+        assert_eq!(audit.manifest_count, 3);
+        assert_eq!(audit.last_manifest_sequence, Some(3));
+        assert_eq!(
+            audit.last_manifest_id,
+            Some(third.restore_identity.manifest_id)
+        );
+        assert_eq!(
+            audit.lineage_high_waters,
+            vec![ManifestLineageHighWaterV1 {
+                root_fingerprint: first.derivation_lineage.root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                child_index: 435,
+            }]
+        );
+    }
+
+    #[test]
+    fn append_only_manifest_set_rejects_sequence_gaps_and_branches() {
+        let first = manifest_set_fixture(1, None, 10, 500, 501, 501, 30, 31, 0x41);
+        let gap = manifest_set_fixture(
+            3,
+            Some(first.restore_identity.manifest_id),
+            11,
+            502,
+            503,
+            503,
+            32,
+            33,
+            0x42,
+        );
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), gap]),
+            Err(SwapManifestSetError::SequenceDiscontinuity {
+                expected: 2,
+                actual: 3
+            })
+        ));
+
+        let branch = manifest_set_fixture(
+            2,
+            Some(Uuid::from_u128(99_999)),
+            12,
+            502,
+            503,
+            503,
+            34,
+            35,
+            0x43,
+        );
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first, branch]),
+            Err(SwapManifestSetError::PredecessorMismatch { sequence: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn append_only_manifest_set_rejects_allocator_high_water_rewind() {
+        let first = manifest_set_fixture(1, None, 20, 600, 601, 700, 40, 41, 0x51);
+        let second = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            21,
+            602,
+            603,
+            603,
+            42,
+            43,
+            0x52,
+        );
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first, second]),
+            Err(SwapManifestSetError::AllocationHighWaterRewind {
+                previous: 700,
+                actual: 603,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn append_only_manifest_set_rejects_reused_global_identities() {
+        let first = manifest_set_fixture(1, None, 30, 800, 801, 810, 50, 51, 0x61);
+        let second = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            31,
+            802,
+            803,
+            810,
+            52,
+            53,
+            0x62,
+        );
+        let mut third = manifest_set_fixture(
+            3,
+            Some(second.restore_identity.manifest_id),
+            32,
+            804,
+            805,
+            810,
+            54,
+            55,
+            0x63,
+        );
+        third.restore_identity.manifest_id = first.restore_identity.manifest_id;
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), second.clone(), third]),
+            Err(SwapManifestSetError::DuplicateManifestId(_))
+        ));
+
+        let mut duplicate_chain = second.clone();
+        duplicate_chain.restore_identity.chain_swap_id = first.restore_identity.chain_swap_id;
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), duplicate_chain]),
+            Err(SwapManifestSetError::DuplicateChainSwapId(_))
+        ));
+
+        let mut duplicate_boltz = second.clone();
+        duplicate_boltz.restore_identity.boltz_swap_id =
+            first.restore_identity.boltz_swap_id.clone();
+        let mut response = provider_response(&duplicate_boltz);
+        response.id = duplicate_boltz.restore_identity.boltz_swap_id.clone();
+        replace_provider_response(&mut duplicate_boltz, &response);
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), duplicate_boltz]),
+            Err(SwapManifestSetError::DuplicateBoltzSwapId(_))
+        ));
+
+        let mut duplicate_allocation = second.clone();
+        duplicate_allocation.derivation_lineage.claim.allocation_id =
+            first.derivation_lineage.claim.allocation_id;
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), duplicate_allocation]),
+            Err(SwapManifestSetError::DuplicateAllocationId(_))
+        ));
+
+        let mut duplicate_derivation = second.clone();
+        duplicate_derivation.derivation_lineage.claim.child_index =
+            first.derivation_lineage.claim.child_index;
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first, duplicate_derivation]),
+            Err(SwapManifestSetError::DuplicateDerivationIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn append_only_manifest_set_rejects_reused_keys_and_preimages() {
+        let first = manifest_set_fixture(1, None, 40, 900, 901, 910, 60, 61, 0x71);
+        let duplicate_key = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            41,
+            902,
+            903,
+            910,
+            60,
+            62,
+            0x72,
+        );
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first.clone(), duplicate_key]),
+            Err(SwapManifestSetError::DuplicatePublicKey(_))
+        ));
+
+        let duplicate_preimage = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            42,
+            902,
+            903,
+            910,
+            63,
+            64,
+            0x71,
+        );
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&[first, duplicate_preimage]),
+            Err(SwapManifestSetError::DuplicatePreimageHash(_))
+        ));
     }
 
     #[test]
