@@ -2230,7 +2230,7 @@ async fn create_bitcoin_chain_offer(
             "chain-swap recovery capability is unavailable".into(),
         ));
     };
-    let creation_permit = ChainSwapCreationPermit::acquire(&state.db, recovery_runtime.store())
+    let creation_permit = ChainSwapCreationPermit::acquire(&state.db, recovery_runtime)
         .await
         .map_err(|error| {
             tracing::warn!(

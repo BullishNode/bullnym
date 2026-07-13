@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::ClaimFailureOutcome;
@@ -994,6 +994,49 @@ where
          )",
     )
     .fetch_one(executor)
+    .await
+}
+
+/// Lock and return the oldest complete canonical chain swap without a
+/// migration-052 manifest-ledger row.
+///
+/// Creation time followed by UUID is a stable total order even when multiple
+/// rows share the same PostgreSQL timestamp. The caller must already own the
+/// manifest-ledger tail lock in the same transaction, so the negative ledger
+/// predicate cannot race a concurrent append before the repair row is staged.
+/// Historical rows without the complete migration-051 creation packet are
+/// deliberately excluded.
+pub async fn oldest_manifestless_complete_chain_swap_for_update(
+    connection: &mut PgConnection,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
+           FROM chain_swap_records chain_swap \
+          WHERE num_nonnulls( \
+                    chain_swap.pinned_pair_hash, \
+                    chain_swap.canonical_pair_quote_json, \
+                    chain_swap.creation_response_sha256, \
+                    chain_swap.btc_claim_script_sha256, \
+                    chain_swap.btc_refund_script_sha256, \
+                    chain_swap.liquid_claim_script_sha256, \
+                    chain_swap.liquid_refund_script_sha256, \
+                    chain_swap.btc_timeout_height, \
+                    chain_swap.liquid_timeout_height, \
+                    chain_swap.btc_network, \
+                    chain_swap.liquid_network, \
+                    chain_swap.liquid_asset_id, \
+                    chain_swap.merchant_liquid_destination \
+                ) = 13 \
+            AND NOT EXISTS ( \
+                  SELECT 1 \
+                    FROM chain_swap_manifest_deliveries delivery \
+                   WHERE delivery.chain_swap_id = chain_swap.id \
+            ) \
+          ORDER BY chain_swap.created_at, chain_swap.id \
+          LIMIT 1 \
+          FOR UPDATE"
+    ))
+    .fetch_optional(connection)
     .await
 }
 

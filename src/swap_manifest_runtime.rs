@@ -139,13 +139,32 @@ impl RecoveryManifestRuntimeV1 {
         &self.store
     }
 
+    /// Construct a protected runtime around an injected integration backend.
+    ///
+    /// The fixed values are test protocol material, not production secrets.
+    /// Keeping them inside this redacted capability lets database/object-store
+    /// integration tests exercise the production repair path without adding a
+    /// public key-extraction API or depending on a networked S3 service.
+    #[doc(hidden)]
+    pub fn from_store_for_integration_tests(store: RecoveryManifestStore) -> Self {
+        let signing_secret =
+            SecretKey::from_slice(&[0x43; 32]).expect("fixed integration signing key is valid");
+        let signing_keypair = Keypair::from_secret_key(&Secp256k1::new(), &signing_secret);
+        let expected_signer = signing_keypair.x_only_public_key().0;
+        Self {
+            store,
+            encryption_key_id: "manifest-key-runtime-integration".to_owned(),
+            encryption_key: [0x42; 32],
+            signing_keypair,
+            expected_signer,
+        }
+    }
+
     /// Borrow the opaque sealing inputs required by atomic manifest staging.
     ///
     /// This crate-private adapter returns only the existing non-`Clone`,
     /// non-`Debug` capability. It neither copies nor exposes the encryption or
     /// signing keys, and it does not grant witness-opening access.
-    // This seam is intentionally unwired until the owning creation-route slice.
-    #[allow(dead_code)]
     pub(crate) fn borrow_manifest_staging_crypto_v1(&self) -> ManifestStagingCrypto<'_> {
         ManifestStagingCrypto::new(
             &self.encryption_key_id,

@@ -9,6 +9,7 @@ use pay_service::chain_swap_creation_permit::{
 };
 use pay_service::db::{self, ChainSwapManifestDelivery, NewChainSwapRecord, NewInvoice};
 use pay_service::swap_manifest::EncryptedSwapManifestV1;
+use pay_service::swap_manifest_runtime::RecoveryManifestRuntimeV1;
 use pay_service::swap_manifest_store::{ManifestObjectId, RecoveryManifestStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -48,6 +49,14 @@ fn memory_store(prefix: &str) -> (Arc<InMemory>, RecoveryManifestStore) {
     let store = RecoveryManifestStore::from_object_store_for_integration_tests(erased, prefix)
         .expect("valid in-memory manifest store");
     (backend, store)
+}
+
+fn memory_runtime(prefix: &str) -> (Arc<InMemory>, RecoveryManifestRuntimeV1) {
+    let (backend, store) = memory_store(prefix);
+    (
+        backend,
+        RecoveryManifestRuntimeV1::from_store_for_integration_tests(store),
+    )
 }
 
 #[derive(Serialize)]
@@ -299,9 +308,9 @@ async fn pending_state(pool: &PgPool, manifest_id: Uuid) -> String {
 
 async fn acquire_after_drop(
     pool: &PgPool,
-    store: &RecoveryManifestStore,
+    runtime: &RecoveryManifestRuntimeV1,
 ) -> ChainSwapCreationPermit {
-    match acquire_after_session_release(pool, store).await {
+    match acquire_after_session_release(pool, runtime).await {
         Ok(permit) => permit,
         Err(error) => panic!("unexpected permit acquisition failure: {error}"),
     }
@@ -309,11 +318,11 @@ async fn acquire_after_drop(
 
 async fn acquire_after_session_release(
     pool: &PgPool,
-    store: &RecoveryManifestStore,
+    runtime: &RecoveryManifestRuntimeV1,
 ) -> Result<ChainSwapCreationPermit, ChainSwapCreationPermitError> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            match ChainSwapCreationPermit::acquire(pool, store).await {
+            match ChainSwapCreationPermit::acquire(pool, runtime).await {
                 result @ Ok(_) => return result,
                 Err(ChainSwapCreationPermitError::Busy) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -332,20 +341,20 @@ async fn creation_permit_is_globally_mutually_exclusive() {
     let _serial = TEST_SERIAL.lock().await;
     let pool = test_pool().await;
     cleanup(&pool).await;
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
-    let first = ChainSwapCreationPermit::acquire(&pool, &store)
+    let first = ChainSwapCreationPermit::acquire(&pool, &runtime)
         .await
         .expect("first creation permit");
     assert_eq!(
-        ChainSwapCreationPermit::acquire(&pool, &store)
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
             .await
             .unwrap_err(),
         ChainSwapCreationPermitError::Busy
     );
     first.release().await.expect("explicit permit release");
 
-    let next = ChainSwapCreationPermit::acquire(&pool, &store)
+    let next = ChainSwapCreationPermit::acquire(&pool, &runtime)
         .await
         .expect("permit after explicit release");
     next.release().await.expect("release next permit");
@@ -358,13 +367,13 @@ async fn dropping_permit_closes_session_and_releases_lock() {
     let _serial = TEST_SERIAL.lock().await;
     let pool = test_pool().await;
     cleanup(&pool).await;
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
-    let permit = ChainSwapCreationPermit::acquire(&pool, &store)
+    let permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
         .await
         .expect("initial creation permit");
     drop(permit);
-    let next = acquire_after_drop(&pool, &store).await;
+    let next = acquire_after_drop(&pool, &runtime).await;
     next.release().await.expect("release permit after drop");
     cleanup(&pool).await;
 }
@@ -376,16 +385,16 @@ async fn complete_manifestless_swap_refuses_permit_and_releases_session_lock() {
     let pool = test_pool().await;
     cleanup(&pool).await;
     let swap = insert_complete_manifestless_swap(&pool).await;
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
     assert!(db::has_manifestless_complete_chain_swap(&pool)
         .await
         .expect("probe complete manifest-less row"));
     assert_eq!(
-        ChainSwapCreationPermit::acquire(&pool, &store)
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
             .await
             .unwrap_err(),
-        ChainSwapCreationPermitError::ManifestObligationMissing
+        ChainSwapCreationPermitError::ManifestRepairFailed
     );
     assert_eq!(
         db::get_chain_swap_by_id(&pool, swap.id)
@@ -400,10 +409,10 @@ async fn complete_manifestless_swap_refuses_permit_and_releases_session_lock() {
     // advisory lock. The caller never receives a permit and therefore cannot
     // cross into key allocation or a provider call.
     assert_eq!(
-        acquire_after_session_release(&pool, &store)
+        acquire_after_session_release(&pool, &runtime)
             .await
             .unwrap_err(),
-        ChainSwapCreationPermitError::ManifestObligationMissing
+        ChainSwapCreationPermitError::ManifestRepairFailed
     );
     cleanup(&pool).await;
 }
@@ -415,13 +424,13 @@ async fn legacy_manifestless_swap_is_structurally_nonblocking() {
     let pool = test_pool().await;
     cleanup(&pool).await;
     let legacy = insert_legacy_manifestless_swap(&pool).await;
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
     assert!(legacy.creation_terms.is_none());
     assert!(!db::has_manifestless_complete_chain_swap(&pool)
         .await
         .expect("probe legacy manifest-less row"));
-    let permit = ChainSwapCreationPermit::acquire(&pool, &store)
+    let permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
         .await
         .expect("legacy row must not block new creation");
     permit.release().await.expect("release legacy-row permit");
@@ -435,20 +444,25 @@ async fn complete_manifestless_refusal_recovers_after_ledger_obligation_is_creat
     let pool = test_pool().await;
     cleanup(&pool).await;
     let swap = insert_complete_manifestless_swap(&pool).await;
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
     assert_eq!(
-        ChainSwapCreationPermit::acquire(&pool, &store)
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
             .await
             .unwrap_err(),
-        ChainSwapCreationPermitError::ManifestObligationMissing
+        ChainSwapCreationPermitError::ManifestRepairFailed
     );
     let delivery = insert_pending_delivery_for_swap(&pool, swap.id, 0x61).await;
     assert_eq!(pending_state(&pool, delivery.manifest_id).await, "pending");
 
-    // Acquisition first resumes the newly created pending obligation, then
-    // re-runs coverage while still holding the session creation lock.
-    let permit = acquire_after_drop(&pool, &store).await;
+    // Acquisition resumes the newly created pending obligation but must not
+    // return a provider-creation permit in the request that repaired it.
+    assert_eq!(
+        acquire_after_session_release(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted
+    );
     assert_eq!(
         pending_state(&pool, delivery.manifest_id).await,
         "delivered"
@@ -459,13 +473,15 @@ async fn complete_manifestless_refusal_recovers_after_ledger_obligation_is_creat
     let object_id = ManifestObjectId::new(swap.id, delivery.manifest_id)
         .expect("valid recovered object identity");
     assert_eq!(
-        store
+        runtime
+            .store()
             .get_v1(object_id)
             .await
             .expect("read recovered manifest object")
             .encoded(),
         delivery.encrypted_envelope().encoded()
     );
+    let permit = acquire_after_drop(&pool, &runtime).await;
     permit
         .release()
         .await
@@ -475,17 +491,20 @@ async fn complete_manifestless_refusal_recovers_after_ledger_obligation_is_creat
 
 #[tokio::test]
 #[ignore = "requires a disposable migrated PostgreSQL database"]
-async fn pending_manifest_is_resumed_before_permit_is_returned() {
+async fn pending_manifest_is_resumed_without_returning_a_same_attempt_permit() {
     let _serial = TEST_SERIAL.lock().await;
     let pool = test_pool().await;
     cleanup(&pool).await;
     let delivery = insert_pending_delivery(&pool, 0x41).await;
     assert_eq!(pending_state(&pool, delivery.manifest_id).await, "pending");
-    let (_, store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (_, runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
 
-    let permit = ChainSwapCreationPermit::acquire(&pool, &store)
-        .await
-        .expect("permit resumes pending delivery");
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted
+    );
     assert_eq!(
         pending_state(&pool, delivery.manifest_id).await,
         "delivered"
@@ -493,14 +512,16 @@ async fn pending_manifest_is_resumed_before_permit_is_returned() {
     let object_id = ManifestObjectId::new(delivery.chain_swap_id, delivery.manifest_id)
         .expect("valid delivery object identity");
     assert_eq!(
-        store
+        runtime
+            .store()
             .get_v1(object_id)
             .await
             .expect("read resumed manifest")
             .encoded(),
         delivery.encrypted_envelope().encoded()
     );
-    permit.release().await.expect("release resumed permit");
+    let permit = acquire_after_drop(&pool, &runtime).await;
+    permit.release().await.expect("release subsequent permit");
     cleanup(&pool).await;
 }
 
@@ -511,19 +532,19 @@ async fn storage_failure_leaves_pending_and_refuses_permit() {
     let pool = test_pool().await;
     cleanup(&pool).await;
     let delivery = insert_pending_delivery(&pool, 0x51).await;
-    let (backend, failing_store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    let (backend, failing_runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
     let object_id = ManifestObjectId::new(delivery.chain_swap_id, delivery.manifest_id)
         .expect("valid delivery object identity");
     backend
         .put(
-            &ObjectStorePath::from(failing_store.object_key_v1(object_id)),
+            &ObjectStorePath::from(failing_runtime.store().object_key_v1(object_id)),
             PutPayload::from("pre-existing-invalid-object"),
         )
         .await
         .expect("seed conflicting object");
 
     assert_eq!(
-        ChainSwapCreationPermit::acquire(&pool, &failing_store)
+        ChainSwapCreationPermit::acquire(&pool, &failing_runtime)
             .await
             .unwrap_err(),
         ChainSwapCreationPermitError::PendingDeliveryFailed
@@ -531,12 +552,18 @@ async fn storage_failure_leaves_pending_and_refuses_permit() {
     assert_eq!(pending_state(&pool, delivery.manifest_id).await, "pending");
 
     // The failed acquisition must also close its lock-holding session.
-    let (_, recovery_store) = memory_store(&format!("bullnym/permit/{}", Uuid::new_v4()));
-    let permit = acquire_after_drop(&pool, &recovery_store).await;
+    let (_, recovery_runtime) = memory_runtime(&format!("bullnym/permit/{}", Uuid::new_v4()));
+    assert_eq!(
+        acquire_after_session_release(&pool, &recovery_runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted
+    );
     assert_eq!(
         pending_state(&pool, delivery.manifest_id).await,
         "delivered"
     );
-    permit.release().await.expect("release recovery permit");
+    let permit = acquire_after_drop(&pool, &recovery_runtime).await;
+    permit.release().await.expect("release subsequent permit");
     cleanup(&pool).await;
 }

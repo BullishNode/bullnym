@@ -10,8 +10,14 @@ use std::fmt;
 
 use sqlx::{Connection, PgConnection, PgPool};
 
-use crate::swap_manifest_delivery::resume_pending_manifest_delivery;
-use crate::swap_manifest_store::RecoveryManifestStore;
+use crate::swap_manifest_delivery::{
+    resume_pending_manifest_delivery, ManifestDeliveryResumeOutcome,
+};
+use crate::swap_manifest_persistence::{
+    repair_oldest_manifestless_chain_swap, ManifestlessChainSwapRepairError,
+    ManifestlessChainSwapRepairOutcome,
+};
+use crate::swap_manifest_runtime::RecoveryManifestRuntimeV1;
 
 // `CSCP` (chain-swap creation permit), distinct from migration 052's `BULL`
 // class plus object 87 transaction lock.
@@ -28,8 +34,9 @@ pub enum ChainSwapCreationPermitError {
     LockCheckFailed,
     Busy,
     PendingDeliveryFailed,
-    ManifestCoverageCheckFailed,
-    ManifestObligationMissing,
+    ManifestRepairFailed,
+    ManifestRepairCompleted,
+    ManifestPolicyReferenceMissing,
     ReleaseFailed,
 }
 
@@ -44,9 +51,12 @@ impl fmt::Display for ChainSwapCreationPermitError {
             Self::PendingDeliveryFailed => {
                 "prior recovery-manifest delivery could not be completed"
             }
-            Self::ManifestCoverageCheckFailed => "chain-swap manifest coverage check failed",
-            Self::ManifestObligationMissing => {
-                "canonical chain swap lacks a recovery manifest obligation"
+            Self::ManifestRepairFailed => "canonical chain-swap manifest repair failed",
+            Self::ManifestRepairCompleted => {
+                "a prior chain-swap manifest was repaired; retry the request"
+            }
+            Self::ManifestPolicyReferenceMissing => {
+                "canonical chain swap lacks emergency_bitcoin_commitment_id"
             }
             Self::ReleaseFailed => "chain-swap creation permit release failed",
         })
@@ -72,10 +82,13 @@ impl ChainSwapCreationPermit {
     /// This call never waits for another creator's advisory lock: contention
     /// returns [`ChainSwapCreationPermitError::Busy`]. Once the lock is held,
     /// any migration-052 pending delivery is synchronously create-or-verified
-    /// and acknowledged before the permit becomes observable to the caller.
+    /// and acknowledged. It then reconstructs at most one complete canonical
+    /// row that lacks a ledger obligation. An acquisition that performs either
+    /// repair returns a retry refusal instead of a creation permit; only a
+    /// clean later acquisition can cross the provider boundary.
     pub async fn acquire(
         pool: &PgPool,
-        store: &RecoveryManifestStore,
+        runtime: &RecoveryManifestRuntimeV1,
     ) -> Result<Self, ChainSwapCreationPermitError> {
         let pooled = pool
             .acquire()
@@ -96,23 +109,27 @@ impl ChainSwapCreationPermit {
             return Err(ChainSwapCreationPermitError::Busy);
         }
 
-        resume_pending_manifest_delivery(pool, store)
+        let resumed = resume_pending_manifest_delivery(pool, runtime.store())
             .await
             .map_err(|_| ChainSwapCreationPermitError::PendingDeliveryFailed)?;
+        if matches!(resumed, ManifestDeliveryResumeOutcome::Delivered { .. }) {
+            // A repaired payer instruction must be rediscovered by the
+            // caller's normal existing-offer lookup. Do not create a second
+            // provider swap in the request that finished its delivery.
+            return Err(ChainSwapCreationPermitError::ManifestRepairCompleted);
+        }
 
-        // A staging/ledger refusal after a mutating provider call deliberately
-        // retains the complete canonical chain-swap row. That row is a
-        // blocking obligation: do not let the next caller cross the provider
-        // boundary until a migration-052 ledger row exists for it. Historical
-        // rows without the complete #80 creation packet remain nonblocking.
-        let missing_obligation = crate::db::has_manifestless_complete_chain_swap(&mut connection)
-            .await
-            .map_err(|_| ChainSwapCreationPermitError::ManifestCoverageCheckFailed)?;
-        if missing_obligation {
-            // `connection` is detached and still owns the session advisory
-            // lock. Returning drops/closes it, so PostgreSQL releases the lock
-            // before any later acquisition can succeed.
-            return Err(ChainSwapCreationPermitError::ManifestObligationMissing);
+        match repair_oldest_manifestless_chain_swap(pool, runtime).await {
+            Ok(ManifestlessChainSwapRepairOutcome::NoRepairNeeded) => {}
+            Ok(ManifestlessChainSwapRepairOutcome::Repaired { .. }) => {
+                // Returning closes the detached lock-holding connection. The
+                // next request can reuse the repaired payer-exposable row.
+                return Err(ChainSwapCreationPermitError::ManifestRepairCompleted);
+            }
+            Err(ManifestlessChainSwapRepairError::EmergencyPolicyCommitmentMissing) => {
+                return Err(ChainSwapCreationPermitError::ManifestPolicyReferenceMissing);
+            }
+            Err(_) => return Err(ChainSwapCreationPermitError::ManifestRepairFailed),
         }
 
         Ok(Self {
@@ -172,8 +189,9 @@ mod tests {
             ChainSwapCreationPermitError::LockCheckFailed,
             ChainSwapCreationPermitError::Busy,
             ChainSwapCreationPermitError::PendingDeliveryFailed,
-            ChainSwapCreationPermitError::ManifestCoverageCheckFailed,
-            ChainSwapCreationPermitError::ManifestObligationMissing,
+            ChainSwapCreationPermitError::ManifestRepairFailed,
+            ChainSwapCreationPermitError::ManifestRepairCompleted,
+            ChainSwapCreationPermitError::ManifestPolicyReferenceMissing,
             ChainSwapCreationPermitError::ReleaseFailed,
         ] {
             assert!(error.to_string().len() <= 72);

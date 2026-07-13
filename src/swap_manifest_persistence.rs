@@ -1,5 +1,5 @@
-//! Unwired durable provider-result persistence and manifest delivery for one
-//! chain swap.
+//! Durable provider-result persistence, manifest delivery, and repair for
+//! canonical chain swaps.
 //!
 //! The fully validated migration-050/051 chain-swap row is committed first so
 //! no later recovery-manifest failure can erase the only canonical record of a
@@ -14,8 +14,10 @@
 //! record, withholding the payer instruction. A post-ledger-commit failure
 //! also leaves the sole pending delivery available to
 //! [`crate::swap_manifest_delivery::resume_pending_manifest_delivery`]. This
-//! module does not participate in invoice creation, admission, startup, worker
-//! scheduling, or retry policy.
+//! Permit acquisition also uses the same staging and delivery boundaries to
+//! repair a canonical row left without a ledger obligation after a prior
+//! post-provider failure. This module does not invoke providers, expose payer
+//! instructions, alter public reads, or own worker scheduling and retry policy.
 
 use std::fmt;
 
@@ -26,8 +28,9 @@ use uuid::Uuid;
 use crate::boltz::ChainSwapResult;
 use crate::db::{
     insert_manifest_delivery, load_manifest_staging_evidence, lock_manifest_delivery_tail,
+    oldest_manifestless_complete_chain_swap_for_update,
     record_chain_swap_with_lineage_and_creation_terms, ChainSwapLineage, ChainSwapRecord,
-    ManifestDeliveryError, NewChainSwapCreationTerms, NewChainSwapRecord,
+    ManifestDeliveryError, ManifestDeliveryIdentity, NewChainSwapCreationTerms, NewChainSwapRecord,
 };
 use crate::swap_manifest::MerchantPolicyReferencesV1;
 use crate::swap_manifest_delivery::{
@@ -356,6 +359,301 @@ impl fmt::Display for PersistAndDeliverChainSwapError {
 }
 
 impl std::error::Error for PersistAndDeliverChainSwapError {}
+
+/// Result of one bounded pass over canonical rows that predate their
+/// migration-052 ledger obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestlessChainSwapRepairOutcome {
+    NoRepairNeeded,
+    Repaired { identity: ManifestDeliveryIdentity },
+}
+
+/// Fixed, source-free failures from reconstructing one exact persisted row.
+///
+/// No variant retains a chain-swap identity, provider response, destination,
+/// key, envelope, database/object-store source, or runtime configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestlessChainSwapRepairError {
+    TransactionBeginFailed,
+    PendingManifestDelivery,
+    ManifestTailReservationFailed,
+    ManifestlessRowReadFailed,
+    MerchantNymMissing,
+    EmergencyPolicyCommitmentMissing,
+    ManifestEvidenceReadFailed,
+    ManifestEvidenceMissing,
+    ManifestStagingFailed,
+    ManifestIdentityFailed,
+    ManifestLedgerInsertFailed,
+    ManifestLedgerInvariantFailed,
+    TransactionRollbackFailed,
+    TransactionCommitFailed,
+    ManifestDeliveryFailed,
+    ManifestDeliveryInvariantFailed,
+}
+
+impl fmt::Display for ManifestlessChainSwapRepairError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TransactionBeginFailed => "manifest repair transaction could not begin",
+            Self::PendingManifestDelivery => "a prior recovery-manifest delivery is still pending",
+            Self::ManifestTailReservationFailed => {
+                "manifest repair could not reserve the ledger tail"
+            }
+            Self::ManifestlessRowReadFailed => "manifestless canonical row could not be read",
+            Self::MerchantNymMissing => "canonical chain swap lacks merchant_nym",
+            Self::EmergencyPolicyCommitmentMissing => {
+                "canonical chain swap lacks emergency_bitcoin_commitment_id"
+            }
+            Self::ManifestEvidenceReadFailed => "manifest repair evidence could not be read",
+            Self::ManifestEvidenceMissing => "manifest repair evidence is unexpectedly absent",
+            Self::ManifestStagingFailed => "canonical chain swap manifest could not be staged",
+            Self::ManifestIdentityFailed => "manifest repair identity is invalid",
+            Self::ManifestLedgerInsertFailed => "manifest repair ledger row could not be inserted",
+            Self::ManifestLedgerInvariantFailed => "manifest repair ledger row did not match",
+            Self::TransactionRollbackFailed => "manifest repair transaction rollback failed",
+            Self::TransactionCommitFailed => "manifest repair transaction commit failed",
+            Self::ManifestDeliveryFailed => {
+                "reconstructed recovery manifest could not be delivered"
+            }
+            Self::ManifestDeliveryInvariantFailed => {
+                "reconstructed recovery manifest delivery did not match"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ManifestlessChainSwapRepairError {}
+
+/// Reconstruct, append, deliver, and acknowledge the oldest complete
+/// canonical provider row that lacks a migration-052 ledger row.
+///
+/// The caller owns the wider session-scoped creation lock. This function owns
+/// the ledger transaction lock, stages only from the selected immutable row
+/// plus its exact allocation journal evidence, and commits the pending ledger
+/// row before object-store I/O. A crash or delivery failure therefore leaves a
+/// single pending row that the next permit acquisition resumes with the same
+/// committed manifest identity. The canonical provider row is never modified.
+pub async fn repair_oldest_manifestless_chain_swap(
+    pool: &PgPool,
+    runtime: &RecoveryManifestRuntimeV1,
+) -> Result<ManifestlessChainSwapRepairOutcome, ManifestlessChainSwapRepairError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ManifestlessChainSwapRepairError::TransactionBeginFailed)?;
+
+    let reservation = match lock_manifest_delivery_tail(&mut tx).await {
+        Ok(reservation) => reservation,
+        Err(ManifestDeliveryError::PendingDelivery { .. }) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::PendingManifestDelivery,
+            )
+            .await);
+        }
+        Err(_) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestTailReservationFailed,
+            )
+            .await);
+        }
+    };
+
+    let chain_swap = match oldest_manifestless_complete_chain_swap_for_update(&mut tx).await {
+        Ok(Some(chain_swap)) => chain_swap,
+        Ok(None) => {
+            tx.commit()
+                .await
+                .map_err(|_| ManifestlessChainSwapRepairError::TransactionCommitFailed)?;
+            return Ok(ManifestlessChainSwapRepairOutcome::NoRepairNeeded);
+        }
+        Err(_) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestlessRowReadFailed,
+            )
+            .await);
+        }
+    };
+
+    let Some(nym) = chain_swap.nym.as_deref().filter(|nym| !nym.is_empty()) else {
+        return Err(rollback_repair_or_replace(
+            tx,
+            ManifestlessChainSwapRepairError::MerchantNymMissing,
+        )
+        .await);
+    };
+    let Some(creation_terms) = chain_swap.creation_terms.as_ref() else {
+        return Err(rollback_repair_or_replace(
+            tx,
+            ManifestlessChainSwapRepairError::ManifestEvidenceMissing,
+        )
+        .await);
+    };
+    if creation_terms.merchant_emergency_btc_address.is_some() {
+        // Migration 051 retained the destination but has no column for the
+        // signed policy commitment that authorizes it. Inventing one would
+        // produce a valid-looking manifest with false recovery authority.
+        return Err(rollback_repair_or_replace(
+            tx,
+            ManifestlessChainSwapRepairError::EmergencyPolicyCommitmentMissing,
+        )
+        .await);
+    }
+    let merchant_policy = MerchantPolicyReferencesV1::new(
+        chain_swap.invoice_id,
+        nym,
+        &creation_terms.merchant_liquid_destination,
+        None,
+    );
+
+    let evidence = match load_manifest_staging_evidence(&mut *tx, chain_swap.id).await {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestEvidenceMissing,
+            )
+            .await);
+        }
+        Err(_) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestEvidenceReadFailed,
+            )
+            .await);
+        }
+    };
+
+    // No manifest identity exists for this row: the negative ledger predicate
+    // was checked while holding the ledger tail lock. Generate the identity
+    // only now; it becomes authoritative solely if the transaction commits.
+    let manifest_id = Uuid::new_v4();
+    if manifest_id.is_nil() {
+        return Err(rollback_repair_or_replace(
+            tx,
+            ManifestlessChainSwapRepairError::ManifestIdentityFailed,
+        )
+        .await);
+    }
+    let staged = match stage_swap_manifest_v1(ManifestStagingRequest {
+        chain_swap: &chain_swap,
+        persisted_lineage: &evidence.persisted_lineage,
+        claim_allocation: &evidence.claim_allocation,
+        refund_allocation: &evidence.refund_allocation,
+        sequence_reservation: reservation,
+        manifest_id,
+        allocation_high_water: &evidence.allocation_high_water,
+        merchant_policy: &merchant_policy,
+        crypto: runtime.borrow_manifest_staging_crypto_v1(),
+    }) {
+        Ok(staged) => staged,
+        Err(_) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestStagingFailed,
+            )
+            .await);
+        }
+    };
+    let identity = match reservation.identity(manifest_id, chain_swap.id) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Err(rollback_repair_or_replace(
+                tx,
+                ManifestlessChainSwapRepairError::ManifestIdentityFailed,
+            )
+            .await);
+        }
+    };
+    let delivery =
+        match insert_manifest_delivery(&mut tx, &identity, &staged.encrypted_envelope).await {
+            Ok(delivery) => delivery,
+            Err(_) => {
+                return Err(rollback_repair_or_replace(
+                    tx,
+                    ManifestlessChainSwapRepairError::ManifestLedgerInsertFailed,
+                )
+                .await);
+            }
+        };
+
+    let expected_digest = hex::encode(Sha256::digest(
+        staged.encrypted_envelope.encoded().as_bytes(),
+    ));
+    if delivery.identity() != identity
+        || delivery.encrypted_envelope() != &staged.encrypted_envelope
+        || delivery.envelope_sha256 != expected_digest
+        || delivery.delivery_state != "pending"
+        || delivery.delivered_at_unix.is_some()
+    {
+        return Err(rollback_repair_or_replace(
+            tx,
+            ManifestlessChainSwapRepairError::ManifestLedgerInvariantFailed,
+        )
+        .await);
+    }
+
+    tx.commit()
+        .await
+        .map_err(|_| ManifestlessChainSwapRepairError::TransactionCommitFailed)?;
+
+    match deliver_exact_manifest_delivery(pool, runtime.store(), &delivery).await {
+        Ok(ManifestDeliveryResumeOutcome::Delivered {
+            identity: delivered_identity,
+            ..
+        }) if delivered_identity == identity => {
+            Ok(ManifestlessChainSwapRepairOutcome::Repaired { identity })
+        }
+        Ok(_) => Err(ManifestlessChainSwapRepairError::ManifestDeliveryInvariantFailed),
+        Err(_) => Err(ManifestlessChainSwapRepairError::ManifestDeliveryFailed),
+    }
+}
+
+async fn rollback_repair_or_replace(
+    tx: Transaction<'_, Postgres>,
+    original: ManifestlessChainSwapRepairError,
+) -> ManifestlessChainSwapRepairError {
+    match tx.rollback().await {
+        Ok(()) => original,
+        Err(_) => ManifestlessChainSwapRepairError::TransactionRollbackFailed,
+    }
+}
+
+#[cfg(test)]
+mod manifestless_repair_error_tests {
+    use std::error::Error as _;
+
+    use super::ManifestlessChainSwapRepairError as Error;
+
+    #[test]
+    fn failures_are_bounded_and_source_free() {
+        for error in [
+            Error::TransactionBeginFailed,
+            Error::PendingManifestDelivery,
+            Error::ManifestTailReservationFailed,
+            Error::ManifestlessRowReadFailed,
+            Error::MerchantNymMissing,
+            Error::EmergencyPolicyCommitmentMissing,
+            Error::ManifestEvidenceReadFailed,
+            Error::ManifestEvidenceMissing,
+            Error::ManifestStagingFailed,
+            Error::ManifestIdentityFailed,
+            Error::ManifestLedgerInsertFailed,
+            Error::ManifestLedgerInvariantFailed,
+            Error::TransactionRollbackFailed,
+            Error::TransactionCommitFailed,
+            Error::ManifestDeliveryFailed,
+            Error::ManifestDeliveryInvariantFailed,
+        ] {
+            assert!(error.to_string().len() <= 72);
+            assert!(format!("{error:?}").len() <= 48);
+            assert!(error.source().is_none());
+        }
+    }
+}
 
 /// Persist one canonical provider-created chain swap first, then stage,
 /// durably deliver, and acknowledge its exact manifest before returning it to
