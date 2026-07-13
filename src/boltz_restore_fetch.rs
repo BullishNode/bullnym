@@ -142,6 +142,16 @@ impl BoltzRestoreFetcher {
         Self::build(base_url, BOLTZ_RESTORE_TIMEOUT, false)
     }
 
+    /// Deterministic integration-test transport. Production construction above
+    /// remains HTTPS-only; this seam accepts only an HTTP loopback host and
+    /// retains the same redirect, body, status, and validation policy.
+    #[doc(hidden)]
+    pub fn from_loopback_for_integration_tests(
+        base_url: &str,
+    ) -> Result<Self, BoltzRestoreFetchError> {
+        Self::build(base_url, BOLTZ_RESTORE_TIMEOUT, true)
+    }
+
     /// Fetch the pinned restore list and summary, validate every record against
     /// the local secret key, then require the summary to equal the validated
     /// record high-water. Nothing is persisted or admitted by this boundary.

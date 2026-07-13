@@ -20,10 +20,11 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db,
-    derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr,
-    og_image, pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration,
-    registration,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_watcher, claimer,
+    config, db, derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl,
+    nostr, og_image, pricer, qr, rate_limit, readiness, reconciler,
+    recovery_address_registration, registration, startup_provider_reconciliation,
+    swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -100,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let recovery_manifest_runtime_v1 =
+        swap_manifest_runtime::RecoveryManifestRuntimeV1::for_process_startup();
+
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
         .connect(&config.database_url)
@@ -149,6 +153,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let swap_master_key =
         SwapMasterKey::from_mnemonic(&config.swap_mnemonic, None, Network::Mainnet)
             .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
+
+    // Compare the provider's validated xpub restore snapshot with both the
+    // authenticated off-host witness and one coherent PostgreSQL snapshot
+    // before moving the master key into the Boltz service. Failures close only
+    // new Bitcoin chain-swap admission; HTTP and existing-obligation recovery
+    // continue to start.
+    let provider_recovery_consistent = match recovery_manifest_runtime_v1.as_deref() {
+        Some(runtime) => {
+            let fetcher = boltz_restore_fetch::BoltzRestoreFetcher::new(&config.boltz.api_url);
+            match fetcher {
+                Ok(fetcher) => {
+                    match startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+                        &pool,
+                        runtime,
+                        &fetcher,
+                        &swap_master_key,
+                    )
+                    .await
+                    {
+                        Ok(fact) => {
+                            let report = fact.report();
+                            let exact_agreement = fact.exact_agreement();
+                            let repaired_obligation_count = fact.repaired_obligation_count();
+                            if exact_agreement {
+                                tracing::info!(
+                                    event = "startup_provider_recovery_consistent",
+                                    repaired_obligation_count,
+                                    manifest_count = report.manifest_count,
+                                    provider_record_count = report.boltz.validated_record_count,
+                                    provider_chain_record_count = report.boltz.chain_record_count,
+                                    local_record_count = report.local.local_record_count,
+                                    "startup recovery sources agree exactly"
+                                );
+                            } else {
+                                tracing::error!(
+                                    event = "startup_provider_recovery_inconsistent",
+                                    repaired_obligation_count,
+                                    manifest_count = report.manifest_count,
+                                    provider_chain_record_count = report.boltz.chain_record_count,
+                                    provider_only_chain_record_count =
+                                        report.boltz.provider_only_chain_record_count,
+                                    local_record_count = report.local.local_record_count,
+                                    manifest_only_record_count =
+                                        report.local.manifest_only_record_count,
+                                    local_only_record_count = report.local.local_only_record_count,
+                                    "startup recovery sources differ; new Bitcoin chain-swap admission is closed"
+                                );
+                            }
+                            exact_agreement
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                event = "startup_provider_recovery_unavailable",
+                                error = %error,
+                                "startup recovery evidence is unavailable or invalid; new Bitcoin chain-swap admission is closed"
+                            );
+                            false
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        event = "startup_provider_recovery_configuration_invalid",
+                        "startup recovery evidence configuration is invalid; new Bitcoin chain-swap admission is closed"
+                    );
+                    false
+                }
+            }
+        }
+        None => {
+            tracing::error!(
+                event = "startup_provider_recovery_configuration_missing",
+                "startup recovery evidence configuration is unavailable; new Bitcoin chain-swap admission is closed"
+            );
+            false
+        }
+    };
 
     // Boltz does not HMAC-sign webhook deliveries; the only viable
     // authenticator is the URL itself. Compatibility details live in
@@ -420,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             boltz_client_ready: boltz.client_ready(),
             swap_key_lineage_safe,
             recovery_journal_ready: schema_and_journal_ready,
+            provider_recovery_consistent,
             // #64 owns live fee observation and persistence. Until it lands,
             // new reverse and chain swaps deliberately remain fail-closed.
             fee_policy_ready: false,
@@ -448,6 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitcoin_recovery_backend,
         pricer: pricer_client,
         pwa_shells,
+        recovery_manifest_runtime_v1,
         swap_key_root_fingerprint: swap_key_root_fingerprint.clone(),
     };
 

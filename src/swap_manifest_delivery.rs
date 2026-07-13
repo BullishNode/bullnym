@@ -11,7 +11,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::{
-    list_pending_manifest_deliveries, mark_manifest_delivered, ManifestDeliveryIdentity,
+    list_pending_manifest_deliveries, mark_manifest_delivered, ChainSwapManifestDelivery,
+    ManifestDeliveryIdentity,
 };
 use crate::swap_manifest_store::{
     ManifestObjectId, ManifestStoreError, ManifestWriteOutcome, RecoveryManifestStore,
@@ -161,6 +162,21 @@ pub async fn resume_pending_manifest_delivery(
         return Ok(ManifestDeliveryResumeOutcome::NoPending);
     };
 
+    deliver_exact_manifest_delivery(pool, store, &delivery).await
+}
+
+/// Durably create/read-verify and acknowledge one exact ledger row.
+///
+/// The row is supplied by the caller rather than rediscovered from the global
+/// pending set. This is the post-commit half of an atomic swap-plus-ledger
+/// insertion: a concurrent resume worker may race this function, but both
+/// attempts target the same immutable object and exact idempotent
+/// acknowledgement.
+pub async fn deliver_exact_manifest_delivery(
+    pool: &PgPool,
+    store: &RecoveryManifestStore,
+    delivery: &ChainSwapManifestDelivery,
+) -> Result<ManifestDeliveryResumeOutcome, ManifestDeliveryCoordinatorError> {
     let identity = delivery.identity();
     let manifest = delivery.encrypted_envelope();
     let computed_sha256 = hex::encode(Sha256::digest(manifest.encoded().as_bytes()));

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderMap, Request, StatusCode};
-use axum::routing::{get, post, put};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post, put};
 use axum::Router;
 use futures_util::stream::BoxStream;
 use http_body_util::BodyExt;
@@ -22,11 +23,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use pay_service::boltz::BoltzService;
+use pay_service::chain_swap_creation_permit::{
+    ChainSwapCreationPermit, ChainSwapCreationPermitError,
+};
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
     ElectrumConfig, FeaturesConfig, InvoiceAccountingConfig, LimitsConfig, LiquidWatcherConfig,
@@ -42,6 +47,7 @@ use pay_service::swap_manifest_delivery::{
     resume_pending_manifest_delivery, ManifestDeliveryCoordinatorError,
     ManifestDeliveryResumeOutcome,
 };
+use pay_service::swap_manifest_runtime::{self, RecoveryManifestRuntimeV1};
 use pay_service::swap_manifest_store::{
     ManifestObjectId, ManifestWriteOutcome, RecoveryManifestStore, S3ManifestCredentials,
     S3ManifestStoreConfig,
@@ -71,6 +77,11 @@ use boltz_client::{
 use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
+
+#[path = "support/chain_swap_transaction_insert.rs"]
+mod chain_swap_transaction_insert;
+#[path = "support/local_chain_swap_recovery_snapshot.rs"]
+mod local_chain_swap_recovery_snapshot;
 
 // --- Test infrastructure ---
 
@@ -274,6 +285,7 @@ fn test_state_with_provider_limits(
         bitcoin_recovery_backend: Some(bitcoin_recovery_backend),
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
+        recovery_manifest_runtime_v1: None,
         swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
     }
 }
@@ -914,6 +926,90 @@ async fn m11_creation_mutation_snapshot(pool: &PgPool) -> M11CreationMutationSna
             .await
             .unwrap(),
     }
+}
+
+fn test_recovery_manifest_runtime() -> Arc<RecoveryManifestRuntimeV1> {
+    let signing_secret = [0x31; 32];
+    let signing_key = Keypair::from_secret_key(
+        &Secp256k1::new(),
+        &SecretKey::from_slice(&signing_secret).unwrap(),
+    );
+    let values = HashMap::from([
+        (
+            swap_manifest_runtime::S3_ENDPOINT_ENV,
+            "http://127.0.0.1:1".to_owned(),
+        ),
+        (swap_manifest_runtime::S3_REGION_ENV, "us-east-1".to_owned()),
+        (
+            swap_manifest_runtime::S3_BUCKET_ENV,
+            "bullnym-recovery-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::S3_PREFIX_ENV,
+            "bullnym/tests".to_owned(),
+        ),
+        (swap_manifest_runtime::S3_PATH_STYLE_ENV, "true".to_owned()),
+        (swap_manifest_runtime::S3_ALLOW_HTTP_ENV, "true".to_owned()),
+        (
+            swap_manifest_runtime::S3_ACCESS_KEY_ID_ENV,
+            "ACCESSKEYTEST".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::S3_SECRET_ACCESS_KEY_ENV,
+            "secret-access-key-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::ENCRYPTION_KEY_ID_ENV,
+            "manifest-key-route-test".to_owned(),
+        ),
+        (
+            swap_manifest_runtime::ENCRYPTION_KEY_HEX_ENV,
+            hex::encode([0x42; 32]),
+        ),
+        (
+            swap_manifest_runtime::SIGNING_SECRET_KEY_HEX_ENV,
+            hex::encode(signing_secret),
+        ),
+        (
+            swap_manifest_runtime::EXPECTED_SIGNER_XONLY_HEX_ENV,
+            signing_key.x_only_public_key().0.to_string(),
+        ),
+    ]);
+    Arc::new(
+        RecoveryManifestRuntimeV1::from_lookup(|name| values.get(name).cloned())
+            .expect("valid route-test recovery runtime"),
+    )
+}
+
+fn in_memory_recovery_manifest_runtime() -> Arc<RecoveryManifestRuntimeV1> {
+    Arc::new(RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    ))
+}
+
+async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
+    let npub = create_test_user(pool, nym).await;
+    insert_test_recovery_commitment(pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x84).await;
+    pay_service::db::upsert_donation_page(
+        pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Recovery-gated checkout",
+            description: "Chain creation must remain behind recovery readiness",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[derive(Clone)]
@@ -2601,6 +2697,206 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
         .unwrap()
         .creation_terms
         .is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_staging_evidence_reads_exact_public_lineage_and_fails_on_dangling_rows() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "manifeststage";
+    let npub = "91".repeat(32);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(
+        &pool,
+        nym,
+        &npub,
+        "lq1manifeststagingmerchantdestination",
+        3_600,
+    )
+    .await;
+
+    let root = "9191919191919191";
+    let claim_public_key = format!("02{}", "92".repeat(32));
+    let refund_public_key = format!("03{}", "93".repeat(32));
+    let later_public_key = format!("02{}", "94".repeat(32));
+    let preimage_hash = "95".repeat(32);
+    let later_preimage_hash = "96".repeat(32);
+    let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_001,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_002,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 9_003,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &later_public_key,
+            preimage_hash_hex: Some(&later_preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+
+    const PRIVATE_PREIMAGE_CANARY: &str =
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const PRIVATE_CLAIM_KEY_CANARY: &str =
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+    const PRIVATE_REFUND_KEY_CANARY: &str =
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+    const PROVIDER_RESPONSE_CANARY: &str = "{\"private_provider_response\":\"must-not-load\"}";
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x97).await;
+    let mut creation_terms = valid_chain_swap_creation_terms_fixture();
+    creation_terms.merchant_emergency_btc_address = Some(RECOVERY_COMMITMENT_P2WPKH);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id: "MANIFEST_STAGE_EVIDENCE",
+            lockup_address: "bc1qmanifeststaginglockup",
+            lockup_bip21: Some("bitcoin:bc1qmanifeststaginglockup?amount=0.00025431"),
+            user_lock_amount_sat: 25_431,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: PRIVATE_PREIMAGE_CANARY,
+            claim_key_hex: PRIVATE_CLAIM_KEY_CANARY,
+            refund_key_hex: PRIVATE_REFUND_KEY_CANARY,
+            boltz_response_json: PROVIDER_RESPONSE_CANARY,
+            claim_key_index: Some(9_001),
+            refund_key_index: Some(9_002),
+            root_fingerprint: Some(root),
+        },
+        &pay_service::db::ChainSwapLineage {
+            claim_allocation_id,
+            refund_allocation_id,
+            key_epoch: 3,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key,
+            refund_public_key_hex: &refund_public_key,
+            preimage_hash_hex: &preimage_hash,
+        },
+        &pay_service::db::NewChainSwapCreationEvidence {
+            creation_terms,
+            recovery_address_commitment_id: Some(recovery_address_commitment_id),
+        },
+    )
+    .await
+    .unwrap();
+
+    let evidence = pay_service::db::load_manifest_staging_evidence(&pool, inserted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.persisted_lineage.chain_swap_id, inserted.id);
+    assert_eq!(evidence.persisted_lineage.root_fingerprint, root);
+    assert_eq!(evidence.persisted_lineage.key_epoch, 3);
+    assert_eq!(
+        evidence.persisted_lineage.claim.allocation_id,
+        claim_allocation_id
+    );
+    assert_eq!(
+        evidence.persisted_lineage.refund.allocation_id,
+        refund_allocation_id
+    );
+    assert_eq!(evidence.claim_allocation.child_index, 9_001);
+    assert_eq!(
+        evidence.claim_allocation.purpose,
+        pay_service::db::SwapKeyPurpose::ChainClaim
+    );
+    assert_eq!(
+        evidence.claim_allocation.preimage_hash_hex,
+        Some(preimage_hash)
+    );
+    assert_eq!(evidence.refund_allocation.child_index, 9_002);
+    assert_eq!(
+        evidence.refund_allocation.purpose,
+        pay_service::db::SwapKeyPurpose::ChainRefund
+    );
+    assert_eq!(evidence.refund_allocation.preimage_hash_hex, None);
+    assert_eq!(evidence.allocation_high_water.child_index, 9_003);
+
+    let rendered = format!("{evidence:?}");
+    for secret in [
+        PRIVATE_PREIMAGE_CANARY,
+        PRIVATE_CLAIM_KEY_CANARY,
+        PRIVATE_REFUND_KEY_CANARY,
+        PROVIDER_RESPONSE_CANARY,
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+    assert!(
+        pay_service::db::load_manifest_staging_evidence(&pool, uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Model a damaged restore with a dangling lineage reference. The loader's
+    // LEFT JOIN must distinguish the present chain row from an absent chain
+    // row and fail closed instead of manufacturing allocation evidence.
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM swap_key_allocations WHERE id = $1")
+        .bind(refund_allocation_id)
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    corruption.commit().await.unwrap();
+
+    let error = pay_service::db::load_manifest_staging_evidence(&pool, inserted.id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        pay_service::db::ManifestStagingEvidenceReadError::IncompleteStoredEvidence {
+            field: "refund_allocation.id"
+        }
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    let rendered = format!("{error:?} {error}");
+    for secret in [
+        PRIVATE_PREIMAGE_CANARY,
+        PRIVATE_CLAIM_KEY_CANARY,
+        PRIVATE_REFUND_KEY_CANARY,
+        PROVIDER_RESPONSE_CANARY,
+    ] {
+        assert!(!rendered.contains(secret));
+    }
 
     cleanup_db(&pool).await;
 }
@@ -6110,6 +6406,126 @@ async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
     provider_task.abort();
     let _ = provider_task.await;
 
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_offer_missing_runtime_refuses_before_key_or_provider_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    seed_chain_offer_checkout_surface(&pool, "chainruntimemissing").await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let state = test_state_with_config(pool.clone(), config);
+    assert!(state.recovery_manifest_runtime_v1().is_none());
+    let app = test_app(state);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    );
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        post_json(
+            &request_app,
+            "/chainruntimemissing/invoice",
+            json!({"amount_sat": 1_000}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), hook.wait_until_reached())
+        .await
+        .expect("chain offer did not reach its recovery gate");
+    let mutation_at_gate = m11_creation_mutation_snapshot(&pool).await;
+    let provider_calls_at_gate = provider_calls.load(Ordering::SeqCst);
+    assert_eq!(mutation_at_gate.key_allocations, 1);
+    assert_eq!(mutation_at_gate.chain_swaps, 0);
+    assert_eq!(provider_calls_at_gate, 1);
+    hook.release();
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("runtime-refused checkout did not finish")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lightning_pr"], "");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert_eq!(
+        m11_creation_mutation_snapshot(&pool).await,
+        mutation_at_gate
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        provider_calls_at_gate
+    );
+
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_offer_permit_contention_refuses_before_key_or_provider_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    seed_chain_offer_checkout_surface(&pool, "chainpermitbusy").await;
+    let runtime = test_recovery_manifest_runtime();
+    let held_permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
+        .await
+        .expect("hold competing chain-creation permit");
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(runtime);
+    let app = test_app(state);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ChainOfferBeforeRecoveryGate,
+    );
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        post_json(
+            &request_app,
+            "/chainpermitbusy/invoice",
+            json!({"amount_sat": 1_000}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), hook.wait_until_reached())
+        .await
+        .expect("chain offer did not reach its permit gate");
+    let mutation_at_gate = m11_creation_mutation_snapshot(&pool).await;
+    let provider_calls_at_gate = provider_calls.load(Ordering::SeqCst);
+    assert_eq!(mutation_at_gate.key_allocations, 1);
+    assert_eq!(mutation_at_gate.chain_swaps, 0);
+    assert_eq!(provider_calls_at_gate, 1);
+    hook.release();
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("permit-refused checkout did not finish")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lightning_pr"], "");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert_eq!(
+        m11_creation_mutation_snapshot(&pool).await,
+        mutation_at_gate
+    );
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        provider_calls_at_gate
+    );
+
+    held_permit
+        .release()
+        .await
+        .expect("release competing chain-creation permit");
+    provider_task.abort();
+    let _ = provider_task.await;
     cleanup_db(&pool).await;
 }
 
@@ -10776,12 +11192,11 @@ async fn cancelled_invoice_records_late_boltz_settlement_once() {
     .execute(&pool)
     .await
     .unwrap();
-    let repair_epoch_micros: i64 = sqlx::query_scalar(
-        "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let repair_epoch_micros: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         pay_service::db::list_claimed_swaps_missing_lightning_event(
             &pool,
@@ -10951,8 +11366,7 @@ async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible(
     let state = test_state(pool.clone());
     state.admission.set_workers_enabled(false);
     let app = test_app(state);
-    let (npub, _, _, keypair) =
-        sign_registration_with_keypair("cancellatedirect", TEST_DESCRIPTOR);
+    let (npub, _, _, keypair) = sign_registration_with_keypair("cancellatedirect", TEST_DESCRIPTOR);
     pay_service::db::create_user(&pool, "cancellatedirect", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
@@ -15817,6 +16231,8 @@ fn manifest_delivery_envelope(byte: u8) -> EncryptedSwapManifestV1 {
 struct InstrumentedManifestObjectStore {
     inner: Arc<InMemory>,
     io_calls: AtomicUsize,
+    fail_next_put: AtomicBool,
+    conflict_next_put: AtomicBool,
     pause_next_successful_put: AtomicBool,
     put_committed: Option<Arc<Barrier>>,
     release_put: Option<Arc<Barrier>>,
@@ -15827,6 +16243,8 @@ impl InstrumentedManifestObjectStore {
         Arc::new(Self {
             inner: Arc::new(InMemory::new()),
             io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(false),
+            conflict_next_put: AtomicBool::new(false),
             pause_next_successful_put: AtomicBool::new(false),
             put_committed: None,
             release_put: None,
@@ -15840,6 +16258,8 @@ impl InstrumentedManifestObjectStore {
             Arc::new(Self {
                 inner: Arc::new(InMemory::new()),
                 io_calls: AtomicUsize::new(0),
+                fail_next_put: AtomicBool::new(false),
+                conflict_next_put: AtomicBool::new(false),
                 pause_next_successful_put: AtomicBool::new(true),
                 put_committed: Some(put_committed.clone()),
                 release_put: Some(release_put.clone()),
@@ -15847,6 +16267,30 @@ impl InstrumentedManifestObjectStore {
             put_committed,
             release_put,
         )
+    }
+
+    fn failing_first_put() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(true),
+            conflict_next_put: AtomicBool::new(false),
+            pause_next_successful_put: AtomicBool::new(false),
+            put_committed: None,
+            release_put: None,
+        })
+    }
+
+    fn conflicting_first_put() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(false),
+            conflict_next_put: AtomicBool::new(true),
+            pause_next_successful_put: AtomicBool::new(false),
+            put_committed: None,
+            release_put: None,
+        })
     }
 
     fn io_calls(&self) -> usize {
@@ -15879,6 +16323,44 @@ impl ObjectStore for InstrumentedManifestObjectStore {
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.record_io();
+        if self.fail_next_put.swap(false, Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "instrumented manifest store",
+                source: Box::new(std::io::Error::other("injected put failure")),
+            });
+        }
+        if self.conflict_next_put.swap(false, Ordering::SeqCst) {
+            let path = location.to_string();
+            let conflicting = manifest_delivery_envelope(0xfe).into_encoded();
+            let conflicting_digest = manifest_envelope_sha256(&conflicting);
+            let mut conflicting_attributes = object_store::Attributes::new();
+            conflicting_attributes.insert(
+                object_store::Attribute::ContentType,
+                "application/vnd.bullnym.chain-swap-manifest.v1+json".into(),
+            );
+            conflicting_attributes.insert(
+                object_store::Attribute::Metadata(std::borrow::Cow::Borrowed(
+                    "bullnym-manifest-format-version",
+                )),
+                "1".into(),
+            );
+            conflicting_attributes.insert(
+                object_store::Attribute::Metadata(std::borrow::Cow::Borrowed("bullnym-sha256")),
+                conflicting_digest.into(),
+            );
+            let mut conflicting_options = options;
+            conflicting_options.attributes = conflicting_attributes;
+            self.inner
+                .put_opts(location, PutPayload::from(conflicting), conflicting_options)
+                .await?;
+            return Err(object_store::Error::AlreadyExists {
+                path,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "injected create conflict",
+                )),
+            });
+        }
         let result = self.inner.put_opts(location, payload, options).await;
         if result.is_ok() && self.pause_next_successful_put.swap(false, Ordering::SeqCst) {
             self.put_committed
@@ -16084,6 +16566,199 @@ fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
         Some(expected),
         "unexpected database error: {database}"
     );
+}
+
+#[derive(Clone)]
+struct StartupRestoreProviderState {
+    records: &'static str,
+    index: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+struct StartupRestoreProviderServer {
+    base_url: String,
+    calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StartupRestoreProviderServer {
+    async fn spawn(records: &'static str, index: &'static str) -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StartupRestoreProviderState {
+            records,
+            index,
+            calls: calls.clone(),
+        };
+        let app = Router::new()
+            .route("/v2/swap/restore", post(startup_restore_provider_records))
+            .route(
+                "/v2/swap/restore/index",
+                post(startup_restore_provider_index),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{address}/v2"),
+            calls,
+            task,
+        }
+    }
+}
+
+impl Drop for StartupRestoreProviderServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn startup_restore_provider_records(
+    State(state): State<StartupRestoreProviderState>,
+) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    startup_restore_provider_response(state.records)
+}
+
+async fn startup_restore_provider_index(
+    State(state): State<StartupRestoreProviderState>,
+) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    startup_restore_provider_response(state.index)
+}
+
+fn startup_restore_provider_response(body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn startup_reconciliation_master_key() -> SwapMasterKey {
+    SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_opens_only_on_exact_empty_source_agreement() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let server = StartupRestoreProviderServer::spawn("[]", r#"{"index":-1}"#).await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    );
+    let master_key = startup_reconciliation_master_key();
+
+    let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &master_key,
+    )
+    .await
+    .unwrap();
+
+    assert!(fact.exact_agreement());
+    assert_eq!(fact.repaired_obligation_count(), 0);
+    let report = fact.report();
+    assert_eq!(report.manifest_count, 0);
+    assert_eq!(report.local.local_record_count, 0);
+    assert_eq!(report.boltz.validated_record_count, 0);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let server = StartupRestoreProviderServer::spawn(
+        include_str!("fixtures/boltz-xpub-restore-v1.json"),
+        include_str!("fixtures/boltz-xpub-restore-index-v1.json"),
+    )
+    .await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    );
+    let master_key = startup_reconciliation_master_key();
+
+    let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &master_key,
+    )
+    .await
+    .unwrap();
+
+    assert!(!fact.exact_agreement());
+    assert_eq!(fact.repaired_obligation_count(), 0);
+    let report = fact.report();
+    assert_eq!(report.manifest_count, 0);
+    assert_eq!(report.local.local_record_count, 0);
+    assert_eq!(report.boltz.chain_record_count, 1);
+    assert_eq!(report.boltz.provider_only_chain_record_count, 1);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "startuprepairthenaudit", 30_001).await;
+    let row = fixture.persist_manifestless_row(&pool).await;
+    let store = coordinator_manifest_store(InstrumentedManifestObjectStore::new());
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store);
+    let server = StartupRestoreProviderServer::spawn("[]", r#"{"index":-1}"#).await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let master_key = startup_reconciliation_master_key();
+
+    let error =
+        pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+            &pool,
+            &runtime,
+            &fetcher,
+            &master_key,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        pay_service::startup_provider_reconciliation::StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
+        "the deliberately empty provider snapshot must fail only after repair and audit"
+    );
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let deliveries = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].chain_swap_id, row.id);
+    assert_eq!(deliveries[0].delivery_state, "delivered");
+    cleanup_db(&pool).await;
 }
 
 fn assert_corrupt_manifest_envelope(
@@ -16808,6 +17483,1150 @@ async fn manifest_delivery_ledger_enforces_bounds_digest_immutability_and_delete
             .unwrap_err(),
         corrupt_manifest_id,
         corrupt_envelope,
+    );
+
+    cleanup_db(&pool).await;
+}
+
+// =====================================================================
+// #87: unwired atomic chain-swap persistence + manifest delivery.
+// =====================================================================
+
+const ATOMIC_MANIFEST_LIQUID_DESTINATION: &str = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
+const ATOMIC_MANIFEST_EMERGENCY_ADDRESS: &str =
+    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+
+fn atomic_manifest_public_key(scalar: u8) -> boltz_client::PublicKey {
+    let mut bytes = [0_u8; 32];
+    bytes[31] = scalar;
+    let secret = SecretKey::from_slice(&bytes).unwrap();
+    boltz_client::PublicKey::new(secp256k1::PublicKey::from_secret_key(
+        &Secp256k1::new(),
+        &secret,
+    ))
+}
+
+fn atomic_manifest_claim_script(
+    hashlock: bitcoin::hashes::hash160::Hash,
+    receiver: &boltz_client::PublicKey,
+) -> bitcoin::ScriptBuf {
+    use bitcoin::opcodes::all::{OP_CHECKSIG, OP_EQUALVERIFY, OP_HASH160, OP_SIZE};
+    use bitcoin::script::Builder;
+
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn atomic_manifest_refund_script(
+    sender: &boltz_client::PublicKey,
+    timeout_height: u32,
+) -> bitcoin::ScriptBuf {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::opcodes::all::{OP_CHECKSIGVERIFY, OP_CLTV};
+    use bitcoin::script::Builder;
+
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn atomic_manifest_provider_fixture(
+    boltz_swap_id: &str,
+    preimage: &boltz_client::util::secrets::Preimage,
+    claim_public_key: boltz_client::PublicKey,
+    refund_public_key: boltz_client::PublicKey,
+) -> boltz_client::swaps::boltz::CreateChainResponse {
+    use bitcoin::absolute::LockTime;
+    use boltz_client::network::{BitcoinChain, LiquidChain};
+    use boltz_client::swaps::boltz::{
+        ChainSwapDetails, CreateChainResponse, Leaf, Side, SwapTree, SwapType,
+    };
+    use boltz_client::{BtcSwapScript, LBtcSwapScript, ZKKeyPair, ZKSecp256k1};
+
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    let bitcoin_server_key = boltz_client::PublicKey::from_str(
+        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+    )
+    .unwrap();
+    let liquid_server_key = boltz_client::PublicKey::from_str(
+        "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+    )
+    .unwrap();
+    let bitcoin_timeout = 958_033;
+    let liquid_timeout = 3_972_215;
+    let bitcoin_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(atomic_manifest_claim_script(
+                preimage.hash160,
+                &bitcoin_server_key,
+            )),
+            version: 0xc0,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(atomic_manifest_refund_script(
+                &refund_public_key,
+                bitcoin_timeout,
+            )),
+            version: 0xc0,
+        },
+        covenant_claim_leaf: None,
+    };
+    let liquid_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(atomic_manifest_claim_script(
+                preimage.hash160,
+                &claim_public_key,
+            )),
+            version: 0xc4,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(atomic_manifest_refund_script(
+                &liquid_server_key,
+                liquid_timeout,
+            )),
+            version: 0xc4,
+        },
+        covenant_claim_leaf: None,
+    };
+    let bitcoin_address = BtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Lockup),
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: bitcoin_server_key,
+        locktime: LockTime::from_consensus(bitcoin_timeout),
+        sender_pubkey: refund_public_key,
+    }
+    .to_address(BitcoinChain::Bitcoin)
+    .unwrap()
+    .to_string();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let liquid_address = LBtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Claim),
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+        sender_pubkey: liquid_server_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+
+    CreateChainResponse {
+        id: boltz_swap_id.to_owned(),
+        claim_details: ChainSwapDetails {
+            swap_tree: liquid_tree,
+            lockup_address: liquid_address,
+            server_public_key: liquid_server_key,
+            timeout_block_height: liquid_timeout,
+            amount: 25_000,
+            blinding_key: Some(BLINDING_KEY.into()),
+            refund_address: None,
+            claim_address: None,
+            bip21: None,
+        },
+        lockup_details: ChainSwapDetails {
+            swap_tree: bitcoin_tree,
+            lockup_address: bitcoin_address,
+            server_public_key: bitcoin_server_key,
+            timeout_block_height: bitcoin_timeout,
+            amount: 25_431,
+            blinding_key: None,
+            refund_address: None,
+            claim_address: None,
+            bip21: Some("bitcoin:provider-evidence-only?amount=999".into()),
+        },
+    }
+}
+
+fn atomic_manifest_sort_json(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries: Vec<_> = object.into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                sorted.insert(key, atomic_manifest_sort_json(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(atomic_manifest_sort_json).collect())
+        }
+        scalar => scalar,
+    }
+}
+
+fn atomic_manifest_canonical_json<T: serde::Serialize>(value: &T) -> String {
+    let value = serde_json::to_value(value).unwrap();
+    serde_json::to_string(&atomic_manifest_sort_json(value)).unwrap()
+}
+
+fn atomic_manifest_leaf_sha256(leaf: &boltz_client::swaps::boltz::Leaf) -> String {
+    hex::encode(Sha256::digest(hex::decode(&leaf.output).unwrap()))
+}
+
+struct AtomicManifestPersistenceFixture {
+    invoice_id: uuid::Uuid,
+    nym: String,
+    boltz_swap_id: String,
+    lockup_address: String,
+    lockup_bip21: String,
+    canonical_provider_response: String,
+    preimage_hex: String,
+    claim_key_hex: String,
+    refund_key_hex: String,
+    root_fingerprint: String,
+    claim_child_index: i64,
+    refund_child_index: i64,
+    claim_allocation_id: uuid::Uuid,
+    refund_allocation_id: uuid::Uuid,
+    claim_public_key_hex: String,
+    refund_public_key_hex: String,
+    preimage_hash_hex: String,
+    creation_terms: pay_service::db::ChainSwapCreationTerms,
+    policy: pay_service::swap_manifest::MerchantPolicyReferencesV1,
+    encryption_key: [u8; 32],
+    signing_key: Keypair,
+    pinned_signer: secp256k1::XOnlyPublicKey,
+}
+
+impl AtomicManifestPersistenceFixture {
+    async fn seed(pool: &PgPool, nym: &str, child_index: i64) -> Self {
+        let npub = hex::encode(Sha256::digest(nym.as_bytes()));
+        pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+            .await
+            .unwrap();
+        let recovery_address_commitment_id = insert_test_recovery_commitment(
+            pool,
+            &npub,
+            ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
+            1,
+            0x87,
+        )
+        .await;
+        let invoice =
+            insert_test_invoice(pool, nym, &npub, &format!("lq1atomic{nym}"), 3_600).await;
+        let boltz_swap_id = format!("AtomicManifest{child_index}");
+        let claim_scalar = u8::try_from((child_index / 100).rem_euclid(100) + 1).unwrap();
+        let preimage = boltz_client::util::secrets::Preimage::from_str(
+            &format!("{claim_scalar:02x}").repeat(32),
+        )
+        .unwrap();
+        let claim_public_key = atomic_manifest_public_key(claim_scalar);
+        let refund_public_key = atomic_manifest_public_key(claim_scalar + 100);
+        let provider = atomic_manifest_provider_fixture(
+            &boltz_swap_id,
+            &preimage,
+            claim_public_key,
+            refund_public_key,
+        );
+        let canonical_provider_response = atomic_manifest_canonical_json(&provider);
+        let claim_public_key_hex = claim_public_key.to_string();
+        let refund_public_key_hex = refund_public_key.to_string();
+        let preimage_hash_hex = preimage.sha256.to_string();
+        let root_fingerprint = format!("{:016x}", child_index as u64);
+        let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+            pool,
+            &pay_service::db::NewSwapKeyAllocation {
+                root_fingerprint: &root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                child_index,
+                purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
+        .await
+        .unwrap();
+        let refund_child_index = child_index + 1;
+        let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+            pool,
+            &pay_service::db::NewSwapKeyAllocation {
+                root_fingerprint: &root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                child_index: refund_child_index,
+                purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+                public_key_hex: &refund_public_key_hex,
+                preimage_hash_hex: None,
+            },
+        )
+        .await
+        .unwrap();
+        let pinned_pair_hash = "22".repeat(32);
+        let creation_terms = pay_service::db::ChainSwapCreationTerms {
+            pinned_pair_hash: pinned_pair_hash.clone(),
+            canonical_pair_quote_json: format!(r#"{{"hash":"{pinned_pair_hash}","rate":1}}"#),
+            creation_response_sha256: hex::encode(Sha256::digest(
+                canonical_provider_response.as_bytes(),
+            )),
+            btc_claim_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.lockup_details.swap_tree.claim_leaf,
+            ),
+            btc_refund_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.lockup_details.swap_tree.refund_leaf,
+            ),
+            liquid_claim_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.claim_details.swap_tree.claim_leaf,
+            ),
+            liquid_refund_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.claim_details.swap_tree.refund_leaf,
+            ),
+            btc_timeout_height: i64::from(provider.lockup_details.timeout_block_height),
+            liquid_timeout_height: i64::from(provider.claim_details.timeout_block_height),
+            btc_network: "bitcoin".into(),
+            liquid_network: "liquid".into(),
+            liquid_asset_id: boltz_client::elements::AssetId::LIQUID_BTC.to_string(),
+            merchant_liquid_destination: ATOMIC_MANIFEST_LIQUID_DESTINATION.into(),
+            merchant_emergency_btc_address: Some(ATOMIC_MANIFEST_EMERGENCY_ADDRESS.into()),
+            recovery_address_commitment_id: Some(recovery_address_commitment_id),
+        };
+        let signing_key = Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&[0x11; 32]).unwrap(),
+        );
+        let pinned_signer = signing_key.x_only_public_key().0;
+        let lockup_address = provider.lockup_details.lockup_address;
+        let lockup_bip21 =
+            format!("bitcoin:{lockup_address}?amount=0.00025431&label=Send%20to%20L-BTC%20address");
+
+        Self {
+            invoice_id: invoice.id,
+            nym: nym.into(),
+            boltz_swap_id,
+            lockup_address,
+            lockup_bip21,
+            canonical_provider_response,
+            preimage_hex: "aa".repeat(32),
+            claim_key_hex: "bb".repeat(32),
+            refund_key_hex: "cc".repeat(32),
+            root_fingerprint,
+            claim_child_index: child_index,
+            refund_child_index,
+            claim_allocation_id,
+            refund_allocation_id,
+            claim_public_key_hex,
+            refund_public_key_hex,
+            preimage_hash_hex,
+            creation_terms,
+            policy: pay_service::swap_manifest::MerchantPolicyReferencesV1::new(
+                invoice.id,
+                nym,
+                ATOMIC_MANIFEST_LIQUID_DESTINATION,
+                Some((
+                    recovery_address_commitment_id,
+                    ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
+                )),
+            ),
+            encryption_key: [0x42; 32],
+            signing_key,
+            pinned_signer,
+        }
+    }
+
+    async fn persist(
+        &self,
+        pool: &PgPool,
+        store: &RecoveryManifestStore,
+        manifest_id: uuid::Uuid,
+        policy: Option<&pay_service::swap_manifest::MerchantPolicyReferencesV1>,
+    ) -> Result<
+        pay_service::db::ChainSwapRecord,
+        pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
+    > {
+        let swap = pay_service::db::NewChainSwapRecord {
+            invoice_id: self.invoice_id,
+            nym: Some(&self.nym),
+            boltz_swap_id: &self.boltz_swap_id,
+            lockup_address: &self.lockup_address,
+            lockup_bip21: Some(&self.lockup_bip21),
+            user_lock_amount_sat: 25_431,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: &self.preimage_hex,
+            claim_key_hex: &self.claim_key_hex,
+            refund_key_hex: &self.refund_key_hex,
+            boltz_response_json: &self.canonical_provider_response,
+            claim_key_index: Some(self.claim_child_index),
+            refund_key_index: Some(self.refund_child_index),
+            root_fingerprint: Some(&self.root_fingerprint),
+        };
+        let lineage = pay_service::db::ChainSwapLineage {
+            claim_allocation_id: self.claim_allocation_id,
+            refund_allocation_id: self.refund_allocation_id,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &self.claim_public_key_hex,
+            refund_public_key_hex: &self.refund_public_key_hex,
+            preimage_hash_hex: &self.preimage_hash_hex,
+        };
+        let terms = &self.creation_terms;
+        let creation_terms = pay_service::db::NewChainSwapCreationTerms {
+            pinned_pair_hash: &terms.pinned_pair_hash,
+            canonical_pair_quote_json: &terms.canonical_pair_quote_json,
+            creation_response_sha256: &terms.creation_response_sha256,
+            btc_claim_script_sha256: &terms.btc_claim_script_sha256,
+            btc_refund_script_sha256: &terms.btc_refund_script_sha256,
+            liquid_claim_script_sha256: &terms.liquid_claim_script_sha256,
+            liquid_refund_script_sha256: &terms.liquid_refund_script_sha256,
+            btc_timeout_height: terms.btc_timeout_height,
+            liquid_timeout_height: terms.liquid_timeout_height,
+            btc_network: &terms.btc_network,
+            liquid_network: &terms.liquid_network,
+            liquid_asset_id: &terms.liquid_asset_id,
+            merchant_liquid_destination: &terms.merchant_liquid_destination,
+            merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
+        };
+        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap(
+            pool,
+            store,
+            pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapRequest {
+                swap: &swap,
+                lineage: &lineage,
+                creation_terms: &creation_terms,
+                manifest_id,
+                merchant_policy: policy.unwrap_or(&self.policy),
+                crypto: pay_service::swap_manifest_staging::ManifestStagingCrypto::new(
+                    "manifest-key-atomic-test",
+                    &self.encryption_key,
+                    &self.signing_key,
+                    &self.pinned_signer,
+                ),
+            },
+        )
+        .await
+    }
+
+    async fn persist_manifestless_row(&self, pool: &PgPool) -> pay_service::db::ChainSwapRecord {
+        let terms = &self.creation_terms;
+        pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+            pool,
+            &pay_service::db::NewChainSwapRecord {
+                invoice_id: self.invoice_id,
+                nym: Some(&self.nym),
+                boltz_swap_id: &self.boltz_swap_id,
+                lockup_address: &self.lockup_address,
+                lockup_bip21: Some(&self.lockup_bip21),
+                user_lock_amount_sat: 25_431,
+                server_lock_amount_sat: 25_000,
+                preimage_hex: &self.preimage_hex,
+                claim_key_hex: &self.claim_key_hex,
+                refund_key_hex: &self.refund_key_hex,
+                boltz_response_json: &self.canonical_provider_response,
+                claim_key_index: Some(self.claim_child_index),
+                refund_key_index: Some(self.refund_child_index),
+                root_fingerprint: Some(&self.root_fingerprint),
+            },
+            &pay_service::db::ChainSwapLineage {
+                claim_allocation_id: self.claim_allocation_id,
+                refund_allocation_id: self.refund_allocation_id,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                claim_public_key_hex: &self.claim_public_key_hex,
+                refund_public_key_hex: &self.refund_public_key_hex,
+                preimage_hash_hex: &self.preimage_hash_hex,
+            },
+            &pay_service::db::NewChainSwapCreationEvidence {
+                creation_terms: pay_service::db::NewChainSwapCreationTerms {
+                    pinned_pair_hash: &terms.pinned_pair_hash,
+                    canonical_pair_quote_json: &terms.canonical_pair_quote_json,
+                    creation_response_sha256: &terms.creation_response_sha256,
+                    btc_claim_script_sha256: &terms.btc_claim_script_sha256,
+                    btc_refund_script_sha256: &terms.btc_refund_script_sha256,
+                    liquid_claim_script_sha256: &terms.liquid_claim_script_sha256,
+                    liquid_refund_script_sha256: &terms.liquid_refund_script_sha256,
+                    btc_timeout_height: terms.btc_timeout_height,
+                    liquid_timeout_height: terms.liquid_timeout_height,
+                    btc_network: &terms.btc_network,
+                    liquid_network: &terms.liquid_network,
+                    liquid_asset_id: &terms.liquid_asset_id,
+                    merchant_liquid_destination: &terms.merchant_liquid_destination,
+                    merchant_emergency_btc_address: terms
+                        .merchant_emergency_btc_address
+                        .as_deref(),
+                },
+                recovery_address_commitment_id: terms.recovery_address_commitment_id,
+            },
+        )
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicmanifestok", 10_001).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+
+    let persisted = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap();
+    let delivery = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.chain_swap_id, persisted.id);
+    assert_eq!(delivery.delivery_state, "delivered");
+    assert!(delivery.delivered_at_unix.is_some());
+    assert_eq!(delivery.manifest_sequence, 1);
+    assert_eq!(delivery.previous_manifest_id, None);
+    assert_eq!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            fixture.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .map(|row| row.id),
+        Some(persisted.id),
+        "the payer address stayed hidden after exact durable manifest delivery"
+    );
+    let object_id = ManifestObjectId::new(persisted.id, manifest_id).unwrap();
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        delivery.encrypted_envelope().encoded()
+    );
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::NoPending
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permit_repairs_manifestless_row_and_requires_a_fresh_creation_attempt() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "repairmanifestlessok", 20_001).await;
+    let row = fixture.persist_manifestless_row(&pool).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store.clone());
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted,
+        "the repair attempt must never return a new provider-creation permit"
+    );
+    let audit = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    let delivery = &audit[0];
+    assert_eq!(delivery.chain_swap_id, row.id);
+    assert_eq!(delivery.manifest_sequence, 1);
+    assert_eq!(delivery.previous_manifest_id, None);
+    assert_eq!(delivery.delivery_state, "delivered");
+    let object_id = ManifestObjectId::new(row.id, delivery.manifest_id).unwrap();
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        delivery.encrypted_envelope().encoded(),
+        "the repaired object must pass the production read-verification path"
+    );
+    assert_eq!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            fixture.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .map(|candidate| candidate.id),
+        Some(row.id)
+    );
+
+    let permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
+        .await
+        .expect("a later clean attempt may receive the creation permit");
+    permit.release().await.unwrap();
+    assert_eq!(
+        pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "repeat acquisition must not append another manifest"
+    );
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permit_repair_store_failure_retains_row_and_resumes_one_committed_identity() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "repairmanifeststorefail", 20_101).await;
+    let row = fixture.persist_manifestless_row(&pool).await;
+    let backend = InstrumentedManifestObjectStore::failing_first_put();
+    let store = coordinator_manifest_store(backend);
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store.clone());
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairFailed
+    );
+    let retained = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .expect("canonical provider row must survive store failure");
+    assert_eq!(retained.boltz_response_json, row.boltz_response_json);
+    assert_eq!(retained.status, "pending");
+    let pending = pay_service::db::list_pending_manifest_deliveries(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].chain_swap_id, row.id);
+    let committed_manifest_id = pending[0].manifest_id;
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted,
+        "resuming the pending repair must not return a creation permit"
+    );
+    let audit = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].manifest_id, committed_manifest_id);
+    assert_eq!(audit[0].delivery_state, "delivered");
+    let object_id = ManifestObjectId::new(row.id, committed_manifest_id).unwrap();
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        audit[0].encrypted_envelope().encoded()
+    );
+
+    let permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
+        .await
+        .expect("only the clean post-repair attempt receives a permit");
+    permit.release().await.unwrap();
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permit_repairs_multiple_rows_in_oldest_canonical_order() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let newer_fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "repairmanifestnewer", 20_201).await;
+    let newer = newer_fixture.persist_manifestless_row(&pool).await;
+    let older_fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "repairmanifestolder", 20_301).await;
+    let older = older_fixture.persist_manifestless_row(&pool).await;
+    sqlx::query("UPDATE chain_swap_records SET created_at = '2026-02-02T00:00:00Z' WHERE id = $1")
+        .bind(newer.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chain_swap_records SET created_at = '2026-02-01T00:00:00Z' WHERE id = $1")
+        .bind(older.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store);
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted
+    );
+    let first = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].chain_swap_id, older.id);
+    assert_eq!(first[0].manifest_sequence, 1);
+
+    assert_eq!(
+        ChainSwapCreationPermit::acquire(&pool, &runtime)
+            .await
+            .unwrap_err(),
+        ChainSwapCreationPermitError::ManifestRepairCompleted
+    );
+    let both = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2);
+    assert_eq!(both[0].chain_swap_id, older.id);
+    assert_eq!(both[1].chain_swap_id, newer.id);
+    assert_eq!(both[1].manifest_sequence, 2);
+    assert_eq!(both[1].previous_manifest_id, Some(both[0].manifest_id));
+
+    let permit = ChainSwapCreationPermit::acquire(&pool, &runtime)
+        .await
+        .expect("all older obligations are repaired");
+    permit.release().await.unwrap();
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn post_provider_staging_failure_retains_canonical_pending_swap_and_withholds_payer_address()
+{
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicstagebad", 10_101).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend.clone());
+    let mut wrong_policy = fixture.policy.clone();
+    wrong_policy.merchant_nym = "different-merchant".into();
+
+    // Model the real create_bitcoin_chain_offer boundary: the provider has
+    // already created the remote swap and returned its one canonical response,
+    // but a later manifest-staging check refuses the payer instruction.
+    let staging_error = fixture
+        .persist(&pool, &store, uuid::Uuid::new_v4(), Some(&wrong_policy))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        staging_error,
+        PersistAndDeliverChainSwapError::ManifestStagingFailed
+    );
+    let retained = pay_service::db::get_chain_swap_by_boltz_id(&pool, &fixture.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("post-provider staging failure erased the canonical swap record");
+    assert_eq!(retained.invoice_id, fixture.invoice_id);
+    assert_eq!(retained.nym.as_deref(), Some(fixture.nym.as_str()));
+    assert_eq!(retained.lockup_address, fixture.lockup_address);
+    assert_eq!(
+        retained.lockup_bip21.as_deref(),
+        Some(fixture.lockup_bip21.as_str())
+    );
+    assert_eq!(
+        retained.boltz_response_json,
+        fixture.canonical_provider_response
+    );
+    assert_eq!(retained.preimage_hex, fixture.preimage_hex);
+    assert_eq!(retained.claim_key_hex, fixture.claim_key_hex);
+    assert_eq!(retained.refund_key_hex, fixture.refund_key_hex);
+    assert_eq!(
+        retained.creation_terms.as_ref(),
+        Some(&fixture.creation_terms)
+    );
+    assert_eq!(retained.status, "pending");
+    let evidence = pay_service::db::load_manifest_staging_evidence(&pool, retained.id)
+        .await
+        .unwrap()
+        .expect("retained provider record lost its recoverable public lineage");
+    assert_eq!(
+        evidence.persisted_lineage.claim.allocation_id,
+        fixture.claim_allocation_id
+    );
+    assert_eq!(
+        evidence.persisted_lineage.refund.allocation_id,
+        fixture.refund_allocation_id
+    );
+
+    // The row remains an internal pending obligation, but public invoice reads
+    // cannot expose its payer address until a delivered manifest exists.
+    assert_eq!(
+        pay_service::db::latest_payable_chain_swap_for_invoice(&pool, fixture.invoice_id, 25_000,)
+            .await
+            .unwrap()
+            .map(|row| row.id),
+        Some(retained.id)
+    );
+    assert!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            fixture.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "an undelivered recovery manifest exposed the payer address"
+    );
+    let npub = hex::encode(Sha256::digest(fixture.nym.as_bytes()));
+    match pay_service::db::purge_user(&pool, &npub).await.unwrap() {
+        pay_service::db::PurgeOutcome::InFlightSwaps(1) => {}
+        _ => panic!("the retained pending chain swap did not block destructive purge"),
+    }
+    assert!(pay_service::db::list_pending_manifest_deliveries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(backend.io_calls(), 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_persistence_retains_canonical_row_on_ledger_failure() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    let retained_manifest_id = uuid::Uuid::new_v4();
+    let first = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerfirst", 10_201).await;
+    first
+        .persist(&pool, &store, retained_manifest_id, None)
+        .await
+        .unwrap();
+    let intermediate =
+        AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbetween", 10_301).await;
+    intermediate
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap();
+    let rejected = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbad", 10_401).await;
+    let ledger_error = rejected
+        .persist(&pool, &store, retained_manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        ledger_error,
+        PersistAndDeliverChainSwapError::ManifestLedgerInsertFailed
+    );
+    let retained = pay_service::db::get_chain_swap_by_boltz_id(&pool, &rejected.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("ledger failure erased the canonical provider-created swap");
+    assert_eq!(retained.status, "pending");
+    assert!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            rejected.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_manifest_deliveries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_count, 2);
+
+    let duplicate_error = first
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        duplicate_error,
+        PersistAndDeliverChainSwapError::ChainSwapPersistenceFailed
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        3
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_pending_barrier_blocks_concurrent_swap_and_success_waits_for_storage() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let first =
+        Arc::new(AtomicManifestPersistenceFixture::seed(&pool, "atomicblockedone", 10_301).await);
+    let second = AtomicManifestPersistenceFixture::seed(&pool, "atomicblockedtwo", 10_401).await;
+    let first_manifest_id = uuid::Uuid::new_v4();
+    let (backend, put_committed, release_put) =
+        InstrumentedManifestObjectStore::pausing_after_first_put();
+    let store = coordinator_manifest_store(backend);
+    let task_pool = pool.clone();
+    let task_store = store.clone();
+    let task_fixture = first.clone();
+    let first_attempt = tokio::spawn(async move {
+        task_fixture
+            .persist(&task_pool, &task_store, first_manifest_id, None)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), put_committed.wait())
+        .await
+        .expect("atomic persistence did not reach its post-create barrier");
+    assert!(
+        !first_attempt.is_finished(),
+        "a committed object is not success until read verification and acknowledgement"
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, first_manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert!(
+        pay_service::db::get_chain_swap_by_boltz_id(&pool, &first.boltz_swap_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "canonical swap and pending ledger row must exist before off-host I/O"
+    );
+
+    let blocked = second
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        blocked,
+        PersistAndDeliverChainSwapError::PendingManifestDelivery
+    );
+    let blocked_record = pay_service::db::get_chain_swap_by_boltz_id(&pool, &second.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("the pending-manifest barrier erased a second provider-created swap");
+    assert_eq!(blocked_record.status, "pending");
+    assert!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            second.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the blocked provider-created swap leaked a payer instruction"
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), release_put.wait())
+        .await
+        .expect("atomic persistence did not leave its post-create barrier");
+    let completed = tokio::time::timeout(Duration::from_secs(30), first_attempt)
+        .await
+        .expect("atomic persistence did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.boltz_swap_id, first.boltz_swap_id);
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, first_manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "delivered"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_storage_failure_commits_one_pending_row_and_resumes_exactly() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicstorefail", 10_501).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::failing_first_put();
+    let store = coordinator_manifest_store(backend);
+
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let public_error = format!("{error:?} {error}");
+    for forbidden in [
+        fixture.preimage_hex.as_str(),
+        fixture.claim_key_hex.as_str(),
+        fixture.refund_key_hex.as_str(),
+        fixture.canonical_provider_response.as_str(),
+        "injected put failure",
+    ] {
+        assert!(!public_error.contains(forbidden));
+    }
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM chain_swap_manifest_deliveries WHERE delivery_state = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: pending.identity(),
+            storage_outcome: ManifestWriteOutcome::Created,
+        }
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_storage_conflict_never_acknowledges_or_returns_swap() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "atomicstoreconflict", 10_601).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::conflicting_first_put();
+    let store = coordinator_manifest_store(backend);
+
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    let retry_error = resume_pending_manifest_delivery(&pool, &store)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            retry_error,
+            ManifestDeliveryCoordinatorError::StorageConflict { .. }
+        ),
+        "unexpected retry error: {retry_error:?}"
+    );
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "pending"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_ack_failure_retries_read_verified_object_as_already_present() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS bullnym_test_reject_manifest_ack ON chain_swap_manifest_deliveries",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS bullnym_test_reject_manifest_ack()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION bullnym_test_reject_manifest_ack() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+             IF OLD.delivery_state = 'pending' AND NEW.delivery_state = 'delivered' THEN \
+                 RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'injected ack failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER bullnym_test_reject_manifest_ack \
+         BEFORE UPDATE ON chain_swap_manifest_deliveries \
+         FOR EACH ROW EXECUTE FUNCTION bullnym_test_reject_manifest_ack()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicackretry", 10_701).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert_eq!(
+        store
+            .get_v1(ManifestObjectId::new(pending.chain_swap_id, manifest_id).unwrap())
+            .await
+            .unwrap()
+            .encoded(),
+        pending.encrypted_envelope().encoded()
+    );
+
+    sqlx::query("DROP TRIGGER bullnym_test_reject_manifest_ack ON chain_swap_manifest_deliveries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION bullnym_test_reject_manifest_ack()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: pending.identity(),
+            storage_outcome: ManifestWriteOutcome::AlreadyPresent,
+        }
     );
 
     cleanup_db(&pool).await;
@@ -17670,7 +19489,8 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
-    let state = test_state_with_config(pool.clone(), config);
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
 
     let returned = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
@@ -17730,7 +19550,8 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .await;
     let mut first_config = test_config();
     first_config.boltz.api_url = first_provider.base_url.clone();
-    let first_state = test_state_with_config(pool.clone(), first_config);
+    let mut first_state = test_state_with_config(pool.clone(), first_config);
+    first_state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &first_state,
         Some(nym),
@@ -17773,7 +19594,8 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .await;
     let mut second_config = test_config();
     second_config.boltz.api_url = second_provider.base_url.clone();
-    let second_state = test_state_with_config(pool.clone(), second_config);
+    let mut second_state = test_state_with_config(pool.clone(), second_config);
+    second_state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &second_state,
         Some(nym),
@@ -18648,5 +20470,616 @@ async fn recovery_address_commitment_concurrent_rotations_are_contiguous_and_imm
         .unwrap();
     assert_eq!(still_current, rotations[1]);
 
+    cleanup_db(&pool).await;
+}
+// #87: invoice route -> atomic persistence + synchronous delivery.
+// =====================================================================
+
+#[derive(Clone, Copy)]
+enum InvoiceRouteManifestStoreMode {
+    Durable,
+    RejectWrites,
+}
+
+#[derive(Clone)]
+struct InvoiceRouteStoredManifest {
+    body: Vec<u8>,
+    content_type: String,
+    format_version: String,
+    sha256: String,
+}
+
+#[derive(Clone)]
+struct InvoiceRouteManifestStoreState {
+    mode: InvoiceRouteManifestStoreMode,
+    objects: Arc<Mutex<HashMap<String, InvoiceRouteStoredManifest>>>,
+    put_calls: Arc<AtomicUsize>,
+}
+
+struct InvoiceRouteManifestStoreFixture {
+    endpoint: String,
+    put_calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InvoiceRouteManifestStoreFixture {
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+fn invoice_route_s3_response(status: StatusCode, body: impl Into<Body>) -> Response {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response
+}
+
+fn invoice_route_s3_object_response(object: &InvoiceRouteStoredManifest, head: bool) -> Response {
+    let mut response = invoice_route_s3_response(
+        StatusCode::OK,
+        if head {
+            Body::empty()
+        } else {
+            Body::from(object.body.clone())
+        },
+    );
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-length",
+        object.body.len().to_string().parse().unwrap(),
+    );
+    headers.insert("content-type", object.content_type.parse().unwrap());
+    headers.insert("etag", "\"invoice-route-manifest-etag\"".parse().unwrap());
+    headers.insert(
+        "last-modified",
+        "Mon, 13 Jul 2026 12:00:00 GMT".parse().unwrap(),
+    );
+    headers.insert(
+        "x-amz-meta-bullnym-manifest-format-version",
+        object.format_version.parse().unwrap(),
+    );
+    headers.insert("x-amz-meta-bullnym-sha256", object.sha256.parse().unwrap());
+    response
+}
+
+async fn invoice_route_s3_handler(
+    axum::extract::State(state): axum::extract::State<InvoiceRouteManifestStoreState>,
+    request: Request<Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let key = parts.uri.path().to_owned();
+    match parts.method {
+        Method::PUT => {
+            state.put_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(state.mode, InvoiceRouteManifestStoreMode::RejectWrites) {
+                let mut response = invoice_route_s3_response(
+                    StatusCode::FORBIDDEN,
+                    Body::from("<Error><Code>AccessDenied</Code></Error>"),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-type", "application/xml".parse().unwrap());
+                return response;
+            }
+
+            let format_version = parts
+                .headers
+                .get("x-amz-meta-bullnym-manifest-format-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let sha256 = parts
+                .headers
+                .get("x-amz-meta-bullnym-sha256")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let content_type = parts
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let body = match body.collect().await {
+                Ok(body) => body.to_bytes().to_vec(),
+                Err(_) => return invoice_route_s3_response(StatusCode::BAD_REQUEST, Body::empty()),
+            };
+            state.objects.lock().await.insert(
+                key,
+                InvoiceRouteStoredManifest {
+                    body,
+                    content_type,
+                    format_version,
+                    sha256,
+                },
+            );
+            let mut response = invoice_route_s3_response(StatusCode::OK, Body::empty());
+            response
+                .headers_mut()
+                .insert("etag", "\"invoice-route-manifest-etag\"".parse().unwrap());
+            response
+        }
+        Method::GET | Method::HEAD => {
+            let object = state.objects.lock().await.get(&key).cloned();
+            match object {
+                Some(object) => {
+                    invoice_route_s3_object_response(&object, parts.method == Method::HEAD)
+                }
+                None => {
+                    let mut response = invoice_route_s3_response(
+                        StatusCode::NOT_FOUND,
+                        Body::from("<Error><Code>NoSuchKey</Code></Error>"),
+                    );
+                    response
+                        .headers_mut()
+                        .insert("content-type", "application/xml".parse().unwrap());
+                    response
+                }
+            }
+        }
+        _ => invoice_route_s3_response(StatusCode::METHOD_NOT_ALLOWED, Body::empty()),
+    }
+}
+
+async fn spawn_invoice_route_manifest_store(
+    mode: InvoiceRouteManifestStoreMode,
+) -> InvoiceRouteManifestStoreFixture {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let put_calls = Arc::new(AtomicUsize::new(0));
+    let state = InvoiceRouteManifestStoreState {
+        mode,
+        objects: Arc::new(Mutex::new(HashMap::new())),
+        put_calls: put_calls.clone(),
+    };
+    let app = Router::new()
+        .fallback(any(invoice_route_s3_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    InvoiceRouteManifestStoreFixture {
+        endpoint: format!("http://{address}"),
+        put_calls,
+        task,
+    }
+}
+
+#[derive(Clone)]
+struct InvoiceRouteBoltzState {
+    chain_response: Value,
+    chain_calls: Arc<AtomicUsize>,
+}
+
+struct InvoiceRouteBoltzFixture {
+    base_url: String,
+    chain_calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InvoiceRouteBoltzFixture {
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+async fn invoice_route_chain_pair(
+    axum::extract::State(state): axum::extract::State<InvoiceRouteBoltzState>,
+) -> axum::Json<Value> {
+    state.chain_calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(json!({
+        "BTC": {
+            "L-BTC": {
+                "hash": "014261b046f2045ddedd49fe291e0255afe002454c65a5aa7d6457a35cd32f19",
+                "rate": 1.0,
+                "limits": {
+                    "maximal": 25_000_000,
+                    "minimal": 25_000,
+                    "maximalZeroConf": 0
+                },
+                "fees": {
+                    "percentage": 0.1,
+                    "minerFees": {
+                        "server": 405,
+                        "user": {"claim": 20, "lockup": 385}
+                    }
+                }
+            }
+        },
+        "L-BTC": {}
+    }))
+}
+
+async fn invoice_route_chain_heights(
+    axum::extract::State(state): axum::extract::State<InvoiceRouteBoltzState>,
+) -> axum::Json<Value> {
+    state.chain_calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(json!({"BTC": 957_817, "L-BTC": 3_970_775}))
+}
+
+async fn invoice_route_create_chain(
+    axum::extract::State(state): axum::extract::State<InvoiceRouteBoltzState>,
+    axum::Json(_request): axum::Json<Value>,
+) -> axum::Json<Value> {
+    state.chain_calls.fetch_add(1, Ordering::SeqCst);
+    axum::Json(state.chain_response)
+}
+
+async fn invoice_route_reject_reverse() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        axum::Json(json!({"error": "fixture"})),
+    )
+        .into_response()
+}
+
+async fn spawn_invoice_route_boltz(
+    response: &boltz_client::swaps::boltz::CreateChainResponse,
+) -> InvoiceRouteBoltzFixture {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let chain_calls = Arc::new(AtomicUsize::new(0));
+    let state = InvoiceRouteBoltzState {
+        chain_response: serde_json::to_value(response).unwrap(),
+        chain_calls: chain_calls.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/swap/chain",
+            get(invoice_route_chain_pair).post(invoice_route_create_chain),
+        )
+        .route("/chain/heights", get(invoice_route_chain_heights))
+        .route("/swap/reverse", post(invoice_route_reject_reverse))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    InvoiceRouteBoltzFixture {
+        base_url: format!("http://{address}"),
+        chain_calls,
+        task,
+    }
+}
+
+fn invoice_route_chain_response(
+    boltz_swap_id: &str,
+    claim_child_index: u64,
+    refund_child_index: u64,
+) -> boltz_client::swaps::boltz::CreateChainResponse {
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(claim_child_index).unwrap();
+    let refund_keypair = master.derive_swapkey(refund_child_index).unwrap();
+    let preimage = boltz_client::util::secrets::Preimage::from_swap_key(&claim_keypair);
+    atomic_manifest_provider_fixture(
+        boltz_swap_id,
+        &preimage,
+        boltz_client::PublicKey::new(claim_keypair.public_key()),
+        boltz_client::PublicKey::new(refund_keypair.public_key()),
+    )
+}
+
+fn invoice_route_manifest_runtime(
+    endpoint: &str,
+) -> Arc<pay_service::swap_manifest_runtime::RecoveryManifestRuntimeV1> {
+    use pay_service::swap_manifest_runtime as runtime;
+
+    let signing_secret = SecretKey::from_slice(&[0x61; 32]).unwrap();
+    let signing_keypair = Keypair::from_secret_key(&Secp256k1::new(), &signing_secret);
+    let values = HashMap::from([
+        (runtime::S3_ENDPOINT_ENV.to_owned(), endpoint.to_owned()),
+        (runtime::S3_REGION_ENV.to_owned(), "us-east-1".to_owned()),
+        (
+            runtime::S3_BUCKET_ENV.to_owned(),
+            "bullnym-invoice-route".to_owned(),
+        ),
+        (
+            runtime::S3_PREFIX_ENV.to_owned(),
+            "invoice-route".to_owned(),
+        ),
+        (runtime::S3_PATH_STYLE_ENV.to_owned(), "true".to_owned()),
+        (runtime::S3_ALLOW_HTTP_ENV.to_owned(), "true".to_owned()),
+        (
+            runtime::S3_ACCESS_KEY_ID_ENV.to_owned(),
+            "invoice-route-access".to_owned(),
+        ),
+        (
+            runtime::S3_SECRET_ACCESS_KEY_ENV.to_owned(),
+            "invoice-route-secret".to_owned(),
+        ),
+        (
+            runtime::ENCRYPTION_KEY_ID_ENV.to_owned(),
+            "invoice-route-key-v1".to_owned(),
+        ),
+        (
+            runtime::ENCRYPTION_KEY_HEX_ENV.to_owned(),
+            hex::encode([0x51; 32]),
+        ),
+        (
+            runtime::SIGNING_SECRET_KEY_HEX_ENV.to_owned(),
+            hex::encode(signing_secret.secret_bytes()),
+        ),
+        (
+            runtime::EXPECTED_SIGNER_XONLY_HEX_ENV.to_owned(),
+            signing_keypair.x_only_public_key().0.to_string(),
+        ),
+    ]);
+    Arc::new(
+        runtime::RecoveryManifestRuntimeV1::from_lookup(|name| values.get(name).cloned()).unwrap(),
+    )
+}
+
+async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
+    let npub = create_test_user(pool, nym).await;
+    let recovery_address_commitment_id = insert_test_recovery_commitment(
+        pool,
+        &npub,
+        ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
+        1,
+        0x88,
+    )
+    .await;
+    pay_service::db::upsert_donation_page(
+        pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Atomic route",
+            description: "Atomic chain-swap route fixture",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+    recovery_address_commitment_id
+}
+
+async fn drop_invoice_route_staging_drift(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS zz_invoice_route_staging_drift ON chain_swap_records")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS invoice_route_staging_drift()")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn install_invoice_route_staging_drift(pool: &PgPool) {
+    drop_invoice_route_staging_drift(pool).await;
+    sqlx::query(
+        "CREATE FUNCTION invoice_route_staging_drift() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN NEW.nym := NEW.nym || '-persisted-drift'; RETURN NEW; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER zz_invoice_route_staging_drift \
+         BEFORE INSERT ON chain_swap_records FOR EACH ROW \
+         EXECUTE FUNCTION invoice_route_staging_drift()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn invoice_route_test_state(
+    pool: &PgPool,
+    boltz_url: &str,
+    manifest_endpoint: &str,
+) -> AppState {
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.to_owned();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(invoice_route_manifest_runtime(manifest_endpoint));
+    state
+}
+
+#[tokio::test]
+async fn invoice_chain_offer_returns_only_after_manifest_delivery() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    drop_invoice_route_staging_drift(&pool).await;
+    let nym = "invoicemanifestdelivered";
+    let recovery_address_commitment_id = seed_invoice_route_page(&pool, nym).await;
+
+    let first_child_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider_response = invoice_route_chain_response(
+        "InvoiceManifestDelivered1",
+        first_child_index + 1,
+        first_child_index + 2,
+    );
+    let expected_provider_json = atomic_manifest_canonical_json(&provider_response);
+    let expected_lockup_address = provider_response.lockup_details.lockup_address.clone();
+    let boltz = spawn_invoice_route_boltz(&provider_response).await;
+    let store = spawn_invoice_route_manifest_store(InvoiceRouteManifestStoreMode::Durable).await;
+    let state = invoice_route_test_state(&pool, &boltz.base_url, &store.endpoint).await;
+    let app = test_app(state);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({"amount_sat": 25_000}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lightning_pr"], "");
+    assert_eq!(body["bitcoin_chain_address"], expected_lockup_address);
+    let payer_bip21 = body["bitcoin_chain_bip21"].as_str().unwrap();
+    assert!(payer_bip21.starts_with(&format!(
+        "bitcoin:{}?amount=0.00025431&",
+        provider_response.lockup_details.lockup_address
+    )));
+    assert_ne!(
+        payer_bip21,
+        provider_response.lockup_details.bip21.as_deref().unwrap()
+    );
+
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestDelivered1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.nym.as_deref(), Some(nym));
+    assert_eq!(row.boltz_response_json, expected_provider_json);
+    assert_eq!(row.lockup_bip21.as_deref(), Some(payer_bip21));
+    let terms = row.creation_terms.as_ref().unwrap();
+    assert_eq!(terms.merchant_liquid_destination, body["liquid_address"]);
+    assert_eq!(
+        terms.merchant_emergency_btc_address.as_deref(),
+        Some(ATOMIC_MANIFEST_EMERGENCY_ADDRESS)
+    );
+    assert_eq!(
+        terms.recovery_address_commitment_id,
+        Some(recovery_address_commitment_id)
+    );
+
+    let audit = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert!(!audit[0].manifest_id.is_nil());
+    assert_eq!(audit[0].chain_swap_id, row.id);
+    assert_eq!(audit[0].delivery_state, "delivered");
+    assert!(audit[0].delivered_at_unix.is_some());
+    assert_eq!(store.put_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(boltz.chain_calls.load(Ordering::SeqCst), 3);
+
+    boltz.shutdown().await;
+    store.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_chain_offer_staging_failure_withholds_offer_and_retains_provider_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    install_invoice_route_staging_drift(&pool).await;
+    let nym = "invoicemanifeststagingfailure";
+    seed_invoice_route_page(&pool, nym).await;
+    // Keep the deliberate post-validation nym drift database-valid so this
+    // test reaches manifest staging after the canonical row commits.
+    create_test_user(&pool, "invoicemanifeststagingfailure-persisted-drift").await;
+
+    let first_child_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider_response = invoice_route_chain_response(
+        "InvoiceManifestStagingFailure1",
+        first_child_index + 1,
+        first_child_index + 2,
+    );
+    let expected_provider_json = atomic_manifest_canonical_json(&provider_response);
+    let boltz = spawn_invoice_route_boltz(&provider_response).await;
+    let store = spawn_invoice_route_manifest_store(InvoiceRouteManifestStoreMode::Durable).await;
+    let state = invoice_route_test_state(&pool, &boltz.base_url, &store.endpoint).await;
+    let app = test_app(state);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({"amount_sat": 25_000}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestStagingFailure1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(
+        row.nym.as_deref(),
+        Some("invoicemanifeststagingfailure-persisted-drift")
+    );
+    assert_eq!(row.boltz_response_json, expected_provider_json);
+    assert_eq!(
+        pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(store.put_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(boltz.chain_calls.load(Ordering::SeqCst), 3);
+
+    boltz.shutdown().await;
+    store.shutdown().await;
+    drop_invoice_route_staging_drift(&pool).await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_chain_offer_delivery_failure_withholds_offer_and_retains_provider_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    drop_invoice_route_staging_drift(&pool).await;
+    let nym = "invoicemanifestdeliveryfailure";
+    seed_invoice_route_page(&pool, nym).await;
+
+    let first_child_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider_response = invoice_route_chain_response(
+        "InvoiceManifestDeliveryFailure1",
+        first_child_index + 1,
+        first_child_index + 2,
+    );
+    let expected_provider_json = atomic_manifest_canonical_json(&provider_response);
+    let boltz = spawn_invoice_route_boltz(&provider_response).await;
+    let store =
+        spawn_invoice_route_manifest_store(InvoiceRouteManifestStoreMode::RejectWrites).await;
+    let state = invoice_route_test_state(&pool, &boltz.base_url, &store.endpoint).await;
+    let app = test_app(state);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({"amount_sat": 25_000}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["bitcoin_chain_address"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestDeliveryFailure1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.nym.as_deref(), Some(nym));
+    assert_eq!(row.boltz_response_json, expected_provider_json);
+    let audit = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert!(!audit[0].manifest_id.is_nil());
+    assert_eq!(audit[0].chain_swap_id, row.id);
+    assert_eq!(audit[0].delivery_state, "pending");
+    assert_eq!(audit[0].delivered_at_unix, None);
+    assert!(store.put_calls.load(Ordering::SeqCst) >= 1);
+    assert_eq!(boltz.chain_calls.load(Ordering::SeqCst), 3);
+
+    boltz.shutdown().await;
+    store.shutdown().await;
     cleanup_db(&pool).await;
 }
