@@ -41,7 +41,6 @@ pub struct ChainSwapResult {
     /// `creation_terms`. This is what recovery code reads after restart.
     pub canonical_response_json: String,
     pub creation_terms: ValidatedChainSwapCreationTerms,
-    pub boltz_response: CreateChainResponse,
 }
 
 /// Complete non-secret provider evidence approved before a payer can see the
@@ -691,7 +690,6 @@ impl BoltzService {
             refund_keypair,
             canonical_response_json,
             creation_terms,
-            boltz_response: response,
         })
     }
 
