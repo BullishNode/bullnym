@@ -38,6 +38,7 @@ pub mod liquid_fee_adapter;
 pub mod liquid_fee_sources;
 pub mod lnurl;
 pub mod local_chain_swap_recovery_audit;
+pub mod merchant_output_verifier;
 pub mod nostr;
 pub mod og_image;
 pub mod pricer;
