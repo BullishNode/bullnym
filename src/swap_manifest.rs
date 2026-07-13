@@ -3446,4 +3446,8 @@ mod tests {
     mod local_chain_swap_recovery_audit_tests {
         include!("local_chain_swap_recovery_audit_tests.rs");
     }
+
+    mod chain_lockup_witness_audit_tests {
+        include!("chain_lockup_witness_audit_tests.rs");
+    }
 }
