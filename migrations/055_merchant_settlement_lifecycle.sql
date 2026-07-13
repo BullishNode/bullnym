@@ -325,6 +325,8 @@ ALTER TABLE invoice_payment_events
             AND address IS NOT NULL
             AND merchant_settlement_family_key ~
                 '^chain_swap_merchant_output:[0-9a-f-]{36}:[0-9a-f]{64}$'
+            AND split_part(merchant_settlement_family_key, ':', 2)
+                = merchant_chain_swap_id::TEXT
             AND event_key = merchant_settlement_family_key || ':' || txid || ':' || vout::TEXT
         )
     ),
@@ -477,6 +479,7 @@ CREATE TABLE merchant_settlement_retained_outputs (
         AND block_height > 0
         AND block_hash ~ '^[0-9a-f]{64}$'
         AND family_key ~ '^chain_swap_merchant_output:[0-9a-f-]{36}:[0-9a-f]{64}$'
+        AND split_part(family_key, ':', 2) = chain_swap_id::TEXT
         AND event_key = family_key || ':' || txid || ':' || vout::TEXT
         AND (NOT active OR recorded)
         AND (NOT finalized OR active)
@@ -494,17 +497,32 @@ AS $$
 DECLARE
     journal_chain_swap_id UUID;
     journal_purpose TEXT;
+    journal_status TEXT;
+    parent_invoice_id UUID;
+    parent_boltz_swap_id TEXT;
 BEGIN
-    SELECT chain_swap_id, purpose
-      INTO journal_chain_swap_id, journal_purpose
+    SELECT chain_swap_id, purpose, status
+      INTO journal_chain_swap_id, journal_purpose, journal_status
       FROM chain_swap_tx_attempts
      WHERE txid = NEW.journal_txid
      FOR KEY SHARE;
     IF NOT FOUND
        OR journal_chain_swap_id <> NEW.chain_swap_id
+       OR journal_status = 'integrity_hold'
        OR (NEW.settlement_path = 'liquid_claim' AND journal_purpose <> 'liquid_claim')
        OR (NEW.settlement_path = 'bitcoin_recovery' AND journal_purpose <> 'btc_recovery') THEN
         RAISE EXCEPTION 'merchant settlement checkpoint does not match its original journal'
+            USING ERRCODE = '23514';
+    END IF;
+    SELECT invoice_id, boltz_swap_id
+      INTO parent_invoice_id, parent_boltz_swap_id
+      FROM chain_swap_records
+     WHERE id = NEW.chain_swap_id
+     FOR KEY SHARE;
+    IF NOT FOUND
+       OR parent_invoice_id <> NEW.invoice_id
+       OR parent_boltz_swap_id <> NEW.boltz_swap_id THEN
+        RAISE EXCEPTION 'merchant settlement checkpoint does not match its parent swap'
             USING ERRCODE = '23514';
     END IF;
     IF TG_OP = 'INSERT' THEN
@@ -535,7 +553,16 @@ AS $$
 DECLARE
     journal_chain_swap_id UUID;
     journal_purpose TEXT;
+    journal_status TEXT;
     candidate_replaces_txid TEXT;
+    candidate_status TEXT;
+    event_invoice_id UUID;
+    event_chain_swap_id UUID;
+    event_family_key TEXT;
+    event_txid TEXT;
+    event_vout INTEGER;
+    event_amount_sat BIGINT;
+    event_address TEXT;
 BEGIN
     IF TG_OP = 'UPDATE' AND ROW(
         NEW.event_key, NEW.family_key, NEW.invoice_id, NEW.chain_swap_id,
@@ -551,26 +578,48 @@ BEGIN
         RAISE EXCEPTION 'retained merchant settlement identity is immutable'
             USING ERRCODE = '55000';
     END IF;
-    SELECT chain_swap_id, purpose
-      INTO journal_chain_swap_id, journal_purpose
+    SELECT chain_swap_id, purpose, status
+      INTO journal_chain_swap_id, journal_purpose, journal_status
       FROM chain_swap_tx_attempts
      WHERE txid = NEW.journal_txid
      FOR KEY SHARE;
     IF NOT FOUND
        OR journal_chain_swap_id <> NEW.chain_swap_id
+       OR journal_status = 'integrity_hold'
        OR (NEW.settlement_path = 'liquid_claim' AND journal_purpose <> 'liquid_claim')
        OR (NEW.settlement_path = 'bitcoin_recovery' AND journal_purpose <> 'btc_recovery') THEN
         RAISE EXCEPTION 'retained merchant output does not match its original journal'
             USING ERRCODE = '23514';
     END IF;
+    SELECT invoice_id, merchant_chain_swap_id, merchant_settlement_family_key,
+           txid, vout, amount_sat, address
+      INTO event_invoice_id, event_chain_swap_id, event_family_key,
+           event_txid, event_vout, event_amount_sat, event_address
+      FROM invoice_payment_events
+     WHERE event_key = NEW.event_key
+     FOR KEY SHARE;
+    IF NOT FOUND
+       OR event_invoice_id <> NEW.invoice_id
+       OR event_chain_swap_id <> NEW.chain_swap_id
+       OR event_family_key <> NEW.family_key
+       OR event_txid <> NEW.txid
+       OR event_vout <> NEW.vout
+       OR event_amount_sat <> NEW.actual_amount_sat
+       OR event_address <> NEW.destination_address THEN
+        RAISE EXCEPTION 'retained merchant output does not match its accounting event'
+            USING ERRCODE = '23514';
+    END IF;
     IF NEW.linked_replacement THEN
-        SELECT replaces_txid INTO candidate_replaces_txid
+        SELECT replaces_txid, status
+          INTO candidate_replaces_txid, candidate_status
           FROM chain_swap_tx_attempts
          WHERE chain_swap_id = NEW.chain_swap_id
            AND purpose = 'liquid_claim_replacement'
            AND txid = NEW.txid
          FOR KEY SHARE;
-        IF NOT FOUND OR candidate_replaces_txid <> NEW.journal_txid THEN
+        IF NOT FOUND
+           OR candidate_replaces_txid <> NEW.journal_txid
+           OR candidate_status = 'integrity_hold' THEN
             RAISE EXCEPTION 'retained replacement is not linked to its original journal'
                 USING ERRCODE = '23514';
         END IF;

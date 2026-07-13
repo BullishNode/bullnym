@@ -2510,7 +2510,8 @@ async fn claim_chain_swap_inner(
                     "insert Liquid merchant settlement journal: {error}"
                 ))
             })?;
-        let fee_record = fee_record.expect("unjournaled chain claims require fee decision metadata");
+        let fee_record =
+            fee_record.expect("unjournaled chain claims require fee decision metadata");
         let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&claim_tx)?;
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
