@@ -10,6 +10,8 @@ dependency health separately.
 - counts and maximum age by swap and invoice status;
 - claim attempts, slow-recovery attempts, and next retry timestamps;
 - provider, Electrum, mempool API, and price-source latency/error rates;
+- `money_admission_creation_circuit_changed` state/reason transitions and its
+  monotonic provider-creation transition count;
 - Bitcoin and Liquid direct-watcher recent/historical backlog counts,
   oldest-due timestamps, and lag from each frozen lane-start log;
 - descriptor allocation failures and uniqueness violations;

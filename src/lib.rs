@@ -63,3 +63,12 @@ pub struct AppState {
     /// provider call so a rewound key sequence is detectable even for orphans.
     pub swap_key_root_fingerprint: Arc<String>,
 }
+
+impl AppState {
+    /// Private #68 operations view. Public `/ready` deliberately remains the
+    /// DB/schema readiness contract and does not serialize these details.
+    pub fn operations_snapshot(&self) -> admission::OperationsSnapshot {
+        self.admission
+            .operations_snapshot(self.boltz.creation_circuit_snapshot())
+    }
+}

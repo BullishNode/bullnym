@@ -92,6 +92,13 @@ creating a provider obligation. Existing payment instructions, status reads,
 webhooks, claims, reconciliation, settlement repair, and recovery continue
 while new-money admission is closed.
 
+The Boltz creation circuit is reported alongside this private operations view,
+but remains a load-shedding mechanism rather than another admission policy.
+Its fixed `closed`, `suspect`, `open`, and `half_open` states and monotonic
+transition count cover only new provider-dependent offer creation. Direct
+Liquid and existing claim, refund, status, reconciliation, and recovery work
+never consult it. `/ready` does not serialize circuit details.
+
 An admission rejection is HTTP 503 with the fixed public message `This payment
 method is temporarily unavailable. Try again later.` Detailed rail and
 dependency reason codes appear only in transition logs. This prevents callers
