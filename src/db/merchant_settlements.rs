@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use super::{direct_payments, InvoiceAccountingTolerances};
 use crate::{
-    merchant_output_verifier::{ApprovedMerchantDestination, MerchantAsset},
+    merchant_output_verifier::{
+        ApprovedMerchantDestination, MerchantAsset, PersistableMerchantTransactionJournal,
+    },
     merchant_settlement_adoption::{
         ConfirmedMerchantOutputEvidence, ConfirmedMerchantOutputEvidenceSnapshot,
         MerchantOutputAccountingIdentity, MerchantOutputAccountingIntent,
@@ -64,10 +66,18 @@ impl From<MerchantSettlementProcessingError> for MerchantSettlementRepositoryErr
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerchantSettlementPersistenceResult {
     pub checkpoint_version: i64,
     pub projection_changed: bool,
+    pub parent_transition: MerchantSettlementParentTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerchantSettlementParentTransition {
+    pub previous_status: String,
+    pub current_status: String,
+    pub changed: bool,
 }
 
 /// Owned prior-output evidence for a journal row. Workers can borrow these
@@ -105,14 +115,9 @@ pub struct MerchantSettlementJournalRow {
 pub struct NewLiquidMerchantSettlementJournal<'a> {
     pub chain_swap_id: Uuid,
     pub replaces_txid: Option<&'a str>,
-    pub raw_transaction: &'a [u8],
-    pub txid: &'a str,
-    pub source_prevouts: &'a [MerchantSettlementSourcePrevout],
-    pub destination_address: &'a str,
-    pub destination_script_hex: &'a str,
-    pub asset_id: &'a str,
-    pub destination_amount_sat: u64,
-    pub destination_vout: u32,
+    /// Verifier-derived owned packet. Callers cannot supply an independent
+    /// amount, vout, txid, script, asset, or source set to persistence.
+    pub prepared: &'a PersistableMerchantTransactionJournal,
     pub fee_amount_sat: u64,
     pub fee_rate_sat_vb: f64,
     pub liquid_blinding_key_hex: &'a str,
@@ -227,32 +232,47 @@ pub async fn insert_liquid_merchant_settlement_journal(
     } else {
         "liquid_claim"
     };
-    let source_prevouts = serde_json::to_value(journal.source_prevouts)
+    let prepared = journal.prepared;
+    let source_prevouts: Vec<_> = prepared
+        .source_prevouts
+        .iter()
+        .map(|source| MerchantSettlementSourcePrevout {
+            txid: source.txid.clone(),
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: source.script_pubkey_hex.clone(),
+        })
+        .collect();
+    let source_prevouts = serde_json::to_value(source_prevouts)
         .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?;
-    let row = sqlx::query_as::<_, JournalDbRow>(&format!(
+    let MerchantAsset::Liquid(asset_id) = &prepared.asset else {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    };
+    let inserted = sqlx::query_as::<_, JournalDbRow>(&format!(
         "INSERT INTO chain_swap_tx_attempts (\
              chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
              destination_address, destination_script_hex, destination_asset_id, \
              destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
              liquid_blinding_key_hex\
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+         ON CONFLICT (chain_swap_id, purpose) DO NOTHING \
          RETURNING {JOURNAL_COLUMNS}"
     ))
     .bind(journal.chain_swap_id)
     .bind(purpose)
     .bind(journal.replaces_txid)
-    .bind(hex::encode(journal.raw_transaction))
-    .bind(journal.txid)
+    .bind(&prepared.raw_transaction_hex)
+    .bind(&prepared.txid)
     .bind(source_prevouts)
-    .bind(journal.destination_address)
-    .bind(journal.destination_script_hex)
-    .bind(journal.asset_id)
+    .bind(&prepared.destination_address)
+    .bind(&prepared.destination_script_hex)
+    .bind(asset_id)
     .bind(
-        i32::try_from(journal.destination_vout)
+        i32::try_from(prepared.vout)
             .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
     )
     .bind(
-        i64::try_from(journal.destination_amount_sat)
+        i64::try_from(prepared.amount_sat)
             .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
     )
     .bind(
@@ -261,9 +281,97 @@ pub async fn insert_liquid_merchant_settlement_journal(
     )
     .bind(journal.fee_rate_sat_vb)
     .bind(journal.liquid_blinding_key_hex)
-    .fetch_one(connection)
+    .fetch_optional(&mut *connection)
     .await?;
-    row.try_into()
+    let row = match inserted {
+        Some(row) => row.try_into()?,
+        None => load_liquid_journal_by_purpose(connection, journal.chain_swap_id, purpose)
+            .await?
+            .ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?,
+    };
+    assert_liquid_journal_matches(&row, journal, purpose)?;
+    Ok(row)
+}
+
+/// Re-read and lock an already persisted claim/replacement in the caller's
+/// transaction, then require byte-for-byte equality with the newly prepared
+/// packet. A rebroadcaster therefore uses the journaled raw bytes or stops; it
+/// cannot silently accept a reconstructed transaction with the same purpose.
+pub async fn load_exact_liquid_merchant_settlement_journal(
+    connection: &mut PgConnection,
+    journal: &NewLiquidMerchantSettlementJournal<'_>,
+) -> Result<MerchantSettlementJournalRow, MerchantSettlementRepositoryError> {
+    validate_new_liquid_journal(journal)?;
+    let purpose = if journal.replaces_txid.is_some() {
+        "liquid_claim_replacement"
+    } else {
+        "liquid_claim"
+    };
+    let row = sqlx::query_as::<_, JournalDbRow>(&format!(
+        "SELECT {JOURNAL_COLUMNS} FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND purpose = $2 FOR UPDATE"
+    ))
+    .bind(journal.chain_swap_id)
+    .bind(purpose)
+    .fetch_optional(connection)
+    .await?
+    .ok_or(MerchantSettlementRepositoryError::MissingJournal)?
+    .try_into()?;
+    assert_liquid_journal_matches(&row, journal, purpose)?;
+    Ok(row)
+}
+
+async fn load_liquid_journal_by_purpose(
+    connection: &mut PgConnection,
+    chain_swap_id: Uuid,
+    purpose: &str,
+) -> Result<Option<MerchantSettlementJournalRow>, MerchantSettlementRepositoryError> {
+    sqlx::query_as::<_, JournalDbRow>(&format!(
+        "SELECT {JOURNAL_COLUMNS} FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND purpose = $2 FOR UPDATE"
+    ))
+    .bind(chain_swap_id)
+    .bind(purpose)
+    .fetch_optional(connection)
+    .await?
+    .map(TryInto::try_into)
+    .transpose()
+}
+
+fn assert_liquid_journal_matches(
+    row: &MerchantSettlementJournalRow,
+    journal: &NewLiquidMerchantSettlementJournal<'_>,
+    purpose: &str,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    let prepared = journal.prepared;
+    let expected_sources: Vec<_> = prepared
+        .source_prevouts
+        .iter()
+        .map(|source| MerchantSettlementSourcePrevout {
+            txid: source.txid.clone(),
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: source.script_pubkey_hex.clone(),
+        })
+        .collect();
+    if row.chain_swap_id != journal.chain_swap_id
+        || row.purpose != purpose
+        || row.replaces_txid.as_deref() != journal.replaces_txid
+        || row.raw_transaction != prepared.raw_transaction
+        || row.txid != prepared.txid
+        || row.source_prevouts != expected_sources
+        || row.destination_address != prepared.destination_address
+        || row.destination_script_hex != prepared.destination_script_hex
+        || row.asset != prepared.asset
+        || row.destination_amount_sat != prepared.amount_sat
+        || row.destination_vout != prepared.vout
+        || row.fee_amount_sat != journal.fee_amount_sat
+        || row.fee_rate_sat_vb.to_bits() != journal.fee_rate_sat_vb.to_bits()
+        || row.liquid_blinding_key_hex.as_deref() != Some(journal.liquid_blinding_key_hex)
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
 }
 
 fn validate_new_liquid_journal(
@@ -276,15 +384,16 @@ fn validate_new_liquid_journal(
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     };
     if journal.chain_swap_id.is_nil()
-        || journal.raw_transaction.is_empty()
-        || !hash(journal.txid)
+        || journal.prepared.raw_transaction.is_empty()
+        || journal.prepared.raw_transaction_hex != hex::encode(&journal.prepared.raw_transaction)
+        || !hash(&journal.prepared.txid)
         || journal
             .replaces_txid
-            .is_some_and(|txid| !hash(txid) || txid == journal.txid)
-        || journal.source_prevouts.is_empty()
-        || journal.source_prevouts.len() > 256
-        || !hash(journal.asset_id)
-        || journal.destination_amount_sat == 0
+            .is_some_and(|txid| !hash(txid) || txid == journal.prepared.txid)
+        || journal.prepared.source_prevouts.is_empty()
+        || journal.prepared.source_prevouts.len() > 256
+        || !matches!(&journal.prepared.asset, MerchantAsset::Liquid(asset_id) if hash(asset_id))
+        || journal.prepared.amount_sat == 0
         || journal.fee_amount_sat == 0
         || !journal.fee_rate_sat_vb.is_finite()
         || journal.fee_rate_sat_vb <= 0.0
@@ -452,6 +561,7 @@ pub async fn persist_merchant_settlement_outcome(
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
+    let parent_transition = transition_parent_locked(&mut tx, snapshot).await?;
     let swap_status = if snapshot.lifecycle.accounting == SettlementAccountingState::Finalized {
         "settled"
     } else {
@@ -468,6 +578,76 @@ pub async fn persist_merchant_settlement_outcome(
     Ok(MerchantSettlementPersistenceResult {
         checkpoint_version,
         projection_changed,
+        parent_transition,
+    })
+}
+
+async fn transition_parent_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &MerchantSettlementAdoptionSnapshot,
+) -> Result<MerchantSettlementParentTransition, MerchantSettlementRepositoryError> {
+    let (previous_status, claim_txid, refund_txid): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, claim_txid, refund_txid FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+        )
+        .bind(snapshot.context.chain_swap_id())
+        .fetch_one(&mut **tx)
+        .await?;
+    let finalized = snapshot.lifecycle.accounting == SettlementAccountingState::Finalized;
+    let active_txid = snapshot.lifecycle.active_txid.as_str();
+    let (current_status, allowed) = match snapshot.context.path() {
+        MerchantSettlementPath::LiquidClaim => (
+            if finalized { "claimed" } else { "claiming" },
+            matches!(previous_status.as_str(), "claiming" | "claimed"),
+        ),
+        MerchantSettlementPath::BitcoinRecovery => (
+            if finalized { "refunded" } else { "refunding" },
+            matches!(previous_status.as_str(), "refunding" | "refunded"),
+        ),
+    };
+    if !allowed {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    let prior_txid = match snapshot.context.path() {
+        MerchantSettlementPath::LiquidClaim => claim_txid.as_deref(),
+        MerchantSettlementPath::BitcoinRecovery => refund_txid.as_deref(),
+    };
+    if prior_txid != Some(active_txid) {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    let changed = previous_status != current_status;
+    if changed {
+        match snapshot.context.path() {
+            MerchantSettlementPath::LiquidClaim => {
+                sqlx::query(
+                    "UPDATE chain_swap_records SET status = $2, \
+                         claim_txid = CASE WHEN $2 = 'claimed' THEN $3 ELSE claim_txid END, \
+                         updated_at = NOW() WHERE id = $1",
+                )
+                .bind(snapshot.context.chain_swap_id())
+                .bind(current_status)
+                .bind(active_txid)
+                .execute(&mut **tx)
+                .await?;
+            }
+            MerchantSettlementPath::BitcoinRecovery => {
+                sqlx::query(
+                    "UPDATE chain_swap_records SET status = $2, \
+                         refund_txid = CASE WHEN $2 = 'refunded' THEN $3 ELSE refund_txid END, \
+                         updated_at = NOW() WHERE id = $1",
+                )
+                .bind(snapshot.context.chain_swap_id())
+                .bind(current_status)
+                .bind(active_txid)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+    }
+    Ok(MerchantSettlementParentTransition {
+        previous_status,
+        current_status: current_status.to_owned(),
+        changed,
     })
 }
 
@@ -1213,6 +1393,10 @@ impl StoredLifecycle {
         };
         let [constructed, broadcast, mempool, confirmed, finalized, replaced, evicted, reorged] =
             self.history;
+        let linked_replacement = match self.linked_replacement {
+            Some((parent, child)) => Some((parse_txid(&parent)?, parse_txid(&child)?)),
+            None => None,
+        };
         Ok(SettlementLifecycleSnapshot {
             chain: match self.chain.as_str() {
                 "liquid" => SettlementChain::Liquid,
@@ -1239,10 +1423,7 @@ impl StoredLifecycle {
                 evicted,
                 reorged,
             },
-            linked_replacement: self
-                .linked_replacement
-                .map(|(a, b)| Ok((parse_txid(&a)?, parse_txid(&b)?)))
-                .transpose()?,
+            linked_replacement,
             last_confirmed_block: self.last_confirmed_block.map(parse_block).transpose()?,
             last_reorged_block: self.last_reorged_block.map(parse_block).transpose()?,
         })
