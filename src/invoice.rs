@@ -2239,9 +2239,9 @@ async fn create_bitcoin_chain_offer(
         );
         return Ok(None);
     };
-    // Keep the selected immutable record in scope through the durable swap
-    // insert. The composed #84 slice can bind its `commitment_id` beside this
-    // exact address without performing a second, rotation-sensitive lookup.
+    // Keep the selected immutable record in scope so the durable swap insert
+    // atomically binds its `commitment_id` and exact address without a second,
+    // rotation-sensitive lookup.
 
     let claim_key_index = db::next_swap_key_index(&state.db)
         .await
@@ -2311,7 +2311,7 @@ async fn create_bitcoin_chain_offer(
         .map_err(|_| AppError::BoltzError("chain user-lock amount exceeds i64".into()))?;
     let server_lock_amount_sat = i64::try_from(result.server_lock_amount_sat)
         .map_err(|_| AppError::BoltzError("chain server-lock amount exceeds i64".into()))?;
-    db::record_chain_swap_with_lineage_and_creation_terms(
+    db::record_chain_swap_with_lineage_and_creation_evidence(
         &state.db,
         &db::NewChainSwapRecord {
             invoice_id: invoice.id,
@@ -2338,21 +2338,26 @@ async fn create_bitcoin_chain_offer(
             refund_public_key_hex: &refund_public_key_hex,
             preimage_hash_hex: &preimage_hash_hex,
         },
-        &db::NewChainSwapCreationTerms {
-            pinned_pair_hash: &result.creation_terms.pinned_pair_hash,
-            canonical_pair_quote_json: &result.creation_terms.canonical_pair_quote_json,
-            creation_response_sha256: &result.creation_terms.creation_response_sha256,
-            btc_claim_script_sha256: &result.creation_terms.btc_claim_script_sha256,
-            btc_refund_script_sha256: &result.creation_terms.btc_refund_script_sha256,
-            liquid_claim_script_sha256: &result.creation_terms.liquid_claim_script_sha256,
-            liquid_refund_script_sha256: &result.creation_terms.liquid_refund_script_sha256,
-            btc_timeout_height: i64::from(result.creation_terms.btc_timeout_height),
-            liquid_timeout_height: i64::from(result.creation_terms.liquid_timeout_height),
-            btc_network: result.creation_terms.btc_network,
-            liquid_network: result.creation_terms.liquid_network,
-            liquid_asset_id: &result.creation_terms.liquid_asset_id,
-            merchant_liquid_destination: &merchant_liquid_destination,
-            merchant_emergency_btc_address: Some(recovery_commitment.canonical_btc_address()),
+        &db::NewChainSwapCreationEvidence {
+            creation_terms: db::NewChainSwapCreationTerms {
+                pinned_pair_hash: &result.creation_terms.pinned_pair_hash,
+                canonical_pair_quote_json: &result.creation_terms.canonical_pair_quote_json,
+                creation_response_sha256: &result.creation_terms.creation_response_sha256,
+                btc_claim_script_sha256: &result.creation_terms.btc_claim_script_sha256,
+                btc_refund_script_sha256: &result.creation_terms.btc_refund_script_sha256,
+                liquid_claim_script_sha256: &result.creation_terms.liquid_claim_script_sha256,
+                liquid_refund_script_sha256: &result.creation_terms.liquid_refund_script_sha256,
+                btc_timeout_height: i64::from(result.creation_terms.btc_timeout_height),
+                liquid_timeout_height: i64::from(result.creation_terms.liquid_timeout_height),
+                btc_network: result.creation_terms.btc_network,
+                liquid_network: result.creation_terms.liquid_network,
+                liquid_asset_id: &result.creation_terms.liquid_asset_id,
+                merchant_liquid_destination: &merchant_liquid_destination,
+                merchant_emergency_btc_address: Some(
+                    recovery_commitment.canonical_btc_address(),
+                ),
+            },
+            recovery_address_commitment_id: Some(recovery_commitment.commitment_id),
         },
     )
     .await

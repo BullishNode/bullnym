@@ -17488,11 +17488,12 @@ async fn issue84_persist_recovery_commitment(
     npub: &str,
     address: &str,
     timestamp: u64,
-) {
+) -> Uuid {
     let evidence = verified_recovery_commitment(keypair, npub, address, timestamp);
     pay_service::db::persist_recovery_address_commitment(pool, &evidence)
         .await
-        .unwrap();
+        .unwrap()
+        .commitment_id
 }
 
 #[tokio::test]
@@ -17607,7 +17608,7 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     cleanup_db(&pool).await;
     let nym = "issue84durable";
     let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
-    issue84_persist_recovery_commitment(
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
         &pool,
         &keypair,
         &npub,
@@ -17639,8 +17640,8 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     .unwrap()
     .expect("registered merchant should receive a chain offer");
 
-    let recorded: (String, String, i64, i64) = sqlx::query_as(
-        "SELECT merchant_emergency_btc_address, lockup_address, \
+    let recorded: (Uuid, String, String, i64, i64) = sqlx::query_as(
+        "SELECT recovery_address_commitment_id, merchant_emergency_btc_address, lockup_address, \
                 claim_key_index, refund_key_index \
            FROM chain_swap_records WHERE invoice_id = $1",
     )
@@ -17648,10 +17649,11 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(recorded.0, RECOVERY_COMMITMENT_P2WPKH);
-    assert_eq!(recorded.1, returned.0);
-    assert_eq!(recorded.2, next_key);
-    assert_eq!(recorded.3, next_key + 1);
+    assert_eq!(recorded.0, recovery_commitment_id);
+    assert_eq!(recorded.1, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(recorded.2, returned.0);
+    assert_eq!(recorded.3, next_key);
+    assert_eq!(recorded.4, next_key + 1);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
 
@@ -17666,7 +17668,7 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     let nym = "issue84rotation";
     let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
     let first_commitment_timestamp = auth_timestamp();
-    issue84_persist_recovery_commitment(
+    let first_recovery_commitment_id = issue84_persist_recovery_commitment(
         &pool,
         &keypair,
         &npub,
@@ -17698,7 +17700,7 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .expect("first registered commitment should admit creation");
     first_provider.shutdown().await;
 
-    issue84_persist_recovery_commitment(
+    let second_recovery_commitment_id = issue84_persist_recovery_commitment(
         &pool,
         &keypair,
         &npub,
@@ -17706,15 +17708,16 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
         first_commitment_timestamp + 1,
     )
     .await;
-    let first_after_rotation: String = sqlx::query_scalar(
-        "SELECT merchant_emergency_btc_address \
+    let first_after_rotation: (Uuid, String) = sqlx::query_as(
+        "SELECT recovery_address_commitment_id, merchant_emergency_btc_address \
            FROM chain_swap_records WHERE invoice_id = $1",
     )
     .bind(first_invoice.id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(first_after_rotation, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(first_after_rotation.0, first_recovery_commitment_id);
+    assert_eq!(first_after_rotation.1, RECOVERY_COMMITMENT_P2WPKH);
 
     let second_invoice = issue84_chain_invoice(&pool, nym, &npub, 1).await;
     let second_key = pay_service::db::swap_key_seq_next_value(&pool)
@@ -17739,8 +17742,8 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .unwrap()
     .expect("rotated commitment should admit future creation");
 
-    let recorded: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT invoice_id, merchant_emergency_btc_address \
+    let recorded: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT invoice_id, recovery_address_commitment_id, merchant_emergency_btc_address \
            FROM chain_swap_records \
           WHERE invoice_id = ANY($1) \
           ORDER BY created_at, invoice_id",
@@ -17750,20 +17753,22 @@ async fn issue84_chain_offer_rotation_changes_only_future_swaps() {
     .await
     .unwrap();
     assert_eq!(recorded.len(), 2);
-    let first_address = recorded
+    let first_evidence = recorded
         .iter()
-        .find_map(|(invoice_id, address)| {
-            (*invoice_id == first_invoice.id).then_some(address.as_str())
+        .find_map(|(invoice_id, commitment_id, address)| {
+            (*invoice_id == first_invoice.id).then_some((*commitment_id, address.as_str()))
         })
         .unwrap();
-    let second_address = recorded
+    let second_evidence = recorded
         .iter()
-        .find_map(|(invoice_id, address)| {
-            (*invoice_id == second_invoice.id).then_some(address.as_str())
+        .find_map(|(invoice_id, commitment_id, address)| {
+            (*invoice_id == second_invoice.id).then_some((*commitment_id, address.as_str()))
         })
         .unwrap();
-    assert_eq!(first_address, RECOVERY_COMMITMENT_P2WPKH);
-    assert_eq!(second_address, RECOVERY_COMMITMENT_P2TR);
+    assert_eq!(first_evidence.0, first_recovery_commitment_id);
+    assert_eq!(first_evidence.1, RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(second_evidence.0, second_recovery_commitment_id);
+    assert_eq!(second_evidence.1, RECOVERY_COMMITMENT_P2TR);
     assert_eq!(second_provider.calls.load(Ordering::SeqCst), 3);
     assert_eq!(second_provider.creation_calls.load(Ordering::SeqCst), 1);
 
