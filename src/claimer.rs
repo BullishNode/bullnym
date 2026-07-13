@@ -1017,9 +1017,9 @@ async fn try_claim_chain_swap_with_retry(
 /// Outcome of a single `claim_swap` invocation.
 #[derive(Debug, Clone, Copy)]
 pub enum ClaimOutcome {
-    /// Constructed (or re-broadcast) a claim tx and Electrum accepted it
-    /// (or reported it was already in the utxo set — same outcome from
-    /// our perspective).
+    /// Constructed (or re-broadcast) a claim tx and the backend accepted it
+    /// (or independently recovered the exact journaled txid). For chain swaps,
+    /// this means in-flight `claiming`; observation owns accounting/finality.
     Broadcast,
     /// Another process holds the per-swap advisory lock; the next sweep
     /// tick (or webhook delivery) will try again.
@@ -2044,7 +2044,7 @@ async fn claim_chain_swap_inner(
     claim_clients: Option<&LiquidClaimClientFactory>,
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
-    tolerances: db::InvoiceAccountingTolerances,
+    _tolerances: db::InvoiceAccountingTolerances,
     fee_decision: Option<&LiquidFeeDecision>,
     fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
@@ -2262,7 +2262,7 @@ async fn claim_chain_swap_inner(
 
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
-    let mut txid = btc_like_txid(&claim_tx);
+    let txid = btc_like_txid(&claim_tx);
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
         if let Some(backend) = utxo_backend {
             match backend.tx_exists(&txid).await {
@@ -2276,16 +2276,20 @@ async fn claim_chain_swap_inner(
                     );
                 }
                 Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
-                    Ok(Some(spending_txid)) => {
+                    Ok(Some(spending_txid)) if spending_txid.eq_ignore_ascii_case(&txid) => {
                         tracing::info!(
                             event = "chain_claim_outspend_recovered",
                             swap_id = %swap.boltz_swap_id,
                             expected_txid = %txid,
                             recovered_txid = %spending_txid,
                             broadcast_error = %broadcast_err,
-                            "chain claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                            "chain claim broadcast errored and expected txid was absent, but its exact lockup outspend was found"
                         );
-                        txid = spending_txid;
+                    }
+                    Ok(Some(spending_txid)) => {
+                        return Err(AppError::ClaimError(format!(
+                            "chain claim lockup was spent by unlinked transaction {spending_txid}; expected journaled {txid}; settlement integrity review required"
+                        )));
                     }
                     Ok(None) => {
                         return Err(AppError::ClaimError(format!(
@@ -2319,39 +2323,16 @@ async fn claim_chain_swap_inner(
         }
     }
 
-    db::update_chain_swap_status(pool, swap.id, ChainSwapStatus::Claimed, Some(&txid))
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    if let Err(e) = db::clear_chain_swap_claim_failure_state(pool, swap.id).await {
-        tracing::warn!(
-            "clear_chain_swap_claim_failure_state for {}: {e}",
-            swap.boltz_swap_id
-        );
-    }
-    if let Err(e) = db::mark_invoice_settlement_status(pool, Some(swap.invoice_id), "settled").await
-    {
-        tracing::warn!(
-            event = "invoice_chain_swap_settlement_status_mark_failed",
-            swap_id = %swap.boltz_swap_id,
-            "failed to mark invoice settlement_status=settled: {e}"
-        );
-    }
-    invoice::flip_invoice_on_bitcoin_boltz_settlement(
-        pool,
-        Some(swap.invoice_id),
-        // Credit the SERVER lockup (the L-BTC actually claimed to the merchant),
-        // which equals the invoice under payer-pays gross-up pricing. Crediting
-        // user_lock_amount_sat would over-credit by the swap overhead (and trip
-        // the overpaid tolerance) now that the payer's amount is grossed up.
-        // After a Phase 3 renegotiation the settled server lockup is the
-        // renegotiated amount, so credit that (effective_* falls back to the
-        // original server_lock when the swap was never renegotiated).
-        swap.effective_server_lock_amount_sat(),
-        &swap.boltz_swap_id,
-        &txid,
-        tolerances,
-    )
-    .await;
+    // Broadcast is retained as an in-flight `claiming` transaction. Exact
+    // merchant-output observation owns one-confirmation accounting and the
+    // later Liquid-finality transition; provider/broadcast success cannot
+    // terminalize the obligation or supply an invoice amount.
+    tracing::info!(
+        event = "chain_swap_claim_broadcast_pending_settlement",
+        swap_id = %swap.boltz_swap_id,
+        claim_txid = %txid,
+        "chain claim broadcast; awaiting exact merchant-output confirmation"
+    );
 
     Ok(ClaimOutcome::Broadcast)
 }

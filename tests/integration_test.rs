@@ -15712,7 +15712,7 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(final_swap.status, "refunded");
+    assert_eq!(final_swap.status, "refunding");
     assert_eq!(
         final_swap.refund_txid.as_deref(),
         Some(harness.expected_txid.as_str())
@@ -15826,7 +15826,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(final_swap.status, "refunded");
+        assert_eq!(final_swap.status, "refunding");
         assert_eq!(
             final_swap.refund_txid.as_deref(),
             Some(harness.expected_txid.as_str())
