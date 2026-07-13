@@ -714,6 +714,21 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Migration 055 makes merchant evidence append-only to the runtime role.
+    // The isolated database owner uses DDL, in dependency order, before
+    // deleting the parent swap/invoice fixtures.
+    sqlx::query("TRUNCATE merchant_settlement_retained_outputs")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("TRUNCATE merchant_settlement_checkpoints")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("TRUNCATE invoice_payment_events CASCADE")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM chain_swap_records")
         .execute(pool)
         .await
@@ -15691,10 +15706,11 @@ async fn seed_recovery_journal_harness(
     }
 }
 
-async fn seed_liquid_merchant_settlement_attempt(
-    pool: &PgPool,
-    suffix: &str,
-) -> (Uuid, String) {
+async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) -> (Uuid, String) {
+    const DESTINATION_ADDRESS: &str =
+        "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv";
+    const ASSET_ID: &str = "6f0279e9ed041c3d710a9f57d0c02928416453c0e87cbbe43c8ca792a3b6e499";
+
     let nym = format!("lmjs{suffix}");
     let boltz_id = format!("liquid-merchant-journal-{suffix}");
     let (_, _, _, swap) = seed_merchant_invoice_swap(
@@ -15702,18 +15718,53 @@ async fn seed_liquid_merchant_settlement_attempt(
         &nym,
         &boltz_id,
         &format!("el1qqlockup{suffix}"),
-        51_000,
-        50_000,
+        1_100,
+        1_000,
     )
     .await;
-    let txid = format!("{:064x}", swap.id.as_u128());
-    let raw_tx_hex = "0102";
+    let destination_script = lwk_wollet::elements::Address::from_str(DESTINATION_ADDRESS)
+        .unwrap()
+        .script_pubkey();
+    let destination_script_hex = hex::encode(destination_script.as_bytes());
+    let source_txid =
+        lwk_wollet::elements::Txid::from_str(&format!("{:064x}", swap.id.as_u128())).unwrap();
+    let asset = lwk_wollet::elements::AssetId::from_str(ASSET_ID).unwrap();
+    let transaction = lwk_wollet::elements::Transaction {
+        version: 2,
+        lock_time: lwk_wollet::elements::LockTime::ZERO,
+        input: vec![lwk_wollet::elements::TxIn {
+            previous_output: lwk_wollet::elements::OutPoint::new(source_txid, 0),
+            is_pegin: false,
+            script_sig: lwk_wollet::elements::Script::new(),
+            sequence: lwk_wollet::elements::Sequence::MAX,
+            asset_issuance: lwk_wollet::elements::AssetIssuance::default(),
+            witness: lwk_wollet::elements::TxInWitness::default(),
+        }],
+        output: vec![
+            lwk_wollet::elements::TxOut {
+                asset: lwk_wollet::elements::confidential::Asset::Explicit(asset.clone()),
+                value: lwk_wollet::elements::confidential::Value::Explicit(1_000),
+                nonce: lwk_wollet::elements::confidential::Nonce::Null,
+                script_pubkey: destination_script,
+                witness: lwk_wollet::elements::TxOutWitness::default(),
+            },
+            lwk_wollet::elements::TxOut {
+                asset: lwk_wollet::elements::confidential::Asset::Explicit(asset),
+                value: lwk_wollet::elements::confidential::Value::Explicit(100),
+                nonce: lwk_wollet::elements::confidential::Nonce::Null,
+                script_pubkey: lwk_wollet::elements::Script::new(),
+                witness: lwk_wollet::elements::TxOutWitness::default(),
+            },
+        ],
+    };
+    let txid = transaction.txid().to_string();
+    let raw_tx_hex = hex::encode(lwk_wollet::elements::encode::serialize(&transaction));
     sqlx::query(
         "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
              claim_txid = $3, updated_at = NOW() WHERE id = $1",
     )
     .bind(swap.id)
-    .bind(raw_tx_hex)
+    .bind(&raw_tx_hex)
     .bind(&txid)
     .execute(pool)
     .await
@@ -15724,25 +15775,69 @@ async fn seed_liquid_merchant_settlement_attempt(
              destination_address, destination_script_hex, destination_asset_id, \
              destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
              liquid_blinding_key_hex\
-         ) VALUES ($1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,50000,1000,1.5,$8)",
+         ) VALUES ($1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,1000,100,1.5,$8)",
     )
     .bind(swap.id)
-    .bind(raw_tx_hex)
+    .bind(&raw_tx_hex)
     .bind(&txid)
     .bind(json!([{
-        "txid": "4444444444444444444444444444444444444444444444444444444444444444",
+        "txid": source_txid.to_string(),
         "vout": 0,
-        "amount_sat": 51_000,
+        "amount_sat": 1_100,
         "script_pubkey_hex": "0014abcd"
     }]))
-    .bind(format!("el1qqmerchant{suffix}"))
-    .bind("0014dcba")
-    .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind(DESTINATION_ADDRESS)
+    .bind(destination_script_hex)
+    .bind(ASSET_ID)
     .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     .execute(pool)
     .await
     .unwrap();
     (swap.id, txid)
+}
+
+fn verified_liquid_merchant_output(
+    txid: &str,
+    destination_address: &str,
+    destination_script_hex: &str,
+    asset_id: &str,
+    confirmations: u32,
+    block_height: u32,
+    block_hash: &str,
+) -> pay_service::merchant_output_verifier::VerifiedMerchantOutput {
+    use pay_service::merchant_output_verifier::{
+        verify_merchant_output, ApprovedMerchantDestination, JournaledMerchantTransaction,
+        MerchantAsset, MerchantOutputEvidence, ObservedMerchantOutput,
+    };
+
+    let asset = MerchantAsset::Liquid(asset_id.to_owned());
+    let approved =
+        ApprovedMerchantDestination::liquid(destination_address, destination_script_hex, asset_id);
+    let journal = JournaledMerchantTransaction::original(
+        txid,
+        destination_address,
+        destination_script_hex,
+        asset.clone(),
+        1_000,
+        0,
+    );
+    verify_merchant_output(
+        txid,
+        &journal,
+        &approved,
+        &MerchantOutputEvidence::Authoritative(ObservedMerchantOutput::new(
+            txid,
+            destination_script_hex,
+            asset,
+            1_000,
+            0,
+            confirmations,
+            Some(block_height),
+            Some(block_hash.to_owned()),
+        )),
+        1,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -15933,6 +16028,244 @@ async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_paren
         settled_metadata.2.as_deref(),
         Some("finalized retry observed")
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
+    use pay_service::merchant_settlement_adoption::{
+        MerchantSettlementContext, MerchantSettlementPath,
+    };
+    use pay_service::merchant_settlement_lifecycle::SettlementFinalityPolicy;
+    use pay_service::merchant_settlement_service::MerchantSettlementAdoptionService;
+
+    const BLOCK_HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "cas").await;
+    pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+        "initial broadcast accepted",
+    )
+    .await
+    .unwrap();
+
+    let (invoice_id, boltz_swap_id, destination_address, destination_script_hex, asset_id): (
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT parent.invoice_id, parent.boltz_swap_id, attempt.destination_address, \
+                attempt.destination_script_hex, attempt.destination_asset_id \
+           FROM chain_swap_records parent \
+           JOIN chain_swap_tx_attempts attempt ON attempt.chain_swap_id = parent.id \
+          WHERE parent.id = $1 AND attempt.txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let context = MerchantSettlementContext::new(
+        invoice_id,
+        swap_id,
+        boltz_swap_id,
+        MerchantSettlementPath::LiquidClaim,
+    )
+    .unwrap();
+    let policy = SettlementFinalityPolicy::new(2, 3).unwrap();
+    let mut service = MerchantSettlementAdoptionService::new(context, &txid, policy).unwrap();
+
+    let one_confirmation = verified_liquid_merchant_output(
+        &txid,
+        &destination_address,
+        &destination_script_hex,
+        &asset_id,
+        1,
+        100,
+        BLOCK_HASH,
+    );
+    let confirmed_outcome = service
+        .apply_verified_confirmation(&one_confirmation)
+        .unwrap();
+    let confirmed_snapshot = service.snapshot();
+    let confirmed = pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        0,
+        &confirmed_snapshot,
+        &confirmed_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(confirmed.checkpoint_version, 1);
+    assert!(!confirmed.journal_rebroadcast_required);
+    assert_eq!(confirmed.parent_transition.previous_status, "claiming");
+    assert_eq!(confirmed.parent_transition.current_status, "claiming");
+    assert!(!confirmed.parent_transition.changed);
+    let confirmed_event: (i64, String, bool, String, String) = sqlx::query_as(
+        "SELECT amount_sat, accounting_state, merchant_settlement_finalized, source, rail \
+           FROM invoice_payment_events WHERE merchant_chain_swap_id = $1",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(confirmed_event.0, 1_000);
+    assert_eq!(confirmed_event.1, "active");
+    assert!(!confirmed_event.2);
+    assert_eq!(confirmed_event.3, "bitcoin_boltz_chain");
+    assert_eq!(confirmed_event.4, "bitcoin");
+    let confirmed_invoice: (Option<i64>, Option<String>, String, String) = sqlx::query_as(
+        "SELECT paid_amount_sat, paid_via, status, swap_settlement_status \
+           FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(confirmed_invoice.0, Some(1_000));
+    assert_eq!(confirmed_invoice.1.as_deref(), Some("bitcoin"));
+    assert_eq!(confirmed_invoice.2, "paid");
+    assert_eq!(confirmed_invoice.3, "pending");
+    let confirmed_attempt: String = sqlx::query_scalar(
+        "SELECT status FROM chain_swap_tx_attempts WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(confirmed_attempt, "confirmed");
+
+    let final_confirmation = verified_liquid_merchant_output(
+        &txid,
+        &destination_address,
+        &destination_script_hex,
+        &asset_id,
+        2,
+        100,
+        BLOCK_HASH,
+    );
+    let finalized_outcome = service
+        .apply_verified_confirmation(&final_confirmation)
+        .unwrap();
+    let finalized_snapshot = service.snapshot();
+    let finalized = pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        1,
+        &finalized_snapshot,
+        &finalized_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(finalized.checkpoint_version, 2);
+    assert_eq!(finalized.parent_transition.previous_status, "claiming");
+    assert_eq!(finalized.parent_transition.current_status, "claimed");
+    assert!(finalized.parent_transition.changed);
+    let finalized_state: (String, bool, String, String) = sqlx::query_as(
+        "SELECT event.accounting_state, event.merchant_settlement_finalized, \
+                attempt.status, parent.status \
+           FROM invoice_payment_events event \
+           JOIN chain_swap_records parent ON parent.id = event.merchant_chain_swap_id \
+           JOIN chain_swap_tx_attempts attempt ON attempt.chain_swap_id = parent.id \
+          WHERE parent.id = $1 AND attempt.txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(finalized_state.0, "active");
+    assert!(finalized_state.1);
+    assert_eq!(finalized_state.2, "finalized");
+    assert_eq!(finalized_state.3, "claimed");
+
+    let stale = pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        1,
+        &finalized_snapshot,
+        &finalized_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await;
+    assert!(matches!(
+        stale,
+        Err(
+            pay_service::db::MerchantSettlementRepositoryError::CheckpointConflict {
+                expected: 1,
+                actual: 2
+            }
+        )
+    ));
+
+    let reorg_outcome = service.apply_reorg(100, BLOCK_HASH).unwrap();
+    let reorg_snapshot = service.snapshot();
+    let demoted = pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        2,
+        &reorg_snapshot,
+        &reorg_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(demoted.checkpoint_version, 3);
+    assert!(demoted.journal_rebroadcast_required);
+    assert_eq!(demoted.parent_transition.previous_status, "claimed");
+    assert_eq!(demoted.parent_transition.current_status, "claiming");
+    assert!(demoted.parent_transition.changed);
+    let demoted_state: (String, bool, Option<String>, String, String) = sqlx::query_as(
+        "SELECT event.accounting_state, event.merchant_settlement_finalized, \
+                event.deactivation_reason, attempt.status, parent.status \
+           FROM invoice_payment_events event \
+           JOIN chain_swap_records parent ON parent.id = event.merchant_chain_swap_id \
+           JOIN chain_swap_tx_attempts attempt ON attempt.chain_swap_id = parent.id \
+          WHERE parent.id = $1 AND attempt.txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(demoted_state.0, "inactive");
+    assert!(!demoted_state.1);
+    assert_eq!(demoted_state.2.as_deref(), Some("reorged"));
+    assert_eq!(demoted_state.3, "broadcast_ambiguous");
+    assert_eq!(demoted_state.4, "claiming");
+    let demoted_invoice: (Option<i64>, Option<String>, String, String) = sqlx::query_as(
+        "SELECT paid_amount_sat, paid_via, status, swap_settlement_status \
+           FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(demoted_invoice.0, None);
+    assert_eq!(demoted_invoice.1, None);
+    assert_eq!(demoted_invoice.2, "in_progress");
+    assert_eq!(demoted_invoice.3, "pending");
+    let checkpoint_version: i64 = sqlx::query_scalar(
+        "SELECT checkpoint_version FROM merchant_settlement_checkpoints \
+          WHERE chain_swap_id = $1 AND settlement_path = 'liquid_claim'",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checkpoint_version, 3);
 
     cleanup_db(&pool).await;
 }
