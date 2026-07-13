@@ -1661,6 +1661,110 @@ async fn load_projection_events_locked(
     .await
 }
 
+/// Rebuild the invoice projection after an exact merchant-settlement command
+/// batch while retaining the direct-payment reducer as the sole amount/status
+/// replay implementation.
+///
+/// The caller owns the surrounding transaction. Re-taking the advisory lock
+/// is intentional: PostgreSQL transaction-scoped advisory locks are reentrant,
+/// so this is safe whether the repository acquired the shared Lightning offer
+/// boundary before locking its settlement rows or calls this helper first.
+pub(crate) async fn reproject_after_merchant_settlement_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    swap_settlement_status: &str,
+    tolerances: InvoiceAccountingTolerances,
+) -> Result<bool, sqlx::Error> {
+    if !matches!(swap_settlement_status, "pending" | "settled") {
+        return protocol_error("merchant settlement projection status is invalid");
+    }
+
+    let offer_lock_key = super::invoice_lightning_lock_key(invoice_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&offer_lock_key)
+        .execute(&mut **tx)
+        .await?;
+    let mut invoice = sqlx::query_as::<_, LockedInvoice>(
+        "SELECT amount_sat, status, presentation_status, \
+                direct_settlement_status, swap_settlement_status, settlement_status, \
+                paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
+         FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invoice_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)?;
+    let prior_swap_settlement_status = invoice.swap_settlement_status.clone();
+    invoice.swap_settlement_status = swap_settlement_status.to_owned();
+
+    let projection_events = load_projection_events_locked(tx, invoice_id).await?;
+    let projection = reduce_projection(&invoice, &projection_events, tolerances);
+    let active_rails: Vec<String> = projection_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.accounting_state.as_str(),
+                "active" | "legacy_unverified"
+            )
+        })
+        .map(|event| event.rail.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let paid_via = match active_rails.as_slice() {
+        [] => None,
+        [rail] => Some(rail.as_str()),
+        _ => Some("mixed"),
+    };
+    let paid_amount_sat = (projection.received_sat > 0).then_some(projection.received_sat);
+    // A demoted or merely observed swap is still in progress even when its
+    // exact output is currently non-countable. This is the swap equivalent of
+    // the direct reducer's resolution-pending presentation.
+    let invoice_status = if projection.received_sat == 0
+        && swap_settlement_status == "pending"
+        && !matches!(invoice.status.as_str(), "cancelled" | "expired")
+    {
+        "in_progress"
+    } else {
+        projection.status
+    };
+    let changed = invoice.status != invoice_status
+        || invoice.presentation_status.as_deref() != Some(projection.presentation_status)
+        || invoice.direct_settlement_status != projection.direct_settlement_status
+        || prior_swap_settlement_status != swap_settlement_status
+        || invoice.settlement_status != projection.settlement_status
+        || invoice.paid_via.as_deref() != paid_via
+        || invoice.paid_amount_sat != paid_amount_sat;
+    if changed {
+        sqlx::query(
+            "UPDATE invoices SET \
+                 status = $2, presentation_status = $3, \
+                 direct_settlement_status = $4, swap_settlement_status = $5, \
+                 settlement_status = $6, paid_via = $7, paid_amount_sat = $8, \
+                 paid_at = CASE \
+                     WHEN $2 IN ('paid', 'overpaid') \
+                       OR ($2 IN ('cancelled', 'expired') \
+                           AND $3 IN ('payment_received', 'overpaid') \
+                           AND $8 IS NOT NULL) \
+                     THEN COALESCE(paid_at, NOW()) \
+                     ELSE NULL END, \
+                 direct_payment_projection_version = direct_payment_projection_version + 1 \
+             WHERE id = $1",
+        )
+        .bind(invoice_id)
+        .bind(invoice_status)
+        .bind(projection.presentation_status)
+        .bind(projection.direct_settlement_status)
+        .bind(swap_settlement_status)
+        .bind(projection.settlement_status)
+        .bind(paid_via)
+        .bind(paid_amount_sat)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
