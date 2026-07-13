@@ -18,6 +18,11 @@ MODE="all"
 FILTER=""
 KEEP=0
 STARTED=0
+RUN_IGNORED=0
+LOCKED=0
+DATA_VOLUME=""
+CLEANUP_FAILURE_PROBE=0
+CLEANUP_FAILURE_STATUS=86
 
 usage() {
   cat <<'USAGE'
@@ -26,6 +31,9 @@ Usage: scripts/test-db.sh [options] [test-filter]
 Options:
   --mode fresh|upgrade|all  Select migration/test lanes (default: all).
   --filter NAME             Pass one test-name filter to cargo test.
+  --ignored                 Run the exact ignored test selected by --filter.
+  --locked                  Require Cargo.lock to remain unchanged.
+  --cleanup-failure-probe   Exit after startup to prove trap cleanup.
   --keep                    Leave the uniquely named container running.
   -h, --help                Show this help.
 
@@ -55,6 +63,18 @@ while (($# > 0)); do
       KEEP=1
       shift
       ;;
+    --ignored)
+      RUN_IGNORED=1
+      shift
+      ;;
+    --locked)
+      LOCKED=1
+      shift
+      ;;
+    --cleanup-failure-probe)
+      CLEANUP_FAILURE_PROBE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -74,23 +94,39 @@ case "$MODE" in
   fresh|upgrade|all) ;;
   *) die "invalid mode '$MODE' (expected fresh, upgrade, or all)" ;;
 esac
+if ((CLEANUP_FAILURE_PROBE == 1 && KEEP == 1)); then
+  die "--cleanup-failure-probe cannot be combined with --keep"
+fi
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
 
 cleanup() {
   local status=$?
+  local cleanup_failed=0
   trap - EXIT
   if ((STARTED == 1)); then
-    if ((status != 0)); then
+    if ((status != 0 && CLEANUP_FAILURE_PROBE == 0)); then
       echo "test-db: PostgreSQL log tail after failure:" >&2
       docker logs --tail 50 "$CONTAINER" >&2 || true
     fi
     if ((KEEP == 1)); then
       echo "test-db: kept container $CONTAINER (host port ${HOST_PORT:-unknown})"
     else
-      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-      echo "test-db: removed container $CONTAINER"
+      docker rm -fv "$CONTAINER" >/dev/null 2>&1 || cleanup_failed=1
+      if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        echo "test-db: container cleanup verification failed" >&2
+        cleanup_failed=1
+      fi
+      if [[ -n "$DATA_VOLUME" ]] && docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+        echo "test-db: anonymous data-volume cleanup verification failed" >&2
+        cleanup_failed=1
+      fi
+      if ((cleanup_failed == 0)); then
+        echo "test-db: verified container and anonymous data-volume cleanup"
+      else
+        status=1
+      fi
     fi
   fi
   exit "$status"
@@ -105,6 +141,14 @@ docker run --detach \
   --publish 127.0.0.1::5432 \
   "$POSTGRES_IMAGE" >/dev/null
 STARTED=1
+
+DATA_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' "$CONTAINER")"
+[[ "$DATA_VOLUME" =~ ^[0-9a-f]{64}$ ]] \
+  || die "could not resolve the anonymous PostgreSQL data volume"
+if ((CLEANUP_FAILURE_PROBE == 1)); then
+  echo "test-db: exercising intentional post-start cleanup failure path"
+  exit "$CLEANUP_FAILURE_STATUS"
+fi
 
 READY=0
 READY_STREAK=0
@@ -172,11 +216,20 @@ apply_migrations() {
 
 run_integration_suite() {
   local database="$1"
-  local -a args=(test --test integration_test)
+  local -a args=(test)
+  if ((LOCKED == 1)); then
+    args+=(--locked)
+  fi
+  args+=(--test integration_test)
   if [[ -n "$FILTER" ]]; then
     args+=("$FILTER")
   fi
-  args+=(-- --test-threads=1)
+  if ((RUN_IGNORED == 1)); then
+    [[ -n "$FILTER" ]] || die "--ignored requires --filter"
+    args+=(-- --ignored --exact --test-threads=1)
+  else
+    args+=(-- --test-threads=1)
+  fi
   echo "test-db: running serial integration suite against $database"
   TEST_DATABASE_URL="$(db_url "$database")" cargo "${args[@]}"
 }

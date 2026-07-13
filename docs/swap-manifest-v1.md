@@ -108,6 +108,9 @@ sequence or treat a malformed record as an absent obligation.
 ## Integration boundary left to the next package
 
 Before a payer instruction is exposed, creation must durably write this exact
-record to configured off-host storage and record delivery evidence. Later
-restore work must reconcile database, manifest, chain, and validated Boltz xpub
-restore evidence. This format package alone does not claim either guarantee.
+record to configured off-host storage and record delivery evidence. Migration
+052 provides only the local append-only handoff described in
+[`swap-manifest-delivery-ledger.md`](swap-manifest-delivery-ledger.md); it does
+not perform off-host delivery or authorize exposure. Later restore work must
+reconcile database, manifest, chain, and validated Boltz xpub restore evidence.
+This format package alone does not claim either guarantee.
