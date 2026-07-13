@@ -26,9 +26,14 @@ record skip an undelivered predecessor. Delivery advances only
 acknowledgement is idempotent; a mismatched manifest, swap, sequence,
 predecessor, or digest changes nothing.
 
-The envelope is nonempty and at most one MiB. PostgreSQL independently checks
-its exact lowercase SHA-256. Identity, topology, envelope, digest, and creation
-timestamp are immutable, and ordinary deletion is rejected.
+The Rust insert boundary accepts only `EncryptedSwapManifestV1`, so an
+arbitrary or noncanonical string cannot become the global pending barrier.
+PostgreSQL still independently requires a nonempty envelope of at most one MiB
+and checks its exact lowercase SHA-256, protecting against direct SQL writers.
+Identity, topology, envelope, digest, and creation timestamp are immutable,
+and ordinary deletion is rejected. Audit reads return full envelopes and are
+therefore capped at 64 rows per page (at most 64 MiB of envelope bytes before
+row metadata overhead).
 
 ## Transaction boundary
 
@@ -38,13 +43,17 @@ A future writer must use one database transaction to:
 2. allocate the manifest UUID and construct the returned sequence/predecessor
    identity;
 3. sign and encrypt the manifest with that identity;
-4. call `insert_manifest_delivery` with those exact envelope bytes;
+4. parse those exact envelope bytes as `EncryptedSwapManifestV1` and call
+   `insert_manifest_delivery` with that validated value;
 5. commit the pending row.
 
 Off-host I/O happens after that commit. Restart code reads
 `list_pending_manifest_deliveries`, retries create-only delivery of the exact
 bytes, and calls `mark_manifest_delivered` with the exact identity and digest.
-Only then can another tail be reserved.
+Database rows are parsed back into `EncryptedSwapManifestV1` before any read or
+resume API returns them; malformed restored or direct-SQL bytes fail closed as
+a sanitized database-corruption error. Only after successful delivery can
+another tail be reserved.
 
 The database cannot decrypt the envelope and cannot prove its ciphertext binds
 the clear ledger metadata. Typed manifest construction and restore-time

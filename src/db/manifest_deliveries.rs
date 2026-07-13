@@ -4,11 +4,15 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::swap_manifest::EncryptedSwapManifestV1;
+
 /// PostgreSQL advisory-lock namespace shared with migration 052.
 const MANIFEST_LEDGER_LOCK_CLASS: i32 = 1_112_886_348;
 const MANIFEST_LEDGER_LOCK_OBJECT: i32 = 87;
 pub const MAX_MANIFEST_ENVELOPE_BYTES: usize = 1_048_576;
-pub const MAX_MANIFEST_AUDIT_PAGE: usize = 1_000;
+/// Audit rows include the encrypted envelope, so cap worst-case envelope
+/// materialization at 64 MiB before row metadata overhead.
+pub const MAX_MANIFEST_AUDIT_PAGE: usize = 64;
 
 const DELIVERY_COLUMNS: &str = "manifest_id, chain_swap_id, manifest_sequence, \
     previous_manifest_id, encrypted_envelope, envelope_sha256, delivery_state, \
@@ -73,7 +77,7 @@ pub struct ChainSwapManifestDelivery {
     pub chain_swap_id: Uuid,
     pub manifest_sequence: u64,
     pub previous_manifest_id: Option<Uuid>,
-    encrypted_envelope: String,
+    encrypted_envelope: EncryptedSwapManifestV1,
     pub envelope_sha256: String,
     pub delivery_state: String,
     pub created_at_unix: i64,
@@ -90,11 +94,11 @@ impl ChainSwapManifestDelivery {
         }
     }
 
-    pub fn encrypted_envelope(&self) -> &str {
+    pub fn encrypted_envelope(&self) -> &EncryptedSwapManifestV1 {
         &self.encrypted_envelope
     }
 
-    pub fn into_encrypted_envelope(self) -> String {
+    pub fn into_encrypted_envelope(self) -> EncryptedSwapManifestV1 {
         self.encrypted_envelope
     }
 }
@@ -106,7 +110,10 @@ impl fmt::Debug for ChainSwapManifestDelivery {
             .field("chain_swap_id", &self.chain_swap_id)
             .field("manifest_sequence", &self.manifest_sequence)
             .field("previous_manifest_id", &self.previous_manifest_id)
-            .field("encrypted_envelope_bytes", &self.encrypted_envelope.len())
+            .field(
+                "encrypted_envelope_bytes",
+                &self.encrypted_envelope.encoded().len(),
+            )
             .field("encrypted_envelope", &"<redacted>")
             .field("envelope_sha256", &self.envelope_sha256)
             .field("delivery_state", &self.delivery_state)
@@ -142,6 +149,9 @@ pub enum ManifestDeliveryError {
     CorruptDatabaseSequence {
         sequence: i64,
     },
+    CorruptDatabaseEnvelope {
+        manifest_id: Uuid,
+    },
 }
 
 impl fmt::Display for ManifestDeliveryError {
@@ -170,6 +180,9 @@ impl fmt::Display for ManifestDeliveryError {
             }
             Self::CorruptDatabaseSequence { .. } => {
                 f.write_str("manifest delivery database contains a non-positive sequence")
+            }
+            Self::CorruptDatabaseEnvelope { .. } => {
+                f.write_str("manifest delivery database contains an invalid encrypted envelope")
             }
         }
     }
@@ -217,12 +230,18 @@ impl TryFrom<ManifestDeliveryDbRow> for ChainSwapManifestDelivery {
                 sequence: row.manifest_sequence,
             });
         }
+        let encrypted_envelope =
+            EncryptedSwapManifestV1::parse(row.encrypted_envelope).map_err(|_| {
+                ManifestDeliveryError::CorruptDatabaseEnvelope {
+                    manifest_id: row.manifest_id,
+                }
+            })?;
         Ok(Self {
             manifest_id: row.manifest_id,
             chain_swap_id: row.chain_swap_id,
             manifest_sequence,
             previous_manifest_id: row.previous_manifest_id,
-            encrypted_envelope: row.encrypted_envelope,
+            encrypted_envelope,
             envelope_sha256: row.envelope_sha256,
             delivery_state: row.delivery_state,
             created_at_unix: row.created_at_unix,
@@ -295,15 +314,17 @@ pub async fn lock_manifest_delivery_tail(
     }
 }
 
-/// Insert the exact caller-signed encrypted envelope while the caller's
-/// transaction still owns the tail reservation lock. The database recomputes
-/// and checks this SHA-256 independently. This layer cannot decrypt the
-/// envelope and therefore does not claim its ciphertext binds these metadata.
+/// Insert the exact, structurally validated encrypted envelope while the
+/// caller's transaction still owns the tail reservation lock. The database
+/// recomputes and checks this SHA-256 independently. This layer cannot decrypt
+/// the envelope and therefore does not claim its ciphertext binds these
+/// metadata.
 pub async fn insert_manifest_delivery(
     conn: &mut PgConnection,
     identity: &ManifestDeliveryIdentity,
-    encrypted_envelope: &str,
+    encrypted_envelope: &EncryptedSwapManifestV1,
 ) -> Result<ChainSwapManifestDelivery, ManifestDeliveryError> {
+    let encrypted_envelope = encrypted_envelope.encoded();
     let actual = encrypted_envelope.len();
     if actual == 0 || actual > MAX_MANIFEST_ENVELOPE_BYTES {
         return Err(ManifestDeliveryError::InvalidEnvelopeSize {

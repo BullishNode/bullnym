@@ -4,8 +4,15 @@ DECLARE
     second_manifest CONSTANT UUID := '52000000-0000-0000-0000-000000000002';
     first_swap CONSTANT UUID := '50000000-0000-0000-0000-000000000003';
     second_swap CONSTANT UUID := '51000000-0000-0000-0000-000000000003';
-    first_envelope CONSTANT TEXT := '{"ciphertext_hex":"migration-052-first"}';
-    second_envelope CONSTANT TEXT := '{"ciphertext_hex":"migration-052-second"}';
+    first_envelope CONSTANT TEXT :=
+        '{"ciphertext_hex":"51515151515151515151515151515151","encryption_algorithm":"xchacha20poly1305","encryption_key_id":"manifest-key-migration-052","format":"bullnym-chain-swap-manifest",' ||
+        '"nonce_hex":"525252525252525252525252525252525252525252525252","signature_algorithm":"bip340-secp256k1-sha256","signer_xonly_public_key":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","version":1}';
+    second_envelope CONSTANT TEXT :=
+        '{"ciphertext_hex":"53535353535353535353535353535353","encryption_algorithm":"xchacha20poly1305","encryption_key_id":"manifest-key-migration-052","format":"bullnym-chain-swap-manifest",' ||
+        '"nonce_hex":"545454545454545454545454545454545454545454545454","signature_algorithm":"bip340-secp256k1-sha256","signer_xonly_public_key":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","version":1}';
+    mutated_envelope CONSTANT TEXT :=
+        '{"ciphertext_hex":"55555555555555555555555555555555","encryption_algorithm":"xchacha20poly1305","encryption_key_id":"manifest-key-migration-052","format":"bullnym-chain-swap-manifest",' ||
+        '"nonce_hex":"565656565656565656565656565656565656565656565656","signature_algorithm":"bip340-secp256k1-sha256","signer_xonly_public_key":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","version":1}';
     first_digest TEXT;
     second_digest TEXT;
     persisted_count BIGINT;
@@ -86,9 +93,9 @@ BEGIN
 
     BEGIN
         UPDATE chain_swap_manifest_deliveries
-           SET encrypted_envelope = '{"ciphertext_hex":"mutated"}',
+           SET encrypted_envelope = mutated_envelope,
                envelope_sha256 = encode(
-                   digest(convert_to('{"ciphertext_hex":"mutated"}', 'UTF8'), 'sha256'),
+                   digest(convert_to(mutated_envelope, 'UTF8'), 'sha256'),
                    'hex'
                )
          WHERE manifest_id = second_manifest;
