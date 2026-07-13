@@ -22,7 +22,7 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db,
     derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr,
-    og_image, pricer, qr, rate_limit, readiness, reconciler, registration,
+    og_image, pricer, qr, rate_limit, readiness, reconciler, registration, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -98,6 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              host-local missing-file verification will not run"
         );
     }
+
+    let recovery_manifest_runtime_v1 =
+        swap_manifest_runtime::RecoveryManifestRuntimeV1::for_process_startup();
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_size)
@@ -424,6 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitcoin_recovery_backend,
         pricer: pricer_client,
         pwa_shells,
+        recovery_manifest_runtime_v1,
         swap_key_root_fingerprint: swap_key_root_fingerprint.clone(),
     };
 

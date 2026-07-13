@@ -63,6 +63,9 @@ pub struct AppState {
     pub bitcoin_recovery_backend: Option<Arc<chain_recovery::BitcoinRecoveryBackend>>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
+    /// Protected off-host manifest capability. Absence is fail-closed for new
+    /// chain-swap creation but must not stop existing-obligation recovery.
+    pub recovery_manifest_runtime_v1: Option<Arc<swap_manifest_runtime::RecoveryManifestRuntimeV1>>,
     /// Fingerprint of the swap-key master seed (see [`derivation_guard`] and
     /// migrations 044/050). Persisted in the allocation registry before each
     /// provider call so a rewound key sequence is detectable even for orphans.
@@ -70,6 +73,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Narrow handoff for the chain-swap creation/delivery coordinator.
+    ///
+    /// Callers can seal through [`swap_manifest_runtime::RecoveryManifestRuntimeV1`]
+    /// and use its retained store, but cannot access raw credentials or keys.
+    pub fn recovery_manifest_runtime_v1(
+        &self,
+    ) -> Option<&swap_manifest_runtime::RecoveryManifestRuntimeV1> {
+        self.recovery_manifest_runtime_v1.as_deref()
+    }
+
     /// Private #68 operations view. Public `/ready` deliberately remains the
     /// DB/schema readiness contract and does not serialize these details.
     pub fn operations_snapshot(&self) -> admission::OperationsSnapshot {

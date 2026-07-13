@@ -9,6 +9,7 @@
 use std::env::VarError;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
@@ -122,6 +123,17 @@ impl RecoveryManifestRuntimeV1 {
         })
     }
 
+    /// Build the protected runtime once for retention in application state.
+    ///
+    /// Missing, partial, or invalid protected configuration leaves this
+    /// capability unavailable instead of stopping existing-obligation HTTP and
+    /// recovery paths. The future creation coordinator must treat `None` as a
+    /// refusal before any provider mutation. The warning contains only the
+    /// bounded source-free error class.
+    pub fn for_process_startup() -> Option<Arc<Self>> {
+        Self::finish_startup(Self::from_process_env())
+    }
+
     pub fn store(&self) -> &RecoveryManifestStore {
         &self.store
     }
@@ -208,6 +220,28 @@ impl RecoveryManifestRuntimeV1 {
             signing_keypair,
             expected_signer,
         })
+    }
+
+    fn finish_startup(
+        result: Result<Self, RecoveryManifestRuntimeConfigError>,
+    ) -> Option<Arc<Self>> {
+        match result {
+            Ok(runtime) => {
+                tracing::info!(
+                    event = "recovery_manifest_runtime_configured",
+                    "recovery-manifest protected runtime configured"
+                );
+                Some(Arc::new(runtime))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "recovery_manifest_runtime_unavailable",
+                    error = %error,
+                    "recovery-manifest protected runtime unavailable; new chain-swap creation must remain closed"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -653,5 +687,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, RecoveryManifestRuntimeConfigError::InvalidValue);
         assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn startup_state_retains_a_complete_configured_runtime() {
+        let runtime = RecoveryManifestRuntimeV1::finish_startup(load(&valid_values()))
+            .expect("complete protected configuration must be retained");
+        let id = ManifestObjectId::new(Uuid::from_u128(3), Uuid::from_u128(4)).unwrap();
+        assert_eq!(
+            runtime.store().object_key_v1(id),
+            "bullnym/recovery/v1/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004.json"
+        );
+    }
+
+    #[test]
+    fn startup_state_is_unavailable_when_protected_config_is_missing() {
+        let missing = BTreeMap::new();
+        assert!(RecoveryManifestRuntimeV1::finish_startup(load(&missing)).is_none());
+    }
+
+    #[test]
+    fn startup_state_is_unavailable_when_protected_config_is_invalid() {
+        let mut invalid = valid_values();
+        invalid.insert(S3_PATH_STYLE_ENV.to_owned(), "True".to_owned());
+        assert!(RecoveryManifestRuntimeV1::finish_startup(load(&invalid)).is_none());
     }
 }

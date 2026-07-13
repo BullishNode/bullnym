@@ -222,6 +222,7 @@ fn test_state_with_provider_limits(
         bitcoin_recovery_backend: Some(bitcoin_recovery_backend),
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
+        recovery_manifest_runtime_v1: None,
         swap_key_root_fingerprint: Arc::new("0000000000000000".to_string()),
     }
 }
