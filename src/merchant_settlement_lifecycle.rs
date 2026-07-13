@@ -171,6 +171,22 @@ pub struct MerchantSettlementLifecycle {
     last_reorged_block: Option<SettlementBlock>,
 }
 
+/// Complete typed state exported for durable repository storage. Fields remain
+/// public so a repository can map columns without serialization coupling; only
+/// [`MerchantSettlementLifecycle::restore`] may turn them back into authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementLifecycleSnapshot {
+    pub chain: SettlementChain,
+    pub journal_txid: SettlementTxid,
+    pub active_txid: SettlementTxid,
+    pub state: SettlementState,
+    pub accounting: SettlementAccountingState,
+    pub history: SettlementEvidenceHistory,
+    pub linked_replacement: Option<(SettlementTxid, SettlementTxid)>,
+    pub last_confirmed_block: Option<SettlementBlock>,
+    pub last_reorged_block: Option<SettlementBlock>,
+}
+
 impl MerchantSettlementLifecycle {
     pub fn new(chain: SettlementChain, journal_txid: SettlementTxid) -> Self {
         Self {
@@ -221,6 +237,40 @@ impl MerchantSettlementLifecycle {
 
     pub fn last_confirmed_block(&self) -> Option<&SettlementBlock> {
         self.last_confirmed_block.as_ref()
+    }
+
+    pub fn snapshot(&self) -> SettlementLifecycleSnapshot {
+        SettlementLifecycleSnapshot {
+            chain: self.chain,
+            journal_txid: self.journal_txid.clone(),
+            active_txid: self.active_txid.clone(),
+            state: self.state.clone(),
+            accounting: self.accounting,
+            history: self.history,
+            linked_replacement: self.linked_replacement.clone(),
+            last_confirmed_block: self.last_confirmed_block.clone(),
+            last_reorged_block: self.last_reorged_block.clone(),
+        }
+    }
+
+    /// Restore persisted state only after revalidating every cross-field
+    /// invariant and the current nonzero finality policy.
+    pub fn restore(
+        snapshot: SettlementLifecycleSnapshot,
+        policy: SettlementFinalityPolicy,
+    ) -> Result<Self, SettlementLifecycleError> {
+        validate_snapshot(&snapshot, policy)?;
+        Ok(Self {
+            chain: snapshot.chain,
+            journal_txid: snapshot.journal_txid,
+            active_txid: snapshot.active_txid,
+            state: snapshot.state,
+            accounting: snapshot.accounting,
+            history: snapshot.history,
+            linked_replacement: snapshot.linked_replacement,
+            last_confirmed_block: snapshot.last_confirmed_block,
+            last_reorged_block: snapshot.last_reorged_block,
+        })
     }
 }
 
@@ -300,6 +350,11 @@ pub enum SettlementLifecycleError {
     ReorgRequiresConfirmedEvidence,
     ReorgBlockMismatch,
     ReconfirmationUsesReorgedBlock,
+    InvalidSnapshotIdentity,
+    InvalidSnapshotState,
+    InvalidSnapshotHistory,
+    InvalidSnapshotAccounting,
+    InvalidSnapshotBlockEvidence,
 }
 
 impl fmt::Display for SettlementLifecycleError {
@@ -573,6 +628,152 @@ fn require_active(
 fn canonical_hash(value: &str) -> Option<String> {
     (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then(|| value.to_ascii_lowercase())
+}
+
+fn validate_snapshot(
+    snapshot: &SettlementLifecycleSnapshot,
+    policy: SettlementFinalityPolicy,
+) -> Result<(), SettlementLifecycleError> {
+    if !snapshot.history.constructed {
+        return Err(SettlementLifecycleError::InvalidSnapshotHistory);
+    }
+
+    match &snapshot.linked_replacement {
+        None if snapshot.active_txid != snapshot.journal_txid => {
+            return Err(SettlementLifecycleError::InvalidSnapshotIdentity);
+        }
+        None if snapshot.history.replaced
+            || matches!(snapshot.state, SettlementState::Replaced { .. }) =>
+        {
+            return Err(SettlementLifecycleError::InvalidSnapshotIdentity);
+        }
+        Some((parent, child))
+            if parent != &snapshot.journal_txid
+                || child != &snapshot.active_txid
+                || parent == child
+                || !snapshot.history.replaced =>
+        {
+            return Err(SettlementLifecycleError::InvalidSnapshotIdentity);
+        }
+        Some((parent, child)) => {
+            if let SettlementState::Replaced {
+                replaced_txid,
+                replacement_txid,
+            } = &snapshot.state
+            {
+                if replaced_txid != parent || replacement_txid != child {
+                    return Err(SettlementLifecycleError::InvalidSnapshotIdentity);
+                }
+            }
+        }
+        None => {}
+    }
+
+    let required = policy.required(snapshot.chain);
+    match &snapshot.state {
+        SettlementState::Constructed => {
+            if snapshot.history
+                != (SettlementEvidenceHistory {
+                    constructed: true,
+                    ..SettlementEvidenceHistory::default()
+                })
+                || snapshot.linked_replacement.is_some()
+            {
+                return Err(SettlementLifecycleError::InvalidSnapshotState);
+            }
+        }
+        SettlementState::Broadcast if !snapshot.history.broadcast => {
+            return Err(SettlementLifecycleError::InvalidSnapshotHistory);
+        }
+        SettlementState::Mempool if !snapshot.history.mempool => {
+            return Err(SettlementLifecycleError::InvalidSnapshotHistory);
+        }
+        SettlementState::Confirmed {
+            block,
+            confirmations,
+            required_confirmations,
+        } => {
+            if *confirmations == 0
+                || *confirmations >= required
+                || *required_confirmations != required
+                || snapshot.last_confirmed_block.as_ref() != Some(block)
+                || !snapshot.history.confirmed
+            {
+                return Err(SettlementLifecycleError::InvalidSnapshotState);
+            }
+        }
+        SettlementState::Finalized {
+            block,
+            confirmations,
+            required_confirmations,
+        } => {
+            if *confirmations < required
+                || *required_confirmations != required
+                || snapshot.last_confirmed_block.as_ref() != Some(block)
+                || !snapshot.history.confirmed
+                || !snapshot.history.finalized
+            {
+                return Err(SettlementLifecycleError::InvalidSnapshotState);
+            }
+        }
+        SettlementState::Replaced { .. } if snapshot.linked_replacement.is_none() => {
+            return Err(SettlementLifecycleError::InvalidSnapshotIdentity);
+        }
+        SettlementState::Evicted => {
+            if !snapshot.history.evicted {
+                return Err(SettlementLifecycleError::InvalidSnapshotHistory);
+            }
+        }
+        SettlementState::Reorged { previous_block } => {
+            if !snapshot.history.reorged
+                || snapshot.last_confirmed_block.as_ref() != Some(previous_block)
+                || snapshot.last_reorged_block.as_ref() != Some(previous_block)
+            {
+                return Err(SettlementLifecycleError::InvalidSnapshotBlockEvidence);
+            }
+        }
+        SettlementState::Broadcast
+        | SettlementState::Mempool
+        | SettlementState::Replaced { .. } => {}
+    }
+
+    if snapshot.history.confirmed != snapshot.last_confirmed_block.is_some()
+        || snapshot.history.reorged != snapshot.last_reorged_block.is_some()
+        || snapshot.history.finalized && !snapshot.history.confirmed
+    {
+        return Err(SettlementLifecycleError::InvalidSnapshotBlockEvidence);
+    }
+    let accounting_valid = match (&snapshot.state, snapshot.accounting) {
+        (SettlementState::Constructed, SettlementAccountingState::Unrecorded) => true,
+        (SettlementState::Confirmed { .. }, SettlementAccountingState::Confirmed)
+        | (SettlementState::Finalized { .. }, SettlementAccountingState::Finalized)
+        | (SettlementState::Reorged { .. }, SettlementAccountingState::Demoted) => true,
+        (
+            SettlementState::Broadcast
+            | SettlementState::Mempool
+            | SettlementState::Replaced { .. }
+            | SettlementState::Evicted,
+            SettlementAccountingState::Unrecorded,
+        ) if !snapshot.history.confirmed => true,
+        (
+            SettlementState::Broadcast
+            | SettlementState::Mempool
+            | SettlementState::Replaced { .. }
+            | SettlementState::Evicted,
+            SettlementAccountingState::Demoted,
+        ) if snapshot.history.confirmed => true,
+        _ => false,
+    };
+    if !accounting_valid {
+        return Err(SettlementLifecycleError::InvalidSnapshotAccounting);
+    }
+    if snapshot.accounting == SettlementAccountingState::Demoted
+        && !(snapshot.history.evicted || snapshot.history.reorged || snapshot.history.replaced)
+    {
+        return Err(SettlementLifecycleError::InvalidSnapshotAccounting);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -943,5 +1144,201 @@ mod tests {
         assert!(history.mempool);
         assert!(history.confirmed);
         assert!(history.evicted);
+    }
+
+    #[test]
+    fn confirmed_and_finalized_snapshots_restore_without_replaying_accounting() {
+        let confirmed = apply(
+            &lifecycle(SettlementChain::Liquid),
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        let restored = MerchantSettlementLifecycle::restore(
+            confirmed.lifecycle.snapshot(),
+            SettlementFinalityPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(restored, confirmed.lifecycle);
+        let duplicate = apply(
+            &restored,
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        assert_eq!(duplicate.effects, SettlementTransitionEffects::default());
+
+        let finalized = apply(
+            &restored,
+            SettlementEvidence::Finalized {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 2,
+            },
+        );
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(
+                finalized.lifecycle.snapshot(),
+                SettlementFinalityPolicy::default(),
+            )
+            .unwrap(),
+            finalized.lifecycle
+        );
+    }
+
+    #[test]
+    fn reorg_snapshot_restores_demotion_and_reconfirms_on_a_new_block() {
+        let confirmed = apply(
+            &lifecycle(SettlementChain::Liquid),
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        let reorged = apply(
+            &confirmed.lifecycle,
+            SettlementEvidence::Reorged {
+                txid: txid('1'),
+                previous_block: block(100, 'a'),
+            },
+        );
+        let restored = MerchantSettlementLifecycle::restore(
+            reorged.lifecycle.snapshot(),
+            SettlementFinalityPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.accounting_state(),
+            SettlementAccountingState::Demoted
+        );
+        let reconfirmed = apply(
+            &restored,
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(101, 'b'),
+                confirmations: 1,
+            },
+        );
+        assert!(reconfirmed.effects.reactivate_accounting);
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(
+                reconfirmed.lifecycle.snapshot(),
+                SettlementFinalityPolicy::default(),
+            )
+            .unwrap(),
+            reconfirmed.lifecycle
+        );
+    }
+
+    #[test]
+    fn linked_replacement_snapshot_restores_original_and_active_identities() {
+        let confirmed = apply(
+            &lifecycle(SettlementChain::Liquid),
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        let replaced = apply(
+            &confirmed.lifecycle,
+            SettlementEvidence::Replaced {
+                replaced_txid: txid('1'),
+                replacement_txid: txid('2'),
+            },
+        );
+        let restored = MerchantSettlementLifecycle::restore(
+            replaced.lifecycle.snapshot(),
+            SettlementFinalityPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.journal_txid(), &txid('1'));
+        assert_eq!(restored.active_txid(), &txid('2'));
+        assert_eq!(
+            restored.linked_replacement(),
+            Some((&txid('1'), &txid('2')))
+        );
+        let child = apply(
+            &restored,
+            SettlementEvidence::Confirmed {
+                txid: txid('2'),
+                block: block(101, 'b'),
+                confirmations: 1,
+            },
+        );
+        assert!(child.effects.reactivate_accounting);
+    }
+
+    #[test]
+    fn malformed_snapshots_fail_closed_at_each_invariant_boundary() {
+        let policy = SettlementFinalityPolicy::default();
+
+        let mut identity = lifecycle(SettlementChain::Liquid).snapshot();
+        identity.active_txid = txid('2');
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(identity, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotIdentity)
+        );
+
+        let confirmed = apply(
+            &lifecycle(SettlementChain::Liquid),
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        let mut accounting = confirmed.lifecycle.snapshot();
+        accounting.accounting = SettlementAccountingState::Unrecorded;
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(accounting, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotAccounting)
+        );
+
+        let mut unsupported_demotion = confirmed.lifecycle.snapshot();
+        unsupported_demotion.state = SettlementState::Mempool;
+        unsupported_demotion.history.mempool = true;
+        unsupported_demotion.accounting = SettlementAccountingState::Demoted;
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(unsupported_demotion, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotAccounting)
+        );
+
+        let mut state = confirmed.lifecycle.snapshot();
+        state.state = SettlementState::Confirmed {
+            block: block(100, 'a'),
+            confirmations: 2,
+            required_confirmations: 2,
+        };
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(state, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotState)
+        );
+
+        let mut history = lifecycle(SettlementChain::Liquid).snapshot();
+        history.history.constructed = false;
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(history, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotHistory)
+        );
+
+        let reorged = apply(
+            &confirmed.lifecycle,
+            SettlementEvidence::Reorged {
+                txid: txid('1'),
+                previous_block: block(100, 'a'),
+            },
+        );
+        let mut block_evidence = reorged.lifecycle.snapshot();
+        block_evidence.last_reorged_block = None;
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(block_evidence, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotBlockEvidence)
+        );
     }
 }
