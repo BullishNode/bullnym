@@ -396,11 +396,13 @@ impl SwapManifestV1 {
         if lineage.key_epoch <= 0 || lineage.derivation_scheme_version <= 0 {
             return invalid("derivation epoch and scheme version must be positive");
         }
-        validate_allocation(&lineage.claim, ManifestKeyPurposeV1::ChainClaim)?;
-        validate_allocation(&lineage.refund, ManifestKeyPurposeV1::ChainRefund)?;
+        let claim_public_key =
+            validate_allocation(&lineage.claim, ManifestKeyPurposeV1::ChainClaim)?;
+        let refund_public_key =
+            validate_allocation(&lineage.refund, ManifestKeyPurposeV1::ChainRefund)?;
         if lineage.claim.allocation_id == lineage.refund.allocation_id
             || lineage.claim.child_index == lineage.refund.child_index
-            || lineage.claim.public_key_hex == lineage.refund.public_key_hex
+            || claim_public_key.x_only_public_key().0 == refund_public_key.x_only_public_key().0
         {
             return invalid("claim and refund derivation identities must be distinct");
         }
@@ -626,7 +628,7 @@ fn validate_envelope_header(header: &EnvelopeHeaderV1) -> Result<(), SwapManifes
 fn validate_allocation(
     allocation: &ManifestKeyAllocationV1,
     expected_purpose: ManifestKeyPurposeV1,
-) -> Result<(), SwapManifestError> {
+) -> Result<secp256k1::PublicKey, SwapManifestError> {
     require_non_nil("allocation id", allocation.allocation_id)?;
     if allocation.child_index < 0 {
         return invalid("derivation child index must be non-negative");
@@ -640,7 +642,7 @@ fn validate_allocation(
         return invalid("derivation public key is not compressed secp256k1 hex");
     }
     require_lower_hex("derivation public key", &allocation.public_key_hex, 33)?;
-    secp256k1::PublicKey::from_str(&allocation.public_key_hex)
+    let public_key = secp256k1::PublicKey::from_str(&allocation.public_key_hex)
         .map_err(|_| SwapManifestError::InvalidField("derivation public key is invalid".into()))?;
     match (allocation.purpose, allocation.preimage_hash_hex.as_deref()) {
         (ManifestKeyPurposeV1::ChainClaim, Some(hash)) => {
@@ -649,7 +651,7 @@ fn validate_allocation(
         (ManifestKeyPurposeV1::ChainRefund, None) => {}
         _ => return invalid("preimage hash does not match derivation purpose"),
     }
-    Ok(())
+    Ok(public_key)
 }
 
 fn validate_local_bip21(creation: &ImmutableChainSwapCreationV1) -> Result<(), SwapManifestError> {
@@ -1195,6 +1197,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, SwapManifestError::InvalidField(_)));
         assert!(error.to_string().contains("provider response id"));
+    }
+
+    #[test]
+    fn manifest_rejects_opposite_parity_for_one_taproot_role_key() {
+        let mut manifest = fixture();
+        manifest.derivation_lineage.refund.public_key_hex =
+            "024f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa".into();
+
+        let error = manifest
+            .seal_with_nonce(
+                "manifest-key-2026-01",
+                &ENCRYPTION_KEY,
+                &signing_key(),
+                &NONCE,
+            )
+            .unwrap_err();
+        assert!(matches!(error, SwapManifestError::InvalidField(_)));
+        assert!(error.to_string().contains("derivation identities"));
     }
 
     #[test]

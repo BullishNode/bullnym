@@ -59,8 +59,9 @@ Version 1 contains closed typed fields, with no extension map:
 
 Readers cross-check the provider ID, lockup address, both amounts, pair hash,
 BIP21 address/amount, response digest, and duplicated policy destinations.
-Claim/refund allocation identities must be distinct and valid compressed
-secp256k1 public keys.
+Claim/refund allocation identities must be valid compressed secp256k1 keys and
+distinct after x-only normalization; opposite compressed parity does not create
+a distinct Taproot role key.
 
 The payload has no preimage, claim private key, refund private key, seed,
 descriptor, xprv, or arbitrary caller-defined field. The canonical provider
