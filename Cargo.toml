@@ -55,3 +55,4 @@ toml = "0.8"
 
 [dev-dependencies]
 http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
