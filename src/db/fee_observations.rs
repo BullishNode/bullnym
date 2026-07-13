@@ -261,6 +261,13 @@ impl PersistedFeeObservation {
         &self.accepted
     }
 
+    /// Whether this row is the exact durable authority for a candidate quote.
+    /// Acceptance time is deliberately excluded: retrying the same observed
+    /// quote later must neither extend its lifetime nor make it a new quote.
+    pub fn authorizes(&self, candidate: &AcceptedFeeObservation) -> bool {
+        self.accepted.same_observation_authority(candidate)
+    }
+
     /// Convert a validated Bitcoin row into typed fallback evidence. The
     /// original live source remains available through [`Self::accepted`]; the
     /// restored semantic source is intentionally BitcoinLastKnownGood.

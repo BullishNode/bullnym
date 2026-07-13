@@ -150,12 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // The standalone runtime slice uses an explicitly unavailable persistence
-    // adapter. The database-persistence lane replaces this composition seam;
-    // until then no live observation can make readiness or construction open.
     let fee_runtime = Arc::new(fee_runtime::FeeRuntime::from_config(
         &config.fee_policy,
-        Arc::new(fee_runtime::UnavailableFeeRuntimePersistence),
+        Arc::new(db::PgFeeRuntimePersistence::new(pool.clone())),
     )?);
     let fee_startup = fee_runtime.initialize().await;
     tracing::info!(
