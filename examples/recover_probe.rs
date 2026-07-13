@@ -104,7 +104,30 @@ async fn main() {
     )
     .await
     .unwrap();
-    let swap = db::record_chain_swap_with_lineage(
+    let boltz_response_json = r#"{"id":"probe-swap-1"}"#;
+    let pair_hash = "aa".repeat(32);
+    let creation_response_sha256 = hex::encode(Sha256::digest(boltz_response_json.as_bytes()));
+    let btc_claim_script_sha256 = hex::encode(Sha256::digest(b"probe-btc-claim-script"));
+    let btc_refund_script_sha256 = hex::encode(Sha256::digest(b"probe-btc-refund-script"));
+    let liquid_claim_script_sha256 = hex::encode(Sha256::digest(b"probe-liquid-claim-script"));
+    let liquid_refund_script_sha256 = hex::encode(Sha256::digest(b"probe-liquid-refund-script"));
+    let creation_terms = db::NewChainSwapCreationTerms {
+        pinned_pair_hash: &pair_hash,
+        canonical_pair_quote_json: r#"{"fees":{"minerFees":{"server":1},"percentage":0},"hash":"probe","limits":{"maximal":1000000,"minimal":1},"rate":1}"#,
+        creation_response_sha256: &creation_response_sha256,
+        btc_claim_script_sha256: &btc_claim_script_sha256,
+        btc_refund_script_sha256: &btc_refund_script_sha256,
+        liquid_claim_script_sha256: &liquid_claim_script_sha256,
+        liquid_refund_script_sha256: &liquid_refund_script_sha256,
+        btc_timeout_height: 1,
+        liquid_timeout_height: 1,
+        btc_network: "bitcoin",
+        liquid_network: "liquid",
+        liquid_asset_id: "6f0279e9ed041c3d710a9f57d0c02928416413f827c37bf6833e2407092ff84d",
+        merchant_liquid_destination: "lq1probe",
+        merchant_emergency_btc_address: None,
+    };
+    let swap = db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &db::NewChainSwapRecord {
             claim_key_index: Some(claim_index as i64),
@@ -120,7 +143,7 @@ async fn main() {
             preimage_hex: &preimage_hex,
             claim_key_hex: &"22".repeat(32),
             refund_key_hex: &"33".repeat(32),
-            boltz_response_json: "{\"id\":\"probe-swap-1\"}",
+            boltz_response_json,
         },
         &db::ChainSwapLineage {
             claim_allocation_id,
@@ -131,6 +154,7 @@ async fn main() {
             refund_public_key_hex: &refund_public_key,
             preimage_hash_hex: &preimage_hash,
         },
+        &creation_terms,
     )
     .await
     .unwrap();

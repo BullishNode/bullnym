@@ -938,6 +938,60 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
+
+    // Migration 051 is incomplete if its all-or-none creation-evidence shape
+    // constraint is missing, even when every column happens to be present.
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_creation_terms_shape_check \
+         TO chain_swap_records_creation_terms_shape_check_before_readiness_test",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let (missing_shape_guard_status, missing_shape_guard_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_creation_terms_shape_check_before_readiness_test \
+         TO chain_swap_records_creation_terms_shape_check",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(missing_shape_guard_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_shape_guard_body["ready"], false);
+
+    let app = test_app(test_state(pool.clone()));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
+    assert_eq!(restored_body["ready"], true);
+
+    // The immutable creation packet is also part of the deployed schema
+    // boundary: disabling its update guard must remove the service from ready.
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DISABLE TRIGGER \
+         chain_swap_records_reject_creation_terms_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let (mutable_terms_status, mutable_terms_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_records ENABLE TRIGGER \
+         chain_swap_records_reject_creation_terms_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mutable_terms_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_terms_body["ready"], false);
+
+    let app = test_app(test_state(pool));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
+    assert_eq!(restored_body["ready"], true);
 }
 
 #[tokio::test]

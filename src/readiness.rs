@@ -671,7 +671,51 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND t.tgname = 'swap_key_allocations_reject_update' \
                   AND NOT t.tgisinternal \
                   AND t.tgenabled IN ('O', 'A') \
-            )",
+            ) \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'chain_swap_records' \
+                  AND column_name IN ( \
+                      'pinned_pair_hash', \
+                      'canonical_pair_quote_json', \
+                      'creation_response_sha256', \
+                      'btc_claim_script_sha256', \
+                      'btc_refund_script_sha256', \
+                      'liquid_claim_script_sha256', \
+                      'liquid_refund_script_sha256', \
+                      'btc_timeout_height', \
+                      'liquid_timeout_height', \
+                      'btc_network', \
+                      'liquid_network', \
+                      'liquid_asset_id', \
+                      'merchant_liquid_destination', \
+                      'merchant_emergency_btc_address' \
+                  ) \
+            ) = 14 \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'chain_swap_records' \
+                  AND c.conname = 'chain_swap_records_creation_terms_shape_check' \
+                  AND c.contype = 'c' \
+                  AND c.convalidated \
+            ) \
+            AND ( \
+                SELECT COUNT(*) FROM pg_trigger t \
+                JOIN pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND c.relname = 'chain_swap_records' \
+                  AND t.tgname IN ( \
+                      'chain_swap_records_require_creation_terms', \
+                      'chain_swap_records_reject_creation_terms_update' \
+                  ) \
+                  AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
+            ) = 2",
     )
     .fetch_one(pool)
     .await
