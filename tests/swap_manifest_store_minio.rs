@@ -3,12 +3,15 @@
 //! Run through `scripts/test-swap-manifest-store-minio.sh`; the ordinary test
 //! suite compiles this target but never reaches an external endpoint.
 
+use std::sync::Arc;
+
 use pay_service::swap_manifest::EncryptedSwapManifestV1;
 use pay_service::swap_manifest_store::{
     ManifestObjectId, ManifestStoreError, ManifestWriteOutcome, RecoveryManifestStore,
     S3ManifestCredentials, S3ManifestStoreConfig,
 };
 use serde::Serialize;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 const ENDPOINT_ENV: &str = "BULLNYM_MINIO_ENDPOINT";
@@ -71,7 +74,17 @@ fn config(
     )
 }
 
-#[tokio::test]
+async fn put_after_barrier(
+    store: RecoveryManifestStore,
+    start: Arc<Barrier>,
+    object_id: ManifestObjectId,
+    manifest: EncryptedSwapManifestV1,
+) -> Result<ManifestWriteOutcome, ManifestStoreError> {
+    start.wait().await;
+    store.put_v1(object_id, &manifest).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the disposable MinIO harness"]
 async fn minio_exercises_manifest_store_contract_and_redaction() {
     let endpoint = required_env(ENDPOINT_ENV);
@@ -139,6 +152,105 @@ async fn minio_exercises_manifest_store_contract_and_redaction() {
     );
     assert!(!final_page.truncated);
     assert_eq!(final_page.next_after, None);
+
+    // Use a fresh sub-prefix so both races target objects that cannot exist
+    // before these synchronized writes begin.
+    let race_prefix = format!("{prefix}/races/{}", Uuid::new_v4());
+    let race_store = RecoveryManifestStore::from_s3(config(
+        &endpoint,
+        &bucket,
+        &race_prefix,
+        &access_key,
+        &secret_key,
+    ))
+    .unwrap();
+
+    let identical_id = id(4);
+    let identical = manifest(0x55);
+    let identical_start = Arc::new(Barrier::new(2));
+    let identical_left = tokio::spawn(put_after_barrier(
+        race_store.clone(),
+        Arc::clone(&identical_start),
+        identical_id,
+        identical.clone(),
+    ));
+    let identical_right = tokio::spawn(put_after_barrier(
+        race_store.clone(),
+        identical_start,
+        identical_id,
+        identical.clone(),
+    ));
+    let (identical_left, identical_right) = tokio::join!(identical_left, identical_right);
+    let identical_results = [identical_left.unwrap(), identical_right.unwrap()];
+    assert_eq!(
+        identical_results
+            .iter()
+            .filter(|result| { matches!(result.as_ref(), Ok(ManifestWriteOutcome::Created)) })
+            .count(),
+        1,
+        "identical MinIO race must create exactly once: {identical_results:?}"
+    );
+    assert_eq!(
+        identical_results
+            .iter()
+            .filter(|result| {
+                matches!(result.as_ref(), Ok(ManifestWriteOutcome::AlreadyPresent))
+            })
+            .count(),
+        1,
+        "identical MinIO race must make the retry idempotent: {identical_results:?}"
+    );
+    assert_eq!(
+        race_store.get_v1(identical_id).await.unwrap().encoded(),
+        identical.encoded()
+    );
+
+    let differing_id = id(5);
+    let differing_left = manifest(0x66);
+    let differing_right = manifest(0x77);
+    let differing_start = Arc::new(Barrier::new(2));
+    let left_task = tokio::spawn(put_after_barrier(
+        race_store.clone(),
+        Arc::clone(&differing_start),
+        differing_id,
+        differing_left.clone(),
+    ));
+    let right_task = tokio::spawn(put_after_barrier(
+        race_store.clone(),
+        differing_start,
+        differing_id,
+        differing_right.clone(),
+    ));
+    let (left_result, right_result) = tokio::join!(left_task, right_task);
+    let left_result = left_result.unwrap();
+    let right_result = right_result.unwrap();
+    let (winner, loser) = match (&left_result, &right_result) {
+        (Ok(ManifestWriteOutcome::Created), Err(ManifestStoreError::Conflict { id, .. }))
+            if *id == differing_id =>
+        {
+            (&differing_left, &differing_right)
+        }
+        (Err(ManifestStoreError::Conflict { id, .. }), Ok(ManifestWriteOutcome::Created))
+            if *id == differing_id =>
+        {
+            (&differing_right, &differing_left)
+        }
+        results => {
+            panic!("differing MinIO race must yield exactly Created + Conflict: {results:?}")
+        }
+    };
+    let stored_after_race = race_store.get_v1(differing_id).await.unwrap();
+    assert_eq!(stored_after_race.encoded(), winner.encoded());
+    assert_ne!(stored_after_race.encoded(), loser.encoded());
+    let bytes_before_conflicting_retry = stored_after_race.into_encoded();
+    assert!(matches!(
+        race_store.put_v1(differing_id, loser).await,
+        Err(ManifestStoreError::Conflict { id, .. }) if id == differing_id
+    ));
+    assert_eq!(
+        race_store.get_v1(differing_id).await.unwrap().encoded(),
+        bytes_before_conflicting_retry
+    );
 
     let wrong_access_key = format!("{access_key}-wrong");
     let wrong_secret_key = format!("{secret_key}-wrong");
