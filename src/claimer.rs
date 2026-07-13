@@ -2576,7 +2576,7 @@ async fn claim_chain_swap_inner(
                 reason: LIQUID_FEE_DECISION_PENDING_REASON,
             });
         }
-        db::insert_liquid_merchant_settlement_journal(&mut *tx, &new_journal)
+        db::insert_liquid_merchant_settlement_journal(&mut tx, &new_journal)
             .await
             .map_err(|error| {
                 AppError::DbError(format!(
@@ -2636,7 +2636,7 @@ async fn claim_chain_swap_inner(
             ));
         }
         require_exact_persisted_chain_claim_journal(
-            db::load_exact_liquid_merchant_settlement_journal(&mut *tx, &new_journal).await,
+            db::load_exact_liquid_merchant_settlement_journal(&mut tx, &new_journal).await,
         )?;
     }
 
