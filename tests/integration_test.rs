@@ -5682,6 +5682,105 @@ async fn direct_lifecycle_zero_confirmation_is_presented_but_not_accounted() {
 }
 
 #[tokio::test]
+async fn legacy_confirmed_bitcoin_observation_enriches_its_missing_block_hash() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "legacyblockhash").await;
+    let address = "bc1qlegacyblockhash";
+    let invoice = insert_test_btc_invoice(&pool, "legacyblockhash", &npub, address)
+        .await
+        .unwrap();
+    let txid = "3131313131313131313131313131313131313131313131313131313131313131";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+
+    pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        bitcoin_direct_evidence(&event_key, 1_000, txid, 0, address),
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    pay_service::db::upsert_invoice_payment_observation(
+        &pool,
+        invoice.id,
+        bitcoin_direct_observation(
+            &event_key,
+            1_000,
+            txid,
+            0,
+            address,
+            6,
+            Some(900_000),
+            "counted",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let finalized = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        address,
+        1_000,
+        6,
+        pay_service::db::DirectObservationPhase::Finalized,
+        None,
+    )];
+    let (_, outcome) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &finalized,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let state: (Option<String>, String, String, String) = sqlx::query_as(
+        "SELECT o.inclusion_block_hash, o.verification_state, \
+                e.accounting_state, e.verification_state \
+         FROM invoice_payment_observations o \
+         JOIN invoice_payment_events e ON e.observation_id = o.id \
+         WHERE o.invoice_id = $1 AND o.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state.0.as_deref(), Some(DIRECT_LIFECYCLE_BLOCK_HASH));
+    assert_eq!(state.1, "verified");
+    assert_eq!(state.2, "active");
+    assert_eq!(state.3, "verified");
+    let accounting: (Option<i64>, i64) = sqlx::query_as(
+        "SELECT i.paid_amount_sat, COUNT(e.id) \
+         FROM invoices i \
+         LEFT JOIN invoice_payment_events e ON e.invoice_id = i.id \
+         WHERE i.id = $1 GROUP BY i.id",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(accounting, (Some(1_000), 1));
+    let transitions: Vec<String> = sqlx::query_scalar(
+        "SELECT transition_kind FROM invoice_direct_payment_transitions \
+         WHERE invoice_id = $1 ORDER BY generation",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(transitions, vec!["legacy_revalidated".to_owned()]);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn direct_lifecycle_one_confirmation_activates_accounting_once() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

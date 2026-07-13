@@ -1069,12 +1069,17 @@ async fn upsert_direct_observation_locked(
             );
         }
         if confirmed_block_identity_conflicts(
-            &stored.last_seen_state,
-            stored.block_height,
-            stored.inclusion_block_hash.as_deref(),
-            next_state,
-            observation.block_height,
-            observation.block_hash,
+            ConfirmedBlockIdentity {
+                state: &stored.last_seen_state,
+                height: stored.block_height,
+                hash: stored.inclusion_block_hash.as_deref(),
+            },
+            &stored.verification_state,
+            ConfirmedBlockIdentity {
+                state: next_state,
+                height: observation.block_height,
+                hash: observation.block_hash,
+            },
             observation.phase,
         ) {
             return protocol_error(
@@ -1224,20 +1229,28 @@ fn validate_block_regression_prior(
     Ok(())
 }
 
+struct ConfirmedBlockIdentity<'a> {
+    state: &'a str,
+    height: Option<i32>,
+    hash: Option<&'a str>,
+}
+
 fn confirmed_block_identity_conflicts(
-    stored_state: &str,
-    stored_block_height: Option<i32>,
-    stored_block_hash: Option<&str>,
-    next_state: &str,
-    next_block_height: Option<i32>,
-    next_block_hash: Option<&str>,
+    stored: ConfirmedBlockIdentity<'_>,
+    stored_verification_state: &str,
+    next: ConfirmedBlockIdentity<'_>,
     phase: DirectObservationPhase,
 ) -> bool {
-    let stored_has_positive_block = matches!(stored_state, "awaiting_confirmations" | "counted");
-    let next_has_positive_block = matches!(next_state, "awaiting_confirmations" | "counted");
+    let stored_has_positive_block = matches!(stored.state, "awaiting_confirmations" | "counted");
+    let next_has_positive_block = matches!(next.state, "awaiting_confirmations" | "counted");
+    let legacy_missing_hash_enrichment = stored_verification_state == "legacy_unverified"
+        && stored.height == next.height
+        && stored.hash.is_none()
+        && next.hash.is_some();
     stored_has_positive_block
         && next_has_positive_block
-        && (stored_block_height != next_block_height || stored_block_hash != next_block_hash)
+        && (stored.height != next.height || stored.hash != next.hash)
+        && !legacy_missing_hash_enrichment
         && phase.block_regression().is_none()
 }
 
@@ -1642,6 +1655,18 @@ mod tests {
     const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BLOCK_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const NEW_BLOCK_HASH: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn block_identity<'a>(
+        state: &'a str,
+        height: Option<i32>,
+        hash: Option<&'a str>,
+    ) -> ConfirmedBlockIdentity<'a> {
+        ConfirmedBlockIdentity {
+            state,
+            height,
+            hash,
+        }
+    }
 
     fn tolerances() -> InvoiceAccountingTolerances {
         InvoiceAccountingTolerances {
@@ -2096,30 +2121,25 @@ mod tests {
     #[test]
     fn confirmed_block_identity_change_requires_an_explicit_demotion() {
         assert!(!confirmed_block_identity_conflicts(
-            "awaiting_confirmations",
-            Some(900_000),
-            Some(BLOCK_HASH),
-            "counted",
-            Some(900_000),
-            Some(BLOCK_HASH),
+            block_identity("awaiting_confirmations", Some(900_000), Some(BLOCK_HASH)),
+            "verified",
+            block_identity("counted", Some(900_000), Some(BLOCK_HASH)),
             DirectObservationPhase::Finalized,
         ));
         assert!(confirmed_block_identity_conflicts(
-            "awaiting_confirmations",
-            Some(900_000),
-            Some(BLOCK_HASH),
-            "awaiting_confirmations",
-            Some(900_001),
-            Some(&"c".repeat(64)),
+            block_identity("awaiting_confirmations", Some(900_000), Some(BLOCK_HASH)),
+            "verified",
+            block_identity(
+                "awaiting_confirmations",
+                Some(900_001),
+                Some(&"c".repeat(64)),
+            ),
             DirectObservationPhase::Confirmed,
         ));
         assert!(!confirmed_block_identity_conflicts(
-            "awaiting_confirmations",
-            Some(900_000),
-            Some(BLOCK_HASH),
-            "seen_unconfirmed",
-            None,
-            None,
+            block_identity("awaiting_confirmations", Some(900_000), Some(BLOCK_HASH)),
+            "verified",
+            block_identity("seen_unconfirmed", None, None),
             DirectObservationPhase::Provisional,
         ));
 
@@ -2131,13 +2151,38 @@ mod tests {
         )
         .unwrap();
         assert!(!confirmed_block_identity_conflicts(
-            "awaiting_confirmations",
-            Some(900_000),
-            Some(BLOCK_HASH),
-            "awaiting_confirmations",
-            Some(900_001),
-            Some(&"c".repeat(64)),
+            block_identity("awaiting_confirmations", Some(900_000), Some(BLOCK_HASH)),
+            "verified",
+            block_identity(
+                "awaiting_confirmations",
+                Some(900_001),
+                Some(&"c".repeat(64)),
+            ),
             atomic_reobservation,
+        ));
+        assert!(!confirmed_block_identity_conflicts(
+            block_identity("counted", Some(900_000), None),
+            "legacy_unverified",
+            block_identity("counted", Some(900_000), Some(BLOCK_HASH)),
+            DirectObservationPhase::Finalized,
+        ));
+        assert!(confirmed_block_identity_conflicts(
+            block_identity("counted", Some(900_000), None),
+            "verified",
+            block_identity("counted", Some(900_000), Some(BLOCK_HASH)),
+            DirectObservationPhase::Finalized,
+        ));
+        assert!(confirmed_block_identity_conflicts(
+            block_identity("counted", Some(900_000), None),
+            "legacy_unverified",
+            block_identity("counted", Some(900_001), Some(BLOCK_HASH)),
+            DirectObservationPhase::Finalized,
+        ));
+        assert!(confirmed_block_identity_conflicts(
+            block_identity("counted", Some(900_000), Some(BLOCK_HASH)),
+            "legacy_unverified",
+            block_identity("counted", Some(900_000), Some(NEW_BLOCK_HASH)),
+            DirectObservationPhase::Finalized,
         ));
     }
 
