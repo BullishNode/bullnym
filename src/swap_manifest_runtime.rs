@@ -14,6 +14,7 @@ use std::sync::Arc;
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
 use crate::swap_manifest::{SwapManifestError, SwapManifestV1};
+use crate::swap_manifest_staging::ManifestStagingCrypto;
 use crate::swap_manifest_store::{
     RecoveryManifestStore, S3ManifestCredentials, S3ManifestStoreConfig,
 };
@@ -136,6 +137,22 @@ impl RecoveryManifestRuntimeV1 {
 
     pub fn store(&self) -> &RecoveryManifestStore {
         &self.store
+    }
+
+    /// Borrow the opaque sealing inputs required by atomic manifest staging.
+    ///
+    /// This crate-private adapter returns only the existing non-`Clone`,
+    /// non-`Debug` capability. It neither copies nor exposes the encryption or
+    /// signing keys, and it does not grant witness-opening access.
+    // This seam is intentionally unwired until the owning creation-route slice.
+    #[allow(dead_code)]
+    pub(crate) fn borrow_manifest_staging_crypto_v1(&self) -> ManifestStagingCrypto<'_> {
+        ManifestStagingCrypto::new(
+            &self.encryption_key_id,
+            &self.encryption_key,
+            &self.signing_keypair,
+            &self.expected_signer,
+        )
     }
 
     /// Seal one already validated manifest without exposing key material.
@@ -676,6 +693,42 @@ mod tests {
                 assert!(!display.contains(value));
                 assert!(!debug.contains(value));
             }
+        }
+    }
+
+    fn consume_staging_crypto(_: ManifestStagingCrypto<'_>) {}
+
+    #[test]
+    fn staging_crypto_capability_borrows_without_exposing_runtime_material() {
+        let runtime = load(&valid_values()).expect("valid protected configuration");
+
+        consume_staging_crypto(runtime.borrow_manifest_staging_crypto_v1());
+
+        let id = ManifestObjectId::new(Uuid::from_u128(5), Uuid::from_u128(6)).unwrap();
+        assert_eq!(
+            runtime.store().object_key_v1(id),
+            "bullnym/recovery/v1/00000000-0000-0000-0000-000000000005/00000000-0000-0000-0000-000000000006.json"
+        );
+    }
+
+    #[test]
+    fn staging_crypto_borrow_preserves_runtime_and_witness_redaction() {
+        let values = valid_values();
+        let runtime = load(&values).expect("valid protected configuration");
+        let runtime_debug_before = format!("{runtime:?}");
+
+        consume_staging_crypto(runtime.borrow_manifest_staging_crypto_v1());
+
+        assert_eq!(format!("{runtime:?}"), runtime_debug_before);
+        let opening_debug = format!(
+            "{:?}",
+            runtime
+                .witness_open_secrets_v1()
+                .expect("validated opening material")
+        );
+        for value in values.values() {
+            assert!(!runtime_debug_before.contains(value));
+            assert!(!opening_debug.contains(value));
         }
     }
 
