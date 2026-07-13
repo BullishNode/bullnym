@@ -68,6 +68,12 @@ client images can be deliberately overridden with `MINIO_IMAGE` and
 `MINIO_MC_IMAGE`. The harness removes and verifies removal of its container and
 network on success or failure.
 
+Database-plus-store integration tests use the doc-hidden
+`from_object_store_for_integration_tests` constructor with an instrumented
+in-memory backend. The seam validates the same safe prefix and returns the same
+store handle: writes still use create-only mode with verified reads, and no
+overwrite or delete API is exposed.
+
 ## Off-host provisioning still required
 
 The production VM currently has no configured independent object store. Before

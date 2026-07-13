@@ -59,6 +59,23 @@ The database cannot decrypt the envelope and cannot prove its ciphertext binds
 the clear ledger metadata. Typed manifest construction and restore-time
 authentication remain separate required boundaries.
 
+## Unwired delivery coordinator
+
+`resume_pending_manifest_delivery` is the smallest bridge from the durable
+ledger to `RecoveryManifestStore`. It reads a two-row invariant probe (the
+schema permits at most one pending row), rejects a digest mismatch before any
+object-store call, derives the object identity from the exact swap and manifest
+UUIDs, and accepts only a verified create or verified identical retry. It then
+requires the exact identity-and-digest acknowledgement row before reporting
+success.
+
+A storage conflict or failure leaves the row pending. If the process stops, or
+the database acknowledgement fails, after a durable create, the next call is
+safe: create-only storage returns the verified `AlreadyPresent` outcome and the
+same acknowledgement is retried. This coordinator is not invoked by startup,
+swap creation, invoice handling, admission, or a background worker; scheduling
+and retry policy remain intentionally out of scope.
+
 ## Independent retention
 
 The ledger has no persistent foreign key to `chain_swap_records`. Its insert

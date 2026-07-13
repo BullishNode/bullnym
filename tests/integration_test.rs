@@ -3,7 +3,14 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
+use futures_util::stream::BoxStream;
 use http_body_util::BodyExt;
+use object_store::memory::InMemory;
+use object_store::path::Path as ObjectStorePath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -29,6 +36,11 @@ use pay_service::ip_whitelist::IpWhitelist;
 use pay_service::pricer::PricerClient;
 use pay_service::rate_limit::RateLimiter;
 use pay_service::swap_manifest::EncryptedSwapManifestV1;
+use pay_service::swap_manifest_delivery::{
+    resume_pending_manifest_delivery, ManifestDeliveryCoordinatorError,
+    ManifestDeliveryResumeOutcome,
+};
+use pay_service::swap_manifest_store::{ManifestObjectId, ManifestWriteOutcome};
 use pay_service::{
     certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
     registration, AppState,
@@ -14803,6 +14815,267 @@ fn manifest_delivery_envelope(byte: u8) -> EncryptedSwapManifestV1 {
     EncryptedSwapManifestV1::parse(encoded).unwrap()
 }
 
+struct InstrumentedManifestObjectStore {
+    inner: Arc<InMemory>,
+    io_calls: AtomicUsize,
+    pause_next_successful_put: AtomicBool,
+    put_committed: Option<Arc<Barrier>>,
+    release_put: Option<Arc<Barrier>>,
+}
+
+impl InstrumentedManifestObjectStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            io_calls: AtomicUsize::new(0),
+            pause_next_successful_put: AtomicBool::new(false),
+            put_committed: None,
+            release_put: None,
+        })
+    }
+
+    fn pausing_after_first_put() -> (Arc<Self>, Arc<Barrier>, Arc<Barrier>) {
+        let put_committed = Arc::new(Barrier::new(2));
+        let release_put = Arc::new(Barrier::new(2));
+        (
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                io_calls: AtomicUsize::new(0),
+                pause_next_successful_put: AtomicBool::new(true),
+                put_committed: Some(put_committed.clone()),
+                release_put: Some(release_put.clone()),
+            }),
+            put_committed,
+            release_put,
+        )
+    }
+
+    fn io_calls(&self) -> usize {
+        self.io_calls.load(Ordering::SeqCst)
+    }
+
+    fn record_io(&self) {
+        self.io_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for InstrumentedManifestObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstrumentedManifestObjectStore")
+    }
+}
+
+impl std::fmt::Display for InstrumentedManifestObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("instrumented manifest object store")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for InstrumentedManifestObjectStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectStorePath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.record_io();
+        let result = self.inner.put_opts(location, payload, options).await;
+        if result.is_ok() && self.pause_next_successful_put.swap(false, Ordering::SeqCst) {
+            self.put_committed
+                .as_ref()
+                .expect("paused store has a commit barrier")
+                .wait()
+                .await;
+            self.release_put
+                .as_ref()
+                .expect("paused store has a release barrier")
+                .wait()
+                .await;
+        }
+        result
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.record_io();
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.record_io();
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectStorePath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectStorePath>> {
+        self.record_io();
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.record_io();
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> object_store::Result<ListResult> {
+        self.record_io();
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.record_io();
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+fn coordinator_manifest_store(
+    backend: Arc<InstrumentedManifestObjectStore>,
+) -> pay_service::swap_manifest_store::RecoveryManifestStore {
+    let backend: Arc<dyn ObjectStore> = backend;
+    pay_service::swap_manifest_store::RecoveryManifestStore::from_object_store_for_integration_tests(
+        backend,
+        format!("bullnym/coordinator/{}", uuid::Uuid::new_v4()),
+    )
+    .unwrap()
+}
+
+async fn insert_pending_manifest_delivery_fixture(
+    pool: &PgPool,
+    nym: &str,
+    envelope_byte: u8,
+) -> pay_service::db::ChainSwapManifestDelivery {
+    let boltz_swap_id = format!("manifest-coordinator-{nym}");
+    let lockup_address = format!("bc1q{nym}");
+    let (_, _, _, swap) =
+        seed_merchant_invoice_swap(pool, nym, &boltz_swap_id, &lockup_address, 1_010, 1_000).await;
+    let envelope = manifest_delivery_envelope(envelope_byte);
+    let mut tx = pool.begin().await.unwrap();
+    let reservation = pay_service::db::lock_manifest_delivery_tail(&mut tx)
+        .await
+        .unwrap();
+    let identity = reservation.identity(uuid::Uuid::new_v4(), swap.id).unwrap();
+    let delivery = pay_service::db::insert_manifest_delivery(&mut tx, &identity, &envelope)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    delivery
+}
+
+fn delivery_object_id(delivery: &pay_service::db::ChainSwapManifestDelivery) -> ManifestObjectId {
+    ManifestObjectId::new(delivery.chain_swap_id, delivery.manifest_id).unwrap()
+}
+
+async fn replace_manifest_digest_without_constraint(
+    pool: &PgPool,
+    manifest_id: uuid::Uuid,
+    replacement_digest: &str,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_manifest_deliveries \
+         DROP CONSTRAINT chain_swap_manifest_digest_match_check",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET envelope_sha256 = $2 \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .bind(replacement_digest)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn restore_manifest_digest_constraint(
+    pool: &PgPool,
+    manifest_id: uuid::Uuid,
+    correct_digest: &str,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET envelope_sha256 = $2 \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .bind(correct_digest)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_manifest_deliveries \
+         ADD CONSTRAINT chain_swap_manifest_digest_match_check CHECK (\
+             envelope_sha256 = encode(\
+                 digest(convert_to(encrypted_envelope, 'UTF8'), 'sha256'),\
+                 'hex'\
+             )\
+         )",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn replace_manifest_envelope_bypassing_update_trigger(
+    pool: &PgPool,
+    manifest_id: uuid::Uuid,
+    replacement: &EncryptedSwapManifestV1,
+) {
+    let replacement_digest = manifest_envelope_sha256(replacement.encoded());
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_manifest_deliveries \
+            SET encrypted_envelope = $2, envelope_sha256 = $3 \
+          WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .bind(replacement.encoded())
+    .bind(replacement_digest)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
     let database = error
         .as_database_error()
@@ -15536,6 +15809,242 @@ async fn manifest_delivery_ledger_enforces_bounds_digest_immutability_and_delete
             .unwrap_err(),
         corrupt_manifest_id,
         corrupt_envelope,
+    );
+
+    cleanup_db(&pool).await;
+}
+
+// =====================================================================
+// #87: unwired pending-manifest delivery coordinator.
+// =====================================================================
+
+#[tokio::test]
+async fn manifest_delivery_coordinator_creates_verifies_and_acknowledges() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let delivery =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestcoordcreated", 0x81).await;
+    let object_id = delivery_object_id(&delivery);
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+
+    let outcome = resume_pending_manifest_delivery(&pool, &store)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: delivery.identity(),
+            storage_outcome: ManifestWriteOutcome::Created,
+        }
+    );
+    assert!(!format!("{outcome:?}").contains(delivery.encrypted_envelope().encoded()));
+    let acknowledged = pay_service::db::get_manifest_delivery(&pool, delivery.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acknowledged.delivery_state, "delivered");
+    assert!(acknowledged.delivered_at_unix.is_some());
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        delivery.encrypted_envelope().encoded()
+    );
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::NoPending
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_coordinator_retries_post_put_pre_ack_as_already_present() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let delivery =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestcoordretry", 0x82).await;
+    let object_id = delivery_object_id(&delivery);
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+
+    // Model a process disappearing after the durable write but before its
+    // database acknowledgement.
+    assert_eq!(
+        store
+            .put_v1(object_id, delivery.encrypted_envelope())
+            .await
+            .unwrap(),
+        ManifestWriteOutcome::Created
+    );
+    assert_eq!(
+        pay_service::db::list_pending_manifest_deliveries(&pool)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: delivery.identity(),
+            storage_outcome: ManifestWriteOutcome::AlreadyPresent,
+        }
+    );
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, delivery.manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "delivered"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_coordinator_store_conflict_does_not_acknowledge() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let delivery =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestcoordconflict", 0x83).await;
+    let object_id = delivery_object_id(&delivery);
+    let conflicting_envelope = manifest_delivery_envelope(0x84);
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    assert_eq!(
+        store
+            .put_v1(object_id, &conflicting_envelope)
+            .await
+            .unwrap(),
+        ManifestWriteOutcome::Created
+    );
+
+    let error = resume_pending_manifest_delivery(&pool, &store)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ManifestDeliveryCoordinatorError::StorageConflict { object_id: stored_id }
+            if stored_id == object_id
+    ));
+    let public_error = format!("{error:?} {error}");
+    for forbidden in [
+        delivery.encrypted_envelope().encoded(),
+        conflicting_envelope.encoded(),
+    ] {
+        assert!(!public_error.contains(forbidden));
+    }
+    let still_pending = pay_service::db::get_manifest_delivery(&pool, delivery.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_pending.delivery_state, "pending");
+    assert_eq!(still_pending.delivered_at_unix, None);
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        conflicting_envelope.encoded()
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_coordinator_digest_mismatch_performs_no_store_io() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let delivery =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestcoorddigest", 0x85).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend.clone());
+    let incorrect_digest = "00".repeat(32);
+    assert_ne!(incorrect_digest, delivery.envelope_sha256);
+    replace_manifest_digest_without_constraint(&pool, delivery.manifest_id, &incorrect_digest)
+        .await;
+
+    let result = resume_pending_manifest_delivery(&pool, &store).await;
+    let observed_store_io = backend.io_calls();
+    restore_manifest_digest_constraint(&pool, delivery.manifest_id, &delivery.envelope_sha256)
+        .await;
+
+    let error = result.unwrap_err();
+    assert!(matches!(
+        error,
+        ManifestDeliveryCoordinatorError::EnvelopeDigestMismatch { manifest_id }
+            if manifest_id == delivery.manifest_id
+    ));
+    assert_eq!(observed_store_io, 0);
+    assert!(!format!("{error:?} {error}").contains(delivery.encrypted_envelope().encoded()));
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, delivery.manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "pending"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn manifest_delivery_coordinator_exact_ack_mismatch_is_not_success() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let delivery = insert_pending_manifest_delivery_fixture(&pool, "manifestcoordack", 0x86).await;
+    let original_envelope = delivery.encrypted_envelope().clone();
+    let replacement_envelope = manifest_delivery_envelope(0x87);
+    let object_id = delivery_object_id(&delivery);
+    let (backend, put_committed, release_put) =
+        InstrumentedManifestObjectStore::pausing_after_first_put();
+    let store = coordinator_manifest_store(backend);
+    let coordinator_pool = pool.clone();
+    let coordinator_store = store.clone();
+    let coordinator = tokio::spawn(async move {
+        resume_pending_manifest_delivery(&coordinator_pool, &coordinator_store).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), put_committed.wait())
+        .await
+        .expect("coordinator did not reach the post-put barrier");
+    replace_manifest_envelope_bypassing_update_trigger(
+        &pool,
+        delivery.manifest_id,
+        &replacement_envelope,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(30), release_put.wait())
+        .await
+        .expect("coordinator did not leave the post-put barrier");
+    let error = tokio::time::timeout(Duration::from_secs(30), coordinator)
+        .await
+        .expect("coordinator did not finish")
+        .unwrap()
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ManifestDeliveryCoordinatorError::AcknowledgementMismatch { manifest_id }
+            if manifest_id == delivery.manifest_id
+    ));
+    let public_error = format!("{error:?} {error}");
+    for forbidden in [original_envelope.encoded(), replacement_envelope.encoded()] {
+        assert!(!public_error.contains(forbidden));
+    }
+    let still_pending = pay_service::db::get_manifest_delivery(&pool, delivery.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_pending.delivery_state, "pending");
+    assert_eq!(still_pending.encrypted_envelope(), &replacement_envelope);
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        original_envelope.encoded()
     );
 
     cleanup_db(&pool).await;

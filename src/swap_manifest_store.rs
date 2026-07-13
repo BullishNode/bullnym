@@ -412,6 +412,23 @@ impl RecoveryManifestStore {
         Ok(Self::with_backend(Arc::new(backend), prefix))
     }
 
+    /// Construct the same create-only adapter around a deterministic test
+    /// backend.
+    ///
+    /// This narrow seam exists for database-plus-object-store integration
+    /// evidence. It validates the production key prefix and exposes no
+    /// overwrite or delete operation; every write still uses `PutMode::Create`
+    /// and the same read-after-write verification as [`Self::from_s3`].
+    #[doc(hidden)]
+    pub fn from_object_store_for_integration_tests(
+        backend: Arc<dyn ObjectStore>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, ManifestStoreError> {
+        let prefix = prefix.into();
+        validate_prefix(&prefix)?;
+        Ok(Self::with_backend(backend, prefix))
+    }
+
     /// Deterministic key containing only canonical UUID segments.
     pub fn object_key_v1(&self, id: ManifestObjectId) -> String {
         format!(

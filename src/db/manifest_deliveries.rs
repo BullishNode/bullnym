@@ -9,6 +9,7 @@ use crate::swap_manifest::EncryptedSwapManifestV1;
 /// PostgreSQL advisory-lock namespace shared with migration 052.
 const MANIFEST_LEDGER_LOCK_CLASS: i32 = 1_112_886_348;
 const MANIFEST_LEDGER_LOCK_OBJECT: i32 = 87;
+const PENDING_DELIVERY_INVARIANT_PROBE_LIMIT: i64 = 2;
 pub const MAX_MANIFEST_ENVELOPE_BYTES: usize = 1_048_576;
 /// Audit rows include the encrypted envelope, so cap worst-case envelope
 /// materialization at 64 MiB before row metadata overhead.
@@ -367,9 +368,10 @@ pub async fn insert_manifest_delivery(
     row.try_into()
 }
 
-/// Resume every pending delivery in global sequence order. Migration 052
-/// constrains this set to at most one row, but returning a list keeps recovery
-/// callers fail-visible if a future version deliberately changes that policy.
+/// Read a bounded invariant probe of pending deliveries in global sequence
+/// order. Migration 052 constrains this set to at most one row; fetching at
+/// most two lets the coordinator fail visibly if that invariant is corrupted
+/// without accidentally materializing an unbounded queue.
 pub async fn list_pending_manifest_deliveries(
     pool: &PgPool,
 ) -> Result<Vec<ChainSwapManifestDelivery>, ManifestDeliveryError> {
@@ -377,8 +379,10 @@ pub async fn list_pending_manifest_deliveries(
         "SELECT {DELIVERY_COLUMNS} \
            FROM chain_swap_manifest_deliveries \
           WHERE delivery_state = 'pending' \
-          ORDER BY manifest_sequence"
+          ORDER BY manifest_sequence \
+          LIMIT $1"
     ))
+    .bind(PENDING_DELIVERY_INVARIANT_PROBE_LIMIT)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(TryInto::try_into).collect()
