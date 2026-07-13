@@ -1343,9 +1343,23 @@ pub async fn observe_bitcoin_recovery_merchant_output(
             vout,
         },
     };
+    observe_bitcoin_merchant_output_journal(evidence, &original, replacement, previous).await
+}
+
+/// Observe an already repository-validated Bitcoin merchant journal without
+/// reopening the database snapshot used to load it. The recovery-attempt
+/// wrapper above remains the compatibility boundary for existing callers;
+/// the settlement worker consumes its complete repeatable-read work packet
+/// through this journal-shaped entry point.
+pub(crate) async fn observe_bitcoin_merchant_output_journal(
+    evidence: &dyn BitcoinRecoveryEvidence,
+    original: &MerchantTransactionJournalEvidence<'_>,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    previous: PreviousBitcoinMerchantConfirmation<'_>,
+) -> Result<BitcoinMerchantOutputObservation, BitcoinMerchantObservationError> {
     let candidate = replacement
         .map(|linked| &linked.replacement)
-        .unwrap_or(&original);
+        .unwrap_or(original);
     let candidate_txid = canonical_hash(candidate.txid).ok_or(
         BitcoinMerchantObservationError::Adapter(MerchantOutputAdapterError::JournalTxidMismatch),
     )?;
@@ -1447,7 +1461,7 @@ pub async fn observe_bitcoin_recovery_merchant_output(
         txid: &candidate_txid,
         confirmation,
     };
-    let adapted = adapt_bitcoin_merchant_output(&original, replacement, &observation)
+    let adapted = adapt_bitcoin_merchant_output(original, replacement, &observation)
         .map_err(BitcoinMerchantObservationError::Adapter)?;
     Ok(BitcoinMerchantOutputObservation::Observed(adapted))
 }
