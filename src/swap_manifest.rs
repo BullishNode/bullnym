@@ -7,8 +7,9 @@
 //! encrypted, so possession of the storage-encryption key is not sufficient to
 //! forge Bullnym restore evidence.
 //!
-//! This module defines the format only. Export-before-exposure, external
-//! storage durability, and restore reconciliation are separate #87 packages.
+//! This module defines the format and pure cross-object audits only.
+//! Export-before-exposure, external storage durability, and runtime restore
+//! policy remain separate #87 packages.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -33,6 +34,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::boltz_restore::{
+    BoltzRestoreKeyPurpose, BoltzRestoreKind, ValidatedBoltzRestoreKey,
+    ValidatedBoltzRestoreRecord, ValidatedBoltzRestoreSet,
+};
 
 pub const SWAP_MANIFEST_FORMAT: &str = "bullnym-chain-swap-manifest";
 pub const SWAP_MANIFEST_VERSION: u16 = 1;
@@ -265,6 +271,19 @@ pub struct SwapManifestSetAuditV1 {
     pub lineage_high_waters: Vec<ManifestLineageHighWaterV1>,
 }
 
+/// Compact result of cross-referencing one valid append-only witness with one
+/// fully validated provider restore snapshot. Provider-only chain records are
+/// reported for later cutover policy; they are not rejected here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapManifestBoltzAuditV1 {
+    pub manifest_set: SwapManifestSetAuditV1,
+    pub provider_only_chain_swap_ids: Vec<String>,
+    pub provider_only_chain_record_count: usize,
+    /// Provider-wide high-water, including reverse swaps and provider-only
+    /// chain records, copied from the validated restore snapshot.
+    pub provider_max_child_index: Option<u32>,
+}
+
 /// Cross-object integrity failures that one individually valid record cannot
 /// detect on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +374,70 @@ impl std::error::Error for SwapManifestSetError {
             Self::InvalidManifest { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+/// Fail-closed manifest/provider mismatches. Variants intentionally carry no
+/// provider identifier or key material, and every `Display` message is fixed
+/// and bounded for safe operational logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapManifestBoltzAuditError {
+    InvalidManifestSet,
+    DuplicateProviderRecord,
+    MissingWitnessedProviderRecord,
+    WrongWitnessedProviderKind,
+    InvalidChainKeyPurposes,
+    ClaimChildIndexMismatch,
+    RefundChildIndexMismatch,
+    ClaimPublicKeyMismatch,
+    RefundPublicKeyMismatch,
+    ClaimPreimageHashMismatch,
+    RefundPreimageHashMismatch,
+}
+
+impl fmt::Display for SwapManifestBoltzAuditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidManifestSet => {
+                f.write_str("manifest/Boltz audit rejected the append-only manifest set")
+            }
+            Self::DuplicateProviderRecord => {
+                f.write_str("manifest/Boltz audit found duplicate provider records")
+            }
+            Self::MissingWitnessedProviderRecord => {
+                f.write_str("manifest/Boltz audit is missing a witnessed provider record")
+            }
+            Self::WrongWitnessedProviderKind => {
+                f.write_str("manifest/Boltz audit found the wrong witnessed swap kind")
+            }
+            Self::InvalidChainKeyPurposes => {
+                f.write_str("manifest/Boltz audit found invalid chain key purposes")
+            }
+            Self::ClaimChildIndexMismatch => {
+                f.write_str("manifest/Boltz audit found a claim child-index mismatch")
+            }
+            Self::RefundChildIndexMismatch => {
+                f.write_str("manifest/Boltz audit found a refund child-index mismatch")
+            }
+            Self::ClaimPublicKeyMismatch => {
+                f.write_str("manifest/Boltz audit found a claim public-key mismatch")
+            }
+            Self::RefundPublicKeyMismatch => {
+                f.write_str("manifest/Boltz audit found a refund public-key mismatch")
+            }
+            Self::ClaimPreimageHashMismatch => {
+                f.write_str("manifest/Boltz audit found a claim preimage-hash mismatch")
+            }
+            Self::RefundPreimageHashMismatch => {
+                f.write_str("manifest/Boltz audit found unexpected refund preimage evidence")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SwapManifestBoltzAuditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
     }
 }
 
@@ -509,6 +592,105 @@ pub fn audit_append_only_manifest_set_v1(
             .map(|manifest| manifest.restore_identity.manifest_id),
         lineage_high_waters,
     })
+}
+
+/// First audit the complete append-only witness, then require every witnessed
+/// Boltz id to bind exactly one validated chain record with identical public
+/// derivation evidence. Extra provider chain records are returned, sorted, for
+/// a later caller to classify as legacy/cutover candidates.
+pub fn audit_manifest_set_against_boltz_restore_v1(
+    manifests: &[SwapManifestV1],
+    provider: &ValidatedBoltzRestoreSet,
+) -> Result<SwapManifestBoltzAuditV1, SwapManifestBoltzAuditError> {
+    let manifest_set = audit_append_only_manifest_set_v1(manifests)
+        .map_err(|_| SwapManifestBoltzAuditError::InvalidManifestSet)?;
+
+    let mut provider_by_id: BTreeMap<&str, &ValidatedBoltzRestoreRecord> = BTreeMap::new();
+    for record in &provider.records {
+        if provider_by_id
+            .insert(record.provider_swap_id.as_str(), record)
+            .is_some()
+        {
+            return Err(SwapManifestBoltzAuditError::DuplicateProviderRecord);
+        }
+    }
+
+    let witnessed_ids: BTreeSet<&str> = manifests
+        .iter()
+        .map(|manifest| manifest.restore_identity.boltz_swap_id.as_str())
+        .collect();
+    for manifest in manifests {
+        let record = provider_by_id
+            .get(manifest.restore_identity.boltz_swap_id.as_str())
+            .copied()
+            .ok_or(SwapManifestBoltzAuditError::MissingWitnessedProviderRecord)?;
+        if record.kind != BoltzRestoreKind::Chain {
+            return Err(SwapManifestBoltzAuditError::WrongWitnessedProviderKind);
+        }
+        let (claim, refund) = exact_chain_restore_keys(record)?;
+        let lineage = &manifest.derivation_lineage;
+
+        if i64::from(claim.child_index) != lineage.claim.child_index {
+            return Err(SwapManifestBoltzAuditError::ClaimChildIndexMismatch);
+        }
+        if i64::from(refund.child_index) != lineage.refund.child_index {
+            return Err(SwapManifestBoltzAuditError::RefundChildIndexMismatch);
+        }
+        if claim.public_key_hex != lineage.claim.public_key_hex {
+            return Err(SwapManifestBoltzAuditError::ClaimPublicKeyMismatch);
+        }
+        if refund.public_key_hex != lineage.refund.public_key_hex {
+            return Err(SwapManifestBoltzAuditError::RefundPublicKeyMismatch);
+        }
+        if claim.preimage_sha256_hex != lineage.claim.preimage_hash_hex {
+            return Err(SwapManifestBoltzAuditError::ClaimPreimageHashMismatch);
+        }
+        if refund.preimage_sha256_hex != lineage.refund.preimage_hash_hex {
+            return Err(SwapManifestBoltzAuditError::RefundPreimageHashMismatch);
+        }
+    }
+
+    let mut provider_only_chain_swap_ids: Vec<String> = provider
+        .records
+        .iter()
+        .filter(|record| {
+            record.kind == BoltzRestoreKind::Chain
+                && !witnessed_ids.contains(record.provider_swap_id.as_str())
+        })
+        .map(|record| record.provider_swap_id.clone())
+        .collect();
+    provider_only_chain_swap_ids.sort_unstable();
+
+    Ok(SwapManifestBoltzAuditV1 {
+        manifest_set,
+        provider_only_chain_record_count: provider_only_chain_swap_ids.len(),
+        provider_only_chain_swap_ids,
+        provider_max_child_index: provider.max_child_index,
+    })
+}
+
+fn exact_chain_restore_keys(
+    record: &ValidatedBoltzRestoreRecord,
+) -> Result<(&ValidatedBoltzRestoreKey, &ValidatedBoltzRestoreKey), SwapManifestBoltzAuditError> {
+    if record.keys.len() != 2 {
+        return Err(SwapManifestBoltzAuditError::InvalidChainKeyPurposes);
+    }
+    let mut claim = None;
+    let mut refund = None;
+    for key in &record.keys {
+        match key.purpose {
+            BoltzRestoreKeyPurpose::ChainClaim if claim.is_none() => claim = Some(key),
+            BoltzRestoreKeyPurpose::ChainRefund if refund.is_none() => refund = Some(key),
+            BoltzRestoreKeyPurpose::ReverseClaim
+            | BoltzRestoreKeyPurpose::ChainClaim
+            | BoltzRestoreKeyPurpose::ChainRefund => {
+                return Err(SwapManifestBoltzAuditError::InvalidChainKeyPurposes);
+            }
+        }
+    }
+    claim
+        .zip(refund)
+        .ok_or(SwapManifestBoltzAuditError::InvalidChainKeyPurposes)
 }
 
 impl SwapManifestV1 {
@@ -1758,6 +1940,87 @@ mod tests {
         manifest
     }
 
+    fn manifest_boltz_audit_pair() -> (SwapManifestV1, SwapManifestV1) {
+        let first = manifest_set_fixture(1, None, 100, 1_000, 1_001, 1_003, 70, 71, 0x81);
+        let second = manifest_set_fixture(
+            2,
+            Some(first.restore_identity.manifest_id),
+            101,
+            1_002,
+            1_003,
+            1_003,
+            72,
+            73,
+            0x82,
+        );
+        (first, second)
+    }
+
+    fn validated_chain_record(manifest: &SwapManifestV1) -> ValidatedBoltzRestoreRecord {
+        ValidatedBoltzRestoreRecord {
+            provider_swap_id: manifest.restore_identity.boltz_swap_id.clone(),
+            kind: BoltzRestoreKind::Chain,
+            status: "transaction.server.mempool".into(),
+            created_at: u64::try_from(manifest.restore_identity.created_at_unix).unwrap(),
+            keys: vec![
+                ValidatedBoltzRestoreKey {
+                    purpose: BoltzRestoreKeyPurpose::ChainClaim,
+                    child_index: u32::try_from(manifest.derivation_lineage.claim.child_index)
+                        .unwrap(),
+                    public_key_hex: manifest.derivation_lineage.claim.public_key_hex.clone(),
+                    preimage_sha256_hex: manifest
+                        .derivation_lineage
+                        .claim
+                        .preimage_hash_hex
+                        .clone(),
+                },
+                ValidatedBoltzRestoreKey {
+                    purpose: BoltzRestoreKeyPurpose::ChainRefund,
+                    child_index: u32::try_from(manifest.derivation_lineage.refund.child_index)
+                        .unwrap(),
+                    public_key_hex: manifest.derivation_lineage.refund.public_key_hex.clone(),
+                    preimage_sha256_hex: manifest
+                        .derivation_lineage
+                        .refund
+                        .preimage_hash_hex
+                        .clone(),
+                },
+            ],
+        }
+    }
+
+    fn validated_reverse_record(
+        provider_swap_id: &str,
+        child_index: u32,
+    ) -> ValidatedBoltzRestoreRecord {
+        ValidatedBoltzRestoreRecord {
+            provider_swap_id: provider_swap_id.into(),
+            kind: BoltzRestoreKind::Reverse,
+            status: "transaction.mempool".into(),
+            created_at: 1_784_000_500,
+            keys: vec![ValidatedBoltzRestoreKey {
+                purpose: BoltzRestoreKeyPurpose::ReverseClaim,
+                child_index,
+                public_key_hex: public_key_from_scalar(90).to_string(),
+                preimage_sha256_hex: Some("ab".repeat(32)),
+            }],
+        }
+    }
+
+    fn validated_restore_set(
+        records: Vec<ValidatedBoltzRestoreRecord>,
+    ) -> ValidatedBoltzRestoreSet {
+        let max_child_index = records
+            .iter()
+            .flat_map(|record| record.keys.iter())
+            .map(|key| key.child_index)
+            .max();
+        ValidatedBoltzRestoreSet {
+            records,
+            max_child_index,
+        }
+    }
+
     fn signer_public_key(keypair: &Keypair) -> XOnlyPublicKey {
         keypair.x_only_public_key().0
     }
@@ -1992,6 +2255,286 @@ mod tests {
             audit_append_only_manifest_set_v1(&[first, duplicate_preimage]),
             Err(SwapManifestSetError::DuplicatePreimageHash(_))
         ));
+    }
+
+    #[test]
+    fn manifest_boltz_audit_accepts_unordered_exact_matches_and_ignores_reverse_records() {
+        let (first, second) = manifest_boltz_audit_pair();
+        let mut first_record = validated_chain_record(&first);
+        first_record.keys.reverse();
+        let provider = validated_restore_set(vec![
+            validated_chain_record(&second),
+            validated_reverse_record("ProviderReverseOnly", 1_500),
+            first_record,
+        ]);
+
+        let audit = audit_manifest_set_against_boltz_restore_v1(
+            &[second.clone(), first.clone()],
+            &provider,
+        )
+        .unwrap();
+
+        assert_eq!(audit.manifest_set.manifest_count, 2);
+        assert_eq!(audit.manifest_set.last_manifest_sequence, Some(2));
+        assert_eq!(
+            audit.manifest_set.last_manifest_id,
+            Some(second.restore_identity.manifest_id)
+        );
+        assert_eq!(audit.provider_only_chain_swap_ids, Vec::<String>::new());
+        assert_eq!(audit.provider_only_chain_record_count, 0);
+        assert_eq!(audit.provider_max_child_index, Some(1_500));
+    }
+
+    #[test]
+    fn manifest_boltz_audit_runs_append_only_audit_before_provider_matching() {
+        let invalid_manifest = manifest_set_fixture(
+            2,
+            Some(Uuid::from_u128(99_999)),
+            110,
+            1_100,
+            1_101,
+            1_101,
+            74,
+            75,
+            0x83,
+        );
+        let duplicate = validated_chain_record(&invalid_manifest);
+        let provider = validated_restore_set(vec![duplicate.clone(), duplicate]);
+
+        assert!(matches!(
+            audit_manifest_set_against_boltz_restore_v1(&[invalid_manifest], &provider),
+            Err(SwapManifestBoltzAuditError::InvalidManifestSet)
+        ));
+    }
+
+    #[test]
+    fn manifest_boltz_audit_rejects_missing_ambiguous_or_reverse_witness_matches() {
+        let (first, _) = manifest_boltz_audit_pair();
+
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(Vec::new()),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::MissingWitnessedProviderRecord
+        );
+
+        let chain = validated_chain_record(&first);
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![chain.clone(), chain]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::DuplicateProviderRecord
+        );
+
+        let reverse = validated_reverse_record(&first.restore_identity.boltz_swap_id, 1_000);
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![reverse]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::WrongWitnessedProviderKind
+        );
+    }
+
+    #[test]
+    fn manifest_boltz_audit_requires_exact_claim_and_refund_purposes() {
+        let (first, _) = manifest_boltz_audit_pair();
+
+        let mut wrong_claim = validated_chain_record(&first);
+        wrong_claim.keys[0].purpose = BoltzRestoreKeyPurpose::ReverseClaim;
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![wrong_claim]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::InvalidChainKeyPurposes
+        );
+
+        let mut wrong_refund = validated_chain_record(&first);
+        wrong_refund.keys[1].purpose = BoltzRestoreKeyPurpose::ChainClaim;
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![wrong_refund]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::InvalidChainKeyPurposes
+        );
+
+        let mut extra_key = validated_chain_record(&first);
+        extra_key.keys.push(extra_key.keys[0].clone());
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![extra_key]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::InvalidChainKeyPurposes
+        );
+    }
+
+    #[test]
+    fn manifest_boltz_audit_requires_exact_child_indices() {
+        let (first, _) = manifest_boltz_audit_pair();
+
+        let mut claim_mismatch = validated_chain_record(&first);
+        claim_mismatch.keys[0].child_index += 1;
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![claim_mismatch]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::ClaimChildIndexMismatch
+        );
+
+        let mut refund_mismatch = validated_chain_record(&first);
+        refund_mismatch.keys[1].child_index += 1;
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![refund_mismatch]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::RefundChildIndexMismatch
+        );
+    }
+
+    #[test]
+    fn manifest_boltz_audit_requires_exact_compressed_public_keys() {
+        let (first, _) = manifest_boltz_audit_pair();
+
+        let mut claim_mismatch = validated_chain_record(&first);
+        claim_mismatch.keys[0].public_key_hex = public_key_from_scalar(91).to_string();
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![claim_mismatch]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::ClaimPublicKeyMismatch
+        );
+
+        let mut refund_mismatch = validated_chain_record(&first);
+        refund_mismatch.keys[1].public_key_hex = public_key_from_scalar(92).to_string();
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![refund_mismatch]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::RefundPublicKeyMismatch
+        );
+    }
+
+    #[test]
+    fn manifest_boltz_audit_requires_exact_claim_and_absent_refund_preimage_hashes() {
+        let (first, _) = manifest_boltz_audit_pair();
+
+        let mut claim_mismatch = validated_chain_record(&first);
+        claim_mismatch.keys[0].preimage_sha256_hex = Some("cd".repeat(32));
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![claim_mismatch]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::ClaimPreimageHashMismatch
+        );
+
+        let mut refund_evidence = validated_chain_record(&first);
+        refund_evidence.keys[1].preimage_sha256_hex = Some("ef".repeat(32));
+        assert_eq!(
+            audit_manifest_set_against_boltz_restore_v1(
+                std::slice::from_ref(&first),
+                &validated_restore_set(vec![refund_evidence]),
+            )
+            .unwrap_err(),
+            SwapManifestBoltzAuditError::RefundPreimageHashMismatch
+        );
+    }
+
+    #[test]
+    fn manifest_boltz_audit_reports_sorted_provider_only_chain_candidates() {
+        let (first, _) = manifest_boltz_audit_pair();
+        let alpha_manifest = manifest_set_fixture(1, None, 120, 1_200, 1_201, 1_201, 76, 77, 0x84);
+        let zulu_manifest = manifest_set_fixture(1, None, 121, 1_300, 1_301, 1_301, 78, 79, 0x85);
+        let mut alpha = validated_chain_record(&alpha_manifest);
+        alpha.provider_swap_id = "LegacyAlpha".into();
+        let mut zulu = validated_chain_record(&zulu_manifest);
+        zulu.provider_swap_id = "LegacyZulu".into();
+        let provider = validated_restore_set(vec![
+            zulu,
+            validated_reverse_record("ReverseNotLegacyChain", 1_400),
+            validated_chain_record(&first),
+            alpha,
+        ]);
+
+        let audit =
+            audit_manifest_set_against_boltz_restore_v1(std::slice::from_ref(&first), &provider)
+                .unwrap();
+        assert_eq!(
+            audit.provider_only_chain_swap_ids,
+            ["LegacyAlpha".to_owned(), "LegacyZulu".to_owned()]
+        );
+        assert_eq!(audit.provider_only_chain_record_count, 2);
+        assert_eq!(audit.provider_max_child_index, Some(1_400));
+    }
+
+    #[test]
+    fn manifest_boltz_audit_error_display_is_fixed_bounded_and_redacted() {
+        const SENTINEL: &str = "OperationalProviderIdOrKeyMaterialMustNotEscape";
+        let (mut first, mut second) = manifest_boltz_audit_pair();
+        first.restore_identity.boltz_swap_id = SENTINEL.into();
+        second.restore_identity.boltz_swap_id = SENTINEL.into();
+        for manifest in [&mut first, &mut second] {
+            let mut response = provider_response(manifest);
+            response.id = SENTINEL.into();
+            replace_provider_response(manifest, &response);
+        }
+        let manifests = [first, second];
+        assert!(matches!(
+            audit_append_only_manifest_set_v1(&manifests),
+            Err(SwapManifestSetError::DuplicateBoltzSwapId(value)) if value == SENTINEL
+        ));
+        let invalid_manifest_set = audit_manifest_set_against_boltz_restore_v1(
+            &manifests,
+            &validated_restore_set(Vec::new()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_manifest_set,
+            SwapManifestBoltzAuditError::InvalidManifestSet
+        );
+
+        let errors = vec![
+            invalid_manifest_set,
+            SwapManifestBoltzAuditError::DuplicateProviderRecord,
+            SwapManifestBoltzAuditError::MissingWitnessedProviderRecord,
+            SwapManifestBoltzAuditError::WrongWitnessedProviderKind,
+            SwapManifestBoltzAuditError::InvalidChainKeyPurposes,
+            SwapManifestBoltzAuditError::ClaimChildIndexMismatch,
+            SwapManifestBoltzAuditError::RefundChildIndexMismatch,
+            SwapManifestBoltzAuditError::ClaimPublicKeyMismatch,
+            SwapManifestBoltzAuditError::RefundPublicKeyMismatch,
+            SwapManifestBoltzAuditError::ClaimPreimageHashMismatch,
+            SwapManifestBoltzAuditError::RefundPreimageHashMismatch,
+        ];
+
+        for error in errors {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(display.len() <= 96, "unbounded audit error: {display}");
+            assert!(!display.contains(SENTINEL));
+            assert!(!debug.contains(SENTINEL));
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
