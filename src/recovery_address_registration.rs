@@ -64,14 +64,37 @@ impl RecoveryAddressRegistrationResponse {
 ///
 /// Keeping the original signature and timestamp here lets that layer persist
 /// the exact merchant authorization rather than reconstructing it. This type
-/// is server-internal evidence and is never a response body.
+/// is server-internal evidence and is never a response body. Private fields
+/// prevent callers from mutating the verified identity or signed payload.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedRecoveryAddressRegistration {
-    pub version: u16,
-    pub npub: String,
-    pub canonical_btc_address: String,
-    pub timestamp: u64,
-    pub original_signature: String,
+    version: u16,
+    npub: String,
+    canonical_btc_address: String,
+    timestamp: u64,
+    original_signature: String,
+}
+
+impl VerifiedRecoveryAddressRegistration {
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    pub fn npub(&self) -> &str {
+        &self.npub
+    }
+
+    pub fn canonical_btc_address(&self) -> &str {
+        &self.canonical_btc_address
+    }
+
+    pub const fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    pub fn original_signature(&self) -> &str {
+        &self.original_signature
+    }
 }
 
 /// Build the byte-exact message clients must sign.
@@ -278,11 +301,11 @@ mod tests {
         let request = signed_request(&keypair, &npub, MAINNET_P2WPKH, timestamp);
 
         let verified = verify_recovery_address_registration(&request).unwrap();
-        assert_eq!(verified.version, RECOVERY_ADDRESS_REGISTRATION_VERSION);
-        assert_eq!(verified.npub, npub);
-        assert_eq!(verified.canonical_btc_address, MAINNET_P2WPKH);
-        assert_eq!(verified.timestamp, timestamp);
-        assert_eq!(verified.original_signature, request.signature);
+        assert_eq!(verified.version(), RECOVERY_ADDRESS_REGISTRATION_VERSION);
+        assert_eq!(verified.npub(), npub);
+        assert_eq!(verified.canonical_btc_address(), MAINNET_P2WPKH);
+        assert_eq!(verified.timestamp(), timestamp);
+        assert_eq!(verified.original_signature(), request.signature);
     }
 
     #[test]
