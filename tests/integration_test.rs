@@ -273,6 +273,13 @@ fn test_state_with_provider_limits(
         )
         .unwrap(),
     );
+    let fee_runtime = Arc::new(
+        pay_service::fee_runtime::FeeRuntime::from_config(
+            &config.fee_policy,
+            Arc::new(pay_service::fee_runtime::UnavailableFeeRuntimePersistence),
+        )
+        .unwrap(),
+    );
 
     AppState {
         db: pool,
@@ -285,6 +292,7 @@ fn test_state_with_provider_limits(
         utxo_backend: None,
         liquid_claim_client_factory: Some(liquid_claim_client_factory),
         bitcoin_recovery_backend: Some(bitcoin_recovery_backend),
+        fee_runtime,
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),
         recovery_manifest_runtime_v1: None,

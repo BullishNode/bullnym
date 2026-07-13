@@ -201,6 +201,35 @@ fn expired_future_or_invalid_restored_evidence_fails_closed() {
         .bitcoin;
     assert!(future_error.is_err());
 
+    let mut outside_policy_bounds = RestartedFeeFixture::new();
+    outside_policy_bounds.restore_bitcoin_last_known_good(
+        PersistedLkgFixture {
+            rail: FeeRail::Bitcoin,
+            original_source: FeeObservationSource::LiveBitcoin,
+            rate_sat_per_vbyte: bitcoin_policy.cap().as_f64() + 1.0,
+            observed_at_unix: NOW_UNIX,
+            provenance: "unsafe-restored-bitcoin".to_owned(),
+        }
+        .restore_bitcoin()
+        .unwrap(),
+    );
+    outside_policy_bounds.restore_liquid_last_known_good(
+        PersistedLkgFixture {
+            rail: FeeRail::Liquid,
+            original_source: FeeObservationSource::LiveLiquid,
+            rate_sat_per_vbyte: liquid_policy.cap().as_f64() + 0.1,
+            observed_at_unix: NOW_UNIX,
+            provenance: "unsafe-restored-liquid".to_owned(),
+        }
+        .restore_liquid()
+        .unwrap(),
+    );
+    let outside_policy_bounds =
+        outside_policy_bounds.decisions(&bitcoin_policy, &liquid_policy, NOW_UNIX);
+    assert!(outside_policy_bounds.bitcoin.is_err());
+    assert!(outside_policy_bounds.liquid.is_err());
+    assert_swap_admission_closed_for_fee_policy(&outside_policy_bounds.apply_to_admission());
+
     for invalid in [
         PersistedLkgFixture {
             rail: FeeRail::Bitcoin,
