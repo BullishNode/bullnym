@@ -509,13 +509,24 @@ impl SwapManifestV1 {
             return invalid("manifest-v1 requires the Bitcoin and Liquid mainnet networks");
         }
         require_lower_hex("Liquid asset id", &creation.liquid_asset_id, 32)?;
+        if creation.liquid_asset_id != boltz_client::elements::AssetId::LIQUID_BTC.to_string() {
+            return invalid("manifest-v1 requires the Liquid Bitcoin asset id");
+        }
         require_bounded_no_whitespace(
             "merchant Liquid destination",
             &creation.merchant_liquid_destination,
             512,
         )?;
+        require_canonical_liquid_mainnet_address(
+            "merchant Liquid destination",
+            &creation.merchant_liquid_destination,
+        )?;
         if let Some(address) = creation.merchant_emergency_btc_address.as_deref() {
             require_bounded_no_whitespace("merchant emergency Bitcoin address", address, 128)?;
+            require_canonical_bitcoin_mainnet_address(
+                "merchant emergency Bitcoin address",
+                address,
+            )?;
         }
 
         let policy = &self.merchant_policy;
@@ -525,6 +536,10 @@ impl SwapManifestV1 {
             "policy Liquid destination",
             &policy.merchant_liquid_destination,
             512,
+        )?;
+        require_canonical_liquid_mainnet_address(
+            "policy Liquid destination",
+            &policy.merchant_liquid_destination,
         )?;
         if policy.merchant_liquid_destination != creation.merchant_liquid_destination {
             return invalid("Liquid destination policy reference does not match creation evidence");
@@ -541,6 +556,10 @@ impl SwapManifestV1 {
                     "policy emergency Bitcoin address",
                     policy_address,
                     128,
+                )?;
+                require_canonical_bitcoin_mainnet_address(
+                    "policy emergency Bitcoin address",
+                    policy_address,
                 )?;
                 if policy_address != address {
                     return invalid(
@@ -991,6 +1010,35 @@ fn validate_exact_leaf_cross_reference(
     Ok(())
 }
 
+fn require_canonical_liquid_mainnet_address(
+    name: &str,
+    address: &str,
+) -> Result<(), SwapManifestError> {
+    let canonical =
+        crate::validators::canonical_liquid_mainnet_address(address).map_err(|error| {
+            SwapManifestError::InvalidField(format!(
+                "{name} is not a confidential Liquid mainnet address: {error}"
+            ))
+        })?;
+    if canonical != address {
+        return invalid(format!("{name} is not canonical"));
+    }
+    Ok(())
+}
+
+fn require_canonical_bitcoin_mainnet_address(
+    name: &str,
+    address: &str,
+) -> Result<(), SwapManifestError> {
+    let canonical = crate::validators::canonical_btc_mainnet_address(address).map_err(|error| {
+        SwapManifestError::InvalidField(format!("{name} is not a Bitcoin mainnet address: {error}"))
+    })?;
+    if canonical != address {
+        return invalid(format!("{name} is not canonical"));
+    }
+    Ok(())
+}
+
 fn validate_network_name(name: &str, value: &str) -> Result<(), SwapManifestError> {
     if value.is_empty()
         || value.len() > 32
@@ -1246,13 +1294,23 @@ mod tests {
         );
     }
 
+    fn replace_liquid_destination(manifest: &mut SwapManifestV1, address: &str) {
+        manifest.creation.merchant_liquid_destination = address.to_owned();
+        manifest.merchant_policy.merchant_liquid_destination = address.to_owned();
+    }
+
+    fn replace_emergency_bitcoin_address(manifest: &mut SwapManifestV1, address: &str) {
+        manifest.creation.merchant_emergency_btc_address = Some(address.to_owned());
+        manifest.merchant_policy.merchant_emergency_btc_address = Some(address.to_owned());
+    }
+
     fn fixture() -> SwapManifestV1 {
         let (provider_response, preimage, claim_public_key, refund_public_key) =
             real_shaped_provider_fixture();
         let canonical_response = canonical_json(&provider_response).unwrap();
         let lockup_address = provider_response.lockup_details.lockup_address.clone();
-        let liquid_destination = "lq1qqmanifestdestination000000000000000000000000000000000000000";
-        let emergency_address = "bc1qmanifestrecovery0000000000000000000000000";
+        let liquid_destination = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
+        let emergency_address = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
         SwapManifestV1::new(
             SwapRestoreIdentityV1 {
                 manifest_id: Uuid::from_u128(1),
@@ -1313,7 +1371,7 @@ mod tests {
                 ),
                 btc_network: "bitcoin".into(),
                 liquid_network: "liquid".into(),
-                liquid_asset_id: "99".repeat(32),
+                liquid_asset_id: boltz_client::elements::AssetId::LIQUID_BTC.to_string(),
                 merchant_liquid_destination: liquid_destination.into(),
                 merchant_emergency_btc_address: Some(emergency_address.into()),
             },
@@ -1378,6 +1436,117 @@ mod tests {
         assert_eq!(
             response.claim_details.swap_tree.claim_leaf.version,
             LIQUID_TAPSCRIPT_LEAF_VERSION
+        );
+    }
+
+    #[test]
+    fn real_mainnet_asset_and_merchant_destinations_are_accepted() {
+        let manifest = fixture();
+
+        assert_eq!(
+            manifest.creation.liquid_asset_id,
+            boltz_client::elements::AssetId::LIQUID_BTC.to_string()
+        );
+        assert_eq!(
+            crate::validators::canonical_liquid_mainnet_address(
+                &manifest.creation.merchant_liquid_destination
+            )
+            .unwrap(),
+            manifest.creation.merchant_liquid_destination
+        );
+        assert_eq!(
+            crate::validators::canonical_btc_mainnet_address(
+                manifest
+                    .creation
+                    .merchant_emergency_btc_address
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap(),
+            manifest
+                .creation
+                .merchant_emergency_btc_address
+                .as_deref()
+                .unwrap()
+        );
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_v1_rejects_any_asset_other_than_liquid_bitcoin() {
+        let mut manifest = fixture();
+        manifest.creation.liquid_asset_id = "99".repeat(32);
+
+        assert_invalid(&manifest, "requires the Liquid Bitcoin asset id");
+    }
+
+    #[test]
+    fn merchant_liquid_destination_rejects_wrong_network_unconfidential_and_malformed() {
+        const TESTNET_CONFIDENTIAL: &str = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
+        let mut wrong_network = fixture();
+        replace_liquid_destination(&mut wrong_network, TESTNET_CONFIDENTIAL);
+        assert_invalid(&wrong_network, "not a confidential Liquid mainnet address");
+
+        let mut parsed = fixture()
+            .creation
+            .merchant_liquid_destination
+            .parse::<lwk_wollet::elements::Address>()
+            .unwrap();
+        parsed.blinding_pubkey = None;
+        let mut unconfidential = fixture();
+        replace_liquid_destination(&mut unconfidential, &parsed.to_string());
+        assert_invalid(&unconfidential, "not a confidential Liquid mainnet address");
+
+        let mut malformed = fixture();
+        replace_liquid_destination(&mut malformed, "not-a-liquid-address");
+        assert_invalid(&malformed, "not a confidential Liquid mainnet address");
+    }
+
+    #[test]
+    fn emergency_bitcoin_destination_rejects_wrong_network_and_malformed() {
+        let mut wrong_network = fixture();
+        replace_emergency_bitcoin_address(
+            &mut wrong_network,
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        );
+        assert_invalid(&wrong_network, "not a Bitcoin mainnet address");
+
+        let mut malformed = fixture();
+        replace_emergency_bitcoin_address(&mut malformed, "not-a-bitcoin-address");
+        assert_invalid(&malformed, "not a Bitcoin mainnet address");
+    }
+
+    #[test]
+    fn emergency_bitcoin_destination_remains_optional_until_issue_84() {
+        let mut manifest = fixture();
+        manifest.creation.merchant_emergency_btc_address = None;
+        manifest.merchant_policy.emergency_bitcoin_commitment_id = None;
+        manifest.merchant_policy.merchant_emergency_btc_address = None;
+
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn merchant_destinations_reject_noncanonical_address_encoding() {
+        let mut liquid = fixture();
+        let uppercase_liquid = liquid
+            .creation
+            .merchant_liquid_destination
+            .to_ascii_uppercase();
+        replace_liquid_destination(&mut liquid, &uppercase_liquid);
+        assert_invalid(&liquid, "merchant Liquid destination is not canonical");
+
+        let mut bitcoin = fixture();
+        let uppercase_bitcoin = bitcoin
+            .creation
+            .merchant_emergency_btc_address
+            .as_deref()
+            .unwrap()
+            .to_ascii_uppercase();
+        replace_emergency_bitcoin_address(&mut bitcoin, &uppercase_bitcoin);
+        assert_invalid(
+            &bitcoin,
+            "merchant emergency Bitcoin address is not canonical",
         );
     }
 
@@ -1693,7 +1862,7 @@ mod tests {
         assert!(!first.contains(char::is_whitespace));
         assert_eq!(
             sha256_hex(first.as_bytes()),
-            "0b60637df653cd51b14e4e4c3b59f7aae5e5dad973e40d8eee0617c149ed9ac5"
+            "4c5b7a934a6fa3196d612158f5aa61a3f861222385e302d1c20a0b25e4db787b"
         );
     }
 

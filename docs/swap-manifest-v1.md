@@ -56,7 +56,7 @@ Version 1 contains closed typed fields, with no extension map:
 - immutable creation evidence: lockup address, locally constructed BIP21,
   payer and merchant amounts, canonical provider response, pinned canonical
   pair quote, response and four script hashes, both timeout heights, networks,
-  Liquid asset, and immutable merchant destinations;
+  exact Liquid Bitcoin asset, and immutable canonical merchant destinations;
 - merchant policy references: invoice UUID, merchant nym, exact Liquid
   destination, and the optional append-only emergency-Bitcoin commitment UUID
   plus exact address.
@@ -72,6 +72,14 @@ Claim/refund allocation identities must be valid compressed secp256k1 keys and
 all local/provider roles must be distinct after x-only normalization; opposite
 compressed parity does not create a distinct Taproot role key. Covenant or
 other fifth leaves are not part of manifest v1 and fail closed.
+
+Manifest v1 is mainnet-only: its asset must equal the pinned client's exact
+`AssetId::LIQUID_BTC`, its merchant Liquid destination must parse and round-trip
+canonically as a confidential Liquid-mainnet address, and an optional emergency
+Bitcoin destination must parse and round-trip canonically as Bitcoin mainnet.
+The same checks apply to duplicated policy destinations before equality is
+accepted. The optional emergency commitment remains a #84 integration concern;
+this format check does not create, rotate, or wire that commitment.
 
 The sequence/predecessor fields define one configured append-only witness, not
 a quorum or a second live database. Later export wiring must serialize sequence
