@@ -773,6 +773,17 @@ pub async fn record_chain_swap_with_lineage_and_creation_terms(
     insert_chain_swap(pool, swap, Some(lineage), Some(creation_terms)).await
 }
 
+/// Transaction-aware counterpart to
+/// [`record_chain_swap_with_lineage_and_creation_terms`].
+pub async fn record_chain_swap_with_lineage_and_creation_terms_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_terms: &NewChainSwapCreationTerms<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(creation_terms)).await
+}
+
 pub async fn record_chain_swap_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &NewChainSwapRecord<'_>,

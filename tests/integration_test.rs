@@ -58,6 +58,9 @@ use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
+#[path = "support/chain_swap_transaction_insert.rs"]
+mod chain_swap_transaction_insert;
+
 // --- Test infrastructure ---
 
 fn require_test_db() -> String {
