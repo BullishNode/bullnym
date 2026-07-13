@@ -2,9 +2,9 @@
 //!
 //! Periodically polls the Liquid Electrum backend for activity at each active
 //! nym's "next address" (and a small lookahead window). When a payment is
-//! observed at an address with index `>= next_addr_idx`, we advance
+//! confirmed at an address with index `>= next_addr_idx`, we advance
 //! `users.next_addr_idx` past it so future LNURL callbacks return a fresh
-//! unused address.
+//! unused address. Mempool-only history never burns the durable cursor.
 //!
 //! Polling-based by design: simple, no subscription state to manage. ~30s
 //! cadence is fine for our LUD-22 "last unused address" semantics.
@@ -1485,8 +1485,8 @@ async fn poll_nyms(
             return Ok(CycleOutcome::after_token_exhaustion(useful_progress));
         }
 
-        match ctx.backend.has_history(&script).await {
-            Ok(true) => {
+        match ctx.backend.script_history(&script).await {
+            Ok(crate::utxo::LiquidScriptHistory::Confirmed) => {
                 // Preserve reservation-before-user-cursor ordering. The address
                 // subcursor advances only after both idempotent writes succeed;
                 // either failure retries this exact index on the next tick.
@@ -1504,12 +1504,19 @@ async fn poll_nyms(
                     "chain_watcher: observed payment in frozen nym range"
                 );
             }
-            Ok(false) => {}
+            Ok(crate::utxo::LiquidScriptHistory::MempoolOnly) => {
+                tracing::debug!(
+                    nym = %current.nym,
+                    idx = current.next_index,
+                    "chain_watcher: observed mempool-only history; retaining durable nym cursor"
+                );
+            }
+            Ok(crate::utxo::LiquidScriptHistory::Empty) => {}
             Err(error) => {
                 tracing::warn!(
                     nym = %current.nym,
                     idx = current.next_index,
-                    "chain_watcher: has_history failed for frozen nym address: {error}"
+                    "chain_watcher: script history failed for frozen nym address: {error}"
                 );
                 return Ok(CycleOutcome::Failed);
             }
@@ -1553,6 +1560,7 @@ mod tests {
 
     enum FakeHistory {
         Empty,
+        MempoolOnly,
         BackendFailure,
     }
 
@@ -1588,9 +1596,13 @@ mod tests {
             Ok(false)
         }
 
-        async fn has_history(&self, _script_pubkey: &elements::Script) -> Result<bool, AppError> {
+        async fn script_history(
+            &self,
+            _script_pubkey: &elements::Script,
+        ) -> Result<crate::utxo::LiquidScriptHistory, AppError> {
             match self.history {
-                FakeHistory::Empty => Ok(false),
+                FakeHistory::Empty => Ok(crate::utxo::LiquidScriptHistory::Empty),
+                FakeHistory::MempoolOnly => Ok(crate::utxo::LiquidScriptHistory::MempoolOnly),
                 FakeHistory::BackendFailure => {
                     Err(AppError::ElectrumError("test backend failure".to_string()))
                 }
@@ -2533,6 +2545,44 @@ mod tests {
         assert_eq!(outcome, CycleOutcome::Failed);
         assert_eq!(epoch.cursor(), Some("alice"));
         assert_eq!(epoch.current().expect("bob still retained").next_index, 0);
+    }
+
+    #[tokio::test]
+    async fn mempool_history_never_attempts_durable_nym_cursor_writes() {
+        // No database exists behind this lazy pool. The scan can complete only
+        // if mempool-only history avoids both reservation and cursor writes.
+        let pool = lazy_test_pool();
+        let rate_limiter = RateLimiter::new(pool.clone(), RateLimitConfig::default());
+        let backend = FakeNymBackend {
+            history: FakeHistory::MempoolOnly,
+            health_calls: Arc::new(AtomicUsize::new(0)),
+            fail_health: false,
+        };
+        let cancel = CancellationToken::new();
+        let (_admission, reporter, _) = fixture();
+        let ctx = ChainWatcherPollCtx {
+            pool: &pool,
+            backend: &backend,
+            rate_limiter: &rate_limiter,
+            cancel: &cancel,
+        };
+        let mut epoch = db::WatcherNymScanEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string());
+
+        let outcome = poll_nyms(
+            ctx,
+            0,
+            vec![test_nym("mempool-only")],
+            "active",
+            &reporter,
+            &mut epoch,
+        )
+        .await
+        .expect("mempool-only scan remains observational");
+
+        assert_eq!(outcome, CycleOutcome::Healthy);
+        assert_eq!(epoch.cursor(), Some("mempool-only"));
+        assert!(epoch.current().is_none());
     }
 
     #[tokio::test]

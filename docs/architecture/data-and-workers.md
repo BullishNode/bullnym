@@ -25,7 +25,9 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 ## Descriptor Cursors
 
 `users.next_addr_idx` belongs to Lightning Address receive flows. It is used by
-LNURL Lightning claims and LUD-22 Liquid allocation.
+LNURL Lightning claims and LUD-22 Liquid allocation. Direct LUD-22 history does
+not fulfill its reservation or advance this durable cursor until Electrum
+reports a positive confirmation height; mempool-only history may be evicted.
 
 `donation_pages.next_addr_idx` belongs to public checkout surfaces. It is
 advanced when `POST /:nym/invoice` or `POST /:nym/pos/invoice` creates a

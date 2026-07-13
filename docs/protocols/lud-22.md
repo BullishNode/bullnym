@@ -130,8 +130,9 @@ The server caches `(nym, outpoint) -> address_index`. A new unpaid reservation
 uses the nym's current `next_addr_idx` without incrementing it, so different
 unpaid reservations can return the same address. Repeating the same proof for
 the same nym reuses its cached index. The chain watcher advances the cursor only
-after it observes a payment to the reserved index. The returned address is not
-an exclusive per-request allocation.
+after it observes a confirmed payment to the reserved index. Mempool-only
+history is not durable cursor evidence because it may be evicted. The returned
+address is not an exclusive per-request allocation.
 
 The same outpoint is subject to configured distinct-nym fan-out, per-source,
 and pending-reservation limits. Periodic GC deletes unfulfilled reservation

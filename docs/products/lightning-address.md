@@ -37,7 +37,9 @@ LUD-22 lets compatible senders request direct Liquid by passing
 Liquid UTXO, which makes descriptor-exhaustion attacks costly.
 
 The server caches `(nym, outpoint)` to address index, so repeated requests for
-the same outpoint and nym reuse the index instead of advancing the cursor.
+the same outpoint and nym reuse the index instead of advancing the cursor. A
+mempool sighting remains observational; only confirmed Liquid history fulfills
+the reservation and advances the durable descriptor cursor.
 Replacing the nym descriptor can change the address derived at that cached
 index; descriptor rotation must be coordinated with in-flight payments.
 
