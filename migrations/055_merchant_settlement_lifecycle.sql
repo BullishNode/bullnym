@@ -116,6 +116,7 @@ BEGIN
 
     FOREACH function_name IN ARRAY ARRAY[
         'guard_chain_swap_tx_attempt_immutable',
+        'require_review25_bitcoin_attempt_fee_authority',
         'guard_invoice_payment_event_evidence'
     ] LOOP
         SELECT procedure_info.proowner
@@ -167,6 +168,7 @@ $$;
 ALTER TABLE chain_swap_tx_attempts
     DROP CONSTRAINT chain_swap_tx_attempts_purpose_check,
     DROP CONSTRAINT chain_swap_tx_attempts_one_recovery,
+    DROP CONSTRAINT chain_swap_tx_attempts_fee_authority_value_check,
     ADD COLUMN replaces_txid TEXT,
     ADD COLUMN destination_asset_id TEXT,
     ADD COLUMN liquid_blinding_key_hex TEXT,
@@ -193,10 +195,124 @@ ALTER TABLE chain_swap_tx_attempts
             AND liquid_blinding_key_hex ~ '^[0-9a-f]{64}$'
         )
     ),
+    ADD CONSTRAINT chain_swap_tx_attempts_fee_authority_value_check CHECK (
+        fee_decision_purpose IS NULL OR ((
+            (
+                purpose = 'btc_recovery'
+                AND fee_decision_purpose = 'bitcoin_recovery'
+                AND fee_decision_rail = 'bitcoin'
+                AND fee_decision_target = 'fastestFee'
+                AND fee_decision_source IN (
+                    'bitcoin_live', 'bitcoin_last_known_good'
+                )
+            ) OR (
+                purpose IN ('liquid_claim', 'liquid_claim_replacement')
+                AND fee_decision_purpose = 'chain_liquid_claim'
+                AND fee_decision_rail = 'liquid'
+                AND fee_decision_target = '1'
+                AND fee_decision_source IN (
+                    'liquid_live', 'liquid_last_known_good'
+                )
+            )
+        ) AND (
+            fee_decision_rate_sat_vb > 0
+            AND fee_decision_rate_sat_vb NOT IN (
+                'NaN'::DOUBLE PRECISION,
+                'Infinity'::DOUBLE PRECISION,
+                '-Infinity'::DOUBLE PRECISION
+            )
+            AND fee_decision_quoted_at_unix >= 0
+            AND fee_decision_evaluated_at_unix
+                >= fee_decision_quoted_at_unix
+            AND fee_decision_freshness_age_secs >= 0
+            AND fee_decision_freshness_max_age_secs > 0
+            AND fee_decision_evaluated_at_unix
+                - fee_decision_quoted_at_unix
+                = fee_decision_freshness_age_secs
+            AND fee_decision_freshness_age_secs
+                <= fee_decision_freshness_max_age_secs
+            AND btrim(fee_decision_provenance) <> ''
+            AND octet_length(fee_decision_provenance) <= 512
+            AND fee_decision_policy_floor_sat_vb > 0
+            AND fee_decision_policy_floor_sat_vb NOT IN (
+                'NaN'::DOUBLE PRECISION,
+                'Infinity'::DOUBLE PRECISION,
+                '-Infinity'::DOUBLE PRECISION
+            )
+            AND fee_decision_policy_cap_sat_vb
+                >= fee_decision_policy_floor_sat_vb
+            AND fee_decision_policy_cap_sat_vb NOT IN (
+                'NaN'::DOUBLE PRECISION,
+                'Infinity'::DOUBLE PRECISION,
+                '-Infinity'::DOUBLE PRECISION
+            )
+            AND fee_decision_rate_sat_vb BETWEEN
+                fee_decision_policy_floor_sat_vb
+                AND fee_decision_policy_cap_sat_vb
+            AND fee_decision_policy_version = 'review25-v1'
+        ))
+    ),
     ADD CONSTRAINT chain_swap_tx_attempts_replaces_fkey
         FOREIGN KEY (replaces_txid)
         REFERENCES chain_swap_tx_attempts(txid)
         ON UPDATE RESTRICT ON DELETE RESTRICT;
+
+CREATE OR REPLACE FUNCTION require_review25_bitcoin_attempt_fee_authority()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    parent chain_swap_records%ROWTYPE;
+BEGIN
+    IF NEW.fee_decision_purpose IS NULL THEN
+        RAISE EXCEPTION 'new transaction attempt bytes require Review-25 fee authority'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.purpose = 'liquid_claim' THEN
+        SELECT * INTO parent
+          FROM chain_swap_records
+         WHERE id = NEW.chain_swap_id
+         FOR KEY SHARE;
+        IF NOT FOUND
+           OR ROW(
+               NEW.raw_tx_hex, NEW.txid,
+               NEW.fee_amount_sat, NEW.fee_rate_sat_vb,
+               NEW.fee_decision_purpose, NEW.fee_decision_rail,
+               NEW.fee_decision_target, NEW.fee_decision_source,
+               NEW.fee_decision_rate_sat_vb,
+               NEW.fee_decision_quoted_at_unix,
+               NEW.fee_decision_evaluated_at_unix,
+               NEW.fee_decision_freshness_age_secs,
+               NEW.fee_decision_freshness_max_age_secs,
+               NEW.fee_decision_provenance,
+               NEW.fee_decision_policy_floor_sat_vb,
+               NEW.fee_decision_policy_cap_sat_vb,
+               NEW.fee_decision_policy_version
+           ) IS DISTINCT FROM ROW(
+               parent.claim_tx_hex, parent.claim_txid,
+               parent.claim_actual_fee_sat,
+               parent.claim_actual_fee_rate_sat_vb,
+               parent.claim_fee_decision_purpose,
+               parent.claim_fee_decision_rail,
+               parent.claim_fee_decision_target,
+               parent.claim_fee_decision_source,
+               parent.claim_fee_decision_rate_sat_vb,
+               parent.claim_fee_decision_quoted_at_unix,
+               parent.claim_fee_decision_evaluated_at_unix,
+               parent.claim_fee_decision_freshness_age_secs,
+               parent.claim_fee_decision_freshness_max_age_secs,
+               parent.claim_fee_decision_provenance,
+               parent.claim_fee_decision_policy_floor_sat_vb,
+               parent.claim_fee_decision_policy_cap_sat_vb,
+               parent.claim_fee_decision_policy_version
+           ) THEN
+            RAISE EXCEPTION 'Liquid claim attempt authority differs from its parent claim'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$$;
 
 CREATE OR REPLACE FUNCTION guard_chain_swap_tx_attempt_immutable()
 RETURNS TRIGGER
@@ -217,6 +333,19 @@ BEGIN
        OR NEW.destination_amount_sat IS DISTINCT FROM OLD.destination_amount_sat
        OR NEW.fee_amount_sat IS DISTINCT FROM OLD.fee_amount_sat
        OR NEW.fee_rate_sat_vb IS DISTINCT FROM OLD.fee_rate_sat_vb
+       OR NEW.fee_decision_purpose IS DISTINCT FROM OLD.fee_decision_purpose
+       OR NEW.fee_decision_rail IS DISTINCT FROM OLD.fee_decision_rail
+       OR NEW.fee_decision_target IS DISTINCT FROM OLD.fee_decision_target
+       OR NEW.fee_decision_source IS DISTINCT FROM OLD.fee_decision_source
+       OR NEW.fee_decision_rate_sat_vb IS DISTINCT FROM OLD.fee_decision_rate_sat_vb
+       OR NEW.fee_decision_quoted_at_unix IS DISTINCT FROM OLD.fee_decision_quoted_at_unix
+       OR NEW.fee_decision_evaluated_at_unix IS DISTINCT FROM OLD.fee_decision_evaluated_at_unix
+       OR NEW.fee_decision_freshness_age_secs IS DISTINCT FROM OLD.fee_decision_freshness_age_secs
+       OR NEW.fee_decision_freshness_max_age_secs IS DISTINCT FROM OLD.fee_decision_freshness_max_age_secs
+       OR NEW.fee_decision_provenance IS DISTINCT FROM OLD.fee_decision_provenance
+       OR NEW.fee_decision_policy_floor_sat_vb IS DISTINCT FROM OLD.fee_decision_policy_floor_sat_vb
+       OR NEW.fee_decision_policy_cap_sat_vb IS DISTINCT FROM OLD.fee_decision_policy_cap_sat_vb
+       OR NEW.fee_decision_policy_version IS DISTINCT FROM OLD.fee_decision_policy_version
        OR NEW.liquid_blinding_key_hex IS DISTINCT FROM OLD.liquid_blinding_key_hex
        OR NEW.constructed_at IS DISTINCT FROM OLD.constructed_at THEN
         RAISE EXCEPTION 'chain-swap transaction intent is immutable'

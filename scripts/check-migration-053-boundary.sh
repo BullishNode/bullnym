@@ -320,7 +320,86 @@ IFS='|' read -r actual_runtime_role actual_database ready extra <<<"$result"
 if [[ "$require_migration_055" == "1" ]]; then
   migration_055_ready="$(
     clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
-      --tuples-only --no-align <<'SQL'
+      --quiet --tuples-only --no-align <<'SQL'
+DO $migration_055_authority_probe$
+DECLARE
+    value_check_expression TEXT;
+    admitted BOOLEAN;
+    probe RECORD;
+BEGIN
+    SELECT pg_get_expr(
+               constraint_info.conbin,
+               constraint_info.conrelid,
+               TRUE
+           )
+      INTO STRICT value_check_expression
+      FROM pg_constraint constraint_info
+     WHERE constraint_info.conrelid =
+               'public.chain_swap_tx_attempts'::REGCLASS
+       AND constraint_info.conname =
+               'chain_swap_tx_attempts_fee_authority_value_check'
+       AND constraint_info.contype = 'c'
+       AND constraint_info.convalidated;
+
+    FOR probe IN
+        SELECT *
+          FROM (VALUES
+              ('btc_recovery', 'bitcoin_recovery', 'bitcoin',
+                  'fastestFee', 'bitcoin_live', TRUE),
+              ('btc_recovery', 'bitcoin_recovery', 'bitcoin',
+                  'fastestFee', 'bitcoin_last_known_good', TRUE),
+              ('liquid_claim', 'chain_liquid_claim', 'liquid',
+                  '1', 'liquid_live', TRUE),
+              ('liquid_claim', 'chain_liquid_claim', 'liquid',
+                  '1', 'liquid_last_known_good', TRUE),
+              ('liquid_claim_replacement', 'chain_liquid_claim', 'liquid',
+                  '1', 'liquid_live', TRUE),
+              ('liquid_claim_replacement', 'chain_liquid_claim', 'liquid',
+                  '1', 'liquid_last_known_good', TRUE),
+              ('btc_recovery', 'chain_liquid_claim', 'liquid',
+                  '1', 'liquid_live', FALSE),
+              ('liquid_claim', 'bitcoin_recovery', 'bitcoin',
+                  'fastestFee', 'bitcoin_live', FALSE)
+          ) AS probes(
+              purpose, decision_purpose, rail, target, source, expected
+          )
+    LOOP
+        EXECUTE format(
+            'SELECT (%s) FROM (SELECT '
+            || '$1::TEXT AS purpose, '
+            || '$2::TEXT AS fee_decision_purpose, '
+            || '$3::TEXT AS fee_decision_rail, '
+            || '$4::TEXT AS fee_decision_target, '
+            || '$5::TEXT AS fee_decision_source, '
+            || '1.5::DOUBLE PRECISION AS fee_decision_rate_sat_vb, '
+            || '1700000100::BIGINT AS fee_decision_quoted_at_unix, '
+            || '1700000105::BIGINT AS fee_decision_evaluated_at_unix, '
+            || '5::BIGINT AS fee_decision_freshness_age_secs, '
+            || '60::BIGINT AS fee_decision_freshness_max_age_secs, '
+            || '''migration-055-boundary''::TEXT '
+            || 'AS fee_decision_provenance, '
+            || '0.1::DOUBLE PRECISION '
+            || 'AS fee_decision_policy_floor_sat_vb, '
+            || '10.0::DOUBLE PRECISION '
+            || 'AS fee_decision_policy_cap_sat_vb, '
+            || '''review25-v1''::TEXT '
+            || 'AS fee_decision_policy_version) authority_probe',
+            value_check_expression
+        )
+        INTO admitted
+        USING probe.purpose, probe.decision_purpose, probe.rail,
+              probe.target, probe.source;
+        IF admitted IS DISTINCT FROM probe.expected THEN
+            RAISE EXCEPTION
+                'migration 055 fee-authority constraint admitted=% for purpose=% authority=%/%/%/%; expected=%',
+                admitted, probe.purpose, probe.decision_purpose,
+                probe.rail, probe.target, probe.source, probe.expected
+                USING ERRCODE = '23514';
+        END IF;
+    END LOOP;
+END
+$migration_055_authority_probe$;
+
 SELECT (
     NOT EXISTS (
         SELECT 1
@@ -328,6 +407,19 @@ SELECT (
               ('chain_swap_tx_attempts', 'replaces_txid'),
               ('chain_swap_tx_attempts', 'destination_asset_id'),
               ('chain_swap_tx_attempts', 'liquid_blinding_key_hex'),
+              ('chain_swap_tx_attempts', 'fee_decision_purpose'),
+              ('chain_swap_tx_attempts', 'fee_decision_rail'),
+              ('chain_swap_tx_attempts', 'fee_decision_target'),
+              ('chain_swap_tx_attempts', 'fee_decision_source'),
+              ('chain_swap_tx_attempts', 'fee_decision_rate_sat_vb'),
+              ('chain_swap_tx_attempts', 'fee_decision_quoted_at_unix'),
+              ('chain_swap_tx_attempts', 'fee_decision_evaluated_at_unix'),
+              ('chain_swap_tx_attempts', 'fee_decision_freshness_age_secs'),
+              ('chain_swap_tx_attempts', 'fee_decision_freshness_max_age_secs'),
+              ('chain_swap_tx_attempts', 'fee_decision_provenance'),
+              ('chain_swap_tx_attempts', 'fee_decision_policy_floor_sat_vb'),
+              ('chain_swap_tx_attempts', 'fee_decision_policy_cap_sat_vb'),
+              ('chain_swap_tx_attempts', 'fee_decision_policy_version'),
               ('invoice_payment_events', 'merchant_settlement_family_key'),
               ('invoice_payment_events', 'merchant_chain_swap_id'),
               ('invoice_payment_events', 'merchant_settlement_finalized')
@@ -345,6 +437,8 @@ SELECT (
     AND NOT EXISTS (
         SELECT 1
           FROM (VALUES
+              ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_fee_authority_shape_check'),
+              ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_fee_authority_value_check'),
               ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_replaces_fkey'),
               ('invoice_payment_events', 'invoice_payment_events_merchant_chain_swap_fkey'),
               ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_journal_fkey'),
@@ -366,6 +460,8 @@ SELECT (
     AND NOT EXISTS (
         SELECT 1
           FROM (VALUES
+              ('chain_swap_tx_attempts_require_review25_fee_authority'),
+              ('chain_swap_tx_attempts_immutable'),
               ('chain_swap_tx_attempts_validate_replacement'),
               ('invoice_payment_event_reject_merchant_settlement_delete'),
               ('merchant_settlement_checkpoint_validate_write'),
@@ -378,6 +474,85 @@ SELECT (
               WHERE tgname = required.trigger_name
                 AND NOT tgisinternal
                 AND tgenabled IN ('O', 'A')
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_trigger trigger_info
+          JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'chain_swap_tx_attempts'
+           AND trigger_info.tgname =
+               'chain_swap_tx_attempts_require_review25_fee_authority'
+           AND trigger_info.tgtype = 7
+           AND NOT trigger_info.tgisinternal
+           AND trigger_info.tgenabled IN ('O', 'A')
+           AND function_info.proname =
+               'require_review25_bitcoin_attempt_fee_authority'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%IF NEW.fee_decision_purpose IS NULL THEN%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%IF NEW.purpose = ''liquid_claim'' THEN%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%parent.claim_fee_decision_policy_version%'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('fee_decision_purpose'),
+              ('fee_decision_rail'),
+              ('fee_decision_target'),
+              ('fee_decision_source'),
+              ('fee_decision_rate_sat_vb'),
+              ('fee_decision_quoted_at_unix'),
+              ('fee_decision_evaluated_at_unix'),
+              ('fee_decision_freshness_age_secs'),
+              ('fee_decision_freshness_max_age_secs'),
+              ('fee_decision_provenance'),
+              ('fee_decision_policy_floor_sat_vb'),
+              ('fee_decision_policy_cap_sat_vb'),
+              ('fee_decision_policy_version')
+          ) required(column_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname =
+                    'guard_chain_swap_tx_attempt_immutable'
+                AND function_info.pronargs = 0
+                AND position(
+                    format(
+                        'NEW.%s IS DISTINCT FROM OLD.%s',
+                        required.column_name,
+                        required.column_name
+                    ) IN pg_get_functiondef(function_info.oid)
+                ) > 0
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('guard_chain_swap_tx_attempt_immutable'),
+              ('require_review25_bitcoin_attempt_fee_authority')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'MEMBER'
+                )
          )
     )
     AND NOT EXISTS (

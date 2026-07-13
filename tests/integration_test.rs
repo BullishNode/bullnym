@@ -15855,8 +15855,19 @@ async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) ->
              chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
              destination_address, destination_script_hex, destination_asset_id, \
              destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
-             liquid_blinding_key_hex\
-         ) VALUES ($1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,1000,100,1.5,$8)",
+             liquid_blinding_key_hex, \
+             fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+             fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version\
+         ) VALUES (\
+             $1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,1000,100,1.5,$8, \
+             'chain_liquid_claim','liquid','1','liquid_live',1.5, \
+             1700000100,1700000105,5,60,'integration-test-liquid-live', \
+             0.1,10.0,'review25-v1'\
+         )",
     )
     .bind(swap.id)
     .bind(&raw_tx_hex)
