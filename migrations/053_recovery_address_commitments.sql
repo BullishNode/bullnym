@@ -4,9 +4,9 @@
 --
 -- A recovery address is merchant policy, not mutable profile state. Every
 -- accepted rotation therefore receives a new per-npub commitment version and
--- preserves the exact signed contract evidence. A later chain-swap slice may
--- select and reference the current row, but this migration deliberately adds
--- no swap foreign key or route/readiness wiring.
+-- preserves the exact signed contract evidence. Chain swaps created after this
+-- migration bind both the exact commitment identity and its canonical address;
+-- historical rows remain nullable and are never assigned fabricated evidence.
 
 BEGIN;
 
@@ -63,8 +63,36 @@ CREATE TABLE recovery_address_commitments (
     ),
     CONSTRAINT recovery_address_commitment_signature_once_key UNIQUE (
         npub, original_signature
+    ),
+    -- PostgreSQL requires a unique target with the same ordered columns as the
+    -- composite chain-swap foreign key. The UUID remains the primary identity;
+    -- including the address makes an ID/address mismatch fail atomically.
+    CONSTRAINT recovery_address_commitment_id_address_key UNIQUE (
+        commitment_id, canonical_btc_address
     )
 );
+
+ALTER TABLE chain_swap_records
+    ADD COLUMN recovery_address_commitment_id UUID,
+    -- Existing rows may have no commitment identity. Migration 051 never wrote
+    -- an uncommitted address; fail the upgrade if such unexplained historical
+    -- evidence exists instead of silently legitimizing it. The insert trigger
+    -- below then requires the non-NULL half of this exact pair for new rows.
+    ADD CONSTRAINT chain_swap_records_recovery_commitment_pair_check CHECK (
+        (recovery_address_commitment_id IS NULL)
+        = (merchant_emergency_btc_address IS NULL)
+    ),
+    ADD CONSTRAINT chain_swap_records_recovery_commitment_fkey
+        FOREIGN KEY (
+            recovery_address_commitment_id,
+            merchant_emergency_btc_address
+        )
+        REFERENCES recovery_address_commitments (
+            commitment_id,
+            canonical_btc_address
+        )
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT;
 
 DO $$
 DECLARE
@@ -157,6 +185,36 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION require_chain_swap_recovery_commitment() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.recovery_address_commitment_id IS NULL
+       OR NEW.merchant_emergency_btc_address IS NULL THEN
+        RAISE EXCEPTION 'new chain swaps require an exact recovery-address commitment'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'chain_swap_records_recovery_commitment_pair_check';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION reject_chain_swap_recovery_commitment_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF ROW(
+        OLD.recovery_address_commitment_id,
+        OLD.merchant_emergency_btc_address
+    ) IS DISTINCT FROM ROW(
+        NEW.recovery_address_commitment_id,
+        NEW.merchant_emergency_btc_address
+    ) THEN
+        RAISE EXCEPTION 'chain swap recovery-address commitment is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
 CREATE TRIGGER recovery_address_commitment_validate_insert
     BEFORE INSERT ON recovery_address_commitments
     FOR EACH ROW EXECUTE FUNCTION enforce_recovery_address_commitment_insert();
@@ -168,6 +226,17 @@ CREATE TRIGGER recovery_address_commitment_reject_update
 CREATE TRIGGER recovery_address_commitment_reject_delete
     BEFORE DELETE ON recovery_address_commitments
     FOR EACH ROW EXECUTE FUNCTION reject_recovery_address_commitment_delete();
+
+CREATE TRIGGER chain_swap_records_require_recovery_commitment
+    BEFORE INSERT ON chain_swap_records
+    FOR EACH ROW EXECUTE FUNCTION require_chain_swap_recovery_commitment();
+
+CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update
+    BEFORE UPDATE OF
+        recovery_address_commitment_id,
+        merchant_emergency_btc_address
+    ON chain_swap_records
+    FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_recovery_commitment_mutation();
 
 REVOKE ALL ON recovery_address_commitments FROM PUBLIC;
 

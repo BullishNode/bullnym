@@ -662,12 +662,6 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
-    // Recovery-address commitments reject ordinary DELETE. Test isolation owns
-    // the disposable database and truncates the append-only ledger directly.
-    sqlx::query("TRUNCATE recovery_address_commitments")
-        .execute(pool)
-        .await
-        .ok();
     // Manifest delivery rows reject ordinary DELETE. Isolated test ownership
     // uses DDL before removing their operational source rows.
     sqlx::query("TRUNCATE chain_swap_manifest_deliveries")
@@ -683,6 +677,13 @@ async fn cleanup_db(pool: &PgPool) {
         .await
         .ok();
     sqlx::query("DELETE FROM chain_swap_records")
+        .execute(pool)
+        .await
+        .ok();
+    // Recovery-address commitments reject ordinary DELETE and are referenced
+    // by post-053 chain rows. Test isolation removes those rows first, then
+    // truncates the append-only policy ledger directly.
+    sqlx::query("TRUNCATE recovery_address_commitments CASCADE")
         .execute(pool)
         .await
         .ok();
@@ -761,6 +762,32 @@ fn valid_chain_swap_creation_terms_fixture() -> pay_service::db::NewChainSwapCre
         merchant_liquid_destination: "lq1qqintegrationfixturemerchantdestination",
         merchant_emergency_btc_address: None,
     }
+}
+
+async fn insert_test_recovery_commitment(
+    pool: &PgPool,
+    npub: &str,
+    address: &str,
+    commitment_version: i64,
+    signature_byte: u8,
+) -> uuid::Uuid {
+    let commitment_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, $3, $4, $5, $6)",
+    )
+    .bind(commitment_id)
+    .bind(npub)
+    .bind(commitment_version)
+    .bind(address)
+    .bind(format!("{signature_byte:02x}").repeat(64))
+    .bind(1_700_100_000_i64 + commitment_version)
+    .execute(pool)
+    .await
+    .unwrap();
+    commitment_id
 }
 
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -1066,7 +1093,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "052_chain_swap_manifest_delivery_ledger"
+        "053_recovery_address_commitments"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -1152,6 +1179,210 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
+}
+
+#[tokio::test]
+async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+
+    sqlx::query(
+        "DO $$ BEGIN \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payservice') THEN \
+                 CREATE ROLE payservice NOLOGIN; \
+             END IF; \
+         END $$",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query("REVOKE ALL ON recovery_address_commitments FROM payservice")
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT, INSERT ON recovery_address_commitments TO payservice")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE payservice")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+
+    assert!(readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap());
+
+    sqlx::query("GRANT UPDATE ON recovery_address_commitments TO payservice")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let update_acl_drift = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query("REVOKE UPDATE ON recovery_address_commitments FROM payservice")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    sqlx::query("GRANT SELECT ON recovery_address_commitments TO PUBLIC")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let public_acl_drift = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query("REVOKE SELECT ON recovery_address_commitments FROM PUBLIC")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DISABLE TRIGGER \
+         chain_swap_records_reject_recovery_commitment_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let disabled_trigger = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records ENABLE TRIGGER \
+         chain_swap_records_reject_recovery_commitment_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "DROP TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         ON chain_swap_records",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         BEFORE UPDATE OF status ON chain_swap_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_recovery_commitment_mutation()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_update_columns = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DROP TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         ON chain_swap_records",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update \
+         BEFORE UPDATE OF \
+             recovery_address_commitment_id, merchant_emergency_btc_address \
+         ON chain_swap_records \
+         FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_recovery_commitment_mutation()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey \
+         TO chain_swap_records_recovery_commitment_fkey_before_readiness_test",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let missing_foreign_key = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey_before_readiness_test \
+         TO chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_fkey \
+         FOREIGN KEY (recovery_address_commitment_id, merchant_emergency_btc_address) \
+         REFERENCES recovery_address_commitments (commitment_id, canonical_btc_address) \
+         ON UPDATE RESTRICT ON DELETE CASCADE",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let wrong_foreign_key = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records DROP CONSTRAINT \
+         chain_swap_records_recovery_commitment_fkey",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_records \
+         ADD CONSTRAINT chain_swap_records_recovery_commitment_fkey \
+         FOREIGN KEY (recovery_address_commitment_id, merchant_emergency_btc_address) \
+         REFERENCES recovery_address_commitments (commitment_id, canonical_btc_address) \
+         ON UPDATE RESTRICT ON DELETE RESTRICT",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let restored = readiness::recovery_commitment_ready(&runtime)
+        .await
+        .unwrap();
+    runtime.close().await;
+
+    assert!(!update_acl_drift, "runtime UPDATE must close admission");
+    assert!(!public_acl_drift, "PUBLIC read ACL must close admission");
+    assert!(
+        !disabled_trigger,
+        "disabled immutability must close admission"
+    );
+    assert!(
+        !wrong_update_columns,
+        "an UPDATE trigger on unrelated columns must close admission"
+    );
+    assert!(
+        !missing_foreign_key,
+        "missing exact FK must close admission"
+    );
+    assert!(!wrong_foreign_key, "wrong FK actions must close admission");
+    assert!(
+        restored,
+        "restored exact migration-053 contract must reopen"
+    );
 }
 
 #[tokio::test]
@@ -1287,6 +1518,8 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     pay_service::db::create_user(&pool, "lineageimmutable", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
+    let recovery_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x71).await;
     let reverse_preimage = "66".repeat(32);
     let reverse_claim_key = "77".repeat(32);
     pay_service::db::record_swap_with_lineage(
@@ -1444,8 +1677,13 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     let chain_preimage = "dd".repeat(32);
     let chain_claim_key = "ee".repeat(32);
     let chain_refund_key = "ff".repeat(32);
-    let chain_creation_terms = valid_chain_swap_creation_terms_fixture();
-    pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let mut chain_creation_terms = valid_chain_swap_creation_terms_fixture();
+    chain_creation_terms.merchant_emergency_btc_address = Some(RECOVERY_COMMITMENT_P2WPKH);
+    let chain_creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms: chain_creation_terms,
+        recovery_address_commitment_id: Some(recovery_commitment_id),
+    };
+    pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1472,7 +1710,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &chain_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap();
@@ -1491,7 +1729,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let reused_claim = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1518,7 +1756,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &alternate_refund_public,
             preimage_hash_hex: &chain_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap_err();
@@ -1546,7 +1784,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
     )
     .await
     .unwrap();
-    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+    let reused_refund = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
         &pool,
         &pay_service::db::NewChainSwapRecord {
             invoice_id: chain_invoice.id,
@@ -1573,7 +1811,7 @@ async fn swap_key_registry_is_global_concurrent_and_immutable() {
             refund_public_key_hex: &chain_refund_public,
             preimage_hash_hex: &alternate_claim_hash,
         },
-        &chain_creation_terms,
+        &chain_creation_evidence,
     )
     .await
     .unwrap_err();
@@ -1975,10 +2213,38 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
     cleanup_db(&pool).await;
 
     let nym = "creationterms";
-    let npub = "80".repeat(32);
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
     pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
+    let recovery_timestamp = auth_timestamp();
+    let first_recovery_commitment = pay_service::db::persist_recovery_address_commitment(
+        &pool,
+        &verified_recovery_commitment(
+            &keypair,
+            &npub,
+            RECOVERY_COMMITMENT_P2WPKH,
+            recovery_timestamp,
+        ),
+    )
+    .await
+    .unwrap();
+    let rotated_recovery_commitment = pay_service::db::persist_recovery_address_commitment(
+        &pool,
+        &verified_recovery_commitment(
+            &keypair,
+            &npub,
+            RECOVERY_COMMITMENT_P2PKH,
+            recovery_timestamp,
+        ),
+    )
+    .await
+    .unwrap();
+    let first_recovery_commitment_id = first_recovery_commitment.commitment_id;
+    let rotated_recovery_commitment_id = rotated_recovery_commitment.commitment_id;
     let invoice = insert_test_invoice(
         &pool,
         nym,
@@ -2077,16 +2343,56 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
         liquid_network: "liquid",
         liquid_asset_id: &"8d".repeat(32),
         merchant_liquid_destination: "lq1qqcreationtermsmerchantdestination",
-        merchant_emergency_btc_address: Some(
-            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
-        ),
+        merchant_emergency_btc_address: Some(RECOVERY_COMMITMENT_P2WPKH),
     };
-    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_terms);
-    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+
+    let missing_commitment = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
         &pool,
         &swap,
         &lineage,
         &creation_terms,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        missing_commitment
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_pair_check")
+    );
+
+    let mismatched_creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms: pay_service::db::NewChainSwapCreationTerms {
+            merchant_emergency_btc_address: Some(RECOVERY_COMMITMENT_P2PKH),
+            ..creation_terms
+        },
+        recovery_address_commitment_id: Some(first_recovery_commitment_id),
+    };
+    let mismatch = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+        &pool,
+        &swap,
+        &lineage,
+        &mismatched_creation_evidence,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mismatch
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_fkey")
+    );
+
+    let creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms,
+        recovery_address_commitment_id: Some(first_recovery_commitment_id),
+    };
+    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_evidence);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_evidence(
+        &pool,
+        &swap,
+        &lineage,
+        &creation_evidence,
     )
     .await
     .unwrap();
@@ -2104,6 +2410,77 @@ async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible(
             .unwrap()
             .canonical_pair_quote_json,
         pair_quote
+    );
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .recovery_address_commitment_id,
+        Some(first_recovery_commitment_id)
+    );
+
+    // The CHECK remains authoritative even if an owner bypasses ordinary
+    // triggers: no address-only historical shape can be introduced.
+    let mut pair_check_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *pair_check_tx)
+        .await
+        .unwrap();
+    let partial_pair = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET recovery_address_commitment_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&mut *pair_check_tx)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        partial_pair
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("chain_swap_records_recovery_commitment_pair_check")
+    );
+    pair_check_tx.rollback().await.unwrap();
+
+    let current_commitment =
+        pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        current_commitment.commitment_id,
+        rotated_recovery_commitment_id
+    );
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .recovery_address_commitment_id,
+        Some(first_recovery_commitment_id),
+        "rotation must not retarget an already-created swap"
+    );
+
+    let recovery_mutation = sqlx::query(
+        "UPDATE chain_swap_records \
+            SET recovery_address_commitment_id = $2, \
+                merchant_emergency_btc_address = $3 \
+          WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .bind(rotated_recovery_commitment_id)
+    .bind(RECOVERY_COMMITMENT_P2PKH)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        recovery_mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
     );
 
     let mutation = sqlx::query(

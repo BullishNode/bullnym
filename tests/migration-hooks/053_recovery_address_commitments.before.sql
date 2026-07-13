@@ -5,6 +5,20 @@ BEGIN
     IF to_regclass('public.recovery_address_commitments') IS NOT NULL THEN
         RAISE EXCEPTION 'recovery-address commitment ledger unexpectedly exists before migration 053';
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chain_swap_records'
+           AND column_name = 'recovery_address_commitment_id'
+    ) THEN
+        RAISE EXCEPTION 'chain-swap commitment identity unexpectedly exists before migration 053';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM chain_swap_records
+         WHERE merchant_emergency_btc_address IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'pre-053 chain swap has unexplained address-only recovery evidence';
+    END IF;
 
     -- Production already has this runtime role. The disposable upgrade lane
     -- creates it before the migration so the migration's exact grants can be

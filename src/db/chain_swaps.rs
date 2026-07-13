@@ -553,6 +553,19 @@ pub struct NewChainSwapCreationTerms<'a> {
     pub merchant_emergency_btc_address: Option<&'a str>,
 }
 
+/// Complete creation evidence accepted by the post-053 insert path.
+///
+/// The optional identity keeps legacy/rolling callers source-compatible, but
+/// migration 053 rejects every new row unless both this ID and the address in
+/// [`NewChainSwapCreationTerms`] are present and match one immutable registry
+/// row. New creation code should use this wrapper rather than the legacy
+/// creation-terms insertion function.
+#[derive(Debug, Clone, Copy)]
+pub struct NewChainSwapCreationEvidence<'a> {
+    pub creation_terms: NewChainSwapCreationTerms<'a>,
+    pub recovery_address_commitment_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainSwapCreationTerms {
     pub pinned_pair_hash: String,
@@ -569,6 +582,7 @@ pub struct ChainSwapCreationTerms {
     pub liquid_asset_id: String,
     pub merchant_liquid_destination: String,
     pub merchant_emergency_btc_address: Option<String>,
+    pub recovery_address_commitment_id: Option<Uuid>,
 }
 
 impl From<&NewChainSwapCreationTerms<'_>> for ChainSwapCreationTerms {
@@ -588,7 +602,16 @@ impl From<&NewChainSwapCreationTerms<'_>> for ChainSwapCreationTerms {
             liquid_asset_id: terms.liquid_asset_id.to_owned(),
             merchant_liquid_destination: terms.merchant_liquid_destination.to_owned(),
             merchant_emergency_btc_address: terms.merchant_emergency_btc_address.map(str::to_owned),
+            recovery_address_commitment_id: None,
         }
+    }
+}
+
+impl From<&NewChainSwapCreationEvidence<'_>> for ChainSwapCreationTerms {
+    fn from(evidence: &NewChainSwapCreationEvidence<'_>) -> Self {
+        let mut terms = Self::from(&evidence.creation_terms);
+        terms.recovery_address_commitment_id = evidence.recovery_address_commitment_id;
+        terms
     }
 }
 
@@ -716,7 +739,8 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
          'liquid_network', liquid_network, \
          'liquid_asset_id', liquid_asset_id, \
          'merchant_liquid_destination', merchant_liquid_destination, \
-         'merchant_emergency_btc_address', merchant_emergency_btc_address \
+         'merchant_emergency_btc_address', merchant_emergency_btc_address, \
+         'recovery_address_commitment_id', recovery_address_commitment_id \
      ) END AS creation_terms, \
      renegotiated_server_lock_amount_sat, refund_address, refund_txid, \
      EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
@@ -760,17 +784,33 @@ pub async fn record_chain_swap_with_lineage(
     insert_chain_swap(pool, swap, Some(lineage), None).await
 }
 
-/// Persist a fully validated chain swap and its immutable creation packet.
-/// This is the only insertion API compatible with migration 051. The legacy
-/// insertion functions remain available solely so pre-051 fixtures and a
-/// rolling caller migration can compile; the database rejects their new rows.
+/// Legacy migration-051 insertion API. It carries complete provider creation
+/// terms but no recovery commitment identity, so migration 053 rejects its new
+/// rows. It remains only for source compatibility while callers compose onto
+/// [`record_chain_swap_with_lineage_and_creation_evidence`].
 pub async fn record_chain_swap_with_lineage_and_creation_terms(
     pool: &PgPool,
     swap: &NewChainSwapRecord<'_>,
     lineage: &ChainSwapLineage<'_>,
     creation_terms: &NewChainSwapCreationTerms<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, Some(lineage), Some(creation_terms)).await
+    let evidence = NewChainSwapCreationEvidence {
+        creation_terms: *creation_terms,
+        recovery_address_commitment_id: None,
+    };
+    insert_chain_swap(pool, swap, Some(lineage), Some(&evidence)).await
+}
+
+/// Persist a fully validated post-053 chain swap and its exact recovery-policy
+/// identity. The database remains authoritative: `None`, a missing address,
+/// or an ID/address mismatch is rejected before the row becomes durable.
+pub async fn record_chain_swap_with_lineage_and_creation_evidence(
+    pool: &PgPool,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(pool, swap, Some(lineage), Some(creation_evidence)).await
 }
 
 pub async fn record_chain_swap_in_tx(
@@ -784,8 +824,9 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     swap: &NewChainSwapRecord<'_>,
     lineage: Option<&ChainSwapLineage<'_>>,
-    creation_terms: Option<&NewChainSwapCreationTerms<'_>>,
+    creation_evidence: Option<&NewChainSwapCreationEvidence<'_>>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
+    let creation_terms = creation_evidence.map(|evidence| &evidence.creation_terms);
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
         "INSERT INTO chain_swap_records \
              (invoice_id, nym, boltz_swap_id, from_chain, to_chain, lockup_address, lockup_bip21, \
@@ -799,10 +840,10 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
               liquid_claim_script_sha256, liquid_refund_script_sha256, \
               btc_timeout_height, liquid_timeout_height, btc_network, liquid_network, \
               liquid_asset_id, merchant_liquid_destination, \
-              merchant_emergency_btc_address) \
+              merchant_emergency_btc_address, recovery_address_commitment_id) \
          VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
                  $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                 $30, $31, $32, $33, $34, $35) \
+                 $30, $31, $32, $33, $34, $35, $36) \
          RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
     ))
     .bind(swap.invoice_id)
@@ -840,6 +881,7 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     .bind(creation_terms.map(|terms| terms.liquid_asset_id))
     .bind(creation_terms.map(|terms| terms.merchant_liquid_destination))
     .bind(creation_terms.and_then(|terms| terms.merchant_emergency_btc_address))
+    .bind(creation_evidence.and_then(|evidence| evidence.recovery_address_commitment_id))
     .fetch_one(executor)
     .await
 }

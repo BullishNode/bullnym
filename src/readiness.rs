@@ -20,6 +20,16 @@ type DirectLifecyclePrivileges = (
 type WatcherLanePrivileges = (Option<bool>, Option<bool>, Option<bool>);
 type SwapKeyLineagePrivileges = (Option<bool>, Option<bool>, Option<bool>);
 type ChainSwapRecordPrivileges = (Option<bool>, Option<bool>, Option<bool>);
+type RecoveryCommitmentPrivileges = (
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+);
 
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
@@ -243,6 +253,224 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
 }
 
+/// Global #84 capability boundary. This does not assert that any particular
+/// merchant has registered a policy; creation performs that separate lookup.
+/// It proves that the current runtime role has append/read-only ledger rights,
+/// PUBLIC has no table ACL, and PostgreSQL will bind every new chain swap to
+/// one immutable ID/address pair.
+pub async fn recovery_commitment_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    if !recovery_commitment_invariants_present(pool).await? {
+        return Ok(false);
+    }
+
+    let privileges = sqlx::query_as::<_, RecoveryCommitmentPrivileges>(
+        "SELECT \
+            (SELECT pg_get_userbyid(relation.relowner) <> current_user \
+               FROM pg_class relation \
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' \
+                AND relation.relname = 'recovery_address_commitments'), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'UPDATE' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'DELETE' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'TRUNCATE' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'REFERENCES' \
+            ), \
+            has_table_privilege( \
+                current_user, to_regclass('public.recovery_address_commitments'), 'TRIGGER' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(recovery_commitment_privileges_ready(privileges))
+}
+
+/// Inspect the exact migration-053 contract rather than trusting a table-name
+/// marker. Column types/nullability, constraints, ordered FK columns, actions,
+/// trigger functions/events, and PUBLIC ACL state all fail closed.
+async fn recovery_commitment_invariants_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT \
+            NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('recovery_address_commitments', 'commitment_id', 'uuid', FALSE), \
+                    ('recovery_address_commitments', 'npub', 'text', FALSE), \
+                    ('recovery_address_commitments', 'contract_format_version', 'int2', FALSE), \
+                    ('recovery_address_commitments', 'commitment_version', 'int8', FALSE), \
+                    ('recovery_address_commitments', 'canonical_btc_address', 'text', FALSE), \
+                    ('recovery_address_commitments', 'original_signature', 'text', FALSE), \
+                    ('recovery_address_commitments', 'signed_at_unix', 'int8', FALSE), \
+                    ('recovery_address_commitments', 'registered_at', 'timestamptz', FALSE), \
+                    ('chain_swap_records', 'recovery_address_commitment_id', 'uuid', TRUE), \
+                    ('chain_swap_records', 'merchant_emergency_btc_address', 'text', TRUE) \
+                ) AS required(table_name, column_name, type_name, is_nullable) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_attribute attribute \
+                    JOIN pg_class relation ON relation.oid = attribute.attrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                    JOIN pg_type column_type ON column_type.oid = attribute.atttypid \
+                    WHERE namespace.nspname = 'public' \
+                      AND relation.relname = required.table_name \
+                      AND attribute.attname = required.column_name \
+                      AND column_type.typname = required.type_name \
+                      AND NOT attribute.attisdropped \
+                      AND attribute.attnum > 0 \
+                      AND (NOT attribute.attnotnull) = required.is_nullable \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('recovery_address_commitments', 'recovery_address_commitments_pkey', 'p'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_id_non_nil_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_npub_shape_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_contract_version_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_version_positive_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_address_shape_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_signature_shape_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_signed_at_check', 'c'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_npub_version_key', 'u'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_signature_once_key', 'u'), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_id_address_key', 'u'), \
+                    ('chain_swap_records', 'chain_swap_records_recovery_commitment_pair_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_recovery_commitment_fkey', 'f') \
+                ) AS required(table_name, constraint_name, constraint_type) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_constraint constraint_info \
+                    JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                    WHERE namespace.nspname = 'public' \
+                      AND relation.relname = required.table_name \
+                      AND constraint_info.conname = required.constraint_name \
+                      AND constraint_info.contype::TEXT = required.constraint_type \
+                      AND constraint_info.convalidated \
+                ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_constraint unique_constraint \
+                JOIN pg_class relation ON relation.oid = unique_constraint.conrelid \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                WHERE namespace.nspname = 'public' \
+                  AND relation.relname = 'recovery_address_commitments' \
+                  AND unique_constraint.conname = 'recovery_address_commitment_id_address_key' \
+                  AND unique_constraint.contype = 'u' \
+                  AND unique_constraint.convalidated \
+                  AND ( \
+                      SELECT array_agg(attribute.attname::TEXT ORDER BY key_column.ordinality) \
+                      FROM unnest(unique_constraint.conkey) WITH ORDINALITY \
+                           AS key_column(attnum, ordinality) \
+                      JOIN pg_attribute attribute \
+                        ON attribute.attrelid = relation.oid \
+                       AND attribute.attnum = key_column.attnum \
+                  ) = ARRAY['commitment_id', 'canonical_btc_address']::TEXT[] \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_constraint foreign_key \
+                JOIN pg_class source_relation ON source_relation.oid = foreign_key.conrelid \
+                JOIN pg_namespace source_namespace ON source_namespace.oid = source_relation.relnamespace \
+                JOIN pg_class target_relation ON target_relation.oid = foreign_key.confrelid \
+                JOIN pg_namespace target_namespace ON target_namespace.oid = target_relation.relnamespace \
+                WHERE source_namespace.nspname = 'public' \
+                  AND source_relation.relname = 'chain_swap_records' \
+                  AND target_namespace.nspname = 'public' \
+                  AND target_relation.relname = 'recovery_address_commitments' \
+                  AND foreign_key.conname = 'chain_swap_records_recovery_commitment_fkey' \
+                  AND foreign_key.contype = 'f' \
+                  AND foreign_key.convalidated \
+                  AND NOT foreign_key.condeferrable \
+                  AND NOT foreign_key.condeferred \
+                  AND foreign_key.confupdtype = 'r' \
+                  AND foreign_key.confdeltype = 'r' \
+                  AND foreign_key.confmatchtype = 's' \
+                  AND ( \
+                      SELECT array_agg(attribute.attname::TEXT ORDER BY key_column.ordinality) \
+                      FROM unnest(foreign_key.conkey) WITH ORDINALITY \
+                           AS key_column(attnum, ordinality) \
+                      JOIN pg_attribute attribute \
+                        ON attribute.attrelid = source_relation.oid \
+                       AND attribute.attnum = key_column.attnum \
+                  ) = ARRAY['recovery_address_commitment_id', 'merchant_emergency_btc_address']::TEXT[] \
+                  AND ( \
+                      SELECT array_agg(attribute.attname::TEXT ORDER BY key_column.ordinality) \
+                      FROM unnest(foreign_key.confkey) WITH ORDINALITY \
+                           AS key_column(attnum, ordinality) \
+                      JOIN pg_attribute attribute \
+                        ON attribute.attrelid = target_relation.oid \
+                       AND attribute.attnum = key_column.attnum \
+                  ) = ARRAY['commitment_id', 'canonical_btc_address']::TEXT[] \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                FROM (VALUES \
+                    ('recovery_address_commitments', 'recovery_address_commitment_validate_insert', 'enforce_recovery_address_commitment_insert', 7), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_reject_update', 'reject_recovery_address_commitment_update', 19), \
+                    ('recovery_address_commitments', 'recovery_address_commitment_reject_delete', 'reject_recovery_address_commitment_delete', 11), \
+                    ('chain_swap_records', 'chain_swap_records_require_recovery_commitment', 'require_chain_swap_recovery_commitment', 7), \
+                    ('chain_swap_records', 'chain_swap_records_reject_recovery_commitment_update', 'reject_chain_swap_recovery_commitment_mutation', 19) \
+                ) AS required(table_name, trigger_name, function_name, trigger_type) \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                    FROM pg_trigger trigger_info \
+                    JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                    JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                    WHERE namespace.nspname = 'public' \
+                      AND relation.relname = required.table_name \
+                      AND trigger_info.tgname = required.trigger_name \
+                      AND function_info.proname = required.function_name \
+                      AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                      AND NOT trigger_info.tgisinternal \
+                      AND trigger_info.tgenabled IN ('O', 'A') \
+                      AND ( \
+                          required.trigger_name <> 'chain_swap_records_reject_recovery_commitment_update' \
+                          OR cardinality(trigger_info.tgattr::SMALLINT[]) = 0 \
+                          OR ( \
+                              SELECT array_agg(attribute.attname::TEXT) \
+                              FROM unnest(trigger_info.tgattr::SMALLINT[]) attribute_number \
+                              JOIN pg_attribute attribute \
+                                ON attribute.attrelid = relation.oid \
+                               AND attribute.attnum = attribute_number \
+                          ) @> ARRAY[ \
+                              'recovery_address_commitment_id', \
+                              'merchant_emergency_btc_address' \
+                          ]::TEXT[] \
+                      ) \
+                ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                FROM pg_class relation \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                CROSS JOIN LATERAL aclexplode( \
+                    COALESCE(relation.relacl, acldefault('r', relation.relowner)) \
+                ) acl \
+                WHERE namespace.nspname = 'public' \
+                  AND relation.relname = 'recovery_address_commitments' \
+                  AND acl.grantee = 0 \
+            )",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Migration 050 is a safety boundary, not merely an additive table marker.
 /// Verify every database invariant that prevents swap-key reuse or mutable
 /// lineage. Trigger checks include the owning table, function, timing, event,
@@ -396,6 +624,42 @@ fn chain_swap_record_privileges_ready(
     matches!(
         (select, insert, update),
         (Some(true), Some(true), Some(true))
+    )
+}
+
+fn recovery_commitment_privileges_ready(
+    (
+        distinct_owner,
+        select,
+        insert,
+        update,
+        delete,
+        truncate,
+        references,
+        trigger,
+    ): RecoveryCommitmentPrivileges,
+) -> bool {
+    matches!(
+        (
+            distinct_owner,
+            select,
+            insert,
+            update,
+            delete,
+            truncate,
+            references,
+            trigger,
+        ),
+        (
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        )
     )
 }
 
@@ -773,7 +1037,8 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 mod tests {
     use super::{
         chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
-        journal_privileges_ready, swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
+        journal_privileges_ready, recovery_commitment_privileges_ready,
+        swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
     };
 
     #[test]
@@ -793,6 +1058,85 @@ mod tests {
             (Some(true), Some(true), None),
         ] {
             assert!(!journal_privileges_ready(privileges));
+        }
+    }
+
+    #[test]
+    fn recovery_commitment_requires_private_append_only_runtime_acl() {
+        assert!(recovery_commitment_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        )));
+
+        for privileges in [
+            (
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            (
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            ),
+            (
+                None,
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+        ] {
+            assert!(!recovery_commitment_privileges_ready(privileges));
         }
     }
 
