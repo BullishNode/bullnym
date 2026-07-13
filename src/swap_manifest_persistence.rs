@@ -33,6 +33,7 @@ use crate::swap_manifest::MerchantPolicyReferencesV1;
 use crate::swap_manifest_delivery::{
     deliver_exact_manifest_delivery, ManifestDeliveryResumeOutcome,
 };
+use crate::swap_manifest_runtime::RecoveryManifestRuntimeV1;
 use crate::swap_manifest_staging::{
     stage_swap_manifest_v1, ManifestStagingCrypto, ManifestStagingRequest,
 };
@@ -228,6 +229,60 @@ impl PreparedChainSwapPersistence<'_> {
             merchant_policy: self.merchant_policy,
         }
     }
+}
+
+/// Bounded failures from the route-facing post-provider persistence seam.
+///
+/// No variant retains provider results, private keys, runtime configuration,
+/// database/object-store errors, or lower-layer error sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistCreatedChainSwapError {
+    InvalidPersistenceInput,
+    PersistenceOrDeliveryFailed,
+}
+
+impl fmt::Display for PersistCreatedChainSwapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPersistenceInput => "created chain swap persistence input is invalid",
+            Self::PersistenceOrDeliveryFailed => {
+                "created chain swap recovery persistence or delivery failed"
+            }
+        })
+    }
+}
+
+impl std::error::Error for PersistCreatedChainSwapError {}
+
+/// Persist one already-created provider swap and synchronously deliver its
+/// recovery manifest using the protected runtime capability.
+///
+/// This is the complete post-provider persistence call for the invoice route.
+/// Any error is a hard refusal to expose the payer instruction; the underlying
+/// coordinator preserves the canonical provider row after its first insert.
+pub async fn persist_created_chain_swap(
+    pool: &PgPool,
+    runtime: &RecoveryManifestRuntimeV1,
+    input: CreatedChainSwapPersistenceInput<'_>,
+) -> Result<ChainSwapRecord, PersistCreatedChainSwapError> {
+    let prepared = prepare_created_chain_swap_persistence(input)
+        .map_err(|_| PersistCreatedChainSwapError::InvalidPersistenceInput)?;
+    let parts = prepared.coordinator_request_parts();
+
+    persist_and_deliver_chain_swap(
+        pool,
+        runtime.store(),
+        PersistAndDeliverChainSwapRequest {
+            swap: &parts.swap,
+            lineage: &parts.lineage,
+            creation_terms: &parts.creation_terms,
+            manifest_id: parts.manifest_id,
+            merchant_policy: parts.merchant_policy,
+            crypto: runtime.borrow_manifest_staging_crypto_v1(),
+        },
+    )
+    .await
+    .map_err(|_| PersistCreatedChainSwapError::PersistenceOrDeliveryFailed)
 }
 
 /// Complete borrowed input for one atomic persist-and-deliver attempt.
@@ -725,6 +780,17 @@ mod request_adapter_tests {
             PrepareChainSwapPersistenceError::ServerLockAmountOutsideDatabaseRange,
         ] {
             let public = format!("{error:?} {error}");
+            assert!(!public.contains(&created.canonical_response_json));
+            assert!(!public.contains(&hex::encode(&created.preimage)));
+        }
+
+        for error in [
+            PersistCreatedChainSwapError::InvalidPersistenceInput,
+            PersistCreatedChainSwapError::PersistenceOrDeliveryFailed,
+        ] {
+            let public = format!("{error:?} {error}");
+            assert!(public.len() <= 140);
+            assert!(std::error::Error::source(&error).is_none());
             assert!(!public.contains(&created.canonical_response_json));
             assert!(!public.contains(&hex::encode(&created.preimage)));
         }
