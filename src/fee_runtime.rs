@@ -772,4 +772,37 @@ mod tests {
             .bitcoin_current_at(observed_at + runtime.bitcoin_policy.live_max_age_secs() + 1)
             .is_err());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn freshness_monitor_closes_admission_while_refresh_is_blocked() {
+        let mut config = FeePolicyConfig::default();
+        config.bitcoin.refresh_interval_secs = 1;
+        config.liquid.refresh_interval_secs = 1;
+        let runtime = Arc::new(
+            FeeRuntime::from_config(&config, Arc::new(UnavailableFeeRuntimePersistence)).unwrap(),
+        );
+        let admission = MoneyAdmission::healthy_test_fixture();
+        let cancel = CancellationToken::new();
+
+        // Model a refresh held in slow source or persistence I/O. The
+        // independent one-second freshness task must still close admission.
+        let refresh_guard = runtime.refresh_lock.lock().await;
+        let task = runtime
+            .clone()
+            .spawn_background(admission.clone(), cancel.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(!admission
+            .decision(crate::admission::Rail::LightningReverse)
+            .allowed());
+        assert!(!admission
+            .decision(crate::admission::Rail::BitcoinChain)
+            .allowed());
+
+        cancel.cancel();
+        task.await.unwrap();
+        drop(refresh_guard);
+    }
 }
