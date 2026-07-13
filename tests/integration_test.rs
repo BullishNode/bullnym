@@ -16712,7 +16712,7 @@ async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart()
     cleanup_db(&pool).await;
     let fixture =
         AtomicManifestPersistenceFixture::seed(&pool, "startuprepairthenaudit", 30_001).await;
-    let row = fixture.persist_manifestless_row(&pool, None).await;
+    let row = fixture.persist_manifestless_row(&pool).await;
     let store = coordinator_manifest_store(InstrumentedManifestObjectStore::new());
     let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store);
     let server = StartupRestoreProviderServer::spawn("[]", r#"{"index":-1}"#).await;
