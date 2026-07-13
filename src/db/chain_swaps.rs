@@ -2,6 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -236,6 +237,46 @@ impl ChainSwapRecord {
     pub fn effective_server_lock_amount_sat(&self) -> i64 {
         self.renegotiated_server_lock_amount_sat
             .unwrap_or(self.server_lock_amount_sat)
+    }
+
+    /// New swaps persist the exact canonical provider response alongside an
+    /// immutable digest. Verify that evidence before any signing path parses
+    /// or acts on it. Historical rows have no creation packet and retain their
+    /// explicit legacy behavior.
+    pub fn verify_creation_response_integrity(&self) -> Result<(), String> {
+        let Some(terms) = self.creation_terms.as_ref() else {
+            return Ok(());
+        };
+        let actual = creation_response_sha256(&self.boltz_response_json);
+        if actual != terms.creation_response_sha256 {
+            return Err(format!(
+                "chain swap {} canonical creation response digest mismatch",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn creation_response_sha256(canonical_response_json: &str) -> String {
+    hex::encode(Sha256::digest(canonical_response_json.as_bytes()))
+}
+
+#[cfg(test)]
+mod creation_integrity_tests {
+    use super::creation_response_sha256;
+
+    #[test]
+    fn response_digest_commits_exact_canonical_bytes() {
+        let canonical = r#"{"a":1,"b":2}"#;
+        assert_eq!(
+            creation_response_sha256(canonical),
+            "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+        );
+        assert_ne!(
+            creation_response_sha256(canonical),
+            creation_response_sha256(r#"{"a":1, "b":2}"#)
+        );
     }
 }
 

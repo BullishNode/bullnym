@@ -1803,6 +1803,8 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
         .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
 
     let status = swap
         .parsed_status()
