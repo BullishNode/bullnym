@@ -1,9 +1,9 @@
 //! Offline validation for the exact Boltz xpub-restore response pinned by Bullnym.
 //!
-//! The transport is deliberately not wired here. Future startup reconciliation
-//! can fetch with `BoltzApiClientV2::post_swap_restore`, then must pass every
-//! returned record through this module before comparing it with signed manifests
-//! or database state.
+//! The transport is deliberately not wired here. The bounded sibling
+//! `boltz_restore_fetch` adapter feeds the pinned response types through this
+//! module, but no startup, admission, persistence, or manifest comparison is
+//! connected yet.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
