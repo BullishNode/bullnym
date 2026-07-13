@@ -2574,10 +2574,15 @@ async fn claim_chain_swap_inner(
         fee_amount_sat: prepared.fee_amount_sat,
         fee_rate_sat_vb: prepared.fee_rate_sat_vb,
         liquid_blinding_key_hex: merchant_blinding_key_hex,
+        fee_authority: match journal_mode {
+            PersistedChainClaimJournalMode::ConstructAndInsert => fee_record,
+            PersistedChainClaimJournalMode::DecodeAndLoadExact => None,
+        },
     };
     if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert {
-        let fee_record =
-            fee_record.expect("unjournaled chain claims require fee decision metadata");
+        let fee_record = new_journal.fee_authority.ok_or_else(|| {
+            AppError::ClaimError("unjournaled chain claim is missing fee authority".into())
+        })?;
         let (actual_fee_sat, actual_fee_rate_sat_vb, actual_vbytes) =
             liquid_actual_fee(&claim_tx)?;
         ensure_actual_fee_authorized(
@@ -2658,6 +2663,13 @@ async fn claim_chain_swap_inner(
                 swap.id
             )));
         }
+        db::insert_liquid_merchant_settlement_journal(&mut tx, &new_journal)
+            .await
+            .map_err(|error| {
+                AppError::DbError(format!(
+                    "insert Liquid merchant settlement journal: {error}"
+                ))
+            })?;
     } else {
         if swap.claim_tx_hex.as_deref() != Some(prepared.journal.raw_transaction_hex.as_str())
             || swap.claim_txid.as_deref() != Some(prepared.journal.txid.as_str())
