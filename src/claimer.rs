@@ -1917,6 +1917,8 @@ pub(crate) async fn redrive_journaled_chain_claim(
         state.config.claim.max_claim_attempts,
         state.utxo_backend.as_ref(),
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+        None,
+        None,
     )
     .await
 }
@@ -2440,8 +2442,6 @@ async fn claim_chain_swap_inner(
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
-        let fee_record =
-            fee_record.expect("unjournaled chain claims require fee decision metadata");
         let fee_decision = LiquidBuilderFeeDecision::from(
             fee_decision.expect("unjournaled chain claims require a policy decision"),
         );
