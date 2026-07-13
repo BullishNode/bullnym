@@ -474,6 +474,7 @@ enum JournaledMerchantSettlementTick {
         action: AppliedMerchantSettlementAction,
         checkpoint_version: i64,
         projection_changed: bool,
+        journal_rebroadcast_required: bool,
     },
 }
 
@@ -592,10 +593,31 @@ async fn process_journaled_merchant_settlement(
     .await
     .map_err(map_merchant_settlement_repository_error)?;
 
+    let expected_parent_status = match (context.path(), action) {
+        (MerchantSettlementPath::LiquidClaim, AppliedMerchantSettlementAction::Finalized) => {
+            "claimed"
+        }
+        (MerchantSettlementPath::BitcoinRecovery, AppliedMerchantSettlementAction::Finalized) => {
+            "refunded"
+        }
+        (MerchantSettlementPath::LiquidClaim, _) => "claiming",
+        (MerchantSettlementPath::BitcoinRecovery, _) => "refunding",
+    };
+    if persisted.parent_transition.current_status != expected_parent_status
+        || persisted.journal_rebroadcast_required
+            != matches!(action, AppliedMerchantSettlementAction::Demoted)
+    {
+        return Err(AppError::ClaimError(format!(
+            "merchant settlement persistence returned incoherent parent/journal transition for {}",
+            chain_swap.id
+        )));
+    }
+
     Ok(JournaledMerchantSettlementTick::Applied {
         action,
         checkpoint_version: persisted.checkpoint_version,
         projection_changed: persisted.projection_changed,
+        journal_rebroadcast_required: persisted.journal_rebroadcast_required,
     })
 }
 
@@ -1330,6 +1352,7 @@ async fn run_one_chain_tick(
                                 | AppliedMerchantSettlementAction::Finalized),
                             checkpoint_version,
                             projection_changed,
+                            journal_rebroadcast_required: _,
                         }) => {
                             tracing::info!(
                                 event = "chain_swap_merchant_settlement_applied",
@@ -1347,6 +1370,7 @@ async fn run_one_chain_tick(
                             action: AppliedMerchantSettlementAction::Demoted,
                             checkpoint_version,
                             projection_changed,
+                            journal_rebroadcast_required,
                         }) => {
                             tracing::warn!(
                                 event = "chain_swap_merchant_settlement_demoted",
@@ -1354,6 +1378,7 @@ async fn run_one_chain_tick(
                                 path = "bitcoin_recovery",
                                 checkpoint_version,
                                 projection_changed,
+                                journal_rebroadcast_required,
                                 "persisted Bitcoin recovery demotion; redriving exact journal bytes"
                             );
                         }
@@ -1446,6 +1471,7 @@ async fn run_one_chain_tick(
                         | AppliedMerchantSettlementAction::Finalized),
                     checkpoint_version,
                     projection_changed,
+                    journal_rebroadcast_required: _,
                 }) => {
                     tracing::info!(
                         event = "chain_swap_merchant_settlement_applied",
@@ -1463,6 +1489,7 @@ async fn run_one_chain_tick(
                     action: AppliedMerchantSettlementAction::Demoted,
                     checkpoint_version,
                     projection_changed,
+                    journal_rebroadcast_required,
                 }) => {
                     tracing::warn!(
                         event = "chain_swap_merchant_settlement_demoted",
@@ -1470,8 +1497,23 @@ async fn run_one_chain_tick(
                         path = "liquid_claim",
                         checkpoint_version,
                         projection_changed,
+                        journal_rebroadcast_required,
                         "persisted Liquid claim demotion; redriving exact journal bytes"
                     );
+                    if let Err(error) =
+                        crate::claimer::redrive_journaled_chain_claim(state, swap.id).await
+                    {
+                        health.observe_app_error(&error);
+                        tracing::warn!(
+                            event = "chain_swap_merchant_settlement_rebroadcast_deferred",
+                            swap_id = %swap.boltz_swap_id,
+                            path = "liquid_claim",
+                            error = %error,
+                            "demoted Liquid claim exact-byte rebroadcast deferred"
+                        );
+                    }
+                    cursors[1].visit(swap.id);
+                    continue;
                 }
                 Ok(JournaledMerchantSettlementTick::CandidateNotObserved)
                 | Ok(JournaledMerchantSettlementTick::NoJournal) => {}
