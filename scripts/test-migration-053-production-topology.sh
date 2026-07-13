@@ -206,6 +206,21 @@ if scripts/check-migration-053-boundary.sh \
   die "deploy probe accepted the obsolete payservice database name"
 fi
 
+admin_psql --command \
+  "GRANT UPDATE ON recovery_address_commitments TO $RUNTIME_ROLE" >/dev/null
+if scripts/check-migration-053-boundary.sh \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_ROLE" "$DATABASE_NAME" >/dev/null 2>&1; then
+  die "deploy probe accepted runtime UPDATE drift"
+fi
+admin_psql --command \
+  "REVOKE UPDATE ON recovery_address_commitments FROM $RUNTIME_ROLE" >/dev/null
+restored_probe_output="$(
+  scripts/check-migration-053-boundary.sh \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_ROLE" "$DATABASE_NAME"
+)"
+[[ "$restored_probe_output" == "$probe_output" ]] \
+  || die "deploy probe did not recover after exact ACL restoration"
+
 runtime_psql --command "
   INSERT INTO users (nym, npub, ct_descriptor, is_active)
   VALUES (
