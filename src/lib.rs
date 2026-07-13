@@ -27,6 +27,7 @@ pub mod lnurl;
 pub mod nostr;
 pub mod og_image;
 pub mod pricer;
+pub mod provider_limits;
 pub mod qr;
 pub mod rate_limit;
 pub mod readiness;
