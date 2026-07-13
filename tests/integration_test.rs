@@ -1726,6 +1726,209 @@ async fn derivation_guard_does_not_false_positive_during_concurrent_allocation()
 }
 
 #[tokio::test]
+async fn chain_swap_creation_terms_are_complete_immutable_and_legacy_compatible() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "creationterms";
+    let npub = "80".repeat(32);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(
+        &pool,
+        nym,
+        &npub,
+        "lq1creationtermsmerchantdestination",
+        3_600,
+    )
+    .await;
+
+    let root = "8080808080808080";
+    let claim_public_key = format!("02{}", "81".repeat(32));
+    let refund_public_key = format!("03{}", "82".repeat(32));
+    let preimage_hash = "83".repeat(32);
+    let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_001,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 8_002,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let preimage = "84".repeat(32);
+    let claim_key = "85".repeat(32);
+    let refund_key = "86".repeat(32);
+    let response_json = r#"{"id":"CHAIN_CREATION_TERMS"}"#;
+    let swap = pay_service::db::NewChainSwapRecord {
+        invoice_id: invoice.id,
+        nym: Some(nym),
+        boltz_swap_id: "CHAIN_CREATION_TERMS",
+        lockup_address: "bc1qcreationtermslockup",
+        lockup_bip21: Some("bitcoin:bc1qcreationtermslockup?amount=0.00025431"),
+        user_lock_amount_sat: 25_431,
+        server_lock_amount_sat: 25_000,
+        preimage_hex: &preimage,
+        claim_key_hex: &claim_key,
+        refund_key_hex: &refund_key,
+        boltz_response_json: response_json,
+        claim_key_index: Some(8_001),
+        refund_key_index: Some(8_002),
+        root_fingerprint: Some(root),
+    };
+    let lineage = pay_service::db::ChainSwapLineage {
+        claim_allocation_id,
+        refund_allocation_id,
+        key_epoch: 1,
+        derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+        claim_public_key_hex: &claim_public_key,
+        refund_public_key_hex: &refund_public_key,
+        preimage_hash_hex: &preimage_hash,
+    };
+
+    let missing_terms = pay_service::db::record_chain_swap_with_lineage(&pool, &swap, &lineage)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing_terms
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    let pair_quote = r#"{"fees":{"minerFees":{"server":405},"percentage":0.1},"hash":"014261","limits":{"maximal":25000000,"minimal":25000},"rate":1}"#;
+    let creation_terms = pay_service::db::NewChainSwapCreationTerms {
+        pinned_pair_hash: &"87".repeat(32),
+        canonical_pair_quote_json: pair_quote,
+        creation_response_sha256: &"88".repeat(32),
+        btc_claim_script_sha256: &"89".repeat(32),
+        btc_refund_script_sha256: &"8a".repeat(32),
+        liquid_claim_script_sha256: &"8b".repeat(32),
+        liquid_refund_script_sha256: &"8c".repeat(32),
+        btc_timeout_height: 958_033,
+        liquid_timeout_height: 3_972_215,
+        btc_network: "bitcoin",
+        liquid_network: "liquid",
+        liquid_asset_id: &"8d".repeat(32),
+        merchant_liquid_destination: "lq1qqcreationtermsmerchantdestination",
+        merchant_emergency_btc_address: Some(
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+        ),
+    };
+    let expected_terms = pay_service::db::ChainSwapCreationTerms::from(&creation_terms);
+    let inserted = pay_service::db::record_chain_swap_with_lineage_and_creation_terms(
+        &pool,
+        &swap,
+        &lineage,
+        &creation_terms,
+    )
+    .await
+    .unwrap();
+    assert_eq!(inserted.creation_terms.as_ref(), Some(&expected_terms));
+
+    let fetched = pay_service::db::get_chain_swap_by_boltz_id(&pool, "CHAIN_CREATION_TERMS")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.creation_terms.as_ref(), Some(&expected_terms));
+    assert_eq!(
+        fetched
+            .creation_terms
+            .as_ref()
+            .unwrap()
+            .canonical_pair_quote_json,
+        pair_quote
+    );
+
+    let mutation = sqlx::query(
+        "UPDATE chain_swap_records SET btc_timeout_height = btc_timeout_height + 1 WHERE id = $1",
+    )
+    .bind(inserted.id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        mutation
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        inserted.id,
+        pay_service::db::ChainSwapStatus::UserLockMempool,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let legacy_preimage = "8e".repeat(32);
+    let legacy_claim_key = "8f".repeat(32);
+    let legacy_refund_key = "90".repeat(32);
+    let legacy = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id: "CHAIN_CREATION_TERMS_LEGACY",
+            lockup_address: "bc1qcreationtermslegacy",
+            lockup_bip21: None,
+            user_lock_amount_sat: 26_000,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: &legacy_preimage,
+            claim_key_hex: &legacy_claim_key,
+            refund_key_hex: &legacy_refund_key,
+            boltz_response_json: "{}",
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(legacy.creation_terms.is_none());
+    pay_service::db::update_chain_swap_status(
+        &pool,
+        legacy.id,
+        pay_service::db::ChainSwapStatus::UserLockMempool,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(pay_service::db::get_chain_swap_by_id(&pool, legacy.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .creation_terms
+        .is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
