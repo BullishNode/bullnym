@@ -11,6 +11,9 @@ use bitcoin::{consensus::deserialize, Address, Network, Transaction};
 use lwk_wollet::elements::{self, Address as LiquidAddress, AddressParams};
 
 use crate::{
+    chain_recovery::{
+        BitcoinRecoveryEvidence, BitcoinRecoveryStatusSnapshot, BitcoinRecoveryTransactionStatus,
+    },
     db::ChainSwapTxAttempt,
     error::AppError,
     utxo::{
@@ -388,6 +391,17 @@ pub struct AdaptedMerchantOutputEvidence {
 impl AdaptedMerchantOutputEvidence {
     pub fn original_journal_txid(&self) -> &str {
         &self.original_journal_txid
+    }
+
+    /// Candidate identity is available before confirmation so the lifecycle
+    /// can durably retain mempool/reorg state without constructing verified
+    /// accounting authority.
+    pub fn candidate_txid(&self) -> &str {
+        self.observed().txid()
+    }
+
+    pub fn is_linked_replacement(&self) -> bool {
+        self.journal.replaces_txid.is_some()
     }
 
     pub fn journal(&self) -> &JournaledMerchantTransaction {
@@ -1121,6 +1135,274 @@ fn liquid_confirmation_from_snapshot<'a>(
         block_height,
         block_hash: block_hash_text,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousBitcoinMerchantConfirmation<'a> {
+    NeverObserved,
+    Mempool,
+    Confirmed {
+        block_height: u32,
+        block_hash: &'a str,
+    },
+    Reorged {
+        previous_block_height: u32,
+        previous_block_hash: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitcoinMerchantOutputObservation {
+    Observed(AdaptedMerchantOutputEvidence),
+    Evicted {
+        txid: String,
+    },
+    ReorgDemoted {
+        txid: String,
+        previous_block_height: u32,
+        previous_block_hash: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum BitcoinMerchantObservationError {
+    Backend(AppError),
+    InvalidSnapshot,
+    CandidateNotObserved,
+    Journal(MerchantOutputVerificationError),
+    Adapter(MerchantOutputAdapterError),
+}
+
+impl fmt::Display for BitcoinMerchantObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Backend(_) => "merchant-output Bitcoin backend observation failed",
+            Self::InvalidSnapshot => "merchant-output Bitcoin snapshot is contradictory",
+            Self::CandidateNotObserved => {
+                "merchant-output Bitcoin candidate is not authoritatively observed"
+            }
+            Self::Journal(_) => "merchant-output Bitcoin journal is invalid",
+            Self::Adapter(_) => "merchant-output Bitcoin adapter rejected chain evidence",
+        })
+    }
+}
+
+impl std::error::Error for BitcoinMerchantObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Journal(error) => Some(error),
+            Self::Adapter(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Observe the immutable Bitcoin recovery journal through the anchored
+/// `BitcoinRecoveryEvidence` contract and return the exact adapter packet used
+/// by the settlement lifecycle. Confirmation depth is reported, not promoted
+/// to finality here: accounting starts at one confirmation and the lifecycle's
+/// Bitcoin policy decides the three-confirmation finalization boundary.
+pub async fn observe_bitcoin_recovery_merchant_output(
+    evidence: &dyn BitcoinRecoveryEvidence,
+    attempt: &ChainSwapTxAttempt,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    previous: PreviousBitcoinMerchantConfirmation<'_>,
+) -> Result<BitcoinMerchantOutputObservation, BitcoinMerchantObservationError> {
+    JournaledMerchantTransaction::from_bitcoin_recovery_attempt(attempt)
+        .map_err(BitcoinMerchantObservationError::Journal)?;
+    let raw_transaction = hex::decode(&attempt.raw_tx_hex).map_err(|_| {
+        BitcoinMerchantObservationError::Journal(MerchantOutputVerificationError::InvalidJournal)
+    })?;
+    let source_prevouts = attempt
+        .source_prevouts
+        .iter()
+        .map(|source| MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: &source.script_pubkey_hex,
+        })
+        .collect::<Vec<_>>();
+    let amount_sat = u64::try_from(attempt.destination_amount_sat).map_err(|_| {
+        BitcoinMerchantObservationError::Journal(MerchantOutputVerificationError::InvalidJournal)
+    })?;
+    let vout = u32::try_from(attempt.destination_vout).map_err(|_| {
+        BitcoinMerchantObservationError::Journal(MerchantOutputVerificationError::InvalidJournal)
+    })?;
+    let asset = MerchantAsset::Bitcoin;
+    let original = MerchantTransactionJournalEvidence {
+        raw_transaction: &raw_transaction,
+        txid: &attempt.txid,
+        source_prevouts: &source_prevouts,
+        merchant: MerchantOutputCommitment {
+            destination_address: &attempt.destination_address,
+            destination_script_hex: &attempt.destination_script_hex,
+            asset: &asset,
+            amount_sat,
+            vout,
+        },
+    };
+    let candidate = replacement
+        .map(|linked| &linked.replacement)
+        .unwrap_or(&original);
+    let candidate_txid = canonical_hash(candidate.txid).ok_or(
+        BitcoinMerchantObservationError::Adapter(MerchantOutputAdapterError::JournalTxidMismatch),
+    )?;
+    let previous_block = previous_bitcoin_block(previous)?;
+    let snapshot = evidence
+        .status_snapshot(
+            &candidate_txid,
+            previous_block.as_ref().map(|block| block.height),
+        )
+        .await
+        .map_err(BitcoinMerchantObservationError::Backend)?;
+    validate_bitcoin_snapshot(&snapshot)?;
+    if previous_block.is_none() && snapshot.prior_block_hash.is_some() {
+        return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+    }
+
+    if let Some(block) = previous_block.as_ref() {
+        let current_anchor = snapshot
+            .prior_block_hash
+            .as_deref()
+            .and_then(canonical_hash)
+            .ok_or(BitcoinMerchantObservationError::InvalidSnapshot)?;
+        let anchor_reorged = current_anchor != block.hash;
+        match (block.already_reorged, anchor_reorged) {
+            (false, true) => {
+                return Ok(BitcoinMerchantOutputObservation::ReorgDemoted {
+                    txid: candidate_txid,
+                    previous_block_height: block.height,
+                    previous_block_hash: block.hash.clone(),
+                });
+            }
+            (true, true) | (false, false) => {}
+            (true, false) => return Err(BitcoinMerchantObservationError::InvalidSnapshot),
+        }
+    }
+
+    let confirmation = match &snapshot.status {
+        BitcoinRecoveryTransactionStatus::Absent => {
+            return match previous {
+                PreviousBitcoinMerchantConfirmation::Mempool => {
+                    Ok(BitcoinMerchantOutputObservation::Evicted {
+                        txid: candidate_txid,
+                    })
+                }
+                PreviousBitcoinMerchantConfirmation::NeverObserved
+                | PreviousBitcoinMerchantConfirmation::Confirmed { .. }
+                | PreviousBitcoinMerchantConfirmation::Reorged { .. } => {
+                    Err(BitcoinMerchantObservationError::CandidateNotObserved)
+                }
+            };
+        }
+        BitcoinRecoveryTransactionStatus::Mempool => {
+            if previous_block
+                .as_ref()
+                .is_some_and(|block| !block.already_reorged)
+            {
+                return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+            }
+            MerchantConfirmationEvidence::Mempool
+        }
+        BitcoinRecoveryTransactionStatus::Confirmed {
+            block_height,
+            block_hash,
+        } => {
+            let confirmations = snapshot
+                .tip_height
+                .checked_sub(*block_height)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or(BitcoinMerchantObservationError::InvalidSnapshot)?;
+            if let Some(block) = previous_block.as_ref() {
+                let matches_old =
+                    *block_height == block.height && block_hash.eq_ignore_ascii_case(&block.hash);
+                if (!block.already_reorged && !matches_old)
+                    || (block.already_reorged && matches_old)
+                {
+                    return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+                }
+            }
+            MerchantConfirmationEvidence::Confirmed {
+                confirmations,
+                block_height: *block_height,
+                block_hash,
+            }
+        }
+    };
+    let observed_raw = evidence
+        .raw_transaction(&candidate_txid)
+        .await
+        .map_err(BitcoinMerchantObservationError::Backend)?
+        .ok_or(BitcoinMerchantObservationError::CandidateNotObserved)?;
+    let observation = MerchantTransactionObservation {
+        raw_transaction: &observed_raw,
+        txid: &candidate_txid,
+        confirmation,
+    };
+    let adapted = adapt_bitcoin_merchant_output(&original, replacement, &observation)
+        .map_err(BitcoinMerchantObservationError::Adapter)?;
+    Ok(BitcoinMerchantOutputObservation::Observed(adapted))
+}
+
+struct PreviousBitcoinBlock {
+    height: u32,
+    hash: String,
+    already_reorged: bool,
+}
+
+fn previous_bitcoin_block(
+    previous: PreviousBitcoinMerchantConfirmation<'_>,
+) -> Result<Option<PreviousBitcoinBlock>, BitcoinMerchantObservationError> {
+    let (height, hash, already_reorged) = match previous {
+        PreviousBitcoinMerchantConfirmation::NeverObserved
+        | PreviousBitcoinMerchantConfirmation::Mempool => return Ok(None),
+        PreviousBitcoinMerchantConfirmation::Confirmed {
+            block_height,
+            block_hash,
+        } => (block_height, block_hash, false),
+        PreviousBitcoinMerchantConfirmation::Reorged {
+            previous_block_height,
+            previous_block_hash,
+        } => (previous_block_height, previous_block_hash, true),
+    };
+    if height == 0 {
+        return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+    }
+    let hash = canonical_hash(hash).ok_or(BitcoinMerchantObservationError::InvalidSnapshot)?;
+    Ok(Some(PreviousBitcoinBlock {
+        height,
+        hash,
+        already_reorged,
+    }))
+}
+
+fn validate_bitcoin_snapshot(
+    snapshot: &BitcoinRecoveryStatusSnapshot,
+) -> Result<(), BitcoinMerchantObservationError> {
+    if snapshot.tip_height == 0 {
+        return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+    }
+    if let Some(hash) = &snapshot.prior_block_hash {
+        if canonical_hash(hash).is_none() {
+            return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+        }
+    }
+    match &snapshot.status {
+        BitcoinRecoveryTransactionStatus::Absent | BitcoinRecoveryTransactionStatus::Mempool => {}
+        BitcoinRecoveryTransactionStatus::Confirmed {
+            block_height,
+            block_hash,
+        } => {
+            if *block_height == 0
+                || *block_height > snapshot.tip_height
+                || canonical_hash(block_hash).is_none()
+            {
+                return Err(BitcoinMerchantObservationError::InvalidSnapshot);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1860,6 +2142,69 @@ mod tests {
         raw_failure: bool,
         raw_requests: Mutex<Vec<String>>,
         prior_height_requests: Mutex<Vec<Vec<i32>>>,
+    }
+
+    struct MockBitcoinMerchantEvidence {
+        snapshot: Option<BitcoinRecoveryStatusSnapshot>,
+        snapshot_failure: bool,
+        raw_transaction: Option<Vec<u8>>,
+        raw_failure: bool,
+        raw_requests: Mutex<Vec<String>>,
+        prior_height_requests: Mutex<Vec<Option<u32>>>,
+    }
+
+    impl MockBitcoinMerchantEvidence {
+        fn successful(
+            snapshot: BitcoinRecoveryStatusSnapshot,
+            raw_transaction: Option<Vec<u8>>,
+        ) -> Self {
+            Self {
+                snapshot: Some(snapshot),
+                snapshot_failure: false,
+                raw_transaction,
+                raw_failure: false,
+                raw_requests: Mutex::new(Vec::new()),
+                prior_height_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BitcoinRecoveryEvidence for MockBitcoinMerchantEvidence {
+        async fn raw_transaction(&self, txid: &str) -> Result<Option<Vec<u8>>, AppError> {
+            self.raw_requests.lock().unwrap().push(txid.to_owned());
+            if self.raw_failure {
+                return Err(AppError::ElectrumError("mock Bitcoin raw failure".into()));
+            }
+            Ok(self.raw_transaction.clone())
+        }
+
+        async fn outspend(
+            &self,
+            _txid: &str,
+            _vout: u32,
+        ) -> Result<crate::chain_recovery::BitcoinOutspend, AppError> {
+            unreachable!("merchant observation does not query recovery source outspends")
+        }
+
+        async fn status_snapshot(
+            &self,
+            _txid: &str,
+            prior_block_height: Option<u32>,
+        ) -> Result<BitcoinRecoveryStatusSnapshot, AppError> {
+            self.prior_height_requests
+                .lock()
+                .unwrap()
+                .push(prior_block_height);
+            if self.snapshot_failure {
+                return Err(AppError::ElectrumError(
+                    "mock Bitcoin status failure".into(),
+                ));
+            }
+            self.snapshot
+                .clone()
+                .ok_or_else(|| AppError::ElectrumError("mock Bitcoin snapshot missing".into()))
+        }
     }
 
     impl MockLiquidMerchantBackend {
@@ -3261,5 +3606,277 @@ mod tests {
             Err(LiquidMerchantObservationError::SnapshotIncomplete)
         ));
         assert!(incomplete.raw_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_bitcoin_source_preserves_one_and_three_confirmation_boundaries() {
+        let attempt = recovery_attempt();
+        let raw_transaction = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let one_confirmation = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_000,
+                status: BitcoinRecoveryTransactionStatus::Confirmed {
+                    block_height: 900_000,
+                    block_hash: BLOCK_HASH.into(),
+                },
+                prior_block_hash: None,
+            },
+            Some(raw_transaction.clone()),
+        );
+
+        let result = observe_bitcoin_recovery_merchant_output(
+            &one_confirmation,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::NeverObserved,
+        )
+        .await
+        .unwrap();
+        let BitcoinMerchantOutputObservation::Observed(adapted) = result else {
+            panic!("one confirmation must return positive adapter evidence");
+        };
+        assert_eq!(adapted.observed().confirmations(), 1);
+        assert_eq!(
+            adapted.verify(&approved_bitcoin(), 1).unwrap().amount_sat(),
+            97_000
+        );
+        assert_eq!(
+            adapted.verify(&approved_bitcoin(), 3),
+            Err(MerchantOutputVerificationError::InsufficientConfirmations)
+        );
+
+        let three_confirmations = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_002,
+                status: BitcoinRecoveryTransactionStatus::Confirmed {
+                    block_height: 900_000,
+                    block_hash: BLOCK_HASH.into(),
+                },
+                prior_block_hash: None,
+            },
+            Some(raw_transaction),
+        );
+        let result = observe_bitcoin_recovery_merchant_output(
+            &three_confirmations,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::NeverObserved,
+        )
+        .await
+        .unwrap();
+        let BitcoinMerchantOutputObservation::Observed(adapted) = result else {
+            panic!("three confirmations must return positive adapter evidence");
+        };
+        assert_eq!(adapted.observed().confirmations(), 3);
+        assert_eq!(
+            adapted.verify(&approved_bitcoin(), 3).unwrap().amount_sat(),
+            97_000
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bitcoin_source_separates_absence_uncertainty_and_wrong_raw_txid() {
+        let attempt = recovery_attempt();
+        let absent_snapshot = BitcoinRecoveryStatusSnapshot {
+            tip_height: 900_000,
+            status: BitcoinRecoveryTransactionStatus::Absent,
+            prior_block_hash: None,
+        };
+        let never_seen = MockBitcoinMerchantEvidence::successful(absent_snapshot.clone(), None);
+        assert!(matches!(
+            observe_bitcoin_recovery_merchant_output(
+                &never_seen,
+                &attempt,
+                None,
+                PreviousBitcoinMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(BitcoinMerchantObservationError::CandidateNotObserved)
+        ));
+
+        let evicted = MockBitcoinMerchantEvidence::successful(absent_snapshot.clone(), None);
+        assert_eq!(
+            observe_bitcoin_recovery_merchant_output(
+                &evicted,
+                &attempt,
+                None,
+                PreviousBitcoinMerchantConfirmation::Mempool,
+            )
+            .await
+            .unwrap(),
+            BitcoinMerchantOutputObservation::Evicted {
+                txid: attempt.txid.clone(),
+            }
+        );
+        assert!(evicted.raw_requests.lock().unwrap().is_empty());
+
+        let mut uncertain = MockBitcoinMerchantEvidence::successful(absent_snapshot, None);
+        uncertain.snapshot_failure = true;
+        assert!(matches!(
+            observe_bitcoin_recovery_merchant_output(
+                &uncertain,
+                &attempt,
+                None,
+                PreviousBitcoinMerchantConfirmation::Mempool,
+            )
+            .await,
+            Err(BitcoinMerchantObservationError::Backend(_))
+        ));
+
+        let raw_transaction = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let mut wrong_transaction: Transaction = deserialize(&raw_transaction).unwrap();
+        wrong_transaction.output[0].value = Amount::from_sat(96_999);
+        let wrong_raw = serialize(&wrong_transaction);
+        let wrong_txid = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_000,
+                status: BitcoinRecoveryTransactionStatus::Mempool,
+                prior_block_hash: None,
+            },
+            Some(wrong_raw),
+        );
+        assert!(matches!(
+            observe_bitcoin_recovery_merchant_output(
+                &wrong_txid,
+                &attempt,
+                None,
+                PreviousBitcoinMerchantConfirmation::NeverObserved,
+            )
+            .await,
+            Err(BitcoinMerchantObservationError::Adapter(
+                MerchantOutputAdapterError::ObservedTxidMismatch
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_bitcoin_source_reorg_redrives_new_block_without_loop() {
+        let attempt = recovery_attempt();
+        let old_block_hash = "bb".repeat(32);
+        let current_old_height_hash = "cc".repeat(32);
+        let first_tick = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_001,
+                status: BitcoinRecoveryTransactionStatus::Absent,
+                prior_block_hash: Some(current_old_height_hash.clone()),
+            },
+            None,
+        );
+        let demoted = observe_bitcoin_recovery_merchant_output(
+            &first_tick,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::Confirmed {
+                block_height: 900_000,
+                block_hash: &old_block_hash,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            demoted,
+            BitcoinMerchantOutputObservation::ReorgDemoted {
+                txid: attempt.txid.clone(),
+                previous_block_height: 900_000,
+                previous_block_hash: old_block_hash.clone(),
+            }
+        );
+
+        let raw_transaction = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let new_block_hash = "dd".repeat(32);
+        let redrive = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_003,
+                status: BitcoinRecoveryTransactionStatus::Confirmed {
+                    block_height: 900_002,
+                    block_hash: new_block_hash.clone(),
+                },
+                prior_block_hash: Some(current_old_height_hash),
+            },
+            Some(raw_transaction),
+        );
+        let redriven = observe_bitcoin_recovery_merchant_output(
+            &redrive,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::Reorged {
+                previous_block_height: 900_000,
+                previous_block_hash: &old_block_hash,
+            },
+        )
+        .await
+        .unwrap();
+        let BitcoinMerchantOutputObservation::Observed(adapted) = redriven else {
+            panic!("durable reorg state must redrive the candidate's new block");
+        };
+        assert_eq!(adapted.observed().block_height(), Some(900_002));
+        assert_eq!(
+            adapted.observed().block_hash(),
+            Some(new_block_hash.as_str())
+        );
+        assert_eq!(adapted.observed().confirmations(), 2);
+        assert_eq!(
+            redrive.prior_height_requests.lock().unwrap().as_slice(),
+            &[Some(900_000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bitcoin_source_observes_only_full_linked_replacement_journal() {
+        let attempt = recovery_attempt();
+        let original_raw = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let mut replacement_transaction: Transaction = deserialize(&original_raw).unwrap();
+        replacement_transaction.input[0].sequence = Sequence::ZERO;
+        replacement_transaction.output[0].value = Amount::from_sat(96_500);
+        let replacement_raw = serialize(&replacement_transaction);
+        let replacement_txid = replacement_transaction.compute_txid().to_string();
+        let source = &attempt.source_prevouts.0[0];
+        let replacement_sources = [MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: &source.script_pubkey_hex,
+        }];
+        let asset = MerchantAsset::Bitcoin;
+        let replacement_journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &replacement_raw,
+            txid: &replacement_txid,
+            source_prevouts: &replacement_sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 96_500,
+                vout: 0,
+            },
+        };
+        let linked = LinkedReplacementJournalEvidence {
+            replaces_txid: &attempt.txid,
+            replacement: replacement_journal,
+        };
+        let backend = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 900_000,
+                status: BitcoinRecoveryTransactionStatus::Mempool,
+                prior_block_hash: None,
+            },
+            Some(replacement_raw.clone()),
+        );
+
+        let result = observe_bitcoin_recovery_merchant_output(
+            &backend,
+            &attempt,
+            Some(&linked),
+            PreviousBitcoinMerchantConfirmation::NeverObserved,
+        )
+        .await
+        .unwrap();
+        let BitcoinMerchantOutputObservation::Observed(adapted) = result else {
+            panic!("persisted linked replacement must return positive evidence");
+        };
+        assert_eq!(adapted.original_journal_txid(), attempt.txid);
+        assert_eq!(adapted.candidate_txid(), replacement_txid);
+        assert!(adapted.is_linked_replacement());
+        assert_eq!(adapted.observed().amount_sat(), 96_500);
     }
 }
