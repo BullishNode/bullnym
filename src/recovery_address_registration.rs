@@ -110,6 +110,7 @@ pub fn verify_recovery_address_registration(
 ) -> Result<VerifiedRecoveryAddressRegistration, AppError> {
     let canonical_btc_address =
         validate_contract_fields(request.version, &request.npub, &request.btc_address)?;
+    validate_signature_representation(&request.signature)?;
 
     auth::verify_la_v2(
         ACTION_RECOVERY_ADDRESS_SET,
@@ -130,6 +131,18 @@ pub fn verify_recovery_address_registration(
         timestamp: request.timestamp,
         original_signature: request.signature.clone(),
     })
+}
+
+fn validate_signature_representation(signature: &str) -> Result<(), AppError> {
+    let parsed = secp256k1::schnorr::Signature::from_str(signature).map_err(|_| {
+        AppError::AuthError("invalid recovery-address registration signature representation".into())
+    })?;
+    if parsed.to_string() != signature {
+        return Err(AppError::AuthError(
+            "recovery-address registration signature must be canonical lowercase hex".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_contract_fields(
@@ -334,6 +347,34 @@ mod tests {
         request.npub = npub;
         request.signature = "not-a-schnorr-signature".into();
         assert!(verify_recovery_address_registration(&request).is_err());
+    }
+
+    #[test]
+    fn uppercase_and_malformed_signature_representations_are_rejected() {
+        let (keypair, npub) = test_keypair();
+        let request = signed_request(&keypair, &npub, MAINNET_P2WPKH, now_secs());
+
+        let mut uppercase = request.clone();
+        let canonical_signature = "ab".repeat(64);
+        uppercase.signature = canonical_signature.to_ascii_uppercase();
+        assert_eq!(
+            secp256k1::schnorr::Signature::from_str(&uppercase.signature).unwrap(),
+            secp256k1::schnorr::Signature::from_str(&canonical_signature).unwrap()
+        );
+        assert!(matches!(
+            verify_recovery_address_registration(&uppercase),
+            Err(AppError::AuthError(reason))
+                if reason
+                    == "recovery-address registration signature must be canonical lowercase hex"
+        ));
+
+        let mut malformed = request;
+        malformed.signature = "gg".repeat(64);
+        assert!(matches!(
+            verify_recovery_address_registration(&malformed),
+            Err(AppError::AuthError(reason))
+                if reason == "invalid recovery-address registration signature representation"
+        ));
     }
 
     #[test]
