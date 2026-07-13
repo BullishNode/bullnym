@@ -10,13 +10,62 @@
 
 BEGIN;
 
+-- The runtime identity is an operator-supplied deployment fact, not a name
+-- embedded in schema history. Quoted psql substitution makes an omitted
+-- `--set runtime_role=...` a transaction-aborting syntax error; the following
+-- block also rejects an empty setting before any schema mutation.
+SELECT set_config(
+    'bullnym.migration_runtime_role',
+    :'runtime_role',
+    TRUE
+);
+
 -- PostgreSQL table owners retain implicit TRUNCATE/ALTER authority even after
 -- REVOKE. This ledger's runtime ACL is meaningful only when migrations run as
--- a distinct privileged schema owner rather than the payservice runtime role.
+-- a distinct privileged schema owner that the named runtime role cannot
+-- assume, directly or through role membership.
 DO $$
+DECLARE
+    runtime_role_name TEXT := NULLIF(
+        current_setting('bullnym.migration_runtime_role', TRUE),
+        ''
+    );
+    runtime_role_oid OID;
+    runtime_role_is_superuser BOOLEAN;
+    executor_role_oid OID;
 BEGIN
-    IF current_user = 'payservice' THEN
-        RAISE EXCEPTION 'migration 053 requires a privileged schema owner distinct from runtime role payservice'
+    IF runtime_role_name IS NULL THEN
+        RAISE EXCEPTION 'migration 053 requires a non-empty runtime_role psql variable'
+            USING ERRCODE = '42501';
+    END IF;
+
+    SELECT oid, rolsuper
+      INTO runtime_role_oid, runtime_role_is_superuser
+      FROM pg_roles
+     WHERE rolname = runtime_role_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'migration 053 runtime role % does not exist',
+            quote_ident(runtime_role_name)
+            USING ERRCODE = '42704';
+    END IF;
+    IF runtime_role_is_superuser THEN
+        RAISE EXCEPTION 'migration 053 refuses superuser runtime role %',
+            quote_ident(runtime_role_name)
+            USING ERRCODE = '42501';
+    END IF;
+
+    SELECT oid
+      INTO STRICT executor_role_oid
+      FROM pg_roles
+     WHERE rolname = current_user;
+    IF runtime_role_oid = executor_role_oid THEN
+        RAISE EXCEPTION 'migration 053 executor must be distinct from runtime role %',
+            quote_ident(runtime_role_name)
+            USING ERRCODE = '42501';
+    END IF;
+    IF pg_has_role(runtime_role_oid, executor_role_oid, 'MEMBER') THEN
+        RAISE EXCEPTION 'migration 053 runtime role % can assume executor role %',
+            quote_ident(runtime_role_name), quote_ident(current_user)
             USING ERRCODE = '42501';
     END IF;
 END
@@ -96,14 +145,24 @@ ALTER TABLE chain_swap_records
 
 DO $$
 DECLARE
-    ledger_owner TEXT;
+    runtime_role_name TEXT := current_setting(
+        'bullnym.migration_runtime_role'
+    );
+    runtime_role_oid OID;
+    ledger_owner_oid OID;
 BEGIN
-    SELECT pg_get_userbyid(relowner)
-      INTO ledger_owner
+    SELECT oid
+      INTO STRICT runtime_role_oid
+      FROM pg_roles
+     WHERE rolname = runtime_role_name;
+    SELECT relowner
+      INTO STRICT ledger_owner_oid
       FROM pg_class
      WHERE oid = 'recovery_address_commitments'::REGCLASS;
-    IF ledger_owner = 'payservice' THEN
-        RAISE EXCEPTION 'migration 053 refused runtime ownership of recovery_address_commitments; apply as a distinct privileged schema owner'
+    IF ledger_owner_oid = runtime_role_oid
+       OR pg_has_role(runtime_role_oid, ledger_owner_oid, 'MEMBER') THEN
+        RAISE EXCEPTION 'migration 053 runtime role % owns or can assume the owner of recovery_address_commitments',
+            quote_ident(runtime_role_name)
             USING ERRCODE = '42501';
     END IF;
 END
@@ -241,18 +300,41 @@ CREATE TRIGGER chain_swap_records_reject_recovery_commitment_update
 REVOKE ALL ON recovery_address_commitments FROM PUBLIC;
 
 DO $$
+DECLARE
+    runtime_role_name TEXT := current_setting(
+        'bullnym.migration_runtime_role'
+    );
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payservice') THEN
-        REVOKE ALL ON recovery_address_commitments FROM payservice;
-        GRANT SELECT, INSERT ON recovery_address_commitments TO payservice;
-        IF has_table_privilege('payservice', 'recovery_address_commitments', 'UPDATE')
-           OR has_table_privilege('payservice', 'recovery_address_commitments', 'DELETE')
-           OR has_table_privilege('payservice', 'recovery_address_commitments', 'TRUNCATE')
-           OR has_table_privilege('payservice', 'recovery_address_commitments', 'REFERENCES')
-           OR has_table_privilege('payservice', 'recovery_address_commitments', 'TRIGGER') THEN
-            RAISE EXCEPTION 'migration 053 detected effective owner-level privileges for payservice; apply as a distinct privileged schema owner'
-                USING ERRCODE = '42501';
-        END IF;
+    EXECUTE format(
+        'REVOKE ALL ON TABLE public.recovery_address_commitments FROM %I',
+        runtime_role_name
+    );
+    EXECUTE format(
+        'GRANT SELECT, INSERT ON TABLE public.recovery_address_commitments TO %I',
+        runtime_role_name
+    );
+
+    IF NOT has_table_privilege(
+        runtime_role_name,
+        'public.recovery_address_commitments',
+        'SELECT'
+    ) OR NOT has_table_privilege(
+        runtime_role_name,
+        'public.recovery_address_commitments',
+        'INSERT'
+    ) THEN
+        RAISE EXCEPTION 'migration 053 failed to grant runtime SELECT/INSERT to %',
+            quote_ident(runtime_role_name)
+            USING ERRCODE = '42501';
+    END IF;
+    IF has_table_privilege(runtime_role_name, 'public.recovery_address_commitments', 'UPDATE')
+       OR has_table_privilege(runtime_role_name, 'public.recovery_address_commitments', 'DELETE')
+       OR has_table_privilege(runtime_role_name, 'public.recovery_address_commitments', 'TRUNCATE')
+       OR has_table_privilege(runtime_role_name, 'public.recovery_address_commitments', 'REFERENCES')
+       OR has_table_privilege(runtime_role_name, 'public.recovery_address_commitments', 'TRIGGER') THEN
+        RAISE EXCEPTION 'migration 053 detected effective mutation or owner privileges for runtime role %',
+            quote_ident(runtime_role_name)
+            USING ERRCODE = '42501';
     END IF;
 END
 $$;

@@ -11,6 +11,7 @@ cd "$ROOT_DIR"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
 PG_USER="bullnym_test"
 PG_PASSWORD="bullnym_test"
+RUNTIME_ROLE="bullnym_app"
 CONTAINER="bullnym-test-pg-${USER:-user}-$$-${RANDOM}"
 FRESH_DB="bullnym_fresh"
 UPGRADE_DB="bullnym_upgrade"
@@ -185,8 +186,10 @@ create_database() {
 run_sql_file() {
   local database="$1"
   local file="$2"
+  shift 2
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" --dbname "$database" \
+    "$@" \
     < "$file" >/dev/null
 }
 
@@ -204,7 +207,11 @@ apply_migrations() {
       echo "test-db: applying pre-migration fixture $before"
       run_sql_file "$database" "$before"
     fi
-    run_sql_file "$database" "$migration"
+    if [[ "$base" == "053_recovery_address_commitments" ]]; then
+      run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
+    else
+      run_sql_file "$database" "$migration"
+    fi
     ((count += 1))
     if [[ "$with_hooks" == "true" && -f "$after" ]]; then
       echo "test-db: applying post-migration assertion $after"
@@ -233,6 +240,10 @@ run_integration_suite() {
   echo "test-db: running serial integration suite against $database"
   TEST_DATABASE_URL="$(db_url "$database")" cargo "${args[@]}"
 }
+
+docker exec "$CONTAINER" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" --dbname postgres \
+  --command "CREATE ROLE $RUNTIME_ROLE NOLOGIN" >/dev/null
 
 if [[ "$MODE" == "fresh" || "$MODE" == "all" ]]; then
   create_database "$FRESH_DB"

@@ -59,27 +59,27 @@ BEGIN
       INTO ledger_owner
       FROM pg_class
      WHERE oid = 'recovery_address_commitments'::REGCLASS;
-    IF ledger_owner = 'payservice' THEN
+    IF ledger_owner = 'bullnym_app' THEN
         RAISE EXCEPTION 'migration 053 left the runtime role as ledger owner';
     END IF;
 
-    IF NOT has_table_privilege('payservice', 'recovery_address_commitments', 'SELECT')
-       OR NOT has_table_privilege('payservice', 'recovery_address_commitments', 'INSERT') THEN
+    IF NOT has_table_privilege('bullnym_app', 'recovery_address_commitments', 'SELECT')
+       OR NOT has_table_privilege('bullnym_app', 'recovery_address_commitments', 'INSERT') THEN
         RAISE EXCEPTION 'migration 053 omitted runtime SELECT or INSERT privilege';
     END IF;
-    IF has_table_privilege('payservice', 'recovery_address_commitments', 'UPDATE') THEN
+    IF has_table_privilege('bullnym_app', 'recovery_address_commitments', 'UPDATE') THEN
         unexpected_privileges := array_append(unexpected_privileges, 'UPDATE');
     END IF;
-    IF has_table_privilege('payservice', 'recovery_address_commitments', 'DELETE') THEN
+    IF has_table_privilege('bullnym_app', 'recovery_address_commitments', 'DELETE') THEN
         unexpected_privileges := array_append(unexpected_privileges, 'DELETE');
     END IF;
-    IF has_table_privilege('payservice', 'recovery_address_commitments', 'TRUNCATE') THEN
+    IF has_table_privilege('bullnym_app', 'recovery_address_commitments', 'TRUNCATE') THEN
         unexpected_privileges := array_append(unexpected_privileges, 'TRUNCATE');
     END IF;
-    IF has_table_privilege('payservice', 'recovery_address_commitments', 'REFERENCES') THEN
+    IF has_table_privilege('bullnym_app', 'recovery_address_commitments', 'REFERENCES') THEN
         unexpected_privileges := array_append(unexpected_privileges, 'REFERENCES');
     END IF;
-    IF has_table_privilege('payservice', 'recovery_address_commitments', 'TRIGGER') THEN
+    IF has_table_privilege('bullnym_app', 'recovery_address_commitments', 'TRIGGER') THEN
         unexpected_privileges := array_append(unexpected_privileges, 'TRIGGER');
     END IF;
     IF cardinality(unexpected_privileges) <> 0 THEN
@@ -313,7 +313,7 @@ BEGIN
 END
 $$;
 
-SET ROLE payservice;
+SET ROLE bullnym_app;
 
 INSERT INTO recovery_address_commitments (
     commitment_id,

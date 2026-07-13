@@ -1188,19 +1188,19 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
 
     sqlx::query(
         "DO $$ BEGIN \
-             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payservice') THEN \
-                 CREATE ROLE payservice NOLOGIN; \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bullnym_app') THEN \
+                 CREATE ROLE bullnym_app NOLOGIN; \
              END IF; \
          END $$",
     )
     .execute(&admin)
     .await
     .unwrap();
-    sqlx::query("REVOKE ALL ON recovery_address_commitments FROM payservice")
+    sqlx::query("REVOKE ALL ON recovery_address_commitments FROM bullnym_app")
         .execute(&admin)
         .await
         .unwrap();
-    sqlx::query("GRANT SELECT, INSERT ON recovery_address_commitments TO payservice")
+    sqlx::query("GRANT SELECT, INSERT ON recovery_address_commitments TO bullnym_app")
         .execute(&admin)
         .await
         .unwrap();
@@ -1209,7 +1209,7 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
         .max_connections(1)
         .after_connect(|connection, _metadata| {
             Box::pin(async move {
-                sqlx::query("SET ROLE payservice")
+                sqlx::query("SET ROLE bullnym_app")
                     .execute(&mut *connection)
                     .await?;
                 Ok(())
@@ -1261,14 +1261,14 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
     .await
     .unwrap();
 
-    sqlx::query("GRANT UPDATE ON recovery_address_commitments TO payservice")
+    sqlx::query("GRANT UPDATE ON recovery_address_commitments TO bullnym_app")
         .execute(&admin)
         .await
         .unwrap();
     let update_acl_drift = readiness::recovery_commitment_ready(&runtime)
         .await
         .unwrap();
-    sqlx::query("REVOKE UPDATE ON recovery_address_commitments FROM payservice")
+    sqlx::query("REVOKE UPDATE ON recovery_address_commitments FROM bullnym_app")
         .execute(&admin)
         .await
         .unwrap();

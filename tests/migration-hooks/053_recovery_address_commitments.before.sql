@@ -20,12 +20,6 @@ BEGIN
         RAISE EXCEPTION 'pre-053 chain swap has unexplained address-only recovery evidence';
     END IF;
 
-    -- Production already has this runtime role. The disposable upgrade lane
-    -- creates it before the migration so the migration's exact grants can be
-    -- exercised rather than merely inspected syntactically.
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payservice') THEN
-        EXECUTE 'CREATE ROLE payservice NOLOGIN';
-    END IF;
 END
 $$;
 
@@ -49,4 +43,4 @@ VALUES
 -- Row-locking SELECTs require UPDATE as well as SELECT. The disposable role
 -- models production's existing user lifecycle privileges so its real INSERT
 -- path can exercise the trigger's active-source lookup.
-GRANT SELECT, UPDATE ON users TO payservice;
+GRANT SELECT, UPDATE ON users TO bullnym_app;

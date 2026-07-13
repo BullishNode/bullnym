@@ -23,7 +23,7 @@
    is also a stopped-service cutover because its new insert trigger requires
    the complete creation packet written by a 051-aware chain-swap caller.
    Migration 053 is a stopped-writer, privileged-owner, roll-forward boundary;
-   the runtime `payservice` role must never apply it.
+   the runtime `bullnym_app` role must never apply it.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -76,47 +76,95 @@ readable before reopening chain-swap admission.
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes
-its exact commitment ID/address pair mandatory for every new chain swap. The
-ledger's runtime ACL is safe only when its owner is distinct from the runtime
-`payservice` role: a PostgreSQL table owner retains implicit mutation and
-truncate authority that `REVOKE` cannot remove.
+its exact commitment ID/address pair mandatory for every new chain swap. This
+production topology uses database `bullnym`, runtime role `bullnym_app`, and the
+protected runtime connection in `/etc/bullnym/bullnym.env`. The systemd service
+is `bullnym.service`; the repository is `/opt/bullnym/bullnym`, the executable
+is `/usr/local/bin/pay-service`, the active release record is
+`/opt/bullnym/release.json`, immutable records are under
+`/opt/bullnym/releases`, and backups are under `/opt/bullnym/backups`. None of
+those names is the database runtime identity. PostgreSQL table ownership must
+stay with a separate privileged schema owner because an owner retains mutation
+and truncate authority that `REVOKE` cannot remove.
 
 Close new swap admission, drain requests, stop every Bullnym writer, and take a
-validated database backup. Set the schema-owner name to a role that can perform
-DDL and that is not `payservice`; use normal libpq credential handling rather
-than the runtime password file.
+validated database backup. Obtain a root-only owner environment file containing
+only `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, and any required
+`PGSSLMODE`/`PGSSLROOTCERT` for a role that can alter database `bullnym`. It must
+not reuse `/etc/bullnym/bullnym.env`, role `bullnym_app`, or credentials
+inherited by `bullnym_app`. The examples use
+`/etc/bullnym/bullnym-db-owner.env`; it must be a root-owned, mode-0600 regular
+non-symlink file. Provisioning that distinct secret is an operator prerequisite.
 
 ```bash
-sudo systemctl stop payservice
-if sudo systemctl is-active --quiet payservice; then
-  echo "payservice is still active; refusing migration 053" >&2
+sudo systemctl stop bullnym.service
+if sudo systemctl is-active --quiet bullnym.service; then
+  echo "bullnym.service is still active; refusing migration 053" >&2
   exit 1
 fi
 
-export BULLNYM_SCHEMA_OWNER='<privileged-schema-owner>'
-test "$BULLNYM_SCHEMA_OWNER" != payservice
+sudo test -f /etc/bullnym/bullnym-db-owner.env
+sudo test ! -L /etc/bullnym/bullnym-db-owner.env
+sudo test "$(sudo stat --format='%u:%a' /etc/bullnym/bullnym-db-owner.env)" = 0:600
+sudo test "$(sudo stat --format='%u:%a' /etc/bullnym/bullnym.env)" = 0:600
 ```
 
 Run this first-application preflight as that owner. It fails if a runtime
 session survived the stop, if the core 053 ledger or column is already present,
-or if a pre-053 row contains unexplained address-only evidence.
+if the owner connection targets the wrong database, or if a pre-053 row contains
+unexplained address-only evidence. Every psql child below receives only the
+explicit libpq connection fields and fixed process basics, not the sourced
+owner environment.
 
 ```bash
-psql --no-psqlrc --set ON_ERROR_STOP=1 \
-  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice <<'SQL'
+sudo bash <<'ROOT'
+set -euo pipefail
+owner_env=/etc/bullnym/bullnym-db-owner.env
+[[ -f "$owner_env" && ! -L "$owner_env" && -O "$owner_env" && -r "$owner_env" ]]
+owner_mode="$(stat --format='%a' "$owner_env")"
+(( (8#$owner_mode & 077) == 0 ))
+safe_path="$PATH"
+psql_bin="$(command -v psql)"
+source "$owner_env"
+for required in PGHOST PGDATABASE PGUSER PGPASSWORD; do
+  [[ -n "${!required:-}" ]]
+done
+[[ "$PGDATABASE" == bullnym ]]
+owner_libpq=(
+  "PGHOST=$PGHOST" "PGPORT=${PGPORT:-5432}" "PGDATABASE=$PGDATABASE"
+  "PGUSER=$PGUSER" "PGPASSWORD=$PGPASSWORD"
+)
+[[ -z "${PGSSLMODE:-}" ]] || owner_libpq+=("PGSSLMODE=$PGSSLMODE")
+[[ -z "${PGSSLROOTCERT:-}" ]] || owner_libpq+=("PGSSLROOTCERT=$PGSSLROOTCERT")
+owner_psql() {
+  env -i HOME=/root PATH="$safe_path" PGCONNECT_TIMEOUT=5 \
+    "${owner_libpq[@]}" "$psql_bin" "$@"
+}
+owner_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 <<'SQL'
 DO $migration_053_preflight$
 BEGIN
-    IF current_user = 'payservice' THEN
-        RAISE EXCEPTION 'migration 053 must not run as payservice';
+    IF current_database() <> 'bullnym' THEN
+        RAISE EXCEPTION 'migration 053 owner connection must target bullnym';
+    END IF;
+    IF current_user = 'bullnym_app' THEN
+        RAISE EXCEPTION 'migration 053 must not run as bullnym_app';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = 'bullnym_app'
+    ) THEN
+        RAISE EXCEPTION 'runtime role bullnym_app does not exist';
+    END IF;
+    IF pg_has_role('bullnym_app', current_user, 'MEMBER') THEN
+        RAISE EXCEPTION 'bullnym_app can assume the migration owner role';
     END IF;
     IF EXISTS (
         SELECT 1
           FROM pg_stat_activity
          WHERE datname = current_database()
-           AND usename = 'payservice'
+           AND usename = 'bullnym_app'
            AND pid <> pg_backend_pid()
     ) THEN
-        RAISE EXCEPTION 'payservice database sessions remain';
+        RAISE EXCEPTION 'bullnym_app database sessions remain';
     END IF;
     IF to_regclass('public.recovery_address_commitments') IS NOT NULL THEN
         RAISE EXCEPTION 'migration 053 ledger already exists';
@@ -140,6 +188,7 @@ BEGIN
 END
 $migration_053_preflight$;
 SQL
+ROOT
 ```
 
 Apply the migration in one `ON_ERROR_STOP` session as the same privileged
@@ -147,13 +196,38 @@ owner. The file contains its own transaction and independently refuses the
 runtime role and runtime ownership.
 
 ```bash
-psql --no-psqlrc --set ON_ERROR_STOP=1 \
-  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice \
+sudo bash <<'ROOT'
+set -euo pipefail
+owner_env=/etc/bullnym/bullnym-db-owner.env
+[[ -f "$owner_env" && ! -L "$owner_env" && -O "$owner_env" && -r "$owner_env" ]]
+owner_mode="$(stat --format='%a' "$owner_env")"
+(( (8#$owner_mode & 077) == 0 ))
+safe_path="$PATH"
+psql_bin="$(command -v psql)"
+source "$owner_env"
+for required in PGHOST PGDATABASE PGUSER PGPASSWORD; do
+  [[ -n "${!required:-}" ]]
+done
+[[ "$PGDATABASE" == bullnym ]]
+owner_libpq=(
+  "PGHOST=$PGHOST" "PGPORT=${PGPORT:-5432}" "PGDATABASE=$PGDATABASE"
+  "PGUSER=$PGUSER" "PGPASSWORD=$PGPASSWORD"
+)
+[[ -z "${PGSSLMODE:-}" ]] || owner_libpq+=("PGSSLMODE=$PGSSLMODE")
+[[ -z "${PGSSLROOTCERT:-}" ]] || owner_libpq+=("PGSSLROOTCERT=$PGSSLROOTCERT")
+owner_psql() {
+  env -i HOME=/root PATH="$safe_path" PGCONNECT_TIMEOUT=5 \
+    "${owner_libpq[@]}" "$psql_bin" "$@"
+}
+cd /opt/bullnym/bullnym
+owner_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+  --set runtime_role=bullnym_app \
   --file migrations/053_recovery_address_commitments.sql
+ROOT
 ```
 
 Capture a concise postflight record before starting Bullnym. The ACL row must
-show a non-`payservice` owner, runtime `SELECT/INSERT` only, and no PUBLIC
+show a non-`bullnym_app` owner, runtime `SELECT/INSERT` only, and no PUBLIC
 grant. The two constraint definitions must show the ordered
 `(recovery_address_commitment_id, merchant_emergency_btc_address)` reference
 with `ON UPDATE/DELETE RESTRICT` plus the NULL-pair check. The trigger query
@@ -161,8 +235,30 @@ must return the five migration-053 triggers, enabled, with their expected
 functions.
 
 ```bash
-psql --no-psqlrc --set ON_ERROR_STOP=1 \
-  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice <<'SQL'
+sudo bash <<'ROOT'
+set -euo pipefail
+owner_env=/etc/bullnym/bullnym-db-owner.env
+[[ -f "$owner_env" && ! -L "$owner_env" && -O "$owner_env" && -r "$owner_env" ]]
+owner_mode="$(stat --format='%a' "$owner_env")"
+(( (8#$owner_mode & 077) == 0 ))
+safe_path="$PATH"
+psql_bin="$(command -v psql)"
+source "$owner_env"
+for required in PGHOST PGDATABASE PGUSER PGPASSWORD; do
+  [[ -n "${!required:-}" ]]
+done
+[[ "$PGDATABASE" == bullnym ]]
+owner_libpq=(
+  "PGHOST=$PGHOST" "PGPORT=${PGPORT:-5432}" "PGDATABASE=$PGDATABASE"
+  "PGUSER=$PGUSER" "PGPASSWORD=$PGPASSWORD"
+)
+[[ -z "${PGSSLMODE:-}" ]] || owner_libpq+=("PGSSLMODE=$PGSSLMODE")
+[[ -z "${PGSSLROOTCERT:-}" ]] || owner_libpq+=("PGSSLROOTCERT=$PGSSLROOTCERT")
+owner_psql() {
+  env -i HOME=/root PATH="$safe_path" PGCONNECT_TIMEOUT=5 \
+    "${owner_libpq[@]}" "$psql_bin" "$@"
+}
+owner_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 <<'SQL'
 SELECT pg_get_userbyid(relation.relowner) AS ledger_owner,
        relation.relacl AS ledger_acl
   FROM pg_class relation
@@ -196,14 +292,23 @@ SELECT relation.relname,
  )
  ORDER BY relation.relname, trigger_info.tgname;
 SQL
+ROOT
+
+sudo /opt/bullnym/bullnym/scripts/check-migration-053-boundary.sh \
+  /etc/bullnym/bullnym.env bullnym_app bullnym
 ```
 
-Then run `scripts/deploy.sh`. Before it builds or changes the installed
-service, its read-only `payservice` probe mechanically requires a distinct
-ledger owner, exact runtime/PUBLIC ACL, the validated ordered composite foreign
-key, the validated pair constraint, and all five enabled trigger/function
-bindings. It prints no runtime-role migration command and refuses on missing or
-drifted evidence.
+Do not run the repository's generic `scripts/deploy.sh` in current production;
+its self-build filesystem and unit layout is intentionally different. Follow
+the primary schema-053 hosted-artifact runbook, and require it to invoke the
+committed boundary helper above before starting `bullnym.service`. The helper
+sources the protected runtime `DATABASE_URL` without printing it, proves the
+connection is role `bullnym_app` on database `bullnym`, and mechanically
+requires a distinct ledger owner, exact runtime/PUBLIC ACL, the validated
+ordered composite foreign key, validated pair constraint, and all five enabled
+trigger/function bindings. Explicit environment/role/database arguments are
+the portability seam for disposable tests; no-argument defaults are this
+production database topology.
 
 Start only a 053-aware binary and require its startup recovery-commitment
 verification plus the normal `/health`, `/ready`, and `/version` checks before
@@ -214,7 +319,7 @@ provider-side orphan before its database insert fails. Repair or roll forward.
 automatic cross-boundary rollback.
 
 ```bash
-sudo journalctl -u payservice --since '10 minutes ago' \
+sudo journalctl -u bullnym.service --since '10 minutes ago' \
   | grep -F 'private append-only recovery commitment binding verified'
 curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null
 curl --fail --silent --show-error http://127.0.0.1:8080/ready

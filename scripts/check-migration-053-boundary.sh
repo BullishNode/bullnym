@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# Verify migration 053 through the protected runtime connection, without
+# exposing its DATABASE_URL. Positional defaults describe Bullnym production;
+# explicit arguments keep the probe reusable in disposable test environments.
+set -euo pipefail
+
+if (($# > 3)); then
+  echo "usage: $0 [env-file [expected-runtime-role [expected-database]]]" >&2
+  exit 2
+fi
+
+env_file="${1:-/etc/bullnym/bullnym.env}"
+expected_runtime_role="${2:-bullnym_app}"
+expected_database="${3:-bullnym}"
+
+[[ -f "$env_file" && ! -L "$env_file" && -O "$env_file" && -r "$env_file" ]] || {
+  echo "migration-053 boundary: runtime environment is not a protected owned file: $env_file" >&2
+  exit 1
+}
+env_mode="$(stat --format='%a' "$env_file")"
+(( (8#$env_mode & 077) == 0 )) || {
+  echo "migration-053 boundary: runtime environment has group/other permissions: $env_file" >&2
+  exit 1
+}
+[[ -n "$expected_runtime_role" && "$expected_runtime_role" != *$'\n'* && "$expected_runtime_role" != *'|'* ]] || {
+  echo "migration-053 boundary: invalid expected runtime role" >&2
+  exit 2
+}
+[[ -n "$expected_database" && "$expected_database" != *$'\n'* && "$expected_database" != *'|'* ]] || {
+  echo "migration-053 boundary: invalid expected database" >&2
+  exit 2
+}
+
+# The environment file is trusted deployment configuration. Source it only in
+# this process, then pass only parsed libpq connection fields and fixed process
+# basics to psql. No unrelated runtime secret reaches the database client.
+safe_home="${HOME:-/root}"
+safe_path="$PATH"
+psql_bin="$(command -v psql)"
+python_bin="$(command -v python3)"
+# shellcheck disable=SC1090
+source "$env_file"
+[[ -n "${DATABASE_URL:-}" ]] || {
+  echo "migration-053 boundary: DATABASE_URL is missing from $env_file" >&2
+  exit 1
+}
+database_url="$DATABASE_URL"
+unset DATABASE_URL
+
+# PGDATABASE does not expand a URI into libpq's host/user/password parameters.
+# Parse the protected URL once, allow only connection parameters this probe
+# needs, then give psql those individual values in its clean environment.
+connection_fields=()
+mapfile -d '' -t connection_fields < <(
+  env -i DATABASE_URL="$database_url" "$python_bin" <<'PY'
+import os
+import sys
+import urllib.parse
+
+url = urllib.parse.urlsplit(os.environ["DATABASE_URL"])
+if url.scheme not in {"postgres", "postgresql"}:
+    raise SystemExit("DATABASE_URL must use postgres or postgresql")
+if url.hostname is None or url.username is None:
+    raise SystemExit("DATABASE_URL must include host and user")
+try:
+    port = str(url.port or 5432)
+except ValueError as error:
+    raise SystemExit(f"invalid DATABASE_URL port: {error}") from error
+database = urllib.parse.unquote(url.path.removeprefix("/"))
+if not database:
+    raise SystemExit("DATABASE_URL must include a database")
+
+allowed = {
+    "sslmode": "",
+    "sslrootcert": "",
+    "sslcert": "",
+    "sslkey": "",
+    "channel_binding": "",
+    "target_session_attrs": "",
+}
+query = urllib.parse.parse_qs(
+    url.query,
+    keep_blank_values=True,
+    strict_parsing=True,
+)
+unknown = sorted(set(query) - set(allowed))
+if unknown:
+    raise SystemExit(f"unsupported DATABASE_URL parameter: {unknown[0]}")
+for key, values in query.items():
+    if len(values) != 1:
+        raise SystemExit(f"duplicate DATABASE_URL parameter: {key}")
+    allowed[key] = values[0]
+
+values = [
+    url.hostname,
+    port,
+    urllib.parse.unquote(url.username),
+    urllib.parse.unquote(url.password or ""),
+    database,
+    allowed["sslmode"],
+    allowed["sslrootcert"],
+    allowed["sslcert"],
+    allowed["sslkey"],
+    allowed["channel_binding"],
+    allowed["target_session_attrs"],
+]
+if any("\n" in value or "\x00" in value for value in values):
+    raise SystemExit("DATABASE_URL contains an invalid connection value")
+sys.stdout.buffer.write(b"\x00".join(value.encode() for value in values) + b"\x00")
+PY
+)
+unset database_url
+(( ${#connection_fields[@]} == 11 )) || {
+  echo "migration-053 boundary: DATABASE_URL could not be parsed safely" >&2
+  exit 1
+}
+
+libpq_environment=(
+  "PGHOST=${connection_fields[0]}"
+  "PGPORT=${connection_fields[1]}"
+  "PGUSER=${connection_fields[2]}"
+  "PGPASSWORD=${connection_fields[3]}"
+  "PGDATABASE=${connection_fields[4]}"
+)
+optional_libpq_names=(
+  PGSSLMODE PGSSLROOTCERT PGSSLCERT PGSSLKEY PGCHANNELBINDING
+  PGTARGETSESSIONATTRS
+)
+for index in {5..10}; do
+  if [[ -n "${connection_fields[$index]}" ]]; then
+    libpq_environment+=(
+      "${optional_libpq_names[$((index - 5))]}=${connection_fields[$index]}"
+    )
+  fi
+done
+
+clean_psql() {
+  env -i \
+    HOME="$safe_home" \
+    PATH="$safe_path" \
+    PGCONNECT_TIMEOUT=5 \
+    "${libpq_environment[@]}" \
+    "$psql_bin" "$@"
+}
+
+result="$(
+  clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+    --tuples-only --no-align --field-separator='|' <<'SQL'
+WITH ledger AS (
+    SELECT relation.oid, relation.relowner
+      FROM pg_class relation
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = 'public'
+       AND relation.relname = 'recovery_address_commitments'
+       AND relation.relkind = 'r'
+)
+SELECT current_user,
+       current_database(),
+       COALESCE((
+           SELECT pg_get_userbyid(ledger.relowner) <> current_user
+              AND NOT pg_has_role(current_user, pg_get_userbyid(ledger.relowner), 'MEMBER')
+              AND has_table_privilege(current_user, ledger.oid, 'SELECT')
+              AND has_table_privilege(current_user, ledger.oid, 'INSERT')
+              AND NOT has_table_privilege(current_user, ledger.oid, 'UPDATE')
+              AND NOT has_table_privilege(current_user, ledger.oid, 'DELETE')
+              AND NOT has_table_privilege(current_user, ledger.oid, 'TRUNCATE')
+              AND NOT has_table_privilege(current_user, ledger.oid, 'REFERENCES')
+              AND NOT has_table_privilege(current_user, ledger.oid, 'TRIGGER')
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM aclexplode(COALESCE(
+                        (SELECT relation.relacl
+                           FROM pg_class relation
+                          WHERE relation.oid = ledger.oid),
+                        acldefault('r', ledger.relowner)
+                    )) acl
+                   WHERE acl.grantee = 0
+              )
+              AND EXISTS (
+                  SELECT 1
+                    FROM pg_constraint foreign_key
+                    JOIN pg_class source_relation
+                      ON source_relation.oid = foreign_key.conrelid
+                    JOIN pg_namespace source_namespace
+                      ON source_namespace.oid = source_relation.relnamespace
+                    JOIN pg_class target_relation
+                      ON target_relation.oid = foreign_key.confrelid
+                    JOIN pg_namespace target_namespace
+                      ON target_namespace.oid = target_relation.relnamespace
+                   WHERE source_namespace.nspname = 'public'
+                     AND source_relation.relname = 'chain_swap_records'
+                     AND target_namespace.nspname = 'public'
+                     AND target_relation.relname = 'recovery_address_commitments'
+                     AND foreign_key.conname = 'chain_swap_records_recovery_commitment_fkey'
+                     AND foreign_key.contype = 'f'
+                     AND foreign_key.convalidated
+                     AND NOT foreign_key.condeferrable
+                     AND NOT foreign_key.condeferred
+                     AND foreign_key.confupdtype = 'r'
+                     AND foreign_key.confdeltype = 'r'
+                     AND foreign_key.confmatchtype = 's'
+                     AND (
+                         SELECT array_agg(
+                             attribute.attname::TEXT
+                             ORDER BY key_column.ordinality
+                         )
+                           FROM unnest(foreign_key.conkey) WITH ORDINALITY
+                                AS key_column(attnum, ordinality)
+                           JOIN pg_attribute attribute
+                             ON attribute.attrelid = source_relation.oid
+                            AND attribute.attnum = key_column.attnum
+                     ) = ARRAY[
+                         'recovery_address_commitment_id',
+                         'merchant_emergency_btc_address'
+                     ]::TEXT[]
+                     AND (
+                         SELECT array_agg(
+                             attribute.attname::TEXT
+                             ORDER BY key_column.ordinality
+                         )
+                           FROM unnest(foreign_key.confkey) WITH ORDINALITY
+                                AS key_column(attnum, ordinality)
+                           JOIN pg_attribute attribute
+                             ON attribute.attrelid = target_relation.oid
+                            AND attribute.attnum = key_column.attnum
+                     ) = ARRAY[
+                         'commitment_id',
+                         'canonical_btc_address'
+                     ]::TEXT[]
+              )
+              AND EXISTS (
+                  SELECT 1
+                    FROM pg_constraint pair_check
+                    JOIN pg_class relation ON relation.oid = pair_check.conrelid
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = relation.relnamespace
+                   WHERE namespace.nspname = 'public'
+                     AND relation.relname = 'chain_swap_records'
+                     AND pair_check.conname = 'chain_swap_records_recovery_commitment_pair_check'
+                     AND pair_check.contype = 'c'
+                     AND pair_check.convalidated
+                     AND pg_get_expr(
+                         pair_check.conbin,
+                         pair_check.conrelid,
+                         TRUE
+                     ) = '(recovery_address_commitment_id IS NULL) = (merchant_emergency_btc_address IS NULL)'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM (VALUES
+                        ('recovery_address_commitments', 'recovery_address_commitment_validate_insert', 'enforce_recovery_address_commitment_insert', 7),
+                        ('recovery_address_commitments', 'recovery_address_commitment_reject_update', 'reject_recovery_address_commitment_update', 19),
+                        ('recovery_address_commitments', 'recovery_address_commitment_reject_delete', 'reject_recovery_address_commitment_delete', 11),
+                        ('chain_swap_records', 'chain_swap_records_require_recovery_commitment', 'require_chain_swap_recovery_commitment', 7),
+                        ('chain_swap_records', 'chain_swap_records_reject_recovery_commitment_update', 'reject_chain_swap_recovery_commitment_mutation', 19)
+                    ) AS required(
+                        table_name,
+                        trigger_name,
+                        function_name,
+                        trigger_type
+                    )
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM pg_trigger trigger_info
+                         JOIN pg_class relation
+                           ON relation.oid = trigger_info.tgrelid
+                         JOIN pg_namespace namespace
+                           ON namespace.oid = relation.relnamespace
+                         JOIN pg_proc function_info
+                           ON function_info.oid = trigger_info.tgfoid
+                        WHERE namespace.nspname = 'public'
+                          AND relation.relname = required.table_name
+                          AND trigger_info.tgname = required.trigger_name
+                          AND function_info.proname = required.function_name
+                          AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                          AND NOT trigger_info.tgisinternal
+                          AND trigger_info.tgenabled IN ('O', 'A')
+                          AND (
+                              required.trigger_name <> 'chain_swap_records_reject_recovery_commitment_update'
+                              OR cardinality(trigger_info.tgattr::SMALLINT[]) = 0
+                              OR (
+                                  SELECT array_agg(attribute.attname::TEXT)
+                                    FROM unnest(trigger_info.tgattr::SMALLINT[])
+                                         attribute_number
+                                    JOIN pg_attribute attribute
+                                      ON attribute.attrelid = relation.oid
+                                     AND attribute.attnum = attribute_number
+                              ) @> ARRAY[
+                                  'recovery_address_commitment_id',
+                                  'merchant_emergency_btc_address'
+                              ]::TEXT[]
+                          )
+                   )
+              )
+             FROM ledger
+       ), FALSE)::INT;
+SQL
+)"
+
+IFS='|' read -r actual_runtime_role actual_database ready extra <<<"$result"
+[[ -z "${extra:-}" && "$actual_runtime_role" == "$expected_runtime_role" ]] || {
+  echo "migration-053 boundary: connected runtime role does not match expected role" >&2
+  exit 1
+}
+[[ "$actual_database" == "$expected_database" ]] || {
+  echo "migration-053 boundary: connected database does not match expected database" >&2
+  exit 1
+}
+[[ "$ready" == "1" ]] || {
+  echo "migration-053 boundary: ACL, ownership, constraint, or trigger drift detected" >&2
+  exit 1
+}
+
+echo "migration 053 boundary verified for runtime role $actual_runtime_role on database $actual_database"
