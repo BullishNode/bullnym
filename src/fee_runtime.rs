@@ -393,46 +393,63 @@ impl FeeRuntime {
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut bitcoin_tick = tokio::time::interval(self.bitcoin_refresh_interval);
-            let mut liquid_tick = tokio::time::interval(self.liquid_refresh_interval);
-            let mut readiness_tick = tokio::time::interval(Duration::from_secs(1));
-            // Startup initialization supplied the first observation and fact.
-            bitcoin_tick.tick().await;
-            liquid_tick.tick().await;
-            readiness_tick.tick().await;
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = readiness_tick.tick() => {
-                        admission.set_fee_policy_ready(self.readiness_now().ready());
-                    }
-                    _ = bitcoin_tick.tick() => {
-                        let (outcome, persistence, readiness) =
-                            self.refresh_rail(FeeRail::Bitcoin).await;
-                        admission.set_fee_policy_ready(readiness.ready());
-                        tracing::info!(
-                            event = "fee_refresh_completed",
-                            rail = FeeRail::Bitcoin.as_str(),
-                            outcome = ?outcome,
-                            persistence = ?persistence,
-                            ready = readiness.ready(),
-                            "runtime Bitcoin fee refresh completed"
-                        );
-                    }
-                    _ = liquid_tick.tick() => {
-                        let (outcome, persistence, readiness) =
-                            self.refresh_rail(FeeRail::Liquid).await;
-                        admission.set_fee_policy_ready(readiness.ready());
-                        tracing::info!(
-                            event = "fee_refresh_completed",
-                            rail = FeeRail::Liquid.as_str(),
-                            outcome = ?outcome,
-                            persistence = ?persistence,
-                            ready = readiness.ready(),
-                            "runtime Liquid fee refresh completed"
-                        );
+            let readiness_runtime = self.clone();
+            let readiness_admission = admission.clone();
+            let readiness_loop = async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                // Startup initialization supplied the first fact.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    readiness_admission
+                        .set_fee_policy_ready(readiness_runtime.readiness_now().ready());
+                }
+            };
+
+            let refresh_loop = async move {
+                let mut bitcoin_tick = tokio::time::interval(self.bitcoin_refresh_interval);
+                let mut liquid_tick = tokio::time::interval(self.liquid_refresh_interval);
+                // Startup initialization supplied both first observations.
+                bitcoin_tick.tick().await;
+                liquid_tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = bitcoin_tick.tick() => {
+                            let (outcome, persistence, readiness) =
+                                self.refresh_rail(FeeRail::Bitcoin).await;
+                            admission.set_fee_policy_ready(readiness.ready());
+                            tracing::info!(
+                                event = "fee_refresh_completed",
+                                rail = FeeRail::Bitcoin.as_str(),
+                                outcome = ?outcome,
+                                persistence = ?persistence,
+                                ready = readiness.ready(),
+                                "runtime Bitcoin fee refresh completed"
+                            );
+                        }
+                        _ = liquid_tick.tick() => {
+                            let (outcome, persistence, readiness) =
+                                self.refresh_rail(FeeRail::Liquid).await;
+                            admission.set_fee_policy_ready(readiness.ready());
+                            tracing::info!(
+                                event = "fee_refresh_completed",
+                                rail = FeeRail::Liquid.as_str(),
+                                outcome = ?outcome,
+                                persistence = ?persistence,
+                                ready = readiness.ready(),
+                                "runtime Liquid fee refresh completed"
+                            );
+                        }
                     }
                 }
+            };
+
+            // Keep freshness admission responsive while an acquisition is
+            // waiting on remote I/O. Cancellation drops both loops together.
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = readiness_loop => {}
+                _ = refresh_loop => {}
             }
         })
     }
