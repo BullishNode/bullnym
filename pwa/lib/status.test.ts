@@ -102,6 +102,32 @@ describe('derivePayView combined server projection', () => {
     ).toEqual({ kind: 'paid' })
   })
 
+  it('surfaces money after cancellation without reopening payment instructions', () => {
+    const settling = derivePayView(
+      makeStatus({ status: 'cancelled', presentation_status: 'partial', settlement_status: 'pending' }),
+    )
+    expect(settling).toEqual({ kind: 'settling' })
+    expect(showsRails(settling)).toBe(false)
+
+    const partial = derivePayView(
+      makeStatus({ status: 'cancelled', presentation_status: 'partial', settlement_status: 'settled' }),
+    )
+    expect(partial).toEqual({ kind: 'underpaid' })
+    expect(isTerminalView(partial)).toBe(true)
+
+    const paid = derivePayView(
+      makeStatus({ status: 'cancelled', presentation_status: 'payment_received', settlement_status: 'settled' }),
+    )
+    expect(paid).toEqual({ kind: 'paid' })
+    expect(isTerminalView(paid)).toBe(true)
+
+    const overpaid = derivePayView(
+      makeStatus({ status: 'cancelled', presentation_status: 'overpaid', settlement_status: 'settled' }),
+    )
+    expect(overpaid).toEqual({ kind: 'overpaid' })
+    expect(isTerminalView(overpaid)).toBe(true)
+  })
+
   it('shows resolution pending as a visible, nonterminal payment issue', () => {
     const view = derivePayView(
       makeStatus({ status: 'in_progress', presentation_status: 'partial', settlement_status: 'resolution_pending' }),

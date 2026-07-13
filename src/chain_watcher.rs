@@ -1001,8 +1001,7 @@ async fn record_liquid_events_for_script(
         db::ApplyDirectObservationOutcome::Applied { changed: true } => observation_count,
         db::ApplyDirectObservationOutcome::Applied { changed: false }
         | db::ApplyDirectObservationOutcome::AlreadyApplied
-        | db::ApplyDirectObservationOutcome::Stale { .. }
-        | db::ApplyDirectObservationOutcome::Closed => 0,
+        | db::ApplyDirectObservationOutcome::Stale { .. } => 0,
     };
     if recorded > 0 {
         tracing::info!(

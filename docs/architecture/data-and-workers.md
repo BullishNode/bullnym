@@ -53,8 +53,12 @@ Bitcoin chain-swap claims.
 
 ## Status Fields
 
-`status` tracks payer/payment accounting: `unpaid`, `in_progress`,
+`status` retains the invoice lifecycle/accounting token: `unpaid`, `in_progress`,
 `partially_paid`, `paid`, `underpaid`, `overpaid`, `expired`, or `cancelled`.
+For a cancelled or expired invoice, the terminal lifecycle token remains in
+`status`; `presentation_status`, `paid_via`, `paid_amount_sat`, and settlement
+fields independently expose any money observed afterward. Both direct watchers
+retain closed addresses so cancellation/expiry cannot erase chain evidence.
 
 Migration 047 adds separate `direct_settlement_status` and
 `swap_settlement_status` component caches. The existing top-level

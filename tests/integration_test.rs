@@ -800,8 +800,8 @@ async fn readiness_rejects_schema_before_latest_migration() {
     cleanup_db(&pool).await;
 
     sqlx::query(
-        "ALTER TABLE invoice_direct_payment_transitions \
-         RENAME TO invoice_direct_payment_transitions_before_readiness_test",
+        "ALTER TABLE invoices RENAME CONSTRAINT invoices_paid_via_or_closed_chk \
+         TO invoices_paid_via_or_closed_chk_before_readiness_test",
     )
     .execute(&pool)
     .await
@@ -811,8 +811,9 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
-        "ALTER TABLE invoice_direct_payment_transitions_before_readiness_test \
-         RENAME TO invoice_direct_payment_transitions",
+        "ALTER TABLE invoices RENAME CONSTRAINT \
+         invoices_paid_via_or_closed_chk_before_readiness_test \
+         TO invoices_paid_via_or_closed_chk",
     )
     .execute(&pool)
     .await
@@ -822,7 +823,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "047_direct_payment_lifecycle_foundation"
+        "048_cancelled_invoice_late_money"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -7263,6 +7264,303 @@ async fn signed_invoice_cancel_after_paid_is_terminal_noop() {
 }
 
 #[tokio::test]
+async fn cancelled_invoice_records_late_boltz_settlement_once() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "cancellateboltz").await;
+    let invoice =
+        insert_test_invoice(&pool, "cancellateboltz", &npub, "lq1cancellateboltz", 3_600).await;
+    assert_eq!(
+        pay_service::db::cancel_invoice(&pool, invoice.id)
+            .await
+            .unwrap(),
+        (1, "cancelled".to_string())
+    );
+
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+    let claim_txid = "6363636363636363636363636363636363636363636363636363636363636363";
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: None,
+            boltz_swap_id: "cancelled-repair-reproducer",
+            address: None,
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-cancelled-repair-reproducer",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE swap_records SET status = 'claimed', claim_txid = $2, updated_at = NOW() \
+         WHERE boltz_swap_id = $1",
+    )
+    .bind("cancelled-repair-reproducer")
+    .bind(claim_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let repair_epoch_micros: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::list_claimed_swaps_missing_lightning_event(
+            &pool,
+            7 * 24 * 60 * 60,
+            repair_epoch_micros,
+            None,
+            10,
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "the live #77 claimed+cancelled reproducer must enter settlement repair"
+    );
+    assert!(
+        invoice::flip_invoice_on_lightning_settlement(
+            &pool,
+            Some(invoice.id),
+            1_000,
+            "cancelled-repair-reproducer",
+            claim_txid,
+            tolerances,
+        )
+        .await
+    );
+    assert!(
+        pay_service::db::list_claimed_swaps_missing_lightning_event(
+            &pool,
+            7 * 24 * 60 * 60,
+            repair_epoch_micros,
+            None,
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "one successful late-money event must retire the row from repair"
+    );
+    assert!(
+        invoice::flip_invoice_on_lightning_settlement(
+            &pool,
+            Some(invoice.id),
+            1_000,
+            "cancelled-repair-reproducer",
+            claim_txid,
+            tolerances,
+        )
+        .await,
+        "settlement-repair replay remains an idempotent success"
+    );
+
+    let cancelled = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(
+        cancelled.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(cancelled.paid_via.as_deref(), Some("lightning"));
+    assert_eq!(cancelled.paid_amount_sat, Some(1_000));
+    assert_eq!(cancelled.swap_settlement_status, "settled");
+    assert_eq!(cancelled.settlement_status, "settled");
+    assert!(cancelled.paid_at_unix.is_some());
+
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(event_count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn cancelled_invoice_keeps_lifecycle_marker_while_direct_money_is_visible() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    state.admission.set_workers_enabled(false);
+    let app = test_app(state);
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("cancellatedirect", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "cancellatedirect", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = insert_test_invoice(
+        &pool,
+        "cancellatedirect",
+        &npub,
+        "lq1cancellatedirect",
+        3_600,
+    )
+    .await;
+    pay_service::db::cancel_invoice(&pool, invoice.id)
+        .await
+        .unwrap();
+
+    let txid = "6464646464646464646464646464646464646464646464646464646464646464";
+    let event_key = format!("liquid_direct:{txid}:0");
+    let provisional = [liquid_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "lq1cancellatedirect",
+        1_000,
+        0,
+        pay_service::db::DirectObservationPhase::Provisional,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &provisional,
+    )
+    .await;
+    let provisional_projection = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(provisional_projection.status, "cancelled");
+    assert_eq!(
+        provisional_projection.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(provisional_projection.paid_amount_sat, None);
+    assert_eq!(provisional_projection.paid_via, None);
+    assert!(provisional_projection.paid_at_unix.is_none());
+    assert_eq!(provisional_projection.direct_settlement_status, "pending");
+
+    let confirmed = [liquid_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "lq1cancellatedirect",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &confirmed,
+    )
+    .await;
+
+    let cancelled = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(
+        cancelled.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(cancelled.paid_via.as_deref(), Some("liquid"));
+    assert_eq!(cancelled.paid_amount_sat, Some(1_000));
+    assert_eq!(cancelled.direct_settlement_status, "pending");
+    assert_eq!(cancelled.settlement_status, "pending");
+    assert!(cancelled.paid_at_unix.is_some());
+
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["presentation_status"], "payment_received");
+    assert_eq!(body["paid_amount_sat"], 1_000);
+    assert_eq!(body["remaining_amount_sat"], 0);
+    assert_eq!(body["lightning_pr"], Value::Null);
+    assert_eq!(body["bitcoin_chain_address"], Value::Null);
+
+    let (sig, timestamp) = sign_invoice_list_with_keypair(&keypair, &npub, 1, 10, "");
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "/api/v1/invoices?npub={npub}&page=1&pageSize=10&timestamp={timestamp}&signature={sig}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["invoices"][0]["status"], "cancelled");
+    assert_eq!(
+        body["invoices"][0]["presentation_status"],
+        "payment_received"
+    );
+    assert_eq!(body["invoices"][0]["paid_amount_sat"], 1_000);
+    assert_eq!(body["invoices"][0]["remaining_amount_sat"], 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn expired_invoice_keeps_lifecycle_marker_while_late_money_is_visible() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "expiredlate").await;
+    let invoice = insert_test_invoice(&pool, "expiredlate", &npub, "lq1expiredlate", -10).await;
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let txid = "6565656565656565656565656565656565656565656565656565656565656565";
+    let event_key = format!("liquid_direct:{txid}:0");
+    let confirmed = [liquid_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "lq1expiredlate",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &confirmed,
+    )
+    .await;
+
+    let expired = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.status, "expired");
+    assert_eq!(
+        expired.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(expired.paid_via.as_deref(), Some("liquid"));
+    assert_eq!(expired.paid_amount_sat, Some(1_000));
+    assert_eq!(expired.direct_settlement_status, "pending");
+    assert_eq!(expired.settlement_status, "pending");
+    assert!(expired.paid_at_unix.is_some());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn invoice_insert_rejects_reused_liquid_address() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -9456,12 +9754,13 @@ async fn expired_partial_payment_becomes_underpaid() {
 }
 
 #[tokio::test]
-async fn liquid_watcher_excludes_closed_rows_and_retains_finalized_evidence() {
+async fn liquid_watcher_retains_closed_rows_and_finalized_evidence() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "liquidscan").await;
 
     let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
+    let cancelled = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scancancelled", 60).await;
     let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
     let finalized = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfinalized", 60).await;
     let txid = "2929292929292929292929292929292929292929292929292929292929292929";
@@ -9489,6 +9788,12 @@ async fn liquid_watcher_excludes_closed_rows_and_retains_finalized_evidence() {
         .unwrap();
     assert_eq!(finalized_projection.status, "paid");
     assert_eq!(finalized_projection.direct_settlement_status, "settled");
+    pay_service::db::expire_invoices_past_deadline(&pool, 0)
+        .await
+        .unwrap();
+    pay_service::db::cancel_invoice(&pool, cancelled.id)
+        .await
+        .unwrap();
 
     let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool, 0)
         .await
@@ -9496,7 +9801,8 @@ async fn liquid_watcher_excludes_closed_rows_and_retains_finalized_evidence() {
     let invoice_ids: std::collections::HashSet<_> =
         rows.into_iter().map(|(id, _, _, _)| id).collect();
 
-    assert!(!invoice_ids.contains(&expired.id));
+    assert!(invoice_ids.contains(&expired.id));
+    assert!(invoice_ids.contains(&cancelled.id));
     assert!(invoice_ids.contains(&fresh.id));
     assert!(
         invoice_ids.contains(&finalized.id),

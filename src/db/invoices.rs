@@ -338,9 +338,10 @@ pub async fn list_invoices_by_npub<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
-/// Address-keyed scan for the chain watcher: every payable invoice plus every
-/// non-superseded direct-Liquid observation/event that still needs permanent
-/// reorg monitoring. Cancelled/expired rows remain outside this #28 lifecycle.
+/// Address-keyed scan for the chain watcher: every payable invoice, every
+/// closed invoice whose address can still receive late money, plus every
+/// non-superseded direct-Liquid observation/event that needs permanent reorg
+/// monitoring. Cancellation and expiry suppress instructions, never evidence.
 /// Linked and unlinked invoices are covered uniformly regardless of whether
 /// the address came from the descriptor allocator or the wallet.
 ///
@@ -355,13 +356,13 @@ pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
             GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
             liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
      FROM invoices \
-     WHERE status NOT IN ('cancelled', 'expired') \
-       AND ( \
+     WHERE ( \
              ( \
                (status IN ('unpaid', 'in_progress', 'partially_paid') \
                 OR (origin = 'checkout' AND status = 'underpaid')) \
                AND expires_at + ($1 || ' seconds')::interval > $2::timestamptz \
              ) \
+             OR status IN ('cancelled', 'expired') \
              OR direct_settlement_status IN ('pending', 'resolution_pending') \
              OR EXISTS ( \
                   SELECT 1 FROM invoice_payment_observations direct_observation \
@@ -951,11 +952,6 @@ pub async fn record_invoice_payment(
     .fetch_one(&mut *tx)
     .await?;
 
-    if inv.status == "cancelled" {
-        tx.commit().await?;
-        return Ok(0);
-    }
-
     let is_direct_liquid_payment = evidence.source == "liquid_direct";
     let is_boltz_settlement = matches!(
         evidence.source,
@@ -1148,18 +1144,26 @@ pub async fn record_invoice_payment(
 
     let tolerance_sat = payment_tolerance_sat_for_amount(inv.amount_sat, evidence.rail, tolerances);
     let expired = inv.expires_at_unix <= chrono_like_unix_now();
-    let new_status = resolve_invoice_status(
-        &inv.status,
-        inv.amount_sat,
-        received_sat,
-        tolerance_sat,
-        expired,
-    );
-    let payment_settlement_status = if matches!(new_status, "paid" | "overpaid") {
-        "settled"
-    } else {
-        "none"
+    let new_status = match inv.status.as_str() {
+        // Cancellation/expiry close instructions but remain durable lifecycle
+        // markers after money lands. `presentation_status`, `paid_via`, and
+        // `paid_amount_sat` carry the honest payment projection.
+        "cancelled" => "cancelled",
+        "expired" => "expired",
+        _ => resolve_invoice_status(
+            &inv.status,
+            inv.amount_sat,
+            received_sat,
+            tolerance_sat,
+            expired,
+        ),
     };
+    let payment_settlement_status =
+        if matches!(presentation_status, "payment_received" | "overpaid") {
+            "settled"
+        } else {
+            "none"
+        };
     let direct_evidence_remains: bool = sqlx::query_scalar(
         "SELECT EXISTS ( \
             SELECT 1 FROM invoice_payment_events \
@@ -1201,7 +1205,12 @@ pub async fn record_invoice_payment(
             swap_settlement_status = $8, \
             direct_payment_projection_version = direct_payment_projection_version + \
                 CASE WHEN $9 OR direct_settlement_status IS DISTINCT FROM $7 THEN 1 ELSE 0 END, \
-            paid_at = CASE WHEN $2 IN ('paid', 'overpaid') THEN COALESCE(paid_at, NOW()) ELSE paid_at END \
+            paid_at = CASE \
+                WHEN $2 IN ('paid', 'overpaid') \
+                  OR ($2 IN ('cancelled', 'expired') \
+                      AND $3 IN ('payment_received', 'overpaid')) \
+                THEN COALESCE(paid_at, NOW()) \
+                ELSE paid_at END \
          WHERE id = $1",
     )
     .bind(id)
@@ -1713,7 +1722,8 @@ mod status_tests {
 
     #[test]
     fn liquid_watcher_keeps_all_live_direct_evidence_in_cohort() {
-        assert!(LIQUID_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
+        assert!(LIQUID_WATCHER_PAGE_SQL.contains("OR status IN ('cancelled', 'expired')"));
+        assert!(!LIQUID_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
         assert!(LIQUID_WATCHER_PAGE_SQL
             .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
         assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_observation.source = 'liquid_direct'"));

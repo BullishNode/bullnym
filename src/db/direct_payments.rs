@@ -341,7 +341,6 @@ pub enum ApplyDirectObservationOutcome {
     Applied { changed: bool },
     AlreadyApplied,
     Stale { current_generation: i64 },
-    Closed,
 }
 
 /// Immutable Bitcoin-direct evidence that still needs authoritative tx-specific
@@ -735,7 +734,7 @@ fn reduce_projection(
     let direct_settlement_status =
         direct_settlement_status_for(events, &invoice.direct_settlement_status);
     let presentation_status = presentation_status_for(invoice.amount_sat, events, tolerances);
-    let status = if accounting.received_sat == 0 {
+    let projected_status = if accounting.received_sat == 0 {
         if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
             "in_progress"
         } else if invoice.status == "underpaid" {
@@ -745,6 +744,14 @@ fn reduce_projection(
         }
     } else {
         accounting.status
+    };
+    // Closing an invoice suppresses all future payment instructions but cannot
+    // hide or discard later chain evidence. Preserve the lifecycle marker and
+    // expose the independently reduced presentation/accounting projection.
+    let status = match invoice.status.as_str() {
+        "cancelled" => "cancelled",
+        "expired" => "expired",
+        _ => projected_status,
     };
     ReducedProjection {
         status,
@@ -874,12 +881,6 @@ pub async fn apply_direct_observation_batch(
         tx.rollback().await?;
         return Ok(ApplyDirectObservationOutcome::AlreadyApplied);
     }
-    if matches!(invoice.status.as_str(), "cancelled" | "expired") {
-        mark_generation_applied(&mut tx, &batch, "cancelled").await?;
-        tx.commit().await?;
-        return Ok(ApplyDirectObservationOutcome::Closed);
-    }
-
     // Serialize Liquid discovery against the compatibility/Boltz settlement
     // writer. The watcher may have fetched its exclusion set before a Boltz
     // claim committed; rechecking under the shared advisory boundary makes
@@ -991,7 +992,11 @@ pub async fn apply_direct_observation_batch(
                  direct_settlement_status = $4, settlement_status = $5, \
                  paid_via = $6, paid_amount_sat = $7, \
                  paid_at = CASE \
-                     WHEN $2 IN ('paid', 'overpaid') THEN COALESCE(paid_at, NOW()) \
+                     WHEN $2 IN ('paid', 'overpaid') \
+                       OR ($2 IN ('cancelled', 'expired') \
+                           AND $3 IN ('payment_received', 'overpaid') \
+                           AND $7 IS NOT NULL) \
+                     THEN COALESCE(paid_at, NOW()) \
                      ELSE NULL END, \
                  direct_payment_projection_version = direct_payment_projection_version + 1 \
              WHERE id = $1",

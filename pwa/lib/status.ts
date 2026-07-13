@@ -131,6 +131,7 @@ const KNOWN_SETTLEMENT_STATUSES = new Set([
  */
 export function derivePayView(status: InvoiceStatus): PayView {
   const presentation = status.presentation_status
+  const instructionsClosed = status.status === 'cancelled' || status.status === 'expired'
   if (!KNOWN_SETTLEMENT_STATUSES.has(status.settlement_status)) return { kind: 'unknown' }
 
   if (status.settlement_status === 'claim_stuck') return { kind: 'needs_review' }
@@ -142,6 +143,7 @@ export function derivePayView(status: InvoiceStatus): PayView {
 
   if (status.settlement_status === 'pending') {
     if (presentation === 'partial') {
+      if (instructionsClosed) return { kind: 'settling' }
       if (status.status === 'unpaid' || status.status === 'in_progress' || status.status === 'partially_paid') {
         return { kind: 'partially_paid_pending' }
       }
@@ -152,6 +154,7 @@ export function derivePayView(status: InvoiceStatus): PayView {
   }
 
   if (presentation === 'partial') {
+    if (instructionsClosed) return { kind: 'underpaid' }
     if (status.status === 'underpaid') return { kind: 'underpaid' }
     if (status.status === 'unpaid' || status.status === 'in_progress' || status.status === 'partially_paid') {
       return { kind: 'partially_paid' }
@@ -159,13 +162,19 @@ export function derivePayView(status: InvoiceStatus): PayView {
     return { kind: 'unknown' }
   }
   if (presentation === 'payment_received') {
-    if (status.status === 'paid' && (status.settlement_status === 'none' || status.settlement_status === 'settled')) {
+    if (
+      (status.status === 'paid' || instructionsClosed) &&
+      (status.settlement_status === 'none' || status.settlement_status === 'settled')
+    ) {
       return { kind: 'paid' }
     }
     return { kind: 'in_progress' }
   }
   if (presentation === 'overpaid') {
-    if (status.status === 'overpaid' && (status.settlement_status === 'none' || status.settlement_status === 'settled')) {
+    if (
+      (status.status === 'overpaid' || instructionsClosed) &&
+      (status.settlement_status === 'none' || status.settlement_status === 'settled')
+    ) {
       return { kind: 'overpaid' }
     }
     return { kind: 'overpaid_pending' }

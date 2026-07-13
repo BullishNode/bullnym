@@ -352,6 +352,16 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND column_name = 'presentation_status' \
             ) \
             AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'invoices' \
+                  AND c.conname = 'invoices_paid_via_or_closed_chk' \
+                  AND c.contype = 'c' \
+            ) \
+            AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                 WHERE table_schema = 'public' \
                   AND table_name = 'invoice_payment_events' \
