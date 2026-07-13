@@ -1262,12 +1262,18 @@ pub async fn observe_bitcoin_recovery_merchant_output(
     }
 
     if let Some(block) = previous_block.as_ref() {
-        let current_anchor = snapshot
+        let anchor_reorged = match snapshot
             .prior_block_hash
             .as_deref()
-            .and_then(canonical_hash)
-            .ok_or(BitcoinMerchantObservationError::InvalidSnapshot)?;
-        let anchor_reorged = current_anchor != block.hash;
+            .map(|hash| {
+                canonical_hash(hash).ok_or(BitcoinMerchantObservationError::InvalidSnapshot)
+            })
+            .transpose()?
+        {
+            Some(current_anchor) => current_anchor != block.hash,
+            None if block.height > snapshot.tip_height => true,
+            None => return Err(BitcoinMerchantObservationError::InvalidSnapshot),
+        };
         match (block.already_reorged, anchor_reorged) {
             (false, true) => {
                 return Ok(BitcoinMerchantOutputObservation::ReorgDemoted {
@@ -3819,6 +3825,64 @@ mod tests {
             redrive.prior_height_requests.lock().unwrap().as_slice(),
             &[Some(900_000)]
         );
+    }
+
+    #[tokio::test]
+    async fn production_bitcoin_source_tip_regression_demotes_once_then_redrives() {
+        let attempt = recovery_attempt();
+        let old_block_hash = "bb".repeat(32);
+        let regressed_tip = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 899_999,
+                status: BitcoinRecoveryTransactionStatus::Absent,
+                prior_block_hash: None,
+            },
+            None,
+        );
+        let demoted = observe_bitcoin_recovery_merchant_output(
+            &regressed_tip,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::Confirmed {
+                block_height: 900_000,
+                block_hash: &old_block_hash,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            demoted,
+            BitcoinMerchantOutputObservation::ReorgDemoted {
+                txid: attempt.txid.clone(),
+                previous_block_height: 900_000,
+                previous_block_hash: old_block_hash.clone(),
+            }
+        );
+
+        let redrive = MockBitcoinMerchantEvidence::successful(
+            BitcoinRecoveryStatusSnapshot {
+                tip_height: 899_999,
+                status: BitcoinRecoveryTransactionStatus::Mempool,
+                prior_block_hash: None,
+            },
+            Some(hex::decode(&attempt.raw_tx_hex).unwrap()),
+        );
+        let redriven = observe_bitcoin_recovery_merchant_output(
+            &redrive,
+            &attempt,
+            None,
+            PreviousBitcoinMerchantConfirmation::Reorged {
+                previous_block_height: 900_000,
+                previous_block_hash: &old_block_hash,
+            },
+        )
+        .await
+        .unwrap();
+        let BitcoinMerchantOutputObservation::Observed(adapted) = redriven else {
+            panic!("durable tip-regression demotion must redrive mempool evidence");
+        };
+        assert_eq!(adapted.observed().confirmations(), 0);
+        assert_eq!(adapted.candidate_txid(), attempt.txid);
     }
 
     #[tokio::test]
