@@ -48,6 +48,17 @@ impl ManifestSequenceReservation {
         self.previous_manifest_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_manifest_staging_test(
+        manifest_sequence: u64,
+        previous_manifest_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            manifest_sequence,
+            previous_manifest_id,
+        }
+    }
+
     pub fn identity(
         self,
         manifest_id: Uuid,
