@@ -271,11 +271,14 @@ pub(crate) async fn execute_journaled_recovery(
     let endpoints = evidence.endpoints().to_vec();
     let builder = LiveRecoveryBuilder { state };
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
+    // A missing current decision is passed through deliberately: an existing
+    // journal replays without it, while a new attempt remains pending.
+    let fee_decision = state.fee_runtime.bitcoin_decision_now().ok();
     execute_journaled_recovery_with_builder_fee(
         &state.db,
         chain_swap_id,
         &builder,
-        None,
+        fee_decision.as_ref().map(BitcoinBuilderFeeDecision::from),
         evidence,
         &broadcaster,
         &NoRecoveryFaults,

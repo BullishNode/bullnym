@@ -22,8 +22,8 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr, og_image, pricer, qr,
-    rate_limit, readiness, reconciler, recovery_address_registration, registration,
+    donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl, nostr, og_image,
+    pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration, registration,
     startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, AppState,
@@ -149,6 +149,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             false
         }
     };
+
+    // The standalone runtime slice uses an explicitly unavailable persistence
+    // adapter. The database-persistence lane replaces this composition seam;
+    // until then no live observation can make readiness or construction open.
+    let fee_runtime = Arc::new(fee_runtime::FeeRuntime::from_config(
+        &config.fee_policy,
+        Arc::new(fee_runtime::UnavailableFeeRuntimePersistence),
+    )?);
+    let fee_startup = fee_runtime.initialize().await;
+    tracing::info!(
+        event = "fee_runtime_initialized",
+        bitcoin = ?fee_startup.refresh().bitcoin(),
+        liquid = ?fee_startup.refresh().liquid(),
+        bitcoin_persistence = ?fee_startup.bitcoin_persistence(),
+        liquid_persistence = ?fee_startup.liquid_persistence(),
+        ready = fee_startup.readiness().ready(),
+        "runtime fee evidence initialized"
+    );
 
     let swap_master_key =
         SwapMasterKey::from_mnemonic(&config.swap_mnemonic, None, Network::Mainnet)
@@ -528,9 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             swap_key_lineage_safe,
             recovery_journal_ready: schema_and_journal_ready,
             provider_recovery_consistent,
-            // #64 owns live fee observation and persistence. Until it lands,
-            // new reverse and chain swaps deliberately remain fail-closed.
-            fee_policy_ready: false,
+            fee_policy_ready: fee_startup.readiness().ready(),
             recovery_commitment_ready,
         },
         admission::WorkerCadences::from_runtime(
@@ -554,6 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_backend,
         liquid_claim_client_factory,
         bitcoin_recovery_backend,
+        fee_runtime: fee_runtime.clone(),
         pricer: pricer_client,
         pwa_shells,
         recovery_manifest_runtime_v1,
@@ -561,6 +578,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
+    let _fee_runtime_task = fee_runtime
+        .clone()
+        .spawn_background(state.admission.clone(), cancel.clone());
     let _provider_limits_refresh_task = boltz.spawn_provider_limits_refresh(cancel.clone());
     tracing::info!(
         event = "provider_limits_refresh_started",
@@ -625,6 +645,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.clone(),
             state.liquid_claim_client_factory.clone(),
             state.utxo_backend.clone(),
+            state.fee_runtime.clone(),
             cancel.clone(),
             state.admission.reporter(admission::Worker::ReverseClaimer),
             state.admission.reporter(admission::Worker::ChainClaimer),

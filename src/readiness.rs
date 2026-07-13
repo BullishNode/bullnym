@@ -38,6 +38,8 @@ pub struct ReadinessResponse {
     pub expected_schema_marker: &'static str,
     pub database: ComponentStatus,
     pub schema: ComponentStatus,
+    pub bitcoin_fee: ComponentStatus,
+    pub liquid_fee: ComponentStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,7 +74,18 @@ pub async fn ready(
     } else {
         ComponentStatus::error("database unavailable")
     };
-    let ready = database.ok && schema.ok;
+    let fee_readiness = state.fee_runtime.readiness_now();
+    let bitcoin_fee = if fee_readiness.bitcoin_ready() {
+        ComponentStatus::ok()
+    } else {
+        ComponentStatus::error("current accepted Bitcoin fee evidence unavailable")
+    };
+    let liquid_fee = if fee_readiness.liquid_ready() {
+        ComponentStatus::ok()
+    } else {
+        ComponentStatus::error("current accepted Liquid fee evidence unavailable")
+    };
+    let ready = database.ok && schema.ok && bitcoin_fee.ok && liquid_fee.ok;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -87,6 +100,8 @@ pub async fn ready(
             expected_schema_marker: EXPECTED_SCHEMA_MARKER,
             database,
             schema,
+            bitcoin_fee,
+            liquid_fee,
         }),
     )
 }

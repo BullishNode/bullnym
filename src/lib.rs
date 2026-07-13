@@ -28,6 +28,7 @@ pub mod esplora;
 pub mod fee_policy;
 pub mod fee_decision_record;
 pub mod fee_refresh_cycle;
+pub mod fee_runtime;
 pub mod gc;
 pub mod image_pipeline;
 pub mod invoice;
@@ -77,6 +78,7 @@ pub struct AppState {
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub liquid_claim_client_factory: Option<Arc<claimer::LiquidClaimClientFactory>>,
     pub bitcoin_recovery_backend: Option<Arc<chain_recovery::BitcoinRecoveryBackend>>,
+    pub fee_runtime: Arc<fee_runtime::FeeRuntime>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
     /// Protected off-host manifest capability. Absence is fail-closed for new

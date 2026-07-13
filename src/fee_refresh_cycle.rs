@@ -150,6 +150,34 @@ impl<'a> FeeRefreshCycle<'a> {
         );
         FeeRefreshCycleOutcome { bitcoin, liquid }
     }
+
+    /// Refresh only Bitcoin for a runtime that preserves rail-local cadences.
+    pub async fn refresh_bitcoin_once<C>(&self, clock: C) -> FeeRailRefreshOutcome
+    where
+        C: Fn(FeeRail) -> Result<u64, FeeRefreshClockError> + Sync,
+    {
+        refresh_bitcoin(
+            self.source_sets.bitcoin_sources(),
+            self.bitcoin_policy,
+            self.snapshot,
+            &clock,
+        )
+        .await
+    }
+
+    /// Refresh only Liquid for a runtime that preserves rail-local cadences.
+    pub async fn refresh_liquid_once<C>(&self, clock: C) -> FeeRailRefreshOutcome
+    where
+        C: Fn(FeeRail) -> Result<u64, FeeRefreshClockError> + Sync,
+    {
+        refresh_liquid(
+            self.source_sets.liquid_sources(),
+            self.liquid_policy,
+            self.snapshot,
+            &clock,
+        )
+        .await
+    }
 }
 
 impl fmt::Debug for FeeRefreshCycle<'_> {

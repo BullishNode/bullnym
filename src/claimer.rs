@@ -32,6 +32,7 @@ use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
 use crate::fee_policy::LiquidFeeDecision;
+use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
@@ -350,6 +351,7 @@ async fn dispatch_webhook(
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
                 db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+                state.fee_runtime.as_ref(),
             )
             .await;
         }
@@ -745,6 +747,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
             db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+            state.fee_runtime.as_ref(),
         )
         .await;
         return Ok(());
@@ -772,6 +775,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
             db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+            state.fee_runtime.as_ref(),
         )
         .await;
         return Ok(());
@@ -876,6 +880,7 @@ pub(crate) async fn handle_chain_swap_webhook(
                 state.config.claim.max_claim_attempts,
                 state.utxo_backend.as_ref(),
                 db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+                state.fee_runtime.as_ref(),
             )
             .await;
         } else {
@@ -949,6 +954,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             state.config.claim.max_claim_attempts,
             state.utxo_backend.as_ref(),
             db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+            state.fee_runtime.as_ref(),
         )
         .await;
     }
@@ -996,7 +1002,9 @@ async fn try_claim_chain_swap_with_retry(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_runtime: &FeeRuntime,
 ) {
+    let fee_decision = fee_runtime.liquid_decision_now().ok();
     match claim_chain_swap(
         pool,
         swap.id,
@@ -1005,7 +1013,7 @@ async fn try_claim_chain_swap_with_retry(
         max_claim_attempts,
         utxo_backend,
         tolerances,
-        None,
+        fee_decision.as_ref(),
     )
     .await
     {
@@ -1142,7 +1150,9 @@ async fn try_claim_with_retry(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_runtime: &FeeRuntime,
 ) {
+    let fee_decision = fee_runtime.liquid_decision_now().ok();
     match claim_swap(
         pool,
         swap.id,
@@ -1151,7 +1161,7 @@ async fn try_claim_with_retry(
         max_claim_attempts,
         utxo_backend,
         tolerances,
-        None,
+        fee_decision.as_ref(),
     )
     .await
     {
@@ -2848,6 +2858,7 @@ pub fn spawn_background_claimer(
     config: Arc<Config>,
     claim_clients: Option<Arc<LiquidClaimClientFactory>>,
     utxo_backend: Option<Arc<dyn UtxoBackend>>,
+    fee_runtime: Arc<FeeRuntime>,
     cancel: CancellationToken,
     mut reverse_reporter: WorkerReporter,
     mut chain_reporter: WorkerReporter,
@@ -2921,6 +2932,7 @@ pub fn spawn_background_claimer(
                         }
                         for swap in &ready {
                             reverse_reporter.progress();
+                            let fee_decision = fee_runtime.liquid_decision_now().ok();
                             match claim_swap(
                                 &pool,
                                 swap.id,
@@ -2929,7 +2941,7 @@ pub fn spawn_background_claimer(
                                 config.claim.max_claim_attempts,
                                 utxo_backend.as_ref(),
                                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
-                                None,
+                                fee_decision.as_ref(),
                             )
                             .await
                             {
@@ -2991,6 +3003,7 @@ pub fn spawn_background_claimer(
                         );
                         for swap in &ready_chain {
                             chain_reporter.progress();
+                            let fee_decision = fee_runtime.liquid_decision_now().ok();
                             match claim_chain_swap(
                                 &pool,
                                 swap.id,
@@ -2999,7 +3012,7 @@ pub fn spawn_background_claimer(
                                 config.claim.max_claim_attempts,
                                 utxo_backend.as_ref(),
                                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
-                                None,
+                                fee_decision.as_ref(),
                             )
                             .await
                             {
