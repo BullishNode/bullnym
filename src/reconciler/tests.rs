@@ -637,6 +637,8 @@ fn chain_settlement_scans_revisit_only_checkpoint_owned_terminal_rows() {
     ] {
         assert!(sql.contains("merchant_settlement_checkpoints"));
     }
+    assert!(db::CHAIN_SETTLEMENT_REPAIR_ELIGIBILITY_SQL.contains("merchant_chain_swap_id = c.id"));
+    assert!(db::CHAIN_SETTLEMENT_REPAIR_ELIGIBILITY_SQL.contains("e.accounting_state = 'active'"));
 }
 
 #[test]
