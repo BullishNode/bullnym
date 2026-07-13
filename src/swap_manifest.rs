@@ -35,6 +35,8 @@ use uuid::Uuid;
 
 pub const SWAP_MANIFEST_FORMAT: &str = "bullnym-chain-swap-manifest";
 pub const SWAP_MANIFEST_VERSION: u16 = 1;
+/// Largest child index accepted by unhardened BIP32 derivation (`m/{index}`).
+pub const MAX_UNHARDENED_SWAP_CHILD_INDEX: i64 = (1_i64 << 31) - 1;
 
 const ENCRYPTION_ALGORITHM: &str = "xchacha20poly1305";
 const SIGNATURE_ALGORITHM: &str = "bip340-secp256k1-sha256";
@@ -439,6 +441,11 @@ impl SwapManifestV1 {
         {
             return invalid("claim and refund derivation identities must be distinct");
         }
+        if !(0..=MAX_UNHARDENED_SWAP_CHILD_INDEX)
+            .contains(&lineage.allocation_high_water_child_index)
+        {
+            return invalid("allocation high-water is outside the unhardened derivation domain");
+        }
         if lineage.allocation_high_water_child_index
             < lineage.claim.child_index.max(lineage.refund.child_index)
         {
@@ -693,8 +700,8 @@ fn validate_allocation(
     expected_purpose: ManifestKeyPurposeV1,
 ) -> Result<secp256k1::PublicKey, SwapManifestError> {
     require_non_nil("allocation id", allocation.allocation_id)?;
-    if allocation.child_index < 0 {
-        return invalid("derivation child index must be non-negative");
+    if !(0..=MAX_UNHARDENED_SWAP_CHILD_INDEX).contains(&allocation.child_index) {
+        return invalid("derivation child index is outside the unhardened derivation domain");
     }
     if allocation.purpose != expected_purpose {
         return invalid("derivation allocation purpose is incorrect");
@@ -1619,6 +1626,46 @@ mod tests {
             .derivation_lineage
             .allocation_high_water_child_index = 450;
         concurrent.validate().unwrap();
+    }
+
+    #[test]
+    fn maximum_unhardened_derivation_indices_are_accepted() {
+        let mut manifest = fixture();
+        manifest.derivation_lineage.claim.child_index = MAX_UNHARDENED_SWAP_CHILD_INDEX - 1;
+        manifest.derivation_lineage.refund.child_index = MAX_UNHARDENED_SWAP_CHILD_INDEX;
+        manifest
+            .derivation_lineage
+            .allocation_high_water_child_index = MAX_UNHARDENED_SWAP_CHILD_INDEX;
+
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn hardened_bit_or_larger_derivation_indices_are_rejected() {
+        for invalid_index in [MAX_UNHARDENED_SWAP_CHILD_INDEX + 1, i64::MAX] {
+            let mut claim = fixture();
+            claim.derivation_lineage.claim.child_index = invalid_index;
+            assert_invalid(
+                &claim,
+                "child index is outside the unhardened derivation domain",
+            );
+
+            let mut refund = fixture();
+            refund.derivation_lineage.refund.child_index = invalid_index;
+            assert_invalid(
+                &refund,
+                "child index is outside the unhardened derivation domain",
+            );
+
+            let mut high_water = fixture();
+            high_water
+                .derivation_lineage
+                .allocation_high_water_child_index = invalid_index;
+            assert_invalid(
+                &high_water,
+                "allocation high-water is outside the unhardened derivation domain",
+            );
+        }
     }
 
     #[test]

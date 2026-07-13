@@ -51,7 +51,8 @@ Version 1 contains closed typed fields, with no extension map:
 - derivation lineage: root fingerprint, key epoch, scheme version, signed
   allocator child-index high-water, and the allocation UUID/index/purpose/
   public key for both claim and refund keys. The high-water may include
-  concurrent allocations but cannot trail either allocation in this record;
+  concurrent allocations but cannot trail either allocation in this record.
+  All three indices are limited to the pinned unhardened `0..=2^31-1` domain;
 - the claim preimage **hash**, never the preimage;
 - immutable creation evidence: lockup address, locally constructed BIP21,
   payer and merchant amounts, canonical provider response, pinned canonical
