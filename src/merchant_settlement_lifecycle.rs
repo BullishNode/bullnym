@@ -697,9 +697,14 @@ fn validate_snapshot(
                 || *confirmations >= required
                 || *required_confirmations != required
                 || snapshot.last_confirmed_block.as_ref() != Some(block)
+                || snapshot.last_reorged_block.as_ref() == Some(block)
                 || !snapshot.history.confirmed
             {
-                return Err(SettlementLifecycleError::InvalidSnapshotState);
+                return Err(if snapshot.last_reorged_block.as_ref() == Some(block) {
+                    SettlementLifecycleError::InvalidSnapshotBlockEvidence
+                } else {
+                    SettlementLifecycleError::InvalidSnapshotState
+                });
             }
         }
         SettlementState::Finalized {
@@ -710,10 +715,15 @@ fn validate_snapshot(
             if *confirmations < required
                 || *required_confirmations != required
                 || snapshot.last_confirmed_block.as_ref() != Some(block)
+                || snapshot.last_reorged_block.as_ref() == Some(block)
                 || !snapshot.history.confirmed
                 || !snapshot.history.finalized
             {
-                return Err(SettlementLifecycleError::InvalidSnapshotState);
+                return Err(if snapshot.last_reorged_block.as_ref() == Some(block) {
+                    SettlementLifecycleError::InvalidSnapshotBlockEvidence
+                } else {
+                    SettlementLifecycleError::InvalidSnapshotState
+                });
             }
         }
         SettlementState::Replaced { .. } if snapshot.linked_replacement.is_none() => {
@@ -1338,6 +1348,18 @@ mod tests {
         block_evidence.last_reorged_block = None;
         assert_eq!(
             MerchantSettlementLifecycle::restore(block_evidence, policy),
+            Err(SettlementLifecycleError::InvalidSnapshotBlockEvidence)
+        );
+
+        let mut reconfirmed_reorged_block = reorged.lifecycle.snapshot();
+        reconfirmed_reorged_block.state = SettlementState::Confirmed {
+            block: block(100, 'a'),
+            confirmations: 1,
+            required_confirmations: 2,
+        };
+        reconfirmed_reorged_block.accounting = SettlementAccountingState::Confirmed;
+        assert_eq!(
+            MerchantSettlementLifecycle::restore(reconfirmed_reorged_block, policy),
             Err(SettlementLifecycleError::InvalidSnapshotBlockEvidence)
         );
     }
