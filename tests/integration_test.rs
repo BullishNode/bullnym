@@ -15528,6 +15528,8 @@ fn manifest_delivery_envelope(byte: u8) -> EncryptedSwapManifestV1 {
 struct InstrumentedManifestObjectStore {
     inner: Arc<InMemory>,
     io_calls: AtomicUsize,
+    fail_next_put: AtomicBool,
+    conflict_next_put: AtomicBool,
     pause_next_successful_put: AtomicBool,
     put_committed: Option<Arc<Barrier>>,
     release_put: Option<Arc<Barrier>>,
@@ -15538,6 +15540,8 @@ impl InstrumentedManifestObjectStore {
         Arc::new(Self {
             inner: Arc::new(InMemory::new()),
             io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(false),
+            conflict_next_put: AtomicBool::new(false),
             pause_next_successful_put: AtomicBool::new(false),
             put_committed: None,
             release_put: None,
@@ -15551,6 +15555,8 @@ impl InstrumentedManifestObjectStore {
             Arc::new(Self {
                 inner: Arc::new(InMemory::new()),
                 io_calls: AtomicUsize::new(0),
+                fail_next_put: AtomicBool::new(false),
+                conflict_next_put: AtomicBool::new(false),
                 pause_next_successful_put: AtomicBool::new(true),
                 put_committed: Some(put_committed.clone()),
                 release_put: Some(release_put.clone()),
@@ -15558,6 +15564,30 @@ impl InstrumentedManifestObjectStore {
             put_committed,
             release_put,
         )
+    }
+
+    fn failing_first_put() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(true),
+            conflict_next_put: AtomicBool::new(false),
+            pause_next_successful_put: AtomicBool::new(false),
+            put_committed: None,
+            release_put: None,
+        })
+    }
+
+    fn conflicting_first_put() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()),
+            io_calls: AtomicUsize::new(0),
+            fail_next_put: AtomicBool::new(false),
+            conflict_next_put: AtomicBool::new(true),
+            pause_next_successful_put: AtomicBool::new(false),
+            put_committed: None,
+            release_put: None,
+        })
     }
 
     fn io_calls(&self) -> usize {
@@ -15590,6 +15620,44 @@ impl ObjectStore for InstrumentedManifestObjectStore {
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.record_io();
+        if self.fail_next_put.swap(false, Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "instrumented manifest store",
+                source: Box::new(std::io::Error::other("injected put failure")),
+            });
+        }
+        if self.conflict_next_put.swap(false, Ordering::SeqCst) {
+            let path = location.to_string();
+            let conflicting = manifest_delivery_envelope(0xfe).into_encoded();
+            let conflicting_digest = manifest_envelope_sha256(&conflicting);
+            let mut conflicting_attributes = object_store::Attributes::new();
+            conflicting_attributes.insert(
+                object_store::Attribute::ContentType,
+                "application/vnd.bullnym.chain-swap-manifest.v1+json".into(),
+            );
+            conflicting_attributes.insert(
+                object_store::Attribute::Metadata(std::borrow::Cow::Borrowed(
+                    "bullnym-manifest-format-version",
+                )),
+                "1".into(),
+            );
+            conflicting_attributes.insert(
+                object_store::Attribute::Metadata(std::borrow::Cow::Borrowed("bullnym-sha256")),
+                conflicting_digest.into(),
+            );
+            let mut conflicting_options = options;
+            conflicting_options.attributes = conflicting_attributes;
+            self.inner
+                .put_opts(location, PutPayload::from(conflicting), conflicting_options)
+                .await?;
+            return Err(object_store::Error::AlreadyExists {
+                path,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "injected create conflict",
+                )),
+            });
+        }
         let result = self.inner.put_opts(location, payload, options).await;
         if result.is_ok() && self.pause_next_successful_put.swap(false, Ordering::SeqCst) {
             self.put_committed
@@ -16519,6 +16587,815 @@ async fn manifest_delivery_ledger_enforces_bounds_digest_immutability_and_delete
             .unwrap_err(),
         corrupt_manifest_id,
         corrupt_envelope,
+    );
+
+    cleanup_db(&pool).await;
+}
+
+// =====================================================================
+// #87: unwired atomic chain-swap persistence + manifest delivery.
+// =====================================================================
+
+const ATOMIC_MANIFEST_LIQUID_DESTINATION: &str = "lq1pqv20pj0v3drz4xuzra5tgl4lylxaaglu6uamqryj06raeztexcyfquafnsttga69pezal4khvghxwkg65cqa9mrm9q4t9z0sk0a0gvsur6lrsu8hg8zg";
+const ATOMIC_MANIFEST_EMERGENCY_ADDRESS: &str =
+    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+
+fn atomic_manifest_public_key(scalar: u8) -> boltz_client::PublicKey {
+    let mut bytes = [0_u8; 32];
+    bytes[31] = scalar;
+    let secret = SecretKey::from_slice(&bytes).unwrap();
+    boltz_client::PublicKey::new(secp256k1::PublicKey::from_secret_key(
+        &Secp256k1::new(),
+        &secret,
+    ))
+}
+
+fn atomic_manifest_claim_script(
+    hashlock: bitcoin::hashes::hash160::Hash,
+    receiver: &boltz_client::PublicKey,
+) -> bitcoin::ScriptBuf {
+    use bitcoin::opcodes::all::{OP_CHECKSIG, OP_EQUALVERIFY, OP_HASH160, OP_SIZE};
+    use bitcoin::script::Builder;
+
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn atomic_manifest_refund_script(
+    sender: &boltz_client::PublicKey,
+    timeout_height: u32,
+) -> bitcoin::ScriptBuf {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::opcodes::all::{OP_CHECKSIGVERIFY, OP_CLTV};
+    use bitcoin::script::Builder;
+
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn atomic_manifest_provider_fixture(
+    boltz_swap_id: &str,
+    claim_scalar: u8,
+    refund_scalar: u8,
+    preimage_byte: u8,
+) -> (
+    boltz_client::swaps::boltz::CreateChainResponse,
+    boltz_client::util::secrets::Preimage,
+    boltz_client::PublicKey,
+    boltz_client::PublicKey,
+) {
+    use bitcoin::absolute::LockTime;
+    use boltz_client::network::{BitcoinChain, LiquidChain};
+    use boltz_client::swaps::boltz::{
+        ChainSwapDetails, CreateChainResponse, Leaf, Side, SwapTree, SwapType,
+    };
+    use boltz_client::util::secrets::Preimage;
+    use boltz_client::{BtcSwapScript, LBtcSwapScript, ZKKeyPair, ZKSecp256k1};
+
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    let preimage = Preimage::from_str(&format!("{preimage_byte:02x}").repeat(32)).unwrap();
+    let claim_public_key = atomic_manifest_public_key(claim_scalar);
+    let refund_public_key = atomic_manifest_public_key(refund_scalar);
+    let bitcoin_server_key = boltz_client::PublicKey::from_str(
+        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+    )
+    .unwrap();
+    let liquid_server_key = boltz_client::PublicKey::from_str(
+        "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+    )
+    .unwrap();
+    let bitcoin_timeout = 958_033;
+    let liquid_timeout = 3_972_215;
+    let bitcoin_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(atomic_manifest_claim_script(
+                preimage.hash160,
+                &bitcoin_server_key,
+            )),
+            version: 0xc0,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(atomic_manifest_refund_script(
+                &refund_public_key,
+                bitcoin_timeout,
+            )),
+            version: 0xc0,
+        },
+        covenant_claim_leaf: None,
+    };
+    let liquid_tree = SwapTree {
+        claim_leaf: Leaf {
+            output: hex::encode(atomic_manifest_claim_script(
+                preimage.hash160,
+                &claim_public_key,
+            )),
+            version: 0xc4,
+        },
+        refund_leaf: Leaf {
+            output: hex::encode(atomic_manifest_refund_script(
+                &liquid_server_key,
+                liquid_timeout,
+            )),
+            version: 0xc4,
+        },
+        covenant_claim_leaf: None,
+    };
+    let bitcoin_address = BtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Lockup),
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: bitcoin_server_key,
+        locktime: LockTime::from_consensus(bitcoin_timeout),
+        sender_pubkey: refund_public_key,
+    }
+    .to_address(BitcoinChain::Bitcoin)
+    .unwrap()
+    .to_string();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let liquid_address = LBtcSwapScript {
+        swap_type: SwapType::Chain,
+        side: Some(Side::Claim),
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+        sender_pubkey: liquid_server_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+
+    (
+        CreateChainResponse {
+            id: boltz_swap_id.to_owned(),
+            claim_details: ChainSwapDetails {
+                swap_tree: liquid_tree,
+                lockup_address: liquid_address,
+                server_public_key: liquid_server_key,
+                timeout_block_height: liquid_timeout,
+                amount: 25_000,
+                blinding_key: Some(BLINDING_KEY.into()),
+                refund_address: None,
+                claim_address: None,
+                bip21: None,
+            },
+            lockup_details: ChainSwapDetails {
+                swap_tree: bitcoin_tree,
+                lockup_address: bitcoin_address,
+                server_public_key: bitcoin_server_key,
+                timeout_block_height: bitcoin_timeout,
+                amount: 25_431,
+                blinding_key: None,
+                refund_address: None,
+                claim_address: None,
+                bip21: Some("bitcoin:provider-evidence-only?amount=999".into()),
+            },
+        },
+        preimage,
+        claim_public_key,
+        refund_public_key,
+    )
+}
+
+fn atomic_manifest_sort_json(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries: Vec<_> = object.into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                sorted.insert(key, atomic_manifest_sort_json(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(atomic_manifest_sort_json).collect())
+        }
+        scalar => scalar,
+    }
+}
+
+fn atomic_manifest_canonical_json<T: serde::Serialize>(value: &T) -> String {
+    let value = serde_json::to_value(value).unwrap();
+    serde_json::to_string(&atomic_manifest_sort_json(value)).unwrap()
+}
+
+fn atomic_manifest_leaf_sha256(leaf: &boltz_client::swaps::boltz::Leaf) -> String {
+    hex::encode(Sha256::digest(hex::decode(&leaf.output).unwrap()))
+}
+
+struct AtomicManifestPersistenceFixture {
+    invoice_id: uuid::Uuid,
+    nym: String,
+    boltz_swap_id: String,
+    lockup_address: String,
+    lockup_bip21: String,
+    canonical_provider_response: String,
+    preimage_hex: String,
+    claim_key_hex: String,
+    refund_key_hex: String,
+    root_fingerprint: String,
+    claim_child_index: i64,
+    refund_child_index: i64,
+    claim_allocation_id: uuid::Uuid,
+    refund_allocation_id: uuid::Uuid,
+    claim_public_key_hex: String,
+    refund_public_key_hex: String,
+    preimage_hash_hex: String,
+    creation_terms: pay_service::db::ChainSwapCreationTerms,
+    policy: pay_service::swap_manifest::MerchantPolicyReferencesV1,
+    encryption_key: [u8; 32],
+    signing_key: Keypair,
+    pinned_signer: secp256k1::XOnlyPublicKey,
+}
+
+impl AtomicManifestPersistenceFixture {
+    async fn seed(pool: &PgPool, nym: &str, child_index: i64) -> Self {
+        let npub = hex::encode(Sha256::digest(nym.as_bytes()));
+        pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+            .await
+            .unwrap();
+        let invoice =
+            insert_test_invoice(pool, nym, &npub, &format!("lq1atomic{nym}"), 3_600).await;
+        let boltz_swap_id = format!("AtomicManifest{child_index}");
+        let claim_scalar = u8::try_from((child_index / 100).rem_euclid(100) + 1).unwrap();
+        let (provider, preimage, claim_public_key, refund_public_key) =
+            atomic_manifest_provider_fixture(
+                &boltz_swap_id,
+                claim_scalar,
+                claim_scalar + 100,
+                claim_scalar,
+            );
+        let canonical_provider_response = atomic_manifest_canonical_json(&provider);
+        let claim_public_key_hex = claim_public_key.to_string();
+        let refund_public_key_hex = refund_public_key.to_string();
+        let preimage_hash_hex = preimage.sha256.to_string();
+        let root_fingerprint = format!("{:016x}", child_index as u64);
+        let claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+            pool,
+            &pay_service::db::NewSwapKeyAllocation {
+                root_fingerprint: &root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                child_index,
+                purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
+        .await
+        .unwrap();
+        let refund_child_index = child_index + 1;
+        let refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+            pool,
+            &pay_service::db::NewSwapKeyAllocation {
+                root_fingerprint: &root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                child_index: refund_child_index,
+                purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+                public_key_hex: &refund_public_key_hex,
+                preimage_hash_hex: None,
+            },
+        )
+        .await
+        .unwrap();
+        let pinned_pair_hash = "22".repeat(32);
+        let creation_terms = pay_service::db::ChainSwapCreationTerms {
+            pinned_pair_hash: pinned_pair_hash.clone(),
+            canonical_pair_quote_json: format!(r#"{{"hash":"{pinned_pair_hash}","rate":1}}"#),
+            creation_response_sha256: hex::encode(Sha256::digest(
+                canonical_provider_response.as_bytes(),
+            )),
+            btc_claim_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.lockup_details.swap_tree.claim_leaf,
+            ),
+            btc_refund_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.lockup_details.swap_tree.refund_leaf,
+            ),
+            liquid_claim_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.claim_details.swap_tree.claim_leaf,
+            ),
+            liquid_refund_script_sha256: atomic_manifest_leaf_sha256(
+                &provider.claim_details.swap_tree.refund_leaf,
+            ),
+            btc_timeout_height: i64::from(provider.lockup_details.timeout_block_height),
+            liquid_timeout_height: i64::from(provider.claim_details.timeout_block_height),
+            btc_network: "bitcoin".into(),
+            liquid_network: "liquid".into(),
+            liquid_asset_id: boltz_client::elements::AssetId::LIQUID_BTC.to_string(),
+            merchant_liquid_destination: ATOMIC_MANIFEST_LIQUID_DESTINATION.into(),
+            merchant_emergency_btc_address: Some(ATOMIC_MANIFEST_EMERGENCY_ADDRESS.into()),
+        };
+        let signing_key = Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&[0x11; 32]).unwrap(),
+        );
+        let pinned_signer = signing_key.x_only_public_key().0;
+        let lockup_address = provider.lockup_details.lockup_address;
+        let lockup_bip21 =
+            format!("bitcoin:{lockup_address}?amount=0.00025431&label=Send%20to%20L-BTC%20address");
+
+        Self {
+            invoice_id: invoice.id,
+            nym: nym.into(),
+            boltz_swap_id,
+            lockup_address,
+            lockup_bip21,
+            canonical_provider_response,
+            preimage_hex: "aa".repeat(32),
+            claim_key_hex: "bb".repeat(32),
+            refund_key_hex: "cc".repeat(32),
+            root_fingerprint,
+            claim_child_index: child_index,
+            refund_child_index,
+            claim_allocation_id,
+            refund_allocation_id,
+            claim_public_key_hex,
+            refund_public_key_hex,
+            preimage_hash_hex,
+            creation_terms,
+            policy: pay_service::swap_manifest::MerchantPolicyReferencesV1::new(
+                invoice.id,
+                nym,
+                ATOMIC_MANIFEST_LIQUID_DESTINATION,
+                Some((uuid::Uuid::new_v4(), ATOMIC_MANIFEST_EMERGENCY_ADDRESS)),
+            ),
+            encryption_key: [0x42; 32],
+            signing_key,
+            pinned_signer,
+        }
+    }
+
+    async fn persist(
+        &self,
+        pool: &PgPool,
+        store: &RecoveryManifestStore,
+        manifest_id: uuid::Uuid,
+        policy: Option<&pay_service::swap_manifest::MerchantPolicyReferencesV1>,
+    ) -> Result<
+        pay_service::db::ChainSwapRecord,
+        pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
+    > {
+        let swap = pay_service::db::NewChainSwapRecord {
+            invoice_id: self.invoice_id,
+            nym: Some(&self.nym),
+            boltz_swap_id: &self.boltz_swap_id,
+            lockup_address: &self.lockup_address,
+            lockup_bip21: Some(&self.lockup_bip21),
+            user_lock_amount_sat: 25_431,
+            server_lock_amount_sat: 25_000,
+            preimage_hex: &self.preimage_hex,
+            claim_key_hex: &self.claim_key_hex,
+            refund_key_hex: &self.refund_key_hex,
+            boltz_response_json: &self.canonical_provider_response,
+            claim_key_index: Some(self.claim_child_index),
+            refund_key_index: Some(self.refund_child_index),
+            root_fingerprint: Some(&self.root_fingerprint),
+        };
+        let lineage = pay_service::db::ChainSwapLineage {
+            claim_allocation_id: self.claim_allocation_id,
+            refund_allocation_id: self.refund_allocation_id,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &self.claim_public_key_hex,
+            refund_public_key_hex: &self.refund_public_key_hex,
+            preimage_hash_hex: &self.preimage_hash_hex,
+        };
+        let terms = &self.creation_terms;
+        let creation_terms = pay_service::db::NewChainSwapCreationTerms {
+            pinned_pair_hash: &terms.pinned_pair_hash,
+            canonical_pair_quote_json: &terms.canonical_pair_quote_json,
+            creation_response_sha256: &terms.creation_response_sha256,
+            btc_claim_script_sha256: &terms.btc_claim_script_sha256,
+            btc_refund_script_sha256: &terms.btc_refund_script_sha256,
+            liquid_claim_script_sha256: &terms.liquid_claim_script_sha256,
+            liquid_refund_script_sha256: &terms.liquid_refund_script_sha256,
+            btc_timeout_height: terms.btc_timeout_height,
+            liquid_timeout_height: terms.liquid_timeout_height,
+            btc_network: &terms.btc_network,
+            liquid_network: &terms.liquid_network,
+            liquid_asset_id: &terms.liquid_asset_id,
+            merchant_liquid_destination: &terms.merchant_liquid_destination,
+            merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
+        };
+        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap(
+            pool,
+            store,
+            pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapRequest {
+                swap: &swap,
+                lineage: &lineage,
+                creation_terms: &creation_terms,
+                manifest_id,
+                merchant_policy: policy.unwrap_or(&self.policy),
+                crypto: pay_service::swap_manifest_staging::ManifestStagingCrypto::new(
+                    "manifest-key-atomic-test",
+                    &self.encryption_key,
+                    &self.signing_key,
+                    &self.pinned_signer,
+                ),
+            },
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicmanifestok", 10_001).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+
+    let persisted = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap();
+    let delivery = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.chain_swap_id, persisted.id);
+    assert_eq!(delivery.delivery_state, "delivered");
+    assert!(delivery.delivered_at_unix.is_some());
+    assert_eq!(delivery.manifest_sequence, 1);
+    assert_eq!(delivery.previous_manifest_id, None);
+    let object_id = ManifestObjectId::new(persisted.id, manifest_id).unwrap();
+    assert_eq!(
+        store.get_v1(object_id).await.unwrap().encoded(),
+        delivery.encrypted_envelope().encoded()
+    );
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::NoPending
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_persistence_rolls_back_staging_and_ledger_failures() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let first = AtomicManifestPersistenceFixture::seed(&pool, "atomicstagebad", 10_101).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend.clone());
+    let mut wrong_policy = first.policy.clone();
+    wrong_policy.merchant_nym = "different-merchant".into();
+
+    let staging_error = first
+        .persist(&pool, &store, uuid::Uuid::new_v4(), Some(&wrong_policy))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        staging_error,
+        PersistAndDeliverChainSwapError::ManifestStagingFailed
+    );
+    assert!(
+        pay_service::db::get_chain_swap_by_boltz_id(&pool, &first.boltz_swap_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(pay_service::db::list_pending_manifest_deliveries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(backend.io_calls(), 0);
+
+    let retained_manifest_id = uuid::Uuid::new_v4();
+    first
+        .persist(&pool, &store, retained_manifest_id, None)
+        .await
+        .unwrap();
+    let intermediate =
+        AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbetween", 10_201).await;
+    intermediate
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap();
+    let rejected = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbad", 10_301).await;
+    let ledger_error = rejected
+        .persist(&pool, &store, retained_manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        ledger_error,
+        PersistAndDeliverChainSwapError::ManifestLedgerInsertFailed
+    );
+    assert!(
+        pay_service::db::get_chain_swap_by_boltz_id(&pool, &rejected.boltz_swap_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_manifest_deliveries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_count, 2);
+
+    let duplicate_error = first
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        duplicate_error,
+        PersistAndDeliverChainSwapError::ChainSwapPersistenceFailed
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_pending_barrier_blocks_concurrent_swap_and_success_waits_for_storage() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let first =
+        Arc::new(AtomicManifestPersistenceFixture::seed(&pool, "atomicblockedone", 10_301).await);
+    let second = AtomicManifestPersistenceFixture::seed(&pool, "atomicblockedtwo", 10_401).await;
+    let first_manifest_id = uuid::Uuid::new_v4();
+    let (backend, put_committed, release_put) =
+        InstrumentedManifestObjectStore::pausing_after_first_put();
+    let store = coordinator_manifest_store(backend);
+    let task_pool = pool.clone();
+    let task_store = store.clone();
+    let task_fixture = first.clone();
+    let first_attempt = tokio::spawn(async move {
+        task_fixture
+            .persist(&task_pool, &task_store, first_manifest_id, None)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), put_committed.wait())
+        .await
+        .expect("atomic persistence did not reach its post-create barrier");
+    assert!(
+        !first_attempt.is_finished(),
+        "a committed object is not success until read verification and acknowledgement"
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, first_manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert!(
+        pay_service::db::get_chain_swap_by_boltz_id(&pool, &first.boltz_swap_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "swap and pending ledger row commit atomically before off-host I/O"
+    );
+
+    let blocked = second
+        .persist(&pool, &store, uuid::Uuid::new_v4(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        blocked,
+        PersistAndDeliverChainSwapError::PendingManifestDelivery
+    );
+    assert!(
+        pay_service::db::get_chain_swap_by_boltz_id(&pool, &second.boltz_swap_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), release_put.wait())
+        .await
+        .expect("atomic persistence did not leave its post-create barrier");
+    let completed = tokio::time::timeout(Duration::from_secs(30), first_attempt)
+        .await
+        .expect("atomic persistence did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.boltz_swap_id, first.boltz_swap_id);
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, first_manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "delivered"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_storage_failure_commits_one_pending_row_and_resumes_exactly() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicstorefail", 10_501).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::failing_first_put();
+    let store = coordinator_manifest_store(backend);
+
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let public_error = format!("{error:?} {error}");
+    for forbidden in [
+        fixture.preimage_hex.as_str(),
+        fixture.claim_key_hex.as_str(),
+        fixture.refund_key_hex.as_str(),
+        fixture.canonical_provider_response.as_str(),
+        "injected put failure",
+    ] {
+        assert!(!public_error.contains(forbidden));
+    }
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM chain_swap_manifest_deliveries WHERE delivery_state = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: pending.identity(),
+            storage_outcome: ManifestWriteOutcome::Created,
+        }
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_storage_conflict_never_acknowledges_or_returns_swap() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "atomicstoreconflict", 10_601).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::conflicting_first_put();
+    let store = coordinator_manifest_store(backend);
+
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    let retry_error = resume_pending_manifest_delivery(&pool, &store)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            retry_error,
+            ManifestDeliveryCoordinatorError::StorageConflict { .. }
+        ),
+        "unexpected retry error: {retry_error:?}"
+    );
+    assert_eq!(
+        pay_service::db::get_manifest_delivery(&pool, manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_state,
+        "pending"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_ack_failure_retries_read_verified_object_as_already_present() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS bullnym_test_reject_manifest_ack ON chain_swap_manifest_deliveries",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS bullnym_test_reject_manifest_ack()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION bullnym_test_reject_manifest_ack() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+             IF OLD.delivery_state = 'pending' AND NEW.delivery_state = 'delivered' THEN \
+                 RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'injected ack failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER bullnym_test_reject_manifest_ack \
+         BEFORE UPDATE ON chain_swap_manifest_deliveries \
+         FOR EACH ROW EXECUTE FUNCTION bullnym_test_reject_manifest_ack()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicackretry", 10_701).await;
+    let manifest_id = uuid::Uuid::new_v4();
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
+    let error = fixture
+        .persist(&pool, &store, manifest_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        PersistAndDeliverChainSwapError::ManifestDeliveryFailed
+    );
+    let pending = pay_service::db::get_manifest_delivery(&pool, manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery_state, "pending");
+    assert_eq!(
+        store
+            .get_v1(ManifestObjectId::new(pending.chain_swap_id, manifest_id).unwrap())
+            .await
+            .unwrap()
+            .encoded(),
+        pending.encrypted_envelope().encoded()
+    );
+
+    sqlx::query("DROP TRIGGER bullnym_test_reject_manifest_ack ON chain_swap_manifest_deliveries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION bullnym_test_reject_manifest_ack()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: pending.identity(),
+            storage_outcome: ManifestWriteOutcome::AlreadyPresent,
+        }
     );
 
     cleanup_db(&pool).await;
