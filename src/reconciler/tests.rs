@@ -309,6 +309,60 @@ fn runtime_settlement_recovery_requires_the_refunding_record_branch() {
 }
 
 #[test]
+fn runtime_worker_selects_journal_owned_active_and_finalized_paths() {
+    use crate::{
+        merchant_settlement_adoption::MerchantSettlementPath,
+        merchant_settlement_lifecycle::SettlementChain,
+    };
+
+    let liquid = settlement_record(SettlementChain::Liquid, "claiming");
+    let liquid_context = merchant_settlement_context_for_record(&liquid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(liquid_context.invoice_id(), liquid.invoice_id);
+    assert_eq!(liquid_context.chain_swap_id(), liquid.id);
+    assert_eq!(liquid_context.path(), MerchantSettlementPath::LiquidClaim);
+
+    let bitcoin = settlement_record(SettlementChain::Bitcoin, "refunding");
+    let bitcoin_context = merchant_settlement_context_for_record(&bitcoin)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bitcoin_context.invoice_id(), bitcoin.invoice_id);
+    assert_eq!(bitcoin_context.chain_swap_id(), bitcoin.id);
+    assert_eq!(
+        bitcoin_context.path(),
+        MerchantSettlementPath::BitcoinRecovery
+    );
+
+    let claimed = settlement_record(SettlementChain::Liquid, "claimed");
+    assert_eq!(
+        merchant_settlement_context_for_record(&claimed)
+            .unwrap()
+            .unwrap()
+            .path(),
+        MerchantSettlementPath::LiquidClaim
+    );
+    let refunded = settlement_record(SettlementChain::Bitcoin, "refunded");
+    assert_eq!(
+        merchant_settlement_context_for_record(&refunded)
+            .unwrap()
+            .unwrap()
+            .path(),
+        MerchantSettlementPath::BitcoinRecovery
+    );
+
+    for status in ["pending", "server_lock_confirmed", "claim_stuck"] {
+        let record = settlement_record(SettlementChain::Liquid, status);
+        assert!(
+            merchant_settlement_context_for_record(&record)
+                .unwrap()
+                .is_none(),
+            "{status}"
+        );
+    }
+}
+
+#[test]
 fn boltz_swap_created_no_op() {
     let swap = fixture("pending");
     assert_eq!(decide_action(&swap, "swap.created"), ReconcilerAction::Noop);
@@ -567,6 +621,21 @@ fn scan_sql_eligibility_ignores_shared_reconciliation_markers() {
     ] {
         assert!(!sql.contains("last_reconciled_at"));
         assert!(sql.contains("$3::uuid"));
+    }
+}
+
+#[test]
+fn chain_settlement_scans_revisit_only_checkpoint_owned_terminal_rows() {
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("c.status = 'claimed'"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("m.settlement_path = 'liquid_claim'"));
+    assert!(db::STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL.contains("c.status = 'refunded'"));
+    assert!(db::STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL
+        .contains("m.settlement_path = 'bitcoin_recovery'"));
+    for sql in [
+        db::CHAIN_RECONCILER_ELIGIBILITY_SQL,
+        db::STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL,
+    ] {
+        assert!(sql.contains("merchant_settlement_checkpoints"));
     }
 }
 

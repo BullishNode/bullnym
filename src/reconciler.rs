@@ -39,8 +39,21 @@ use crate::{
     db::{self, ChainSwapRecord, ChainSwapStatus, ReconcilerSwap, SwapStatus},
     error::AppError,
     invoice,
+    merchant_output_verifier::{
+        observe_bitcoin_merchant_output_journal, observe_liquid_merchant_output,
+        BitcoinMerchantObservationError, LinkedReplacementJournalEvidence,
+        LiquidMerchantObservationError, MerchantOutputCommitment, MerchantSourcePrevout,
+        MerchantTransactionJournalEvidence, PreviousBitcoinMerchantConfirmation,
+        PreviousLiquidMerchantConfirmation,
+    },
+    merchant_settlement_adoption::{MerchantSettlementContext, MerchantSettlementPath},
     merchant_settlement_lifecycle::{
         MerchantSettlementLifecycle, SettlementAccountingState, SettlementChain,
+        SettlementFinalityPolicy,
+    },
+    merchant_settlement_service::{
+        MerchantSettlementPersistenceCommand, MerchantSettlementProcessingError,
+        MerchantSettlementProcessingOutcome,
     },
     AppState,
 };
@@ -446,6 +459,305 @@ fn blocked_settlement_decision(action: ChainSwapAction) -> ChainSwapSettlementRu
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedMerchantSettlementAction {
+    Watching,
+    Demoted,
+    Finalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournaledMerchantSettlementTick {
+    NoJournal,
+    CandidateNotObserved,
+    Applied {
+        action: AppliedMerchantSettlementAction,
+        checkpoint_version: i64,
+        projection_changed: bool,
+    },
+}
+
+/// Execute one exact-output settlement observation from a single validated
+/// repository work packet. The packet's checkpoint version is the CAS token;
+/// no database read is reopened between chain observation and persistence.
+/// Parent terminal/demotion state is deliberately not written here: the CAS
+/// repository transaction is its sole authority.
+async fn process_journaled_merchant_settlement(
+    state: &AppState,
+    chain_swap: &ChainSwapRecord,
+) -> Result<JournaledMerchantSettlementTick, AppError> {
+    let Some(context) = merchant_settlement_context_for_record(chain_swap)? else {
+        return Ok(JournaledMerchantSettlementTick::NoJournal);
+    };
+    let policy = merchant_settlement_finality_policy(state)?;
+    let Some(mut work) = db::load_merchant_settlement_work_item(&state.db, &context, policy)
+        .await
+        .map_err(map_merchant_settlement_repository_error)?
+    else {
+        return Ok(JournaledMerchantSettlementTick::NoJournal);
+    };
+
+    let processing = match context.path() {
+        MerchantSettlementPath::LiquidClaim => {
+            let backend = state.utxo_backend.as_deref().ok_or_else(|| {
+                AppError::ElectrumError(
+                    "Liquid merchant settlement observation backend is unavailable".into(),
+                )
+            })?;
+            let original_sources = journal_source_prevouts(&work.original_journal);
+            let original = journal_evidence(&work.original_journal, &original_sources);
+            let replacement_sources = work
+                .linked_replacement
+                .as_ref()
+                .map(journal_source_prevouts);
+            let replacement_evidence = work
+                .linked_replacement
+                .as_ref()
+                .zip(replacement_sources.as_ref())
+                .map(|(row, sources)| journal_evidence(row, sources));
+            let linked_replacement = work
+                .linked_replacement
+                .as_ref()
+                .zip(replacement_evidence.as_ref())
+                .map(|(row, replacement)| LinkedReplacementJournalEvidence {
+                    replaces_txid: row.replaces_txid.as_deref().unwrap_or_default(),
+                    replacement: *replacement,
+                });
+            let blinding_key = work.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
+                AppError::ClaimError(
+                    "Liquid merchant settlement journal lacks its blinding key".into(),
+                )
+            })?;
+            let previous = previous_liquid_confirmation(&work.previous_confirmation);
+            let observation = match observe_liquid_merchant_output(
+                backend,
+                &original,
+                linked_replacement.as_ref(),
+                blinding_key,
+                previous,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(LiquidMerchantObservationError::CandidateNotObserved) => {
+                    return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                }
+                Err(error) => return Err(map_liquid_observation_error(error)),
+            };
+            work.service
+                .apply_liquid_observation(&observation, &work.approved_destination)
+                .map_err(map_settlement_processing_error)?
+        }
+        MerchantSettlementPath::BitcoinRecovery => {
+            let backend = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+                AppError::ElectrumError(
+                    "Bitcoin merchant settlement observation backend is unavailable".into(),
+                )
+            })?;
+            let original_sources = journal_source_prevouts(&work.original_journal);
+            let original = journal_evidence(&work.original_journal, &original_sources);
+            let previous = previous_bitcoin_confirmation(&work.previous_confirmation);
+            let observation =
+                match observe_bitcoin_merchant_output_journal(backend, &original, None, previous)
+                    .await
+                {
+                    Ok(observation) => observation,
+                    Err(BitcoinMerchantObservationError::CandidateNotObserved) => {
+                        return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                    }
+                    Err(error) => return Err(map_bitcoin_observation_error(error)),
+                };
+            work.service
+                .apply_bitcoin_recovery_observation(&observation, &work.approved_destination)
+                .map_err(map_settlement_processing_error)?
+        }
+    };
+
+    let action = match work.service.lifecycle().accounting_state() {
+        SettlementAccountingState::Finalized => AppliedMerchantSettlementAction::Finalized,
+        SettlementAccountingState::Demoted => AppliedMerchantSettlementAction::Demoted,
+        SettlementAccountingState::Unrecorded | SettlementAccountingState::Confirmed => {
+            AppliedMerchantSettlementAction::Watching
+        }
+    };
+    let snapshot = work.service.snapshot();
+    let persisted = db::persist_merchant_settlement_outcome(
+        &state.db,
+        work.checkpoint_version,
+        &snapshot,
+        &processing,
+        policy,
+        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+    )
+    .await
+    .map_err(map_merchant_settlement_repository_error)?;
+
+    Ok(JournaledMerchantSettlementTick::Applied {
+        action,
+        checkpoint_version: persisted.checkpoint_version,
+        projection_changed: persisted.projection_changed,
+    })
+}
+
+fn merchant_settlement_finality_policy(
+    state: &AppState,
+) -> Result<SettlementFinalityPolicy, AppError> {
+    SettlementFinalityPolicy::new(
+        state.config.liquid_watcher.finality_confirmations,
+        state.config.bitcoin_watcher.confirmations_required,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "merchant settlement finality configuration is invalid: {error}"
+        ))
+    })
+}
+
+fn merchant_settlement_context_for_record(
+    chain_swap: &ChainSwapRecord,
+) -> Result<Option<MerchantSettlementContext>, AppError> {
+    let status = chain_swap.parsed_status().map_err(|error| {
+        AppError::ClaimError(format!(
+            "invalid chain-swap status at merchant settlement boundary: {error}"
+        ))
+    })?;
+    let path = match status {
+        ChainSwapStatus::Claiming | ChainSwapStatus::Claimed => MerchantSettlementPath::LiquidClaim,
+        ChainSwapStatus::Refunding | ChainSwapStatus::Refunded => {
+            MerchantSettlementPath::BitcoinRecovery
+        }
+        _ => return Ok(None),
+    };
+    MerchantSettlementContext::new(
+        chain_swap.invoice_id,
+        chain_swap.id,
+        chain_swap.boltz_swap_id.clone(),
+        path,
+    )
+    .map(Some)
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "invalid merchant settlement context for chain swap {}: {error}",
+            chain_swap.id
+        ))
+    })
+}
+
+fn journal_source_prevouts(
+    row: &db::MerchantSettlementJournalRow,
+) -> Vec<MerchantSourcePrevout<'_>> {
+    row.source_prevouts
+        .iter()
+        .map(|source| MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: &source.script_pubkey_hex,
+        })
+        .collect()
+}
+
+fn journal_evidence<'a>(
+    row: &'a db::MerchantSettlementJournalRow,
+    source_prevouts: &'a [MerchantSourcePrevout<'a>],
+) -> MerchantTransactionJournalEvidence<'a> {
+    MerchantTransactionJournalEvidence {
+        raw_transaction: &row.raw_transaction,
+        txid: &row.txid,
+        source_prevouts,
+        merchant: MerchantOutputCommitment {
+            destination_address: &row.destination_address,
+            destination_script_hex: &row.destination_script_hex,
+            asset: &row.asset,
+            amount_sat: row.destination_amount_sat,
+            vout: row.destination_vout,
+        },
+    }
+}
+
+fn previous_liquid_confirmation(
+    previous: &db::MerchantSettlementPreviousConfirmation,
+) -> PreviousLiquidMerchantConfirmation<'_> {
+    match previous {
+        db::MerchantSettlementPreviousConfirmation::NeverObserved => {
+            PreviousLiquidMerchantConfirmation::NeverObserved
+        }
+        db::MerchantSettlementPreviousConfirmation::Mempool => {
+            PreviousLiquidMerchantConfirmation::Mempool
+        }
+        db::MerchantSettlementPreviousConfirmation::Confirmed {
+            block_height,
+            block_hash,
+        } => PreviousLiquidMerchantConfirmation::Confirmed {
+            block_height: *block_height,
+            block_hash,
+        },
+        db::MerchantSettlementPreviousConfirmation::Reorged {
+            previous_block_height,
+            previous_block_hash,
+        } => PreviousLiquidMerchantConfirmation::Reorged {
+            previous_block_height: *previous_block_height,
+            previous_block_hash,
+        },
+    }
+}
+
+fn previous_bitcoin_confirmation(
+    previous: &db::MerchantSettlementPreviousConfirmation,
+) -> PreviousBitcoinMerchantConfirmation<'_> {
+    match previous {
+        db::MerchantSettlementPreviousConfirmation::NeverObserved => {
+            PreviousBitcoinMerchantConfirmation::NeverObserved
+        }
+        db::MerchantSettlementPreviousConfirmation::Mempool => {
+            PreviousBitcoinMerchantConfirmation::Mempool
+        }
+        db::MerchantSettlementPreviousConfirmation::Confirmed {
+            block_height,
+            block_hash,
+        } => PreviousBitcoinMerchantConfirmation::Confirmed {
+            block_height: *block_height,
+            block_hash,
+        },
+        db::MerchantSettlementPreviousConfirmation::Reorged {
+            previous_block_height,
+            previous_block_hash,
+        } => PreviousBitcoinMerchantConfirmation::Reorged {
+            previous_block_height: *previous_block_height,
+            previous_block_hash,
+        },
+    }
+}
+
+fn map_merchant_settlement_repository_error(
+    error: db::MerchantSettlementRepositoryError,
+) -> AppError {
+    match error {
+        db::MerchantSettlementRepositoryError::Database(error) => {
+            AppError::DbError(error.to_string())
+        }
+        error => AppError::ClaimError(error.to_string()),
+    }
+}
+
+fn map_settlement_processing_error(error: MerchantSettlementProcessingError) -> AppError {
+    AppError::ClaimError(error.to_string())
+}
+
+fn map_liquid_observation_error(error: LiquidMerchantObservationError) -> AppError {
+    match error {
+        LiquidMerchantObservationError::Backend(error) => error,
+        error => AppError::ClaimError(error.to_string()),
+    }
+}
+
+fn map_bitcoin_observation_error(error: BitcoinMerchantObservationError) -> AppError {
+    match error {
+        BitcoinMerchantObservationError::Backend(error) => error,
+        error => AppError::ClaimError(error.to_string()),
+    }
+}
+
 /// Chain-swap reconciler. The reverse `spawn` above only touches `swap_records`;
 /// chain swaps have no other polling recovery, so a dropped Boltz webhook during
 /// `pending`/`user_lock_*`/`server_lock_*` would strand the swap forever. This
@@ -731,6 +1043,17 @@ async fn run_settlement_repair_tick(
     // The window covers the maximum invoice lifetime.
     const REPAIR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
     let tolerances = db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting);
+    let merchant_policy = match merchant_settlement_finality_policy(state) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!(
+                event = "merchant_settlement_repair_configuration_invalid",
+                error = %error,
+                "legacy settlement repair is disabled because exact-output finality is invalid"
+            );
+            return Ok(ScanOutcome::Failed);
+        }
+    };
     let mut health = CycleHealth::default();
     let limit = config.max_per_tick;
     if limit == 0 {
@@ -794,12 +1117,9 @@ async fn run_settlement_repair_tick(
         cursors[0].finish_page(limit, fetched, true)
     };
 
-    // --- Bitcoin (chain) rail (issue #61) ---
-    // Same crash-consistency gap: a chain swap can reach terminal `claimed`
-    // (merchant L-BTC on chain) without its `bitcoin_boltz_chain` payment event.
-    // Reuse the same idempotent event key and the same settlement flip, so a
-    // repaired invoice lands in the identical state as an uninterrupted claim,
-    // and a replay is a no-op (ON CONFLICT on the UNIQUE event_key).
+    // --- Bitcoin chain-swap rail ---
+    // Exact-output checkpoints are the only authority for a missing payment
+    // event. Legacy requested/provider amounts must never repair these rows.
     let chain_outcome = if cursors[1].drained {
         ScanOutcome::Succeeded
     } else {
@@ -821,35 +1141,123 @@ async fn run_settlement_repair_tick(
                 return Ok(ScanOutcome::Cancelled);
             }
             reporter.progress();
-            // The query requires a persisted claim txid; a terminal status alone is
-            // never fabricated into a payment. Guard defensively and alert instead.
-            let Some(claim_txid) = swap.claim_txid.as_deref() else {
+            let repository_context = match MerchantSettlementContext::new(
+                swap.invoice_id,
+                swap.id,
+                swap.boltz_swap_id.clone(),
+                MerchantSettlementPath::LiquidClaim,
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    health.settlement_write(false);
+                    tracing::error!(
+                        event = "settlement_repair_irreconcilable",
+                        swap_id = %swap.boltz_swap_id,
+                        invoice_id = %swap.invoice_id,
+                        error = %error,
+                        "claimed chain swap has invalid exact-output settlement identity"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+            };
+            let work = match db::load_merchant_settlement_work_item(
+                &state.db,
+                &repository_context,
+                merchant_policy,
+            )
+            .await
+            {
+                Ok(Some(work)) => work,
+                Ok(None) => {
+                    health.settlement_write(false);
+                    tracing::error!(
+                        event = "settlement_repair_exact_evidence_missing",
+                        swap_id = %swap.boltz_swap_id,
+                        invoice_id = %swap.invoice_id,
+                        "claimed chain swap has no validated exact-output checkpoint; proxy amount repair refused"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+                Err(db::MerchantSettlementRepositoryError::Database(error)) => return Err(error),
+                Err(error) => {
+                    health.settlement_write(false);
+                    tracing::error!(
+                        event = "settlement_repair_repository_invalid",
+                        swap_id = %swap.boltz_swap_id,
+                        invoice_id = %swap.invoice_id,
+                        error = %error,
+                        "exact-output repository ownership could not be validated; legacy amount repair skipped"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+            };
+            let Some(intent) = work.service.repair_accounting_intent().cloned() else {
+                health.settlement_write(false);
                 tracing::error!(
-                    event = "settlement_repair_irreconcilable",
+                    event = "settlement_repair_exact_evidence_unconfirmed",
                     swap_id = %swap.boltz_swap_id,
                     invoice_id = %swap.invoice_id,
-                    "claimed chain swap missing claim_txid; not fabricating a payment"
+                    "claimed chain swap checkpoint has no confirmed exact-output repair intent"
                 );
                 cursors[1].visit(swap.id);
                 continue;
             };
+            let mut commands = vec![
+                MerchantSettlementPersistenceCommand::Record(intent.clone()),
+                MerchantSettlementPersistenceCommand::Activate(intent.identity.clone()),
+            ];
+            if work.service.lifecycle().accounting_state() == SettlementAccountingState::Finalized {
+                commands.push(MerchantSettlementPersistenceCommand::Finalize(
+                    intent.identity.clone(),
+                ));
+            }
+            let outcome = MerchantSettlementProcessingOutcome {
+                commands,
+                redrive_observation: false,
+                rebroadcast_journaled: false,
+            };
+            let snapshot = work.service.snapshot();
             tracing::warn!(
-                event = "settlement_repair",
+                event = "settlement_repair_exact_output",
                 rail = "bitcoin_boltz_chain",
                 swap_id = %swap.boltz_swap_id,
                 invoice_id = %swap.invoice_id,
-                "re-recording missing invoice payment event for a claimed chain swap"
+                txid = %intent.txid,
+                vout = intent.vout,
+                actual_amount_sat = intent.actual_amount_sat,
+                "CAS-replaying confirmed exact-output accounting for a claimed chain swap"
             );
-            let write_succeeded = crate::invoice::flip_invoice_on_bitcoin_boltz_settlement(
+            match db::persist_merchant_settlement_outcome(
                 &state.db,
-                Some(swap.invoice_id),
-                swap.effective_server_lock_amount_sat(),
-                &swap.boltz_swap_id,
-                claim_txid,
+                work.checkpoint_version,
+                &snapshot,
+                &outcome,
+                merchant_policy,
                 tolerances,
             )
-            .await;
-            health.settlement_write(write_succeeded);
+            .await
+            {
+                Ok(result) => tracing::info!(
+                    event = "settlement_repair_exact_output_applied",
+                    swap_id = %swap.boltz_swap_id,
+                    checkpoint_version = result.checkpoint_version,
+                    projection_changed = result.projection_changed,
+                    "repaired chain-swap accounting from retained exact output"
+                ),
+                Err(db::MerchantSettlementRepositoryError::Database(error)) => return Err(error),
+                Err(error) => {
+                    health.settlement_write(false);
+                    tracing::error!(
+                        event = "settlement_repair_exact_output_failed",
+                        swap_id = %swap.boltz_swap_id,
+                        error = %error,
+                        "exact-output settlement repair CAS failed"
+                    );
+                }
+            }
             cursors[1].visit(swap.id);
         }
         if cancel.is_cancelled() {
@@ -915,6 +1323,55 @@ async fn run_one_chain_tick(
                         return Ok(ScanOutcome::Cancelled);
                     }
                     reporter.progress();
+                    match process_journaled_merchant_settlement(state, &swap).await {
+                        Ok(JournaledMerchantSettlementTick::Applied {
+                            action:
+                                action @ (AppliedMerchantSettlementAction::Watching
+                                | AppliedMerchantSettlementAction::Finalized),
+                            checkpoint_version,
+                            projection_changed,
+                        }) => {
+                            tracing::info!(
+                                event = "chain_swap_merchant_settlement_applied",
+                                swap_id = %swap.boltz_swap_id,
+                                path = "bitcoin_recovery",
+                                ?action,
+                                checkpoint_version,
+                                projection_changed,
+                                "persisted exact Bitcoin recovery merchant-output observation"
+                            );
+                            cursors[0].visit(swap.id);
+                            continue;
+                        }
+                        Ok(JournaledMerchantSettlementTick::Applied {
+                            action: AppliedMerchantSettlementAction::Demoted,
+                            checkpoint_version,
+                            projection_changed,
+                        }) => {
+                            tracing::warn!(
+                                event = "chain_swap_merchant_settlement_demoted",
+                                swap_id = %swap.boltz_swap_id,
+                                path = "bitcoin_recovery",
+                                checkpoint_version,
+                                projection_changed,
+                                "persisted Bitcoin recovery demotion; redriving exact journal bytes"
+                            );
+                        }
+                        Ok(JournaledMerchantSettlementTick::CandidateNotObserved)
+                        | Ok(JournaledMerchantSettlementTick::NoJournal) => {}
+                        Err(error) => {
+                            health.observe_app_error(&error);
+                            tracing::warn!(
+                                event = "chain_swap_merchant_settlement_deferred",
+                                swap_id = %swap.boltz_swap_id,
+                                path = "bitcoin_recovery",
+                                error = %error,
+                                "exact Bitcoin recovery settlement observation failed closed"
+                            );
+                            cursors[0].visit(swap.id);
+                            continue;
+                        }
+                    }
                     match crate::claimer::execute_chain_swap_refund(state, &swap).await {
                         Ok(txid) => tracing::warn!(
                             event = "chain_swap_recovery_resumed",
@@ -981,6 +1438,55 @@ async fn run_one_chain_tick(
         for swap in &stale {
             if cancel.is_cancelled() {
                 return Ok(ScanOutcome::Cancelled);
+            }
+            match process_journaled_merchant_settlement(state, swap).await {
+                Ok(JournaledMerchantSettlementTick::Applied {
+                    action:
+                        action @ (AppliedMerchantSettlementAction::Watching
+                        | AppliedMerchantSettlementAction::Finalized),
+                    checkpoint_version,
+                    projection_changed,
+                }) => {
+                    tracing::info!(
+                        event = "chain_swap_merchant_settlement_applied",
+                        swap_id = %swap.boltz_swap_id,
+                        path = "liquid_claim",
+                        ?action,
+                        checkpoint_version,
+                        projection_changed,
+                        "persisted exact Liquid claim merchant-output observation"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+                Ok(JournaledMerchantSettlementTick::Applied {
+                    action: AppliedMerchantSettlementAction::Demoted,
+                    checkpoint_version,
+                    projection_changed,
+                }) => {
+                    tracing::warn!(
+                        event = "chain_swap_merchant_settlement_demoted",
+                        swap_id = %swap.boltz_swap_id,
+                        path = "liquid_claim",
+                        checkpoint_version,
+                        projection_changed,
+                        "persisted Liquid claim demotion; redriving exact journal bytes"
+                    );
+                }
+                Ok(JournaledMerchantSettlementTick::CandidateNotObserved)
+                | Ok(JournaledMerchantSettlementTick::NoJournal) => {}
+                Err(error) => {
+                    health.observe_app_error(&error);
+                    tracing::warn!(
+                        event = "chain_swap_merchant_settlement_deferred",
+                        swap_id = %swap.boltz_swap_id,
+                        path = "liquid_claim",
+                        error = %error,
+                        "exact Liquid claim settlement observation failed closed"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
             }
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(ScanOutcome::Cancelled),

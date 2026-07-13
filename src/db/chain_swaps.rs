@@ -1298,7 +1298,9 @@ pub(crate) const CHAIN_SETTLEMENT_REPAIR_ELIGIBILITY_SQL: &str = "WHERE c.status
        AND NOT EXISTS ( \
              SELECT 1 FROM invoice_payment_events e \
               WHERE e.invoice_id = c.invoice_id \
-                AND e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
+                AND (e.event_key = 'bitcoin_boltz_chain:' || c.boltz_swap_id \
+                     OR (e.merchant_chain_swap_id = c.id \
+                         AND e.accounting_state = 'active')) \
          )";
 
 pub async fn list_claimed_chain_swaps_missing_payment_event(
@@ -1563,7 +1565,13 @@ pub async fn mark_chain_swap_refunded(
 /// reconciles/rebroadcasts the exact committed attempt.  Legacy rows without
 /// an attempt are returned too so the executor can stop them with an explicit
 /// integrity alert rather than silently manufacture new bytes.
-pub(crate) const STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL: &str = "WHERE c.status = 'refunding' \
+pub(crate) const STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL: &str =
+    "WHERE (c.status = 'refunding' \
+       OR (c.status = 'refunded' AND EXISTS ( \
+             SELECT 1 FROM merchant_settlement_checkpoints m \
+              WHERE m.chain_swap_id = c.id \
+                AND m.settlement_path = 'bitcoin_recovery' \
+         ))) \
        AND c.updated_at <= scan.epoch - ($1 || ' seconds')::interval \
        AND ($3::uuid IS NULL OR c.id > $3)";
 
@@ -1601,8 +1609,13 @@ pub async fn list_stale_refunding_chain_swaps(
 /// re-driven by polling Boltz `get_swap`. Mirrors
 /// `swaps::list_non_terminal_swaps_oldest_first`.
 pub(crate) const CHAIN_RECONCILER_ELIGIBILITY_SQL: &str =
-    "WHERE c.status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
-       AND c.status <> 'refunding' \
+    "WHERE ((c.status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
+             AND c.status <> 'refunding') \
+          OR (c.status = 'claimed' AND EXISTS ( \
+                SELECT 1 FROM merchant_settlement_checkpoints m \
+                 WHERE m.chain_swap_id = c.id \
+                   AND m.settlement_path = 'liquid_claim' \
+             ))) \
        AND c.updated_at <= scan.epoch - ($1 || ' seconds')::interval \
        AND ($3::uuid IS NULL OR c.id > $3)";
 
