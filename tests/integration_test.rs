@@ -12,7 +12,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -72,6 +72,17 @@ async fn test_pool() -> PgPool {
         .connect(&url)
         .await
         .expect("failed to connect to test database")
+}
+
+async fn named_single_connection_test_pool(application_name: &str) -> PgPool {
+    let options = PgConnectOptions::from_str(&require_test_db())
+        .expect("invalid TEST_DATABASE_URL")
+        .application_name(application_name);
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("failed to connect named test pool")
 }
 
 /// A separate lazy pool for claim-preparation progress proofs. Seeding and
@@ -601,6 +612,12 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    // Recovery-address commitments reject ordinary DELETE. Test isolation owns
+    // the disposable database and truncates the append-only ledger directly.
+    sqlx::query("TRUNCATE recovery_address_commitments")
+        .execute(pool)
+        .await
+        .ok();
     // Manifest delivery rows reject ordinary DELETE. Isolated test ownership
     // uses DDL before removing their operational source rows.
     sqlx::query("TRUNCATE chain_swap_manifest_deliveries")
@@ -16701,6 +16718,579 @@ async fn manifest_delivery_coordinator_real_postgres_minio_contract() {
     observed_ids.sort_unstable();
     expected_ids.sort_unstable();
     assert_eq!(observed_ids, expected_ids);
+
+    cleanup_db(&pool).await;
+}
+
+const RECOVERY_COMMITMENT_P2WPKH: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+const RECOVERY_COMMITMENT_P2TR: &str =
+    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+const RECOVERY_COMMITMENT_P2PKH: &str = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
+
+fn verified_recovery_commitment(
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) -> pay_service::recovery_address_registration::VerifiedRecoveryAddressRegistration {
+    let message =
+        pay_service::recovery_address_registration::build_recovery_address_registration_message(
+            pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+            npub,
+            address,
+            timestamp,
+        )
+        .unwrap();
+    let request = pay_service::recovery_address_registration::RecoveryAddressRegistrationRequest {
+        version: pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        npub: npub.to_string(),
+        btc_address: address.to_string(),
+        timestamp,
+        signature: sign_with_keypair(keypair, &message),
+    };
+    pay_service::recovery_address_registration::verify_recovery_address_registration(&request)
+        .unwrap()
+}
+
+async fn observe_recovery_lock_wait(
+    pool: &PgPool,
+    backend_pid: i32,
+    query_pattern: &str,
+) -> Result<bool, sqlx::Error> {
+    match tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let observed = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                     SELECT 1 \
+                      FROM pg_stat_activity \
+                      WHERE datname = current_database() \
+                        AND pid = $1 \
+                        AND wait_event_type = 'Lock' \
+                        AND query LIKE $2\
+                 )",
+            )
+            .bind(backend_pid)
+            .bind(query_pattern)
+            .fetch_one(pool)
+            .await?;
+            if observed {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn join_recovery_task_bounded<T>(mut task: tokio::task::JoinHandle<T>, label: &str) -> T {
+    match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => panic!("{label} task failed: {error}"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            panic!("{label} task did not finish within 10 seconds");
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_refuses_missing_and_inactive_sources() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+
+    let missing_error = pay_service::db::persist_recovery_address_commitment(&pool, &evidence)
+        .await
+        .unwrap_err();
+    let missing_debug = format!("{missing_error:?}");
+    assert_eq!(missing_debug, "SourceIdentityNotActive");
+    assert!(!missing_debug.contains(&npub));
+    assert!(matches!(
+        missing_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    pay_service::db::create_user(&pool, "recoveryinactive", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let inactive_error = pay_service::db::persist_recovery_address_commitment(&pool, &evidence)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        inactive_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_deactivation_serializes_before_acceptance() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverylockorder", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+
+    // Hold the deactivation row update open. A correct acceptance check uses a
+    // conflicting row lock and must wait; FOR KEY SHARE would incorrectly run
+    // concurrently with this non-key is_active update.
+    let mut deactivation = pool.begin().await.unwrap();
+    let deactivated =
+        sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1 AND is_active = TRUE")
+            .bind(&npub)
+            .execute(&mut *deactivation)
+            .await
+            .unwrap();
+    assert_eq!(deactivated.rows_affected(), 1);
+
+    let persist_pool = named_single_connection_test_pool("recovery-persistence-lock-test").await;
+    let persist_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&persist_pool)
+        .await
+        .unwrap();
+    let persistence_task_pool = persist_pool.clone();
+    let persist_evidence = evidence.clone();
+    let persistence = tokio::spawn(async move {
+        pay_service::db::persist_recovery_address_commitment(
+            &persistence_task_pool,
+            &persist_evidence,
+        )
+        .await
+    });
+
+    let observed_row_lock_wait =
+        match observe_recovery_lock_wait(&pool, persist_backend_pid, "%FROM users%FOR UPDATE%")
+            .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                deactivation.rollback().await.unwrap();
+                let task_result = join_recovery_task_bounded(persistence, "persistence").await;
+                persist_pool.close().await;
+                cleanup_db(&pool).await;
+                panic!("persistence lock probe failed: {error}; task result: {task_result:?}");
+            }
+        };
+
+    if !observed_row_lock_wait {
+        deactivation.rollback().await.unwrap();
+        let premature = join_recovery_task_bounded(persistence, "persistence").await;
+        persist_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("persistence did not wait for deactivation row lock: {premature:?}");
+    }
+
+    deactivation.commit().await.unwrap();
+    let error = join_recovery_task_bounded(persistence, "persistence")
+        .await
+        .unwrap_err();
+    persist_pool.close().await;
+    assert!(matches!(
+        error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_trigger_serializes_deactivation_before_direct_insert() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverytriggerlock", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let mut deactivation = pool.begin().await.unwrap();
+    let deactivated =
+        sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1 AND is_active = TRUE")
+            .bind(&npub)
+            .execute(&mut *deactivation)
+            .await
+            .unwrap();
+    assert_eq!(deactivated.rows_affected(), 1);
+
+    let insert_pool = named_single_connection_test_pool("recovery-trigger-lock-test").await;
+    let insert_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&insert_pool)
+        .await
+        .unwrap();
+    let insertion_task_pool = insert_pool.clone();
+    let insert_npub = npub.clone();
+    let insertion = tokio::spawn(async move {
+        sqlx::query(
+            "INSERT INTO recovery_address_commitments (\
+                 commitment_id, npub, contract_format_version, commitment_version, \
+                 canonical_btc_address, original_signature, signed_at_unix\
+             ) VALUES ($1, $2, 1, 1, $3, $4, $5)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(insert_npub)
+        .bind(RECOVERY_COMMITMENT_P2WPKH)
+        .bind("22".repeat(64))
+        .bind(i64::try_from(auth_timestamp()).unwrap())
+        .execute(&insertion_task_pool)
+        .await
+    });
+
+    let observed_row_lock_wait = match observe_recovery_lock_wait(
+        &pool,
+        insert_backend_pid,
+        "%INSERT INTO recovery_address_commitments%",
+    )
+    .await
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            deactivation.rollback().await.unwrap();
+            let task_result = join_recovery_task_bounded(insertion, "trigger insertion").await;
+            insert_pool.close().await;
+            cleanup_db(&pool).await;
+            panic!("trigger lock probe failed: {error}; task result: {task_result:?}");
+        }
+    };
+
+    if !observed_row_lock_wait {
+        deactivation.rollback().await.unwrap();
+        let premature = join_recovery_task_bounded(insertion, "trigger insertion").await;
+        insert_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("trigger insert did not wait for deactivation row lock: {premature:?}");
+    }
+
+    deactivation.commit().await.unwrap();
+    let error = join_recovery_task_bounded(insertion, "trigger insertion")
+        .await
+        .unwrap_err();
+    insert_pool.close().await;
+    assert_sqlstate(&error, "23503");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.constraint()),
+        Some("recovery_address_commitment_source_exists")
+    );
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_exact_retry_preserves_identity_and_selects_current() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverycurrent", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let timestamp = auth_timestamp();
+    let first_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2WPKH, timestamp);
+
+    let first = pay_service::db::persist_recovery_address_commitment(&pool, &first_evidence)
+        .await
+        .unwrap();
+    let exact_retry = pay_service::db::persist_recovery_address_commitment(&pool, &first_evidence)
+        .await
+        .unwrap();
+    assert_eq!(first, exact_retry);
+    assert!(!first.commitment_id.is_nil());
+    assert_eq!(first.npub, npub);
+    assert_eq!(
+        first.contract_format_version,
+        pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION
+    );
+    assert_eq!(first.commitment_version, 1);
+    assert_eq!(first.canonical_btc_address(), RECOVERY_COMMITMENT_P2WPKH);
+    assert_eq!(
+        first.original_signature(),
+        first_evidence.original_signature()
+    );
+    assert_eq!(first.signed_at_unix, timestamp);
+    assert!(first.registered_at_unix > 0);
+    let debug = format!("{first:?}");
+    assert!(debug.contains("npub: \"<redacted>\""));
+    assert!(debug.contains("canonical_btc_address: \"<redacted>\""));
+    assert!(debug.contains("original_signature: \"<redacted>\""));
+    assert!(!debug.contains(&npub));
+    assert!(!debug.contains(RECOVERY_COMMITMENT_P2WPKH));
+    assert!(!debug.contains(first_evidence.original_signature()));
+
+    let signature_reuse_error = sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, 2, $3, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&npub)
+    .bind(RECOVERY_COMMITMENT_P2PKH)
+    .bind(first_evidence.original_signature())
+    .bind(i64::try_from(timestamp).unwrap() + 1)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&signature_reuse_error, "23505");
+    assert_eq!(
+        signature_reuse_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("recovery_address_commitment_signature_once_key")
+    );
+    let raw_database_debug = format!("{signature_reuse_error:?}");
+    assert!(raw_database_debug.contains(&npub));
+    assert!(raw_database_debug.contains(first_evidence.original_signature()));
+    let wrapped_database_error =
+        pay_service::db::RecoveryAddressCommitmentError::Database(signature_reuse_error);
+    let wrapped_database_debug = format!("{wrapped_database_error:?}");
+    assert_eq!(wrapped_database_debug, "Database(<redacted>)");
+    assert!(std::error::Error::source(&wrapped_database_error).is_none());
+    assert!(!wrapped_database_debug.contains(&npub));
+    assert!(!wrapped_database_debug.contains(RECOVERY_COMMITMENT_P2PKH));
+    assert!(!wrapped_database_debug.contains(first_evidence.original_signature()));
+
+    let second_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2TR, timestamp);
+    let second = pay_service::db::persist_recovery_address_commitment(&pool, &second_evidence)
+        .await
+        .unwrap();
+    assert_eq!(second.commitment_version, 2);
+    assert_ne!(second.commitment_id, first.commitment_id);
+
+    let current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, second);
+    let mut tx = pool.begin().await.unwrap();
+    let transactional_current =
+        pay_service::db::select_current_recovery_address_commitment(&mut *tx, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(transactional_current, second);
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 2);
+
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let retained_current =
+        pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained_current, second);
+    let inactive_retry_error =
+        pay_service::db::persist_recovery_address_commitment(&pool, &second_evidence)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        inactive_retry_error,
+        pay_service::db::RecoveryAddressCommitmentError::SourceIdentityNotActive
+    ));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_concurrent_exact_retries_collapse_to_one_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryretry", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let evidence = verified_recovery_commitment(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+    let start = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_start = start.clone();
+    let first_evidence = evidence.clone();
+    let first = tokio::spawn(async move {
+        first_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&first_pool, &first_evidence).await
+    });
+    let second_pool = pool.clone();
+    let second_start = start.clone();
+    let second_evidence = evidence.clone();
+    let second = tokio::spawn(async move {
+        second_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&second_pool, &second_evidence).await
+    });
+    start.wait().await;
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.commitment_version, 1);
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_commitment_concurrent_rotations_are_contiguous_and_immutable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryrotate", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let timestamp = auth_timestamp();
+    let first_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2WPKH, timestamp);
+    let second_evidence =
+        verified_recovery_commitment(&keypair, &npub, RECOVERY_COMMITMENT_P2PKH, timestamp);
+    let start = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_start = start.clone();
+    let first = tokio::spawn(async move {
+        first_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&first_pool, &first_evidence).await
+    });
+    let second_pool = pool.clone();
+    let second_start = start.clone();
+    let second = tokio::spawn(async move {
+        second_start.wait().await;
+        pay_service::db::persist_recovery_address_commitment(&second_pool, &second_evidence).await
+    });
+    start.wait().await;
+
+    let mut rotations = [
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    ];
+    rotations.sort_by_key(|row| row.commitment_version);
+    assert_eq!(
+        rotations
+            .iter()
+            .map(|row| row.commitment_version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_ne!(rotations[0].commitment_id, rotations[1].commitment_id);
+    let current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, rotations[1]);
+
+    let gap_error = sqlx::query(
+        "INSERT INTO recovery_address_commitments (\
+             commitment_id, npub, contract_format_version, commitment_version, \
+             canonical_btc_address, original_signature, signed_at_unix\
+         ) VALUES ($1, $2, 1, 4, $3, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&npub)
+    .bind(RECOVERY_COMMITMENT_P2TR)
+    .bind("11".repeat(64))
+    .bind(i64::try_from(timestamp).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&gap_error, "23514");
+
+    let update_error = sqlx::query(
+        "UPDATE recovery_address_commitments \
+            SET canonical_btc_address = $2 \
+          WHERE commitment_id = $1",
+    )
+    .bind(rotations[1].commitment_id)
+    .bind(RECOVERY_COMMITMENT_P2TR)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_sqlstate(&update_error, "55000");
+    let delete_error =
+        sqlx::query("DELETE FROM recovery_address_commitments WHERE commitment_id = $1")
+            .bind(rotations[1].commitment_id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_sqlstate(&delete_error, "55000");
+
+    let still_current = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_current, rotations[1]);
 
     cleanup_db(&pool).await;
 }
