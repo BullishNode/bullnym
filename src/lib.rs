@@ -9,6 +9,7 @@ pub(crate) mod canonical_json;
 pub mod certification;
 pub mod chain_recovery;
 pub mod chain_swap_action;
+pub mod chain_swap_creation_permit;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
