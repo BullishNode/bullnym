@@ -22,7 +22,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
@@ -15838,6 +15838,267 @@ fn verified_liquid_merchant_output(
         1,
     )
     .unwrap()
+}
+
+struct FakeChainClaimSource {
+    raw_transactions: HashMap<String, Vec<u8>>,
+}
+
+#[async_trait]
+impl pay_service::utxo::UtxoBackend for FakeChainClaimSource {
+    async fn get_raw_tx(&self, txid_hex: &str) -> Result<Vec<u8>, AppError> {
+        self.raw_transactions
+            .get(txid_hex)
+            .cloned()
+            .ok_or(AppError::UtxoNotFound)
+    }
+
+    async fn is_unspent(
+        &self,
+        _script_pubkey: &lwk_wollet::elements::Script,
+        _txid_hex: &str,
+        _vout: u32,
+    ) -> Result<bool, AppError> {
+        Ok(false)
+    }
+
+    async fn script_history(
+        &self,
+        _script_pubkey: &lwk_wollet::elements::Script,
+    ) -> Result<pay_service::utxo::LiquidScriptHistory, AppError> {
+        Ok(pay_service::utxo::LiquidScriptHistory::Empty)
+    }
+
+    async fn history_txids(
+        &self,
+        _script_pubkey: &lwk_wollet::elements::Script,
+    ) -> Result<Vec<String>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn find_spending_txid(
+        &self,
+        _script_pubkey: &lwk_wollet::elements::Script,
+        _txid_hex: &str,
+        _vout: u32,
+    ) -> Result<Option<String>, AppError> {
+        Ok(None)
+    }
+}
+
+fn persisted_liquid_claim_fixture(
+    response: &CreateChainResponse,
+    merchant_address: &str,
+    merchant_blinding_key_hex: &str,
+) -> (String, String, Arc<dyn pay_service::utxo::UtxoBackend>) {
+    use boltz_client::elements;
+
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = elements::secp256k1_zkp::rand::thread_rng();
+    let asset = elements::AssetId::LIQUID_BTC;
+    let source_address = elements::Address::from_str(&response.claim_details.lockup_address)
+        .expect("issue84 fixture has a valid Liquid source address");
+    let source_blinding_key = elements::secp256k1_zkp::SecretKey::from_str(
+        response
+            .claim_details
+            .blinding_key
+            .as_deref()
+            .expect("issue84 fixture has a Liquid blinding key"),
+    )
+    .unwrap();
+    let source_blinding_pubkey =
+        elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &source_blinding_key);
+    let source_amount = response.claim_details.amount;
+    let source_input_secrets = elements::TxOutSecrets::new(
+        asset,
+        elements::confidential::AssetBlindingFactor::new(&mut rng),
+        source_amount,
+        elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+    let (source_output, source_abf, source_vbf, _) = elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        source_amount,
+        asset,
+        source_address.script_pubkey(),
+        source_blinding_pubkey,
+        &[source_input_secrets],
+        &[],
+    )
+    .unwrap();
+    let source_secrets = elements::TxOutSecrets::new(asset, source_abf, source_amount, source_vbf);
+    let source_transaction = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![source_output],
+    };
+    let source_txid = source_transaction.txid();
+
+    let merchant_address = elements::Address::from_str(merchant_address).unwrap();
+    let merchant_blinding_key =
+        elements::secp256k1_zkp::SecretKey::from_str(merchant_blinding_key_hex).unwrap();
+    let merchant_blinding_pubkey =
+        elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &merchant_blinding_key);
+    let merchant_amount = source_amount - 1_000;
+    let (merchant_output, _, _, _) = elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        merchant_amount,
+        asset,
+        merchant_address.script_pubkey(),
+        merchant_blinding_pubkey,
+        &[source_secrets],
+        &[],
+    )
+    .unwrap();
+    let claim_transaction = elements::Transaction {
+        version: 2,
+        lock_time: elements::LockTime::ZERO,
+        input: vec![elements::TxIn {
+            previous_output: elements::OutPoint::new(source_txid, 0),
+            is_pegin: false,
+            script_sig: elements::Script::new(),
+            sequence: elements::Sequence::MAX,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness::default(),
+        }],
+        output: vec![merchant_output, elements::TxOut::new_fee(1_000, asset)],
+    };
+    let claim_txid = claim_transaction.txid().to_string();
+    let claim_tx_hex = hex::encode(elements::encode::serialize(&claim_transaction));
+    let backend = Arc::new(FakeChainClaimSource {
+        raw_transactions: HashMap::from([(
+            source_txid.to_string(),
+            elements::encode::serialize(&source_transaction),
+        )]),
+    });
+    (claim_tx_hex, claim_txid, backend)
+}
+
+async fn spawn_counting_liquid_broadcast_server(
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let broadcast_calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = broadcast_calls.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let calls = task_calls.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap_or_default();
+                    if method == "blockchain.transaction.broadcast" {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let result = match method {
+                        "server.version" => json!(["bullnym-test", "1.4"]),
+                        "blockchain.transaction.broadcast" => json!("00".repeat(32)),
+                        _ => Value::Null,
+                    };
+                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+    (format!("tcp://{address}"), broadcast_calls, task)
+}
+
+#[tokio::test]
+async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcast() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "claimnojournal";
+    let (npub, _) = issue84_test_merchant(&pool, nym).await;
+    let invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let boltz_swap_id = "CLAIM_WITHOUT_JOURNAL";
+    let (_, _, response) = issue84_chain_creation_response(401, 402, boltz_swap_id);
+    let response_json = serde_json::to_string(&response).unwrap();
+    let swap = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some(nym),
+            boltz_swap_id,
+            lockup_address: &response.lockup_details.lockup_address,
+            lockup_bip21: response.lockup_details.bip21.as_deref(),
+            user_lock_amount_sat: i64::try_from(response.lockup_details.amount).unwrap(),
+            server_lock_amount_sat: i64::try_from(response.claim_details.amount).unwrap(),
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: &response_json,
+        },
+    )
+    .await
+    .unwrap();
+    let merchant_address = invoice.liquid_address.as_deref().unwrap();
+    let merchant_blinding_key = invoice.liquid_blinding_key_hex.as_deref().unwrap();
+    let (claim_tx_hex, claim_txid, backend) =
+        persisted_liquid_claim_fixture(&response, merchant_address, merchant_blinding_key);
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
+             claim_txid = $3 WHERE id = $1",
+    )
+    .bind(swap.id)
+    .bind(&claim_tx_hex)
+    .bind(&claim_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let parent_before: Value =
+        sqlx::query_scalar("SELECT to_jsonb(parent) FROM chain_swap_records parent WHERE id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (electrum_url, broadcast_calls, server_task) =
+        spawn_counting_liquid_broadcast_server().await;
+    let claim_clients = claimer::LiquidClaimClientFactory::try_new(vec![electrum_url]).unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        claimer::exercise_journaled_chain_claim_retry(&pool, swap.id, &claim_clients, &backend),
+    )
+    .await
+    .expect("missing-journal retry must fail locally")
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("merchant settlement transaction journal is incomplete"),
+        "unexpected retry error: {error}"
+    );
+    assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
+    let parent_after: Value =
+        sqlx::query_scalar("SELECT to_jsonb(parent) FROM chain_swap_records parent WHERE id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(parent_after, parent_before);
+    let journal_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_tx_attempts WHERE chain_swap_id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(journal_count, 0);
+
+    server_task.abort();
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]

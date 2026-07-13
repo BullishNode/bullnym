@@ -1973,6 +1973,31 @@ pub async fn exercise_chain_claim_without_fee(
     .await
 }
 
+/// Integration seam for an already-constructed Liquid claim retry. This calls
+/// the production preparation path directly, without the outer retry-bookkeeping
+/// wrapper, so a test can prove that a missing immutable journal rolls the
+/// advisory transaction back before the Electrum broadcaster is reached.
+#[doc(hidden)]
+pub async fn exercise_journaled_chain_claim_retry(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    claim_clients: &LiquidClaimClientFactory,
+    utxo_backend: &Arc<dyn UtxoBackend>,
+) -> Result<ClaimOutcome, AppError> {
+    claim_chain_swap_inner(
+        pool,
+        chain_swap_id,
+        Some(claim_clients),
+        "http://127.0.0.1:1",
+        Some(utxo_backend),
+        db::InvoiceAccountingTolerances::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_chain_swap_with_guard(
     pool: &sqlx::PgPool,
