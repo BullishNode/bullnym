@@ -35,6 +35,15 @@ Rollback the binary only when its migrations and signed API behavior remain
 compatible. Never roll back the database blindly. A rollback does not undo an
 on-chain transaction; reconcile in-flight swaps before and after the change.
 
+Migration 047 has an explicit binary boundary. A same-schema rollback remains
+allowed. An initial rollback from a 047 binary to a 046 binary is also allowed
+while `invoice_direct_payment_transitions` is absent or empty. Once any direct
+lifecycle transition exists, the 046 writer is incompatible with that durable
+history, so `scripts/deploy.sh` refuses the entire automatic binary/PWA restore
+and leaves the candidate files installed for operator recovery. Do not delete
+transition history to force a rollback; repair or roll forward with a
+047-compatible binary.
+
 ## Reproducing a prior artifact
 
 1. Check out the Bullnym `build_commit` from its preserved release record.

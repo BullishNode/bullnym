@@ -685,27 +685,21 @@ impl BitcoinWatcher {
         }
 
         if saw_mempool {
-            match db::mark_invoice_in_progress(&self.pool, inv.id).await {
-                Ok(rows) if rows > 0 => {
+            match db::mark_invoice_in_progress_for_component(
+                &self.pool,
+                inv.id,
+                db::InvoiceInProgressComponent::Direct,
+            )
+            .await
+            {
+                Ok(true) => {
                     tracing::info!(
                         event = "invoice_in_progress_via_bitcoin",
                         invoice_id = %inv.id,
                         "bitcoin_watcher: invoice flipped to in_progress (mempool seen)"
                     );
                 }
-                Ok(_) => {
-                    if let Err(e) =
-                        db::mark_invoice_settlement_status(&self.pool, Some(inv.id), "pending")
-                            .await
-                    {
-                        healthy = false;
-                        tracing::warn!(
-                            invoice_id = %inv.id,
-                            "bitcoin_watcher: mark settlement pending failed: {e}"
-                        );
-                    }
-                    // Already in_progress / terminal — no-op.
-                }
+                Ok(false) => {}
                 Err(e) => {
                     healthy = false;
                     tracing::error!(

@@ -35,6 +35,71 @@ binary_switch_started=0
 pwa_switch_started=0
 ready_response="$(mktemp)"
 version_response="$(mktemp)"
+candidate_build_info="$(mktemp)"
+previous_build_info="$(mktemp)"
+
+build_info_schema_marker() {
+  python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+marker = payload.get("expected_schema_marker")
+if not isinstance(marker, str) or not marker:
+    raise SystemExit("build info has no expected_schema_marker")
+print(marker)
+PY
+}
+
+direct_transition_history_count() {
+  local relation count password
+  password="$(<"$HOME/.pgpass_payservice")"
+  relation="$(
+    PGPASSWORD="$password" psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --host 127.0.0.1 --username payservice --dbname payservice \
+      --tuples-only --no-align \
+      --command "SELECT COALESCE(to_regclass('public.invoice_direct_payment_transitions')::TEXT, '')"
+  )" || return 1
+  if [[ -z "$relation" ]]; then
+    echo 0
+    return 0
+  fi
+  count="$(
+    PGPASSWORD="$password" psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --host 127.0.0.1 --username payservice --dbname payservice \
+      --tuples-only --no-align \
+      --command "SELECT COUNT(*) FROM public.invoice_direct_payment_transitions"
+  )" || return 1
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  echo "$count"
+}
+
+automatic_binary_rollback_allowed() {
+  local previous_schema candidate_schema transition_count
+  [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
+    echo "automatic rollback refused: missing previous/candidate build-info evidence" >&2
+    return 1
+  }
+  previous_schema="$(build_info_schema_marker "$previous_build_info")" || return 1
+  candidate_schema="$(build_info_schema_marker "$candidate_build_info")" || return 1
+
+  if [[ "$previous_schema" == "$candidate_schema" ]]; then
+    transition_count=0
+  elif [[ "$previous_schema" == "046_chain_swap_tx_attempts" \
+       && "$candidate_schema" == "047_direct_payment_lifecycle_foundation" ]]; then
+    transition_count="$(direct_transition_history_count)" || {
+      echo "automatic rollback refused: could not inspect direct lifecycle history" >&2
+      return 1
+    }
+  else
+    transition_count=0
+  fi
+
+  "$REPO/scripts/check-direct-lifecycle-rollback.py" \
+    "$previous_schema" "$candidate_schema" "$transition_count"
+}
+
 rollback_on_failure() {
   status=$?
   trap - EXIT
@@ -42,36 +107,46 @@ rollback_on_failure() {
   rollback_failed=0
   rm -f "$ready_response" "$version_response"
   if ((status != 0)); then
-    echo "deployment failed; restoring previous binary and PWA" >&2
-    if ((pwa_switch_started == 1)); then
-      sudo rm -rf "$APP/pwa/dist" || rollback_failed=1
-      if sudo test -d "$APP/pwa/dist.prev"; then
-        sudo mv "$APP/pwa/dist.prev" "$APP/pwa/dist" || rollback_failed=1
-      fi
+    rollback_allowed=1
+    if ((binary_switch_started == 1)) \
+        && ! automatic_binary_rollback_allowed; then
+      rollback_allowed=0
+      rollback_failed=1
+      echo "deployment failed; automatic binary/PWA rollback refused; candidate files remain installed for operator recovery" >&2
     fi
-    if ((binary_switch_started == 1)); then
-      sudo rm -f "$APP/pay-service" || rollback_failed=1
-      if sudo test -f "$APP/pay-service.prev"; then
-        sudo mv "$APP/pay-service.prev" "$APP/pay-service" || rollback_failed=1
-      fi
-    fi
-    if ((binary_switch_started == 1 || pwa_switch_started == 1)); then
-      sudo systemctl restart payservice || rollback_failed=1
-      restored_ready=0
-      for _ in $(seq 1 15); do
-        if curl --fail --silent --show-error --max-time 2 \
-            http://127.0.0.1:8080/ready >/dev/null; then
-          restored_ready=1
-          break
+    if ((rollback_allowed == 1)); then
+      echo "deployment failed; restoring previous binary and PWA" >&2
+      if ((pwa_switch_started == 1)); then
+        sudo rm -rf "$APP/pwa/dist" || rollback_failed=1
+        if sudo test -d "$APP/pwa/dist.prev"; then
+          sudo mv "$APP/pwa/dist.prev" "$APP/pwa/dist" || rollback_failed=1
         fi
-        sleep 1
-      done
-      ((restored_ready == 1)) || rollback_failed=1
+      fi
+      if ((binary_switch_started == 1)); then
+        sudo rm -f "$APP/pay-service" || rollback_failed=1
+        if sudo test -f "$APP/pay-service.prev"; then
+          sudo mv "$APP/pay-service.prev" "$APP/pay-service" || rollback_failed=1
+        fi
+      fi
+      if ((binary_switch_started == 1 || pwa_switch_started == 1)); then
+        sudo systemctl restart payservice || rollback_failed=1
+        restored_ready=0
+        for _ in $(seq 1 15); do
+          if curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:8080/ready >/dev/null; then
+            restored_ready=1
+            break
+          fi
+          sleep 1
+        done
+        ((restored_ready == 1)) || rollback_failed=1
+      fi
     fi
     if ((rollback_failed != 0)); then
       echo "WARNING: automatic rollback did not restore a ready service; operator action required" >&2
     fi
   fi
+  rm -f "$candidate_build_info" "$previous_build_info"
   exit "$status"
 }
 trap rollback_on_failure EXIT
@@ -86,6 +161,12 @@ export CARGO_BUILD_JOBS=2
 release_binary="$REPO/target/verified-release/pay-service"
 release_record="$REPO/target/verified-release/pay-service.release.json"
 ./scripts/verify-release-record.sh "$release_record" "$release_binary" "$REPO"
+"$release_binary" --build-info >"$candidate_build_info"
+if sudo test -x "$APP/pay-service"; then
+  sudo "$APP/pay-service" --build-info >"$previous_build_info"
+else
+  rm -f "$previous_build_info"
+fi
 artifact_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$release_record")"
 [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid release artifact digest" >&2; exit 1; }
 expected_pwa_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"]["pwa_content_sha256"])' "$release_record")"
@@ -171,6 +252,7 @@ else
 fi
 sudo install -o root -g root -m 644 "$release_record" "$APP/release.json.new"
 sudo mv "$APP/release.json.new" "$APP/release.json"
-rm -f "$ready_response" "$version_response" || true
+rm -f "$ready_response" "$version_response" \
+  "$candidate_build_info" "$previous_build_info" || true
 trap - EXIT
 echo "verified release deployed: $release_commit ($artifact_digest)"

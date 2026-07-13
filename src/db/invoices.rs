@@ -50,6 +50,10 @@ pub struct Invoice {
     pub paid_amount_sat: Option<i64>,
     pub pricing_mode: String,
     pub settlement_status: String,
+    pub presentation_status: Option<String>,
+    pub direct_settlement_status: String,
+    pub swap_settlement_status: String,
+    pub direct_payment_projection_version: i64,
     pub liquid_blinding_key_hex: Option<String>,
     /// Unix epoch seconds. See section comment above for the timestamp
     /// projection convention.
@@ -71,7 +75,9 @@ const INVOICE_COLUMNS: &str =
      bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      public_description, invoice_number, \
      liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
-     pricing_mode, settlement_status, liquid_blinding_key_hex, \
+     pricing_mode, settlement_status, presentation_status, \
+     direct_settlement_status, swap_settlement_status, \
+     direct_payment_projection_version, liquid_blinding_key_hex, \
      EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
      EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
      EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
@@ -502,6 +508,16 @@ pub struct InvoicePaymentEvidence<'a> {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct BoltzSupersededDirectEvent {
+    direct_event_id: Uuid,
+    observation_id: Option<Uuid>,
+    source: String,
+    from_event_state: String,
+    from_observation_state: Option<String>,
+    observation_verification_state: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
 pub struct InvoicePaymentObservation {
     pub rail: String,
     pub source: String,
@@ -824,26 +840,17 @@ pub async fn record_invoice_payment(
         }
     }
 
-    let pruned_direct_rows = if is_boltz_settlement {
-        sqlx::query(
-            "DELETE FROM invoice_payment_events \
-              WHERE invoice_id = $1 \
-                AND txid = $2 \
-                AND source = 'liquid_direct'",
-        )
-        .bind(id)
-        .bind(evidence.txid)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    } else {
-        0
-    };
-
+    let (accounting_state, verification_state) =
+        if matches!(evidence.source, "bitcoin_direct" | "liquid_direct") {
+            ("legacy_unverified", "legacy_unverified")
+        } else {
+            ("active", "not_applicable")
+        };
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO invoice_payment_events \
-            (invoice_id, rail, source, event_key, amount_sat, txid, vout, boltz_swap_id, address) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+            (invoice_id, rail, source, event_key, amount_sat, txid, vout, \
+             boltz_swap_id, address, accounting_state, verification_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (event_key) DO NOTHING \
          RETURNING id",
     )
@@ -856,25 +863,116 @@ pub async fn record_invoice_payment(
     .bind(evidence.vout)
     .bind(evidence.boltz_swap_id)
     .bind(evidence.address)
+    .bind(accounting_state)
+    .bind(verification_state)
     .fetch_optional(&mut *tx)
     .await?;
 
     let inserted_event = inserted.is_some();
-    if !inserted_event && pruned_direct_rows == 0 {
+    let recorded_event_id = if let Some((event_id,)) = inserted {
+        event_id
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM invoice_payment_events \
+             WHERE invoice_id = $1 AND event_key = $2",
+        )
+        .bind(id)
+        .bind(evidence.event_key)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+
+    // A Boltz claim transaction can also appear at the invoice's direct
+    // Liquid address. Preserve that direct evidence for audit/replay, but make
+    // it non-countable and point it at the canonical Boltz accounting event.
+    let mut superseded_direct_events: Vec<BoltzSupersededDirectEvent> = if is_boltz_settlement {
+        sqlx::query_as(
+            "WITH candidates AS MATERIALIZED ( \
+                     SELECT id, observation_id, source, accounting_state \
+                     FROM invoice_payment_events \
+                     WHERE invoice_id = $1 \
+                       AND txid = $2 \
+                       AND source = 'liquid_direct' \
+                       AND accounting_state IN ('active', 'inactive', 'legacy_unverified') \
+                     FOR UPDATE \
+                 ), updated AS ( \
+                     UPDATE invoice_payment_events e SET \
+                         accounting_state = 'superseded', \
+                         state_version = state_version + 1, \
+                         deactivated_at = NOW(), \
+                         deactivation_reason = 'boltz_supersession', \
+                         superseded_by_event_id = $3 \
+                     FROM candidates c \
+                     WHERE e.id = c.id \
+                     RETURNING e.id \
+                 ) \
+                 SELECT c.id AS direct_event_id, c.observation_id, c.source, \
+                        c.accounting_state AS from_event_state, \
+                        NULL::TEXT AS from_observation_state, \
+                        NULL::TEXT AS observation_verification_state \
+                 FROM candidates c JOIN updated u ON u.id = c.id",
+        )
+        .bind(id)
+        .bind(evidence.txid)
+        .bind(recorded_event_id)
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    for superseded in &mut superseded_direct_events {
+        if let Some(observation_id) = superseded.observation_id {
+            let prior = sqlx::query_as(
+                "SELECT last_seen_state, verification_state \
+                 FROM invoice_payment_observations WHERE id = $1 FOR UPDATE",
+            )
+            .bind(observation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((from_state, verification_state)) = prior {
+                sqlx::query(
+                    "UPDATE invoice_payment_observations SET \
+                         last_seen_state = 'superseded', \
+                         lifecycle_version = lifecycle_version + 1, \
+                         invalidation_reason = 'boltz_supersession', \
+                         invalidated_at = NOW(), \
+                         superseded_by_observation_id = NULL, \
+                         superseded_by_payment_event_id = $2, \
+                         last_seen_at = NOW() \
+                     WHERE id = $1",
+                )
+                .bind(observation_id)
+                .bind(recorded_event_id)
+                .execute(&mut *tx)
+                .await?;
+                superseded.from_observation_state = Some(from_state);
+                superseded.observation_verification_state = Some(verification_state);
+            }
+        }
+    }
+    let superseded_direct_rows = superseded_direct_events.len() as u64;
+
+    if !inserted_event && superseded_direct_rows == 0 {
         tx.commit().await?;
         return Ok(0);
     }
 
     let (received_sat,): (i64,) = sqlx::query_as(
         "SELECT COALESCE(SUM(amount_sat), 0)::BIGINT \
-         FROM invoice_payment_events WHERE invoice_id = $1",
+         FROM invoice_payment_events \
+         WHERE invoice_id = $1 \
+           AND accounting_state IN ('active', 'legacy_unverified')",
     )
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
 
     let rails: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT rail FROM invoice_payment_events WHERE invoice_id = $1 ORDER BY rail",
+        "SELECT DISTINCT rail FROM invoice_payment_events \
+         WHERE invoice_id = $1 \
+           AND accounting_state IN ('active', 'legacy_unverified') \
+         ORDER BY rail",
     )
     .bind(id)
     .fetch_all(&mut *tx)
@@ -894,11 +992,36 @@ pub async fn record_invoice_payment(
         tolerance_sat,
         expired,
     );
-    let settlement_status = if matches!(new_status, "paid" | "overpaid") {
+    let payment_settlement_status = if matches!(new_status, "paid" | "overpaid") {
         "settled"
     } else {
         "none"
     };
+    let countable_direct_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM invoice_payment_events \
+            WHERE invoice_id = $1 \
+              AND source IN ('bitcoin_direct', 'liquid_direct') \
+              AND accounting_state IN ('active', 'legacy_unverified') \
+        )",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let direct_settlement_status = if matches!(evidence.source, "bitcoin_direct" | "liquid_direct")
+    {
+        payment_settlement_status
+    } else if is_boltz_settlement && !countable_direct_remains {
+        "none"
+    } else {
+        inv.direct_settlement_status.as_str()
+    };
+    let swap_settlement_status = if is_boltz_settlement {
+        payment_settlement_status
+    } else {
+        inv.swap_settlement_status.as_str()
+    };
+    let settlement_status = payment_settlement_status;
 
     sqlx::query(
         "UPDATE invoices SET \
@@ -906,6 +1029,10 @@ pub async fn record_invoice_payment(
             paid_via = $3, \
             paid_amount_sat = $4, \
             settlement_status = $5, \
+            direct_settlement_status = $6, \
+            swap_settlement_status = $7, \
+            direct_payment_projection_version = direct_payment_projection_version + \
+                CASE WHEN $8 OR direct_settlement_status IS DISTINCT FROM $6 THEN 1 ELSE 0 END, \
             paid_at = CASE WHEN $2 IN ('paid', 'overpaid') THEN COALESCE(paid_at, NOW()) ELSE paid_at END \
          WHERE id = $1",
     )
@@ -914,8 +1041,55 @@ pub async fn record_invoice_payment(
     .bind(paid_via)
     .bind(received_sat)
     .bind(settlement_status)
+    .bind(direct_settlement_status)
+    .bind(swap_settlement_status)
+    .bind(superseded_direct_rows > 0)
     .execute(&mut *tx)
     .await?;
+
+    for superseded in &superseded_direct_events {
+        let idempotency_key = format!(
+            "boltz-supersession:{}:{recorded_event_id}",
+            superseded.direct_event_id
+        );
+        let to_observation_state = superseded.observation_id.map(|_| "superseded");
+        let observation_verification = superseded.observation_verification_state.as_deref();
+        sqlx::query(
+            "INSERT INTO invoice_direct_payment_transitions \
+                 (idempotency_key, invoice_id, observation_id, payment_event_id, \
+                  source, generation, transition_kind, from_observation_state, \
+                  to_observation_state, from_verification_state, \
+                  to_verification_state, from_event_state, to_event_state, reason, \
+                  from_presentation_status, to_presentation_status, \
+                  from_settlement_status, to_settlement_status, \
+                  from_invoice_status, to_invoice_status, \
+                  from_paid_amount_sat, to_paid_amount_sat, metadata) \
+             VALUES ($1, $2, $3, $4, $5, 0, 'superseded', $6, $7, $8, $8, \
+                     $9, 'superseded', 'boltz_supersession', $10, $10, \
+                     $11, $12, $13, $14, $15, $16, \
+                     jsonb_build_object('superseded_by_payment_event_id', $17::TEXT)) \
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(idempotency_key)
+        .bind(id)
+        .bind(superseded.observation_id)
+        .bind(superseded.direct_event_id)
+        .bind(&superseded.source)
+        .bind(superseded.from_observation_state.as_deref())
+        .bind(to_observation_state)
+        .bind(observation_verification)
+        .bind(&superseded.from_event_state)
+        .bind(inv.presentation_status.as_deref())
+        .bind(&inv.settlement_status)
+        .bind(settlement_status)
+        .bind(&inv.status)
+        .bind(new_status)
+        .bind(inv.paid_amount_sat)
+        .bind((received_sat > 0).then_some(received_sat))
+        .bind(recorded_event_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
     Ok(u64::from(inserted_event))
@@ -945,25 +1119,49 @@ fn chrono_like_unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Flip an invoice to `in_progress` on the FIRST mempool sighting of a
-/// payment tx (BTC watcher, or the LN claimer's `transaction.mempool`
-/// hook used by webhook and reconciler paths). Idempotent under the
-/// `WHERE status = 'unpaid'`
-/// guard: a second sighting tick is a no-op (returns 0). Crucially, a
-/// later `record_invoice_payment` call can still advance an
-/// `in_progress` row to paid/under/over.
-///
-/// Returns rows_affected: 1 = flip happened; 0 = no-op (already
-/// in_progress, paid, expired, cancelled, or row absent).
-pub async fn mark_invoice_in_progress(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE invoices SET status = 'in_progress', settlement_status = 'pending' \
-         WHERE id = $1 AND status = 'unpaid'",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceInProgressComponent {
+    Direct,
+    Swap,
+}
+
+/// Atomically preserve the legacy `in_progress`/`pending` projection while
+/// attributing the mempool evidence to the correct component cache. Returns
+/// true only when this call changed the invoice status from `unpaid`.
+pub async fn mark_invoice_in_progress_for_component(
+    pool: &PgPool,
+    id: Uuid,
+    component: InvoiceInProgressComponent,
+) -> Result<bool, sqlx::Error> {
+    let is_direct = component == InvoiceInProgressComponent::Direct;
+    let flipped: Option<bool> = sqlx::query_scalar(
+        "WITH locked AS MATERIALIZED ( \
+             SELECT status FROM invoices WHERE id = $1 FOR UPDATE \
+         ), updated AS ( \
+             UPDATE invoices i SET \
+                 status = CASE WHEN locked.status = 'unpaid' THEN 'in_progress' ELSE i.status END, \
+                 settlement_status = 'pending', \
+                 direct_settlement_status = CASE \
+                     WHEN $2 THEN 'pending' ELSE i.direct_settlement_status END, \
+                 swap_settlement_status = CASE \
+                     WHEN $2 THEN i.swap_settlement_status ELSE 'pending' END, \
+                 direct_payment_projection_version = i.direct_payment_projection_version + \
+                     CASE WHEN $2 AND i.direct_settlement_status IS DISTINCT FROM 'pending' \
+                          THEN 1 ELSE 0 END \
+             FROM locked \
+             WHERE i.id = $1 \
+               AND i.status NOT IN ( \
+                   'paid', 'underpaid', 'overpaid', 'expired', 'cancelled' \
+               ) \
+             RETURNING locked.status = 'unpaid' \
+         ) \
+         SELECT * FROM updated",
     )
     .bind(id)
-    .execute(pool)
+    .bind(is_direct)
+    .fetch_optional(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(flipped.unwrap_or(false))
 }
 
 pub async fn mark_invoice_settlement_status(
@@ -983,7 +1181,7 @@ pub async fn mark_invoice_settlement_status(
         )));
     }
     sqlx::query(
-        "UPDATE invoices SET settlement_status = $2 \
+        "UPDATE invoices SET settlement_status = $2, swap_settlement_status = $2 \
          WHERE id = $1 AND status NOT IN ('paid', 'underpaid', 'overpaid', 'expired', 'cancelled')",
     )
     .bind(id)
@@ -1007,7 +1205,7 @@ pub async fn mark_invoice_settlement_status_for_swap(
         )));
     }
     sqlx::query(
-        "UPDATE invoices i SET settlement_status = $2 \
+        "UPDATE invoices i SET settlement_status = $2, swap_settlement_status = $2 \
          FROM swap_records s \
          WHERE s.id = $1 \
            AND s.invoice_id = i.id \
@@ -1089,6 +1287,7 @@ pub async fn terminalize_stale_checkout_partial_invoice(
              SELECT MAX(e.created_at) \
              FROM invoice_payment_events e \
              WHERE e.invoice_id = i.id \
+               AND e.accounting_state IN ('active', 'legacy_unverified') \
            ) < NOW() - ($2 || ' seconds')::interval",
     )
     .bind(id)
@@ -1110,6 +1309,7 @@ pub async fn terminalize_stale_checkout_partial_invoices(
                SELECT MAX(e.created_at) AS latest_payment_at \
                FROM invoice_payment_events e \
                WHERE e.invoice_id = i.id \
+                 AND e.accounting_state IN ('active', 'legacy_unverified') \
              ) ev ON TRUE \
              WHERE i.origin = 'checkout' \
                AND i.status = 'partially_paid' \

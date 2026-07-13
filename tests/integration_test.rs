@@ -687,8 +687,8 @@ async fn readiness_rejects_schema_before_latest_migration() {
     cleanup_db(&pool).await;
 
     sqlx::query(
-        "ALTER TABLE chain_swap_tx_attempts \
-         RENAME TO chain_swap_tx_attempts_before_readiness_test",
+        "ALTER TABLE invoice_direct_payment_transitions \
+         RENAME TO invoice_direct_payment_transitions_before_readiness_test",
     )
     .execute(&pool)
     .await
@@ -698,8 +698,8 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
-        "ALTER TABLE chain_swap_tx_attempts_before_readiness_test \
-         RENAME TO chain_swap_tx_attempts",
+        "ALTER TABLE invoice_direct_payment_transitions_before_readiness_test \
+         RENAME TO invoice_direct_payment_transitions",
     )
     .execute(&pool)
     .await
@@ -709,7 +709,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "046_chain_swap_tx_attempts"
+        "047_direct_payment_lifecycle_foundation"
     );
 
     let app = test_app(test_state(pool.clone()));
@@ -2201,6 +2201,9 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
         .unwrap();
     assert_eq!(invoice_after.status, "in_progress");
     assert_eq!(invoice_after.settlement_status, "pending");
+    assert_eq!(invoice_after.direct_settlement_status, "none");
+    assert_eq!(invoice_after.swap_settlement_status, "pending");
+    assert_eq!(invoice_after.direct_payment_projection_version, 0);
     assert_eq!(
         provider_calls.load(Ordering::SeqCst),
         0,
@@ -2987,6 +2990,9 @@ async fn webhook_advances_chain_swap_records() {
         .unwrap();
     assert_eq!(invoice_after.status, "in_progress");
     assert_eq!(invoice_after.settlement_status, "pending");
+    assert_eq!(invoice_after.direct_settlement_status, "none");
+    assert_eq!(invoice_after.swap_settlement_status, "pending");
+    assert_eq!(invoice_after.direct_payment_projection_version, 0);
 
     cleanup_db(&pool).await;
 }
@@ -4300,6 +4306,1042 @@ async fn insert_test_btc_invoice(
     .await
 }
 
+const DIRECT_LIFECYCLE_BLOCK_HASH: &str =
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const DIRECT_LIFECYCLE_LIQUID_ASSET: &str =
+    "6f0279e9ed52d9e2846d9eb0f9e5f16a7a6f4f24f88c47f5b9b7b9a78f5d8b5a";
+
+fn direct_lifecycle_tolerances() -> pay_service::db::InvoiceAccountingTolerances {
+    pay_service::db::InvoiceAccountingTolerances {
+        btc_sat: 0,
+        liquid_sat: 0,
+        lightning_sat: 0,
+        payment_grace_secs: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bitcoin_lifecycle_observation<'a>(
+    event_key: &'a str,
+    txid: &'a str,
+    vout: i32,
+    address: &'a str,
+    amount_sat: i64,
+    confirmations: i32,
+    phase: pay_service::db::DirectObservationPhase,
+    supersedes_event_key: Option<&'a str>,
+) -> pay_service::db::DirectOutputObservation<'a> {
+    let confirmed = confirmations > 0;
+    pay_service::db::DirectOutputObservation {
+        event_key,
+        txid,
+        vout,
+        address,
+        amount_sat,
+        asset_id: None,
+        confirmations,
+        block_height: confirmed.then_some(900_000),
+        block_hash: confirmed.then_some(DIRECT_LIFECYCLE_BLOCK_HASH),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase,
+        supersedes_event_key,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn liquid_lifecycle_observation<'a>(
+    event_key: &'a str,
+    txid: &'a str,
+    vout: i32,
+    address: &'a str,
+    amount_sat: i64,
+    confirmations: i32,
+    phase: pay_service::db::DirectObservationPhase,
+    supersedes_event_key: Option<&'a str>,
+) -> pay_service::db::DirectOutputObservation<'a> {
+    let confirmed = confirmations > 0;
+    pay_service::db::DirectOutputObservation {
+        event_key,
+        txid,
+        vout,
+        address,
+        amount_sat,
+        asset_id: Some(DIRECT_LIFECYCLE_LIQUID_ASSET),
+        confirmations,
+        block_height: confirmed.then_some(2_000_000),
+        block_hash: confirmed.then_some(DIRECT_LIFECYCLE_BLOCK_HASH),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase,
+        supersedes_event_key,
+    }
+}
+
+async fn reserve_and_apply_direct_lifecycle<'a>(
+    pool: &PgPool,
+    invoice_id: uuid::Uuid,
+    source: pay_service::db::DirectPaymentSource,
+    observations: &'a [pay_service::db::DirectOutputObservation<'a>],
+) -> (i64, pay_service::db::ApplyDirectObservationOutcome) {
+    let generation =
+        pay_service::db::reserve_direct_observation_generation(pool, invoice_id, source)
+            .await
+            .unwrap();
+    let outcome = pay_service::db::apply_direct_observation_batch(
+        pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id,
+            source,
+            authority: "integration-test",
+            generation,
+            observations,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    (generation, outcome)
+}
+
+#[tokio::test]
+async fn direct_mempool_first_sighting_sets_only_the_direct_component() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directmempoolcache").await;
+    let invoice =
+        insert_test_btc_invoice(&pool, "directmempoolcache", &npub, "bc1qdirectmempoolcache")
+            .await
+            .unwrap();
+
+    let flipped = pay_service::db::mark_invoice_in_progress_for_component(
+        &pool,
+        invoice.id,
+        pay_service::db::InvoiceInProgressComponent::Direct,
+    )
+    .await
+    .unwrap();
+    assert!(flipped);
+
+    let first = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.status, "in_progress");
+    assert_eq!(first.settlement_status, "pending");
+    assert_eq!(first.direct_settlement_status, "pending");
+    assert_eq!(first.swap_settlement_status, "none");
+    assert_eq!(first.direct_payment_projection_version, 1);
+
+    assert!(!pay_service::db::mark_invoice_in_progress_for_component(
+        &pool,
+        invoice.id,
+        pay_service::db::InvoiceInProgressComponent::Direct,
+    )
+    .await
+    .unwrap());
+    let repeated = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.direct_payment_projection_version, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_zero_confirmation_is_presented_but_not_accounted() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directzero").await;
+    let invoice = insert_test_btc_invoice(&pool, "directzero", &npub, "bc1qdirectzero")
+        .await
+        .unwrap();
+    let txid = "1010101010101010101010101010101010101010101010101010101010101010";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let observations = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectzero",
+        1_000,
+        0,
+        pay_service::db::DirectObservationPhase::Provisional,
+        None,
+    )];
+
+    let (_, outcome) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &observations,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let projection: (
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, presentation_status, direct_settlement_status, \
+                settlement_status, paid_amount_sat, paid_via \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        projection,
+        (
+            "in_progress".to_string(),
+            Some("payment_received".to_string()),
+            "pending".to_string(),
+            "pending".to_string(),
+            None,
+            None,
+        )
+    );
+
+    let evidence: (String, String, String, i64) = sqlx::query_as(
+        "SELECT o.last_seen_state, e.accounting_state, e.verification_state, \
+                e.amount_sat \
+         FROM invoice_payment_observations o \
+         JOIN invoice_payment_events e ON e.observation_id = o.id \
+         WHERE o.invoice_id = $1 AND o.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        evidence,
+        (
+            "seen_unconfirmed".to_string(),
+            "inactive".to_string(),
+            "verified".to_string(),
+            1_000,
+        )
+    );
+    let countable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_payment_events \
+         WHERE invoice_id = $1 \
+           AND accounting_state IN ('active', 'legacy_unverified')",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(countable, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_one_confirmation_activates_accounting_once() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directoneconf").await;
+    let invoice = insert_test_btc_invoice(&pool, "directoneconf", &npub, "bc1qdirectoneconf")
+        .await
+        .unwrap();
+    let txid = "2020202020202020202020202020202020202020202020202020202020202020";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let observations = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectoneconf",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+
+    let (_, outcome) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &observations,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let projection: (
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, presentation_status, direct_settlement_status, \
+                    settlement_status, paid_amount_sat, paid_via \
+             FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        projection,
+        (
+            "paid".to_string(),
+            Some("payment_received".to_string()),
+            "pending".to_string(),
+            "pending".to_string(),
+            Some(1_000),
+            Some("bitcoin".to_string()),
+        )
+    );
+
+    let event: (String, String, i64) = sqlx::query_as(
+        "SELECT accounting_state, verification_state, COUNT(*) OVER () \
+         FROM invoice_payment_events WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event, ("active".to_string(), "verified".to_string(), 1));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_finality_promotes_the_same_accounting_event() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directfinality").await;
+    let invoice = insert_test_btc_invoice(&pool, "directfinality", &npub, "bc1qdirectfinality")
+        .await
+        .unwrap();
+    let txid = "3030303030303030303030303030303030303030303030303030303030303030";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let confirmed = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectfinality",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &confirmed,
+    )
+    .await;
+    let before: (uuid::Uuid, i64) = sqlx::query_as(
+        "SELECT id, accounting_sequence FROM invoice_payment_events \
+         WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let finalized = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectfinality",
+        1_000,
+        3,
+        pay_service::db::DirectObservationPhase::Finalized,
+        None,
+    )];
+    let (_, outcome) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &finalized,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let after: (uuid::Uuid, i64, String, i64) = sqlx::query_as(
+        "SELECT id, accounting_sequence, accounting_state, COUNT(*) OVER () \
+         FROM invoice_payment_events WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((after.0, after.1), before);
+    assert_eq!(after.2, "active");
+    assert_eq!(after.3, 1);
+
+    let lifecycle: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT o.last_seen_state, i.direct_settlement_status, \
+                o.lifecycle_version, COUNT(t.id) \
+         FROM invoice_payment_observations o \
+         JOIN invoices i ON i.id = o.invoice_id \
+         LEFT JOIN invoice_direct_payment_transitions t ON t.observation_id = o.id \
+         WHERE o.invoice_id = $1 AND o.event_key = $2 \
+         GROUP BY o.last_seen_state, i.direct_settlement_status, o.lifecycle_version",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lifecycle,
+        ("counted".to_string(), "settled".to_string(), 2, 2)
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_reversal_and_reactivation_reuse_durable_evidence() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directreactivate").await;
+    let invoice = insert_test_btc_invoice(&pool, "directreactivate", &npub, "bc1qdirectreactivate")
+        .await
+        .unwrap();
+    let txid = "4040404040404040404040404040404040404040404040404040404040404040";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let confirmed = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectreactivate",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &confirmed,
+    )
+    .await;
+    let original_event: (uuid::Uuid, i64) = sqlx::query_as(
+        "SELECT id, accounting_sequence FROM invoice_payment_events \
+         WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let regression = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectreactivate",
+        1_000,
+        0,
+        pay_service::db::DirectObservationPhase::ResolutionPending(
+            pay_service::db::DirectRegressionReason::Reorged,
+        ),
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &regression,
+    )
+    .await;
+
+    let reversed: (
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT i.status, i.presentation_status, i.direct_settlement_status, \
+                i.settlement_status, i.paid_amount_sat, e.accounting_state, \
+                e.deactivation_reason \
+         FROM invoices i \
+         JOIN invoice_payment_events e ON e.invoice_id = i.id \
+         WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reversed,
+        (
+            "in_progress".to_string(),
+            "payment_received".to_string(),
+            "resolution_pending".to_string(),
+            "resolution_pending".to_string(),
+            None,
+            "inactive".to_string(),
+            Some("reorged".to_string()),
+        )
+    );
+
+    let first_invalidation: String = sqlx::query_scalar(
+        "SELECT invalidated_at::TEXT FROM invoice_payment_observations \
+         WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &regression,
+    )
+    .await;
+    let repeated_invalidation: (String, String) = sqlx::query_as(
+        "SELECT invalidation_reason, invalidated_at::TEXT \
+         FROM invoice_payment_observations \
+         WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repeated_invalidation.0, "reorged");
+    assert_eq!(repeated_invalidation.1, first_invalidation);
+
+    sqlx::query("SELECT pg_sleep(0.01)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let changed_regression = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectreactivate",
+        1_000,
+        0,
+        pay_service::db::DirectObservationPhase::ResolutionPending(
+            pay_service::db::DirectRegressionReason::Conflict,
+        ),
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &changed_regression,
+    )
+    .await;
+    let changed_invalidation: (String, String) = sqlx::query_as(
+        "SELECT invalidation_reason, invalidated_at::TEXT \
+         FROM invoice_payment_observations \
+         WHERE invoice_id = $1 AND event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(changed_invalidation.0, "conflict");
+    assert_ne!(changed_invalidation.1, first_invalidation);
+
+    let reappeared = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectreactivate",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+        &reappeared,
+    )
+    .await;
+
+    let reactivated: (uuid::Uuid, i64, String, String, String, Option<i64>) = sqlx::query_as(
+        "SELECT e.id, e.accounting_sequence, e.accounting_state, \
+                o.last_seen_state, i.status, i.paid_amount_sat \
+         FROM invoice_payment_events e \
+         JOIN invoice_payment_observations o ON o.id = e.observation_id \
+         JOIN invoices i ON i.id = e.invoice_id \
+         WHERE e.invoice_id = $1 AND e.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((reactivated.0, reactivated.1), original_event);
+    assert_eq!(reactivated.2, "active");
+    assert_eq!(reactivated.3, "awaiting_confirmations");
+    assert_eq!(reactivated.4, "paid");
+    assert_eq!(reactivated.5, Some(1_000));
+
+    let transitions: Vec<String> = sqlx::query_scalar(
+        "SELECT transition_kind FROM invoice_direct_payment_transitions \
+         WHERE invoice_id = $1 ORDER BY generation",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        transitions,
+        vec![
+            "accounting_activated".to_string(),
+            "resolution_pending".to_string(),
+            "resolution_pending".to_string(),
+            "reactivated".to_string(),
+        ]
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_valid_replacement_is_atomic_without_double_counting() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directreplace").await;
+    let invoice =
+        insert_test_invoice(&pool, "directreplace", &npub, "lq1directreplace", 3_600).await;
+    let old_txid = "5050505050505050505050505050505050505050505050505050505050505050";
+    let old_key = format!("liquid_direct:{old_txid}:0");
+    let old = [liquid_lifecycle_observation(
+        &old_key,
+        old_txid,
+        0,
+        "lq1directreplace",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &old,
+    )
+    .await;
+
+    let replacement_txid = "5151515151515151515151515151515151515151515151515151515151515151";
+    let replacement_key = format!("liquid_direct:{replacement_txid}:1");
+    let replacement = [liquid_lifecycle_observation(
+        &replacement_key,
+        replacement_txid,
+        1,
+        "lq1directreplace",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        Some(&old_key),
+    )];
+    let (_, outcome) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &replacement,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event_key, accounting_state, deactivation_reason \
+         FROM invoice_payment_events WHERE invoice_id = $1 \
+         ORDER BY accounting_sequence",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            (
+                old_key.clone(),
+                "superseded".to_string(),
+                Some("replaced".to_string()),
+            ),
+            (replacement_key.clone(), "active".to_string(), None),
+        ]
+    );
+    let projection: (String, String, String, Option<i64>) = sqlx::query_as(
+        "SELECT status, presentation_status, direct_settlement_status, paid_amount_sat \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        projection,
+        (
+            "paid".to_string(),
+            "payment_received".to_string(),
+            "pending".to_string(),
+            Some(1_000),
+        )
+    );
+    let observations: Vec<(String, String, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT event_key, last_seen_state, superseded_by_observation_id \
+         FROM invoice_payment_observations WHERE invoice_id = $1 ORDER BY event_key",
+    )
+    .bind(invoice.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].0, old_key);
+    assert_eq!(observations[0].1, "superseded");
+    assert!(observations[0].2.is_some());
+    assert_eq!(observations[1].0, replacement_key);
+    assert_eq!(observations[1].1, "awaiting_confirmations");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_stale_and_retried_generations_cannot_resurrect_value() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directgeneration").await;
+    let invoice = insert_test_btc_invoice(&pool, "directgeneration", &npub, "bc1qdirectgeneration")
+        .await
+        .unwrap();
+    let txid = "6060606060606060606060606060606060606060606060606060606060606060";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let observations = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectgeneration",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let generation_one = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let generation_two = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    assert_eq!((generation_one, generation_two), (1, 2));
+
+    let stale = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "stale-integration-check",
+            generation: generation_one,
+            observations: &observations,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stale,
+        pay_service::db::ApplyDirectObservationOutcome::Stale {
+            current_generation: generation_two,
+        }
+    );
+    let stale_writes: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM invoice_payment_observations WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_direct_payment_transitions WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_writes, (0, 0, 0));
+
+    let batch = pay_service::db::DirectObservationBatch {
+        invoice_id: invoice.id,
+        source: pay_service::db::DirectPaymentSource::Bitcoin,
+        authority: "current-integration-check",
+        generation: generation_two,
+        observations: &observations,
+    };
+    let applied = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        batch,
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        applied,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let retry = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "current-integration-check",
+            generation: generation_two,
+            observations: &observations,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        retry,
+        pay_service::db::ApplyDirectObservationOutcome::AlreadyApplied
+    );
+    let durable: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT h.applied_generation, \
+            (SELECT COUNT(*) FROM invoice_payment_observations WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_direct_payment_transitions WHERE invoice_id = $1) \
+         FROM invoice_direct_scan_heads h \
+         WHERE h.invoice_id = $1 AND h.source = 'bitcoin_direct'",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable, (2, 1, 1, 1));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_rejects_non_direct_event_identity_before_writing() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "directsourceguard").await;
+    let invoice =
+        insert_test_btc_invoice(&pool, "directsourceguard", &npub, "bc1qdirectsourceguard")
+            .await
+            .unwrap();
+    let txid = "7070707070707070707070707070707070707070707070707070707070707070";
+    let invalid_key = format!("lightning_boltz_reverse:{txid}:0");
+    let observations = [bitcoin_lifecycle_observation(
+        &invalid_key,
+        txid,
+        0,
+        "bc1qdirectsourceguard",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+
+    let error = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "integration-source-guard",
+            generation,
+            observations: &observations,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("event_key"));
+
+    let writes: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT h.applied_generation, \
+            (SELECT COUNT(*) FROM invoice_payment_observations WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1), \
+            (SELECT COUNT(*) FROM invoice_direct_payment_transitions WHERE invoice_id = $1) \
+         FROM invoice_direct_scan_heads h \
+         WHERE h.invoice_id = $1 AND h.source = 'bitcoin_direct'",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(writes, (0, 0, 0, 0));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_lifecycle_transaction_rolls_back_every_projection_write() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS direct_lifecycle_apply_failure_test \
+         ON invoice_direct_scan_heads",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS fail_direct_lifecycle_apply_test()")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let npub = create_test_user(&pool, "directrollback").await;
+    let invoice = insert_test_btc_invoice(&pool, "directrollback", &npub, "bc1qdirectrollback")
+        .await
+        .unwrap();
+    let generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_direct_lifecycle_apply_test() \
+         RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             RAISE EXCEPTION 'forced direct lifecycle apply failure'; \
+         END \
+         $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER direct_lifecycle_apply_failure_test \
+         BEFORE UPDATE ON invoice_direct_scan_heads \
+         FOR EACH ROW EXECUTE FUNCTION fail_direct_lifecycle_apply_test()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let txid = "8080808080808080808080808080808080808080808080808080808080808080";
+    let event_key = format!("bitcoin_direct:{txid}:0");
+    let observations = [bitcoin_lifecycle_observation(
+        &event_key,
+        txid,
+        0,
+        "bc1qdirectrollback",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let error = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "integration-rollback",
+            generation,
+            observations: &observations,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("forced direct lifecycle apply failure"));
+
+    sqlx::query(
+        "DROP TRIGGER direct_lifecycle_apply_failure_test \
+         ON invoice_direct_scan_heads",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION fail_direct_lifecycle_apply_test()")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let durable: (
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT i.status, i.presentation_status, i.direct_settlement_status, \
+                i.paid_amount_sat, i.direct_payment_projection_version, \
+                h.applied_generation, \
+                (SELECT COUNT(*) FROM invoice_payment_observations WHERE invoice_id = i.id), \
+                (SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = i.id), \
+                (SELECT COUNT(*) FROM invoice_direct_payment_transitions WHERE invoice_id = i.id) \
+         FROM invoices i \
+         JOIN invoice_direct_scan_heads h ON h.invoice_id = i.id \
+         WHERE i.id = $1 AND h.source = 'bitcoin_direct'",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        durable,
+        (
+            "unpaid".to_string(),
+            None,
+            "none".to_string(),
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+
+    cleanup_db(&pool).await;
+}
+
 #[tokio::test]
 async fn invoice_insert_rejects_reused_bitcoin_address() {
     let pool = test_pool().await;
@@ -5048,9 +6090,13 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     let expired_paid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpaid", -10).await;
     let fresh_unpaid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1freshunpaid", 60).await;
 
-    pay_service::db::mark_invoice_in_progress(&pool, expired_in_progress.id)
-        .await
-        .unwrap();
+    pay_service::db::mark_invoice_in_progress_for_component(
+        &pool,
+        expired_in_progress.id,
+        pay_service::db::InvoiceInProgressComponent::Direct,
+    )
+    .await
+    .unwrap();
     pay_service::db::record_invoice_payment(
         &pool,
         expired_paid.id,
@@ -5246,16 +6292,331 @@ async fn boltz_liquid_payout_does_not_double_count_lightning_invoice_payment() {
     assert_eq!(paid.status, "paid");
     assert_eq!(paid.paid_via.as_deref(), Some("lightning"));
     assert_eq!(paid.paid_amount_sat, Some(1_000));
+    assert_eq!(paid.direct_settlement_status, "none");
+    assert_eq!(paid.swap_settlement_status, "settled");
+    assert_eq!(paid.direct_payment_projection_version, 1);
 
-    let events: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT source, amount_sat FROM invoice_payment_events \
+    #[allow(clippy::type_complexity)]
+    let events: Vec<(
+        uuid::Uuid,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<uuid::Uuid>,
+    )> = sqlx::query_as(
+        "SELECT id, source, amount_sat, accounting_state, \
+                deactivation_reason, superseded_by_event_id \
+         FROM invoice_payment_events \
          WHERE invoice_id = $1 ORDER BY source",
     )
     .bind(invoice.id)
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(events, vec![("lightning_boltz_reverse".to_string(), 1_000)]);
+    assert_eq!(events.len(), 2, "direct evidence must remain auditable");
+    let boltz = events
+        .iter()
+        .find(|event| event.1 == "lightning_boltz_reverse")
+        .unwrap();
+    assert_eq!(boltz.2, 1_000);
+    assert_eq!(boltz.3, "active");
+    assert!(boltz.4.is_none());
+    assert!(boltz.5.is_none());
+    let direct = events
+        .iter()
+        .find(|event| event.1 == "liquid_direct")
+        .unwrap();
+    assert_eq!(direct.2, 951);
+    assert_eq!(direct.3, "superseded");
+    assert_eq!(direct.4.as_deref(), Some("boltz_supersession"));
+    assert_eq!(direct.5, Some(boltz.0));
+
+    #[allow(clippy::type_complexity)]
+    let transition: (
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+        String,
+        i64,
+        String,
+        String,
+        Value,
+    ) = sqlx::query_as(
+        "SELECT observation_id, payment_event_id, source, generation, \
+                transition_kind, reason, metadata \
+         FROM invoice_direct_payment_transitions WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(transition.0.is_none());
+    assert_eq!(transition.1, direct.0);
+    assert_eq!(transition.2, "liquid_direct");
+    assert_eq!(transition.3, 0);
+    assert_eq!(transition.4, "superseded");
+    assert_eq!(transition.5, "boltz_supersession");
+    assert_eq!(
+        transition.6["superseded_by_payment_event_id"],
+        boltz.0.to_string()
+    );
+    let observation_snapshot: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT from_observation_state, to_observation_state, \
+                from_verification_state, to_verification_state \
+         FROM invoice_direct_payment_transitions WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observation_snapshot, (None, None, None, None));
+    let invoice_snapshot: (String, String, String, String, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT from_settlement_status, to_settlement_status, \
+                    from_invoice_status, to_invoice_status, \
+                    from_paid_amount_sat, to_paid_amount_sat \
+             FROM invoice_direct_payment_transitions WHERE invoice_id = $1",
+        )
+        .bind(invoice.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        invoice_snapshot,
+        (
+            "none".to_string(),
+            "settled".to_string(),
+            "partially_paid".to_string(),
+            "paid".to_string(),
+            Some(951),
+            Some(1_000),
+        )
+    );
+
+    assert!(
+        invoice::flip_invoice_on_lightning_settlement(
+            &pool,
+            Some(invoice.id),
+            1_000,
+            "boltz-payout-race",
+            claim_txid,
+            tolerances,
+        )
+        .await
+    );
+    let retry_state: (i64, i64) = sqlx::query_as(
+        "SELECT i.direct_payment_projection_version, COUNT(t.id) \
+         FROM invoices i \
+         LEFT JOIN invoice_direct_payment_transitions t ON t.invoice_id = i.id \
+         WHERE i.id = $1 GROUP BY i.direct_payment_projection_version",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_state, (1, 1));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn boltz_supersession_terminates_linked_direct_observation_and_blocks_reactivation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "boltzlinkedobs").await;
+    let invoice =
+        insert_test_invoice(&pool, "boltzlinkedobs", &npub, "lq1boltzlinkedobs", 3_600).await;
+    let claim_txid = "9191919191919191919191919191919191919191919191919191919191919191";
+    let direct_key = format!("liquid_direct:{claim_txid}:0");
+    let provisional = [liquid_lifecycle_observation(
+        &direct_key,
+        claim_txid,
+        0,
+        "lq1boltzlinkedobs",
+        1_000,
+        0,
+        pay_service::db::DirectObservationPhase::Provisional,
+        None,
+    )];
+    reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &provisional,
+    )
+    .await;
+
+    assert!(
+        invoice::flip_invoice_on_lightning_settlement(
+            &pool,
+            Some(invoice.id),
+            1_000,
+            "boltz-linked-observation",
+            claim_txid,
+            direct_lifecycle_tolerances(),
+        )
+        .await
+    );
+
+    let canonical_event_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM invoice_payment_events \
+         WHERE invoice_id = $1 AND source = 'lightning_boltz_reverse'",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    #[allow(clippy::type_complexity)]
+    let superseded: (
+        uuid::Uuid,
+        uuid::Uuid,
+        String,
+        Option<uuid::Uuid>,
+        String,
+        String,
+        Option<uuid::Uuid>,
+    ) = sqlx::query_as(
+        "SELECT o.id, e.id, o.last_seen_state, o.superseded_by_payment_event_id, \
+                e.accounting_state, e.deactivation_reason, e.superseded_by_event_id \
+         FROM invoice_payment_observations o \
+         JOIN invoice_payment_events e ON e.observation_id = o.id \
+         WHERE o.invoice_id = $1 AND o.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&direct_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(superseded.2, "superseded");
+    assert_eq!(superseded.3, Some(canonical_event_id));
+    assert_eq!(superseded.4, "superseded");
+    assert_eq!(superseded.5, "boltz_supersession");
+    assert_eq!(superseded.6, Some(canonical_event_id));
+
+    #[allow(clippy::type_complexity)]
+    let transition: (
+        i64,
+        String,
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT generation, transition_kind, observation_id, payment_event_id, \
+                from_observation_state, to_observation_state, \
+                from_event_state, to_event_state, from_invoice_status, \
+                to_invoice_status, from_paid_amount_sat, to_paid_amount_sat \
+         FROM invoice_direct_payment_transitions \
+         WHERE invoice_id = $1 AND reason = 'boltz_supersession'",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(transition.0, 0);
+    assert_eq!(transition.1, "superseded");
+    assert_eq!(transition.2, Some(superseded.0));
+    assert_eq!(transition.3, superseded.1);
+    assert_eq!(transition.4.as_deref(), Some("seen_unconfirmed"));
+    assert_eq!(transition.5.as_deref(), Some("superseded"));
+    assert_eq!(transition.6, "inactive");
+    assert_eq!(transition.7, "superseded");
+    assert_eq!(transition.8, "in_progress");
+    assert_eq!(transition.9, "paid");
+    assert_eq!(transition.10, None);
+    assert_eq!(transition.11, Some(1_000));
+
+    let projection = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.direct_settlement_status, "none");
+    assert_eq!(projection.swap_settlement_status, "settled");
+    assert_eq!(projection.settlement_status, "settled");
+    assert_eq!(projection.direct_payment_projection_version, 2);
+
+    assert!(
+        invoice::flip_invoice_on_lightning_settlement(
+            &pool,
+            Some(invoice.id),
+            1_000,
+            "boltz-linked-observation",
+            claim_txid,
+            direct_lifecycle_tolerances(),
+        )
+        .await
+    );
+    let retry_state: (i64, i64) = sqlx::query_as(
+        "SELECT i.direct_payment_projection_version, COUNT(t.id) \
+         FROM invoices i \
+         LEFT JOIN invoice_direct_payment_transitions t \
+           ON t.invoice_id = i.id AND t.reason = 'boltz_supersession' \
+         WHERE i.id = $1 GROUP BY i.direct_payment_projection_version",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_state, (2, 1));
+
+    let generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    let confirmed = [liquid_lifecycle_observation(
+        &direct_key,
+        claim_txid,
+        0,
+        "lq1boltzlinkedobs",
+        1_000,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let reactivation = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "reactivation-must-fail",
+            generation,
+            observations: &confirmed,
+        },
+        direct_lifecycle_tolerances(),
+    )
+    .await;
+    assert!(reactivation.is_err());
+    let terminal_state: (String, String, i64) = sqlx::query_as(
+        "SELECT o.last_seen_state, e.accounting_state, h.applied_generation \
+         FROM invoice_payment_observations o \
+         JOIN invoice_payment_events e ON e.observation_id = o.id \
+         JOIN invoice_direct_scan_heads h \
+           ON h.invoice_id = o.invoice_id AND h.source = o.source \
+         WHERE o.invoice_id = $1 AND o.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&direct_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_state,
+        ("superseded".to_string(), "superseded".to_string(), 1)
+    );
 
     cleanup_db(&pool).await;
 }
@@ -6082,9 +7443,13 @@ async fn settlement_status_tracks_pending_and_claim_incidents() {
     let invoice =
         insert_test_invoice(&pool, "settlementstate", &npub, "lq1settlementstate", 60).await;
 
-    pay_service::db::mark_invoice_in_progress(&pool, invoice.id)
-        .await
-        .unwrap();
+    pay_service::db::mark_invoice_in_progress_for_component(
+        &pool,
+        invoice.id,
+        pay_service::db::InvoiceInProgressComponent::Swap,
+    )
+    .await
+    .unwrap();
     let pending = pay_service::db::get_invoice_by_id(&pool, invoice.id)
         .await
         .unwrap()

@@ -10,8 +10,10 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `users` | Nym lifecycle | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, nym status, and Lightning Address cursor. |
 | `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, legacy read-only media hashes, descriptor, address cursor, alias, and archive state. |
 | `invoices` | Payment sessions | Stores checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
-| `invoice_payment_events` | Accounting | Idempotent counted payment evidence keyed by rail-specific event keys. |
-| `invoice_payment_observations` | Non-accounting evidence | Direct Bitcoin sightings that are unconfirmed or below the confirmation threshold. |
+| `invoice_payment_events` | Accounting | Idempotent payment evidence keyed by rail-specific event keys, with explicit countable/inactive/superseded state and stable accounting order. |
+| `invoice_payment_observations` | Non-accounting evidence | Durable direct-output identity and lifecycle evidence. The live watcher currently writes Bitcoin observations; migration 047 also prepares exact Liquid evidence for the later watcher-adoption slice. |
+| `invoice_direct_scan_heads` | Direct-payment ordering | One bounded generation row per invoice/source so an older network completion cannot overwrite a newer-started scan. |
+| `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence for direct observation/accounting changes. The dormant reducer writes test/future-adoption transitions, while the live compatibility writer records Boltz supersession immediately. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
 | `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
@@ -54,15 +56,28 @@ Bitcoin chain-swap claims.
 `status` tracks payer/payment accounting: `unpaid`, `in_progress`,
 `partially_paid`, `paid`, `underpaid`, `overpaid`, `expired`, or `cancelled`.
 
-`settlement_status` tracks recipient-side settlement for rails that have an
-asynchronous claim step: `none`, `pending`, `settled`, `claim_stuck`,
-`refunded`, or `failed`.
+Migration 047 adds separate `direct_settlement_status` and
+`swap_settlement_status` component caches. The existing top-level
+`settlement_status` remains the live compatibility projection until watcher
+adoption; compatibility writers preserve their existing last-writer behavior.
+The dormant reducer computes the future aggregate from `none`, `pending`,
+`settled`, `resolution_pending`, `claim_stuck`, `refunded`, and `failed`, with
+existing swap incident tokens taking priority.
 
 ## Payment Evidence
 
-Payment events are counted accounting evidence and update invoice totals.
-Payment observations are status evidence only and must never update
-`paid_amount_sat`, `paid_via`, or `paid_at`.
+Payment events are immutable accounting evidence. Only `active` and
+`legacy_unverified` events contribute to invoice totals; inactive and
+superseded rows remain durable but non-countable. Payment observations are
+status evidence only and must never update `paid_amount_sat`, `paid_via`, or
+`paid_at` by themselves.
+
+Migration 047 separates direct-payment presentation, accounting activation, and
+operational finality in durable schema. Existing direct events remain countable
+as `legacy_unverified`; the compatibility writers tag new direct events the
+same way until the follow-up watcher slice positively revalidates them through
+the dormant transactional reducer. The migration does not by itself change the
+public invoice contract or activate promotion/demotion workers.
 
 ## Worker responsibilities
 
