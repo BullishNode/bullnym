@@ -39,6 +39,7 @@ pub mod reconciler;
 pub mod recovery_shadow_audit;
 pub mod registration;
 pub mod reserved_nyms;
+pub mod startup_provider_reconciliation;
 pub mod swap_manifest;
 pub mod swap_manifest_delivery;
 pub mod swap_manifest_persistence;

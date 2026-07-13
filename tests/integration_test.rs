@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, put};
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
 
@@ -16066,6 +16068,199 @@ fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
         Some(expected),
         "unexpected database error: {database}"
     );
+}
+
+#[derive(Clone)]
+struct StartupRestoreProviderState {
+    records: &'static str,
+    index: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+struct StartupRestoreProviderServer {
+    base_url: String,
+    calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StartupRestoreProviderServer {
+    async fn spawn(records: &'static str, index: &'static str) -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StartupRestoreProviderState {
+            records,
+            index,
+            calls: calls.clone(),
+        };
+        let app = Router::new()
+            .route("/v2/swap/restore", post(startup_restore_provider_records))
+            .route(
+                "/v2/swap/restore/index",
+                post(startup_restore_provider_index),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{address}/v2"),
+            calls,
+            task,
+        }
+    }
+}
+
+impl Drop for StartupRestoreProviderServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn startup_restore_provider_records(
+    State(state): State<StartupRestoreProviderState>,
+) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    startup_restore_provider_response(state.records)
+}
+
+async fn startup_restore_provider_index(
+    State(state): State<StartupRestoreProviderState>,
+) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    startup_restore_provider_response(state.index)
+}
+
+fn startup_restore_provider_response(body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn startup_reconciliation_master_key() -> SwapMasterKey {
+    SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_opens_only_on_exact_empty_source_agreement() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let server = StartupRestoreProviderServer::spawn("[]", r#"{"index":-1}"#).await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    );
+    let master_key = startup_reconciliation_master_key();
+
+    let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &master_key,
+    )
+    .await
+    .unwrap();
+
+    assert!(fact.exact_agreement());
+    assert_eq!(fact.repaired_obligation_count(), 0);
+    let report = fact.report();
+    assert_eq!(report.manifest_count, 0);
+    assert_eq!(report.local.local_record_count, 0);
+    assert_eq!(report.boltz.validated_record_count, 0);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let server = StartupRestoreProviderServer::spawn(
+        include_str!("fixtures/boltz-xpub-restore-v1.json"),
+        include_str!("fixtures/boltz-xpub-restore-index-v1.json"),
+    )
+    .await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
+    );
+    let master_key = startup_reconciliation_master_key();
+
+    let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &master_key,
+    )
+    .await
+    .unwrap();
+
+    assert!(!fact.exact_agreement());
+    assert_eq!(fact.repaired_obligation_count(), 0);
+    let report = fact.report();
+    assert_eq!(report.manifest_count, 0);
+    assert_eq!(report.local.local_record_count, 0);
+    assert_eq!(report.boltz.chain_record_count, 1);
+    assert_eq!(report.boltz.provider_only_chain_record_count, 1);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        AtomicManifestPersistenceFixture::seed(&pool, "startuprepairthenaudit", 30_001).await;
+    let row = fixture.persist_manifestless_row(&pool, None).await;
+    let store = coordinator_manifest_store(InstrumentedManifestObjectStore::new());
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store);
+    let server = StartupRestoreProviderServer::spawn("[]", r#"{"index":-1}"#).await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let master_key = startup_reconciliation_master_key();
+
+    let error =
+        pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+            &pool,
+            &runtime,
+            &fetcher,
+            &master_key,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        pay_service::startup_provider_reconciliation::StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
+        "the deliberately empty provider snapshot must fail only after repair and audit"
+    );
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let deliveries = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].chain_swap_id, row.id);
+    assert_eq!(deliveries[0].delivery_state, "delivered");
+    cleanup_db(&pool).await;
 }
 
 fn assert_corrupt_manifest_envelope(
