@@ -1221,7 +1221,8 @@ async fn render_invoice_template(
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
     let rails_payable = invoice_payment_rails_are_payable(&inv);
     let bitcoin_chain_offer = if rails_payable {
-        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
+        db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
+            .await?
     } else {
         None
     };
@@ -1375,7 +1376,8 @@ pub async fn status(
     let rails_payable = invoice_payment_rails_are_payable(&inv);
     let lightning_pr = latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
     let bitcoin_chain_offer = if rails_payable {
-        db::latest_payable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat).await?
+        db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
+            .await?
     } else {
         None
     };

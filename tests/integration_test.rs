@@ -17037,6 +17037,18 @@ async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery()
     assert!(delivery.delivered_at_unix.is_some());
     assert_eq!(delivery.manifest_sequence, 1);
     assert_eq!(delivery.previous_manifest_id, None);
+    assert_eq!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            fixture.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .map(|row| row.id),
+        Some(persisted.id),
+        "the payer address stayed hidden after exact durable manifest delivery"
+    );
     let object_id = ManifestObjectId::new(persisted.id, manifest_id).unwrap();
     assert_eq!(
         store.get_v1(object_id).await.unwrap().encoded(),
@@ -17053,18 +17065,22 @@ async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery()
 }
 
 #[tokio::test]
-async fn atomic_manifest_persistence_rolls_back_staging_and_ledger_failures() {
+async fn post_provider_staging_failure_retains_canonical_pending_swap_and_withholds_payer_address()
+{
     use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
 
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let first = AtomicManifestPersistenceFixture::seed(&pool, "atomicstagebad", 10_101).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "atomicstagebad", 10_101).await;
     let backend = InstrumentedManifestObjectStore::new();
     let store = coordinator_manifest_store(backend.clone());
-    let mut wrong_policy = first.policy.clone();
+    let mut wrong_policy = fixture.policy.clone();
     wrong_policy.merchant_nym = "different-merchant".into();
 
-    let staging_error = first
+    // Model the real create_bitcoin_chain_offer boundary: the provider has
+    // already created the remote swap and returned its one canonical response,
+    // but a later manifest-staging check refuses the payer instruction.
+    let staging_error = fixture
         .persist(&pool, &store, uuid::Uuid::new_v4(), Some(&wrong_policy))
         .await
         .unwrap_err();
@@ -17072,30 +17088,97 @@ async fn atomic_manifest_persistence_rolls_back_staging_and_ledger_failures() {
         staging_error,
         PersistAndDeliverChainSwapError::ManifestStagingFailed
     );
-    assert!(
-        pay_service::db::get_chain_swap_by_boltz_id(&pool, &first.boltz_swap_id)
+    let retained = pay_service::db::get_chain_swap_by_boltz_id(&pool, &fixture.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("post-provider staging failure erased the canonical swap record");
+    assert_eq!(retained.invoice_id, fixture.invoice_id);
+    assert_eq!(retained.nym.as_deref(), Some(fixture.nym.as_str()));
+    assert_eq!(retained.lockup_address, fixture.lockup_address);
+    assert_eq!(
+        retained.lockup_bip21.as_deref(),
+        Some(fixture.lockup_bip21.as_str())
+    );
+    assert_eq!(
+        retained.boltz_response_json,
+        fixture.canonical_provider_response
+    );
+    assert_eq!(retained.preimage_hex, fixture.preimage_hex);
+    assert_eq!(retained.claim_key_hex, fixture.claim_key_hex);
+    assert_eq!(retained.refund_key_hex, fixture.refund_key_hex);
+    assert_eq!(
+        retained.creation_terms.as_ref(),
+        Some(&fixture.creation_terms)
+    );
+    assert_eq!(retained.status, "pending");
+    let evidence = pay_service::db::load_manifest_staging_evidence(&pool, retained.id)
+        .await
+        .unwrap()
+        .expect("retained provider record lost its recoverable public lineage");
+    assert_eq!(
+        evidence.persisted_lineage.claim.allocation_id,
+        fixture.claim_allocation_id
+    );
+    assert_eq!(
+        evidence.persisted_lineage.refund.allocation_id,
+        fixture.refund_allocation_id
+    );
+
+    // The row remains an internal pending obligation, but public invoice reads
+    // cannot expose its payer address until a delivered manifest exists.
+    assert_eq!(
+        pay_service::db::latest_payable_chain_swap_for_invoice(&pool, fixture.invoice_id, 25_000,)
             .await
             .unwrap()
-            .is_none()
+            .map(|row| row.id),
+        Some(retained.id)
     );
+    assert!(
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            fixture.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "an undelivered recovery manifest exposed the payer address"
+    );
+    let npub = hex::encode(Sha256::digest(fixture.nym.as_bytes()));
+    match pay_service::db::purge_user(&pool, &npub).await.unwrap() {
+        pay_service::db::PurgeOutcome::InFlightSwaps(1) => {}
+        _ => panic!("the retained pending chain swap did not block destructive purge"),
+    }
     assert!(pay_service::db::list_pending_manifest_deliveries(&pool)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(backend.io_calls(), 0);
 
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn atomic_manifest_persistence_retains_canonical_row_on_ledger_failure() {
+    use pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let store = coordinator_manifest_store(backend);
     let retained_manifest_id = uuid::Uuid::new_v4();
+    let first = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerfirst", 10_201).await;
     first
         .persist(&pool, &store, retained_manifest_id, None)
         .await
         .unwrap();
     let intermediate =
-        AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbetween", 10_201).await;
+        AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbetween", 10_301).await;
     intermediate
         .persist(&pool, &store, uuid::Uuid::new_v4(), None)
         .await
         .unwrap();
-    let rejected = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbad", 10_301).await;
+    let rejected = AtomicManifestPersistenceFixture::seed(&pool, "atomicledgerbad", 10_401).await;
     let ledger_error = rejected
         .persist(&pool, &store, retained_manifest_id, None)
         .await
@@ -17104,11 +17187,20 @@ async fn atomic_manifest_persistence_rolls_back_staging_and_ledger_failures() {
         ledger_error,
         PersistAndDeliverChainSwapError::ManifestLedgerInsertFailed
     );
+    let retained = pay_service::db::get_chain_swap_by_boltz_id(&pool, &rejected.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("ledger failure erased the canonical provider-created swap");
+    assert_eq!(retained.status, "pending");
     assert!(
-        pay_service::db::get_chain_swap_by_boltz_id(&pool, &rejected.boltz_swap_id)
-            .await
-            .unwrap()
-            .is_none()
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            rejected.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     let ledger_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_manifest_deliveries")
@@ -17130,7 +17222,7 @@ async fn atomic_manifest_persistence_rolls_back_staging_and_ledger_failures() {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        2
+        3
     );
 
     cleanup_db(&pool).await;
@@ -17175,7 +17267,7 @@ async fn atomic_manifest_pending_barrier_blocks_concurrent_swap_and_success_wait
             .await
             .unwrap()
             .is_some(),
-        "swap and pending ledger row commit atomically before off-host I/O"
+        "canonical swap and pending ledger row must exist before off-host I/O"
     );
 
     let blocked = second
@@ -17186,11 +17278,21 @@ async fn atomic_manifest_pending_barrier_blocks_concurrent_swap_and_success_wait
         blocked,
         PersistAndDeliverChainSwapError::PendingManifestDelivery
     );
+    let blocked_record = pay_service::db::get_chain_swap_by_boltz_id(&pool, &second.boltz_swap_id)
+        .await
+        .unwrap()
+        .expect("the pending-manifest barrier erased a second provider-created swap");
+    assert_eq!(blocked_record.status, "pending");
     assert!(
-        pay_service::db::get_chain_swap_by_boltz_id(&pool, &second.boltz_swap_id)
-            .await
-            .unwrap()
-            .is_none()
+        pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+            &pool,
+            second.invoice_id,
+            25_000,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the blocked provider-created swap leaked a payer instruction"
     );
 
     tokio::time::timeout(Duration::from_secs(30), release_put.wait())

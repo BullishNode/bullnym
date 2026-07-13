@@ -1,16 +1,21 @@
-//! Unwired atomic persistence and durable delivery for one chain swap.
+//! Unwired durable provider-result persistence and manifest delivery for one
+//! chain swap.
 //!
-//! The database transaction owns the migration-052 ledger tail, inserts the
-//! fully validated migration-050/051 chain-swap row, stages its manifest from
-//! exact in-transaction evidence, and inserts the pending delivery row. Only
-//! that transaction is atomic. After commit, the immutable pending row is
-//! synchronously create/read-verified off-host and acknowledged before the
-//! secret-bearing [`crate::db::ChainSwapRecord`] can be returned.
+//! The fully validated migration-050/051 chain-swap row is committed first so
+//! no later recovery-manifest failure can erase the only canonical record of a
+//! provider-created swap. That row remains a non-terminal `pending`
+//! obligation. A following transaction owns the migration-052 ledger tail,
+//! stages from the exact persisted evidence, and inserts the pending delivery
+//! row. After commit, the immutable delivery is synchronously
+//! create/read-verified off-host and acknowledged before the secret-bearing
+//! [`crate::db::ChainSwapRecord`] can be returned.
 //!
-//! A post-commit failure deliberately returns no swap record and leaves the
-//! sole pending row available to [`crate::swap_manifest_delivery::resume_pending_manifest_delivery`].
-//! This module does not participate in invoice creation, admission, startup,
-//! worker scheduling, or retry policy.
+//! Every failure after canonical row persistence deliberately returns no swap
+//! record, withholding the payer instruction. A post-ledger-commit failure
+//! also leaves the sole pending delivery available to
+//! [`crate::swap_manifest_delivery::resume_pending_manifest_delivery`]. This
+//! module does not participate in invoice creation, admission, startup, worker
+//! scheduling, or retry policy.
 
 use std::fmt;
 
@@ -20,7 +25,7 @@ use uuid::Uuid;
 
 use crate::db::{
     insert_manifest_delivery, load_manifest_staging_evidence, lock_manifest_delivery_tail,
-    record_chain_swap_with_lineage_and_creation_terms_in_tx, ChainSwapLineage, ChainSwapRecord,
+    record_chain_swap_with_lineage_and_creation_terms, ChainSwapLineage, ChainSwapRecord,
     ManifestDeliveryError, NewChainSwapCreationTerms, NewChainSwapRecord,
 };
 use crate::swap_manifest::MerchantPolicyReferencesV1;
@@ -104,8 +109,13 @@ impl fmt::Display for PersistAndDeliverChainSwapError {
 
 impl std::error::Error for PersistAndDeliverChainSwapError {}
 
-/// Persist one chain swap with its pending manifest row, then durably deliver
-/// and acknowledge that exact manifest before returning success.
+/// Persist one canonical provider-created chain swap first, then stage,
+/// durably deliver, and acknowledge its exact manifest before returning it to
+/// the payer-facing caller.
+///
+/// Once the first insert succeeds, every later error leaves that row intact in
+/// non-terminal `pending` state. Callers must treat every error as a hard
+/// refusal to expose the payer address.
 pub async fn persist_and_deliver_chain_swap(
     pool: &PgPool,
     store: &RecoveryManifestStore,
@@ -120,6 +130,17 @@ pub async fn persist_and_deliver_chain_swap(
         crypto,
     } = request;
 
+    // This is the crash-safety boundary immediately after the mutating
+    // provider call. Do not put the only canonical provider response, keys,
+    // and lineage inside the manifest transaction: a staging or ledger error
+    // would roll all of it back and make the remote swap undiscoverable.
+    let chain_swap =
+        record_chain_swap_with_lineage_and_creation_terms(pool, swap, lineage, creation_terms)
+            .await
+            .map_err(|_| PersistAndDeliverChainSwapError::ChainSwapPersistenceFailed)?;
+
+    // Only the manifest-ledger reservation and row are transactional from
+    // here. Rolling this transaction back must never erase `chain_swap`.
     let mut tx = pool
         .begin()
         .await
@@ -138,24 +159,6 @@ pub async fn persist_and_deliver_chain_swap(
             return Err(rollback_or_replace(
                 tx,
                 PersistAndDeliverChainSwapError::ManifestTailReservationFailed,
-            )
-            .await);
-        }
-    };
-
-    let chain_swap = match record_chain_swap_with_lineage_and_creation_terms_in_tx(
-        &mut tx,
-        swap,
-        lineage,
-        creation_terms,
-    )
-    .await
-    {
-        Ok(chain_swap) => chain_swap,
-        Err(_) => {
-            return Err(rollback_or_replace(
-                tx,
-                PersistAndDeliverChainSwapError::ChainSwapPersistenceFailed,
             )
             .await);
         }

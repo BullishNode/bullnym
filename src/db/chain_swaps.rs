@@ -920,6 +920,38 @@ pub async fn latest_payable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// Latest chain-swap offer that may be exposed to an unauthenticated payer.
+///
+/// A provider-created row is persisted before recovery-manifest staging so a
+/// post-provider failure cannot erase its canonical response or recovery
+/// keys. Such a row remains a blocking non-terminal `pending` obligation, but
+/// it is not a payer instruction until its exact manifest is durably delivered
+/// and acknowledged. Public invoice reads must use this query rather than
+/// [`latest_payable_chain_swap_for_invoice`].
+pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_id: Uuid,
+    amount_sat: i64,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
+         WHERE invoice_id = $1 \
+           AND status = 'pending' \
+           AND server_lock_amount_sat = $2 \
+           AND EXISTS ( \
+                 SELECT 1 FROM chain_swap_manifest_deliveries delivery \
+                  WHERE delivery.chain_swap_id = chain_swap_records.id \
+                    AND delivery.delivery_state = 'delivered' \
+           ) \
+         ORDER BY created_at DESC \
+         LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .bind(amount_sat)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Atomically fold one webhook/reconciliation provider status into the
 /// persisted chain-swap lifecycle.
 ///
