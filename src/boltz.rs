@@ -69,6 +69,7 @@ const BTC_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 const LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
 const BITCOIN_TARGET_BLOCK_SECS: u64 = 600;
 const LIQUID_TARGET_BLOCK_SECS: u64 = 60;
+const LOCK_TIME_TIMESTAMP_THRESHOLD: u32 = 500_000_000;
 
 fn invalid_chain_response(reason: impl Into<String>) -> AppError {
     AppError::BoltzError(format!("invalid chain swap response: {}", reason.into()))
@@ -248,6 +249,21 @@ fn validate_chain_creation_response(
             "provider returned unrequested destination fields",
         ));
     }
+    if response
+        .lockup_details
+        .swap_tree
+        .covenant_claim_leaf
+        .is_some()
+        || response
+            .claim_details
+            .swap_tree
+            .covenant_claim_leaf
+            .is_some()
+    {
+        return Err(invalid_chain_response(
+            "chain-swap trees contain an unexpected covenant leaf",
+        ));
+    }
 
     let btc_address = Address::from_str(&response.lockup_details.lockup_address)
         .map_err(|error| invalid_chain_response(format!("invalid Bitcoin address: {error}")))?
@@ -309,6 +325,15 @@ fn validate_chain_creation_response(
 
     let btc_timeout = response.lockup_details.timeout_block_height;
     let liquid_timeout = response.claim_details.timeout_block_height;
+    if btc_timeout >= LOCK_TIME_TIMESTAMP_THRESHOLD
+        || liquid_timeout >= LOCK_TIME_TIMESTAMP_THRESHOLD
+        || heights.btc >= LOCK_TIME_TIMESTAMP_THRESHOLD
+        || heights.lbtc >= LOCK_TIME_TIMESTAMP_THRESHOLD
+    {
+        return Err(invalid_chain_response(
+            "chain timeout values must be block heights, not timestamps",
+        ));
+    }
     if btc_script.locktime.to_consensus_u32() != btc_timeout
         || liquid_script.locktime.to_consensus_u32() != liquid_timeout
     {
@@ -726,8 +751,16 @@ impl BoltzService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Json, Router};
     use boltz_client::network::Network;
-    use serde_json::json;
+    use boltz_client::swaps::boltz::{ChainSwapDetails, SwapTree, SwapType};
+    use boltz_client::{ZKKeyPair, ZKSecp256k1};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -735,6 +768,215 @@ mod tests {
     fn test_service(mnemonic: &str) -> BoltzService {
         let key = SwapMasterKey::from_mnemonic(mnemonic, None, Network::Mainnet).unwrap();
         BoltzService::new("http://127.0.0.1:1", key, None)
+    }
+
+    fn test_service_at(boltz_url: &str, mnemonic: &str) -> BoltzService {
+        let key = SwapMasterKey::from_mnemonic(mnemonic, None, Network::Mainnet).unwrap();
+        BoltzService::new(boltz_url, key, None)
+    }
+
+    #[derive(Clone)]
+    struct ChainTransportFixtureState {
+        pair_response: Value,
+        height_response: Value,
+        creation_response: Value,
+        creation_status: StatusCode,
+        calls: Arc<Mutex<Vec<String>>>,
+        request: Arc<Mutex<Option<Value>>>,
+    }
+
+    struct ChainTransportFixture {
+        base_url: String,
+        calls: Arc<Mutex<Vec<String>>>,
+        request: Arc<Mutex<Option<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ChainTransportFixture {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn request(&self) -> Value {
+            self.request
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("chain creation request was not captured")
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    async fn chain_pairs_handler(State(state): State<ChainTransportFixtureState>) -> Json<Value> {
+        state.calls.lock().unwrap().push("GET /swap/chain".into());
+        Json(state.pair_response)
+    }
+
+    async fn chain_heights_handler(State(state): State<ChainTransportFixtureState>) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .unwrap()
+            .push("GET /chain/heights".into());
+        Json(state.height_response)
+    }
+
+    async fn create_chain_handler(
+        State(state): State<ChainTransportFixtureState>,
+        Json(request): Json<Value>,
+    ) -> Response {
+        state.calls.lock().unwrap().push("POST /swap/chain".into());
+        *state.request.lock().unwrap() = Some(request);
+        if state.creation_status.is_success() {
+            Json(state.creation_response).into_response()
+        } else {
+            (
+                state.creation_status,
+                Json(json!({"error": "stale pair hash"})),
+            )
+                .into_response()
+        }
+    }
+
+    async fn spawn_chain_transport_fixture(
+        pair: &ChainPair,
+        heights: &HeightResponse,
+        response: &CreateChainResponse,
+        creation_status: StatusCode,
+    ) -> ChainTransportFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let request = Arc::new(Mutex::new(None));
+        let state = ChainTransportFixtureState {
+            pair_response: json!({"BTC": {"L-BTC": pair}, "L-BTC": {}}),
+            height_response: serde_json::to_value(heights).unwrap(),
+            creation_response: serde_json::to_value(response).unwrap(),
+            creation_status,
+            calls: calls.clone(),
+            request: request.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/swap/chain",
+                get(chain_pairs_handler).post(create_chain_handler),
+            )
+            .route("/chain/heights", get(chain_heights_handler))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ChainTransportFixture {
+            base_url: format!("http://{address}"),
+            calls,
+            request,
+            task,
+        }
+    }
+
+    fn dynamic_chain_creation_response(
+        pair: &ChainPair,
+        heights: &HeightResponse,
+        hashlock: hash160::Hash,
+        claim_public_key: PublicKey,
+        refund_public_key: PublicKey,
+        server_lock_amount_sat: u64,
+        provider_bip21: &str,
+    ) -> CreateChainResponse {
+        const BLINDING_KEY: &str =
+            "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+        let bitcoin_server_key = PublicKey::from_str(
+            "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+        )
+        .unwrap();
+        let liquid_server_key = PublicKey::from_str(
+            "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
+        )
+        .unwrap();
+        let bitcoin_timeout = heights.btc + 144;
+        let liquid_timeout = heights.lbtc + 720;
+        let user_lock_amount_sat =
+            expected_chain_user_lock_amount(pair, server_lock_amount_sat).unwrap();
+
+        let bitcoin_tree = SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(expected_claim_script(hashlock, &bitcoin_server_key)),
+                version: BTC_TAPSCRIPT_LEAF_VERSION,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(expected_refund_script(&refund_public_key, bitcoin_timeout)),
+                version: BTC_TAPSCRIPT_LEAF_VERSION,
+            },
+            covenant_claim_leaf: None,
+        };
+        let liquid_tree = SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(expected_claim_script(hashlock, &claim_public_key)),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(expected_refund_script(&liquid_server_key, liquid_timeout)),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            covenant_claim_leaf: None,
+        };
+
+        let bitcoin_address = BtcSwapScript {
+            swap_type: SwapType::Chain,
+            side: Some(Side::Lockup),
+            funding_addrs: None,
+            hashlock,
+            receiver_pubkey: bitcoin_server_key,
+            locktime: LockTime::from_consensus(bitcoin_timeout),
+            sender_pubkey: refund_public_key,
+        }
+        .to_address(BitcoinChain::Bitcoin)
+        .unwrap()
+        .to_string();
+        let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+        let liquid_address = LBtcSwapScript {
+            swap_type: SwapType::Chain,
+            side: Some(Side::Claim),
+            funding_addrs: None,
+            hashlock,
+            receiver_pubkey: claim_public_key,
+            locktime: boltz_client::elements::LockTime::from_consensus(liquid_timeout),
+            sender_pubkey: liquid_server_key,
+            blinding_key,
+        }
+        .to_address(LiquidChain::Liquid)
+        .unwrap()
+        .to_string();
+
+        CreateChainResponse {
+            id: "DynamicChainTransport1".into(),
+            claim_details: ChainSwapDetails {
+                swap_tree: liquid_tree,
+                lockup_address: liquid_address,
+                server_public_key: liquid_server_key,
+                timeout_block_height: liquid_timeout,
+                amount: server_lock_amount_sat,
+                blinding_key: Some(BLINDING_KEY.into()),
+                refund_address: None,
+                claim_address: None,
+                bip21: None,
+            },
+            lockup_details: ChainSwapDetails {
+                swap_tree: bitcoin_tree,
+                lockup_address: bitcoin_address,
+                server_public_key: bitcoin_server_key,
+                timeout_block_height: bitcoin_timeout,
+                amount: user_lock_amount_sat,
+                blinding_key: None,
+                refund_address: None,
+                claim_address: None,
+                bip21: Some(provider_bip21.into()),
+            },
+        }
     }
 
     fn live_chain_creation_fixture() -> (
@@ -952,6 +1194,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unexpected_covenant_leaf_in_either_chain_tree() {
+        let (pair, heights, hashlock, claim, refund, response) = live_chain_creation_fixture();
+
+        let mut bitcoin_covenant = response.clone();
+        bitcoin_covenant
+            .lockup_details
+            .swap_tree
+            .covenant_claim_leaf =
+            Some(bitcoin_covenant.lockup_details.swap_tree.claim_leaf.clone());
+        let error = validate_chain_creation_response(
+            &pair,
+            &heights,
+            hashlock,
+            &claim,
+            &refund,
+            25_000,
+            &bitcoin_covenant,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected covenant leaf"));
+
+        let mut liquid_covenant = response;
+        liquid_covenant.claim_details.swap_tree.covenant_claim_leaf =
+            Some(liquid_covenant.claim_details.swap_tree.claim_leaf.clone());
+        let error = validate_chain_creation_response(
+            &pair,
+            &heights,
+            hashlock,
+            &claim,
+            &refund,
+            25_000,
+            &liquid_covenant,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected covenant leaf"));
+    }
+
+    #[test]
     fn rejects_inconsistent_amounts_hashlocks_leaf_versions_and_timeout_order() {
         let (pair, heights, hashlock, claim, refund, response) = live_chain_creation_fixture();
 
@@ -1046,5 +1326,124 @@ mod tests {
             first_terms.btc_claim_script_sha256,
             second_terms.btc_claim_script_sha256
         );
+    }
+
+    #[tokio::test]
+    async fn chain_creation_transport_pins_quote_and_returns_only_validated_evidence() {
+        let key_source = test_service(TEST_MNEMONIC);
+        let claim_key = key_source.derive_swap_key(8_000).unwrap();
+        let refund_key = key_source.derive_swap_key(8_001).unwrap();
+        let claim_public_key = PublicKey::new(claim_key.keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_key.keypair.public_key());
+        let preimage_hash = claim_key.preimage.sha256.to_string();
+        let hashlock = claim_key.preimage.hash160;
+        let (pair, heights, _, _, _, _) = live_chain_creation_fixture();
+        let provider_bip21 =
+            "bitcoin:provider-controlled-and-never-forwarded?amount=21000000&label=unsafe";
+        let response = dynamic_chain_creation_response(
+            &pair,
+            &heights,
+            hashlock,
+            claim_public_key,
+            refund_public_key,
+            25_000,
+            provider_bip21,
+        );
+        let expected_lockup_address = response.lockup_details.lockup_address.clone();
+        let expected_user_lock_amount = response.lockup_details.amount;
+        let fixture =
+            spawn_chain_transport_fixture(&pair, &heights, &response, StatusCode::OK).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+
+        let result = service
+            .create_btc_to_lbtc_chain_swap(claim_key, refund_key, 25_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.calls(),
+            vec!["GET /swap/chain", "GET /chain/heights", "POST /swap/chain",]
+        );
+        let request = fixture.request();
+        assert_eq!(request["from"], "BTC");
+        assert_eq!(request["to"], "L-BTC");
+        assert_eq!(request["pairHash"], pair.hash);
+        assert_eq!(request["serverLockAmount"], 25_000);
+        assert!(request.get("userLockAmount").is_none());
+        assert_eq!(request["preimageHash"], preimage_hash);
+        assert_eq!(request["claimPublicKey"], claim_public_key.to_string());
+        assert_eq!(request["refundPublicKey"], refund_public_key.to_string());
+
+        // Exhaustive destructuring keeps the provider response (and therefore
+        // its BIP21) out of the result API while retaining canonical evidence.
+        let ChainSwapResult {
+            swap_id,
+            lockup_address,
+            user_lock_amount_sat,
+            server_lock_amount_sat,
+            preimage,
+            claim_keypair: _,
+            refund_keypair: _,
+            canonical_response_json,
+            creation_terms,
+        } = result;
+        assert_eq!(swap_id, response.id);
+        assert_eq!(lockup_address, expected_lockup_address);
+        assert!(!lockup_address.contains(':'));
+        assert!(!lockup_address.contains('?'));
+        assert_eq!(user_lock_amount_sat, expected_user_lock_amount);
+        assert_eq!(server_lock_amount_sat, 25_000);
+        assert_eq!(preimage.len(), 32);
+        assert_eq!(creation_terms.pinned_pair_hash, pair.hash);
+        assert_eq!(
+            creation_terms.creation_response_sha256,
+            hex::encode(Sha256::digest(canonical_response_json.as_bytes()))
+        );
+        let canonical_response: Value = serde_json::from_str(&canonical_response_json).unwrap();
+        assert_eq!(canonical_response["lockupDetails"]["bip21"], provider_bip21);
+        let canonical_pair: Value =
+            serde_json::from_str(&creation_terms.canonical_pair_quote_json).unwrap();
+        assert_eq!(canonical_pair["hash"], pair.hash);
+
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn chain_creation_transport_surfaces_stale_pair_provider_error() {
+        let key_source = test_service(TEST_MNEMONIC);
+        let claim_key = key_source.derive_swap_key(8_010).unwrap();
+        let refund_key = key_source.derive_swap_key(8_011).unwrap();
+        let claim_public_key = PublicKey::new(claim_key.keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_key.keypair.public_key());
+        let (pair, heights, _, _, _, _) = live_chain_creation_fixture();
+        let response = dynamic_chain_creation_response(
+            &pair,
+            &heights,
+            claim_key.preimage.hash160,
+            claim_public_key,
+            refund_public_key,
+            25_000,
+            "bitcoin:not-returned",
+        );
+        let fixture =
+            spawn_chain_transport_fixture(&pair, &heights, &response, StatusCode::CONFLICT).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+
+        let error = match service
+            .create_btc_to_lbtc_chain_swap(claim_key, refund_key, 25_000)
+            .await
+        {
+            Ok(_) => panic!("stale pair response unexpectedly created a chain swap"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("stale pair hash"), "{error}");
+        assert_eq!(
+            fixture.calls(),
+            vec!["GET /swap/chain", "GET /chain/heights", "POST /swap/chain",]
+        );
+        assert_eq!(fixture.request()["pairHash"], pair.hash);
+
+        fixture.shutdown().await;
     }
 }
