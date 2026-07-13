@@ -4415,6 +4415,744 @@ async fn webhook_advances_chain_swap_records() {
 }
 
 #[tokio::test]
+async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "chaintransitiondb").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "chaintransitiondb",
+        &npub,
+        "lq1chaintransitiondb",
+        60,
+    )
+    .await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("chaintransitiondb"),
+            boltz_swap_id: "CHAIN_TRANSITION_DB_1",
+            lockup_address: "bc1qchaintransitiondb",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE chain_swap_records SET updated_at = '2000-01-01 00:00:00+00' WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let initial_updated_at: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // A provider failure while still pending is not local proof of payer
+    // funding and cannot make Bitcoin recovery eligible. Keep the one-way
+    // failure fact so a later user-lock observation converges with the
+    // opposite delivery order.
+    let pending_failure = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::FundingFailed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        pending_failure.current_status,
+        pay_service::db::ChainSwapStatus::Pending
+    );
+    assert!(pending_failure.changed);
+    assert!(pending_failure.cooperative_refused);
+    let failure_updated_at: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(failure_updated_at, initial_updated_at);
+
+    let duplicate_failure = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::FundingFailed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!duplicate_failure.changed);
+    let duplicate_failure_updated_at: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(duplicate_failure_updated_at, failure_updated_at);
+
+    let user_after_failure = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockConfirmed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        user_after_failure.current_status,
+        pay_service::db::ChainSwapStatus::RefundDue
+    );
+
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockConfirmed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let failed_after_user = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::FundingFailed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        failed_after_user.current_status,
+        pay_service::db::ChainSwapStatus::RefundDue
+    );
+
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let pending_expiry = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::SwapExpired,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        pending_expiry.current_status,
+        pay_service::db::ChainSwapStatus::Pending
+    );
+    assert!(pending_expiry.changed);
+    assert!(pending_expiry.cooperative_refused);
+    let duplicate_expiry = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::SwapExpired,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!duplicate_expiry.changed);
+    let user_after_expiry = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockMempool,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        user_after_expiry.current_status,
+        pay_service::db::ChainSwapStatus::RefundDue
+    );
+
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockMempool,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let expiry_after_user = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::SwapExpired,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        expiry_after_user.current_status,
+        pay_service::db::ChainSwapStatus::RefundDue
+    );
+
+    // A late valid server lock revokes an unstarted recovery branch and
+    // returns the swap to the normal Liquid claim path.
+    let late_server = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::ServerLockConfirmed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        late_server.current_status,
+        pay_service::db::ChainSwapStatus::ServerLockConfirmed
+    );
+    let before_reordered: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let reordered = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockMempool,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        reordered.current_status,
+        pay_service::db::ChainSwapStatus::ServerLockConfirmed
+    );
+    assert!(!reordered.changed);
+    let after_reordered: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_reordered, before_reordered);
+
+    // Concurrent stale/new evidence converges regardless of lock acquisition
+    // order because both calls reduce under the same row lock.
+    sqlx::query(
+        "UPDATE chain_swap_records \
+         SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let older = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockMempool,
+    );
+    let newer = pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::ServerLockConfirmed,
+    );
+    let (older_result, newer_result) = tokio::join!(older, newer);
+    older_result.unwrap().unwrap();
+    newer_result.unwrap().unwrap();
+    let final_row = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.status, "server_lock_confirmed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue30_user_lock_projection_converges_after_failure_or_expiry_in_either_order() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "chainprojectionorder").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "chainprojectionorder",
+        &npub,
+        "lq1chainprojectionorder",
+        60,
+    )
+    .await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("chainprojectionorder"),
+            boltz_swap_id: "CHAIN_PROJECTION_ORDER_1",
+            lockup_address: "bc1qchainprojectionorder",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+
+    for failure_status in ["transaction.failed", "swap.expired"] {
+        sqlx::query(
+            "UPDATE chain_swap_records \
+             SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE invoices \
+             SET status = 'unpaid', settlement_status = 'none', \
+                 swap_settlement_status = 'none' WHERE id = $1",
+        )
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (failure_first_status, failure_first_body) = post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {"id": "CHAIN_PROJECTION_ORDER_1", "status": failure_status}
+            }),
+        )
+        .await;
+        assert_eq!(
+            failure_first_status,
+            StatusCode::OK,
+            "{failure_status}: {failure_first_body}"
+        );
+        let pending_failure = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_failure.status, "pending", "{failure_status}");
+        assert!(pending_failure.cooperative_refused, "{failure_status}");
+        let not_yet_funded = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(not_yet_funded.status, "unpaid", "{failure_status}");
+        assert_eq!(
+            not_yet_funded.swap_settlement_status, "none",
+            "{failure_status}"
+        );
+
+        let (user_after_failure_status, user_after_failure_body) = post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "CHAIN_PROJECTION_ORDER_1",
+                    "status": "transaction.confirmed"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            user_after_failure_status,
+            StatusCode::OK,
+            "{failure_status}: {user_after_failure_body}"
+        );
+        let failure_first_final = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure_first_final.status, "refund_due", "{failure_status}");
+        let failure_first_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure_first_invoice.status, "in_progress",
+            "{failure_status}"
+        );
+        assert_eq!(
+            failure_first_invoice.settlement_status, "pending",
+            "{failure_status}"
+        );
+        assert_eq!(
+            failure_first_invoice.swap_settlement_status, "pending",
+            "{failure_status}"
+        );
+
+        // Simulate cancellation after the atomic swap-row commit but before
+        // the invoice side effect. Re-delivering identical user-lock evidence
+        // must repair the projection even though the reducer is now a no-op.
+        sqlx::query(
+            "UPDATE invoices \
+             SET status = 'unpaid', settlement_status = 'none', \
+                 swap_settlement_status = 'none' WHERE id = $1",
+        )
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (retry_status, retry_body) = post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "CHAIN_PROJECTION_ORDER_1",
+                    "status": "transaction.confirmed"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            retry_status,
+            StatusCode::OK,
+            "{failure_status}: {retry_body}"
+        );
+        let repaired_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired_invoice.status, "in_progress", "{failure_status}");
+        assert_eq!(
+            repaired_invoice.settlement_status, "pending",
+            "{failure_status}"
+        );
+        assert_eq!(
+            repaired_invoice.swap_settlement_status, "pending",
+            "{failure_status}"
+        );
+
+        sqlx::query(
+            "UPDATE chain_swap_records \
+             SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE invoices \
+             SET status = 'unpaid', settlement_status = 'none', \
+                 swap_settlement_status = 'none' WHERE id = $1",
+        )
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (user_first_status, user_first_body) = post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {
+                    "id": "CHAIN_PROJECTION_ORDER_1",
+                    "status": "transaction.confirmed"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            user_first_status,
+            StatusCode::OK,
+            "{failure_status}: {user_first_body}"
+        );
+        let (failure_after_user_status, failure_after_user_body) = post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {"id": "CHAIN_PROJECTION_ORDER_1", "status": failure_status}
+            }),
+        )
+        .await;
+        assert_eq!(
+            failure_after_user_status,
+            StatusCode::OK,
+            "{failure_status}: {failure_after_user_body}"
+        );
+        let user_first_final = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_first_final.status, "refund_due", "{failure_status}");
+        let user_first_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_first_invoice.status, "in_progress", "{failure_status}");
+        assert_eq!(
+            user_first_invoice.settlement_status, "pending",
+            "{failure_status}"
+        );
+        assert_eq!(
+            user_first_invoice.swap_settlement_status, "pending",
+            "{failure_status}"
+        );
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_lock() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "chainredrive").await;
+    let invoice = insert_test_invoice(&pool, "chainredrive", &npub, "lq1chainredrive", 60).await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("chainredrive"),
+            boltz_swap_id: "CHAIN_REDRIVE_1",
+            lockup_address: "bc1qchainredrive",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{",
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_chain_swap_provider_status(
+        &pool,
+        row.id,
+        pay_service::db::ChainSwapProviderStatusInput::UserLockConfirmed,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (failed_status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.failed"}
+        }),
+    )
+    .await;
+    assert_eq!(failed_status, StatusCode::OK);
+    let refund_due = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refund_due.status, "refund_due");
+
+    // Seed the legacy permanent status key: chain correctness must not consult
+    // it, and the late server lock must still revoke recovery + redrive claim.
+    sqlx::query("INSERT INTO processed_webhook_events (event_id) VALUES ($1)")
+        .bind("CHAIN_REDRIVE_1:transaction.server.confirmed")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (server_status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.server.confirmed"}
+        }),
+    )
+    .await;
+    assert_eq!(server_status, StatusCode::OK);
+    let claimed_branch = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_branch.status, "server_lock_confirmed");
+    assert_eq!(claimed_branch.claim_attempts, 1);
+    assert!(claimed_branch
+        .last_claim_error
+        .as_deref()
+        .is_some_and(|error| error.contains("invalid chain boltz response json")));
+
+    let (repeat_status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.server.confirmed"}
+        }),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::OK);
+    let repeated = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.status, "server_lock_confirmed");
+    assert_eq!(
+        repeated.claim_attempts, 2,
+        "identical later evidence must redrive a previously failed claim action"
+    );
+
+    let (reordered_failure_status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.lockupFailed"}
+        }),
+    )
+    .await;
+    assert_eq!(reordered_failure_status, StatusCode::OK);
+    let after_reordered_failure = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_reordered_failure.status, "server_lock_confirmed");
+    assert_eq!(
+        after_reordered_failure.claim_attempts, 3,
+        "reordered failure evidence must preserve and redrive the late Liquid claim branch"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue30_cancelled_chain_transition_can_retry_the_identical_evidence() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "chainretry").await;
+    let invoice = insert_test_invoice(&pool, "chainretry", &npub, "lq1chainretry", 60).await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("chainretry"),
+            boltz_swap_id: "CHAIN_RETRY_1",
+            lockup_address: "bc1qchainretry",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM chain_swap_records WHERE id = $1 FOR UPDATE")
+        .bind(row.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(
+        Duration::from_millis(100),
+        post_json(
+            &app,
+            "/webhook/boltz",
+            json!({
+                "event": "swap.update",
+                "data": {"id": "CHAIN_RETRY_1", "status": "transaction.confirmed"}
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "the first transition must be cancelled at its row lock"
+    );
+    blocker.rollback().await.unwrap();
+
+    let after_cancel = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_cancel.status, "pending");
+    let dedup_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_webhook_events WHERE event_id = $1")
+            .bind("CHAIN_RETRY_1:transaction.confirmed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dedup_rows, 0);
+
+    let (retry_status, _) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {"id": "CHAIN_RETRY_1", "status": "transaction.confirmed"}
+        }),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK);
+    let after_retry = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_retry.status, "user_lock_confirmed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn webhook_skips_terminal_chain_swap_records() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

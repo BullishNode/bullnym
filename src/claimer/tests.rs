@@ -200,12 +200,12 @@ fn claim_cycle_keeps_malformed_and_business_local_obligations_local() {
 #[test]
 fn chain_swap_boltz_claimed_does_not_terminalize_local_status() {
     assert_eq!(
-        chain_swap_status_from_boltz_status("transaction.server.mempool"),
-        Some(ChainSwapStatus::ServerLockMempool)
+        chain_swap_provider_input("transaction.server.mempool"),
+        Some(db::ChainSwapProviderStatusInput::ServerLockMempool)
     );
     assert_eq!(
-        chain_swap_status_from_boltz_status("transaction.claimed"),
-        None
+        chain_swap_provider_input("transaction.claimed"),
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
 }
 
@@ -418,29 +418,37 @@ fn chain_swap_expired_is_not_terminal() {
     // `swap.expired` is Boltz's wall-clock timer, not the on-chain lockup
     // timeout — the server lockup stays claimable until timeoutBlockHeight.
     // It must NOT map to terminal `Expired` (which abandoned claimable funds);
-    // it is handled in handle_chain_swap_webhook (flip cooperative_refused,
-    // keep sweepable), so the raw mapping returns None.
-    assert!(chain_swap_status_from_boltz_status("swap.expired").is_none());
+    // it is folded by the shared transition as a one-way script-claim hint.
+    assert_eq!(
+        chain_swap_provider_input("swap.expired"),
+        Some(db::ChainSwapProviderStatusInput::SwapExpired)
+    );
 }
 
 #[test]
-fn chain_swap_status_mapping_still_advances_and_terminalizes_correctly() {
-    assert!(matches!(
-        chain_swap_status_from_boltz_status("transaction.server.confirmed"),
-        Some(ChainSwapStatus::ServerLockConfirmed)
-    ));
+fn chain_swap_status_mapping_feeds_the_shared_transition() {
+    assert_eq!(
+        chain_swap_provider_input("transaction.server.confirmed"),
+        Some(db::ChainSwapProviderStatusInput::ServerLockConfirmed)
+    );
     // 0-conf rejection is a "wait for confirmation" signal, not a failure —
     // it must re-sight the user lockup, never terminalize (was a live loss bug).
-    assert!(matches!(
-        chain_swap_status_from_boltz_status("transaction.zeroconf.rejected"),
-        Some(ChainSwapStatus::UserLockMempool)
-    ));
-    // Funded-failure statuses are handled explicitly in handle_chain_swap_webhook
-    // (→ refund_due, funds recoverable), so the raw mapper returns None for them
-    // rather than terminalizing (which stranded the payer's BTC).
-    assert!(chain_swap_status_from_boltz_status("transaction.refunded").is_none());
-    assert!(chain_swap_status_from_boltz_status("transaction.lockupFailed").is_none());
-    assert!(chain_swap_status_from_boltz_status("transaction.failed").is_none());
+    assert_eq!(
+        chain_swap_provider_input("transaction.zeroconf.rejected"),
+        Some(db::ChainSwapProviderStatusInput::UserLockMempool)
+    );
+    assert_eq!(
+        chain_swap_provider_input("transaction.refunded"),
+        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+    );
+    assert_eq!(
+        chain_swap_provider_input("transaction.lockupFailed"),
+        Some(db::ChainSwapProviderStatusInput::Observe)
+    );
+    assert_eq!(
+        chain_swap_provider_input("transaction.failed"),
+        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+    );
 }
 
 #[test]
