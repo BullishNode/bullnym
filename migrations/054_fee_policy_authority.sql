@@ -467,21 +467,59 @@ BEGIN
         runtime_role_name
     );
     EXECUTE format(
-        'SELECT has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''SELECT'') AS can_select, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''INSERT'') AS can_insert, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''UPDATE'') AS can_update, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''DELETE'') AS can_delete, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''TRUNCATE'') AS can_truncate, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''REFERENCES'') AS can_reference, \
-                has_table_privilege(%L, ''public.fee_last_known_good_observations'', ''TRIGGER'') AS can_trigger',
-        runtime_role_name, runtime_role_name, runtime_role_name,
-        runtime_role_name, runtime_role_name, runtime_role_name,
+        'GRANT SELECT, INSERT, UPDATE ON public.swap_records, public.chain_swap_records, public.chain_swap_tx_attempts TO %I',
         runtime_role_name
-    ) INTO cache_acl;
+    );
+    SELECT has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'SELECT'
+           ) AS can_select,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'INSERT'
+           ) AS can_insert,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'UPDATE'
+           ) AS can_update,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'DELETE'
+           ) AS can_delete,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'TRUNCATE'
+           ) AS can_truncate,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'REFERENCES'
+           ) AS can_reference,
+           has_table_privilege(
+               runtime_role_name,
+               'public.fee_last_known_good_observations',
+               'TRIGGER'
+           ) AS can_trigger
+      INTO cache_acl;
     IF NOT cache_acl.can_select OR NOT cache_acl.can_insert OR NOT cache_acl.can_update
        OR cache_acl.can_delete OR cache_acl.can_truncate
        OR cache_acl.can_reference OR cache_acl.can_trigger THEN
         RAISE EXCEPTION 'migration 054 runtime fee-cache privileges are unsafe'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT has_table_privilege(runtime_role_name, 'public.swap_records', 'SELECT')
+       OR NOT has_table_privilege(runtime_role_name, 'public.swap_records', 'UPDATE')
+       OR NOT has_table_privilege(runtime_role_name, 'public.chain_swap_records', 'SELECT')
+       OR NOT has_table_privilege(runtime_role_name, 'public.chain_swap_records', 'UPDATE')
+       OR NOT has_table_privilege(runtime_role_name, 'public.chain_swap_tx_attempts', 'SELECT')
+       OR NOT has_table_privilege(runtime_role_name, 'public.chain_swap_tx_attempts', 'INSERT')
+       OR NOT has_table_privilege(runtime_role_name, 'public.chain_swap_tx_attempts', 'UPDATE') THEN
+        RAISE EXCEPTION 'migration 054 runtime journal privileges are incomplete'
             USING ERRCODE = '42501';
     END IF;
 END
