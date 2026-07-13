@@ -2087,6 +2087,16 @@ fn persisted_chain_claim_journal_mode(
     }
 }
 
+fn require_exact_persisted_chain_claim_journal<T>(
+    loaded: Result<T, db::MerchantSettlementRepositoryError>,
+) -> Result<T, AppError> {
+    loaded.map_err(|error| {
+        AppError::DbError(format!(
+            "load exact Liquid merchant settlement journal: {error}"
+        ))
+    })
+}
+
 /// Rebuild the complete immutable Liquid claim journal from locally decoded
 /// transaction bytes and the independently fetched source transactions. This
 /// runs while the per-swap advisory transaction is still open and before any
@@ -2545,13 +2555,9 @@ async fn claim_chain_swap_inner(
                 "persisted chain claim bytes/txid do not match their decoded journal".into(),
             ));
         }
-        db::load_exact_liquid_merchant_settlement_journal(&mut *tx, &new_journal)
-            .await
-            .map_err(|error| {
-                AppError::DbError(format!(
-                    "load exact Liquid merchant settlement journal: {error}"
-                ))
-            })?;
+        require_exact_persisted_chain_claim_journal(
+            db::load_exact_liquid_merchant_settlement_journal(&mut *tx, &new_journal).await,
+        )?;
     }
 
     let marked_claiming = sqlx::query(
@@ -2581,65 +2587,76 @@ async fn claim_chain_swap_inner(
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let txid = btc_like_txid(&claim_tx);
-    if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
-        if let Some(backend) = utxo_backend {
-            match backend.tx_exists(&txid).await {
-                Ok(true) => {
+    let broadcast_result = match chain_client.try_broadcast_tx(&claim_tx).await {
+        Ok(_) => "broadcast accepted or exact transaction already known",
+        Err(broadcast_err) => match backend.tx_exists(&txid).await {
+            Ok(true) => {
+                tracing::info!(
+                    event = "chain_claim_broadcast_probe_recovered",
+                    swap_id = %swap.boltz_swap_id,
+                    txid = %txid,
+                    broadcast_error = %broadcast_err,
+                    "chain claim broadcast errored but tx is on chain; treating as success"
+                );
+                "broadcast errored; exact transaction observed"
+            }
+            Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                Ok(Some(spending_txid)) if spending_txid.eq_ignore_ascii_case(&txid) => {
                     tracing::info!(
-                        event = "chain_claim_broadcast_probe_recovered",
+                        event = "chain_claim_outspend_recovered",
                         swap_id = %swap.boltz_swap_id,
-                        txid = %txid,
+                        expected_txid = %txid,
+                        recovered_txid = %spending_txid,
                         broadcast_error = %broadcast_err,
-                        "chain claim broadcast errored but tx is on chain; treating as success"
+                        "chain claim broadcast errored and expected txid was absent, but its exact lockup outspend was found"
                     );
+                    "broadcast errored; exact journal outspend observed"
                 }
-                Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
-                    Ok(Some(spending_txid)) if spending_txid.eq_ignore_ascii_case(&txid) => {
-                        tracing::info!(
-                            event = "chain_claim_outspend_recovered",
-                            swap_id = %swap.boltz_swap_id,
-                            expected_txid = %txid,
-                            recovered_txid = %spending_txid,
-                            broadcast_error = %broadcast_err,
-                            "chain claim broadcast errored and expected txid was absent, but its exact lockup outspend was found"
-                        );
-                    }
-                    Ok(Some(spending_txid)) => {
-                        return Err(AppError::ClaimError(format!(
+                Ok(Some(spending_txid)) => {
+                    return Err(AppError::ClaimError(format!(
                             "chain claim lockup was spent by unlinked transaction {spending_txid}; expected journaled {txid}; settlement integrity review required"
                         )));
-                    }
-                    Ok(None) => {
-                        return Err(AppError::ClaimError(format!(
-                            "broadcast chain claim failed: {broadcast_err}"
-                        )));
-                    }
-                    Err(recovery_err) => {
-                        tracing::warn!(
-                            "chain claim outspend recovery failed for {}: {recovery_err}; treating broadcast as failed",
-                            swap.boltz_swap_id
-                        );
-                        return Err(AppError::ClaimError(format!(
-                            "broadcast chain claim failed: {broadcast_err}"
-                        )));
-                    }
-                },
-                Err(probe_err) => {
-                    tracing::warn!(
-                        "chain claim tx_exists probe failed for {}: {probe_err}; treating broadcast as failed",
-                        swap.boltz_swap_id
-                    );
+                }
+                Ok(None) => {
                     return Err(AppError::ClaimError(format!(
                         "broadcast chain claim failed: {broadcast_err}"
                     )));
                 }
+                Err(recovery_err) => {
+                    tracing::warn!(
+                            "chain claim outspend recovery failed for {}: {recovery_err}; treating broadcast as failed",
+                            swap.boltz_swap_id
+                        );
+                    return Err(AppError::ClaimError(format!(
+                        "broadcast chain claim failed: {broadcast_err}"
+                    )));
+                }
+            },
+            Err(probe_err) => {
+                tracing::warn!(
+                        "chain claim tx_exists probe failed for {}: {probe_err}; treating broadcast as failed",
+                        swap.boltz_swap_id
+                    );
+                return Err(AppError::ClaimError(format!(
+                    "broadcast chain claim failed: {broadcast_err}"
+                )));
             }
-        } else {
-            return Err(AppError::ClaimError(format!(
-                "broadcast chain claim failed: {broadcast_err}"
-            )));
-        }
-    }
+        },
+    };
+
+    db::mark_liquid_merchant_settlement_broadcast(
+        pool,
+        swap.id,
+        &txid,
+        "liquid_claim",
+        broadcast_result,
+    )
+    .await
+    .map_err(|error| {
+        AppError::DbError(format!(
+            "mark Liquid merchant settlement broadcast: {error}"
+        ))
+    })?;
 
     // Broadcast is retained as an in-flight `claiming` transaction. Exact
     // merchant-output observation owns one-confirmation accounting and the
