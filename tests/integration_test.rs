@@ -1230,7 +1230,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "054_fee_policy_authority"
+        "055_merchant_settlement_lifecycle"
     );
 
     let app = test_app(test_state(pool.clone()));

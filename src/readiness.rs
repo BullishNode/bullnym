@@ -127,7 +127,10 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// HTTP readiness endpoint reuses the same predicate so deploy and runtime
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-    if !schema_marker_present(pool).await? || !swap_key_lineage_invariants_present(pool).await? {
+    if !schema_marker_present(pool).await?
+        || !swap_key_lineage_invariants_present(pool).await?
+        || !merchant_settlement_privileges_present(pool).await?
+    {
         return Ok(false);
     }
 
@@ -251,6 +254,28 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn merchant_settlement_privileges_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "WITH required(table_name) AS (VALUES \
+             ('invoice_payment_events'), \
+             ('merchant_settlement_checkpoints'), \
+             ('merchant_settlement_retained_outputs') \
+         ) \
+         SELECT COUNT(*) = 3 \
+            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'SELECT')) \
+            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'INSERT')) \
+            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'UPDATE')) \
+           FROM required \
+           JOIN pg_class relation ON relation.relname = required.table_name \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+          WHERE namespace.nspname = 'public' AND relation.relkind = 'r'",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 /// Global #84 capability boundary. This does not assert that any particular
@@ -1043,7 +1068,57 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   ) \
                   AND NOT t.tgisinternal \
                   AND t.tgenabled IN ('O', 'A') \
-            ) = 2",
+            ) = 2 \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND (table_name, column_name) IN ( \
+                      ('chain_swap_tx_attempts', 'replaces_txid'), \
+                      ('chain_swap_tx_attempts', 'destination_asset_id'), \
+                      ('chain_swap_tx_attempts', 'liquid_blinding_key_hex'), \
+                      ('invoice_payment_events', 'merchant_settlement_family_key'), \
+                      ('invoice_payment_events', 'merchant_chain_swap_id'), \
+                      ('invoice_payment_events', 'merchant_settlement_finalized') \
+                  ) \
+            ) = 6 \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name IN ( \
+                      'merchant_settlement_checkpoints', \
+                      'merchant_settlement_retained_outputs' \
+                  ) \
+            ) = 2 \
+            AND ( \
+                SELECT COUNT(*) \
+                  FROM pg_constraint constraint_info \
+                  JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+                  JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                 WHERE namespace.nspname = 'public' \
+                   AND constraint_info.convalidated \
+                   AND constraint_info.conname IN ( \
+                       'chain_swap_tx_attempts_replaces_fkey', \
+                       'invoice_payment_events_merchant_chain_swap_fkey', \
+                       'merchant_settlement_checkpoint_journal_fkey', \
+                       'merchant_settlement_retained_event_fkey', \
+                       'merchant_settlement_retained_journal_fkey', \
+                       'merchant_settlement_retained_checkpoint_fkey' \
+                   ) \
+            ) = 6 \
+            AND ( \
+                SELECT COUNT(*) \
+                  FROM pg_trigger trigger_info \
+                 WHERE trigger_info.tgname IN ( \
+                     'chain_swap_tx_attempts_validate_replacement', \
+                     'invoice_payment_event_reject_merchant_settlement_delete', \
+                     'merchant_settlement_checkpoint_validate_write', \
+                     'merchant_settlement_checkpoint_reject_delete', \
+                     'merchant_settlement_retained_validate_update', \
+                     'merchant_settlement_retained_reject_delete' \
+                 ) \
+                   AND NOT trigger_info.tgisinternal \
+                   AND trigger_info.tgenabled IN ('O', 'A') \
+            ) = 6",
     )
     .fetch_one(pool)
     .await
