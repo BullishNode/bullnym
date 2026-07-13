@@ -296,9 +296,6 @@ pub struct SwapRecord {
     /// sweep gives up at `config.max_claim_attempts` and transitions the
     /// row to `ClaimStuck`.
     pub claim_attempts: i32,
-    /// Currently-budgeted fee rate in sat/vByte. Set on first attempt;
-    /// bumped on relay-fee rejection up to `claim_fee_sat_per_vb_cap`.
-    pub current_fee_rate: Option<f64>,
     /// Last claim error message — operator-facing surface for stuck swaps.
     pub last_claim_error: Option<String>,
     /// Set when Boltz refused the cooperative MuSig2 endpoint (HTTP 4xx
@@ -333,7 +330,7 @@ impl SwapRecord {
 const SWAP_RECORD_COLUMNS: &str =
     "id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
      preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid, \
-     claim_tx_hex, claim_path, claim_attempts, current_fee_rate, \
+     claim_tx_hex, claim_path, claim_attempts, \
      last_claim_error, cooperative_refused, invoice_id";
 
 pub async fn get_swap_by_boltz_id(

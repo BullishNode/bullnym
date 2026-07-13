@@ -7,7 +7,9 @@ use pay_service::fee_policy::{
     FeePolicyError, FeeProvenance, FeeRail, LiquidFeeDecision, LiquidFeePolicy,
     LiquidLastKnownGood, LiveBitcoin, LiveLiquid, SatPerVbyte,
 };
-use pay_service::fee_runtime::{FeePersistenceError, FeeRuntimePersistence};
+use pay_service::fee_runtime::{
+    FeePersistenceDisposition, FeePersistenceError, FeeRuntimePersistence,
+};
 
 pub const NOW_UNIX: u64 = 20_000;
 
@@ -186,7 +188,7 @@ impl FeeRuntimePersistence for RestoringFeePersistence {
         _current: &CurrentBitcoinFee,
         _policy: &BitcoinFeePolicy,
         _accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError> {
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError> {
         Err(FeePersistenceError::WriteFailed)
     }
 
@@ -196,7 +198,7 @@ impl FeeRuntimePersistence for RestoringFeePersistence {
         _current: &CurrentLiquidFee,
         _policy: &LiquidFeePolicy,
         _accepted_at_unix: u64,
-    ) -> Result<(), FeePersistenceError> {
+    ) -> Result<FeePersistenceDisposition, FeePersistenceError> {
         Err(FeePersistenceError::WriteFailed)
     }
 }
