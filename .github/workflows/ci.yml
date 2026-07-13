@@ -45,7 +45,9 @@ jobs:
           cargo clippy --lib --tests --locked -- -D warnings
 
       - name: Fresh and upgrade database integration tests
-        run: scripts/test-db.sh
+        run: |
+          scripts/test-db.sh
+          scripts/test-migration-053-production-topology.sh
 
       - name: Documentation integrity
         run: scripts/check-docs.sh
