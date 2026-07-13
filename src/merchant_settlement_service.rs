@@ -857,7 +857,7 @@ mod tests {
                 txid,
                 confirmation,
             };
-            LiquidMerchantOutputObservation::Observed(
+            LiquidMerchantOutputObservation::Observed(Box::new(
                 adapt_liquid_merchant_output(
                     &original,
                     replacement.then_some(&linked),
@@ -865,7 +865,7 @@ mod tests {
                     &self.blinding_key,
                 )
                 .unwrap(),
-            )
+            ))
         }
     }
 
@@ -970,14 +970,14 @@ mod tests {
                 txid,
                 confirmation,
             };
-            BitcoinMerchantOutputObservation::Observed(
+            BitcoinMerchantOutputObservation::Observed(Box::new(
                 adapt_bitcoin_merchant_output(
                     &original,
                     replacement.then_some(&linked),
                     &observation,
                 )
                 .unwrap(),
-            )
+            ))
         }
     }
 

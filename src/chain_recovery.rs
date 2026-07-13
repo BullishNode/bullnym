@@ -370,7 +370,7 @@ async fn fetch_bitcoin_recovery_status_snapshot(
         }
     }
     let prior_block_hash = match prior_block_height {
-        Some(height) if height == 0 => {
+        Some(0) => {
             return Err(AppError::ElectrumError(
                 "Bitcoin recovery prior block height must be positive".into(),
             ));

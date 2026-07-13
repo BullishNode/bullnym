@@ -255,7 +255,7 @@ impl ConfirmedMerchantOutputEvidence {
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         };
         let script_valid = !snapshot.destination_script_hex.is_empty()
-            && snapshot.destination_script_hex.len() % 2 == 0
+            && snapshot.destination_script_hex.len().is_multiple_of(2)
             && snapshot
                 .destination_script_hex
                 .bytes()

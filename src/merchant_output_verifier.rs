@@ -904,7 +904,7 @@ pub enum PreviousLiquidMerchantConfirmation<'a> {
 /// candidate identity and the prior canonical block needed by the lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiquidMerchantOutputObservation {
-    Observed(AdaptedMerchantOutputEvidence),
+    Observed(Box<AdaptedMerchantOutputEvidence>),
     Evicted {
         txid: String,
     },
@@ -1072,7 +1072,7 @@ pub async fn observe_liquid_merchant_output<B: UtxoBackend + ?Sized>(
     };
     let adapted = adapt_liquid_merchant_output(original, replacement, &observation, &blinding_key)
         .map_err(LiquidMerchantObservationError::Adapter)?;
-    Ok(LiquidMerchantOutputObservation::Observed(adapted))
+    Ok(LiquidMerchantOutputObservation::Observed(Box::new(adapted)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1254,7 +1254,7 @@ pub enum PreviousBitcoinMerchantConfirmation<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitcoinMerchantOutputObservation {
-    Observed(AdaptedMerchantOutputEvidence),
+    Observed(Box<AdaptedMerchantOutputEvidence>),
     Evicted {
         txid: String,
     },
@@ -1463,7 +1463,9 @@ pub(crate) async fn observe_bitcoin_merchant_output_journal(
     };
     let adapted = adapt_bitcoin_merchant_output(original, replacement, &observation)
         .map_err(BitcoinMerchantObservationError::Adapter)?;
-    Ok(BitcoinMerchantOutputObservation::Observed(adapted))
+    Ok(BitcoinMerchantOutputObservation::Observed(Box::new(
+        adapted,
+    )))
 }
 
 struct PreviousBitcoinBlock {
@@ -2949,7 +2951,7 @@ mod tests {
         let source_prevouts = [MerchantSourcePrevout {
             txid: &source.txid,
             vout: source.vout,
-            amount_sat: source.amount_sat.try_into().unwrap(),
+            amount_sat: source.amount_sat,
             script_pubkey_hex: &source.script_pubkey_hex,
         }];
         let asset = MerchantAsset::Bitcoin;
@@ -3001,7 +3003,7 @@ mod tests {
         let source_prevouts = [MerchantSourcePrevout {
             txid: &source.txid,
             vout: source.vout,
-            amount_sat: source.amount_sat.try_into().unwrap(),
+            amount_sat: source.amount_sat,
             script_pubkey_hex: &source.script_pubkey_hex,
         }];
         let asset = MerchantAsset::Bitcoin;
@@ -3052,7 +3054,7 @@ mod tests {
         let original_sources = [MerchantSourcePrevout {
             txid: &source.txid,
             vout: source.vout,
-            amount_sat: source.amount_sat.try_into().unwrap(),
+            amount_sat: source.amount_sat,
             script_pubkey_hex: &source.script_pubkey_hex,
         }];
         let replacement_sources = original_sources;
@@ -3128,7 +3130,7 @@ mod tests {
         let sources = [MerchantSourcePrevout {
             txid: &source.txid,
             vout: source.vout,
-            amount_sat: source.amount_sat.try_into().unwrap(),
+            amount_sat: source.amount_sat,
             script_pubkey_hex: &source.script_pubkey_hex,
         }];
         let asset = MerchantAsset::Bitcoin;
