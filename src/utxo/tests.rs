@@ -257,6 +257,59 @@ fn liquid_snapshot_plan_bounds_unique_current_and_prior_heights() {
 }
 
 #[test]
+fn liquid_snapshot_plan_accepts_256_and_rejects_257() {
+    let limits = LiquidHistorySnapshotLimits {
+        max_history_entries: 256,
+        max_block_heights: 256,
+    };
+    let entries = (1..=257)
+        .map(|height| LiquidHistoryEntry {
+            txid: format!("{height:064x}"),
+            height,
+            block_hash: None,
+        })
+        .collect::<Vec<_>>();
+    let production_entries = (0..204)
+        .map(|index| LiquidHistoryEntry {
+            txid: format!("{:064x}", index + 1),
+            height: index % 71 + 1,
+            block_hash: None,
+        })
+        .collect::<Vec<_>>();
+
+    let LiquidSnapshotPlan::Ready(production_heights) =
+        liquid_snapshot_plan(&production_entries, &[], 300, limits).unwrap()
+    else {
+        panic!("observed production history and height counts must fit the bounded snapshot");
+    };
+    assert_eq!(production_entries.len(), 204);
+    assert_eq!(production_heights.len(), 71);
+
+    assert!(matches!(
+        liquid_snapshot_plan(&entries[..256], &[], 300, limits).unwrap(),
+        LiquidSnapshotPlan::Ready(_)
+    ));
+    assert_eq!(
+        liquid_snapshot_plan(&entries, &[], 300, limits).unwrap(),
+        LiquidSnapshotPlan::Incomplete(LiquidHistorySnapshotLimit::HistoryEntries {
+            observed: 257,
+            limit: 256,
+        })
+    );
+    assert!(matches!(
+        liquid_snapshot_plan(&[], &(1..=256).collect::<Vec<_>>(), 300, limits).unwrap(),
+        LiquidSnapshotPlan::Ready(_)
+    ));
+    assert_eq!(
+        liquid_snapshot_plan(&[], &(1..=257).collect::<Vec<_>>(), 300, limits).unwrap(),
+        LiquidSnapshotPlan::Incomplete(LiquidHistorySnapshotLimit::BlockHeights {
+            observed: 257,
+            limit: 256,
+        })
+    );
+}
+
+#[test]
 fn liquid_snapshot_plan_rejects_invalid_prior_height() {
     let error = liquid_snapshot_plan(
         &[],

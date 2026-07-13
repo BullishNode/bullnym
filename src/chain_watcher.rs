@@ -33,11 +33,11 @@ use crate::utxo::{
 /// fetch consumes its own token. These caps stop a dusted address from causing
 /// unbounded header or raw-transaction fanout in one obligation.
 const LIQUID_SNAPSHOT_LIMITS: LiquidHistorySnapshotLimits = LiquidHistorySnapshotLimits {
-    max_history_entries: 32,
-    max_block_heights: 64,
+    max_history_entries: db::MAX_DIRECT_OBSERVATIONS_PER_BATCH,
+    max_block_heights: db::MAX_DIRECT_OBSERVATIONS_PER_BATCH,
 };
-const MAX_LIQUID_KNOWN_OBSERVATIONS: usize = 128;
-const MAX_LIQUID_EMITTED_OUTPUTS: usize = 128;
+const MAX_LIQUID_KNOWN_OBSERVATIONS: usize = db::MAX_DIRECT_OBSERVATIONS_PER_BATCH;
+const MAX_LIQUID_EMITTED_OUTPUTS: usize = db::MAX_DIRECT_OBSERVATIONS_PER_BATCH;
 
 fn complete_liquid_snapshot(
     outcome: LiquidHistorySnapshotOutcome,
@@ -2349,13 +2349,18 @@ mod tests {
 
     #[test]
     fn liquid_history_anchor_and_prior_tx_caps_are_hard_bounds() {
+        assert_eq!(LIQUID_SNAPSHOT_LIMITS.max_history_entries, 256);
+        assert_eq!(LIQUID_SNAPSHOT_LIMITS.max_block_heights, 256);
+        assert_eq!(MAX_LIQUID_KNOWN_OBSERVATIONS, 256);
+        assert_eq!(MAX_LIQUID_EMITTED_OUTPUTS, 256);
+
         for limit in [
             LiquidHistorySnapshotLimit::HistoryEntries {
-                observed: LIQUID_SNAPSHOT_LIMITS.max_history_entries + 1,
+                observed: 257,
                 limit: LIQUID_SNAPSHOT_LIMITS.max_history_entries,
             },
             LiquidHistorySnapshotLimit::BlockHeights {
-                observed: LIQUID_SNAPSHOT_LIMITS.max_block_heights + 1,
+                observed: 257,
                 limit: LIQUID_SNAPSHOT_LIMITS.max_block_heights,
             },
         ] {
@@ -2363,32 +2368,17 @@ mod tests {
             assert_eq!(result.unwrap_err(), limit);
         }
 
-        assert!(!prior_liquid_tx_count_is_hard_bound(
-            LIQUID_SNAPSHOT_LIMITS.max_history_entries
-        ));
-        assert!(prior_liquid_tx_count_is_hard_bound(
-            LIQUID_SNAPSHOT_LIMITS.max_history_entries + 1
-        ));
-        assert!(!liquid_known_observation_count_is_hard_bound(
-            MAX_LIQUID_KNOWN_OBSERVATIONS
-        ));
-        assert!(liquid_known_observation_count_is_hard_bound(
-            MAX_LIQUID_KNOWN_OBSERVATIONS + 1
-        ));
-        assert!(!liquid_emitted_output_count_is_hard_bound(
-            MAX_LIQUID_EMITTED_OUTPUTS
-        ));
-        assert!(liquid_emitted_output_count_is_hard_bound(
-            MAX_LIQUID_EMITTED_OUTPUTS + 1
-        ));
-        assert!(!liquid_emitted_output_count_would_be_hard_bound(
-            MAX_LIQUID_EMITTED_OUTPUTS - 1,
-            1
-        ));
-        assert!(liquid_emitted_output_count_would_be_hard_bound(
-            MAX_LIQUID_EMITTED_OUTPUTS,
-            1
-        ));
+        assert!(!prior_liquid_tx_count_is_hard_bound(204));
+        assert!(!prior_liquid_tx_count_is_hard_bound(256));
+        assert!(prior_liquid_tx_count_is_hard_bound(257));
+        assert!(!liquid_known_observation_count_is_hard_bound(199));
+        assert!(!liquid_known_observation_count_is_hard_bound(256));
+        assert!(liquid_known_observation_count_is_hard_bound(257));
+        assert!(!liquid_emitted_output_count_is_hard_bound(199));
+        assert!(!liquid_emitted_output_count_is_hard_bound(256));
+        assert!(liquid_emitted_output_count_is_hard_bound(257));
+        assert!(!liquid_emitted_output_count_would_be_hard_bound(255, 1));
+        assert!(liquid_emitted_output_count_would_be_hard_bound(256, 1));
         assert!(liquid_emitted_output_count_would_be_hard_bound(
             usize::MAX,
             1

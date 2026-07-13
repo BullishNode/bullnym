@@ -5,6 +5,11 @@ use uuid::Uuid;
 
 use super::InvoiceAccountingTolerances;
 
+/// Maximum number of direct observations the atomic reducer accepts in one
+/// generation. Watchers may use tighter rail-specific bounds, but never a
+/// larger batch than this downstream limit.
+pub(crate) const MAX_DIRECT_OBSERVATIONS_PER_BATCH: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectPaymentSource {
     Bitcoin,
@@ -761,6 +766,9 @@ fn validate_observation_batch(
     source: DirectPaymentSource,
     observations: &[DirectOutputObservation<'_>],
 ) -> Result<(), sqlx::Error> {
+    if observations.len() > MAX_DIRECT_OBSERVATIONS_PER_BATCH {
+        return protocol_error("direct observation batch exceeds the atomic reducer limit");
+    }
     let mut event_keys = HashSet::with_capacity(observations.len());
     for observation in observations {
         observation.validate(source)?;
@@ -2013,6 +2021,40 @@ mod tests {
             ),
         ];
         assert!(validate_observation_batch(DirectPaymentSource::Bitcoin, &observations).is_err());
+    }
+
+    #[test]
+    fn direct_reducer_batch_accepts_256_and_rejects_257() {
+        assert_eq!(MAX_DIRECT_OBSERVATIONS_PER_BATCH, 256);
+        let txids = (0..=256)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let event_keys = txids
+            .iter()
+            .map(|txid| format!("bitcoin_direct:{txid}:0"))
+            .collect::<Vec<_>>();
+        let observations = txids
+            .iter()
+            .zip(&event_keys)
+            .map(|(txid, event_key)| {
+                bitcoin_observation(
+                    event_key,
+                    txid,
+                    0,
+                    DirectEvidenceVerification::Verified,
+                    DirectObservationPhase::Confirmed,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            validate_observation_batch(DirectPaymentSource::Bitcoin, &observations[..256]).is_ok()
+        );
+        let error = validate_observation_batch(DirectPaymentSource::Bitcoin, &observations)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("atomic reducer limit"));
     }
 
     #[test]
