@@ -29,12 +29,21 @@ use boltz_client::swaps::boltz::BoltzApiClientV2;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::WorkerReporter;
-use crate::config::ReconcilerConfig;
-use crate::db::{self, ReconcilerSwap, SwapStatus};
-use crate::error::AppError;
-use crate::invoice;
-use crate::AppState;
+use crate::{
+    admission::WorkerReporter,
+    chain_swap_action::{
+        recheck_recovery_under_lock, reduce_chain_swap_evidence, ChainSwapAction,
+        ChainSwapEvidence, MerchantTransactionEvidence, RecoveryExecutionGate,
+    },
+    config::ReconcilerConfig,
+    db::{self, ChainSwapRecord, ChainSwapStatus, ReconcilerSwap, SwapStatus},
+    error::AppError,
+    invoice,
+    merchant_settlement_lifecycle::{
+        MerchantSettlementLifecycle, SettlementAccountingState, SettlementChain,
+    },
+    AppState,
+};
 
 /// Health accumulated across one worker cycle. Provider failures only close a
 /// cycle when every attempted provider call failed, which isolates a missing or
@@ -275,6 +284,166 @@ pub fn spawn(
             }
         }
     })
+}
+
+/// Runtime action exposed to the future lifecycle repository worker. Only
+/// chain observation/finality and the already-established under-lock recovery
+/// gate can produce an executable action; every other reducer result is
+/// retained explicitly as blocked work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapSettlementRuntimeAction {
+    WatchTransaction,
+    Finalize,
+    RecoverBitcoin,
+    Blocked(ChainSwapAction),
+}
+
+/// One coherent runtime boundary: current source/lock/action evidence plus the
+/// exact verified merchant-output amount retained by the settlement repository.
+/// Requested, quoted, and provider amounts do not belong here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredSettlementRuntimeInput {
+    pub chain_evidence: ChainSwapEvidence,
+    pub verified_actual_amount_sat: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSwapSettlementRuntimeDecision {
+    pub action: ChainSwapSettlementRuntimeAction,
+    /// Present from the first independently verified confirmation onward, but
+    /// only when the coherent reducer result still authorizes watching or
+    /// finalization. This is intentionally independent of finality.
+    pub accounting_eligible_actual_amount_sat: Option<u64>,
+}
+
+/// Compose a policy-validated restored settlement lifecycle with a fresh
+/// per-swap source/lock evidence boundary. The lifecycle is authoritative for
+/// its merchant transaction slot; conflicting persisted transaction evidence
+/// fails closed. Bitcoin recovery is returned only through the shared
+/// under-lock execution gate. A recovery executor must call this at its
+/// per-swap execution-lock boundary; a pre-lock call is planning evidence only
+/// and never authorizes broadcast.
+pub fn decide_restored_chain_swap_settlement(
+    chain_swap: &ChainSwapRecord,
+    lifecycle: &MerchantSettlementLifecycle,
+    input: RestoredSettlementRuntimeInput,
+) -> ChainSwapSettlementRuntimeDecision {
+    let status = match chain_swap.parsed_status() {
+        Ok(status) => status,
+        Err(_) => return blocked_settlement_decision(ChainSwapAction::IntegrityHold),
+    };
+    if chain_swap.from_chain != "BTC"
+        || chain_swap.to_chain != "L-BTC"
+        || chain_swap.user_lock_amount_sat <= 0
+        || chain_swap.effective_server_lock_amount_sat() <= 0
+        || !record_matches_settlement_path(chain_swap, status, lifecycle)
+    {
+        return blocked_settlement_decision(ChainSwapAction::IntegrityHold);
+    }
+
+    let mapped = MerchantTransactionEvidence::from_settlement_lifecycle(lifecycle);
+    let mut evidence = input.chain_evidence;
+    let transaction_slot = match lifecycle.chain() {
+        SettlementChain::Liquid => &mut evidence.liquid_claim_transaction,
+        SettlementChain::Bitcoin => &mut evidence.bitcoin_recovery_transaction,
+    };
+    if !matches!(*transaction_slot, MerchantTransactionEvidence::None)
+        && *transaction_slot != mapped
+    {
+        return blocked_settlement_decision(ChainSwapAction::IntegrityHold);
+    }
+    *transaction_slot = mapped;
+
+    let reduced = reduce_chain_swap_evidence(&evidence);
+    let recovery_gate = recheck_recovery_under_lock(&evidence);
+    let action = match reduced {
+        ChainSwapAction::WatchTransaction => ChainSwapSettlementRuntimeAction::WatchTransaction,
+        ChainSwapAction::Finalize => ChainSwapSettlementRuntimeAction::Finalize,
+        ChainSwapAction::RecoverBitcoin => match recovery_gate {
+            RecoveryExecutionGate::Authorized => ChainSwapSettlementRuntimeAction::RecoverBitcoin,
+            RecoveryExecutionGate::Blocked(action) => {
+                ChainSwapSettlementRuntimeAction::Blocked(action)
+            }
+        },
+        _ => match recovery_gate {
+            RecoveryExecutionGate::Blocked(action) => {
+                ChainSwapSettlementRuntimeAction::Blocked(action)
+            }
+            RecoveryExecutionGate::Authorized => {
+                ChainSwapSettlementRuntimeAction::Blocked(ChainSwapAction::IntegrityHold)
+            }
+        },
+    };
+    if matches!(action, ChainSwapSettlementRuntimeAction::RecoverBitcoin)
+        && status != ChainSwapStatus::Refunding
+    {
+        return blocked_settlement_decision(ChainSwapAction::IntegrityHold);
+    }
+
+    let accounting_eligible = matches!(
+        lifecycle.accounting_state(),
+        SettlementAccountingState::Confirmed | SettlementAccountingState::Finalized
+    );
+    let executable_settlement = matches!(
+        action,
+        ChainSwapSettlementRuntimeAction::WatchTransaction
+            | ChainSwapSettlementRuntimeAction::Finalize
+    );
+    let accounting_eligible_actual_amount_sat = if accounting_eligible && executable_settlement {
+        match input
+            .verified_actual_amount_sat
+            .and_then(|amount| u64::try_from(amount).ok())
+            .filter(|amount| *amount > 0)
+        {
+            Some(amount) => Some(amount),
+            None => return blocked_settlement_decision(ChainSwapAction::IntegrityHold),
+        }
+    } else {
+        None
+    };
+
+    ChainSwapSettlementRuntimeDecision {
+        action,
+        accounting_eligible_actual_amount_sat,
+    }
+}
+
+fn record_matches_settlement_path(
+    chain_swap: &ChainSwapRecord,
+    status: ChainSwapStatus,
+    lifecycle: &MerchantSettlementLifecycle,
+) -> bool {
+    let txid_matches =
+        |candidate: &str| candidate.eq_ignore_ascii_case(lifecycle.active_txid().as_str());
+    match lifecycle.chain() {
+        SettlementChain::Liquid => {
+            matches!(
+                status,
+                ChainSwapStatus::ServerLockMempool
+                    | ChainSwapStatus::ServerLockConfirmed
+                    | ChainSwapStatus::Claiming
+                    | ChainSwapStatus::Claimed
+                    | ChainSwapStatus::ClaimFailed
+                    | ChainSwapStatus::ClaimStuck
+            ) && chain_swap.claim_txid.as_deref().is_some_and(txid_matches)
+        }
+        SettlementChain::Bitcoin => match status {
+            ChainSwapStatus::Refunding => {
+                chain_swap.refund_txid.as_deref().is_none_or(txid_matches)
+            }
+            ChainSwapStatus::Refunded => {
+                chain_swap.refund_txid.as_deref().is_some_and(txid_matches)
+            }
+            _ => false,
+        },
+    }
+}
+
+fn blocked_settlement_decision(action: ChainSwapAction) -> ChainSwapSettlementRuntimeDecision {
+    ChainSwapSettlementRuntimeDecision {
+        action: ChainSwapSettlementRuntimeAction::Blocked(action),
+        accounting_eligible_actual_amount_sat: None,
+    }
 }
 
 /// Chain-swap reconciler. The reverse `spawn` above only touches `swap_records`;

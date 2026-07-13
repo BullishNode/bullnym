@@ -265,9 +265,11 @@ pub async fn mark_recovery_integrity_hold(
     Ok(result.rows_affected())
 }
 
-/// Atomically record a known broadcast transaction and mirror it to the
-/// compatibility chain-swap columns.  The destination equality predicate is
-/// the final database-side guard against redirecting a committed attempt.
+/// Atomically record a known broadcast transaction and mirror its txid to the
+/// compatibility chain-swap columns. The swap remains nonterminal `refunding`:
+/// exact merchant-output confirmation/finality owns the later transition.
+/// The destination equality predicate is the final database-side guard against
+/// redirecting a committed attempt.
 pub async fn complete_recovery_broadcast(
     pool: &PgPool,
     attempt_id: Uuid,
@@ -303,15 +305,15 @@ pub async fn complete_recovery_broadcast(
 
     let swap_rows = sqlx::query(
         "UPDATE chain_swap_records cs \
-            SET status = 'refunded', refund_txid = $3, updated_at = NOW() \
+            SET status = 'refunding', refund_txid = $3, updated_at = NOW() \
           FROM chain_swap_tx_attempts a \
          WHERE cs.id = $2 \
            AND a.id = $1 \
            AND a.chain_swap_id = cs.id \
            AND a.txid = $3 \
            AND cs.refund_address = a.destination_address \
-           AND (cs.status = 'refunding' \
-                OR (cs.status = 'refunded' AND cs.refund_txid = $3))",
+           AND cs.status = 'refunding' \
+           AND (cs.refund_txid IS NULL OR cs.refund_txid = $3)",
     )
     .bind(attempt_id)
     .bind(chain_swap_id)
