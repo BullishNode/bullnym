@@ -23,6 +23,14 @@ mode and is followed synchronously by a full bounded read. Bullnym verifies the
 returned bytes, byte length, format metadata, and SHA-256 metadata before it
 reports success.
 
+The write API accepts only `EncryptedSwapManifestV1`. Constructing that type
+requires a canonical closed-schema v1 envelope with the fixed algorithms, a
+safe key identifier, a parseable x-only signer, a 192-bit lowercase-hex nonce,
+and bounded lowercase-hex ciphertext. This is structural admission, not
+decryption: only restore-time authentication with the expected key and signer
+can validate the encrypted payload, and the ciphertext cannot be assumed to
+bind the UUIDs in the object key.
+
 Retrying the same identity with the same bytes is idempotent. The same identity
 with different bytes is an integrity conflict. The Bullnym API exposes no
 overwrite or delete operation. Reads are capped at one MiB and lexicographic

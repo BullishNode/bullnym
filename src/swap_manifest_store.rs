@@ -16,6 +16,8 @@ use object_store::{Attribute, Attributes, ObjectStore, ObjectStoreExt, PutMode, 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::swap_manifest::EncryptedSwapManifestV1;
+
 /// The format package has the same one-MiB encoded-envelope ceiling.
 pub const MAX_MANIFEST_OBJECT_BYTES: usize = 1_048_576;
 /// A caller must explicitly page or narrow a later restore scan above this cap.
@@ -262,6 +264,7 @@ pub enum CorruptReadKind {
     DigestMismatch,
     WrongFormatVersion,
     InvalidUtf8,
+    InvalidEnvelope,
     UnexpectedObjectKey,
 }
 
@@ -424,8 +427,9 @@ impl RecoveryManifestStore {
     pub async fn put_v1(
         &self,
         id: ManifestObjectId,
-        encoded: &str,
+        manifest: &EncryptedSwapManifestV1,
     ) -> Result<ManifestWriteOutcome, ManifestStoreError> {
+        let encoded = manifest.encoded();
         validate_encoded_size(encoded.len())?;
         let requested_sha256 = sha256_hex(encoded.as_bytes());
         let location = Path::from(self.object_key_v1(id));
@@ -552,6 +556,9 @@ impl RecoveryManifestStore {
         }
         let encoded = String::from_utf8(encoded)
             .map_err(|_| ManifestStoreError::corrupt(id, CorruptReadKind::InvalidUtf8))?;
+        let encoded = EncryptedSwapManifestV1::parse(encoded)
+            .map_err(|_| ManifestStoreError::corrupt(id, CorruptReadKind::InvalidEnvelope))?
+            .into_encoded();
         Ok(StoredRecoveryManifest {
             encoded,
             sha256_hex: actual_sha256,
@@ -797,6 +804,26 @@ mod tests {
         ManifestObjectId::new(Uuid::from_u128(number), Uuid::from_u128(number + 10_000)).unwrap()
     }
 
+    fn manifest(byte: u8) -> EncryptedSwapManifestV1 {
+        // The storage boundary can validate the public envelope without
+        // possessing restore keys. Authentication remains an open-time check.
+        let value = serde_json::json!({
+            "ciphertext_hex": format!("{byte:02x}").repeat(16),
+            "encryption_algorithm": "xchacha20poly1305",
+            "encryption_key_id": "manifest-key-test",
+            "format": "bullnym-chain-swap-manifest",
+            "nonce_hex": "00".repeat(24),
+            "signature_algorithm": "bip340-secp256k1-sha256",
+            "signer_xonly_public_key":
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "version": 1,
+        });
+        let encoded = crate::canonical_json::canonical_json_and_sha256(&value)
+            .unwrap()
+            .0;
+        EncryptedSwapManifestV1::parse(encoded).unwrap()
+    }
+
     fn memory_store() -> (Arc<InMemory>, RecoveryManifestStore) {
         let backend = Arc::new(InMemory::new());
         let store = RecoveryManifestStore::with_backend(backend.clone(), "bullnym/recovery".into());
@@ -896,11 +923,12 @@ mod tests {
     async fn identical_concurrent_creates_are_idempotent() {
         let (_, store) = memory_store();
         let object_id = id(1);
+        let manifest = manifest(0xaa);
         let first = store.clone();
         let second = store.clone();
         let (first, second) = tokio::join!(
-            first.put_v1(object_id, "{\"ciphertext\":\"aa\"}"),
-            second.put_v1(object_id, "{\"ciphertext\":\"aa\"}"),
+            first.put_v1(object_id, &manifest),
+            second.put_v1(object_id, &manifest),
         );
         let mut outcomes = [first.unwrap(), second.unwrap()];
         outcomes.sort_by_key(|outcome| match outcome {
@@ -920,11 +948,13 @@ mod tests {
     async fn concurrent_different_bytes_never_overwrite() {
         let (_, store) = memory_store();
         let object_id = id(2);
+        let first_manifest = manifest(0xaa);
+        let second_manifest = manifest(0xbb);
         let first = store.clone();
         let second = store.clone();
         let (first, second) = tokio::join!(
-            first.put_v1(object_id, "{\"ciphertext\":\"aa\"}"),
-            second.put_v1(object_id, "{\"ciphertext\":\"bb\"}"),
+            first.put_v1(object_id, &first_manifest),
+            second.put_v1(object_id, &second_manifest),
         );
         let results = [first, second];
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
@@ -938,7 +968,8 @@ mod tests {
         let stored = store.get_v1(object_id).await.unwrap();
         assert!(matches!(
             stored.encoded(),
-            "{\"ciphertext\":\"aa\"}" | "{\"ciphertext\":\"bb\"}"
+            encoded if encoded == first_manifest.encoded()
+                || encoded == second_manifest.encoded()
         ));
     }
 
@@ -946,23 +977,29 @@ mod tests {
     async fn retry_with_different_bytes_is_an_integrity_conflict() {
         let (_, store) = memory_store();
         let object_id = id(3);
+        let first = manifest(0x11);
+        let second = manifest(0x22);
         assert_eq!(
-            store.put_v1(object_id, "first").await.unwrap(),
+            store.put_v1(object_id, &first).await.unwrap(),
             ManifestWriteOutcome::Created
         );
         assert!(matches!(
-            store.put_v1(object_id, "second").await,
+            store.put_v1(object_id, &second).await,
             Err(ManifestStoreError::Conflict { id, .. }) if id == object_id
         ));
-        assert_eq!(store.get_v1(object_id).await.unwrap().encoded(), "first");
+        assert_eq!(
+            store.get_v1(object_id).await.unwrap().encoded(),
+            first.encoded()
+        );
     }
 
     #[tokio::test]
     async fn read_detects_corrupt_bytes_against_stored_digest() {
         let (backend, store) = memory_store();
         let object_id = id(4);
-        let original = "{\"ciphertext\":\"original\"}";
-        store.put_v1(object_id, original).await.unwrap();
+        let manifest = manifest(0x33);
+        let original = manifest.encoded();
+        store.put_v1(object_id, &manifest).await.unwrap();
 
         let location = Path::from(store.object_key_v1(object_id));
         let options = PutOptions {
@@ -988,10 +1025,8 @@ mod tests {
     async fn listing_is_bounded_and_keys_are_deterministic() {
         let (_, store) = memory_store();
         for number in 10..13 {
-            store
-                .put_v1(id(number), &format!("manifest-{number}"))
-                .await
-                .unwrap();
+            let manifest = manifest(number as u8);
+            store.put_v1(id(number), &manifest).await.unwrap();
         }
         assert_eq!(
             store.object_key_v1(id(10)),
@@ -1061,16 +1096,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encoded_size_and_missing_object_are_distinct() {
+    async fn encoded_size_guard_and_missing_object_are_distinct() {
         let (_, store) = memory_store();
         let object_id = id(30);
         assert!(matches!(
-            store.put_v1(object_id, "").await,
+            validate_encoded_size(0),
             Err(ManifestStoreError::EncodedSize { actual: 0, .. })
         ));
-        let oversized = "x".repeat(MAX_MANIFEST_OBJECT_BYTES + 1);
         assert!(matches!(
-            store.put_v1(object_id, &oversized).await,
+            validate_encoded_size(MAX_MANIFEST_OBJECT_BYTES + 1),
             Err(ManifestStoreError::EncodedSize { actual, max })
                 if actual == MAX_MANIFEST_OBJECT_BYTES + 1
                     && max == MAX_MANIFEST_OBJECT_BYTES
