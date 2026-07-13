@@ -31,6 +31,26 @@ expect_allowed \
   045_generated_donation_page_og \
   046_chain_swap_tx_attempts \
   4
+expect_allowed \
+  050_swap_key_lineage \
+  050_swap_key_lineage \
+  0
+expect_allowed \
+  050_swap_key_lineage \
+  051_future_lineage_aware_schema \
+  0
+expect_refused \
+  049_watcher_lane_progress \
+  050_swap_key_lineage \
+  0
+expect_refused \
+  049_watcher_lane_progress \
+  051_future_lineage_aware_schema \
+  0
+expect_refused \
+  malformed-previous-marker \
+  050_swap_key_lineage \
+  0
 expect_refused \
   046_chain_swap_tx_attempts \
   047_direct_payment_lifecycle_foundation \

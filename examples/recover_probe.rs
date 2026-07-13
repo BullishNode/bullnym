@@ -61,12 +61,55 @@ async fn main() {
     )
     .await
     .unwrap();
-    let swap = db::record_chain_swap(
+    let claim_index = db::next_swap_key_index(&pool).await.unwrap();
+    let refund_index = db::next_swap_key_index(&pool).await.unwrap();
+    let root_fingerprint = "70726f62656b6579";
+    let claim_public_key = format!(
+        "02{}",
+        hex::encode(Sha256::digest(format!("recover-probe-claim-{claim_index}")))
+    );
+    let refund_public_key = format!(
+        "03{}",
+        hex::encode(Sha256::digest(format!(
+            "recover-probe-refund-{refund_index}"
+        )))
+    );
+    let preimage_hex = "11".repeat(32);
+    let preimage_hash = hex::encode(Sha256::digest([0x11_u8; 32]));
+    let claim_allocation_id = db::reserve_swap_key_allocation(
+        &pool,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: claim_index as i64,
+            purpose: db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &claim_public_key,
+            preimage_hash_hex: Some(&preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let refund_allocation_id = db::reserve_swap_key_allocation(
+        &pool,
+        &db::NewSwapKeyAllocation {
+            root_fingerprint,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            child_index: refund_index as i64,
+            purpose: db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &refund_public_key,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let swap = db::record_chain_swap_with_lineage(
         &pool,
         &db::NewChainSwapRecord {
-            claim_key_index: None,
-            refund_key_index: None,
-            root_fingerprint: None,
+            claim_key_index: Some(claim_index as i64),
+            refund_key_index: Some(refund_index as i64),
+            root_fingerprint: Some(root_fingerprint),
             invoice_id: invoice.id,
             nym: Some(&nym),
             boltz_swap_id: "probe-swap-1",
@@ -74,15 +117,26 @@ async fn main() {
             lockup_bip21: None,
             user_lock_amount_sat: 105_000,
             server_lock_amount_sat: 100_000,
-            preimage_hex: &"11".repeat(32),
+            preimage_hex: &preimage_hex,
             claim_key_hex: &"22".repeat(32),
             refund_key_hex: &"33".repeat(32),
             boltz_response_json: "{\"id\":\"probe-swap-1\"}",
         },
+        &db::ChainSwapLineage {
+            claim_allocation_id,
+            refund_allocation_id,
+            key_epoch: 1,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key,
+            refund_public_key_hex: &refund_public_key,
+            preimage_hash_hex: &preimage_hash,
+        },
     )
     .await
     .unwrap();
-    db::mark_chain_swap_refund_due(&pool, swap.id).await.unwrap();
+    db::mark_chain_swap_refund_due(&pool, swap.id)
+        .await
+        .unwrap();
 
     // Sign invoice-recovery-list: empty nym, ZERO payload fields.
     let fields: [&str; 0] = [];

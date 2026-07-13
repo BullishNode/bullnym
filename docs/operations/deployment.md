@@ -18,6 +18,8 @@
    identities.
 4. Back up PostgreSQL and confirm the swap mnemonic recovery procedure.
 5. Apply migrations before starting a binary that depends on the new schema.
+   Migration 050 is a stop-the-writers boundary; follow the dedicated sequence
+   below instead of applying it while an older service is live.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -43,6 +45,18 @@ history, so `scripts/deploy.sh` refuses the entire automatic binary/PWA restore
 and leaves the candidate files installed for operator recovery. Do not delete
 transition history to force a rollback; repair or roll forward with a
 047-compatible binary.
+
+Migration 050 is an unconditional roll-forward-only writer boundary. Before
+applying it, close new reverse- and chain-swap admission, drain requests, and
+stop every pre-050 Bullnym instance. Verify no old process or job can create a
+swap, take the required backup, apply `050_swap_key_lineage.sql`, and then start
+only a 050-aware binary. Do not use a rolling or mixed-version rollout across
+this boundary: an old writer can expose a key to Boltz without first committing
+the allocation journal. The backup must preserve `swap_key_allocations`,
+`swap_key_legacy_high_water`, both swap tables, and `swap_key_seq` together.
+After migration 050 exists, automatic rollback to any pre-050 binary is refused
+even when no swap has yet been created; recover by repairing or rolling forward
+with a lineage-aware binary.
 
 ## Reproducing a prior artifact
 

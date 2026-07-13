@@ -338,9 +338,11 @@ pub enum PurgeOutcome {
     InFlightSwaps(usize),
 }
 
-/// Hard-delete every swap_record and outpoint_address tied to this npub's
-/// active nym, then deactivate the user row while keeping `nym` and `npub`
-/// so the address stays reserved and the original owner can re-register.
+/// Hard-delete every reverse/chain swap row and outpoint address tied to this
+/// npub's active nym, then deactivate the user row while keeping `nym` and
+/// `npub` so the address stays reserved and the original owner can re-register.
+/// Migration-050's non-secret allocation journal and migration-044 high-water
+/// ledger are deliberately retained.
 ///
 /// Refuses if any swap is non-terminal: those rows hold the only copy of
 /// `claim_key_hex` / `preimage_hex` needed to redeem a Boltz lockup.
@@ -392,6 +394,10 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     }
 
     sqlx::query("DELETE FROM swap_records WHERE nym = $1")
+        .bind(&user.nym)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chain_swap_records WHERE nym = $1")
         .bind(&user.nym)
         .execute(&mut *tx)
         .await?;
