@@ -18,8 +18,9 @@
 //!
 //! Token-bucket guards against runaway requests when many invoices are open
 //! at once: at the configured rate (default 5 RPS) the watcher stops issuing
-//! requests for the rest of the tick once the bucket is drained, picking up
-//! again next tick.
+//! requests for the rest of the bounded turn once the bucket is drained. An
+//! unfinished epoch receives a short continuation tick without changing the
+//! normal cadence that starts fresh recent or historical traversals.
 //!
 //! Cancellation: `tokio::select!` against `cancel.cancelled()` interleaves
 //! between every blocking await so a `cancel()` from main.rs is honored
@@ -39,6 +40,7 @@ use crate::admission::WorkerReporter;
 use crate::config::BitcoinWatcherConfig;
 use crate::db;
 use crate::rate_limit::TokenBucket;
+use crate::watcher_schedule::{wait_for_epoch_resume, EpochResumeSchedule, WatcherTurn};
 
 type InvoiceForBtcPoll = db::BitcoinWatcherInvoicePageRow;
 
@@ -121,7 +123,8 @@ enum AddressHistoryFetch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvoiceCheckOutcome {
     Complete,
-    Incomplete,
+    ContinueSoon,
+    DeferToCadence,
     HardBound,
     Failed,
 }
@@ -187,6 +190,13 @@ impl WatchTier {
 
     const fn label(self) -> &'static str {
         self.lane().as_str()
+    }
+
+    const fn from_lane(lane: db::WatcherLane) -> Self {
+        match lane {
+            db::WatcherLane::Recent => Self::Recent,
+            db::WatcherLane::Historical => Self::Historical,
+        }
     }
 }
 
@@ -366,6 +376,7 @@ impl BitcoinWatcher {
         let mut tier_health = TierHealth::default();
         let mut active_epoch = BitcoinTierScanEpoch::default();
         let mut idle_epoch = BitcoinTierScanEpoch::default();
+        let mut resume_schedule = EpochResumeSchedule::default();
         tracing::info!(
             event = "bitcoin_watcher_started",
             endpoint = %self.cfg.endpoint,
@@ -386,30 +397,35 @@ impl BitcoinWatcher {
             (WatchTier::Recent, &mut active_epoch),
             (WatchTier::Historical, &mut idle_epoch),
         ] {
-            let startup_outcome = self.poll_tier(tier, &cancel, &reporter, epoch).await;
+            let startup_turn = self.poll_tier(tier, &cancel, &reporter, epoch).await;
             if cancel.is_cancelled() {
                 reporter.intentional_shutdown();
                 return;
             }
-            report_outcome(&reporter, &mut tier_health, tier, startup_outcome);
+            resume_schedule.observe(tier.lane(), startup_turn.resume);
+            report_outcome(&reporter, &mut tier_health, tier, startup_turn.outcome);
         }
 
         let mut active = tokio::time::interval(Duration::from_secs(self.cfg.active_tick_secs));
-        // The current process completed its startup scan above; consume each
-        // interval's immediate tick so subsequent scans follow their cadence.
+        active.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Startup gave each lane one bounded turn above. Consume the immediate
+        // interval ticks so only normal cadence starts a fresh epoch; an
+        // unfinished epoch is continued separately on the short resume tick.
         active.tick().await;
         let mut idle = tokio::time::interval(Duration::from_secs(self.cfg.idle_tick_secs));
+        idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         idle.tick().await;
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     tracing::info!("bitcoin_watcher: shutdown requested");
                     reporter.intentional_shutdown();
                     return;
                 }
                 _ = active.tick() => {
-                    let healthy = self
+                    let turn = self
                         .poll_tier(WatchTier::Recent, &cancel, &reporter, &mut active_epoch)
                         .await;
                     if cancel.is_cancelled() {
@@ -420,11 +436,33 @@ impl BitcoinWatcher {
                         &reporter,
                         &mut tier_health,
                         WatchTier::Recent,
-                        healthy,
+                        turn.outcome,
                     );
+                    resume_schedule.observe(db::WatcherLane::Recent, turn.resume);
+                }
+                _ = wait_for_epoch_resume(resume_schedule.wait()) => {
+                    let tier = WatchTier::from_lane(
+                        resume_schedule
+                            .take_next()
+                            .expect("enabled Bitcoin resume wait has pending lane"),
+                    );
+                    let turn = match tier {
+                        WatchTier::Recent => self
+                            .poll_tier(tier, &cancel, &reporter, &mut active_epoch)
+                            .await,
+                        WatchTier::Historical => self
+                            .poll_tier(tier, &cancel, &reporter, &mut idle_epoch)
+                            .await,
+                    };
+                    if cancel.is_cancelled() {
+                        reporter.intentional_shutdown();
+                        return;
+                    }
+                    report_outcome(&reporter, &mut tier_health, tier, turn.outcome);
+                    resume_schedule.observe(tier.lane(), turn.resume);
                 }
                 _ = idle.tick() => {
-                    let healthy = self
+                    let turn = self
                         .poll_tier(WatchTier::Historical, &cancel, &reporter, &mut idle_epoch)
                         .await;
                     if cancel.is_cancelled() {
@@ -435,8 +473,9 @@ impl BitcoinWatcher {
                         &reporter,
                         &mut tier_health,
                         WatchTier::Historical,
-                        healthy,
+                        turn.outcome,
                     );
+                    resume_schedule.observe(db::WatcherLane::Historical, turn.resume);
                 }
             }
         }
@@ -450,10 +489,10 @@ impl BitcoinWatcher {
         cancel: &CancellationToken,
         reporter: &WorkerReporter,
         epoch: &mut BitcoinTierScanEpoch,
-    ) -> CycleOutcome {
+    ) -> WatcherTurn<CycleOutcome> {
         reporter.progress();
         if cancel.is_cancelled() {
-            return CycleOutcome::Incomplete;
+            return WatcherTurn::defer_to_cadence(CycleOutcome::Incomplete);
         }
         let request = RequestPermit { cancel, reporter };
 
@@ -462,12 +501,14 @@ impl BitcoinWatcher {
         // currently observe a direct-Bitcoin payment.
         let (probe_tip, endpoint) = match self.fetch_tip_and_endpoint(request).await {
             EndpointFetch::Found(pair) => pair,
-            EndpointFetch::BudgetExhausted => return CycleOutcome::Incomplete,
+            EndpointFetch::BudgetExhausted => {
+                return WatcherTurn::continue_soon(CycleOutcome::Incomplete);
+            }
             EndpointFetch::NotFound | EndpointFetch::Retry | EndpointFetch::Backoff => {
                 tracing::warn!(
                     "bitcoin_watcher: tip-height fetch failed on all endpoints; skipping tick"
                 );
-                return CycleOutcome::Failed;
+                return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
             }
         };
 
@@ -480,7 +521,7 @@ impl BitcoinWatcher {
                         lane = tier.label(),
                         "bitcoin_watcher: scan snapshot query failed: {e}"
                     );
-                    return CycleOutcome::Failed;
+                    return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
                 }
             };
             let starting_offset = match db::load_watcher_lane_cursor(
@@ -497,7 +538,7 @@ impl BitcoinWatcher {
                         lane = tier.label(),
                         "bitcoin_watcher: durable lane offset query failed: {e}"
                     );
-                    return CycleOutcome::Failed;
+                    return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
                 }
             };
             epoch.begin(snapshot, starting_offset);
@@ -529,13 +570,14 @@ impl BitcoinWatcher {
                     lane = tier.label(),
                     "bitcoin_watcher: invoice list query failed: {e}"
                 );
-                return CycleOutcome::Failed;
+                return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
             }
         };
         if batch.rows.is_empty() {
-            return epoch
-                .finish_page_range()
-                .unwrap_or(CycleOutcome::Incomplete);
+            return match epoch.finish_page_range() {
+                Some(outcome) => WatcherTurn::complete(outcome),
+                None => WatcherTurn::continue_soon(CycleOutcome::Incomplete),
+            };
         }
 
         let mut processed_any = false;
@@ -544,11 +586,11 @@ impl BitcoinWatcher {
                 // Waiting is reserved for an already-started atomic invoice.
                 // Yield between rows so a large active page cannot monopolize
                 // the single watcher loop and delay the idle tier indefinitely.
-                return CycleOutcome::Incomplete;
+                return WatcherTurn::continue_soon(CycleOutcome::Incomplete);
             }
             reporter.progress();
             if cancel.is_cancelled() {
-                return CycleOutcome::Incomplete;
+                return WatcherTurn::defer_to_cadence(CycleOutcome::Incomplete);
             }
             match self
                 .check_invoice(&inv, &endpoint, probe_tip, request)
@@ -562,15 +604,20 @@ impl BitcoinWatcher {
                             invoice_id = %inv.id,
                             "bitcoin_watcher: completed invoice offset was not persisted: {e}"
                         );
-                        return CycleOutcome::Failed;
+                        return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
                     }
                     processed_any = true;
                 }
-                InvoiceCheckOutcome::Incomplete => {
+                InvoiceCheckOutcome::DeferToCadence => {
                     // Keep the cursor on the last fully applied invoice. Any
                     // pages/follow-ups fetched for this row are discarded and
                     // its reserved generation remains unapplied.
-                    return CycleOutcome::Incomplete;
+                    return WatcherTurn::defer_to_cadence(CycleOutcome::Incomplete);
+                }
+                InvoiceCheckOutcome::ContinueSoon => {
+                    // The current invoice remains atomic and unapplied, but a
+                    // local request budget can make progress after refill.
+                    return WatcherTurn::continue_soon(CycleOutcome::Incomplete);
                 }
                 InvoiceCheckOutcome::HardBound => {
                     // This row cannot fit the process-local evidence bound in
@@ -593,7 +640,7 @@ impl BitcoinWatcher {
                             hard_bound = true,
                             "bitcoin_watcher: isolated invoice offset was not persisted: {e}"
                         );
-                        return CycleOutcome::Failed;
+                        return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
                     }
                     epoch.note_hard_bound(cursor);
                     processed_any = true;
@@ -602,17 +649,18 @@ impl BitcoinWatcher {
                 InvoiceCheckOutcome::Failed => {
                     // Keep the cursor on the last proven row. The failed invoice
                     // is retried on the next page instead of being skipped.
-                    return CycleOutcome::Failed;
+                    return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
                 }
             }
         }
 
         if batch.has_more {
-            CycleOutcome::Incomplete
+            WatcherTurn::continue_soon(CycleOutcome::Incomplete)
         } else {
-            epoch
-                .finish_page_range()
-                .unwrap_or(CycleOutcome::Incomplete)
+            match epoch.finish_page_range() {
+                Some(outcome) => WatcherTurn::complete(outcome),
+                None => WatcherTurn::continue_soon(CycleOutcome::Incomplete),
+            }
         }
     }
 
@@ -824,7 +872,7 @@ impl BitcoinWatcher {
                 None => match self.fetch_tip_from(ep, request).await {
                     EndpointFetch::Found(tip) => tip,
                     EndpointFetch::BudgetExhausted => {
-                        return InvoiceCheckOutcome::Incomplete;
+                        return InvoiceCheckOutcome::ContinueSoon;
                     }
                     EndpointFetch::NotFound | EndpointFetch::Retry | EndpointFetch::Backoff => {
                         endpoint_errors.push(format!("{ep}: tip fetch failed"));
@@ -838,13 +886,13 @@ impl BitcoinWatcher {
                 .await
             {
                 EndpointEvidence::Ready(observations) => observations,
-                EndpointEvidence::Incomplete => return InvoiceCheckOutcome::Incomplete,
+                EndpointEvidence::Incomplete => return InvoiceCheckOutcome::ContinueSoon,
                 EndpointEvidence::HardBound => return InvoiceCheckOutcome::HardBound,
                 EndpointEvidence::Retry => {
                     endpoint_errors.push(format!("{ep}: incomplete evidence view"));
                     continue;
                 }
-                EndpointEvidence::Backoff => return InvoiceCheckOutcome::Incomplete,
+                EndpointEvidence::Backoff => return InvoiceCheckOutcome::DeferToCadence,
             };
 
             if idx > 0 {
@@ -3361,8 +3409,17 @@ mod tests {
         server.await.expect("counting tip server");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(outcome, CycleOutcome::Failed);
-        report_outcome(&reporter, &mut tier_health, WatchTier::Recent, outcome);
+        assert_eq!(outcome.outcome, CycleOutcome::Failed);
+        assert_eq!(
+            outcome.resume,
+            crate::watcher_schedule::ResumeIntent::DeferToCadence
+        );
+        report_outcome(
+            &reporter,
+            &mut tier_health,
+            WatchTier::Recent,
+            outcome.outcome,
+        );
         assert_eq!(tier_health.active, TierState::Failed);
         assert!(!admission.decision(Rail::DirectBitcoin).allowed());
     }

@@ -32,6 +32,7 @@ pub mod reserved_nyms;
 pub mod utxo;
 pub mod validators;
 pub mod version;
+pub(crate) mod watcher_schedule;
 
 use std::sync::Arc;
 
