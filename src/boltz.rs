@@ -713,13 +713,17 @@ impl BoltzService {
             amount_sat,
             &response,
         )?;
+        let preimage = preimage
+            .bytes
+            .ok_or_else(|| invalid_chain_response("locally derived claim preimage is absent"))?
+            .to_vec();
 
         Ok(ChainSwapResult {
             swap_id: response.id.clone(),
             lockup_address: response.lockup_details.lockup_address.clone(),
             user_lock_amount_sat: response.lockup_details.amount,
             server_lock_amount_sat: response.claim_details.amount,
-            preimage: preimage.bytes.map(|b| b.to_vec()).unwrap_or_default(),
+            preimage,
             claim_keypair,
             refund_keypair,
             canonical_response_json,
