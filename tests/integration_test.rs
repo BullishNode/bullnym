@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -47,7 +48,7 @@ use pay_service::swap_manifest_store::{
 };
 use pay_service::{
     certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
-    registration, AppState,
+    recovery_address_registration, registration, AppState,
 };
 
 use bitcoin::absolute::LockTime;
@@ -72,6 +73,36 @@ use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
 // --- Test infrastructure ---
+
+#[derive(Clone, Default)]
+struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct CapturedLogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+    type Writer = CapturedLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogSink(self.0.clone())
+    }
+}
+
+impl CapturedLogWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
 
 fn require_test_db() -> String {
     std::env::var("TEST_DATABASE_URL")
@@ -255,6 +286,12 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 fn test_app(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/api/v1/recovery-address",
+            put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
+                recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
+            )),
+        )
         .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
@@ -16739,6 +16776,29 @@ const RECOVERY_COMMITMENT_P2WPKH: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8
 const RECOVERY_COMMITMENT_P2TR: &str =
     "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 const RECOVERY_COMMITMENT_P2PKH: &str = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
+const RECOVERY_COMMITMENT_TESTNET: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+fn signed_recovery_address_registration(
+    keypair: &Keypair,
+    npub: &str,
+    address: &str,
+    timestamp: u64,
+) -> recovery_address_registration::RecoveryAddressRegistrationRequest {
+    let message = recovery_address_registration::build_recovery_address_registration_message(
+        recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        npub,
+        address,
+        timestamp,
+    )
+    .unwrap();
+    recovery_address_registration::RecoveryAddressRegistrationRequest {
+        version: recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        npub: npub.to_string(),
+        btc_address: address.to_string(),
+        timestamp,
+        signature: sign_with_keypair(keypair, &message),
+    }
+}
 
 fn verified_recovery_commitment(
     keypair: &Keypair,
@@ -16746,21 +16806,7 @@ fn verified_recovery_commitment(
     address: &str,
     timestamp: u64,
 ) -> pay_service::recovery_address_registration::VerifiedRecoveryAddressRegistration {
-    let message =
-        pay_service::recovery_address_registration::build_recovery_address_registration_message(
-            pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
-            npub,
-            address,
-            timestamp,
-        )
-        .unwrap();
-    let request = pay_service::recovery_address_registration::RecoveryAddressRegistrationRequest {
-        version: pay_service::recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
-        npub: npub.to_string(),
-        btc_address: address.to_string(),
-        timestamp,
-        signature: sign_with_keypair(keypair, &message),
-    };
+    let request = signed_recovery_address_registration(keypair, npub, address, timestamp);
     pay_service::recovery_address_registration::verify_recovery_address_registration(&request)
         .unwrap()
 }
@@ -17392,6 +17438,296 @@ async fn join_recovery_task_bounded<T>(mut task: tokio::task::JoinHandle<T>, lab
             panic!("{label} task did not finish within 10 seconds");
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_address_registration_endpoint_first_retry_rotation_and_privacy() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoveryendpoint", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let timestamp = auth_timestamp();
+    let first_request = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        timestamp,
+    );
+    let first_signature = first_request.signature.clone();
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let expected_response = json!({
+        "version": recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        "recovery_address_registered": true,
+        "signed_at_unix": timestamp,
+    });
+    let (first_status, first_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&first_request).unwrap(),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_body, expected_response);
+
+    let first = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.commitment_version, 1);
+
+    let (retry_status, retry_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&first_request).unwrap(),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK);
+    assert_eq!(retry_body, expected_response);
+    let exact_retry = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_retry, first);
+
+    let rotation_request =
+        signed_recovery_address_registration(&keypair, &npub, RECOVERY_COMMITMENT_P2TR, timestamp);
+    let rotation_signature = rotation_request.signature.clone();
+    let (rotation_status, rotation_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&rotation_request).unwrap(),
+    )
+    .await;
+    assert_eq!(rotation_status, StatusCode::OK);
+    assert_eq!(rotation_body, expected_response);
+    let rotated = pay_service::db::select_current_recovery_address_commitment(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.commitment_version, 2);
+    assert_ne!(rotated.commitment_id, first.commitment_id);
+    assert_eq!(rotated.canonical_btc_address(), RECOVERY_COMMITMENT_P2TR);
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 2);
+
+    let response_text = format!("{first_body} {retry_body} {rotation_body}");
+    let response_debug = format!("{first_body:?} {retry_body:?} {rotation_body:?}");
+    let logs = log_writer.contents();
+    let first_commitment_id = first.commitment_id.to_string();
+    let rotated_commitment_id = rotated.commitment_id.to_string();
+    for forbidden in [
+        npub.as_str(),
+        RECOVERY_COMMITMENT_P2WPKH,
+        RECOVERY_COMMITMENT_P2TR,
+        first_signature.as_str(),
+        rotation_signature.as_str(),
+        first_commitment_id.as_str(),
+        rotated_commitment_id.as_str(),
+    ] {
+        assert!(!response_text.contains(forbidden));
+        assert!(!response_debug.contains(forbidden));
+        assert!(!logs.contains(forbidden));
+    }
+    for forbidden_field in ["npub", "btc_address", "signature", "commitment_id"] {
+        assert!(!response_text.contains(forbidden_field));
+        assert!(!response_debug.contains(forbidden_field));
+    }
+
+    let (read_status, _, _) = get_json_with_headers(&app, "/api/v1/recovery-address").await;
+    assert_eq!(read_status, StatusCode::METHOD_NOT_ALLOWED);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_address_registration_endpoint_refuses_missing_and_inactive_identically() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    let request = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    );
+    let signature = request.signature.clone();
+    let app = test_app(test_state(pool.clone()));
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let (missing_status, missing_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&request).unwrap(),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+
+    pay_service::db::create_user(&pool, "recoveryinactiveendpoint", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let deactivated = pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!deactivated.is_active);
+    let (inactive_status, inactive_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&request).unwrap(),
+    )
+    .await;
+    assert_eq!(inactive_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(inactive_body, missing_body);
+    assert_eq!(
+        missing_body,
+        json!({
+            "status": "ERROR",
+            "code": "AuthError",
+            "reason": "Wallet signature did not verify.",
+        })
+    );
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+    let public_output = format!(
+        "{missing_body:?} {inactive_body:?} {}",
+        log_writer.contents()
+    );
+    for forbidden in [
+        npub.as_str(),
+        RECOVERY_COMMITMENT_P2WPKH,
+        signature.as_str(),
+        "missing",
+        "inactive",
+        "SourceIdentityNotActive",
+    ] {
+        assert!(!public_output.contains(forbidden));
+    }
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_address_registration_endpoint_rejects_signature_address_and_oversize_body() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (npub, _) = keypair.x_only_public_key();
+    let npub = npub.to_string();
+    pay_service::db::create_user(&pool, "recoverynegative", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    let timestamp = auth_timestamp();
+
+    let mut bad_signature = signed_recovery_address_registration(
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        timestamp,
+    );
+    bad_signature.signature = "00".repeat(64);
+    let (signature_status, signature_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&bad_signature).unwrap(),
+    )
+    .await;
+    assert_eq!(signature_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(signature_body["code"], "AuthError");
+
+    let invalid_address_message = pay_service::auth::build_la_v2_message(
+        recovery_address_registration::ACTION_RECOVERY_ADDRESS_SET,
+        &npub,
+        "",
+        &["1", RECOVERY_COMMITMENT_TESTNET],
+        timestamp,
+    );
+    let invalid_address_request =
+        recovery_address_registration::RecoveryAddressRegistrationRequest {
+            version: recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+            npub: npub.clone(),
+            btc_address: RECOVERY_COMMITMENT_TESTNET.to_string(),
+            timestamp,
+            signature: sign_with_keypair(&keypair, &invalid_address_message),
+        };
+    let (address_status, address_body) = put_json(
+        &app,
+        "/api/v1/recovery-address",
+        serde_json::to_value(&invalid_address_request).unwrap(),
+    )
+    .await;
+    assert_eq!(address_status, StatusCode::OK);
+    assert_eq!(address_body["code"], "RecoveryAddressInvalid");
+
+    let oversized_body = json!({
+        "version": recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_VERSION,
+        "npub": npub.clone(),
+        "btc_address": RECOVERY_COMMITMENT_P2WPKH,
+        "timestamp": timestamp,
+        "signature": "a".repeat(
+            recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES + 1
+        ),
+    })
+    .to_string();
+    let oversized_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/recovery-address")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recovery_address_commitments WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row_count, 0);
+
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]

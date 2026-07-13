@@ -22,7 +22,8 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db,
     derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr,
-    og_image, pricer, qr, rate_limit, readiness, reconciler, registration,
+    og_image, pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration,
+    registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -680,6 +681,12 @@ fn build_router(state: AppState) -> Router {
     let pwa_dist_dir = state.config.pwa.dist_dir.clone();
 
     let mut router: Router<AppState> = Router::new()
+        .route(
+            "/api/v1/recovery-address",
+            put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
+                recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
+            )),
+        )
         .route(
             "/api/v1/supported-currencies",
             get(pricer::supported_currencies),

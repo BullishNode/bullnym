@@ -1,16 +1,22 @@
-//! Merchant-signed recovery-address registration wire contract.
+//! Merchant-signed recovery-address registration contract and endpoint.
 //!
-//! This module intentionally contains no route, persistence, or swap-creation
-//! wiring. It defines and verifies the contract that a later persistence slice
-//! can consume without changing the signed bytes. The registered address is
-//! private merchant policy: response types expose only acceptance metadata,
-//! never the address itself.
+//! The always-on authenticated route verifies this sealed contract and appends
+//! it to the immutable persistence ledger. Swap creation remains a separate
+//! slice. The registered address is private merchant policy: response types
+//! expose only acceptance metadata, never the address itself.
 
 use crate::auth;
+use crate::db::{self, RecoveryAddressCommitmentError};
 use crate::error::AppError;
+use crate::registration;
 use crate::validators;
+use crate::AppState;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
+use axum::Json;
 use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 /// Version of the recovery-address registration contract.
@@ -19,9 +25,13 @@ pub const RECOVERY_ADDRESS_REGISTRATION_VERSION: u16 = 1;
 /// LA-v2 action allocated to recovery-address registration.
 pub const ACTION_RECOVERY_ADDRESS_SET: &str = "recovery-address-set";
 
+/// The signed JSON body is under 400 bytes for every supported address family.
+/// Keep modest headroom for JSON whitespace without inheriting the global cap.
+pub const RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES: usize = 1024;
+
 const RECOVERY_ADDRESS_REGISTRATION_VERSION_FIELD: &str = "1";
 
-/// Merchant-authenticated request body for a future registration endpoint.
+/// Merchant-authenticated request body for the registration endpoint.
 ///
 /// The canonical signed field order is `[version, btc_address]`. This is a
 /// merchant-identity-wide commitment, so LA-v2's dedicated nym slot is always
@@ -40,8 +50,8 @@ pub struct RecoveryAddressRegistrationRequest {
 /// Privacy-safe registration response.
 ///
 /// This type deliberately has no address, npub, or signature field. The signed
-/// timestamp is safe acceptance evidence already present in the request; an
-/// opaque persistence identity belongs to the later persistence slice.
+/// timestamp is safe acceptance evidence already present in the request; the
+/// opaque persistence identity is never returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAddressRegistrationResponse {
@@ -60,7 +70,54 @@ impl RecoveryAddressRegistrationResponse {
     }
 }
 
-/// Verified evidence ready for a later append-only persistence layer.
+/// `PUT /api/v1/recovery-address` — authenticate and append one merchant-wide
+/// recovery-address commitment. There is intentionally no corresponding read
+/// handler: the address and persistence identity stay server-private.
+pub async fn register(
+    State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(request): Json<RecoveryAddressRegistrationRequest>,
+) -> Result<Json<RecoveryAddressRegistrationResponse>, AppError> {
+    let peer = peer_opt.map(|ConnectInfo(address)| address);
+
+    // Share the registration-setup abuse boundary and apply it before the
+    // comparatively expensive Schnorr verification.
+    registration::gate_registration_setup_per_ip(
+        &state,
+        peer,
+        &headers,
+        "recovery_address_registration",
+    )
+    .await?;
+
+    let verified = verify_recovery_address_registration(&request)?;
+    let signed_at_unix = verified.timestamp();
+    db::persist_recovery_address_commitment(&state.db, &verified)
+        .await
+        .map_err(map_persistence_error)?;
+
+    Ok(Json(RecoveryAddressRegistrationResponse::registered(
+        signed_at_unix,
+    )))
+}
+
+fn map_persistence_error(error: RecoveryAddressCommitmentError) -> AppError {
+    match error {
+        // Missing and inactive identities deliberately collapse into the same
+        // generic auth response; callers cannot use this route as a registry
+        // existence oracle.
+        RecoveryAddressCommitmentError::SourceIdentityNotActive => {
+            AppError::AuthError("recovery-address registration identity is unavailable".into())
+        }
+        // Never move the wrapped sqlx error into AppError: PostgreSQL detail
+        // can contain the npub, address, and signature. AppError logs only this
+        // stable constant and returns its existing generic internal envelope.
+        _ => AppError::DbError("recovery-address registration persistence failed".into()),
+    }
+}
+
+/// Verified evidence ready for the append-only persistence layer.
 ///
 /// Keeping the original signature and timestamp here lets that layer persist
 /// the exact merchant authorization rather than reconstructing it. This type
@@ -124,8 +181,8 @@ pub fn build_recovery_address_registration_message(
 
 /// Validate the canonical contract and verify the merchant's LA-v2 signature.
 ///
-/// Identity ownership lookup belongs to the future authenticated route. This
-/// function proves only that the supplied npub signed this exact version,
+/// Identity activation is enforced by persistence after this verifier runs.
+/// This function proves that the supplied npub signed this exact version,
 /// address, and timestamp in the identity-wide empty-nym domain and that the
 /// address is canonical Bitcoin mainnet.
 pub fn verify_recovery_address_registration(
@@ -521,5 +578,33 @@ mod tests {
             serde_json::from_str::<RecoveryAddressRegistrationResponse>(&address_injection)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn persistence_error_mapping_never_carries_raw_database_evidence() {
+        let raw_evidence = format!(
+            "npub={} address={MAINNET_P2WPKH} signature={}",
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "ab".repeat(64)
+        );
+        let mapped = map_persistence_error(RecoveryAddressCommitmentError::Database(
+            sqlx::Error::Protocol(raw_evidence.clone()),
+        ));
+        assert!(matches!(
+            mapped,
+            AppError::DbError(ref message)
+                if message == "recovery-address registration persistence failed"
+        ));
+        let rendered = format!("{mapped:?} {mapped}");
+        assert!(!rendered.contains(&raw_evidence));
+        assert!(!rendered.contains(MAINNET_P2WPKH));
+
+        let unavailable =
+            map_persistence_error(RecoveryAddressCommitmentError::SourceIdentityNotActive);
+        assert!(matches!(
+            unavailable,
+            AppError::AuthError(ref message)
+                if message == "recovery-address registration identity is unavailable"
+        ));
     }
 }
