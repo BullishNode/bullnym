@@ -40,7 +40,10 @@ use pay_service::swap_manifest_delivery::{
     resume_pending_manifest_delivery, ManifestDeliveryCoordinatorError,
     ManifestDeliveryResumeOutcome,
 };
-use pay_service::swap_manifest_store::{ManifestObjectId, ManifestWriteOutcome};
+use pay_service::swap_manifest_store::{
+    ManifestObjectId, ManifestWriteOutcome, RecoveryManifestStore, S3ManifestCredentials,
+    S3ManifestStoreConfig,
+};
 use pay_service::{
     certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
     registration, AppState,
@@ -16046,6 +16049,148 @@ async fn manifest_delivery_coordinator_exact_ack_mismatch_is_not_success() {
         store.get_v1(object_id).await.unwrap().encoded(),
         original_envelope.encoded()
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable PostgreSQL + MinIO harness"]
+async fn manifest_delivery_coordinator_real_postgres_minio_contract() {
+    fn required_env(name: &str) -> String {
+        std::env::var(name)
+            .unwrap_or_else(|_| panic!("{name} must be supplied by the disposable harness"))
+    }
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let endpoint = required_env("BULLNYM_MINIO_ENDPOINT");
+    let bucket = required_env("BULLNYM_MINIO_BUCKET");
+    let access_key = required_env("BULLNYM_MINIO_ACCESS_KEY");
+    let secret_key = required_env("BULLNYM_MINIO_SECRET_KEY");
+    let prefix = required_env("BULLNYM_MINIO_DELIVERY_PREFIX");
+    let store = RecoveryManifestStore::from_s3(S3ManifestStoreConfig::new(
+        endpoint,
+        "us-east-1",
+        bucket,
+        prefix,
+        true,
+        true,
+        S3ManifestCredentials::new(access_key, secret_key, None),
+    ))
+    .unwrap();
+
+    let created =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestrealcreated", 0x91).await;
+    let created_id = delivery_object_id(&created);
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: created.identity(),
+            storage_outcome: ManifestWriteOutcome::Created,
+        }
+    );
+    let created_ack = pay_service::db::get_manifest_delivery(&pool, created.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(created_ack.identity(), created.identity());
+    assert_eq!(created_ack.envelope_sha256, created.envelope_sha256);
+    assert_eq!(
+        created_ack.encrypted_envelope(),
+        created.encrypted_envelope()
+    );
+    assert_eq!(created_ack.delivery_state, "delivered");
+    assert!(created_ack.delivered_at_unix.is_some());
+    let created_readback = store.get_v1(created_id).await.unwrap();
+    assert_eq!(
+        created_readback.encoded(),
+        created.encrypted_envelope().encoded()
+    );
+    assert_eq!(created_readback.sha256_hex(), created.envelope_sha256);
+
+    let retry = insert_pending_manifest_delivery_fixture(&pool, "manifestrealretry", 0x92).await;
+    let retry_id = delivery_object_id(&retry);
+    // Model a process disappearing after the real durable write and before
+    // the PostgreSQL acknowledgement. The coordinator must read-verify that
+    // same retained object and acknowledge the still-pending exact identity.
+    assert_eq!(
+        store
+            .put_v1(retry_id, retry.encrypted_envelope())
+            .await
+            .unwrap(),
+        ManifestWriteOutcome::Created
+    );
+    assert_eq!(
+        pay_service::db::list_pending_manifest_deliveries(&pool)
+            .await
+            .unwrap()
+            .as_slice(),
+        &[retry.clone()]
+    );
+    assert_eq!(
+        resume_pending_manifest_delivery(&pool, &store)
+            .await
+            .unwrap(),
+        ManifestDeliveryResumeOutcome::Delivered {
+            identity: retry.identity(),
+            storage_outcome: ManifestWriteOutcome::AlreadyPresent,
+        }
+    );
+    let retry_ack = pay_service::db::get_manifest_delivery(&pool, retry.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry_ack.identity(), retry.identity());
+    assert_eq!(retry_ack.envelope_sha256, retry.envelope_sha256);
+    assert_eq!(retry_ack.encrypted_envelope(), retry.encrypted_envelope());
+    assert_eq!(retry_ack.delivery_state, "delivered");
+    assert!(retry_ack.delivered_at_unix.is_some());
+    assert_eq!(
+        store.get_v1(retry_id).await.unwrap().encoded(),
+        retry.encrypted_envelope().encoded()
+    );
+
+    let conflict =
+        insert_pending_manifest_delivery_fixture(&pool, "manifestrealconflict", 0x93).await;
+    let conflict_id = delivery_object_id(&conflict);
+    let conflicting_envelope = manifest_delivery_envelope(0x94);
+    assert_eq!(
+        store
+            .put_v1(conflict_id, &conflicting_envelope)
+            .await
+            .unwrap(),
+        ManifestWriteOutcome::Created
+    );
+    assert!(matches!(
+        resume_pending_manifest_delivery(&pool, &store).await,
+        Err(ManifestDeliveryCoordinatorError::StorageConflict { object_id })
+            if object_id == conflict_id
+    ));
+    let conflict_pending = pay_service::db::get_manifest_delivery(&pool, conflict.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conflict_pending.delivery_state, "pending");
+    assert_eq!(conflict_pending.delivered_at_unix, None);
+    assert_eq!(
+        store.get_v1(conflict_id).await.unwrap().encoded(),
+        conflicting_envelope.encoded()
+    );
+
+    let mut observed_ids = store
+        .list_v1(4)
+        .await
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|object| object.id)
+        .collect::<Vec<_>>();
+    let mut expected_ids = vec![created_id, retry_id, conflict_id];
+    observed_ids.sort_unstable();
+    expected_ids.sort_unstable();
+    assert_eq!(observed_ids, expected_ids);
 
     cleanup_db(&pool).await;
 }

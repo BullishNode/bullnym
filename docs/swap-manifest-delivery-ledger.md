@@ -76,6 +76,15 @@ same acknowledgement is retried. This coordinator is not invoked by startup,
 swap creation, invoice handling, admission, or a background worker; scheduling
 and retry policy remain intentionally out of scope.
 
+The opt-in `scripts/test-swap-manifest-delivery-minio.sh` contract harness runs
+this coordinator against disposable PostgreSQL with the complete migration
+chain and a real, versioned MinIO bucket. It proves create-and-ack, retained
+readback, post-put/pre-ack retry, conflict-without-ack, and exactly one retained
+object version per attempted identity. Both containers and their unique
+resources are removed on success or failure; the wrapper first exercises each
+cleanup trap through an intentional post-start failure and verifies the exact
+anonymous data volume is absent before running the successful contract.
+
 ## Independent retention
 
 The ledger has no persistent foreign key to `chain_swap_records`. Its insert
