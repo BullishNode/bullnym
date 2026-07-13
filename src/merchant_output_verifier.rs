@@ -8,7 +8,7 @@
 use std::{fmt, str::FromStr};
 
 use bitcoin::{consensus::deserialize, Address, Network, Transaction};
-use lwk_wollet::elements::{Address as LiquidAddress, AddressParams};
+use lwk_wollet::elements::{self, Address as LiquidAddress, AddressParams};
 
 use crate::db::ChainSwapTxAttempt;
 
@@ -226,7 +226,257 @@ impl ObservedMerchantOutput {
             block_hash,
         }
     }
+
+    pub fn txid(&self) -> &str {
+        &self.txid
+    }
+
+    pub fn destination_script_hex(&self) -> &str {
+        &self.destination_script_hex
+    }
+
+    pub fn asset(&self) -> &MerchantAsset {
+        &self.asset
+    }
+
+    pub const fn amount_sat(&self) -> u64 {
+        self.amount_sat
+    }
+
+    pub const fn vout(&self) -> u32 {
+        self.vout
+    }
+
+    pub const fn confirmations(&self) -> u32 {
+        self.confirmations
+    }
+
+    pub const fn block_height(&self) -> Option<u32> {
+        self.block_height
+    }
+
+    pub fn block_hash(&self) -> Option<&str> {
+        self.block_hash.as_deref()
+    }
 }
+
+/// Maximum raw transaction size accepted by the production observation
+/// adapters. Bullnym-created settlement transactions are far smaller; this
+/// bound prevents an untrusted backend response from driving unbounded decode
+/// work.
+pub const MAX_MERCHANT_OUTPUT_RAW_TRANSACTION_BYTES: usize = 1_000_000;
+/// Maximum number of inputs or outputs retained by one adapted transaction.
+pub const MAX_MERCHANT_OUTPUT_TRANSACTION_ITEMS: usize = 256;
+/// Maximum number of immutable source prevouts accepted from a journal row.
+pub const MAX_MERCHANT_OUTPUT_SOURCE_PREVOUTS: usize = 256;
+/// Maximum script size accepted from journal evidence.
+pub const MAX_MERCHANT_OUTPUT_SCRIPT_BYTES: usize = 10_000;
+
+/// Immutable prior-output identity and metadata read from the transaction
+/// journal. A spending transaction proves the outpoint relationship, not the
+/// amount or script of the previous output, so callers must source those two
+/// fields from separately verified journal evidence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MerchantSourcePrevout<'a> {
+    pub txid: &'a str,
+    pub vout: u32,
+    pub amount_sat: u64,
+    pub script_pubkey_hex: &'a str,
+}
+
+impl fmt::Debug for MerchantSourcePrevout<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MerchantSourcePrevout(<redacted>)")
+    }
+}
+
+/// Immutable merchant output selected before transaction construction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MerchantOutputCommitment<'a> {
+    pub destination_address: &'a str,
+    pub destination_script_hex: &'a str,
+    pub asset: &'a MerchantAsset,
+    pub amount_sat: u64,
+    pub vout: u32,
+}
+
+impl fmt::Debug for MerchantOutputCommitment<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MerchantOutputCommitment(<redacted>)")
+    }
+}
+
+/// Read-only production view of one persisted transaction-journal row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MerchantTransactionJournalEvidence<'a> {
+    pub raw_transaction: &'a [u8],
+    pub txid: &'a str,
+    pub source_prevouts: &'a [MerchantSourcePrevout<'a>],
+    pub merchant: MerchantOutputCommitment<'a>,
+}
+
+impl fmt::Debug for MerchantTransactionJournalEvidence<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MerchantTransactionJournalEvidence(<redacted>)")
+    }
+}
+
+/// Full persisted replacement row plus its explicit direct parent relation.
+/// A shared input or backend hint is never enough to construct this type's
+/// authority at the adapter boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LinkedReplacementJournalEvidence<'a> {
+    pub replaces_txid: &'a str,
+    pub replacement: MerchantTransactionJournalEvidence<'a>,
+}
+
+impl fmt::Debug for LinkedReplacementJournalEvidence<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LinkedReplacementJournalEvidence(<redacted>)")
+    }
+}
+
+/// Chain position supplied by the independently anchored observation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MerchantConfirmationEvidence<'a> {
+    Mempool,
+    Confirmed {
+        confirmations: u32,
+        block_height: u32,
+        block_hash: &'a str,
+    },
+    Evicted,
+    ReorgDemoted,
+}
+
+/// Raw transaction and chain identity fetched independently of the journal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MerchantTransactionObservation<'a> {
+    pub raw_transaction: &'a [u8],
+    pub txid: &'a str,
+    pub confirmation: MerchantConfirmationEvidence<'a>,
+}
+
+impl fmt::Debug for MerchantTransactionObservation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MerchantTransactionObservation")
+            .field("raw_transaction", &"<redacted>")
+            .field("txid", &"<redacted>")
+            .field("confirmation", &self.confirmation)
+            .finish()
+    }
+}
+
+/// Journal candidate and independently constructed chain observation. The
+/// fields remain private so callers cannot mix evidence from different
+/// adapter runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptedMerchantOutputEvidence {
+    original_journal_txid: String,
+    journal: JournaledMerchantTransaction,
+    evidence: MerchantOutputEvidence,
+}
+
+impl AdaptedMerchantOutputEvidence {
+    pub fn original_journal_txid(&self) -> &str {
+        &self.original_journal_txid
+    }
+
+    pub fn journal(&self) -> &JournaledMerchantTransaction {
+        &self.journal
+    }
+
+    pub fn evidence(&self) -> &MerchantOutputEvidence {
+        &self.evidence
+    }
+
+    pub fn observed(&self) -> &ObservedMerchantOutput {
+        match &self.evidence {
+            MerchantOutputEvidence::Authoritative(observed) => observed,
+            MerchantOutputEvidence::Unknown => {
+                unreachable!("production adapters never construct unknown evidence")
+            }
+        }
+    }
+
+    pub fn verify(
+        &self,
+        approved_destination: &ApprovedMerchantDestination,
+        required_confirmations: u32,
+    ) -> Result<VerifiedMerchantOutput, MerchantOutputVerificationError> {
+        verify_merchant_output(
+            &self.original_journal_txid,
+            &self.journal,
+            approved_destination,
+            &self.evidence,
+            required_confirmations,
+        )
+    }
+}
+
+/// Fail-closed adapter failures. Variants deliberately carry no raw bytes,
+/// identifiers, addresses, or provider-controlled text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MerchantOutputAdapterError {
+    InputBoundsExceeded,
+    InvalidCommitment,
+    InvalidSourcePrevouts,
+    MalformedJournalTransaction,
+    JournalTxidMismatch,
+    JournalSourceMismatch,
+    JournalOutputMismatch,
+    InvalidReplacementLink,
+    UnlinkedObservedTransaction,
+    ReplacementSourceMismatch,
+    ReplacementDestinationMismatch,
+    MalformedObservedTransaction,
+    ObservedTxidMismatch,
+    ObservedSourceMismatch,
+    ObservedOutputMissing,
+    MultipleObservedOutputs,
+    ConfidentialOutputUnverified,
+    IncompleteConfirmationIdentity,
+    ObservationDemoted,
+}
+
+impl fmt::Display for MerchantOutputAdapterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InputBoundsExceeded => "merchant-output adapter input exceeds its bound",
+            Self::InvalidCommitment => "merchant-output journal commitment is invalid",
+            Self::InvalidSourcePrevouts => "merchant-output source evidence is invalid",
+            Self::MalformedJournalTransaction => "merchant-output journal bytes are invalid",
+            Self::JournalTxidMismatch => "merchant-output journal bytes do not match their txid",
+            Self::JournalSourceMismatch => "merchant-output journal inputs do not match sources",
+            Self::JournalOutputMismatch => "merchant-output journal output does not match",
+            Self::InvalidReplacementLink => "merchant-output replacement link is invalid",
+            Self::UnlinkedObservedTransaction => {
+                "merchant-output observation is not journal-linked"
+            }
+            Self::ReplacementSourceMismatch => "merchant-output replacement sources differ",
+            Self::ReplacementDestinationMismatch => {
+                "merchant-output replacement destination differs"
+            }
+            Self::MalformedObservedTransaction => "merchant-output observation bytes are invalid",
+            Self::ObservedTxidMismatch => "merchant-output observation txid does not match bytes",
+            Self::ObservedSourceMismatch => "merchant-output observation inputs differ",
+            Self::ObservedOutputMissing => "merchant-output observation has no candidate output",
+            Self::MultipleObservedOutputs => {
+                "merchant-output observation has multiple candidate outputs"
+            }
+            Self::ConfidentialOutputUnverified => {
+                "merchant-output confidential value could not be verified"
+            }
+            Self::IncompleteConfirmationIdentity => {
+                "merchant-output confirmation identity is incomplete"
+            }
+            Self::ObservationDemoted => "merchant-output observation is evicted or reorged",
+        })
+    }
+}
+
+impl std::error::Error for MerchantOutputAdapterError {}
 
 /// `Unknown` includes unavailable or disagreeing backends and unverified raw
 /// transaction bytes. Such evidence can never become accounting authority.
@@ -475,6 +725,543 @@ pub fn verify_merchant_output(
         block_hash,
         linked_replacement,
     })
+}
+
+/// Construct Bitcoin journal and observation evidence from bounded raw
+/// transactions. When `replacement` is present it must be a complete persisted
+/// replacement row whose direct parent is the supplied original journal.
+pub fn adapt_bitcoin_merchant_output(
+    original: &MerchantTransactionJournalEvidence<'_>,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    observed: &MerchantTransactionObservation<'_>,
+) -> Result<AdaptedMerchantOutputEvidence, MerchantOutputAdapterError> {
+    adapt_merchant_output(MerchantRail::Bitcoin, original, replacement, observed, None)
+}
+
+/// Construct Liquid journal and observation evidence. Explicit outputs are
+/// decoded directly; confidential outputs are accepted only when the supplied
+/// merchant blinding key successfully opens the exact raw transaction output.
+pub fn adapt_liquid_merchant_output(
+    original: &MerchantTransactionJournalEvidence<'_>,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    observed: &MerchantTransactionObservation<'_>,
+    merchant_blinding_key: &elements::secp256k1_zkp::SecretKey,
+) -> Result<AdaptedMerchantOutputEvidence, MerchantOutputAdapterError> {
+    adapt_merchant_output(
+        MerchantRail::Liquid,
+        original,
+        replacement,
+        observed,
+        Some(merchant_blinding_key),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MerchantRail {
+    Bitcoin,
+    Liquid,
+}
+
+#[derive(Clone)]
+struct ValidatedJournal {
+    txid: String,
+    destination_address: String,
+    destination_script: Vec<u8>,
+    asset: MerchantAsset,
+    amount_sat: u64,
+    vout: u32,
+}
+
+fn adapt_merchant_output(
+    rail: MerchantRail,
+    original: &MerchantTransactionJournalEvidence<'_>,
+    replacement: Option<&LinkedReplacementJournalEvidence<'_>>,
+    observed: &MerchantTransactionObservation<'_>,
+    merchant_blinding_key: Option<&elements::secp256k1_zkp::SecretKey>,
+) -> Result<AdaptedMerchantOutputEvidence, MerchantOutputAdapterError> {
+    let original_validated = validate_journal(rail, original, merchant_blinding_key)?;
+    let (candidate_validated, linked_replacement) = if let Some(linked) = replacement {
+        let replaces_txid = canonical_hash(linked.replaces_txid)
+            .ok_or(MerchantOutputAdapterError::InvalidReplacementLink)?;
+        if replaces_txid != original_validated.txid {
+            return Err(MerchantOutputAdapterError::InvalidReplacementLink);
+        }
+        let replacement_validated =
+            validate_journal(rail, &linked.replacement, merchant_blinding_key)?;
+        if replacement_validated.txid == original_validated.txid {
+            return Err(MerchantOutputAdapterError::InvalidReplacementLink);
+        }
+        if !source_evidence_sets_match(original.source_prevouts, linked.replacement.source_prevouts)
+        {
+            return Err(MerchantOutputAdapterError::ReplacementSourceMismatch);
+        }
+        if replacement_validated.destination_address != original_validated.destination_address
+            || replacement_validated.destination_script != original_validated.destination_script
+            || replacement_validated.asset != original_validated.asset
+        {
+            return Err(MerchantOutputAdapterError::ReplacementDestinationMismatch);
+        }
+        (replacement_validated, true)
+    } else {
+        (original_validated.clone(), false)
+    };
+
+    let observed_transaction = decode_merchant_transaction(
+        rail,
+        observed.raw_transaction,
+        MerchantTransactionRole::Observed,
+    )?;
+    let observed_txid =
+        canonical_hash(observed.txid).ok_or(MerchantOutputAdapterError::ObservedTxidMismatch)?;
+    if observed_transaction.txid() != observed_txid {
+        return Err(MerchantOutputAdapterError::ObservedTxidMismatch);
+    }
+    if observed_txid != candidate_validated.txid {
+        return Err(if replacement.is_none() {
+            MerchantOutputAdapterError::UnlinkedObservedTransaction
+        } else {
+            MerchantOutputAdapterError::ObservedTxidMismatch
+        });
+    }
+    if !observed_transaction.inputs_match(original.source_prevouts) {
+        return Err(MerchantOutputAdapterError::ObservedSourceMismatch);
+    }
+
+    let observed_output = observed_transaction.unique_output_for_script(
+        &candidate_validated.destination_script,
+        merchant_blinding_key,
+    )?;
+    let (confirmations, block_height, block_hash) = adapt_confirmation(observed.confirmation)?;
+
+    let destination_amount_sat = i64::try_from(candidate_validated.amount_sat)
+        .map_err(|_| MerchantOutputAdapterError::InvalidCommitment)?;
+    let destination_vout = i32::try_from(candidate_validated.vout)
+        .map_err(|_| MerchantOutputAdapterError::InvalidCommitment)?;
+    let journal = if linked_replacement {
+        JournaledMerchantTransaction::linked_replacement(
+            &candidate_validated.txid,
+            &original_validated.txid,
+            &candidate_validated.destination_address,
+            hex::encode(&candidate_validated.destination_script),
+            candidate_validated.asset.clone(),
+            destination_amount_sat,
+            destination_vout,
+        )
+    } else {
+        JournaledMerchantTransaction::original(
+            &candidate_validated.txid,
+            &candidate_validated.destination_address,
+            hex::encode(&candidate_validated.destination_script),
+            candidate_validated.asset.clone(),
+            destination_amount_sat,
+            destination_vout,
+        )
+    };
+    let evidence = MerchantOutputEvidence::Authoritative(ObservedMerchantOutput::new(
+        observed_txid,
+        hex::encode(&observed_output.script),
+        observed_output.asset,
+        observed_output.amount_sat,
+        observed_output.vout,
+        confirmations,
+        block_height,
+        block_hash,
+    ));
+
+    Ok(AdaptedMerchantOutputEvidence {
+        original_journal_txid: original_validated.txid,
+        journal,
+        evidence,
+    })
+}
+
+fn validate_journal(
+    rail: MerchantRail,
+    journal: &MerchantTransactionJournalEvidence<'_>,
+    merchant_blinding_key: Option<&elements::secp256k1_zkp::SecretKey>,
+) -> Result<ValidatedJournal, MerchantOutputAdapterError> {
+    validate_source_prevouts(journal.source_prevouts)?;
+    let destination_script = validate_output_commitment(&journal.merchant)?;
+    let asset = canonical_asset(journal.merchant.asset)
+        .ok_or(MerchantOutputAdapterError::InvalidCommitment)?;
+    match (rail, &asset) {
+        (MerchantRail::Bitcoin, MerchantAsset::Bitcoin)
+        | (MerchantRail::Liquid, MerchantAsset::Liquid(_)) => {}
+        _ => return Err(MerchantOutputAdapterError::InvalidCommitment),
+    }
+    if matches!(rail, MerchantRail::Liquid) {
+        let blinding_key = merchant_blinding_key
+            .ok_or(MerchantOutputAdapterError::ConfidentialOutputUnverified)?;
+        let address = LiquidAddress::from_str(journal.merchant.destination_address)
+            .map_err(|_| MerchantOutputAdapterError::InvalidCommitment)?;
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let blinding_pubkey =
+            elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, blinding_key);
+        if address.blinding_pubkey != Some(blinding_pubkey) {
+            return Err(MerchantOutputAdapterError::ConfidentialOutputUnverified);
+        }
+    }
+    let txid =
+        canonical_hash(journal.txid).ok_or(MerchantOutputAdapterError::JournalTxidMismatch)?;
+    let transaction = decode_merchant_transaction(
+        rail,
+        journal.raw_transaction,
+        MerchantTransactionRole::Journal,
+    )?;
+    if transaction.txid() != txid {
+        return Err(MerchantOutputAdapterError::JournalTxidMismatch);
+    }
+    if !transaction.inputs_match(journal.source_prevouts) {
+        return Err(MerchantOutputAdapterError::JournalSourceMismatch);
+    }
+    let output = transaction
+        .output_at(journal.merchant.vout, merchant_blinding_key)?
+        .ok_or(MerchantOutputAdapterError::JournalOutputMismatch)?;
+    if output.script != destination_script
+        || output.asset != asset
+        || output.amount_sat != journal.merchant.amount_sat
+    {
+        return Err(MerchantOutputAdapterError::JournalOutputMismatch);
+    }
+
+    Ok(ValidatedJournal {
+        txid,
+        destination_address: journal.merchant.destination_address.to_owned(),
+        destination_script,
+        asset,
+        amount_sat: journal.merchant.amount_sat,
+        vout: journal.merchant.vout,
+    })
+}
+
+fn validate_output_commitment(
+    commitment: &MerchantOutputCommitment<'_>,
+) -> Result<Vec<u8>, MerchantOutputAdapterError> {
+    if commitment.amount_sat == 0
+        || commitment.amount_sat > i64::MAX as u64
+        || commitment.vout > i32::MAX as u32
+    {
+        return Err(MerchantOutputAdapterError::InvalidCommitment);
+    }
+    let asset =
+        canonical_asset(commitment.asset).ok_or(MerchantOutputAdapterError::InvalidCommitment)?;
+    let script = decode_bounded_script(commitment.destination_script_hex).map_err(|exceeded| {
+        if exceeded {
+            MerchantOutputAdapterError::InputBoundsExceeded
+        } else {
+            MerchantOutputAdapterError::InvalidCommitment
+        }
+    })?;
+    let derived = derive_destination_script(commitment.destination_address, &asset)
+        .ok_or(MerchantOutputAdapterError::InvalidCommitment)?;
+    if script != derived {
+        return Err(MerchantOutputAdapterError::InvalidCommitment);
+    }
+    Ok(script)
+}
+
+fn validate_source_prevouts(
+    sources: &[MerchantSourcePrevout<'_>],
+) -> Result<(), MerchantOutputAdapterError> {
+    if sources.is_empty() || sources.len() > MAX_MERCHANT_OUTPUT_SOURCE_PREVOUTS {
+        return Err(MerchantOutputAdapterError::InputBoundsExceeded);
+    }
+    for (index, source) in sources.iter().enumerate() {
+        if canonical_hash(source.txid).is_none() || source.amount_sat == 0 {
+            return Err(MerchantOutputAdapterError::InvalidSourcePrevouts);
+        }
+        decode_bounded_script(source.script_pubkey_hex).map_err(|exceeded| {
+            if exceeded {
+                MerchantOutputAdapterError::InputBoundsExceeded
+            } else {
+                MerchantOutputAdapterError::InvalidSourcePrevouts
+            }
+        })?;
+        if sources[..index]
+            .iter()
+            .any(|prior| prior.txid.eq_ignore_ascii_case(source.txid) && prior.vout == source.vout)
+        {
+            return Err(MerchantOutputAdapterError::InvalidSourcePrevouts);
+        }
+    }
+    Ok(())
+}
+
+fn source_evidence_sets_match(
+    left: &[MerchantSourcePrevout<'_>],
+    right: &[MerchantSourcePrevout<'_>],
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let canonical = |source: &MerchantSourcePrevout<'_>| {
+        (
+            source.txid.to_ascii_lowercase(),
+            source.vout,
+            source.amount_sat,
+            source.script_pubkey_hex.to_ascii_lowercase(),
+        )
+    };
+    let mut left = left.iter().map(canonical).collect::<Vec<_>>();
+    let mut right = right.iter().map(canonical).collect::<Vec<_>>();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
+fn adapt_confirmation(
+    confirmation: MerchantConfirmationEvidence<'_>,
+) -> Result<(u32, Option<u32>, Option<String>), MerchantOutputAdapterError> {
+    match confirmation {
+        MerchantConfirmationEvidence::Mempool => Ok((0, None, None)),
+        MerchantConfirmationEvidence::Confirmed {
+            confirmations,
+            block_height,
+            block_hash,
+        } => {
+            if confirmations == 0 || block_height == 0 {
+                return Err(MerchantOutputAdapterError::IncompleteConfirmationIdentity);
+            }
+            let block_hash = canonical_hash(block_hash)
+                .ok_or(MerchantOutputAdapterError::IncompleteConfirmationIdentity)?;
+            Ok((confirmations, Some(block_height), Some(block_hash)))
+        }
+        MerchantConfirmationEvidence::Evicted | MerchantConfirmationEvidence::ReorgDemoted => {
+            Err(MerchantOutputAdapterError::ObservationDemoted)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MerchantTransactionRole {
+    Journal,
+    Observed,
+}
+
+enum DecodedMerchantTransaction {
+    Bitcoin(Transaction),
+    Liquid(elements::Transaction),
+}
+
+struct DecodedMerchantOutput {
+    script: Vec<u8>,
+    asset: MerchantAsset,
+    amount_sat: u64,
+    vout: u32,
+}
+
+impl DecodedMerchantTransaction {
+    fn txid(&self) -> String {
+        match self {
+            Self::Bitcoin(transaction) => transaction.compute_txid().to_string(),
+            Self::Liquid(transaction) => transaction.txid().to_string(),
+        }
+    }
+
+    fn inputs_match(&self, sources: &[MerchantSourcePrevout<'_>]) -> bool {
+        let observed = match self {
+            Self::Bitcoin(transaction) => transaction
+                .input
+                .iter()
+                .map(|input| {
+                    (
+                        false,
+                        input.previous_output.txid.to_string(),
+                        input.previous_output.vout,
+                    )
+                })
+                .collect(),
+            Self::Liquid(transaction) => transaction
+                .input
+                .iter()
+                .map(|input| {
+                    (
+                        input.is_pegin,
+                        input.previous_output.txid.to_string(),
+                        input.previous_output.vout,
+                    )
+                })
+                .collect(),
+        };
+        exact_outpoint_set_matches(observed, sources)
+    }
+
+    fn output_at(
+        &self,
+        vout: u32,
+        merchant_blinding_key: Option<&elements::secp256k1_zkp::SecretKey>,
+    ) -> Result<Option<DecodedMerchantOutput>, MerchantOutputAdapterError> {
+        let index =
+            usize::try_from(vout).map_err(|_| MerchantOutputAdapterError::InvalidCommitment)?;
+        match self {
+            Self::Bitcoin(transaction) => transaction
+                .output
+                .get(index)
+                .map(|output| decode_bitcoin_output(output, vout))
+                .transpose(),
+            Self::Liquid(transaction) => transaction
+                .output
+                .get(index)
+                .map(|output| decode_liquid_output(output, vout, merchant_blinding_key))
+                .transpose(),
+        }
+    }
+
+    fn unique_output_for_script(
+        &self,
+        expected_script: &[u8],
+        merchant_blinding_key: Option<&elements::secp256k1_zkp::SecretKey>,
+    ) -> Result<DecodedMerchantOutput, MerchantOutputAdapterError> {
+        let matching_indices = match self {
+            Self::Bitcoin(transaction) => transaction
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| output.script_pubkey.as_bytes() == expected_script)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            Self::Liquid(transaction) => transaction
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| output.script_pubkey.as_bytes() == expected_script)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+        };
+        let [index] = matching_indices.as_slice() else {
+            return Err(if matching_indices.is_empty() {
+                MerchantOutputAdapterError::ObservedOutputMissing
+            } else {
+                MerchantOutputAdapterError::MultipleObservedOutputs
+            });
+        };
+        let vout =
+            u32::try_from(*index).map_err(|_| MerchantOutputAdapterError::InputBoundsExceeded)?;
+        self.output_at(vout, merchant_blinding_key)?
+            .ok_or(MerchantOutputAdapterError::ObservedOutputMissing)
+    }
+}
+
+fn decode_merchant_transaction(
+    rail: MerchantRail,
+    raw_transaction: &[u8],
+    role: MerchantTransactionRole,
+) -> Result<DecodedMerchantTransaction, MerchantOutputAdapterError> {
+    if raw_transaction.is_empty() {
+        return Err(malformed_transaction(role));
+    }
+    if raw_transaction.len() > MAX_MERCHANT_OUTPUT_RAW_TRANSACTION_BYTES {
+        return Err(MerchantOutputAdapterError::InputBoundsExceeded);
+    }
+    let transaction = match rail {
+        MerchantRail::Bitcoin => DecodedMerchantTransaction::Bitcoin(
+            deserialize(raw_transaction).map_err(|_| malformed_transaction(role))?,
+        ),
+        MerchantRail::Liquid => DecodedMerchantTransaction::Liquid(
+            elements::encode::deserialize(raw_transaction)
+                .map_err(|_| malformed_transaction(role))?,
+        ),
+    };
+    let (inputs, outputs) = match &transaction {
+        DecodedMerchantTransaction::Bitcoin(transaction) => {
+            (transaction.input.len(), transaction.output.len())
+        }
+        DecodedMerchantTransaction::Liquid(transaction) => {
+            (transaction.input.len(), transaction.output.len())
+        }
+    };
+    if inputs == 0
+        || outputs == 0
+        || inputs > MAX_MERCHANT_OUTPUT_TRANSACTION_ITEMS
+        || outputs > MAX_MERCHANT_OUTPUT_TRANSACTION_ITEMS
+    {
+        return Err(MerchantOutputAdapterError::InputBoundsExceeded);
+    }
+    Ok(transaction)
+}
+
+fn malformed_transaction(role: MerchantTransactionRole) -> MerchantOutputAdapterError {
+    match role {
+        MerchantTransactionRole::Journal => MerchantOutputAdapterError::MalformedJournalTransaction,
+        MerchantTransactionRole::Observed => {
+            MerchantOutputAdapterError::MalformedObservedTransaction
+        }
+    }
+}
+
+fn exact_outpoint_set_matches(
+    mut observed: Vec<(bool, String, u32)>,
+    sources: &[MerchantSourcePrevout<'_>],
+) -> bool {
+    if observed.len() != sources.len() {
+        return false;
+    }
+    let mut expected = sources
+        .iter()
+        .map(|source| (false, source.txid.to_ascii_lowercase(), source.vout))
+        .collect::<Vec<_>>();
+    for (_, txid, _) in &mut observed {
+        txid.make_ascii_lowercase();
+    }
+    observed.sort_unstable();
+    expected.sort_unstable();
+    observed == expected
+}
+
+fn decode_bitcoin_output(
+    output: &bitcoin::TxOut,
+    vout: u32,
+) -> Result<DecodedMerchantOutput, MerchantOutputAdapterError> {
+    if output.script_pubkey.len() > MAX_MERCHANT_OUTPUT_SCRIPT_BYTES {
+        return Err(MerchantOutputAdapterError::InputBoundsExceeded);
+    }
+    Ok(DecodedMerchantOutput {
+        script: output.script_pubkey.as_bytes().to_vec(),
+        asset: MerchantAsset::Bitcoin,
+        amount_sat: output.value.to_sat(),
+        vout,
+    })
+}
+
+fn decode_liquid_output(
+    output: &elements::TxOut,
+    vout: u32,
+    merchant_blinding_key: Option<&elements::secp256k1_zkp::SecretKey>,
+) -> Result<DecodedMerchantOutput, MerchantOutputAdapterError> {
+    if output.script_pubkey.len() > MAX_MERCHANT_OUTPUT_SCRIPT_BYTES {
+        return Err(MerchantOutputAdapterError::InputBoundsExceeded);
+    }
+    let (asset, amount_sat) = match (output.asset.explicit(), output.value.explicit()) {
+        (Some(asset), Some(value)) => (asset, value),
+        (None, None) => {
+            let key = merchant_blinding_key
+                .ok_or(MerchantOutputAdapterError::ConfidentialOutputUnverified)?;
+            let secp = elements::secp256k1_zkp::Secp256k1::new();
+            let secrets = output
+                .unblind(&secp, *key)
+                .map_err(|_| MerchantOutputAdapterError::ConfidentialOutputUnverified)?;
+            (secrets.asset, secrets.value)
+        }
+        _ => return Err(MerchantOutputAdapterError::ConfidentialOutputUnverified),
+    };
+    Ok(DecodedMerchantOutput {
+        script: output.script_pubkey.as_bytes().to_vec(),
+        asset: MerchantAsset::Liquid(asset.to_string()),
+        amount_sat,
+        vout,
+    })
+}
+
+/// Decode a bounded script. The error value is `true` only for a size-bound
+/// violation and `false` for malformed hexadecimal.
+fn decode_bounded_script(value: &str) -> Result<Vec<u8>, bool> {
+    if value.len() > MAX_MERCHANT_OUTPUT_SCRIPT_BYTES.saturating_mul(2) {
+        return Err(true);
+    }
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return Err(false);
+    }
+    hex::decode(value).map_err(|_| false)
 }
 
 fn canonical_hash(value: &str) -> Option<String> {
@@ -1112,5 +1899,473 @@ mod tests {
             verify_bitcoin_recovery_output(&attempt, &approved_bitcoin(), &evidence, 3).unwrap();
 
         assert_eq!(first, repeated);
+    }
+
+    #[test]
+    fn production_bitcoin_adapter_uses_actual_output_and_is_idempotent() {
+        let attempt = recovery_attempt();
+        let raw_transaction = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let source = &attempt.source_prevouts.0[0];
+        let source_prevouts = [MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat.try_into().unwrap(),
+            script_pubkey_hex: &source.script_pubkey_hex,
+        }];
+        let asset = MerchantAsset::Bitcoin;
+        let journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &raw_transaction,
+            txid: &attempt.txid,
+            source_prevouts: &source_prevouts,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let observation = MerchantTransactionObservation {
+            raw_transaction: &raw_transaction,
+            txid: &attempt.txid,
+            confirmation: MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 900_000,
+                block_hash: BLOCK_HASH,
+            },
+        };
+
+        let first = adapt_bitcoin_merchant_output(&journal, None, &observation).unwrap();
+        let repeated = adapt_bitcoin_merchant_output(&journal, None, &observation).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_eq!(first.observed().amount_sat(), 97_000);
+        assert_ne!(first.observed().amount_sat(), source.amount_sat as u64);
+        let verified = first.verify(&approved_bitcoin(), 1).unwrap();
+        assert_eq!(verified.amount_sat(), 97_000);
+        assert_eq!(verified.txid(), attempt.txid);
+        assert!(!verified.is_linked_replacement());
+    }
+
+    #[test]
+    fn production_bitcoin_adapter_rejects_wrong_txid_and_unlinked_replacement() {
+        let attempt = recovery_attempt();
+        let raw_transaction = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let transaction: Transaction = deserialize(&raw_transaction).unwrap();
+        let mut replacement_transaction = transaction.clone();
+        replacement_transaction.input[0].sequence = Sequence::ZERO;
+        replacement_transaction.output[0].value = Amount::from_sat(96_500);
+        let replacement_raw = serialize(&replacement_transaction);
+        let replacement_txid = replacement_transaction.compute_txid().to_string();
+        let source = &attempt.source_prevouts.0[0];
+        let source_prevouts = [MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat.try_into().unwrap(),
+            script_pubkey_hex: &source.script_pubkey_hex,
+        }];
+        let asset = MerchantAsset::Bitcoin;
+        let journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &raw_transaction,
+            txid: &attempt.txid,
+            source_prevouts: &source_prevouts,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let wrong_txid = "22".repeat(32);
+        let wrong_txid_observation = MerchantTransactionObservation {
+            raw_transaction: &raw_transaction,
+            txid: &wrong_txid,
+            confirmation: MerchantConfirmationEvidence::Mempool,
+        };
+        let unlinked_observation = MerchantTransactionObservation {
+            raw_transaction: &replacement_raw,
+            txid: &replacement_txid,
+            confirmation: MerchantConfirmationEvidence::Mempool,
+        };
+
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&journal, None, &wrong_txid_observation),
+            Err(MerchantOutputAdapterError::ObservedTxidMismatch)
+        );
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&journal, None, &unlinked_observation),
+            Err(MerchantOutputAdapterError::UnlinkedObservedTransaction)
+        );
+    }
+
+    #[test]
+    fn production_bitcoin_adapter_requires_full_linked_replacement_evidence() {
+        let attempt = recovery_attempt();
+        let original_raw = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let mut replacement_transaction: Transaction = deserialize(&original_raw).unwrap();
+        replacement_transaction.input[0].sequence = Sequence::ZERO;
+        replacement_transaction.output[0].value = Amount::from_sat(96_500);
+        let replacement_raw = serialize(&replacement_transaction);
+        let replacement_txid = replacement_transaction.compute_txid().to_string();
+        let source = &attempt.source_prevouts.0[0];
+        let original_sources = [MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat.try_into().unwrap(),
+            script_pubkey_hex: &source.script_pubkey_hex,
+        }];
+        let replacement_sources = original_sources;
+        let asset = MerchantAsset::Bitcoin;
+        let original = MerchantTransactionJournalEvidence {
+            raw_transaction: &original_raw,
+            txid: &attempt.txid,
+            source_prevouts: &original_sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let replacement = MerchantTransactionJournalEvidence {
+            raw_transaction: &replacement_raw,
+            txid: &replacement_txid,
+            source_prevouts: &replacement_sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 96_500,
+                vout: 0,
+            },
+        };
+        let linked = LinkedReplacementJournalEvidence {
+            replaces_txid: &attempt.txid,
+            replacement,
+        };
+        let observation = MerchantTransactionObservation {
+            raw_transaction: &replacement_raw,
+            txid: &replacement_txid,
+            confirmation: MerchantConfirmationEvidence::Confirmed {
+                confirmations: 2,
+                block_height: 900_001,
+                block_hash: BLOCK_HASH,
+            },
+        };
+
+        let adapted =
+            adapt_bitcoin_merchant_output(&original, Some(&linked), &observation).unwrap();
+        let verified = adapted.verify(&approved_bitcoin(), 2).unwrap();
+        assert_eq!(verified.journal_txid(), attempt.txid);
+        assert_eq!(verified.txid(), replacement_txid);
+        assert_eq!(verified.amount_sat(), 96_500);
+        assert!(verified.is_linked_replacement());
+
+        let wrong_parent = "33".repeat(32);
+        let incorrectly_linked = LinkedReplacementJournalEvidence {
+            replaces_txid: &wrong_parent,
+            replacement,
+        };
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&original, Some(&incorrectly_linked), &observation),
+            Err(MerchantOutputAdapterError::InvalidReplacementLink)
+        );
+    }
+
+    #[test]
+    fn production_adapter_rejects_wrong_destination_and_multiple_candidates() {
+        let attempt = recovery_attempt();
+        let original_raw = hex::decode(&attempt.raw_tx_hex).unwrap();
+        let mut multiple_transaction: Transaction = deserialize(&original_raw).unwrap();
+        multiple_transaction
+            .output
+            .push(multiple_transaction.output[0].clone());
+        let multiple_raw = serialize(&multiple_transaction);
+        let multiple_txid = multiple_transaction.compute_txid().to_string();
+        let source = &attempt.source_prevouts.0[0];
+        let sources = [MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat.try_into().unwrap(),
+            script_pubkey_hex: &source.script_pubkey_hex,
+        }];
+        let asset = MerchantAsset::Bitcoin;
+        let other_script_hex = {
+            let address = Address::from_str(OTHER_BITCOIN_ADDRESS)
+                .unwrap()
+                .require_network(Network::Bitcoin)
+                .unwrap();
+            hex::encode(address.script_pubkey().as_bytes())
+        };
+        let bad_destination = MerchantTransactionJournalEvidence {
+            raw_transaction: &original_raw,
+            txid: &attempt.txid,
+            source_prevouts: &sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: OTHER_BITCOIN_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let bad_script = MerchantTransactionJournalEvidence {
+            raw_transaction: &original_raw,
+            txid: &attempt.txid,
+            source_prevouts: &sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: &other_script_hex,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let multiple = MerchantTransactionJournalEvidence {
+            raw_transaction: &multiple_raw,
+            txid: &multiple_txid,
+            source_prevouts: &sources,
+            merchant: MerchantOutputCommitment {
+                destination_address: APPROVED_ADDRESS,
+                destination_script_hex: APPROVED_SCRIPT,
+                asset: &asset,
+                amount_sat: 97_000,
+                vout: 0,
+            },
+        };
+        let original_observation = MerchantTransactionObservation {
+            raw_transaction: &original_raw,
+            txid: &attempt.txid,
+            confirmation: MerchantConfirmationEvidence::Mempool,
+        };
+        let multiple_observation = MerchantTransactionObservation {
+            raw_transaction: &multiple_raw,
+            txid: &multiple_txid,
+            confirmation: MerchantConfirmationEvidence::Mempool,
+        };
+
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&bad_destination, None, &original_observation),
+            Err(MerchantOutputAdapterError::InvalidCommitment)
+        );
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&bad_script, None, &original_observation),
+            Err(MerchantOutputAdapterError::InvalidCommitment)
+        );
+        assert_eq!(
+            adapt_bitcoin_merchant_output(&multiple, None, &multiple_observation),
+            Err(MerchantOutputAdapterError::MultipleObservedOutputs)
+        );
+    }
+
+    #[test]
+    fn production_liquid_adapter_reads_actual_value_and_rejects_wrong_asset() {
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let blinding_key = elements::secp256k1_zkp::SecretKey::from_slice(&[1; 32]).unwrap();
+        let blinding_pubkey =
+            elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+        let address = LiquidAddress::from_str(LIQUID_ADDRESS)
+            .unwrap()
+            .to_unconfidential()
+            .to_confidential(blinding_pubkey);
+        let address_text = address.to_string();
+        let script = address.script_pubkey();
+        let source_txid = elements::Txid::from_str(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let source_txid_text = source_txid.to_string();
+        let source_prevouts = [MerchantSourcePrevout {
+            txid: &source_txid_text,
+            vout: 3,
+            amount_sat: 91_000,
+            script_pubkey_hex: "51",
+        }];
+        let liquid_asset = elements::AssetId::from_str(LIQUID_ASSET).unwrap();
+        let liquid_transaction = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(source_txid, 3),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::MAX,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![elements::TxOut {
+                asset: elements::confidential::Asset::Explicit(liquid_asset),
+                value: elements::confidential::Value::Explicit(88_000),
+                nonce: elements::confidential::Nonce::Null,
+                script_pubkey: script.clone(),
+                witness: elements::TxOutWitness::default(),
+            }],
+        };
+        let raw_transaction = elements::encode::serialize(&liquid_transaction);
+        let txid = liquid_transaction.txid().to_string();
+        let asset = MerchantAsset::Liquid(LIQUID_ASSET.into());
+        let destination_script_hex = hex::encode(script.as_bytes());
+        let journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &raw_transaction,
+            txid: &txid,
+            source_prevouts: &source_prevouts,
+            merchant: MerchantOutputCommitment {
+                destination_address: &address_text,
+                destination_script_hex: &destination_script_hex,
+                asset: &asset,
+                amount_sat: 88_000,
+                vout: 0,
+            },
+        };
+        let observation = MerchantTransactionObservation {
+            raw_transaction: &raw_transaction,
+            txid: &txid,
+            confirmation: MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_000,
+                block_hash: BLOCK_HASH,
+            },
+        };
+        let approved = ApprovedMerchantDestination::liquid(
+            &address_text,
+            &destination_script_hex,
+            LIQUID_ASSET,
+        );
+
+        let adapted =
+            adapt_liquid_merchant_output(&journal, None, &observation, &blinding_key).unwrap();
+        assert_eq!(adapted.observed().amount_sat(), 88_000);
+        assert_eq!(adapted.verify(&approved, 1).unwrap().amount_sat(), 88_000);
+
+        let wrong_asset_id = elements::AssetId::from_str(&"22".repeat(32)).unwrap();
+        let mut wrong_asset_transaction = liquid_transaction;
+        wrong_asset_transaction.output[0].asset =
+            elements::confidential::Asset::Explicit(wrong_asset_id);
+        let wrong_asset_raw = elements::encode::serialize(&wrong_asset_transaction);
+        let wrong_asset_txid = wrong_asset_transaction.txid().to_string();
+        let wrong_asset_journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &wrong_asset_raw,
+            txid: &wrong_asset_txid,
+            source_prevouts: &source_prevouts,
+            merchant: journal.merchant,
+        };
+        let wrong_asset_observation = MerchantTransactionObservation {
+            raw_transaction: &wrong_asset_raw,
+            txid: &wrong_asset_txid,
+            confirmation: MerchantConfirmationEvidence::Mempool,
+        };
+        assert_eq!(
+            adapt_liquid_merchant_output(
+                &wrong_asset_journal,
+                None,
+                &wrong_asset_observation,
+                &blinding_key,
+            ),
+            Err(MerchantOutputAdapterError::JournalOutputMismatch)
+        );
+    }
+
+    #[test]
+    fn production_liquid_adapter_unblinds_with_stored_key_and_rejects_wrong_key() {
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let mut rng = secp256k1::rand::thread_rng();
+        let blinding_key = elements::secp256k1_zkp::SecretKey::new(&mut rng);
+        let blinding_pubkey =
+            elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+        let address = LiquidAddress::from_str(LIQUID_ADDRESS)
+            .unwrap()
+            .to_unconfidential()
+            .to_confidential(blinding_pubkey);
+        let address_text = address.to_string();
+        let script = address.script_pubkey();
+        let destination_script_hex = hex::encode(script.as_bytes());
+        let source_txid = elements::Txid::from_str(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let source_txid_text = source_txid.to_string();
+        let source_prevouts = [MerchantSourcePrevout {
+            txid: &source_txid_text,
+            vout: 4,
+            amount_sat: 91_000,
+            script_pubkey_hex: "51",
+        }];
+        let liquid_asset = elements::AssetId::from_str(LIQUID_ASSET).unwrap();
+        let input_secrets = elements::TxOutSecrets::new(
+            liquid_asset,
+            elements::confidential::AssetBlindingFactor::new(&mut rng),
+            88_000,
+            elements::confidential::ValueBlindingFactor::new(&mut rng),
+        );
+        let confidential_output = elements::TxOut::new_last_confidential(
+            &mut rng,
+            &secp,
+            88_000,
+            liquid_asset,
+            script,
+            blinding_pubkey,
+            &[input_secrets],
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert!(confidential_output.asset.explicit().is_none());
+        assert!(confidential_output.value.explicit().is_none());
+        let transaction = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(source_txid, 4),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::MAX,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![confidential_output],
+        };
+        let raw_transaction = elements::encode::serialize(&transaction);
+        let txid = transaction.txid().to_string();
+        let asset = MerchantAsset::Liquid(LIQUID_ASSET.into());
+        let journal = MerchantTransactionJournalEvidence {
+            raw_transaction: &raw_transaction,
+            txid: &txid,
+            source_prevouts: &source_prevouts,
+            merchant: MerchantOutputCommitment {
+                destination_address: &address_text,
+                destination_script_hex: &destination_script_hex,
+                asset: &asset,
+                amount_sat: 88_000,
+                vout: 0,
+            },
+        };
+        let observation = MerchantTransactionObservation {
+            raw_transaction: &raw_transaction,
+            txid: &txid,
+            confirmation: MerchantConfirmationEvidence::Confirmed {
+                confirmations: 1,
+                block_height: 700_001,
+                block_hash: BLOCK_HASH,
+            },
+        };
+        let approved = ApprovedMerchantDestination::liquid(
+            &address_text,
+            &destination_script_hex,
+            LIQUID_ASSET,
+        );
+
+        let adapted =
+            adapt_liquid_merchant_output(&journal, None, &observation, &blinding_key).unwrap();
+        assert_eq!(adapted.observed().asset(), &asset);
+        assert_eq!(adapted.observed().amount_sat(), 88_000);
+        assert_eq!(adapted.verify(&approved, 1).unwrap().amount_sat(), 88_000);
+
+        let wrong_key = elements::secp256k1_zkp::SecretKey::from_slice(&[2; 32]).unwrap();
+        assert_eq!(
+            adapt_liquid_merchant_output(&journal, None, &observation, &wrong_key),
+            Err(MerchantOutputAdapterError::ConfidentialOutputUnverified)
+        );
     }
 }
