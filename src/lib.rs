@@ -31,6 +31,7 @@ pub mod reconciler;
 pub mod registration;
 pub mod reserved_nyms;
 pub mod swap_manifest;
+pub mod swap_manifest_store;
 pub mod utxo;
 pub mod validators;
 pub mod version;

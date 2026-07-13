@@ -51,6 +51,43 @@ const POLY1305_TAG_BYTES: usize = 16;
 const BTC_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 const LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
 
+/// Canonical, structurally valid encrypted manifest-v1 bytes.
+///
+/// Constructing this type validates only the public envelope: its closed JSON
+/// schema, canonical encoding, algorithms, key identifier, signer key, nonce,
+/// and ciphertext encoding/bounds. It deliberately does not decrypt or claim
+/// that the encrypted payload binds any external object key; that requires the
+/// restore-time key and expected signer supplied to [`SwapManifestV1::open`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedSwapManifestV1 {
+    encoded: String,
+}
+
+impl EncryptedSwapManifestV1 {
+    pub fn parse(encoded: impl Into<String>) -> Result<Self, SwapManifestError> {
+        let encoded = encoded.into();
+        parse_structurally_valid_envelope(&encoded)?;
+        Ok(Self { encoded })
+    }
+
+    pub fn encoded(&self) -> &str {
+        &self.encoded
+    }
+
+    pub fn into_encoded(self) -> String {
+        self.encoded
+    }
+}
+
+impl fmt::Debug for EncryptedSwapManifestV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedSwapManifestV1")
+            .field("encoded_bytes", &self.encoded.len())
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Stable identities used to correlate an external record with a restored
 /// database and the provider's xpub restore output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,8 +360,7 @@ impl SwapManifestV1 {
         expected_signer: &XOnlyPublicKey,
     ) -> Result<Self, SwapManifestError> {
         validate_key_id(expected_encryption_key_id)?;
-        let envelope = parse_envelope(encoded)?;
-        validate_envelope_header(&envelope.header)?;
+        let envelope = parse_structurally_valid_envelope(encoded)?;
         if envelope.header.encryption_key_id != expected_encryption_key_id {
             return Err(SwapManifestError::UnexpectedEncryptionKeyId);
         }
@@ -334,13 +370,6 @@ impl SwapManifestV1 {
 
         let nonce =
             decode_fixed_hex::<XCHACHA_NONCE_BYTES>("envelope nonce", &envelope.header.nonce_hex)?;
-        if envelope.ciphertext_hex.len() < POLY1305_TAG_BYTES * 2
-            || envelope.ciphertext_hex.len() > MAX_CIPHERTEXT_BYTES * 2
-        {
-            return Err(SwapManifestError::InvalidField(
-                "envelope ciphertext length is invalid".into(),
-            ));
-        }
         let ciphertext = decode_hex("envelope ciphertext", &envelope.ciphertext_hex)?;
 
         let associated_data = canonical_json(&envelope.header)?;
@@ -675,6 +704,20 @@ fn parse_envelope(encoded: &str) -> Result<EncryptedEnvelopeV1, SwapManifestErro
     Ok(envelope)
 }
 
+fn parse_structurally_valid_envelope(
+    encoded: &str,
+) -> Result<EncryptedEnvelopeV1, SwapManifestError> {
+    let envelope = parse_envelope(encoded)?;
+    validate_envelope_header(&envelope.header)?;
+    if envelope.ciphertext_hex.len() < POLY1305_TAG_BYTES * 2
+        || envelope.ciphertext_hex.len() > MAX_CIPHERTEXT_BYTES * 2
+    {
+        return invalid("envelope ciphertext length is invalid");
+    }
+    decode_hex("envelope ciphertext", &envelope.ciphertext_hex)?;
+    Ok(envelope)
+}
+
 fn validate_envelope_header(header: &EnvelopeHeaderV1) -> Result<(), SwapManifestError> {
     if header.format != SWAP_MANIFEST_FORMAT {
         return invalid("envelope format marker is invalid");
@@ -689,8 +732,11 @@ fn validate_envelope_header(header: &EnvelopeHeaderV1) -> Result<(), SwapManifes
         return invalid("envelope signature algorithm is invalid");
     }
     validate_key_id(&header.encryption_key_id)?;
-    XOnlyPublicKey::from_str(&header.signer_xonly_public_key)
+    let signer = XOnlyPublicKey::from_str(&header.signer_xonly_public_key)
         .map_err(|_| SwapManifestError::InvalidField("envelope signer is malformed".into()))?;
+    if signer.to_string() != header.signer_xonly_public_key {
+        return invalid("envelope signer is not canonical lowercase hex");
+    }
     decode_fixed_hex::<XCHACHA_NONCE_BYTES>("envelope nonce", &header.nonce_hex)?;
     Ok(())
 }
@@ -2160,6 +2206,73 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, SwapManifestError::NonCanonicalEncoding);
+    }
+
+    #[test]
+    fn validated_encrypted_envelope_is_canonical_and_debug_redacted() {
+        let encoded = seal_fixture();
+        let envelope = EncryptedSwapManifestV1::parse(encoded.clone()).unwrap();
+
+        assert_eq!(envelope.encoded(), encoded);
+        let debug = format!("{envelope:?}");
+        assert!(debug.contains("contents: \"<redacted>\""));
+        assert!(!debug.contains(&encoded[..64]));
+    }
+
+    #[test]
+    fn validated_encrypted_envelope_refuses_invalid_public_structure() {
+        let encoded = seal_fixture();
+        let valid: EncryptedEnvelopeV1 = serde_json::from_str(&encoded).unwrap();
+
+        let mut wrong_algorithm = valid.clone();
+        wrong_algorithm.header.encryption_algorithm = "aes-gcm".into();
+        let wrong_algorithm = canonical_json(&wrong_algorithm).unwrap();
+
+        let mut unsafe_key_id = valid.clone();
+        unsafe_key_id.header.encryption_key_id = "key id with spaces".into();
+        let unsafe_key_id = canonical_json(&unsafe_key_id).unwrap();
+
+        let mut malformed_signer = valid.clone();
+        malformed_signer.header.signer_xonly_public_key = "not-a-public-key".into();
+        let malformed_signer = canonical_json(&malformed_signer).unwrap();
+
+        let mut noncanonical_signer = valid.clone();
+        noncanonical_signer.header.signer_xonly_public_key = noncanonical_signer
+            .header
+            .signer_xonly_public_key
+            .to_uppercase();
+        let noncanonical_signer = canonical_json(&noncanonical_signer).unwrap();
+
+        let mut malformed_nonce = valid.clone();
+        malformed_nonce.header.nonce_hex = "AA".repeat(XCHACHA_NONCE_BYTES);
+        let malformed_nonce = canonical_json(&malformed_nonce).unwrap();
+
+        let mut short_ciphertext = valid.clone();
+        short_ciphertext.ciphertext_hex = "00".repeat(POLY1305_TAG_BYTES - 1);
+        let short_ciphertext = canonical_json(&short_ciphertext).unwrap();
+
+        let mut malformed_ciphertext = valid;
+        malformed_ciphertext.ciphertext_hex = "GG".repeat(POLY1305_TAG_BYTES);
+        let malformed_ciphertext = canonical_json(&malformed_ciphertext).unwrap();
+
+        let noncanonical =
+            serde_json::to_string_pretty(&serde_json::from_str::<Value>(&encoded).unwrap())
+                .unwrap();
+
+        for refused in [
+            "garbage".to_owned(),
+            "{}".to_owned(),
+            wrong_algorithm,
+            unsafe_key_id,
+            malformed_signer,
+            noncanonical_signer,
+            malformed_nonce,
+            short_ciphertext,
+            malformed_ciphertext,
+            noncanonical,
+        ] {
+            assert!(EncryptedSwapManifestV1::parse(refused).is_err());
+        }
     }
 
     #[test]
