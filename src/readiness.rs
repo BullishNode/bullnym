@@ -17,6 +17,8 @@ type DirectLifecyclePrivileges = (
     Option<bool>,
 );
 
+type WatcherLanePrivileges = (Option<bool>, Option<bool>, Option<bool>);
+
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
     pub service: &'static str,
@@ -169,8 +171,30 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
     .fetch_one(pool)
     .await?;
 
+    let watcher_lane_privileges = sqlx::query_as::<_, WatcherLanePrivileges>(
+        "SELECT \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.watcher_lane_progress'), \
+                'SELECT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.watcher_lane_progress'), \
+                'INSERT' \
+            ), \
+            has_table_privilege( \
+                current_user, \
+                to_regclass('public.watcher_lane_progress'), \
+                'UPDATE' \
+            )",
+    )
+    .fetch_one(pool)
+    .await?;
+
     Ok(journal_privileges_ready(privileges)
-        && direct_lifecycle_privileges_ready(direct_lifecycle_privileges))
+        && direct_lifecycle_privileges_ready(direct_lifecycle_privileges)
+        && watcher_lane_privileges_ready(watcher_lane_privileges))
 }
 
 fn journal_privileges_ready(
@@ -194,6 +218,13 @@ fn direct_lifecycle_privileges_ready(
             transition_insert,
         ),
         (Some(true), Some(true), Some(true), Some(true), Some(true),)
+    )
+}
+
+fn watcher_lane_privileges_ready((select, insert, update): WatcherLanePrivileges) -> bool {
+    matches!(
+        (select, insert, update),
+        (Some(true), Some(true), Some(true))
     )
 }
 
@@ -362,6 +393,53 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND c.contype = 'c' \
             ) \
             AND EXISTS ( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'watcher_lane_progress' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'watcher_lane_progress' \
+                  AND c.conname = 'watcher_lane_progress_pkey' \
+                  AND c.contype = 'p' \
+                  AND ( \
+                      SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+                  ) = ARRAY['worker', 'lane']::text[] \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'watcher_lane_progress' \
+                  AND c.conname = 'watcher_lane_progress_worker_check' \
+                  AND c.contype = 'c' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'watcher_lane_progress' \
+                  AND c.conname = 'watcher_lane_progress_lane_check' \
+                  AND c.contype = 'c' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_constraint c \
+                JOIN pg_class t ON t.oid = c.conrelid \
+                JOIN pg_namespace n ON n.oid = t.relnamespace \
+                WHERE n.nspname = 'public' \
+                  AND t.relname = 'watcher_lane_progress' \
+                  AND c.conname = 'watcher_lane_progress_cursor_shape_check' \
+                  AND c.contype = 'c' \
+            ) \
+            AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
                 WHERE table_schema = 'public' \
                   AND table_name = 'invoice_payment_events' \
@@ -406,7 +484,9 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_lifecycle_privileges_ready, journal_privileges_ready};
+    use super::{
+        direct_lifecycle_privileges_ready, journal_privileges_ready, watcher_lane_privileges_ready,
+    };
 
     #[test]
     fn recovery_journal_requires_every_privilege() {
@@ -447,6 +527,26 @@ mod tests {
             (None, Some(true), Some(true), Some(true), Some(true)),
         ] {
             assert!(!direct_lifecycle_privileges_ready(privileges));
+        }
+    }
+
+    #[test]
+    fn watcher_lane_progress_requires_read_write_privileges() {
+        assert!(watcher_lane_privileges_ready((
+            Some(true),
+            Some(true),
+            Some(true),
+        )));
+
+        for privileges in [
+            (Some(false), Some(true), Some(true)),
+            (Some(true), Some(false), Some(true)),
+            (Some(true), Some(true), Some(false)),
+            (None, Some(true), Some(true)),
+            (Some(true), None, Some(true)),
+            (Some(true), Some(true), None),
+        ] {
+            assert!(!watcher_lane_privileges_ready(privileges));
         }
     }
 }

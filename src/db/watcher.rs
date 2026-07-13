@@ -1,4 +1,238 @@
 use sqlx::PgPool;
+use uuid::Uuid;
+
+use super::invoices::WatcherScanCursor;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherLaneWorker {
+    BitcoinDirect,
+    LiquidDirect,
+}
+
+impl WatcherLaneWorker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BitcoinDirect => "bitcoin_direct",
+            Self::LiquidDirect => "liquid_direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherLane {
+    Recent,
+    Historical,
+}
+
+impl WatcherLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Historical => "historical",
+        }
+    }
+}
+
+/// Load a restart rotation offset. A row with a null pair is equivalent to no
+/// saved offset; persisted progress is scheduling input and never health proof.
+pub async fn load_watcher_lane_cursor(
+    pool: &PgPool,
+    worker: WatcherLaneWorker,
+    lane: WatcherLane,
+) -> Result<Option<WatcherScanCursor>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<String>, Option<Uuid>)>(
+        "SELECT cursor_created_at::TEXT, cursor_invoice_id \
+         FROM watcher_lane_progress \
+         WHERE worker = $1 AND lane = $2",
+    )
+    .bind(worker.as_str())
+    .bind(lane.as_str())
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        None | Some((None, None)) => Ok(None),
+        Some((Some(created_at), Some(id))) => Ok(Some(WatcherScanCursor { created_at, id })),
+        Some(_) => Err(sqlx::Error::Protocol(
+            "watcher lane cursor contains a partial key".into(),
+        )),
+    }
+}
+
+/// Advance one lane only after its caller has fully applied or explicitly
+/// isolated the invoice obligation. The upsert is intentionally separate from
+/// the idempotent obligation transaction: a crash between them repeats work;
+/// it cannot skip work.
+pub async fn persist_watcher_lane_cursor(
+    pool: &PgPool,
+    worker: WatcherLaneWorker,
+    lane: WatcherLane,
+    cursor: &WatcherScanCursor,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO watcher_lane_progress ( \
+             worker, lane, cursor_created_at, cursor_invoice_id, updated_at \
+         ) VALUES ($1, $2, $3::timestamptz, $4, clock_timestamp()) \
+         ON CONFLICT (worker, lane) DO UPDATE \
+         SET cursor_created_at = EXCLUDED.cursor_created_at, \
+             cursor_invoice_id = EXCLUDED.cursor_invoice_id, \
+             updated_at = clock_timestamp()",
+    )
+    .bind(worker.as_str())
+    .bind(lane.as_str())
+    .bind(&cursor.created_at)
+    .bind(cursor.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+const BITCOIN_WATCHER_ELIGIBLE_PREDICATE: &str = "bitcoin_address IS NOT NULL \
+       AND ( \
+             ( \
+               status IN ('unpaid', 'in_progress', 'partially_paid') \
+               AND accept_btc = TRUE \
+               AND expires_at + ($2 || ' seconds')::interval > $3::timestamptz \
+             ) \
+             OR status IN ('cancelled', 'expired') \
+             OR EXISTS ( \
+               SELECT 1 FROM invoice_payment_observations o \
+               WHERE o.invoice_id = invoices.id \
+                 AND o.source = 'bitcoin_direct' \
+                 AND o.last_seen_state <> 'superseded' \
+             ) \
+             OR EXISTS ( \
+               SELECT 1 FROM invoice_payment_events e \
+               WHERE e.invoice_id = invoices.id \
+                 AND e.source = 'bitcoin_direct' \
+                 AND e.accounting_state <> 'superseded' \
+             ) \
+           )";
+
+/// One canonical priority definition shared by both page and lag queries.
+/// Historical is constructed as its literal negation inside the same eligible
+/// set, so an invoice cannot enter both lanes or fall into a nullable gap.
+const BITCOIN_WATCHER_PRIORITY_PREDICATE: &str = "( \
+             created_at > $3::timestamptz - ($1 || ' seconds')::interval \
+             OR COALESCE(presentation_status = 'partial', FALSE) \
+             OR direct_settlement_status IN ('pending', 'resolution_pending') \
+           )";
+
+const BITCOIN_WATCHER_PAGE_SQL_TEMPLATE: &str = "SELECT \
+            id, bitcoin_address, amount_sat, created_at::TEXT AS created_at_cursor \
+     FROM invoices \
+     WHERE {eligible} \
+       AND {lane_predicate} \
+       AND created_at <= $3::timestamptz \
+       AND ( \
+             $4::timestamptz IS NULL \
+             OR (created_at, id) > ($4::timestamptz, $5::uuid) \
+           ) \
+       AND ( \
+             $6::timestamptz IS NULL \
+             OR (created_at, id) <= ($6::timestamptz, $7::uuid) \
+           ) \
+     ORDER BY created_at ASC, id ASC \
+     LIMIT $8";
+
+const BITCOIN_WATCHER_LAG_SQL_TEMPLATE: &str = "SELECT \
+            COUNT(*)::BIGINT, \
+            MIN(created_at)::TEXT, \
+            COALESCE( \
+                GREATEST( \
+                    0, \
+                    FLOOR(EXTRACT(EPOCH FROM ( \
+                        $3::timestamptz - MIN(created_at) \
+                    )))::BIGINT \
+                ), \
+                0 \
+            )::BIGINT \
+     FROM invoices \
+     WHERE {eligible} \
+       AND {lane_predicate} \
+       AND created_at <= $3::timestamptz";
+
+fn bitcoin_watcher_lane_sql(template: &str, lane: WatcherLane) -> String {
+    let lane_predicate = match lane {
+        WatcherLane::Recent => BITCOIN_WATCHER_PRIORITY_PREDICATE.to_string(),
+        WatcherLane::Historical => format!("NOT {BITCOIN_WATCHER_PRIORITY_PREDICATE}"),
+    };
+    template
+        .replace("{eligible}", BITCOIN_WATCHER_ELIGIBLE_PREDICATE)
+        .replace("{lane_predicate}", &lane_predicate)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct BitcoinWatcherInvoicePageRow {
+    pub id: Uuid,
+    pub bitcoin_address: String,
+    pub amount_sat: i64,
+    pub created_at_cursor: String,
+}
+
+impl BitcoinWatcherInvoicePageRow {
+    pub fn scan_cursor(&self) -> WatcherScanCursor {
+        WatcherScanCursor {
+            created_at: self.created_at_cursor.clone(),
+            id: self.id,
+        }
+    }
+}
+
+pub struct BitcoinWatcherInvoicePage {
+    pub rows: Vec<BitcoinWatcherInvoicePageRow>,
+    pub has_more: bool,
+}
+
+/// Deterministic, bounded page in one frozen Bitcoin invoice lane. The caller
+/// supplies a lower cursor and an optional inclusive wrap limit.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_bitcoin_watcher_invoice_page(
+    pool: &PgPool,
+    active_window_secs: i64,
+    payment_grace_secs: i64,
+    snapshot: &str,
+    lane: WatcherLane,
+    cursor: Option<&WatcherScanCursor>,
+    wrap_limit: Option<&WatcherScanCursor>,
+    batch_size: usize,
+) -> Result<BitcoinWatcherInvoicePage, sqlx::Error> {
+    let fetch_limit = batch_size
+        .checked_add(1)
+        .and_then(|limit| i64::try_from(limit).ok())
+        .ok_or_else(|| sqlx::Error::Protocol("Bitcoin watcher batch limit overflow".into()))?;
+    let sql = bitcoin_watcher_lane_sql(BITCOIN_WATCHER_PAGE_SQL_TEMPLATE, lane);
+    let mut rows = sqlx::query_as::<_, BitcoinWatcherInvoicePageRow>(&sql)
+        .bind(active_window_secs)
+        .bind(payment_grace_secs)
+        .bind(snapshot)
+        .bind(cursor.map(|cursor| cursor.created_at.as_str()))
+        .bind(cursor.map(|cursor| cursor.id))
+        .bind(wrap_limit.map(|cursor| cursor.created_at.as_str()))
+        .bind(wrap_limit.map(|cursor| cursor.id))
+        .bind(fetch_limit)
+        .fetch_all(pool)
+        .await?;
+    let has_more = rows.len() > batch_size;
+    rows.truncate(batch_size);
+    Ok(BitcoinWatcherInvoicePage { rows, has_more })
+}
+
+pub async fn bitcoin_watcher_lane_lag(
+    pool: &PgPool,
+    active_window_secs: i64,
+    payment_grace_secs: i64,
+    snapshot: &str,
+    lane: WatcherLane,
+) -> Result<(i64, Option<String>, i64), sqlx::Error> {
+    let sql = bitcoin_watcher_lane_sql(BITCOIN_WATCHER_LAG_SQL_TEMPLATE, lane);
+    sqlx::query_as(&sql)
+        .bind(active_window_secs)
+        .bind(payment_grace_secs)
+        .bind(snapshot)
+        .fetch_one(pool)
+        .await
+}
 
 // =====================================================================
 // Chain watcher helpers (added 2026-04-27)
@@ -311,6 +545,44 @@ pub async fn mark_reservations_fulfilled_at_idx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitcoin_lane_queries_share_one_priority_and_exact_historical_negation() {
+        let recent =
+            bitcoin_watcher_lane_sql(BITCOIN_WATCHER_PAGE_SQL_TEMPLATE, WatcherLane::Recent);
+        let historical =
+            bitcoin_watcher_lane_sql(BITCOIN_WATCHER_PAGE_SQL_TEMPLATE, WatcherLane::Historical);
+
+        assert!(recent.contains(BITCOIN_WATCHER_PRIORITY_PREDICATE));
+        assert!(historical.contains(&format!("NOT {BITCOIN_WATCHER_PRIORITY_PREDICATE}")));
+        assert_eq!(
+            recent.matches(BITCOIN_WATCHER_ELIGIBLE_PREDICATE).count(),
+            1
+        );
+        assert_eq!(
+            historical
+                .matches(BITCOIN_WATCHER_ELIGIBLE_PREDICATE)
+                .count(),
+            1
+        );
+        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
+            .contains("COALESCE(presentation_status = 'partial', FALSE)"));
+        assert!(BITCOIN_WATCHER_PRIORITY_PREDICATE
+            .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
+        assert!(
+            BITCOIN_WATCHER_ELIGIBLE_PREDICATE.contains("OR status IN ('cancelled', 'expired')")
+        );
+        assert!(!recent.contains("NOW()"));
+        assert!(recent.contains("(created_at, id) >"));
+        assert!(recent.contains("(created_at, id) <="));
+
+        let recent_lag =
+            bitcoin_watcher_lane_sql(BITCOIN_WATCHER_LAG_SQL_TEMPLATE, WatcherLane::Recent);
+        let historical_lag =
+            bitcoin_watcher_lane_sql(BITCOIN_WATCHER_LAG_SQL_TEMPLATE, WatcherLane::Historical);
+        assert!(recent_lag.contains(BITCOIN_WATCHER_PRIORITY_PREDICATE));
+        assert!(historical_lag.contains(&format!("NOT {BITCOIN_WATCHER_PRIORITY_PREDICATE}")));
+    }
 
     #[test]
     fn nym_watcher_batch_detects_only_the_sentinel_boundary() {

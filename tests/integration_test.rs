@@ -541,6 +541,10 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    sqlx::query("DELETE FROM watcher_lane_progress")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM processed_webhook_events")
         .execute(pool)
         .await
@@ -812,8 +816,9 @@ async fn readiness_rejects_schema_before_latest_migration() {
     cleanup_db(&pool).await;
 
     sqlx::query(
-        "ALTER TABLE invoices RENAME CONSTRAINT invoices_paid_via_or_closed_chk \
-         TO invoices_paid_via_or_closed_chk_before_readiness_test",
+        "ALTER TABLE watcher_lane_progress RENAME CONSTRAINT \
+         watcher_lane_progress_cursor_shape_check \
+         TO watcher_lane_progress_cursor_shape_check_before_readiness_test",
     )
     .execute(&pool)
     .await
@@ -823,9 +828,9 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
-        "ALTER TABLE invoices RENAME CONSTRAINT \
-         invoices_paid_via_or_closed_chk_before_readiness_test \
-         TO invoices_paid_via_or_closed_chk",
+        "ALTER TABLE watcher_lane_progress RENAME CONSTRAINT \
+         watcher_lane_progress_cursor_shape_check_before_readiness_test \
+         TO watcher_lane_progress_cursor_shape_check",
     )
     .execute(&pool)
     .await
@@ -835,13 +840,123 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "048_cancelled_invoice_late_money"
+        "049_watcher_lane_progress"
     );
 
     let app = test_app(test_state(pool.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+}
+
+#[tokio::test]
+async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    use pay_service::db::{WatcherLane, WatcherLaneWorker, WatcherScanCursor};
+
+    assert!(pay_service::db::load_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Recent,
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    // A nullable pair is a valid initialized-but-unadvanced lane and remains
+    // distinct from the other worker/lane keys.
+    sqlx::query("INSERT INTO watcher_lane_progress (worker, lane) VALUES ($1, $2)")
+        .bind(WatcherLaneWorker::BitcoinDirect.as_str())
+        .bind(WatcherLane::Historical.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pay_service::db::load_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Historical,
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    let completed = WatcherScanCursor {
+        created_at: "2026-07-12 11:10:00+00".to_string(),
+        id: uuid::Uuid::from_u128(10),
+    };
+    pay_service::db::persist_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Recent,
+        &completed,
+    )
+    .await
+    .unwrap();
+
+    let resumed = pay_service::db::load_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Recent,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.id, completed.id);
+    assert!(resumed.created_at.starts_with("2026-07-12 11:10:00"));
+
+    // Simulate an idempotent invoice obligation committing immediately before
+    // process death: without the later cursor upsert, restart repeats from the
+    // last completed key instead of skipping the obligation.
+    let applied_before_crash = WatcherScanCursor {
+        created_at: "2026-07-12 11:20:00+00".to_string(),
+        id: uuid::Uuid::from_u128(20),
+    };
+    let after_crash = pay_service::db::load_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Recent,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(after_crash.id, completed.id);
+
+    pay_service::db::persist_watcher_lane_cursor(
+        &pool,
+        WatcherLaneWorker::BitcoinDirect,
+        WatcherLane::Recent,
+        &applied_before_crash,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::load_watcher_lane_cursor(
+            &pool,
+            WatcherLaneWorker::BitcoinDirect,
+            WatcherLane::Recent,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id,
+        applied_before_crash.id
+    );
+
+    let keys: Vec<(String, String)> =
+        sqlx::query_as("SELECT worker, lane FROM watcher_lane_progress ORDER BY worker, lane")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            ("bitcoin_direct".to_string(), "historical".to_string()),
+            ("bitcoin_direct".to_string(), "recent".to_string()),
+        ]
+    );
+
+    cleanup_db(&pool).await;
 }
 
 // --- Registration tests ---
@@ -5253,6 +5368,198 @@ async fn insert_test_btc_invoice(
         },
     )
     .await
+}
+
+#[tokio::test]
+async fn bitcoin_watcher_priority_lanes_are_disjoint_complete_and_rotation_bounded() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "btclanes").await;
+    let old_partial = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlaneoldpartial")
+        .await
+        .unwrap();
+    let old_settling = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlaneoldsettling")
+        .await
+        .unwrap();
+    let old_cancelled = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlaneoldcancelled")
+        .await
+        .unwrap();
+    let old_expired = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlaneoldexpired")
+        .await
+        .unwrap();
+    let new_unpaid = insert_test_btc_invoice(&pool, "btclanes", &npub, "bc1qlanenew000")
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 08:00:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-13 00:00:00+00', \
+             status = 'cancelled', presentation_status = 'unpaid', \
+             cancelled_at = TIMESTAMPTZ '2026-07-12 08:01:00+00' \
+         WHERE id = $1",
+    )
+    .bind(old_cancelled.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 08:30:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-12 08:31:00+00', \
+             status = 'expired', presentation_status = 'unpaid' \
+         WHERE id = $1",
+    )
+    .bind(old_expired.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 09:00:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-13 00:00:00+00', \
+             status = 'cancelled', presentation_status = 'partial', \
+             cancelled_at = TIMESTAMPTZ '2026-07-12 09:01:00+00', \
+             paid_via = 'bitcoin', paid_amount_sat = 100 \
+         WHERE id = $1",
+    )
+    .bind(old_partial.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 10:00:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-13 00:00:00+00', \
+             status = 'in_progress', presentation_status = 'payment_received', \
+             direct_settlement_status = 'pending', settlement_status = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(old_settling.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET \
+             created_at = TIMESTAMPTZ '2026-07-12 11:30:00+00', \
+             expires_at = TIMESTAMPTZ '2026-07-13 00:00:00+00' \
+         WHERE id = $1",
+    )
+    .bind(new_unpaid.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let snapshot = "2026-07-12 12:00:00+00";
+    let recent = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Recent,
+        None,
+        None,
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(!recent.has_more);
+    assert_eq!(
+        recent.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![old_partial.id, old_settling.id, new_unpaid.id]
+    );
+    let bounded_recent = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Recent,
+        None,
+        None,
+        2,
+    )
+    .await
+    .unwrap();
+    assert!(bounded_recent.has_more);
+    assert_eq!(
+        bounded_recent
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![old_partial.id, old_settling.id]
+    );
+
+    let historical = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Historical,
+        None,
+        None,
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(!historical.has_more);
+    assert_eq!(
+        historical.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![old_cancelled.id, old_expired.id]
+    );
+
+    let rotation_start = old_settling.id;
+    let rotation_cursor = pay_service::db::WatcherScanCursor {
+        created_at: "2026-07-12 10:00:00+00".to_string(),
+        id: rotation_start,
+    };
+    let tail = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Recent,
+        Some(&rotation_cursor),
+        None,
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tail.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![new_unpaid.id]
+    );
+    let wrap = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Recent,
+        None,
+        Some(&rotation_cursor),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wrap.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![old_partial.id, old_settling.id]
+    );
+
+    let (recent_count, recent_oldest, recent_lag) = pay_service::db::bitcoin_watcher_lane_lag(
+        &pool,
+        3_600,
+        0,
+        snapshot,
+        pay_service::db::WatcherLane::Recent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recent_count, 3);
+    assert!(recent_oldest.unwrap().starts_with("2026-07-12 09:00:00"));
+    assert_eq!(recent_lag, 10_800);
+
+    cleanup_db(&pool).await;
 }
 
 const DIRECT_LIFECYCLE_BLOCK_HASH: &str =
@@ -10002,6 +10309,141 @@ async fn liquid_watcher_retains_closed_rows_and_finalized_evidence() {
         invoice_ids.contains(&finalized.id),
         "finalized Liquid evidence must remain watchable for deep reorgs"
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "liquidlane").await;
+
+    let old_partial =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldpartial", 3_600).await;
+    let old_settling =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldsettling", 3_600).await;
+    let old_cancelled =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldcancelled", 3_600).await;
+    let old_expired =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldexpired", -10).await;
+    let new_unpaid =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1lanenewunpaid", 3_600).await;
+
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             status = 'cancelled', presentation_status = 'partial', \
+             cancelled_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(old_partial.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             direct_settlement_status = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(old_settling.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             status = 'cancelled', cancelled_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(old_cancelled.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', status = 'expired' \
+         WHERE id = $1",
+    )
+    .bind(old_expired.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let snapshot = pay_service::db::watcher_scan_snapshot(&pool).await.unwrap();
+    let recent = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool, 0, 86_400, &snapshot, true, None, None,
+    )
+    .await
+    .unwrap();
+    let historical = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool, 0, 86_400, &snapshot, false, None, None,
+    )
+    .await
+    .unwrap();
+    let recent_rotation_start = recent.rows.first().unwrap().scan_cursor();
+    let recent_ids: std::collections::HashSet<_> =
+        recent.rows.into_iter().map(|row| row.id).collect();
+    let historical_ids: std::collections::HashSet<_> =
+        historical.rows.into_iter().map(|row| row.id).collect();
+
+    assert!(recent_ids.is_disjoint(&historical_ids));
+    assert!(recent_ids.contains(&old_partial.id));
+    assert!(recent_ids.contains(&old_settling.id));
+    assert!(recent_ids.contains(&new_unpaid.id));
+    assert!(historical_ids.contains(&old_cancelled.id));
+    assert!(historical_ids.contains(&old_expired.id));
+
+    let after_saved = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool,
+        0,
+        86_400,
+        &snapshot,
+        true,
+        Some(&recent_rotation_start),
+        None,
+    )
+    .await
+    .unwrap();
+    let through_saved = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool,
+        0,
+        86_400,
+        &snapshot,
+        true,
+        None,
+        Some(&recent_rotation_start),
+    )
+    .await
+    .unwrap();
+    let after_saved_ids: std::collections::HashSet<_> =
+        after_saved.rows.into_iter().map(|row| row.id).collect();
+    let through_saved_ids: std::collections::HashSet<_> =
+        through_saved.rows.into_iter().map(|row| row.id).collect();
+    assert!(after_saved_ids.is_disjoint(&through_saved_ids));
+    assert_eq!(
+        after_saved_ids
+            .union(&through_saved_ids)
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        recent_ids
+    );
+
+    let (recent_backlog, recent_oldest_due, recent_lag_secs) =
+        pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, true)
+            .await
+            .unwrap();
+    let (historical_backlog, historical_oldest_due, historical_lag_secs) =
+        pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, false)
+            .await
+            .unwrap();
+    assert_eq!(recent_backlog, recent_ids.len() as i64);
+    assert!(recent_oldest_due.is_some());
+    assert!(recent_lag_secs >= 0);
+    assert_eq!(historical_backlog, historical_ids.len() as i64);
+    assert!(historical_oldest_due.is_some());
+    assert!(historical_lag_secs >= 0);
 
     cleanup_db(&pool).await;
 }

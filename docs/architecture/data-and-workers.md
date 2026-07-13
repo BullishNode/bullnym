@@ -14,6 +14,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | `invoice_payment_observations` | Non-accounting evidence | Durable exact Bitcoin and Liquid direct-output identity, confirmation, block, verification, and lifecycle evidence written by both live watchers. |
 | `invoice_direct_scan_heads` | Direct-payment ordering | One bounded generation row per invoice/source so an older network completion cannot overwrite a newer-started scan. |
 | `invoice_direct_payment_transitions` | Direct-payment audit | Append-only lifecycle evidence written atomically by the live direct-payment reducer and by compatibility-safe Boltz supersession. |
+| `watcher_lane_progress` | Direct-watcher scheduling | Last fully visited `(created_at, invoice id)` rotation offset per direct worker and recent/historical lane. It is never worker-health evidence. |
 | `swap_records` | Boltz reverse swaps | Lightning Address and invoice reverse-swap state, claim status, and payment association. |
 | `chain_swap_records` | Boltz chain swaps | Payment Page/POS Bitcoin-to-Liquid state, lockup and claim data, refund data, retry state, and derivation metadata. |
 | `chain_swap_tx_attempts` | Chain-swap recovery journal | Durable Bitcoin recovery transaction attempts, raw transaction evidence, broadcast outcome, and competing-spend recovery state. |
@@ -96,7 +97,7 @@ evidence; the unresolved ambiguous-absence policy remains disabled.
 | Slow recovery | funded `claim_stuck` rows | Revive claims on a long exponential backoff after the fast budget is exhausted. |
 | Settlement repair | claimed reverse and chain swaps | Idempotently recreate a missing invoice payment event after a crash between claim and invoice updates. |
 | Payment Page OG reconciler | live `payment_page` rows | Generate versioned, content-addressed social cards; backfill legacy rows; retry render/write failures; and verify referenced files exist on the serving host. |
-| Liquid watcher | persisted blinded destinations | Preserve signed Electrum heights and block identity, verify exact LBTC outputs, present at zero confirmations, account at one, and track configured finality or explicit reorg evidence. |
+| Liquid watcher | persisted blinded destinations | Preserve signed Electrum heights and block identity, verify exact LBTC outputs, present at zero confirmations, account at one, and track configured finality or explicit reorg evidence. Direct-invoice work uses durable, disjoint recent and historical rotation lanes. |
 | Bitcoin watcher | direct-Bitcoin invoice destinations and known observations | Use address history for discovery plus tx-specific follow-up, present at zero confirmations, account at one, and track configured finality or explicit block regression. |
 | GC | terminal and rate-limit rows | Apply retention and partial-checkout expiry policies. |
 
@@ -112,6 +113,19 @@ new process must prove its own dependencies and complete its own startup scans
 instead of inheriting another process's health. Liquid and Bitcoin watchers run
 an immediate startup scan, and the claimer/reconciler/recovery workers run an
 immediate startup cycle before admission can open their dependent rail.
+For direct Liquid invoices, the fast lane contains newly-created targets plus
+any target with partial presentation or pending/resolution-pending direct
+settlement; the historical lane is the exact eligible complement. Cancelled,
+expired, and invoices from subsequently archived surfaces remain eligible for
+late-money and reorg observation. Each fully applied or explicitly isolated
+invoice advances only its own durable lane offset. That offset is restart
+scheduling input, never inherited health: every new process must traverse from
+the offset to the frozen lane end and wrap through the saved boundary before
+that lane can report healthy. Lightning Address nym lookahead keeps its
+separate process-local recent/all cadence. Each Liquid watcher poll gives both
+incomplete phases one bounded turn and alternates which runs first, so nym
+backlog or a phase-local failure cannot defer direct-invoice work by the slow
+historical cadence.
 Direct watcher backends, the retained Liquid claim-client factory, the reused
 Bitcoin recovery-evidence client, and the Boltz client are initialized as
 separate rail facts. A direct backend cannot stand in for a swap claim or
@@ -131,9 +145,19 @@ fail make the worker cycle unhealthy.
 
 Watcher startup covers both active and idle tiers. Each tier freezes a snapshot
 from the database clock and advances through deterministic keyset pages. The
-Liquid watcher completes and latches its nym phase before advancing through
-invoice pages, so a large nym set cannot continually restart and starve a large
-invoice set. Each nym also freezes one bounded descriptor/lookahead range and
+direct invoice watchers persist their most recently completed row after every
+fully applied or explicitly isolated obligation. A new epoch starts after that
+offset, wraps once through the beginning up to its frozen starting offset, and
+only then completes. A crash before the offset write repeats an idempotent
+obligation; it cannot skip one. The recent lane prioritizes age-new invoices,
+`presentation_status = partial`, and direct settlement that is pending or in
+resolution. Historical is the exact complement inside the eligible set, so the
+lanes are disjoint and old cancelled/expired destinations remain eligible.
+The persisted offset controls rotation only: every new process starts with
+unknown tier health and must complete its own tail-and-wrap traversal. The
+Liquid watcher latches completed nym and invoice phases across ticks; neither
+incomplete phase can restart or gate the other. Each nym also freezes one
+bounded descriptor/lookahead range and
 retains its exact address subcursor across deferral; payments that advance the
 live descriptor cursor cannot extend that epoch or starve later nyms.
 Intermediate pages report progress only; an empty page still probes the
