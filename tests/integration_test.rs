@@ -5339,6 +5339,95 @@ async fn reserve_and_apply_direct_lifecycle<'a>(
 }
 
 #[tokio::test]
+async fn liquid_reducer_revalidates_199_legacy_outputs_without_double_count() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "liquidlegacycapacity";
+    let address = "lq1liquidlegacycapacity";
+    let npub = create_test_user(&pool, nym).await;
+    let invoice = insert_test_invoice(&pool, nym, &npub, address, 3_600).await;
+    let txids = (1..=199)
+        .map(|index| format!("{index:064x}"))
+        .collect::<Vec<_>>();
+    let event_keys = txids
+        .iter()
+        .map(|txid| format!("liquid_direct:{txid}:0"))
+        .collect::<Vec<_>>();
+
+    sqlx::query(
+        "INSERT INTO invoice_payment_events \
+             (invoice_id, rail, event_key, amount_sat, source, txid, vout, address) \
+         SELECT $1, 'liquid', 'liquid_direct:' || seeded.txid || ':0', 1, \
+                'liquid_direct', seeded.txid, 0, $2 \
+         FROM UNNEST($3::TEXT[]) AS seeded(txid)",
+    )
+    .bind(invoice.id)
+    .bind(address)
+    .bind(&txids[..197])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let observations = txids
+        .iter()
+        .zip(&event_keys)
+        .map(|(txid, event_key)| {
+            liquid_lifecycle_observation(
+                event_key,
+                txid,
+                0,
+                address,
+                1,
+                1,
+                pay_service::db::DirectObservationPhase::Confirmed,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let (_, first) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &observations,
+    )
+    .await;
+    assert_eq!(
+        first,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let (_, repeated) = reserve_and_apply_direct_lifecycle(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+        &observations,
+    )
+    .await;
+    assert_eq!(
+        repeated,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: false }
+    );
+
+    let durable: (i64, i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM invoice_payment_events \
+              WHERE invoice_id = $1 AND source = 'liquid_direct'), \
+            (SELECT COUNT(*) FROM invoice_payment_observations \
+              WHERE invoice_id = $1 AND source = 'liquid_direct'), \
+            (SELECT COUNT(*) FROM invoice_direct_payment_transitions \
+              WHERE invoice_id = $1 AND source = 'liquid_direct'), \
+            (SELECT paid_amount_sat FROM invoices WHERE id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable, (199, 199, 199, Some(199)));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn direct_mempool_first_sighting_sets_only_the_direct_component() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
