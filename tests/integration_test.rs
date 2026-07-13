@@ -16577,6 +16577,7 @@ struct StartupRestoreProviderState {
 
 struct StartupRestoreProviderServer {
     base_url: String,
+    chain_url: String,
     calls: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -16595,6 +16596,8 @@ impl StartupRestoreProviderServer {
                 "/v2/swap/restore/index",
                 post(startup_restore_provider_index),
             )
+            .route("/blocks/tip/height", get(startup_chain_tip_height))
+            .route("/block-height/:height", get(startup_chain_block_hash))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -16603,10 +16606,29 @@ impl StartupRestoreProviderServer {
         });
         Self {
             base_url: format!("http://{address}/v2"),
+            chain_url: format!("http://{address}"),
             calls,
             task,
         }
     }
+}
+
+async fn startup_chain_tip_height() -> &'static str {
+    "900000"
+}
+
+async fn startup_chain_block_hash() -> String {
+    "11".repeat(32)
+}
+
+fn startup_chain_witness_adapter(
+    server: &StartupRestoreProviderServer,
+) -> pay_service::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1 {
+    pay_service::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1::try_new(
+        vec![server.chain_url.clone()],
+        Duration::from_secs(2),
+    )
+    .unwrap()
 }
 
 impl Drop for StartupRestoreProviderServer {
@@ -16660,12 +16682,14 @@ async fn startup_provider_reconciliation_opens_only_on_exact_empty_source_agreem
         coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
     );
     let master_key = startup_reconciliation_master_key();
+    let chain_witness = startup_chain_witness_adapter(&server);
 
     let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
         &pool,
         &runtime,
         &fetcher,
         &master_key,
+        &chain_witness,
     )
     .await
     .unwrap();
@@ -16698,12 +16722,14 @@ async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() 
         coordinator_manifest_store(InstrumentedManifestObjectStore::new()),
     );
     let master_key = startup_reconciliation_master_key();
+    let chain_witness = startup_chain_witness_adapter(&server);
 
     let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
         &pool,
         &runtime,
         &fetcher,
         &master_key,
+        &chain_witness,
     )
     .await
     .unwrap();
@@ -16735,16 +16761,17 @@ async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart()
         )
         .unwrap();
     let master_key = startup_reconciliation_master_key();
+    let chain_witness = startup_chain_witness_adapter(&server);
 
-    let error =
-        pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
-            &pool,
-            &runtime,
-            &fetcher,
-            &master_key,
-        )
-        .await
-        .unwrap_err();
+    let error = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &master_key,
+        &chain_witness,
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(
         error,

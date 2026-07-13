@@ -20,11 +20,11 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_watcher, claimer,
-    config, db, derivation_guard, donation_page, donation_render, gc, invoice, ip_whitelist, lnurl,
-    nostr, og_image, pricer, qr, rate_limit, readiness, reconciler,
-    recovery_address_registration, registration, startup_provider_reconciliation,
-    swap_manifest_runtime,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification,
+    chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
+    donation_page, donation_render, gc, invoice, ip_whitelist, lnurl, nostr, og_image, pricer, qr,
+    rate_limit, readiness, reconciler, recovery_address_registration, registration,
+    startup_provider_reconciliation, swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -159,8 +159,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before moving the master key into the Boltz service. Failures close only
     // new Bitcoin chain-swap admission; HTTP and existing-obligation recovery
     // continue to start.
-    let provider_recovery_consistent = match recovery_manifest_runtime_v1.as_deref() {
-        Some(runtime) => {
+    let startup_chain_witness =
+        chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1::from_watcher_config(
+            &config.bitcoin_watcher,
+        )
+        .ok();
+    let provider_recovery_consistent = match (
+        recovery_manifest_runtime_v1.as_deref(),
+        startup_chain_witness.as_ref(),
+    ) {
+        (Some(runtime), Some(chain_witness)) => {
             let fetcher = boltz_restore_fetch::BoltzRestoreFetcher::new(&config.boltz.api_url);
             match fetcher {
                 Ok(fetcher) => {
@@ -169,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         runtime,
                         &fetcher,
                         &swap_master_key,
+                        chain_witness,
                     )
                     .await
                     {
@@ -176,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let report = fact.report();
                             let exact_agreement = fact.exact_agreement();
                             let repaired_obligation_count = fact.repaired_obligation_count();
+                            let chain = fact.chain_witness();
                             if exact_agreement {
                                 tracing::info!(
                                     event = "startup_provider_recovery_consistent",
@@ -184,6 +194,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     provider_record_count = report.boltz.validated_record_count,
                                     provider_chain_record_count = report.boltz.chain_record_count,
                                     local_record_count = report.local.local_record_count,
+                                    chain_observation_count = chain.observation_count,
+                                    chain_missing_manifest_count = chain.missing_manifest_count,
+                                    chain_unconfirmed_manifest_count =
+                                        chain.unconfirmed_manifest_count,
+                                    chain_confirmed_manifest_count = chain.confirmed_manifest_count,
+                                    chain_spent_manifest_count = chain.spent_manifest_count,
                                     "startup recovery sources agree exactly"
                                 );
                             } else {
@@ -198,6 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     manifest_only_record_count =
                                         report.local.manifest_only_record_count,
                                     local_only_record_count = report.local.local_only_record_count,
+                                    chain_observation_count = chain.observation_count,
+                                    chain_conflicting_manifest_count =
+                                        chain.conflicting_manifest_count,
                                     "startup recovery sources differ; new Bitcoin chain-swap admission is closed"
                                 );
                             }
@@ -222,7 +241,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        None => {
+        (Some(_), None) => {
+            tracing::error!(
+                event = "startup_chain_witness_configuration_invalid",
+                "startup Bitcoin witness configuration is invalid; new Bitcoin chain-swap admission is closed"
+            );
+            false
+        }
+        (None, _) => {
             tracing::error!(
                 event = "startup_provider_recovery_configuration_missing",
                 "startup recovery evidence configuration is unavailable; new Bitcoin chain-swap admission is closed"

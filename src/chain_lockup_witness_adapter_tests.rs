@@ -24,6 +24,7 @@ use crate::chain_lockup_witness_adapter::{
 use crate::chain_lockup_witness_audit::{
     ChainLockupInclusionV1, ChainLockupSpendV1, ChainLockupWitnessChainV1,
 };
+use crate::config::BitcoinWatcherConfig;
 use crate::swap_manifest::SwapManifestV1;
 
 #[derive(Clone)]
@@ -160,6 +161,27 @@ fn history(txid: &str, tx_status: Value) -> String {
 
 fn adapter(endpoint: String) -> BitcoinLockupWitnessAdapterV1 {
     BitcoinLockupWitnessAdapterV1::try_new(vec![endpoint], Duration::from_secs(2)).unwrap()
+}
+
+#[test]
+fn startup_adapter_projects_valid_watcher_config_and_rejects_invalid_explicit_endpoint() {
+    let valid = BitcoinWatcherConfig {
+        endpoint: "https://primary.example/api/".into(),
+        endpoints: vec!["https://secondary.example/api".into()],
+        ..BitcoinWatcherConfig::default()
+    };
+    let adapter = BitcoinLockupWitnessAdapterV1::from_watcher_config(&valid).unwrap();
+    assert_eq!(adapter.endpoints()[0], "https://primary.example/api");
+    assert_eq!(adapter.endpoints()[1], "https://secondary.example/api");
+
+    let invalid = BitcoinWatcherConfig {
+        endpoint: "file:///private/backend".into(),
+        ..BitcoinWatcherConfig::default()
+    };
+    assert_eq!(
+        BitcoinLockupWitnessAdapterV1::from_watcher_config(&invalid).unwrap_err(),
+        BitcoinLockupWitnessAdapterError::InvalidConfiguration
+    );
 }
 
 fn common_routes(
