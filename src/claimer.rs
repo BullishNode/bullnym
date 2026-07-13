@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +37,10 @@ use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy};
 use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
 use crate::ip_whitelist;
+use crate::merchant_output_verifier::{
+    prepare_liquid_claim_journal, MerchantSourcePrevout, PersistableMerchantTransactionJournal,
+    MAX_MERCHANT_OUTPUT_RAW_TRANSACTION_BYTES, MAX_MERCHANT_OUTPUT_SOURCE_PREVOUTS,
+};
 use crate::utxo::UtxoBackend;
 use crate::validators;
 use crate::AppState;
@@ -1897,6 +1902,25 @@ async fn claim_chain_swap(
     .await
 }
 
+/// Replay the exact journaled Liquid claim after a durable settlement
+/// demotion. The claim path reloads the row by ID under its advisory lock, so
+/// callers cannot accidentally redrive from a stale pre-demotion record.
+pub(crate) async fn redrive_journaled_chain_claim(
+    state: &AppState,
+    chain_swap_id: Uuid,
+) -> Result<ClaimOutcome, AppError> {
+    claim_chain_swap(
+        &state.db,
+        chain_swap_id,
+        state.liquid_claim_client_factory.as_deref(),
+        &state.config.boltz.api_url,
+        state.config.claim.max_claim_attempts,
+        state.utxo_backend.as_ref(),
+        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+    )
+    .await
+}
+
 /// Constrained-pool integration seam for chain claims. The persisted provider
 /// response must be malformed and no claim bytes may exist, guaranteeing that
 /// the exact production path fails locally before Electrum/Boltz I/O or
@@ -2037,6 +2061,222 @@ async fn claim_chain_swap_with_guard(
     result
 }
 
+#[derive(Debug)]
+struct PreparedChainClaimJournal {
+    journal: PersistableMerchantTransactionJournal,
+    fee_amount_sat: u64,
+    fee_rate_sat_vb: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedChainClaimJournalMode {
+    ConstructAndInsert,
+    DecodeAndLoadExact,
+}
+
+fn persisted_chain_claim_journal_mode(
+    claim_tx_hex: Option<&str>,
+    claim_txid: Option<&str>,
+) -> Result<PersistedChainClaimJournalMode, AppError> {
+    match (claim_tx_hex, claim_txid) {
+        (None, None) => Ok(PersistedChainClaimJournalMode::ConstructAndInsert),
+        (Some(_), Some(_)) => Ok(PersistedChainClaimJournalMode::DecodeAndLoadExact),
+        _ => Err(AppError::ClaimError(
+            "persisted chain claim has orphan bytes or txid; integrity review required".into(),
+        )),
+    }
+}
+
+/// Rebuild the complete immutable Liquid claim journal from locally decoded
+/// transaction bytes and the independently fetched source transactions. This
+/// runs while the per-swap advisory transaction is still open and before any
+/// broadcaster can observe the claim.
+async fn prepare_chain_claim_settlement_journal(
+    claim_tx: &BtcLikeTransaction,
+    approved_destination_address: &str,
+    liquid_asset_id: &str,
+    merchant_blinding_key_hex: &str,
+    source_lockup_address: &str,
+    source_blinding_key_hex: &str,
+    backend: &Arc<dyn UtxoBackend>,
+) -> Result<PreparedChainClaimJournal, AppError> {
+    let BtcLikeTransaction::Liquid(transaction) = claim_tx else {
+        return Err(AppError::ClaimError(
+            "chain claim construction returned a non-Liquid transaction".into(),
+        ));
+    };
+    if transaction.input.is_empty() || transaction.input.len() > MAX_MERCHANT_OUTPUT_SOURCE_PREVOUTS
+    {
+        return Err(AppError::ClaimError(
+            "chain claim transaction has an invalid source count".into(),
+        ));
+    }
+
+    let expected_asset = boltz_elements::AssetId::from_str(liquid_asset_id)
+        .map_err(|error| AppError::ClaimError(format!("invalid Liquid asset id: {error}")))?;
+    let source_address =
+        boltz_elements::Address::from_str(source_lockup_address).map_err(|error| {
+            AppError::ClaimError(format!("invalid committed Liquid lockup address: {error}"))
+        })?;
+    if source_address.params != &boltz_elements::AddressParams::LIQUID
+        || source_address.blinding_pubkey.is_none()
+    {
+        return Err(AppError::ClaimError(
+            "committed Liquid lockup address is not confidential mainnet".into(),
+        ));
+    }
+    let source_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::from_str(
+        source_blinding_key_hex,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "invalid committed Liquid lockup blinding key: {error}"
+        ))
+    })?;
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let source_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &source_blinding_key);
+    if source_address.blinding_pubkey != Some(source_blinding_pubkey) {
+        return Err(AppError::ClaimError(
+            "committed Liquid lockup blinding key does not match its address".into(),
+        ));
+    }
+    let source_script = source_address.script_pubkey();
+
+    let mut source_prevouts = Vec::with_capacity(transaction.input.len());
+    let mut total_source_sat = 0u64;
+    for input in &transaction.input {
+        if input.is_pegin || !input.asset_issuance.is_null() {
+            return Err(AppError::ClaimError(
+                "chain claim transaction contains an unsupported source input".into(),
+            ));
+        }
+        let source_txid = input.previous_output.txid.to_string();
+        let source_vout = input.previous_output.vout;
+        if source_prevouts
+            .iter()
+            .any(|source: &db::MerchantSettlementSourcePrevout| {
+                source.txid == source_txid && source.vout == source_vout
+            })
+        {
+            return Err(AppError::ClaimError(
+                "chain claim transaction repeats a source outpoint".into(),
+            ));
+        }
+
+        let raw_source = backend.get_raw_tx(&source_txid).await?;
+        if raw_source.is_empty() || raw_source.len() > MAX_MERCHANT_OUTPUT_RAW_TRANSACTION_BYTES {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source transaction {source_txid} exceeds the journal bounds"
+            )));
+        }
+        let source_transaction: boltz_elements::Transaction =
+            boltz_elements::encode::deserialize(&raw_source).map_err(|error| {
+                AppError::ClaimError(format!(
+                    "decode Liquid claim source transaction {source_txid}: {error}"
+                ))
+            })?;
+        if source_transaction.txid() != input.previous_output.txid {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source bytes do not match txid {source_txid}"
+            )));
+        }
+        let source_output = source_transaction
+            .output
+            .get(source_vout as usize)
+            .ok_or_else(|| {
+                AppError::ClaimError(format!(
+                    "Liquid claim source {source_txid}:{source_vout} has no such output"
+                ))
+            })?;
+        if source_output.script_pubkey != source_script {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source {source_txid}:{source_vout} is not the committed lockup script"
+            )));
+        }
+        let opened = source_output
+            .unblind(&secp, source_blinding_key)
+            .map_err(|error| {
+                AppError::ClaimError(format!(
+                    "unblind Liquid claim source {source_txid}:{source_vout}: {error}"
+                ))
+            })?;
+        if opened.asset != expected_asset || opened.value == 0 {
+            return Err(AppError::ClaimError(format!(
+                "Liquid claim source {source_txid}:{source_vout} has the wrong asset or amount"
+            )));
+        }
+        total_source_sat = total_source_sat
+            .checked_add(opened.value)
+            .ok_or_else(|| AppError::ClaimError("Liquid claim source amount overflow".into()))?;
+        source_prevouts.push(db::MerchantSettlementSourcePrevout {
+            txid: source_txid,
+            vout: source_vout,
+            amount_sat: opened.value,
+            script_pubkey_hex: hex::encode(source_output.script_pubkey.as_bytes()),
+        });
+    }
+
+    let destination =
+        elements::Address::from_str(approved_destination_address).map_err(|error| {
+            AppError::ClaimError(format!("invalid approved Liquid destination: {error}"))
+        })?;
+    if destination.params != &elements::AddressParams::LIQUID
+        || destination.blinding_pubkey.is_none()
+    {
+        return Err(AppError::ClaimError(
+            "approved Liquid destination is not confidential mainnet".into(),
+        ));
+    }
+    let raw_transaction = boltz_elements::encode::serialize(transaction);
+    let source_views = source_prevouts
+        .iter()
+        .map(|source| MerchantSourcePrevout {
+            txid: &source.txid,
+            vout: source.vout,
+            amount_sat: source.amount_sat,
+            script_pubkey_hex: &source.script_pubkey_hex,
+        })
+        .collect::<Vec<_>>();
+    let journal = prepare_liquid_claim_journal(
+        &raw_transaction,
+        &source_views,
+        approved_destination_address,
+        &hex::encode(destination.script_pubkey().as_bytes()),
+        liquid_asset_id,
+        merchant_blinding_key_hex,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "prepare Liquid merchant settlement journal: {error}"
+        ))
+    })?;
+
+    let fee_amount_sat = transaction.fee_in(expected_asset);
+    let fee_vsize = transaction.discount_vsize();
+    if fee_amount_sat == 0
+        || fee_vsize == 0
+        || transaction.all_fees().len() != 1
+        || transaction
+            .output
+            .iter()
+            .filter(|output| !output.is_fee())
+            .count()
+            != 1
+        || total_source_sat.checked_sub(fee_amount_sat) != Some(journal.amount_sat)
+    {
+        return Err(AppError::ClaimError(
+            "Liquid claim transaction has an invalid exact output/fee balance".into(),
+        ));
+    }
+
+    Ok(PreparedChainClaimJournal {
+        journal,
+        fee_amount_sat,
+        fee_rate_sat_vb: fee_amount_sat as f64 / fee_vsize as f64,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_chain_swap_inner(
     pool: &sqlx::PgPool,
@@ -2102,6 +2342,19 @@ async fn claim_chain_swap_inner(
     let claim_clients = claim_clients.ok_or_else(|| {
         AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
     })?;
+    let backend = utxo_backend.ok_or_else(|| {
+        AppError::ClaimError(
+            "Liquid source-evidence backend is unavailable for pre-broadcast journaling".into(),
+        )
+    })?;
+    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
+        .map_err(|error| {
+            AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
+        })?;
+    let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id)))?;
 
     // Post-051 swaps claim only to the immutable destination committed before
     // the payer saw the Bitcoin address. Never re-resolve it through the
@@ -2110,20 +2363,40 @@ async fn claim_chain_swap_inner(
     let output_address = if let Some(terms) = swap.creation_terms.as_ref() {
         validated_chain_creation_destination(terms)?
     } else {
-        let invoice = db::get_invoice_by_id(&mut *tx, swap.invoice_id)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?
-            .ok_or_else(|| {
-                AppError::ClaimError(format!("invoice not found: {}", swap.invoice_id))
-            })?;
-        invoice.liquid_address.ok_or_else(|| {
+        invoice.liquid_address.clone().ok_or_else(|| {
             AppError::ClaimError(format!(
                 "legacy invoice {} has no liquid_address for chain-swap claim",
                 swap.invoice_id
             ))
         })?
     };
+    let merchant_blinding_key_hex =
+        invoice.liquid_blinding_key_hex.as_deref().ok_or_else(|| {
+            AppError::ClaimError(format!(
+                "invoice {} has no Liquid blinding key for chain-swap settlement",
+                swap.invoice_id
+            ))
+        })?;
+    validators::validate_liquid_blinding_key_matches_address(
+        &output_address,
+        merchant_blinding_key_hex,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "chain-swap settlement destination/blinding key mismatch: {error}"
+        ))
+    })?;
+    let default_liquid_asset_id = elements::AssetId::LIQUID_BTC.to_string();
+    let liquid_asset_id = swap
+        .creation_terms
+        .as_ref()
+        .map(|terms| terms.liquid_asset_id.as_str())
+        .unwrap_or(&default_liquid_asset_id);
 
+    let journal_mode = persisted_chain_claim_journal_mode(
+        swap.claim_tx_hex.as_deref(),
+        swap.claim_txid.as_deref(),
+    )?;
     let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
         match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
             .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))
@@ -2167,7 +2440,43 @@ async fn claim_chain_swap_inner(
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
-        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&constructed)?;
+        constructed
+    };
+
+    let prepared = prepare_chain_claim_settlement_journal(
+        &claim_tx,
+        &output_address,
+        liquid_asset_id,
+        merchant_blinding_key_hex,
+        &boltz_response.claim_details.lockup_address,
+        boltz_response
+            .claim_details
+            .blinding_key
+            .as_deref()
+            .ok_or_else(|| {
+                AppError::ClaimError("committed Liquid lockup blinding key is missing".into())
+            })?,
+        backend,
+    )
+    .await?;
+    let new_journal = db::NewLiquidMerchantSettlementJournal {
+        chain_swap_id: swap.id,
+        replaces_txid: None,
+        prepared: &prepared.journal,
+        fee_amount_sat: prepared.fee_amount_sat,
+        fee_rate_sat_vb: prepared.fee_rate_sat_vb,
+        liquid_blinding_key_hex: merchant_blinding_key_hex,
+    };
+    if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert {
+        db::insert_liquid_merchant_settlement_journal(&mut *tx, &new_journal)
+            .await
+            .map_err(|error| {
+                AppError::DbError(format!(
+                    "insert Liquid merchant settlement journal: {error}"
+                ))
+            })?;
+        let fee_record = fee_record.expect("unjournaled chain claims require fee decision metadata");
+        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&claim_tx)?;
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
             fee_record.quoted_at_unix(),
@@ -2184,11 +2493,6 @@ async fn claim_chain_swap_inner(
             "claim_fee_decision_freshness_max_age_secs",
             fee_record.freshness_max_age_secs(),
         )?;
-        let hex = match serialize_claim_tx_hex(&constructed) {
-            Ok(hex) => hex,
-            Err(error) => return commit_claim_preparation_error(tx, error).await,
-        };
-        let txid = btc_like_txid(&constructed);
         let persisted = sqlx::query(
             "UPDATE chain_swap_records \
              SET claim_tx_hex = $2, claim_txid = $3, \
@@ -2207,8 +2511,8 @@ async fn claim_chain_swap_inner(
              WHERE id = $1 AND claim_tx_hex IS NULL",
         )
         .bind(swap.id)
-        .bind(&hex)
-        .bind(&txid)
+        .bind(&prepared.journal.raw_transaction_hex)
+        .bind(&prepared.journal.txid)
         .bind(actual_fee_sat)
         .bind(actual_fee_rate_sat_vb)
         .bind(fee_record.purpose().as_str())
@@ -2226,15 +2530,29 @@ async fn claim_chain_swap_inner(
         .bind(fee_record.policy_version())
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
+        .map_err(|error| AppError::DbError(error.to_string()))?;
         if persisted.rows_affected() != 1 {
             return Err(AppError::DbError(format!(
                 "chain claim preparation lost its locked row: {}",
                 swap.id
             )));
         }
-        constructed
-    };
+    } else {
+        if swap.claim_tx_hex.as_deref() != Some(prepared.journal.raw_transaction_hex.as_str())
+            || swap.claim_txid.as_deref() != Some(prepared.journal.txid.as_str())
+        {
+            return Err(AppError::ClaimError(
+                "persisted chain claim bytes/txid do not match their decoded journal".into(),
+            ));
+        }
+        db::load_exact_liquid_merchant_settlement_journal(&mut *tx, &new_journal)
+            .await
+            .map_err(|error| {
+                AppError::DbError(format!(
+                    "load exact Liquid merchant settlement journal: {error}"
+                ))
+            })?;
+    }
 
     let marked_claiming = sqlx::query(
         "UPDATE chain_swap_records \
