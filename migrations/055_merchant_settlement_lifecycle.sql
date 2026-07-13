@@ -27,6 +27,9 @@ DECLARE
     executor_role_oid OID;
     relation_owner_oid OID;
     relation_name TEXT;
+    executor_role_name TEXT := current_user;
+    function_owner_oid OID;
+    function_name TEXT;
 BEGIN
     IF runtime_role_name IS NULL THEN
         RAISE EXCEPTION 'migration 055 requires a non-empty runtime_role psql variable'
@@ -64,10 +67,81 @@ BEGIN
          WHERE namespace.nspname = 'public'
            AND relation.relname = relation_name
            AND relation.relkind = 'r';
+        IF relation_owner_oid = runtime_role_oid THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I OWNER TO %I',
+                relation_name, executor_role_name
+            );
+            SELECT relation.relowner
+              INTO STRICT relation_owner_oid
+              FROM pg_class relation
+              JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'public'
+               AND relation.relname = relation_name
+               AND relation.relkind = 'r';
+        END IF;
         IF relation_owner_oid = runtime_role_oid
            OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER') THEN
             RAISE EXCEPTION 'migration 055 runtime role % owns or can assume owner of %',
                 quote_ident(runtime_role_name), relation_name
+                USING ERRCODE = '42501';
+        END IF;
+    END LOOP;
+
+    SELECT relation.relowner
+      INTO STRICT relation_owner_oid
+      FROM pg_class relation
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = 'public'
+       AND relation.relname = 'invoice_payment_events_accounting_sequence_seq'
+       AND relation.relkind = 'S';
+    IF relation_owner_oid = runtime_role_oid THEN
+        EXECUTE format(
+            'ALTER SEQUENCE public.invoice_payment_events_accounting_sequence_seq OWNER TO %I',
+            executor_role_name
+        );
+    END IF;
+    SELECT relation.relowner
+      INTO STRICT relation_owner_oid
+      FROM pg_class relation
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = 'public'
+       AND relation.relname = 'invoice_payment_events_accounting_sequence_seq'
+       AND relation.relkind = 'S';
+    IF relation_owner_oid = runtime_role_oid
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER') THEN
+        RAISE EXCEPTION 'migration 055 runtime role owns or can assume the accounting sequence owner'
+            USING ERRCODE = '42501';
+    END IF;
+
+    FOREACH function_name IN ARRAY ARRAY[
+        'guard_chain_swap_tx_attempt_immutable',
+        'guard_invoice_payment_event_evidence'
+    ] LOOP
+        SELECT procedure_info.proowner
+          INTO STRICT function_owner_oid
+          FROM pg_proc procedure_info
+          JOIN pg_namespace namespace ON namespace.oid = procedure_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND procedure_info.proname = function_name
+           AND procedure_info.pronargs = 0;
+        IF function_owner_oid = runtime_role_oid THEN
+            EXECUTE format(
+                'ALTER FUNCTION public.%I() OWNER TO %I',
+                function_name, executor_role_name
+            );
+        END IF;
+        SELECT procedure_info.proowner
+          INTO STRICT function_owner_oid
+          FROM pg_proc procedure_info
+          JOIN pg_namespace namespace ON namespace.oid = procedure_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND procedure_info.proname = function_name
+           AND procedure_info.pronargs = 0;
+        IF function_owner_oid = runtime_role_oid
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'MEMBER') THEN
+            RAISE EXCEPTION 'migration 055 runtime role owns or can assume owner of function %',
+                function_name
                 USING ERRCODE = '42501';
         END IF;
     END LOOP;
@@ -288,6 +362,23 @@ BEGIN
   RETURN NEW;
 END
 $$;
+
+CREATE FUNCTION reject_merchant_settlement_event_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.merchant_chain_swap_id IS NOT NULL THEN
+        RAISE EXCEPTION 'exact merchant settlement events cannot be deleted or cascaded'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN OLD;
+END
+$$;
+
+CREATE TRIGGER invoice_payment_event_reject_merchant_settlement_delete
+    BEFORE DELETE ON invoice_payment_events
+    FOR EACH ROW EXECUTE FUNCTION reject_merchant_settlement_event_delete();
 
 CREATE TABLE merchant_settlement_checkpoints (
     chain_swap_id       UUID NOT NULL,
