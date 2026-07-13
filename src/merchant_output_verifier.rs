@@ -325,6 +325,107 @@ pub struct MerchantTransactionJournalEvidence<'a> {
     pub merchant: MerchantOutputCommitment<'a>,
 }
 
+/// Owned source evidence ready for atomic journal persistence before a claim
+/// transaction is broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistableMerchantSourcePrevout {
+    pub txid: String,
+    pub vout: u32,
+    pub amount_sat: u64,
+    pub script_pubkey_hex: String,
+}
+
+/// Complete Liquid merchant-output journal derived from constructed raw bytes.
+/// No requested, quoted, or provider amount is accepted by this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistableMerchantTransactionJournal {
+    pub raw_transaction: Vec<u8>,
+    pub raw_transaction_hex: String,
+    pub txid: String,
+    pub source_prevouts: Vec<PersistableMerchantSourcePrevout>,
+    pub destination_address: String,
+    pub destination_script_hex: String,
+    pub asset: MerchantAsset,
+    pub amount_sat: u64,
+    pub vout: u32,
+}
+
+/// Validate constructed Liquid claim bytes and derive the exact merchant
+/// output packet that must be persisted before broadcast. The only amount and
+/// vout authority is the unique output opened from the transaction itself.
+pub fn prepare_liquid_claim_journal(
+    raw_transaction: &[u8],
+    source_prevouts: &[MerchantSourcePrevout<'_>],
+    approved_destination_address: &str,
+    approved_destination_script_hex: &str,
+    liquid_asset_id: &str,
+    stored_blinding_key_hex: &str,
+) -> Result<PersistableMerchantTransactionJournal, MerchantOutputAdapterError> {
+    validate_source_prevouts(source_prevouts)?;
+    let asset = canonical_asset(&MerchantAsset::Liquid(liquid_asset_id.to_owned()))
+        .ok_or(MerchantOutputAdapterError::InvalidCommitment)?;
+    let destination_script =
+        decode_bounded_script(approved_destination_script_hex).map_err(|exceeded| {
+            if exceeded {
+                MerchantOutputAdapterError::InputBoundsExceeded
+            } else {
+                MerchantOutputAdapterError::InvalidCommitment
+            }
+        })?;
+    let derived_script = derive_destination_script(approved_destination_address, &asset)
+        .ok_or(MerchantOutputAdapterError::InvalidCommitment)?;
+    if destination_script != derived_script {
+        return Err(MerchantOutputAdapterError::InvalidCommitment);
+    }
+
+    let address = LiquidAddress::from_str(approved_destination_address)
+        .map_err(|_| MerchantOutputAdapterError::InvalidCommitment)?;
+    let blinding_key = elements::secp256k1_zkp::SecretKey::from_str(stored_blinding_key_hex)
+        .map_err(|_| MerchantOutputAdapterError::ConfidentialOutputUnverified)?;
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let blinding_pubkey = elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+    if address.blinding_pubkey != Some(blinding_pubkey) {
+        return Err(MerchantOutputAdapterError::ConfidentialOutputUnverified);
+    }
+
+    let transaction = decode_merchant_transaction(
+        MerchantRail::Liquid,
+        raw_transaction,
+        MerchantTransactionRole::Journal,
+    )?;
+    if !transaction.inputs_match(source_prevouts) {
+        return Err(MerchantOutputAdapterError::JournalSourceMismatch);
+    }
+    let output = transaction.unique_output_for_script(&destination_script, Some(&blinding_key))?;
+    if output.asset != asset
+        || output.amount_sat == 0
+        || output.amount_sat > i64::MAX as u64
+        || output.vout > i32::MAX as u32
+    {
+        return Err(MerchantOutputAdapterError::JournalOutputMismatch);
+    }
+
+    Ok(PersistableMerchantTransactionJournal {
+        raw_transaction: raw_transaction.to_vec(),
+        raw_transaction_hex: hex::encode(raw_transaction),
+        txid: transaction.txid(),
+        source_prevouts: source_prevouts
+            .iter()
+            .map(|source| PersistableMerchantSourcePrevout {
+                txid: source.txid.to_ascii_lowercase(),
+                vout: source.vout,
+                amount_sat: source.amount_sat,
+                script_pubkey_hex: source.script_pubkey_hex.to_ascii_lowercase(),
+            })
+            .collect(),
+        destination_address: approved_destination_address.to_owned(),
+        destination_script_hex: hex::encode(destination_script),
+        asset,
+        amount_sat: output.amount_sat,
+        vout: output.vout,
+    })
+}
+
 impl fmt::Debug for MerchantTransactionJournalEvidence<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MerchantTransactionJournalEvidence(<redacted>)")
@@ -3291,6 +3392,98 @@ mod tests {
         assert_eq!(
             adapt_liquid_merchant_output(&journal, None, &observation, &wrong_key),
             Err(MerchantOutputAdapterError::ConfidentialOutputUnverified)
+        );
+    }
+
+    #[test]
+    fn prepare_liquid_claim_journal_derives_owned_exact_output_from_raw_bytes() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let prepared = prepare_liquid_claim_journal(
+            &fixture.raw_transaction,
+            &sources,
+            &fixture.destination_address,
+            &fixture.destination_script_hex,
+            LIQUID_ASSET,
+            &fixture.blinding_key_hex,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.raw_transaction, fixture.raw_transaction);
+        assert_eq!(
+            prepared.raw_transaction_hex,
+            hex::encode(&prepared.raw_transaction)
+        );
+        assert_eq!(prepared.txid, fixture.txid);
+        assert_eq!(prepared.source_prevouts.len(), 1);
+        assert_eq!(prepared.source_prevouts[0].txid, fixture.source_txid);
+        assert_eq!(prepared.source_prevouts[0].vout, 4);
+        assert_eq!(prepared.source_prevouts[0].amount_sat, 91_000);
+        assert_eq!(prepared.source_prevouts[0].script_pubkey_hex, "51");
+        assert_eq!(prepared.destination_address, fixture.destination_address);
+        assert_eq!(
+            prepared.destination_script_hex,
+            fixture.destination_script_hex
+        );
+        assert_eq!(prepared.asset, MerchantAsset::Liquid(LIQUID_ASSET.into()));
+        assert_eq!(prepared.amount_sat, 88_000);
+        assert_eq!(prepared.vout, 0);
+    }
+
+    #[test]
+    fn prepare_liquid_claim_journal_rejects_wrong_key_and_source_set() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let wrong_key = elements::secp256k1_zkp::SecretKey::from_slice(&[2; 32])
+            .unwrap()
+            .display_secret()
+            .to_string();
+        assert_eq!(
+            prepare_liquid_claim_journal(
+                &fixture.raw_transaction,
+                &sources,
+                &fixture.destination_address,
+                &fixture.destination_script_hex,
+                LIQUID_ASSET,
+                &wrong_key,
+            ),
+            Err(MerchantOutputAdapterError::ConfidentialOutputUnverified)
+        );
+
+        let mut wrong_sources = sources;
+        wrong_sources[0].vout += 1;
+        assert_eq!(
+            prepare_liquid_claim_journal(
+                &fixture.raw_transaction,
+                &wrong_sources,
+                &fixture.destination_address,
+                &fixture.destination_script_hex,
+                LIQUID_ASSET,
+                &fixture.blinding_key_hex,
+            ),
+            Err(MerchantOutputAdapterError::JournalSourceMismatch)
+        );
+    }
+
+    #[test]
+    fn prepare_liquid_claim_journal_rejects_multiple_matching_outputs() {
+        let fixture = liquid_backend_fixture();
+        let sources = liquid_backend_sources(&fixture);
+        let mut transaction: elements::Transaction =
+            elements::encode::deserialize(&fixture.raw_transaction).unwrap();
+        transaction.output.push(transaction.output[0].clone());
+        let raw_transaction = elements::encode::serialize(&transaction);
+
+        assert_eq!(
+            prepare_liquid_claim_journal(
+                &raw_transaction,
+                &sources,
+                &fixture.destination_address,
+                &fixture.destination_script_hex,
+                LIQUID_ASSET,
+                &fixture.blinding_key_hex,
+            ),
+            Err(MerchantOutputAdapterError::MultipleObservedOutputs)
         );
     }
 
