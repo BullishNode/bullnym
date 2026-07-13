@@ -22,6 +22,8 @@
    below instead of applying it while an older service is live. Migration 051
    is also a stopped-service cutover because its new insert trigger requires
    the complete creation packet written by a 051-aware chain-swap caller.
+   Migration 053 is a stopped-writer, privileged-owner, roll-forward boundary;
+   the runtime `payservice` role must never apply it.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -70,6 +72,154 @@ instruction, but it can still create provider-side orphans and must not be used
 as a rollback strategy. Repair or roll forward with a 051-aware binary. Verify
 that new rows contain one immutable creation packet and that legacy rows remain
 readable before reopening chain-swap admission.
+
+## Migration 053 privileged-owner boundary
+
+Migration 053 creates the private append-only recovery-address ledger and makes
+its exact commitment ID/address pair mandatory for every new chain swap. The
+ledger's runtime ACL is safe only when its owner is distinct from the runtime
+`payservice` role: a PostgreSQL table owner retains implicit mutation and
+truncate authority that `REVOKE` cannot remove.
+
+Close new swap admission, drain requests, stop every Bullnym writer, and take a
+validated database backup. Set the schema-owner name to a role that can perform
+DDL and that is not `payservice`; use normal libpq credential handling rather
+than the runtime password file.
+
+```bash
+sudo systemctl stop payservice
+if sudo systemctl is-active --quiet payservice; then
+  echo "payservice is still active; refusing migration 053" >&2
+  exit 1
+fi
+
+export BULLNYM_SCHEMA_OWNER='<privileged-schema-owner>'
+test "$BULLNYM_SCHEMA_OWNER" != payservice
+```
+
+Run this first-application preflight as that owner. It fails if a runtime
+session survived the stop, if the core 053 ledger or column is already present,
+or if a pre-053 row contains unexplained address-only evidence.
+
+```bash
+psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice <<'SQL'
+DO $migration_053_preflight$
+BEGIN
+    IF current_user = 'payservice' THEN
+        RAISE EXCEPTION 'migration 053 must not run as payservice';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND usename = 'payservice'
+           AND pid <> pg_backend_pid()
+    ) THEN
+        RAISE EXCEPTION 'payservice database sessions remain';
+    END IF;
+    IF to_regclass('public.recovery_address_commitments') IS NOT NULL THEN
+        RAISE EXCEPTION 'migration 053 ledger already exists';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chain_swap_records'
+           AND column_name = 'recovery_address_commitment_id'
+    ) THEN
+        RAISE EXCEPTION 'migration 053 chain-swap column already exists';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM chain_swap_records
+         WHERE merchant_emergency_btc_address IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'pre-053 chain swap has address-only recovery evidence';
+    END IF;
+END
+$migration_053_preflight$;
+SQL
+```
+
+Apply the migration in one `ON_ERROR_STOP` session as the same privileged
+owner. The file contains its own transaction and independently refuses the
+runtime role and runtime ownership.
+
+```bash
+psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice \
+  --file migrations/053_recovery_address_commitments.sql
+```
+
+Capture a concise postflight record before starting Bullnym. The ACL row must
+show a non-`payservice` owner, runtime `SELECT/INSERT` only, and no PUBLIC
+grant. The two constraint definitions must show the ordered
+`(recovery_address_commitment_id, merchant_emergency_btc_address)` reference
+with `ON UPDATE/DELETE RESTRICT` plus the NULL-pair check. The trigger query
+must return the five migration-053 triggers, enabled, with their expected
+functions.
+
+```bash
+psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --host 127.0.0.1 --username "$BULLNYM_SCHEMA_OWNER" --dbname payservice <<'SQL'
+SELECT pg_get_userbyid(relation.relowner) AS ledger_owner,
+       relation.relacl AS ledger_acl
+  FROM pg_class relation
+ WHERE relation.oid = 'public.recovery_address_commitments'::REGCLASS;
+
+SELECT constraint_info.conname,
+       constraint_info.convalidated,
+       pg_get_constraintdef(constraint_info.oid) AS definition
+  FROM pg_constraint constraint_info
+  JOIN pg_class relation ON relation.oid = constraint_info.conrelid
+ WHERE relation.oid = 'public.chain_swap_records'::REGCLASS
+   AND constraint_info.conname IN (
+       'chain_swap_records_recovery_commitment_pair_check',
+       'chain_swap_records_recovery_commitment_fkey'
+   )
+ ORDER BY constraint_info.conname;
+
+SELECT relation.relname,
+       trigger_info.tgname,
+       trigger_info.tgenabled,
+       function_info.proname
+  FROM pg_trigger trigger_info
+  JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+  JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+ WHERE trigger_info.tgname IN (
+     'recovery_address_commitment_validate_insert',
+     'recovery_address_commitment_reject_update',
+     'recovery_address_commitment_reject_delete',
+     'chain_swap_records_require_recovery_commitment',
+     'chain_swap_records_reject_recovery_commitment_update'
+ )
+ ORDER BY relation.relname, trigger_info.tgname;
+SQL
+```
+
+Then run `scripts/deploy.sh`. Before it builds or changes the installed
+service, its read-only `payservice` probe mechanically requires a distinct
+ledger owner, exact runtime/PUBLIC ACL, the validated ordered composite foreign
+key, the validated pair constraint, and all five enabled trigger/function
+bindings. It prints no runtime-role migration command and refuses on missing or
+drifted evidence.
+
+Start only a 053-aware binary and require its startup recovery-commitment
+verification plus the normal `/health`, `/ready`, and `/version` checks before
+reopening traffic. After 053 commits, never start or automatically restore a
+pre-053 writer: it cannot supply the required commitment pair and can create a
+provider-side orphan before its database insert fails. Repair or roll forward.
+`scripts/deploy.sh` verifies the 053 boundary before building and refuses an
+automatic cross-boundary rollback.
+
+```bash
+sudo journalctl -u payservice --since '10 minutes ago' \
+  | grep -F 'private append-only recovery commitment binding verified'
+curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null
+curl --fail --silent --show-error http://127.0.0.1:8080/ready
+curl --fail --silent --show-error http://127.0.0.1:8080/version
+```
 
 ## Reproducing a prior artifact
 

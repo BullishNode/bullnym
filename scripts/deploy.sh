@@ -75,14 +75,135 @@ direct_transition_history_count() {
   echo "$count"
 }
 
+migration_053_boundary_ready() {
+  local password ready
+  [[ -r "$HOME/.pgpass_payservice" ]] || return 1
+  password="$(<"$HOME/.pgpass_payservice")"
+  ready="$(
+    PGPASSWORD="$password" psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --host 127.0.0.1 --username payservice --dbname payservice \
+      --tuples-only --no-align \
+      --command "WITH ledger AS ( \
+          SELECT relation.oid, relation.relowner \
+            FROM pg_class relation \
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           WHERE namespace.nspname = 'public' \
+             AND relation.relname = 'recovery_address_commitments' \
+      ) \
+      SELECT COALESCE(( \
+          SELECT pg_get_userbyid(ledger.relowner) <> current_user \
+             AND has_table_privilege(current_user, ledger.oid, 'SELECT') \
+             AND has_table_privilege(current_user, ledger.oid, 'INSERT') \
+             AND NOT has_table_privilege(current_user, ledger.oid, 'UPDATE') \
+             AND NOT has_table_privilege(current_user, ledger.oid, 'DELETE') \
+             AND NOT has_table_privilege(current_user, ledger.oid, 'TRUNCATE') \
+             AND NOT has_table_privilege(current_user, ledger.oid, 'REFERENCES') \
+             AND NOT has_table_privilege(current_user, ledger.oid, 'TRIGGER') \
+             AND NOT EXISTS ( \
+                 SELECT 1 \
+                   FROM aclexplode(COALESCE( \
+                       (SELECT relation.relacl FROM pg_class relation WHERE relation.oid = ledger.oid), \
+                       acldefault('r', ledger.relowner) \
+                   )) acl \
+                  WHERE acl.grantee = 0 \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 \
+                   FROM pg_constraint foreign_key \
+                   JOIN pg_class source_relation ON source_relation.oid = foreign_key.conrelid \
+                   JOIN pg_namespace source_namespace ON source_namespace.oid = source_relation.relnamespace \
+                   JOIN pg_class target_relation ON target_relation.oid = foreign_key.confrelid \
+                   JOIN pg_namespace target_namespace ON target_namespace.oid = target_relation.relnamespace \
+                  WHERE source_namespace.nspname = 'public' \
+                    AND source_relation.relname = 'chain_swap_records' \
+                    AND target_namespace.nspname = 'public' \
+                    AND target_relation.relname = 'recovery_address_commitments' \
+                    AND foreign_key.conname = 'chain_swap_records_recovery_commitment_fkey' \
+                    AND foreign_key.contype = 'f' \
+                    AND foreign_key.convalidated \
+                    AND NOT foreign_key.condeferrable \
+                    AND NOT foreign_key.condeferred \
+                    AND foreign_key.confupdtype = 'r' \
+                    AND foreign_key.confdeltype = 'r' \
+                    AND foreign_key.confmatchtype = 's' \
+                    AND ( \
+                        SELECT array_agg(attribute.attname::TEXT ORDER BY key_column.ordinality) \
+                          FROM unnest(foreign_key.conkey) WITH ORDINALITY \
+                               AS key_column(attnum, ordinality) \
+                          JOIN pg_attribute attribute \
+                            ON attribute.attrelid = source_relation.oid \
+                           AND attribute.attnum = key_column.attnum \
+                    ) = ARRAY['recovery_address_commitment_id', 'merchant_emergency_btc_address']::TEXT[] \
+                    AND ( \
+                        SELECT array_agg(attribute.attname::TEXT ORDER BY key_column.ordinality) \
+                          FROM unnest(foreign_key.confkey) WITH ORDINALITY \
+                               AS key_column(attnum, ordinality) \
+                          JOIN pg_attribute attribute \
+                            ON attribute.attrelid = target_relation.oid \
+                           AND attribute.attnum = key_column.attnum \
+                    ) = ARRAY['commitment_id', 'canonical_btc_address']::TEXT[] \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 \
+                   FROM pg_constraint pair_check \
+                   JOIN pg_class relation ON relation.oid = pair_check.conrelid \
+                   JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                  WHERE namespace.nspname = 'public' \
+                    AND relation.relname = 'chain_swap_records' \
+                    AND pair_check.conname = 'chain_swap_records_recovery_commitment_pair_check' \
+                    AND pair_check.contype = 'c' \
+                    AND pair_check.convalidated \
+                    AND pg_get_expr(pair_check.conbin, pair_check.conrelid, TRUE) = \
+                        '(recovery_address_commitment_id IS NULL) = (merchant_emergency_btc_address IS NULL)' \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 \
+                   FROM (VALUES \
+                       ('recovery_address_commitments', 'recovery_address_commitment_validate_insert', 'enforce_recovery_address_commitment_insert', 7), \
+                       ('recovery_address_commitments', 'recovery_address_commitment_reject_update', 'reject_recovery_address_commitment_update', 19), \
+                       ('recovery_address_commitments', 'recovery_address_commitment_reject_delete', 'reject_recovery_address_commitment_delete', 11), \
+                       ('chain_swap_records', 'chain_swap_records_require_recovery_commitment', 'require_chain_swap_recovery_commitment', 7), \
+                       ('chain_swap_records', 'chain_swap_records_reject_recovery_commitment_update', 'reject_chain_swap_recovery_commitment_mutation', 19) \
+                   ) AS required(table_name, trigger_name, function_name, trigger_type) \
+                  WHERE NOT EXISTS ( \
+                      SELECT 1 \
+                        FROM pg_trigger trigger_info \
+                        JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+                        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                        JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                       WHERE namespace.nspname = 'public' \
+                         AND relation.relname = required.table_name \
+                         AND trigger_info.tgname = required.trigger_name \
+                         AND function_info.proname = required.function_name \
+                         AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                         AND NOT trigger_info.tgisinternal \
+                         AND trigger_info.tgenabled IN ('O', 'A') \
+                  ) \
+             ) \
+            FROM ledger \
+      ), FALSE)::INT"
+  )" || return 1
+  [[ "$ready" == "1" ]]
+}
+
 automatic_binary_rollback_allowed() {
-  local previous_schema candidate_schema transition_count
+  local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
     echo "automatic rollback refused: missing previous/candidate build-info evidence" >&2
     return 1
   }
   previous_schema="$(build_info_schema_marker "$previous_build_info")" || return 1
   candidate_schema="$(build_info_schema_marker "$candidate_build_info")" || return 1
+  previous_version="${previous_schema%%_*}"
+  candidate_version="${candidate_schema%%_*}"
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 53)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 53)); }; then
+    echo "automatic rollback refused: migration 053 is a stopped-writer, roll-forward-only recovery-commitment boundary" >&2
+    return 1
+  fi
 
   if [[ "$previous_schema" == "$candidate_schema" ]]; then
     transition_count=0
@@ -151,8 +272,21 @@ rollback_on_failure() {
 }
 trap rollback_on_failure EXIT
 
-echo "NOTE: migrations are applied manually and deliberately:"
-echo "  PGPASSWORD=\$(cat ~/.pgpass_payservice) psql -h 127.0.0.1 -U payservice -d payservice -f migrations/NNN_*.sql"
+if [[ -f "$REPO/migrations/053_recovery_address_commitments.sql" ]]; then
+  if ! migration_053_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 053 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, then apply migration 053 with
+psql --no-psqlrc --set ON_ERROR_STOP=1 as a distinct privileged schema owner.
+Never apply migration 053 as the runtime role payservice. Follow
+docs/operations/deployment.md, including its pre- and post-migration checks,
+then rerun this script.
+EOF
+    exit 1
+  fi
+  echo "migration 053 privileged-owner ACL/FK/trigger boundary verified read-only as payservice"
+fi
+echo "NOTE: all migrations are applied manually using their documented ownership and stopped-writer boundaries."
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'
 
 export CARGO_BUILD_JOBS=2

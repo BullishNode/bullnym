@@ -1,9 +1,10 @@
 //! Merchant-signed recovery-address registration contract and endpoint.
 //!
 //! The always-on authenticated route verifies this sealed contract and appends
-//! it to the immutable persistence ledger. Swap creation remains a separate
-//! slice. The registered address is private merchant policy: response types
-//! expose only acceptance metadata, never the address itself.
+//! it to the immutable persistence ledger. Chain-swap creation selects the
+//! current commitment and immutably binds its identity and address into the
+//! creation record. The registered address is private merchant policy:
+//! response types expose only acceptance metadata, never the address itself.
 
 use crate::auth;
 use crate::db::{self, RecoveryAddressCommitmentError};

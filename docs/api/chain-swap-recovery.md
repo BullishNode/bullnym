@@ -5,6 +5,66 @@ swaps. When a funded swap fails, the server parks it in `refund_due`: the
 payer's BTC sits in the lockup until the invoice-owning merchant recovers it.
 Recovery has two halves — a signed detection read and a signed recover action.
 
+## Registering the merchant recovery address
+
+Before creating a chain swap, a merchant client registers its private Bitcoin
+recovery policy:
+
+```text
+PUT /api/v1/recovery-address
+```
+
+```json
+{
+  "version": 1,
+  "npub": "<64 lowercase hex>",
+  "btc_address": "bc1...",
+  "timestamp": 1760000000,
+  "signature": "<128 lowercase hex>"
+}
+```
+
+Sign the LA-v2 action `recovery-address-set` in the identity-wide **empty nym**
+domain. The two ordered payload fields are the literal string `1`, then the
+exact canonical Bitcoin-mainnet address from `btc_address`:
+
+```text
+bullpay-la-v2 NUL recovery-address-set NUL npub NUL NUL
+1 NUL canonical_btc_address NUL timestamp
+```
+
+The endpoint accepts an address only, not a BIP21 URI, label, amount, or
+payment-provider substitute. It rejects non-mainnet and non-canonical address
+encodings, unknown JSON fields, non-canonical npubs, and uppercase signatures.
+The lowercase-only signature rule is specific to this commitment contract;
+other LA-v2 endpoints retain the general case-insensitive signature parsing
+described in [Authentication](authentication.md). The request body limit is
+1 KiB.
+
+A successful response contains acceptance metadata only:
+
+```json
+{
+  "version": 1,
+  "recovery_address_registered": true,
+  "signed_at_unix": 1760000000
+}
+```
+
+The response never returns the address, npub, signature, commitment ID, or
+commitment version. There is deliberately no read or list operation; `GET` on
+this path is not allowed. Missing and inactive identities produce the same
+generic authentication response, so the endpoint is not an identity oracle.
+
+An exact signed-request retry (the same five logical values and signature)
+within the 300-second authentication window is idempotent: it resolves to the
+original immutable commitment and returns the same public response. Any other
+valid signed request, including one with a new timestamp for the same address,
+appends a new commitment version and becomes the policy for future swaps.
+Address rotation never rewrites a swap that was already bound to an earlier
+commitment. If a response is lost, retry the exact request while it is fresh;
+do not re-sign merely to poll, because there is no read API.
+
 ## Detecting recoverable swaps
 
 ```text
@@ -101,4 +161,3 @@ a signal to create another recovery request with a different address.
 Treat the returned txid as pending until it confirms on-chain; a low-fee
 transaction can remain unconfirmed or be evicted. Poll the detection endpoint
 (or the txid) rather than presenting broadcast as final settlement.
-
