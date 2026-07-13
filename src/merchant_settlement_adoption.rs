@@ -298,6 +298,8 @@ impl ConfirmedMerchantOutputEvidence {
                 asset_id.clone(),
             ),
         };
+        let destination_vout = i32::try_from(snapshot.vout)
+            .map_err(|_| MerchantSettlementAdoptionError::InvalidPersistedEvidence)?;
         let candidate = if snapshot.linked_replacement {
             JournaledMerchantTransaction::linked_replacement(
                 snapshot.txid.clone(),
@@ -306,7 +308,7 @@ impl ConfirmedMerchantOutputEvidence {
                 snapshot.destination_script_hex.clone(),
                 snapshot.asset.clone(),
                 snapshot.actual_amount_sat,
-                snapshot.vout,
+                destination_vout,
             )
         } else {
             JournaledMerchantTransaction::original(
@@ -315,7 +317,7 @@ impl ConfirmedMerchantOutputEvidence {
                 snapshot.destination_script_hex.clone(),
                 snapshot.asset.clone(),
                 snapshot.actual_amount_sat,
-                snapshot.vout,
+                destination_vout,
             )
         };
         let amount_sat = u64::try_from(snapshot.actual_amount_sat)
