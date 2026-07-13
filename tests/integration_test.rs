@@ -15826,8 +15826,23 @@ async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) ->
     let txid = transaction.txid().to_string();
     let raw_tx_hex = hex::encode(lwk_wollet::elements::encode::serialize(&transaction));
     sqlx::query(
-        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
-             claim_txid = $3, updated_at = NOW() WHERE id = $1",
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', claim_tx_hex = $2, claim_txid = $3, \
+             claim_actual_fee_sat = 100, claim_actual_fee_rate_sat_vb = 1.5, \
+             claim_fee_decision_purpose = 'chain_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = 1.5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1', \
+             updated_at = NOW() \
+         WHERE id = $1",
     )
     .bind(swap.id)
     .bind(&raw_tx_hex)
