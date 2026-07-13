@@ -10,8 +10,8 @@ dependency health separately.
 - counts and maximum age by swap and invoice status;
 - claim attempts, slow-recovery attempts, and next retry timestamps;
 - provider, Electrum, mempool API, and price-source latency/error rates;
-- direct-watcher recent/historical backlog counts and oldest-due lag from each
-  frozen lane-start log;
+- Bitcoin and Liquid direct-watcher recent/historical backlog counts,
+  oldest-due timestamps, and lag from each frozen lane-start log;
 - descriptor allocation failures and uniqueness violations;
 - invoice events missing after a claimed swap;
 - `refunding` rows without a reconciled transaction outcome.

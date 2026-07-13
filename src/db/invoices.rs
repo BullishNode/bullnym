@@ -345,11 +345,12 @@ pub async fn list_invoices_by_npub<'e, E: sqlx::PgExecutor<'e>>(
 /// Linked and unlinked invoices are covered uniformly regardless of whether
 /// the address came from the descriptor allocator or the wallet.
 ///
-/// Watchers page deterministically through a process-local scan epoch. The
-/// epoch captures PostgreSQL time once, then keysets on `(created_at, id)` so
-/// every row that existed at the cutoff is visited exactly once. Rows created
-/// later wait for the next epoch. One sentinel row beyond the 1,000-row work
-/// batch distinguishes a completed epoch from deferred work without a count.
+/// The production watcher pages through disjoint recent and historical lanes.
+/// Each process freezes PostgreSQL time once per lane traversal, then keysets
+/// on `(created_at, id)`. A persisted cursor chooses the rotation start only;
+/// the process wraps through the frozen start before treating the lane as
+/// healthy. One sentinel row beyond the 1,000-row work batch distinguishes a
+/// completed range from deferred work without a count.
 const LIQUID_WATCHER_BATCH_SIZE: usize = 1_000;
 
 pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
@@ -388,6 +389,80 @@ pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
            ) \
      ORDER BY created_at ASC, id ASC \
      LIMIT $5";
+
+const LIQUID_WATCHER_ELIGIBLE_PREDICATE_SQL: &str = "( \
+             ( \
+               (status IN ('unpaid', 'in_progress', 'partially_paid') \
+                OR (origin = 'checkout' AND status = 'underpaid')) \
+               AND expires_at + ($1 || ' seconds')::interval > $2::timestamptz \
+             ) \
+             OR status IN ('cancelled', 'expired') \
+             OR direct_settlement_status IN ('pending', 'resolution_pending') \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_observations direct_observation \
+                  WHERE direct_observation.invoice_id = invoices.id \
+                    AND direct_observation.source = 'liquid_direct' \
+                    AND direct_observation.last_seen_state <> 'superseded' \
+             ) \
+             OR EXISTS ( \
+                  SELECT 1 FROM invoice_payment_events direct_event \
+                  WHERE direct_event.invoice_id = invoices.id \
+                    AND direct_event.source = 'liquid_direct' \
+                    AND direct_event.accounting_state <> 'superseded' \
+                    AND direct_event.superseded_by_event_id IS NULL \
+             ) \
+           ) \
+       AND accept_liquid = TRUE \
+       AND liquid_address IS NOT NULL \
+       AND liquid_blinding_key_hex IS NOT NULL";
+
+/// Canonical priority predicate shared by both lanes. Old invoices with a
+/// partial presentation or unsettled direct evidence remain on the fast lane;
+/// historical is the exact negation within the same eligible cohort.
+pub(crate) const LIQUID_WATCHER_RECENT_PREDICATE_SQL: &str = "( \
+             created_at > $2::timestamptz - ($3 || ' seconds')::interval \
+             OR COALESCE(presentation_status = 'partial', FALSE) \
+             OR direct_settlement_status IN ('pending', 'resolution_pending') \
+           )";
+
+/// Lane-aware production query. `{lane_predicate}` is replaced with the
+/// canonical priority predicate above or its exact negation. Eligibility
+/// deliberately matches the compatibility query so lifecycle closure cannot
+/// erase late-money or reorg obligations.
+pub(crate) const LIQUID_WATCHER_LANE_PAGE_SQL: &str = "SELECT id, liquid_address, \
+            GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
+            liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
+     FROM invoices \
+     WHERE {eligible} \
+       AND {lane_predicate} \
+       AND created_at <= $2::timestamptz \
+       AND ( \
+             $4::timestamptz IS NULL \
+             OR (created_at, id) > ($4::timestamptz, $5::uuid) \
+           ) \
+       AND ( \
+             $6::timestamptz IS NULL \
+             OR (created_at, id) <= ($6::timestamptz, $7::uuid) \
+           ) \
+     ORDER BY created_at ASC, id ASC \
+     LIMIT $8";
+
+pub(crate) const LIQUID_WATCHER_LANE_LAG_SQL: &str = "SELECT \
+            COUNT(*)::BIGINT, \
+            MIN(created_at)::TEXT, \
+            COALESCE( \
+                GREATEST( \
+                    0, \
+                    FLOOR(EXTRACT(EPOCH FROM ( \
+                        $2::timestamptz - MIN(created_at) \
+                    )))::BIGINT \
+                ), \
+                0 \
+            )::BIGINT \
+     FROM invoices \
+     WHERE {eligible} \
+       AND {lane_predicate} \
+       AND created_at <= $2::timestamptz";
 
 type LiquidWatcherInvoice = (Uuid, String, i64, String);
 
@@ -487,6 +562,61 @@ pub async fn list_unpaid_invoices_with_liquid_address_page(
         .await?;
     let has_more = truncate_to_watcher_batch(&mut rows, LIQUID_WATCHER_BATCH_SIZE);
     Ok(LiquidWatcherInvoicePage { rows, has_more })
+}
+
+fn liquid_watcher_lane_sql(template: &str, recent: bool) -> String {
+    let lane_predicate = if recent {
+        LIQUID_WATCHER_RECENT_PREDICATE_SQL.to_string()
+    } else {
+        format!("NOT {LIQUID_WATCHER_RECENT_PREDICATE_SQL}")
+    };
+    template
+        .replace("{eligible}", LIQUID_WATCHER_ELIGIBLE_PREDICATE_SQL)
+        .replace("{lane_predicate}", &lane_predicate)
+}
+
+pub async fn list_liquid_watcher_invoice_lane_page(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+    active_window_secs: u32,
+    snapshot: &str,
+    recent: bool,
+    cursor: Option<&WatcherScanCursor>,
+    wrap_limit: Option<&WatcherScanCursor>,
+) -> Result<LiquidWatcherInvoicePage, sqlx::Error> {
+    let sql = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, recent);
+    let mut rows = sqlx::query_as::<_, LiquidWatcherInvoicePageRow>(&sql)
+        .bind(payment_grace_secs as i64)
+        .bind(snapshot)
+        .bind(active_window_secs as i64)
+        .bind(cursor.map(|cursor| cursor.created_at.as_str()))
+        .bind(cursor.map(|cursor| cursor.id))
+        .bind(wrap_limit.map(|cursor| cursor.created_at.as_str()))
+        .bind(wrap_limit.map(|cursor| cursor.id))
+        .bind((LIQUID_WATCHER_BATCH_SIZE + 1) as i64)
+        .fetch_all(pool)
+        .await?;
+    let has_more = truncate_to_watcher_batch(&mut rows, LIQUID_WATCHER_BATCH_SIZE);
+    Ok(LiquidWatcherInvoicePage { rows, has_more })
+}
+
+/// Frozen-lane backlog observation. `oldest_due_lag_secs` is bounded at zero
+/// when the lane is empty or database time would otherwise produce a negative
+/// duration.
+pub async fn liquid_watcher_lane_lag(
+    pool: &PgPool,
+    payment_grace_secs: u64,
+    active_window_secs: u32,
+    snapshot: &str,
+    recent: bool,
+) -> Result<(i64, Option<String>, i64), sqlx::Error> {
+    let sql = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_LAG_SQL, recent);
+    sqlx::query_as(&sql)
+        .bind(payment_grace_secs as i64)
+        .bind(snapshot)
+        .bind(active_window_secs as i64)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn list_unpaid_invoices_with_liquid_address_batch(
@@ -1705,13 +1835,25 @@ pub async fn latest_lightning_pr_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
 #[cfg(test)]
 mod status_tests {
     use super::{
-        resolve_invoice_status, truncate_to_watcher_batch, WatcherScanCursor, WatcherScanEpoch,
-        LIQUID_WATCHER_BATCH_SIZE, LIQUID_WATCHER_PAGE_SQL,
+        liquid_watcher_lane_sql, resolve_invoice_status, truncate_to_watcher_batch,
+        WatcherScanCursor, WatcherScanEpoch, LIQUID_WATCHER_BATCH_SIZE,
+        LIQUID_WATCHER_LANE_LAG_SQL, LIQUID_WATCHER_LANE_PAGE_SQL, LIQUID_WATCHER_PAGE_SQL,
+        LIQUID_WATCHER_RECENT_PREDICATE_SQL,
     };
     use uuid::Uuid;
 
     // amount 100_000; btc tolerance 300, liquid tolerance 60 (illustrative).
     const AMT: i64 = 100_000;
+
+    fn recent_liquid_lane_facts(
+        age_new: bool,
+        presentation_status: &str,
+        direct_settlement_status: &str,
+    ) -> bool {
+        age_new
+            || presentation_status == "partial"
+            || matches!(direct_settlement_status, "pending" | "resolution_pending")
+    }
 
     #[test]
     fn liquid_watcher_expiry_membership_is_frozen_at_the_scan_epoch() {
@@ -1733,6 +1875,52 @@ mod status_tests {
         assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.source = 'liquid_direct'"));
         assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.accounting_state <> 'superseded'"));
         assert!(LIQUID_WATCHER_PAGE_SQL.contains("direct_event.superseded_by_event_id IS NULL"));
+    }
+
+    #[test]
+    fn liquid_invoice_lanes_share_one_priority_predicate_and_exact_negation() {
+        let recent_page = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, true);
+        let historical_page = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, false);
+        let recent_lag = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_LAG_SQL, true);
+        let historical_lag = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_LAG_SQL, false);
+
+        for sql in [&recent_page, &recent_lag] {
+            assert!(sql.contains(LIQUID_WATCHER_RECENT_PREDICATE_SQL));
+            assert!(!sql.contains(&format!("NOT {LIQUID_WATCHER_RECENT_PREDICATE_SQL}")));
+            assert!(!sql.contains("{eligible}"));
+            assert!(!sql.contains("{lane_predicate}"));
+        }
+        for sql in [&historical_page, &historical_lag] {
+            assert!(sql.contains(&format!("NOT {LIQUID_WATCHER_RECENT_PREDICATE_SQL}")));
+            assert!(!sql.contains("{eligible}"));
+            assert!(!sql.contains("{lane_predicate}"));
+        }
+    }
+
+    #[test]
+    fn old_partial_or_settling_liquid_targets_stay_recent() {
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("presentation_status = 'partial'"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL
+            .contains("direct_settlement_status IN ('pending', 'resolution_pending')"));
+        assert!(LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("created_at >"));
+        assert!(!LIQUID_WATCHER_RECENT_PREDICATE_SQL.contains("status = 'partially_paid'"));
+
+        let historical = liquid_watcher_lane_sql(LIQUID_WATCHER_LANE_PAGE_SQL, false);
+        assert!(historical.contains("OR status IN ('cancelled', 'expired')"));
+        assert!(historical.contains(&format!("NOT {LIQUID_WATCHER_RECENT_PREDICATE_SQL}")));
+
+        assert!(recent_liquid_lane_facts(false, "partial", "none"));
+        assert!(recent_liquid_lane_facts(false, "unpaid", "pending"));
+        assert!(recent_liquid_lane_facts(
+            false,
+            "payment_received",
+            "resolution_pending"
+        ));
+        assert!(recent_liquid_lane_facts(true, "unpaid", "none"));
+
+        // Old cancelled/expired rows remain in the eligible cohort above, but
+        // without partial or settling evidence they are the exact complement.
+        assert!(!recent_liquid_lane_facts(false, "unpaid", "none"));
     }
 
     #[test]

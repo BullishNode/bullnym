@@ -119,6 +119,13 @@ struct ChainWatcherPollCtx<'a> {
     cancel: &'a CancellationToken,
 }
 
+#[derive(Clone, Copy)]
+struct LiquidInvoicePollConfig {
+    tolerances: db::InvoiceAccountingTolerances,
+    finality_confirmations: u32,
+    active_window_secs: u32,
+}
+
 enum LiquidRecordOutcome {
     Applied { recorded: usize },
     Deferred,
@@ -267,8 +274,25 @@ impl CycleOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchTier {
-    Active,
-    Idle,
+    Recent,
+    Historical,
+}
+
+impl WatchTier {
+    const fn lane(self) -> db::WatcherLane {
+        match self {
+            Self::Recent => db::WatcherLane::Recent,
+            Self::Historical => db::WatcherLane::Historical,
+        }
+    }
+
+    const fn is_recent(self) -> bool {
+        matches!(self, Self::Recent)
+    }
+
+    const fn label(self) -> &'static str {
+        self.lane().as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,43 +316,215 @@ struct TierHealth {
     idle: TierState,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RotationPhase {
+    #[default]
+    AfterSaved,
+    ThroughSaved,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LiquidWorkPhase {
+    #[default]
+    Nyms,
+    Invoices,
+}
+
+impl LiquidWorkPhase {
+    const fn other(self) -> Self {
+        match self {
+            Self::Nyms => Self::Invoices,
+            Self::Invoices => Self::Nyms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseTurn {
+    First,
+    Second,
+}
+
+impl PhaseTurn {
+    fn after_token_exhaustion(self, useful_progress: usize) -> CycleOutcome {
+        if self == Self::Second && useful_progress == 0 {
+            // The first bounded phase may have consumed the shared bucket.
+            // Alternating first priority provides capacity on the next tick;
+            // this is a deferral, not evidence that the second phase failed.
+            CycleOutcome::Incomplete
+        } else {
+            CycleOutcome::after_token_exhaustion(useful_progress)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LiquidInvoiceLaneEpoch {
+    snapshot: Option<String>,
+    starting_offset: Option<db::WatcherScanCursor>,
+    cursor: Option<db::WatcherScanCursor>,
+    phase: RotationPhase,
+    hard_bound_failure: bool,
+}
+
+impl LiquidInvoiceLaneEpoch {
+    fn snapshot(&self) -> Option<&str> {
+        self.snapshot.as_deref()
+    }
+
+    fn cursor(&self) -> Option<&db::WatcherScanCursor> {
+        self.cursor.as_ref()
+    }
+
+    fn wrap_limit(&self) -> Option<&db::WatcherScanCursor> {
+        (self.phase == RotationPhase::ThroughSaved)
+            .then_some(self.starting_offset.as_ref())
+            .flatten()
+    }
+
+    fn begin(&mut self, snapshot: String, starting_offset: Option<db::WatcherScanCursor>) {
+        if self.snapshot.is_some() {
+            return;
+        }
+        self.snapshot = Some(snapshot);
+        self.cursor = starting_offset.clone();
+        self.starting_offset = starting_offset;
+        self.phase = RotationPhase::AfterSaved;
+    }
+
+    fn advance(&mut self, cursor: db::WatcherScanCursor) {
+        self.cursor = Some(cursor);
+    }
+
+    fn note_hard_bound(&mut self, cursor: db::WatcherScanCursor) {
+        self.hard_bound_failure = true;
+        self.advance(cursor);
+    }
+
+    /// Complete one keyset range. A persisted offset is only a rotation start:
+    /// the current process must wrap through the frozen boundary before this
+    /// lane can contribute healthy admission evidence.
+    fn finish_page_range(&mut self) -> Option<CycleOutcome> {
+        if self.phase == RotationPhase::AfterSaved && self.starting_offset.is_some() {
+            self.phase = RotationPhase::ThroughSaved;
+            self.cursor = None;
+            return None;
+        }
+
+        let outcome = if std::mem::take(&mut self.hard_bound_failure) {
+            CycleOutcome::HardBoundFailed
+        } else {
+            CycleOutcome::Healthy
+        };
+        self.finish();
+        Some(outcome)
+    }
+
+    fn finish(&mut self) {
+        self.snapshot = None;
+        self.starting_offset = None;
+        self.cursor = None;
+        self.phase = RotationPhase::AfterSaved;
+        self.hard_bound_failure = false;
+    }
+}
+
 #[derive(Debug, Default)]
 struct LiquidTierScanEpoch {
     nyms: db::WatcherNymScanEpoch,
-    invoices: db::WatcherScanEpoch,
+    invoices: LiquidInvoiceLaneEpoch,
     nyms_complete: bool,
+    invoices_complete: bool,
     invoice_hard_bound_failure: bool,
+    next_phase: LiquidWorkPhase,
 }
 
 impl LiquidTierScanEpoch {
-    fn note_invoice_hard_bound(&mut self, cursor: db::WatcherScanCursor) {
-        self.invoice_hard_bound_failure = true;
-        self.invoices.advance(cursor);
+    fn phase_complete(&self, phase: LiquidWorkPhase) -> bool {
+        match phase {
+            LiquidWorkPhase::Nyms => self.nyms_complete,
+            LiquidWorkPhase::Invoices => self.invoices_complete,
+        }
+    }
+
+    /// Return each phase at most once. Both incomplete phases receive a bounded
+    /// turn in the same poll call, while the first-priority position alternates
+    /// so neither can monopolize the shared Electrum bucket.
+    fn take_phase_order(&mut self) -> [LiquidWorkPhase; 2] {
+        let first = match (self.nyms_complete, self.invoices_complete) {
+            (false, false) => self.next_phase,
+            (false, true) => LiquidWorkPhase::Nyms,
+            (true, false) => LiquidWorkPhase::Invoices,
+            (true, true) => self.next_phase,
+        };
+        if !self.nyms_complete && !self.invoices_complete {
+            self.next_phase = first.other();
+        }
+        [first, first.other()]
+    }
+
+    fn observe_phase_outcome(&mut self, phase: LiquidWorkPhase, outcome: CycleOutcome) -> bool {
+        match (phase, outcome) {
+            (LiquidWorkPhase::Nyms, CycleOutcome::Healthy) => self.nyms_complete = true,
+            (LiquidWorkPhase::Invoices, CycleOutcome::Healthy) => {
+                self.invoices_complete = true;
+            }
+            (LiquidWorkPhase::Invoices, CycleOutcome::HardBoundFailed) => {
+                self.invoices_complete = true;
+                self.invoice_hard_bound_failure = true;
+            }
+            (
+                _,
+                CycleOutcome::Incomplete | CycleOutcome::Failed | CycleOutcome::HardBoundFailed,
+            ) => {}
+        }
+        matches!(
+            outcome,
+            CycleOutcome::Failed | CycleOutcome::HardBoundFailed
+        )
+    }
+
+    fn completed_outcome(&self) -> Option<CycleOutcome> {
+        (self.nyms_complete && self.invoices_complete).then_some(
+            if self.invoice_hard_bound_failure {
+                CycleOutcome::Failed
+            } else {
+                CycleOutcome::Healthy
+            },
+        )
+    }
+
+    fn finish_poll(&mut self, saw_failure: bool) -> CycleOutcome {
+        if let Some(proven) = self.completed_outcome() {
+            let outcome = if saw_failure {
+                CycleOutcome::Failed
+            } else {
+                proven
+            };
+            self.finish();
+            outcome
+        } else if saw_failure {
+            CycleOutcome::Failed
+        } else {
+            CycleOutcome::Incomplete
+        }
     }
 
     fn finish(&mut self) {
         self.nyms.finish();
         self.invoices.finish();
         self.nyms_complete = false;
+        self.invoices_complete = false;
         self.invoice_hard_bound_failure = false;
-    }
-}
-
-fn liquid_invoice_epoch_outcome(epoch: &LiquidTierScanEpoch, has_more: bool) -> CycleOutcome {
-    if has_more {
-        CycleOutcome::Incomplete
-    } else if epoch.invoice_hard_bound_failure {
-        CycleOutcome::HardBoundFailed
-    } else {
-        CycleOutcome::Healthy
+        self.next_phase = LiquidWorkPhase::Nyms;
     }
 }
 
 impl TierHealth {
     fn observe(&mut self, tier: WatchTier, outcome: CycleOutcome) -> ReportAction {
         let (current, other) = match tier {
-            WatchTier::Active => (&mut self.active, self.idle),
-            WatchTier::Idle => (&mut self.idle, self.active),
+            WatchTier::Recent => (&mut self.active, self.idle),
+            WatchTier::Historical => (&mut self.idle, self.active),
         };
         match outcome {
             CycleOutcome::Incomplete => ReportAction::ProgressOnly,
@@ -363,10 +559,15 @@ fn report_outcome(
 
 /// Run the chain watcher loop. Spawned for the lifetime of the server.
 /// Two cadences:
-///   - `active_tick_secs`: scans only users with a recent callback.
-///     Bounded by real traffic, not by the size of the `users` table.
-///   - `idle_tick_secs`: scans every active user (active + idle). Catches
-///     payments to users who haven't had a recent callback.
+///   - `active_tick_secs`: scans users with a recent callback and the direct
+///     invoice priority lane (new, partial, or direct-settling targets).
+///   - `idle_tick_secs`: scans every active user and the exact historical
+///     complement of the eligible direct-invoice cohort.
+///
+/// Invoice lanes persist only their last safely visited row. Nym lookahead
+/// remains process-local and retains its recent/all cadence. Each poll gives
+/// both incomplete phases at most one bounded turn and alternates first
+/// priority, while health still requires both current-process traversals.
 ///
 /// `rate_limiter` exposes a dedicated watcher-only Electrum bucket
 /// (`check_electrum_watcher`) so a callback storm cannot starve the
@@ -388,9 +589,9 @@ pub async fn run(
         return;
     }
 
-    for (tier, active, epoch) in [
-        (WatchTier::Active, true, &mut active_epoch),
-        (WatchTier::Idle, false, &mut idle_epoch),
+    for (tier, epoch) in [
+        (WatchTier::Recent, &mut active_epoch),
+        (WatchTier::Historical, &mut idle_epoch),
     ] {
         let startup_outcome = poll_cycle(
             ChainWatcherPollCtx {
@@ -401,7 +602,7 @@ pub async fn run(
             },
             &cfg,
             tolerances,
-            active,
+            tier,
             &reporter,
             epoch,
         )
@@ -438,7 +639,7 @@ pub async fn run(
                         rate_limiter: rate_limiter.as_ref(),
                         cancel: &cancel,
                     },
-                    &cfg, tolerances, true, &reporter, &mut active_epoch,
+                    &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch,
                 ).await;
                 if cancel.is_cancelled() {
                     reporter.intentional_shutdown();
@@ -447,7 +648,7 @@ pub async fn run(
                 report_outcome(
                     &reporter,
                     &mut tier_health,
-                    WatchTier::Active,
+                    WatchTier::Recent,
                     healthy,
                 );
             }
@@ -459,7 +660,7 @@ pub async fn run(
                         rate_limiter: rate_limiter.as_ref(),
                         cancel: &cancel,
                     },
-                    &cfg, tolerances, false, &reporter, &mut idle_epoch,
+                    &cfg, tolerances, WatchTier::Historical, &reporter, &mut idle_epoch,
                 ).await;
                 if cancel.is_cancelled() {
                     reporter.intentional_shutdown();
@@ -468,7 +669,7 @@ pub async fn run(
                 report_outcome(
                     &reporter,
                     &mut tier_health,
-                    WatchTier::Idle,
+                    WatchTier::Historical,
                     healthy,
                 );
             }
@@ -480,7 +681,7 @@ async fn poll_cycle(
     ctx: ChainWatcherPollCtx<'_>,
     cfg: &ChainWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
-    active: bool,
+    tier: WatchTier,
     reporter: &WorkerReporter,
     epoch: &mut LiquidTierScanEpoch,
 ) -> CycleOutcome {
@@ -490,97 +691,109 @@ async fn poll_cycle(
     }
     if let Err(error) = ctx.backend.health_check().await {
         tracing::warn!(
-            tier = if active { "active" } else { "idle" },
+            lane = tier.label(),
             "chain_watcher: Liquid backend health check failed: {error}"
         );
         return CycleOutcome::Failed;
     }
-    let tier = if active { "active" } else { "idle" };
-    if !epoch.nyms_complete {
-        if epoch.nyms.snapshot().is_none() {
-            match db::watcher_scan_snapshot(ctx.pool).await {
-                Ok(snapshot) => epoch.nyms.begin(snapshot),
-                Err(e) => {
-                    tracing::warn!("chain_watcher: nym scan snapshot failed: {e}");
-                    return CycleOutcome::Failed;
-                }
-            }
+    let order = epoch.take_phase_order();
+    let mut attempted = 0usize;
+    let mut saw_failure = false;
+    for phase in order {
+        if epoch.phase_complete(phase) {
+            continue;
         }
-        let snapshot = epoch
-            .nyms
-            .snapshot()
-            .expect("watcher nym epoch snapshot initialized before page query");
-        let page = if active {
-            db::list_recently_active_nyms_for_watcher_page(
-                ctx.pool,
-                cfg.active_window_secs,
-                snapshot,
-                epoch.nyms.query_cursor(),
-            )
-            .await
+        if attempted > 0 && ctx.cancel.is_cancelled() {
+            break;
+        }
+        let turn = if attempted == 0 {
+            PhaseTurn::First
         } else {
-            // Idle ticks scan all active users (active + idle subsets).
-            db::list_active_nyms_for_watcher_page(ctx.pool, snapshot, epoch.nyms.query_cursor())
-                .await
+            PhaseTurn::Second
         };
-        let page = match page {
-            Ok(page) => page,
+        attempted += 1;
+
+        let outcome = match phase {
+            LiquidWorkPhase::Nyms => {
+                poll_nym_phase(ctx, cfg, tier, reporter, &mut epoch.nyms, turn).await
+            }
+            LiquidWorkPhase::Invoices => {
+                poll_invoice_addresses(
+                    ctx,
+                    LiquidInvoicePollConfig {
+                        tolerances,
+                        finality_confirmations: cfg.liquid_finality_confirmations,
+                        active_window_secs: cfg.active_window_secs,
+                    },
+                    tier,
+                    reporter,
+                    epoch,
+                    turn,
+                )
+                .await
+            }
+        };
+        saw_failure |= epoch.observe_phase_outcome(phase, outcome);
+    }
+    epoch.finish_poll(saw_failure)
+}
+
+async fn poll_nym_phase(
+    ctx: ChainWatcherPollCtx<'_>,
+    cfg: &ChainWatcherConfig,
+    tier: WatchTier,
+    reporter: &WorkerReporter,
+    epoch: &mut db::WatcherNymScanEpoch,
+    turn: PhaseTurn,
+) -> CycleOutcome {
+    let lane = tier.label();
+    if epoch.snapshot().is_none() {
+        match db::watcher_scan_snapshot(ctx.pool).await {
+            Ok(snapshot) => epoch.begin(snapshot),
             Err(e) => {
-                tracing::warn!("chain_watcher: list {tier} nym page failed: {e}");
+                tracing::warn!("chain_watcher: nym scan snapshot failed: {e}");
                 return CycleOutcome::Failed;
             }
-        };
-        let has_more = page.has_more;
-        let nym_outcome = match poll_nyms(
-            ctx,
-            cfg.lookahead,
-            page.rows,
-            tier,
-            reporter,
-            &mut epoch.nyms,
+        }
+    }
+    let snapshot = epoch
+        .snapshot()
+        .expect("watcher nym epoch snapshot initialized before page query");
+    let page = if tier.is_recent() {
+        db::list_recently_active_nyms_for_watcher_page(
+            ctx.pool,
+            cfg.active_window_secs,
+            snapshot,
+            epoch.query_cursor(),
         )
         .await
-        {
+    } else {
+        // Idle ticks scan all active users (active + idle subsets).
+        db::list_active_nyms_for_watcher_page(ctx.pool, snapshot, epoch.query_cursor()).await
+    };
+    let page = match page {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!("chain_watcher: list {lane} nym page failed: {e}");
+            return CycleOutcome::Failed;
+        }
+    };
+    let has_more = page.has_more;
+    let nym_outcome =
+        match poll_nyms(ctx, cfg.lookahead, page.rows, lane, reporter, epoch, turn).await {
             Ok(outcome) => outcome,
             Err(e) => {
-                tracing::warn!("chain_watcher {tier} poll failed: {e:?}");
+                tracing::warn!("chain_watcher {lane} poll failed: {e:?}");
                 CycleOutcome::Failed
             }
         };
-        if ctx.cancel.is_cancelled() || nym_outcome != CycleOutcome::Healthy {
-            return nym_outcome;
-        }
-        if has_more {
-            return CycleOutcome::Incomplete;
-        }
-        // Keep the completed nym epoch latched while invoice pages drain.
-        // Reset both phases together only after the invoice epoch is healthy.
-        epoch.nyms_complete = true;
+    if ctx.cancel.is_cancelled() || nym_outcome != CycleOutcome::Healthy {
+        return nym_outcome;
     }
-
-    let outcome = poll_invoice_addresses(
-        ctx,
-        tolerances,
-        cfg.liquid_finality_confirmations,
-        tier,
-        reporter,
-        epoch,
-    )
-    .await;
-    match outcome {
-        CycleOutcome::Healthy => {
-            epoch.finish();
-            CycleOutcome::Healthy
-        }
-        CycleOutcome::HardBoundFailed => {
-            // The whole frozen epoch was visited, including rows after every
-            // hard-bound obligation. Reset process-local cursors so affected
-            // invoices are retried next epoch, while reporting this epoch as
-            // unhealthy to close new direct-Liquid admission.
-            epoch.finish();
-            CycleOutcome::Failed
-        }
-        CycleOutcome::Incomplete | CycleOutcome::Failed => outcome,
+    if has_more {
+        CycleOutcome::Incomplete
+    } else {
+        CycleOutcome::Healthy
     }
 }
 
@@ -592,44 +805,104 @@ async fn poll_cycle(
 /// match the invoice script, and record exact LBTC amounts idempotently.
 async fn poll_invoice_addresses(
     ctx: ChainWatcherPollCtx<'_>,
-    tolerances: db::InvoiceAccountingTolerances,
-    liquid_finality_confirmations: u32,
-    tier: &'static str,
+    config: LiquidInvoicePollConfig,
+    tier: WatchTier,
     reporter: &WorkerReporter,
     epoch: &mut LiquidTierScanEpoch,
+    turn: PhaseTurn,
 ) -> CycleOutcome {
     reporter.progress();
     if epoch.invoices.snapshot().is_none() {
-        match db::watcher_scan_snapshot(ctx.pool).await {
-            Ok(snapshot) => epoch.invoices.begin(snapshot),
+        let snapshot = match db::watcher_scan_snapshot(ctx.pool).await {
+            Ok(snapshot) => snapshot,
             Err(e) => {
-                tracing::warn!("chain_watcher: invoice scan snapshot failed: {e}");
+                tracing::warn!(
+                    event = "liquid_watcher_lane_snapshot_failed",
+                    lane = tier.label(),
+                    "chain_watcher: invoice scan snapshot failed: {e}"
+                );
                 return CycleOutcome::Failed;
             }
+        };
+        let starting_offset = match db::load_watcher_lane_cursor(
+            ctx.pool,
+            db::WatcherLaneWorker::LiquidDirect,
+            tier.lane(),
+        )
+        .await
+        {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                tracing::warn!(
+                    event = "liquid_watcher_lane_progress_load_failed",
+                    lane = tier.label(),
+                    "chain_watcher: durable Liquid lane offset query failed: {e}"
+                );
+                return CycleOutcome::Failed;
+            }
+        };
+        epoch.invoices.begin(snapshot, starting_offset);
+
+        let snapshot = epoch
+            .invoices
+            .snapshot()
+            .expect("Liquid lane snapshot initialized before lag query");
+        match db::liquid_watcher_lane_lag(
+            ctx.pool,
+            config.tolerances.payment_grace_secs,
+            config.active_window_secs,
+            snapshot,
+            tier.is_recent(),
+        )
+        .await
+        {
+            Ok((backlog, oldest_due, oldest_due_lag_secs)) => tracing::info!(
+                event = "liquid_watcher_lane_backlog",
+                lane = tier.label(),
+                backlog,
+                oldest_due = ?oldest_due,
+                oldest_due_lag_secs,
+                "chain_watcher: frozen Liquid invoice lane backlog"
+            ),
+            Err(e) => tracing::warn!(
+                event = "liquid_watcher_lane_backlog_query_failed",
+                lane = tier.label(),
+                "chain_watcher: Liquid lane lag observation failed: {e}"
+            ),
         }
     }
     let snapshot = epoch
         .invoices
         .snapshot()
         .expect("watcher epoch snapshot initialized before page query");
-    let batch = match db::list_unpaid_invoices_with_liquid_address_page(
+    let batch = match db::list_liquid_watcher_invoice_lane_page(
         ctx.pool,
-        tolerances.payment_grace_secs,
+        config.tolerances.payment_grace_secs,
+        config.active_window_secs,
         snapshot,
+        tier.is_recent(),
         epoch.invoices.cursor(),
+        epoch.invoices.wrap_limit(),
     )
     .await
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("chain_watcher: list invoice addresses failed: {e}");
+            tracing::warn!(
+                event = "liquid_watcher_lane_page_failed",
+                lane = tier.label(),
+                "chain_watcher: list invoice addresses failed: {e}"
+            );
             return CycleOutcome::Failed;
         }
     };
     let invoices = batch.rows;
     let n_total = invoices.len();
     if n_total == 0 {
-        return liquid_invoice_epoch_outcome(epoch, false);
+        return epoch
+            .invoices
+            .finish_page_range()
+            .unwrap_or(CycleOutcome::Incomplete);
     }
     let started = std::time::Instant::now();
     let mut hits = 0usize;
@@ -643,7 +916,7 @@ async fn poll_invoice_addresses(
             tracing::debug!(
                 "chain_watcher: invoice scan watcher Electrum bucket exhausted, deferring"
             );
-            return CycleOutcome::after_token_exhaustion(useful_progress);
+            return turn.after_token_exhaustion(useful_progress);
         }
 
         // Parse the wallet-supplied or descriptor-derived address into a
@@ -657,7 +930,18 @@ async fn poll_invoice_addresses(
                     invoice_id = %invoice.id,
                     "chain_watcher: invoice liquid_address parse failed: {e}"
                 );
-                epoch.invoices.advance(invoice.scan_cursor());
+                let cursor = invoice.scan_cursor();
+                if let Err(e) = persist_liquid_lane_cursor(ctx.pool, tier, &cursor).await {
+                    tracing::warn!(
+                        event = "liquid_watcher_lane_progress_write_failed",
+                        lane = tier.label(),
+                        invoice_id = %invoice.id,
+                        isolated = true,
+                        "chain_watcher: malformed invoice offset was not persisted: {e}"
+                    );
+                    return CycleOutcome::Failed;
+                }
+                epoch.invoices.advance(cursor);
                 useful_progress = useful_progress.saturating_add(1);
                 continue;
             }
@@ -671,16 +955,26 @@ async fn poll_invoice_addresses(
                 address: &invoice.liquid_address,
                 script: &script,
                 blinding_key_hex: &invoice.liquid_blinding_key_hex,
-                finality_confirmations: liquid_finality_confirmations,
+                finality_confirmations: config.finality_confirmations,
             },
-            tolerances,
+            config.tolerances,
             reporter,
         )
         .await
         {
             Ok(LiquidRecordOutcome::Applied { recorded }) => {
+                let cursor = invoice.scan_cursor();
+                if let Err(e) = persist_liquid_lane_cursor(ctx.pool, tier, &cursor).await {
+                    tracing::warn!(
+                        event = "liquid_watcher_lane_progress_write_failed",
+                        lane = tier.label(),
+                        invoice_id = %invoice.id,
+                        "chain_watcher: completed invoice offset was not persisted: {e}"
+                    );
+                    return CycleOutcome::Failed;
+                }
                 hits += recorded;
-                epoch.invoices.advance(invoice.scan_cursor());
+                epoch.invoices.advance(cursor);
                 useful_progress = useful_progress.saturating_add(1);
             }
             Ok(LiquidRecordOutcome::Deferred) => {
@@ -694,7 +988,18 @@ async fn poll_invoice_addresses(
                 // this row for the frozen epoch so later obligations are still
                 // scanned, then fail the completed epoch and retry this row in
                 // the next process-local epoch.
-                epoch.note_invoice_hard_bound(invoice.scan_cursor());
+                let cursor = invoice.scan_cursor();
+                if let Err(e) = persist_liquid_lane_cursor(ctx.pool, tier, &cursor).await {
+                    tracing::warn!(
+                        event = "liquid_watcher_lane_progress_write_failed",
+                        lane = tier.label(),
+                        invoice_id = %invoice.id,
+                        hard_bound = true,
+                        "chain_watcher: isolated invoice offset was not persisted: {e}"
+                    );
+                    return CycleOutcome::Failed;
+                }
+                epoch.invoices.note_hard_bound(cursor);
                 useful_progress = useful_progress.saturating_add(1);
                 continue;
             }
@@ -709,7 +1014,18 @@ async fn poll_invoice_addresses(
                 ) {
                     // Malformed persisted row: isolate it, but count the row as
                     // visited so it cannot pin every later invoice forever.
-                    epoch.invoices.advance(invoice.scan_cursor());
+                    let cursor = invoice.scan_cursor();
+                    if let Err(e) = persist_liquid_lane_cursor(ctx.pool, tier, &cursor).await {
+                        tracing::warn!(
+                            event = "liquid_watcher_lane_progress_write_failed",
+                            lane = tier.label(),
+                            invoice_id = %invoice.id,
+                            isolated = true,
+                            "chain_watcher: malformed invoice offset was not persisted: {e}"
+                        );
+                        return CycleOutcome::Failed;
+                    }
+                    epoch.invoices.advance(cursor);
                     useful_progress = useful_progress.saturating_add(1);
                     continue;
                 }
@@ -724,23 +1040,36 @@ async fn poll_invoice_addresses(
     if n_total > 0 {
         tracing::info!(
             event = "chain_watcher_invoice_scan_tick",
-            tier = tier,
+            lane = tier.label(),
             scanned = n_total,
             deferred = batch.has_more,
             hits = hits,
             elapsed_ms = elapsed_ms,
             "chain_watcher: invoice address scan tick"
         );
-    } else {
-        tracing::debug!(
-            "chain_watcher: {} invoice address scan {} addrs, {} hits, {}ms",
-            tier,
-            n_total,
-            hits,
-            elapsed_ms
-        );
     }
-    liquid_invoice_epoch_outcome(epoch, batch.has_more)
+    if batch.has_more {
+        CycleOutcome::Incomplete
+    } else {
+        epoch
+            .invoices
+            .finish_page_range()
+            .unwrap_or(CycleOutcome::Incomplete)
+    }
+}
+
+async fn persist_liquid_lane_cursor(
+    pool: &PgPool,
+    tier: WatchTier,
+    cursor: &db::WatcherScanCursor,
+) -> Result<(), sqlx::Error> {
+    db::persist_watcher_lane_cursor(
+        pool,
+        db::WatcherLaneWorker::LiquidDirect,
+        tier.lane(),
+        cursor,
+    )
+    .await
 }
 
 async fn record_liquid_events_for_script(
@@ -1406,6 +1735,7 @@ async fn poll_nyms(
     tier: &'static str,
     reporter: &WorkerReporter,
     epoch: &mut db::WatcherNymScanEpoch,
+    turn: PhaseTurn,
 ) -> Result<CycleOutcome, AppError> {
     let n_total = nyms.len();
     let started = std::time::Instant::now();
@@ -1482,7 +1812,7 @@ async fn poll_nyms(
                 idx = current.next_index,
                 "chain_watcher: watcher Electrum bucket exhausted; retaining frozen address"
             );
-            return Ok(CycleOutcome::after_token_exhaustion(useful_progress));
+            return Ok(turn.after_token_exhaustion(useful_progress));
         }
 
         match ctx.backend.script_history(&script).await {
@@ -2266,14 +2596,14 @@ mod tests {
         let (admission, reporter, mut tier_health) = fixture();
 
         assert_eq!(
-            TierHealth::default().observe(WatchTier::Active, CycleOutcome::Incomplete),
+            TierHealth::default().observe(WatchTier::Recent, CycleOutcome::Incomplete),
             ReportAction::ProgressOnly
         );
 
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Incomplete,
         );
 
@@ -2287,7 +2617,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
         assert_eq!(tier_health.active, TierState::Healthy);
@@ -2297,7 +2627,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Idle,
+            WatchTier::Historical,
             CycleOutcome::Healthy,
         );
         assert!(admission.decision(Rail::DirectLiquid).allowed());
@@ -2307,13 +2637,13 @@ mod tests {
     fn incomplete_page_does_not_mutate_tier_failure_or_recovery_latch() {
         let mut tier_health = TierHealth::default();
         assert_eq!(
-            tier_health.observe(WatchTier::Idle, CycleOutcome::Failed),
+            tier_health.observe(WatchTier::Historical, CycleOutcome::Failed),
             ReportAction::Failure
         );
         assert_eq!(tier_health.idle, TierState::Failed);
 
         assert_eq!(
-            tier_health.observe(WatchTier::Idle, CycleOutcome::Incomplete),
+            tier_health.observe(WatchTier::Historical, CycleOutcome::Incomplete),
             ReportAction::ProgressOnly
         );
         assert_eq!(tier_health.idle, TierState::Failed);
@@ -2338,7 +2668,9 @@ mod tests {
         epoch.nyms.begin("2026-07-12 12:00:00+00".to_string());
         epoch.nyms.advance("last-nym".to_string());
         epoch.nyms_complete = true;
-        epoch.invoices.begin("2026-07-12 12:01:00+00".to_string());
+        epoch
+            .invoices
+            .begin("2026-07-12 12:01:00+00".to_string(), None);
         epoch.invoices.advance(db::WatcherScanCursor {
             created_at: "2026-07-12 11:00:00+00".to_string(),
             id: uuid::Uuid::from_u128(1),
@@ -2347,8 +2679,13 @@ mod tests {
         // An incomplete invoice page leaves the completed nym phase intact,
         // so the next tick resumes invoices instead of restarting at nym one.
         assert!(epoch.nyms_complete);
+        assert!(!epoch.invoices_complete);
         assert_eq!(epoch.nyms.cursor(), Some("last-nym"));
         assert!(epoch.invoices.cursor().is_some());
+        assert_eq!(
+            epoch.take_phase_order(),
+            [LiquidWorkPhase::Invoices, LiquidWorkPhase::Nyms]
+        );
 
         epoch.finish();
         assert!(!epoch.nyms_complete);
@@ -2356,6 +2693,96 @@ mod tests {
         assert!(epoch.nyms.cursor().is_none());
         assert!(epoch.invoices.snapshot().is_none());
         assert!(epoch.invoices.cursor().is_none());
+    }
+
+    #[test]
+    fn startup_replenished_nym_work_advances_invoice_cursor_in_same_poll() {
+        let mut epoch = LiquidTierScanEpoch::default();
+        epoch.nyms.begin("2026-07-12 12:00:00+00".to_string());
+        let order = epoch.take_phase_order();
+        assert_eq!(order, [LiquidWorkPhase::Nyms, LiquidWorkPhase::Invoices]);
+
+        // Model the two bounded turns of one poll call. A full nym page still
+        // has another page due, yet the invoice turn runs in this same call.
+        epoch.nyms.advance("nym-page-1000".to_string());
+        assert!(!epoch.observe_phase_outcome(order[0], CycleOutcome::Incomplete));
+        assert!(!epoch.nyms_complete);
+
+        // Loading a durable offset and advancing one invoice row proves same-
+        // call progress, but still cannot masquerade as lane completion/health.
+        let saved = db::WatcherScanCursor {
+            created_at: "2026-07-12 10:00:00+00".to_string(),
+            id: uuid::Uuid::from_u128(1),
+        };
+        let applied = db::WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: uuid::Uuid::from_u128(2),
+        };
+        epoch
+            .invoices
+            .begin("2026-07-12 12:00:00+00".to_string(), Some(saved));
+        epoch.invoices.advance(applied.clone());
+        assert!(!epoch.observe_phase_outcome(order[1], CycleOutcome::Incomplete));
+        assert_eq!(epoch.invoices.cursor(), Some(&applied));
+        assert!(!epoch.invoices_complete);
+        assert_eq!(epoch.completed_outcome(), None);
+        assert_eq!(epoch.finish_poll(false), CycleOutcome::Incomplete);
+
+        // First access to the shared bucket alternates on the next poll.
+        assert_eq!(
+            epoch.take_phase_order(),
+            [LiquidWorkPhase::Invoices, LiquidWorkPhase::Nyms]
+        );
+    }
+
+    #[test]
+    fn first_phase_failure_still_allows_second_phase_progress_in_same_poll() {
+        let mut epoch = LiquidTierScanEpoch::default();
+        let order = epoch.take_phase_order();
+        assert_eq!(order[0], LiquidWorkPhase::Nyms);
+        assert!(epoch.observe_phase_outcome(order[0], CycleOutcome::Failed));
+
+        let applied = db::WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: uuid::Uuid::from_u128(2),
+        };
+        epoch
+            .invoices
+            .begin("2026-07-12 12:00:00+00".to_string(), None);
+        epoch.invoices.advance(applied.clone());
+        assert!(!epoch.observe_phase_outcome(order[1], CycleOutcome::Incomplete));
+
+        assert_eq!(epoch.invoices.cursor(), Some(&applied));
+        assert_eq!(epoch.finish_poll(true), CycleOutcome::Failed);
+        assert!(!epoch.nyms_complete);
+        assert!(!epoch.invoices_complete);
+    }
+
+    #[test]
+    fn full_liquid_tier_health_requires_both_current_process_phases() {
+        let mut epoch = LiquidTierScanEpoch::default();
+        let order = epoch.take_phase_order();
+        assert!(!epoch.observe_phase_outcome(order[0], CycleOutcome::Healthy));
+        assert_eq!(epoch.completed_outcome(), None);
+        assert_eq!(epoch.finish_poll(false), CycleOutcome::Incomplete);
+
+        assert!(!epoch.observe_phase_outcome(order[1], CycleOutcome::Healthy));
+        assert_eq!(epoch.completed_outcome(), Some(CycleOutcome::Healthy));
+        assert_eq!(epoch.finish_poll(false), CycleOutcome::Healthy);
+        assert!(!epoch.nyms_complete);
+        assert!(!epoch.invoices_complete);
+    }
+
+    #[test]
+    fn second_phase_empty_shared_budget_is_a_deferral_not_failure() {
+        assert_eq!(
+            PhaseTurn::First.after_token_exhaustion(0),
+            CycleOutcome::Failed
+        );
+        assert_eq!(
+            PhaseTurn::Second.after_token_exhaustion(0),
+            CycleOutcome::Incomplete
+        );
     }
 
     #[test]
@@ -2463,22 +2890,27 @@ mod tests {
             nyms_complete: true,
             ..LiquidTierScanEpoch::default()
         };
-        epoch.invoices.begin("2026-07-12 12:00:00+00".to_string());
+        epoch
+            .invoices
+            .begin("2026-07-12 12:00:00+00".to_string(), None);
 
-        epoch.note_invoice_hard_bound(hard_bound.clone());
+        epoch.invoices.note_hard_bound(hard_bound.clone());
         assert_eq!(epoch.invoices.cursor(), Some(&hard_bound));
         epoch.invoices.advance(later.clone());
         assert_eq!(epoch.invoices.cursor(), Some(&later));
         assert_eq!(
-            liquid_invoice_epoch_outcome(&epoch, false),
-            CycleOutcome::HardBoundFailed
+            epoch.invoices.finish_page_range(),
+            Some(CycleOutcome::HardBoundFailed)
         );
+        epoch.invoices_complete = true;
+        epoch.invoice_hard_bound_failure = true;
+        assert_eq!(epoch.completed_outcome(), Some(CycleOutcome::Failed));
 
         let (admission, reporter, mut tier_health) = fixture();
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::HardBoundFailed,
         );
         assert!(!admission.decision(Rail::DirectLiquid).allowed());
@@ -2486,12 +2918,62 @@ mod tests {
         epoch.finish();
         assert!(epoch.invoices.snapshot().is_none());
         assert!(epoch.invoices.cursor().is_none());
-        assert!(!epoch.invoice_hard_bound_failure);
-        epoch.invoices.begin("2026-07-12 12:05:00+00".to_string());
-        assert!(
-            epoch.invoices.cursor().is_none(),
-            "hard row retries next epoch"
+        assert!(!epoch.invoices.hard_bound_failure);
+        epoch
+            .invoices
+            .begin("2026-07-12 12:05:00+00".to_string(), Some(later.clone()));
+        assert_eq!(epoch.invoices.cursor(), Some(&later));
+        assert_eq!(epoch.invoices.finish_page_range(), None);
+        assert!(epoch.invoices.cursor().is_none());
+        assert_eq!(epoch.invoices.wrap_limit(), Some(&later));
+    }
+
+    #[test]
+    fn persisted_liquid_offset_requires_a_full_current_process_wrap() {
+        let saved = db::WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: uuid::Uuid::from_u128(10),
+        };
+        let after_saved = db::WatcherScanCursor {
+            created_at: "2026-07-12 11:30:00+00".to_string(),
+            id: uuid::Uuid::from_u128(11),
+        };
+        let before_saved = db::WatcherScanCursor {
+            created_at: "2026-07-12 10:30:00+00".to_string(),
+            id: uuid::Uuid::from_u128(9),
+        };
+        let mut epoch = LiquidInvoiceLaneEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string(), Some(saved.clone()));
+
+        assert_eq!(epoch.cursor(), Some(&saved));
+        assert!(epoch.wrap_limit().is_none());
+        epoch.advance(after_saved);
+        assert_eq!(epoch.finish_page_range(), None);
+        assert!(epoch.cursor().is_none());
+        assert_eq!(epoch.wrap_limit(), Some(&saved));
+
+        epoch.advance(before_saved);
+        assert_eq!(
+            epoch.finish_page_range(),
+            Some(CycleOutcome::Healthy),
+            "persisted scheduling input cannot open health before the wrap"
         );
+        assert!(epoch.snapshot().is_none());
+        assert!(epoch.cursor().is_none());
+        assert!(epoch.wrap_limit().is_none());
+    }
+
+    #[test]
+    fn liquid_lane_without_saved_offset_completes_in_one_frozen_traversal() {
+        let mut epoch = LiquidInvoiceLaneEpoch::default();
+        epoch.begin("2026-07-12 12:00:00+00".to_string(), None);
+        epoch.advance(db::WatcherScanCursor {
+            created_at: "2026-07-12 11:00:00+00".to_string(),
+            id: uuid::Uuid::from_u128(1),
+        });
+
+        assert_eq!(epoch.finish_page_range(), Some(CycleOutcome::Healthy));
+        assert!(epoch.snapshot().is_none());
     }
 
     #[tokio::test]
@@ -2525,6 +3007,7 @@ mod tests {
             "active",
             &reporter,
             &mut epoch,
+            PhaseTurn::First,
         )
         .await
         .expect("nym page outcome");
@@ -2539,9 +3022,17 @@ mod tests {
         // The next keyset page begins after bob; bob itself resumes from the
         // frozen subcursor. With no newly-refilled token it makes zero address
         // progress, fails, and still does not skip bob.
-        let outcome = poll_nyms(ctx, 0, vec![], "active", &reporter, &mut epoch)
-            .await
-            .expect("resumed nym page outcome");
+        let outcome = poll_nyms(
+            ctx,
+            0,
+            vec![],
+            "active",
+            &reporter,
+            &mut epoch,
+            PhaseTurn::First,
+        )
+        .await
+        .expect("resumed nym page outcome");
         assert_eq!(outcome, CycleOutcome::Failed);
         assert_eq!(epoch.cursor(), Some("alice"));
         assert_eq!(epoch.current().expect("bob still retained").next_index, 0);
@@ -2576,6 +3067,7 @@ mod tests {
             "active",
             &reporter,
             &mut epoch,
+            PhaseTurn::First,
         )
         .await
         .expect("mempool-only scan remains observational");
@@ -2616,6 +3108,7 @@ mod tests {
             "active",
             &reporter,
             &mut epoch,
+            PhaseTurn::First,
         )
         .await
         .expect("partial nym outcome");
@@ -2629,9 +3122,17 @@ mod tests {
 
         // Production fetches later rows strictly after query_cursor, so the
         // retained nym is absent from this page and resumes from memory.
-        let outcome = poll_nyms(ctx, 2, vec![], "active", &reporter, &mut epoch)
-            .await
-            .expect("retained nym outcome");
+        let outcome = poll_nyms(
+            ctx,
+            2,
+            vec![],
+            "active",
+            &reporter,
+            &mut epoch,
+            PhaseTurn::First,
+        )
+        .await
+        .expect("retained nym outcome");
         assert_eq!(outcome, CycleOutcome::Failed);
         assert_eq!(
             epoch.current().expect("exact address retained").next_index,
@@ -2660,9 +3161,17 @@ mod tests {
         epoch.begin("2026-07-12 12:00:00+00".to_string());
         epoch.advance("alice".to_string());
 
-        let outcome = poll_nyms(ctx, 0, vec![test_nym("bob")], "idle", &reporter, &mut epoch)
-            .await
-            .expect("backend failure outcome");
+        let outcome = poll_nyms(
+            ctx,
+            0,
+            vec![test_nym("bob")],
+            "idle",
+            &reporter,
+            &mut epoch,
+            PhaseTurn::First,
+        )
+        .await
+        .expect("backend failure outcome");
         assert_eq!(outcome, CycleOutcome::Failed);
         assert_eq!(epoch.cursor(), Some("alice"));
         let current = epoch.current().expect("systemic failure retains bob");
@@ -2703,6 +3212,7 @@ mod tests {
             "idle",
             &reporter,
             &mut epoch,
+            PhaseTurn::First,
         )
         .await
         .expect("disappeared nym convergence");
@@ -2736,7 +3246,7 @@ mod tests {
             },
             &ChainWatcherConfig::default(),
             db::InvoiceAccountingTolerances::default(),
-            true,
+            WatchTier::Recent,
             &reporter,
             &mut epoch,
         )
@@ -2744,7 +3254,7 @@ mod tests {
 
         assert_eq!(health_calls.load(Ordering::SeqCst), 1);
         assert_eq!(outcome, CycleOutcome::Failed);
-        report_outcome(&reporter, &mut tier_health, WatchTier::Active, outcome);
+        report_outcome(&reporter, &mut tier_health, WatchTier::Recent, outcome);
         assert_eq!(tier_health.active, TierState::Failed);
         assert!(!admission.decision(Rail::DirectLiquid).allowed());
     }
@@ -2755,7 +3265,7 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
 
@@ -2763,14 +3273,14 @@ mod tests {
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Idle,
+                WatchTier::Historical,
                 CycleOutcome::Failed,
             );
             if attempt < 3 {
                 report_outcome(
                     &reporter,
                     &mut tier_health,
-                    WatchTier::Active,
+                    WatchTier::Recent,
                     CycleOutcome::Healthy,
                 );
             }
@@ -2785,20 +3295,20 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
         for _ in 0..3 {
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Idle,
+                WatchTier::Historical,
                 CycleOutcome::Failed,
             );
             report_outcome(
                 &reporter,
                 &mut tier_health,
-                WatchTier::Active,
+                WatchTier::Recent,
                 CycleOutcome::Healthy,
             );
         }
@@ -2807,14 +3317,14 @@ mod tests {
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Idle,
+            WatchTier::Historical,
             CycleOutcome::Healthy,
         );
         assert!(!admission.decision(Rail::DirectLiquid).allowed());
         report_outcome(
             &reporter,
             &mut tier_health,
-            WatchTier::Active,
+            WatchTier::Recent,
             CycleOutcome::Healthy,
         );
 

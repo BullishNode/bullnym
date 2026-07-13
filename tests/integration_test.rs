@@ -10314,6 +10314,141 @@ async fn liquid_watcher_retains_closed_rows_and_finalized_evidence() {
 }
 
 #[tokio::test]
+async fn liquid_watcher_priority_and_historical_lanes_are_exact_complements() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "liquidlane").await;
+
+    let old_partial =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldpartial", 3_600).await;
+    let old_settling =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldsettling", 3_600).await;
+    let old_cancelled =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldcancelled", 3_600).await;
+    let old_expired =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1laneoldexpired", -10).await;
+    let new_unpaid =
+        insert_test_invoice(&pool, "liquidlane", &npub, "lq1lanenewunpaid", 3_600).await;
+
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             status = 'cancelled', presentation_status = 'partial', \
+             cancelled_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(old_partial.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             direct_settlement_status = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(old_settling.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', \
+             status = 'cancelled', cancelled_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(old_cancelled.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoices \
+         SET created_at = NOW() - INTERVAL '2 days', status = 'expired' \
+         WHERE id = $1",
+    )
+    .bind(old_expired.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let snapshot = pay_service::db::watcher_scan_snapshot(&pool).await.unwrap();
+    let recent = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool, 0, 86_400, &snapshot, true, None, None,
+    )
+    .await
+    .unwrap();
+    let historical = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool, 0, 86_400, &snapshot, false, None, None,
+    )
+    .await
+    .unwrap();
+    let recent_rotation_start = recent.rows.first().unwrap().scan_cursor();
+    let recent_ids: std::collections::HashSet<_> =
+        recent.rows.into_iter().map(|row| row.id).collect();
+    let historical_ids: std::collections::HashSet<_> =
+        historical.rows.into_iter().map(|row| row.id).collect();
+
+    assert!(recent_ids.is_disjoint(&historical_ids));
+    assert!(recent_ids.contains(&old_partial.id));
+    assert!(recent_ids.contains(&old_settling.id));
+    assert!(recent_ids.contains(&new_unpaid.id));
+    assert!(historical_ids.contains(&old_cancelled.id));
+    assert!(historical_ids.contains(&old_expired.id));
+
+    let after_saved = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool,
+        0,
+        86_400,
+        &snapshot,
+        true,
+        Some(&recent_rotation_start),
+        None,
+    )
+    .await
+    .unwrap();
+    let through_saved = pay_service::db::list_liquid_watcher_invoice_lane_page(
+        &pool,
+        0,
+        86_400,
+        &snapshot,
+        true,
+        None,
+        Some(&recent_rotation_start),
+    )
+    .await
+    .unwrap();
+    let after_saved_ids: std::collections::HashSet<_> =
+        after_saved.rows.into_iter().map(|row| row.id).collect();
+    let through_saved_ids: std::collections::HashSet<_> =
+        through_saved.rows.into_iter().map(|row| row.id).collect();
+    assert!(after_saved_ids.is_disjoint(&through_saved_ids));
+    assert_eq!(
+        after_saved_ids
+            .union(&through_saved_ids)
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        recent_ids
+    );
+
+    let (recent_backlog, recent_oldest_due, recent_lag_secs) =
+        pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, true)
+            .await
+            .unwrap();
+    let (historical_backlog, historical_oldest_due, historical_lag_secs) =
+        pay_service::db::liquid_watcher_lane_lag(&pool, 0, 86_400, &snapshot, false)
+            .await
+            .unwrap();
+    assert_eq!(recent_backlog, recent_ids.len() as i64);
+    assert!(recent_oldest_due.is_some());
+    assert!(recent_lag_secs >= 0);
+    assert_eq!(historical_backlog, historical_ids.len() as i64);
+    assert!(historical_oldest_due.is_some());
+    assert!(historical_lag_secs >= 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
