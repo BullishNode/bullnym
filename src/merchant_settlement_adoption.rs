@@ -12,7 +12,10 @@ use std::fmt;
 
 use uuid::Uuid;
 
-use crate::merchant_output_verifier::{MerchantAsset, VerifiedMerchantOutput};
+use crate::merchant_output_verifier::{
+    verify_merchant_output, ApprovedMerchantDestination, JournaledMerchantTransaction,
+    MerchantAsset, MerchantOutputEvidence, ObservedMerchantOutput, VerifiedMerchantOutput,
+};
 
 const MAX_BOLTZ_SWAP_ID_LEN: usize = 200;
 
@@ -150,6 +153,31 @@ pub struct ConfirmedMerchantOutputEvidence {
     linked_replacement: bool,
 }
 
+/// Storage-safe representation of retained verifier evidence. Repository
+/// adapters persist these primitive fields and must call
+/// [`ConfirmedMerchantOutputEvidence::restore`] before the data regains runtime
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedMerchantOutputEvidenceSnapshot {
+    pub invoice_id: Uuid,
+    pub chain_swap_id: Uuid,
+    pub boltz_swap_id: String,
+    pub path: MerchantSettlementPath,
+    pub family_key: String,
+    pub event_key: String,
+    pub journal_txid: String,
+    pub txid: String,
+    pub destination_address: String,
+    pub destination_script_hex: String,
+    pub asset: MerchantAsset,
+    pub actual_amount_sat: i64,
+    pub vout: u32,
+    pub confirmations: u32,
+    pub block_height: u32,
+    pub block_hash: String,
+    pub linked_replacement: bool,
+}
+
 impl ConfirmedMerchantOutputEvidence {
     /// Copy exact verified evidence into a schema-independent persistence
     /// packet. Requested, quoted, provider, and broadcast amounts are absent by
@@ -183,6 +211,138 @@ impl ConfirmedMerchantOutputEvidence {
             block_hash: output.block_hash().to_owned(),
             linked_replacement: output.is_linked_replacement(),
         })
+    }
+
+    pub fn snapshot(&self) -> ConfirmedMerchantOutputEvidenceSnapshot {
+        ConfirmedMerchantOutputEvidenceSnapshot {
+            invoice_id: self.invoice_id,
+            chain_swap_id: self.chain_swap_id,
+            boltz_swap_id: self.boltz_swap_id.clone(),
+            path: self.path,
+            family_key: self.identity.family_key.clone(),
+            event_key: self.identity.event_key.clone(),
+            journal_txid: self.journal_txid.clone(),
+            txid: self.txid.clone(),
+            destination_address: self.destination_address.clone(),
+            destination_script_hex: self.destination_script_hex.clone(),
+            asset: self.asset.clone(),
+            actual_amount_sat: self.actual_amount_sat,
+            vout: self.vout,
+            confirmations: self.confirmations,
+            block_height: self.block_height,
+            block_hash: self.block_hash.clone(),
+            linked_replacement: self.linked_replacement,
+        }
+    }
+
+    /// Rehydrate immutable evidence only after checking its complete context,
+    /// family/event identity, chain shape, and positive exact amount. This is a
+    /// corruption boundary, not a verifier: only repository rows originally
+    /// produced by [`Self::from_verified`] may be supplied.
+    pub fn restore(
+        snapshot: ConfirmedMerchantOutputEvidenceSnapshot,
+    ) -> Result<Self, MerchantSettlementAdoptionError> {
+        let context = MerchantSettlementContext::new(
+            snapshot.invoice_id,
+            snapshot.chain_swap_id,
+            snapshot.boltz_swap_id.clone(),
+            snapshot.path,
+        )?;
+        let canonical_hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        };
+        let script_valid = !snapshot.destination_script_hex.is_empty()
+            && snapshot.destination_script_hex.len() % 2 == 0
+            && snapshot
+                .destination_script_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        let asset_valid = snapshot.path.accepts(&snapshot.asset)
+            && match &snapshot.asset {
+                MerchantAsset::Bitcoin => true,
+                MerchantAsset::Liquid(asset_id) => canonical_hash(asset_id),
+            };
+        let expected_family = format!(
+            "chain_swap_merchant_output:{}:{}",
+            context.chain_swap_id(),
+            snapshot.journal_txid
+        );
+        let expected_event = format!("{expected_family}:{}:{}", snapshot.txid, snapshot.vout);
+        if !canonical_hash(&snapshot.journal_txid)
+            || !canonical_hash(&snapshot.txid)
+            || !canonical_hash(&snapshot.block_hash)
+            || snapshot.destination_address.is_empty()
+            || snapshot.destination_address.len() > 200
+            || !script_valid
+            || !asset_valid
+            || snapshot.actual_amount_sat <= 0
+            || snapshot.confirmations == 0
+            || snapshot.block_height == 0
+            || snapshot.linked_replacement == (snapshot.txid == snapshot.journal_txid)
+            || snapshot.family_key != expected_family
+            || snapshot.event_key != expected_event
+        {
+            return Err(MerchantSettlementAdoptionError::InvalidPersistedEvidence);
+        }
+        let approved = match &snapshot.asset {
+            MerchantAsset::Bitcoin => ApprovedMerchantDestination::bitcoin(
+                snapshot.destination_address.clone(),
+                snapshot.destination_script_hex.clone(),
+            ),
+            MerchantAsset::Liquid(asset_id) => ApprovedMerchantDestination::liquid(
+                snapshot.destination_address.clone(),
+                snapshot.destination_script_hex.clone(),
+                asset_id.clone(),
+            ),
+        };
+        let candidate = if snapshot.linked_replacement {
+            JournaledMerchantTransaction::linked_replacement(
+                snapshot.txid.clone(),
+                snapshot.journal_txid.clone(),
+                snapshot.destination_address.clone(),
+                snapshot.destination_script_hex.clone(),
+                snapshot.asset.clone(),
+                snapshot.actual_amount_sat,
+                snapshot.vout,
+            )
+        } else {
+            JournaledMerchantTransaction::original(
+                snapshot.txid.clone(),
+                snapshot.destination_address.clone(),
+                snapshot.destination_script_hex.clone(),
+                snapshot.asset.clone(),
+                snapshot.actual_amount_sat,
+                snapshot.vout,
+            )
+        };
+        let amount_sat = u64::try_from(snapshot.actual_amount_sat)
+            .map_err(|_| MerchantSettlementAdoptionError::InvalidPersistedEvidence)?;
+        let observed = ObservedMerchantOutput::new(
+            snapshot.txid.clone(),
+            snapshot.destination_script_hex.clone(),
+            snapshot.asset.clone(),
+            amount_sat,
+            snapshot.vout,
+            snapshot.confirmations,
+            Some(snapshot.block_height),
+            Some(snapshot.block_hash.clone()),
+        );
+        let verified = verify_merchant_output(
+            &snapshot.journal_txid,
+            &candidate,
+            &approved,
+            &MerchantOutputEvidence::Authoritative(observed),
+            1,
+        )
+        .map_err(|_| MerchantSettlementAdoptionError::InvalidPersistedEvidence)?;
+        let restored = Self::from_verified(&context, &verified)?;
+        if restored.snapshot() != snapshot {
+            return Err(MerchantSettlementAdoptionError::InvalidPersistedEvidence);
+        }
+        Ok(restored)
     }
 
     pub fn identity(&self) -> &MerchantOutputAccountingIdentity {
@@ -294,6 +454,7 @@ pub enum MerchantSettlementAdoptionError {
     PathAssetMismatch,
     InvalidVerifiedAmount,
     ContextMismatch,
+    InvalidPersistedEvidence,
 }
 
 impl fmt::Display for MerchantSettlementAdoptionError {
@@ -303,6 +464,7 @@ impl fmt::Display for MerchantSettlementAdoptionError {
             Self::PathAssetMismatch => "verified merchant asset does not match the settlement path",
             Self::InvalidVerifiedAmount => "verified merchant amount cannot be accounted",
             Self::ContextMismatch => "merchant settlement context does not own the evidence",
+            Self::InvalidPersistedEvidence => "persisted merchant settlement evidence is invalid",
         })
     }
 }
