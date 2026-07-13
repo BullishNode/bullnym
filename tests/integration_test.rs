@@ -15675,6 +15675,252 @@ async fn seed_recovery_journal_harness(
     }
 }
 
+async fn seed_liquid_merchant_settlement_attempt(
+    pool: &PgPool,
+    suffix: &str,
+) -> (Uuid, String) {
+    let nym = format!("lmjs{suffix}");
+    let boltz_id = format!("liquid-merchant-journal-{suffix}");
+    let (_, _, _, swap) = seed_merchant_invoice_swap(
+        pool,
+        &nym,
+        &boltz_id,
+        &format!("el1qqlockup{suffix}"),
+        51_000,
+        50_000,
+    )
+    .await;
+    let txid = format!("{:064x}", swap.id.as_u128());
+    let raw_tx_hex = "0102";
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
+             claim_txid = $3, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(swap.id)
+    .bind(raw_tx_hex)
+    .bind(&txid)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chain_swap_tx_attempts (\
+             chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
+             destination_address, destination_script_hex, destination_asset_id, \
+             destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+             liquid_blinding_key_hex\
+         ) VALUES ($1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,50000,1000,1.5,$8)",
+    )
+    .bind(swap.id)
+    .bind(raw_tx_hex)
+    .bind(&txid)
+    .bind(json!([{
+        "txid": "4444444444444444444444444444444444444444444444444444444444444444",
+        "vout": 0,
+        "amount_sat": 51_000,
+        "script_pubkey_hex": "0014abcd"
+    }]))
+    .bind(format!("el1qqmerchant{suffix}"))
+    .bind("0014dcba")
+    .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    .execute(pool)
+    .await
+    .unwrap();
+    (swap.id, txid)
+}
+
+#[tokio::test]
+async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_parent_journal() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "broadcast").await;
+
+    pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+        "broadcast accepted",
+    )
+    .await
+    .unwrap();
+    let first: (String, i32, Option<String>, bool, bool, bool) = sqlx::query_as(
+        "SELECT status, broadcast_attempts, last_broadcast_result, \
+                first_broadcast_attempt_at IS NOT NULL, \
+                last_broadcast_attempt_at IS NOT NULL, broadcast_at IS NOT NULL \
+           FROM chain_swap_tx_attempts WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first.0, "broadcast");
+    assert_eq!(first.1, 1);
+    assert_eq!(first.2.as_deref(), Some("broadcast accepted"));
+    assert!(first.3 && first.4 && first.5);
+
+    let wrong_purpose = pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim_replacement",
+        "must not match",
+    )
+    .await;
+    assert!(matches!(
+        wrong_purpose,
+        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+    ));
+    let wrong_txid = pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "liquid_claim",
+        "must not match",
+    )
+    .await;
+    assert!(matches!(
+        wrong_txid,
+        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+    ));
+
+    sqlx::query("UPDATE chain_swap_records SET claim_txid = $2 WHERE id = $1")
+        .bind(swap_id)
+        .bind("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let wrong_parent = pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+        "must not match parent",
+    )
+    .await;
+    assert!(matches!(
+        wrong_parent,
+        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+    ));
+    sqlx::query("UPDATE chain_swap_records SET claim_txid = $2 WHERE id = $1")
+        .bind(swap_id)
+        .bind(&txid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts SET status = 'integrity_hold', \
+             integrity_reason = 'test hold', integrity_hold_at = NOW() \
+          WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let held = pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+        "must not escape hold",
+    )
+    .await;
+    assert!(matches!(
+        held,
+        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+    ));
+    let held_metadata: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, broadcast_attempts, last_broadcast_result \
+           FROM chain_swap_tx_attempts WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(held_metadata.0, "integrity_hold");
+    assert_eq!(held_metadata.1, 1);
+    assert_eq!(held_metadata.2.as_deref(), Some("broadcast accepted"));
+
+    let (settled_swap_id, settled_txid) =
+        seed_liquid_merchant_settlement_attempt(&pool, "settled").await;
+    pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        settled_swap_id,
+        &settled_txid,
+        "liquid_claim",
+        "initial broadcast accepted",
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts SET status = 'confirmed', confirmed_at = NOW() \
+          WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(settled_swap_id)
+    .bind(&settled_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        settled_swap_id,
+        &settled_txid,
+        "liquid_claim",
+        "confirmed retry observed",
+    )
+    .await
+    .unwrap();
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM chain_swap_tx_attempts WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(settled_swap_id)
+    .bind(&settled_txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "confirmed");
+
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts SET status = 'finalized', finalized_at = NOW() \
+          WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(settled_swap_id)
+    .bind(&settled_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pay_service::db::mark_liquid_merchant_settlement_broadcast(
+        &pool,
+        settled_swap_id,
+        &settled_txid,
+        "liquid_claim",
+        "finalized retry observed",
+    )
+    .await
+    .unwrap();
+    let settled_metadata: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, broadcast_attempts, last_broadcast_result \
+           FROM chain_swap_tx_attempts WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(settled_swap_id)
+    .bind(&settled_txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settled_metadata.0, "finalized");
+    assert_eq!(settled_metadata.1, 3);
+    assert_eq!(
+        settled_metadata.2.as_deref(),
+        Some("finalized retry observed")
+    );
+
+    cleanup_db(&pool).await;
+}
+
 #[tokio::test]
 async fn closed_admission_still_completes_existing_chain_recovery() {
     use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
