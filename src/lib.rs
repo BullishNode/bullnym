@@ -3,6 +3,8 @@ pub mod auth;
 pub mod bitcoin_watcher;
 pub mod boltz;
 pub mod boltz_breaker;
+pub mod boltz_restore;
+pub mod boltz_restore_fetch;
 pub(crate) mod canonical_json;
 pub mod certification;
 pub mod chain_recovery;
