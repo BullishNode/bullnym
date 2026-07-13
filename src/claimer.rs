@@ -1973,6 +1973,8 @@ pub(crate) async fn redrive_journaled_chain_claim(
         state.config.claim.max_claim_attempts,
         state.utxo_backend.as_ref(),
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+        None,
+        None,
     )
     .await
 }
