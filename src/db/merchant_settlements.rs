@@ -324,6 +324,50 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     Ok(row)
 }
 
+/// Record a successful or already-known Liquid broadcast only when the
+/// journal and parent still identify the same exact claim. This is deliberately
+/// provider-free: the caller performs chain I/O, then commits its result here.
+pub async fn mark_liquid_merchant_settlement_broadcast(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    txid: &str,
+    purpose: &str,
+    result: &str,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    if chain_swap_id.is_nil()
+        || !matches!(purpose, "liquid_claim" | "liquid_claim_replacement")
+        || !canonical_hash(txid)
+        || result.is_empty()
+    {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    }
+    let rows = sqlx::query(
+        "UPDATE chain_swap_tx_attempts attempt SET \
+             status = CASE WHEN attempt.status IN ('confirmed','finalized') \
+                           THEN attempt.status ELSE 'broadcast' END, \
+             broadcast_attempts = attempt.broadcast_attempts + 1, \
+             first_broadcast_attempt_at = COALESCE(attempt.first_broadcast_attempt_at, NOW()), \
+             last_broadcast_attempt_at = NOW(), \
+             broadcast_at = COALESCE(attempt.broadcast_at, NOW()), \
+             last_broadcast_result = $4, updated_at = NOW() \
+          FROM chain_swap_records parent \
+         WHERE attempt.chain_swap_id = $1 AND attempt.txid = $2 AND attempt.purpose = $3 \
+           AND attempt.status <> 'integrity_hold' \
+           AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid",
+    )
+    .bind(chain_swap_id)
+    .bind(txid)
+    .bind(purpose)
+    .bind(result)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
+}
+
 async fn load_liquid_journal_by_purpose(
     connection: &mut PgConnection,
     chain_swap_id: Uuid,
@@ -591,7 +635,8 @@ async fn transition_attempt_locked(
     tx: &mut Transaction<'_, Postgres>,
     snapshot: &MerchantSettlementAdoptionSnapshot,
 ) -> Result<bool, MerchantSettlementRepositoryError> {
-    if snapshot.lifecycle.accounting != SettlementAccountingState::Demoted {
+    let accounting = snapshot.lifecycle.accounting;
+    if accounting == SettlementAccountingState::Unrecorded {
         return Ok(false);
     }
     let active_txid = snapshot.lifecycle.active_txid.as_str();
@@ -622,24 +667,68 @@ async fn transition_attempt_locked(
     {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
-    if matches!(status.as_str(), "broadcast" | "confirmed" | "finalized") {
-        let rows = sqlx::query(
-            "UPDATE chain_swap_tx_attempts SET status = 'broadcast_ambiguous', \
-                 last_broadcast_result = 'merchant settlement demoted; exact journal replay required', \
-                 updated_at = NOW() \
-              WHERE id = $1 AND txid = $2 AND status = $3",
-        )
-        .bind(attempt_id)
-        .bind(active_txid)
-        .bind(&status)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-        if rows != 1 {
-            return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    match accounting {
+        SettlementAccountingState::Demoted => {
+            if matches!(status.as_str(), "broadcast" | "confirmed" | "finalized") {
+                let rows = sqlx::query(
+                    "UPDATE chain_swap_tx_attempts SET status = 'broadcast_ambiguous', \
+                         last_broadcast_result = 'merchant settlement demoted; exact journal replay required', \
+                         updated_at = NOW() \
+                      WHERE id = $1 AND txid = $2 AND status = $3",
+                )
+                .bind(attempt_id)
+                .bind(active_txid)
+                .bind(&status)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if rows != 1 {
+                    return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+                }
+            }
+            Ok(true)
         }
+        SettlementAccountingState::Confirmed => {
+            if !matches!(status.as_str(), "confirmed" | "finalized") {
+                let rows = sqlx::query(
+                    "UPDATE chain_swap_tx_attempts SET status = 'confirmed', \
+                         confirmed_at = COALESCE(confirmed_at, NOW()), updated_at = NOW() \
+                      WHERE id = $1 AND txid = $2 AND status = $3",
+                )
+                .bind(attempt_id)
+                .bind(active_txid)
+                .bind(&status)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if rows != 1 {
+                    return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+                }
+            }
+            Ok(false)
+        }
+        SettlementAccountingState::Finalized => {
+            if status != "finalized" {
+                let rows = sqlx::query(
+                    "UPDATE chain_swap_tx_attempts SET status = 'finalized', \
+                         confirmed_at = COALESCE(confirmed_at, NOW()), \
+                         finalized_at = COALESCE(finalized_at, NOW()), updated_at = NOW() \
+                      WHERE id = $1 AND txid = $2 AND status = $3",
+                )
+                .bind(attempt_id)
+                .bind(active_txid)
+                .bind(&status)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if rows != 1 {
+                    return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+                }
+            }
+            Ok(false)
+        }
+        SettlementAccountingState::Unrecorded => Ok(false),
     }
-    Ok(true)
 }
 
 async fn transition_parent_locked(
@@ -1524,6 +1613,13 @@ fn parse_path(path: &str) -> Result<MerchantSettlementPath, MerchantSettlementRe
 
 fn parse_txid(txid: &str) -> Result<SettlementTxid, MerchantSettlementRepositoryError> {
     SettlementTxid::parse(txid).map_err(|_| MerchantSettlementRepositoryError::InvalidCheckpoint)
+}
+
+fn canonical_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]
