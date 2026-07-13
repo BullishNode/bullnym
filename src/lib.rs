@@ -26,6 +26,7 @@ pub mod donation_render;
 pub mod error;
 pub mod esplora;
 pub mod fee_policy;
+pub mod fee_decision_record;
 pub mod fee_refresh_cycle;
 pub mod gc;
 pub mod image_pipeline;
