@@ -1814,21 +1814,13 @@ fn remaining_amount_from_received(inv: &db::Invoice, received_sat: i64) -> i64 {
 }
 
 fn payment_tolerance_sat(inv: &db::Invoice, tolerances: db::InvoiceAccountingTolerances) -> i64 {
-    let mut accepted = Vec::new();
-    if inv.accept_btc {
-        accepted.push(tolerances.btc_sat);
-    }
-    if inv.accept_liquid {
-        accepted.push(tolerances.liquid_sat);
-    }
-    if inv.accept_ln {
-        accepted.push(tolerances.lightning_sat);
-    }
-    let rail_tolerance = accepted
-        .into_iter()
-        .min()
-        .unwrap_or(tolerances.lightning_sat);
-    rail_tolerance.min((inv.amount_sat / 100).max(1))
+    db::invoice_payment_tolerance_sat(
+        inv.amount_sat,
+        inv.accept_btc,
+        inv.accept_liquid,
+        inv.accept_ln,
+        tolerances,
+    )
 }
 
 const BOLT11_REFRESH_MARGIN_SECS: u64 = 120;

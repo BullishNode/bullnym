@@ -14876,6 +14876,74 @@ async fn invoice_payment_events_track_partial_completion_and_overpay() {
 }
 
 #[tokio::test]
+async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "m5tolerance").await;
+    let liquid_blinding_key_hex = "11".repeat(32);
+    let invoice = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some("m5tolerance"),
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "checkout",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 60,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_address: Some("bc1qissue14m5tolerance"),
+            liquid_address: Some("lq1issue14m5tolerance"),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
+            expires_in_secs: 60,
+        },
+    )
+    .await
+    .unwrap();
+    let tolerances = pay_service::db::InvoiceAccountingTolerances {
+        btc_sat: 300,
+        liquid_sat: 60,
+        lightning_sat: 1,
+        payment_grace_secs: 0,
+    };
+
+    let rows = pay_service::db::record_invoice_payment(
+        &pool,
+        invoice.id,
+        bitcoin_direct_evidence(
+            "bitcoin_direct:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0",
+            995,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            0,
+            "bc1qissue14m5tolerance",
+        ),
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    let partial = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.status, "partially_paid");
+    assert_eq!(partial.presentation_status.as_deref(), Some("partial"));
+    assert_eq!(partial.settlement_status, "none");
+    assert_eq!(partial.paid_amount_sat, Some(995));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn boltz_liquid_payout_does_not_double_count_lightning_invoice_payment() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
