@@ -152,6 +152,7 @@ pub(crate) struct VerifiedPrimaryFundingAmountMismatch {
 }
 
 impl VerifiedPrimaryFundingAmountMismatch {
+    #[cfg(test)]
     pub(crate) fn new_complete_and_agreed(
         chain_swap_id: Uuid,
         observed_amount_sat: u64,
@@ -234,6 +235,7 @@ pub(crate) struct VerifiedPrimaryFundingObservation(VerifiedPrimaryFundingAmount
 
 impl VerifiedPrimaryFundingObservation {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "stacked #139 projection adoption seam")]
     pub(crate) fn new_complete_and_agreed(
         chain_swap_id: Uuid,
         observed_amount_sat: u64,
@@ -272,6 +274,7 @@ pub(crate) struct VerifiedLiquidServerLockProgression {
 }
 
 impl VerifiedLiquidServerLockProgression {
+    #[allow(dead_code, reason = "stacked #139 projection adoption seam")]
     pub(crate) fn new(
         chain_swap_id: Uuid,
         observed_amount_sat: u64,
