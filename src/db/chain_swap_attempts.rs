@@ -362,7 +362,7 @@ mod recovery_broadcast_start_tests {
     }
 
     #[test]
-    fn completion_matrix_preserves_exact_already_settled_state() {
+    fn completion_matrix_preserves_initial_mirror_and_exact_replay_noop() {
         for (attempt_status, next) in [
             ("constructed", "broadcast"),
             ("broadcast_ambiguous", "broadcast"),
@@ -381,6 +381,8 @@ mod recovery_broadcast_start_tests {
                 ),
                 RecoveryBroadcastCompletionDisposition::Complete(next),
             );
+        }
+        for attempt_status in ["constructed", "broadcast_ambiguous"] {
             assert_eq!(
                 recovery_broadcast_completion_disposition(
                     "refunding",
@@ -390,10 +392,21 @@ mod recovery_broadcast_start_tests {
                     "bc1qdestination",
                     attempt_status,
                 ),
-                RecoveryBroadcastCompletionDisposition::Complete(next),
+                RecoveryBroadcastCompletionDisposition::Complete("broadcast"),
             );
         }
         for attempt_status in ["broadcast", "confirmed", "finalized"] {
+            assert_eq!(
+                recovery_broadcast_completion_disposition(
+                    "refunding",
+                    Some(TXID),
+                    TXID,
+                    Some("bc1qdestination"),
+                    "bc1qdestination",
+                    attempt_status,
+                ),
+                RecoveryBroadcastCompletionDisposition::NoOp,
+            );
             assert_eq!(
                 recovery_broadcast_completion_disposition(
                     "refunded",
@@ -403,7 +416,7 @@ mod recovery_broadcast_start_tests {
                     "bc1qdestination",
                     attempt_status,
                 ),
-                RecoveryBroadcastCompletionDisposition::AlreadySettled,
+                RecoveryBroadcastCompletionDisposition::NoOp,
             );
         }
 
@@ -678,9 +691,11 @@ fn recovery_integrity_hold_allowed(
 /// Atomically record a known broadcast transaction and mirror its txid to the
 /// compatibility chain-swap columns. A live swap remains nonterminal
 /// `refunding`: exact merchant-output confirmation/finality owns the later
-/// transition. An exact already-`refunded` parent is an idempotent success.
-/// The destination equality predicate is the final database-side guard against
-/// redirecting a committed attempt.
+/// transition. Once the expected txid is already mirrored, replaying a
+/// broadcast/confirmed/finalized attempt is a true no-op so settlement aging
+/// cannot be postponed. An exact already-`refunded` parent is also an
+/// idempotent success. The destination equality predicate is the final
+/// database-side guard against redirecting a committed attempt.
 pub async fn complete_recovery_broadcast(
     pool: &PgPool,
     attempt_id: Uuid,
@@ -742,7 +757,7 @@ pub async fn complete_recovery_broadcast(
     );
     let next_status = match disposition {
         RecoveryBroadcastCompletionDisposition::Complete(status) => status,
-        RecoveryBroadcastCompletionDisposition::AlreadySettled => {
+        RecoveryBroadcastCompletionDisposition::NoOp => {
             tx.commit().await?;
             return Ok(());
         }
@@ -802,7 +817,7 @@ pub async fn complete_recovery_broadcast(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryBroadcastCompletionDisposition {
     Complete(&'static str),
-    AlreadySettled,
+    NoOp,
     Reject,
 }
 
@@ -821,7 +836,12 @@ fn recovery_broadcast_completion_disposition(
         ("refunding", None, "constructed" | "broadcast_ambiguous" | "broadcast") => {
             RecoveryBroadcastCompletionDisposition::Complete("broadcast")
         }
-        ("refunding", Some(refund_txid), "constructed" | "broadcast_ambiguous" | "broadcast")
+        ("refunding", Some(refund_txid), "broadcast" | "confirmed" | "finalized")
+            if refund_txid == expected_txid =>
+        {
+            RecoveryBroadcastCompletionDisposition::NoOp
+        }
+        ("refunding", Some(refund_txid), "constructed" | "broadcast_ambiguous")
             if refund_txid == expected_txid =>
         {
             RecoveryBroadcastCompletionDisposition::Complete("broadcast")
@@ -829,19 +849,13 @@ fn recovery_broadcast_completion_disposition(
         ("refunding", None, "confirmed") => {
             RecoveryBroadcastCompletionDisposition::Complete("confirmed")
         }
-        ("refunding", Some(refund_txid), "confirmed") if refund_txid == expected_txid => {
-            RecoveryBroadcastCompletionDisposition::Complete("confirmed")
-        }
         ("refunding", None, "finalized") => {
-            RecoveryBroadcastCompletionDisposition::Complete("finalized")
-        }
-        ("refunding", Some(refund_txid), "finalized") if refund_txid == expected_txid => {
             RecoveryBroadcastCompletionDisposition::Complete("finalized")
         }
         ("refunded", Some(refund_txid), "broadcast" | "confirmed" | "finalized")
             if refund_txid == expected_txid =>
         {
-            RecoveryBroadcastCompletionDisposition::AlreadySettled
+            RecoveryBroadcastCompletionDisposition::NoOp
         }
         _ => RecoveryBroadcastCompletionDisposition::Reject,
     }
