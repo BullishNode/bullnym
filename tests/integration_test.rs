@@ -21215,8 +21215,39 @@ async fn recoverable_list_returns_committed_address_and_txid() {
     assert_eq!(body["items"][0]["refund_address"], committed);
     assert!(body["items"][0]["refund_txid"].is_null());
 
-    // refunded: terminal, txid present (the reinstall reconciliation payload).
+    // Broadcasting records the exact txid internally while the lifecycle is
+    // still `refunding`. The signed read-only contract must not expose that
+    // terminal field before chain evidence advances the parent to `refunded`.
     let txid = "aa".repeat(32);
+    let updated = sqlx::query(
+        "UPDATE chain_swap_records SET refund_txid = $2, updated_at = NOW() \
+          WHERE id = $1 AND status = 'refunding'",
+    )
+    .bind(swap.id)
+    .bind(&txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    let internal_txid: Option<String> =
+        sqlx::query_scalar("SELECT refund_txid FROM chain_swap_records WHERE id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(internal_txid.as_deref(), Some(txid.as_str()));
+
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "refunding");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert!(body["items"][0]["refund_txid"].is_null());
+
+    // refunded: terminal, txid present (the reinstall reconciliation payload).
     pay_service::db::mark_chain_swap_refunded(&pool, swap.id, &txid)
         .await
         .unwrap();
