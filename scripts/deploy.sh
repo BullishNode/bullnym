@@ -204,6 +204,14 @@ automatic_binary_rollback_allowed() {
     return 1
   fi
 
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 56)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 56)); }; then
+    echo "automatic rollback refused: migration 056 is a roll-forward-only renegotiation-intent boundary" >&2
+    return 1
+  fi
+
   if [[ "$previous_schema" == "$candidate_schema" ]]; then
     transition_count=0
   elif [[ "$previous_schema" == "046_chain_swap_tx_attempts" \
