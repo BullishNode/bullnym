@@ -9,7 +9,7 @@ pub enum AliasClaimOutcome {
     Unchanged,
     Claimed,
     NameTaken,
-    AlreadyAssigned,
+    AlreadyAssigned { alias: String },
 }
 
 pub async fn apply_alias_claim(
@@ -32,7 +32,7 @@ pub async fn apply_alias_claim(
         return Ok(if existing == alias {
             AliasClaimOutcome::Unchanged
         } else {
-            AliasClaimOutcome::AlreadyAssigned
+            AliasClaimOutcome::AlreadyAssigned { alias: existing }
         });
     }
 
@@ -54,6 +54,23 @@ pub async fn apply_alias_claim(
     .execute(&mut **tx)
     .await?;
     Ok(AliasClaimOutcome::Claimed)
+}
+
+/// Return the owner's canonical permanent alias after a transaction-level
+/// uniqueness race. Callers use this only after rolling back the failed
+/// transaction so the winning claim is visible and can be returned as typed
+/// conflict detail.
+pub async fn canonical_alias_by_npub(
+    pool: &sqlx::PgPool,
+    owner_npub: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT name FROM public_names \
+         WHERE owner_npub = $1 AND kind = 'alias' AND canonical",
+    )
+    .bind(owner_npub)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Authorize a historical invoice path without consulting Page/POS

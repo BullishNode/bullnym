@@ -497,7 +497,9 @@ pub async fn save(
     .map_err(|error| match error {
         db::UpsertDonationPageError::Database(error) => AppError::from(error),
         db::UpsertDonationPageError::NameTaken => AppError::NameTaken,
-        db::UpsertDonationPageError::AliasAlreadyAssigned => AppError::AliasAlreadyAssigned,
+        db::UpsertDonationPageError::AliasAlreadyAssigned { alias } => {
+            AppError::AliasAlreadyAssigned { alias }
+        }
     })?;
 
     if kind == db::KIND_PAYMENT_PAGE {

@@ -39,7 +39,7 @@ Options and implications:
 | `pos_mode` | Legacy non-null boolean; omitted/null preserves it on update and is not appended to the signature. | New integrations should use `kind`; sending it changes the signed bytes. |
 | `alias` omitted/null | Preserve the permanent owner-level claim; no trailing signed field. | Maintains old-client compatibility without creating a synthetic alias. |
 | `alias: ""` | Append the empty terminal signed field, then reject with `DonationPageInvalid`. | Empty is never a clear/release operation. |
-| non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different owner value returns `AliasAlreadyAssigned`; a reserved string returns `NameTaken`. |
+| non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different value from the same owner returns `AliasAlreadyAssigned` with `details.alias` set to the owner's permanent alias; a name owned by anyone else returns `NameTaken` without ownership details. |
 
 Every successful save clears `archived_at`, so saving an archived surface
 reactivates it. The request body limit is 8 KiB. Length checks use UTF-8 byte

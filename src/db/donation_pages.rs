@@ -73,7 +73,7 @@ pub struct UpsertDonationPage<'a> {
 pub enum UpsertDonationPageError {
     Database(sqlx::Error),
     NameTaken,
-    AliasAlreadyAssigned,
+    AliasAlreadyAssigned { alias: String },
 }
 
 impl From<sqlx::Error> for UpsertDonationPageError {
@@ -117,7 +117,10 @@ pub async fn upsert_donation_page(
             if super::public_name_constraint_is(&error, "public_names_owner_kind_lifetime_key") =>
         {
             tx.rollback().await?;
-            return Err(UpsertDonationPageError::AliasAlreadyAssigned);
+            return match super::canonical_alias_by_npub(pool, &owner_npub).await? {
+                Some(alias) => Err(UpsertDonationPageError::AliasAlreadyAssigned { alias }),
+                None => Err(UpsertDonationPageError::Database(error)),
+            };
         }
         Err(error) => return Err(error.into()),
     };
@@ -126,9 +129,9 @@ pub async fn upsert_donation_page(
             tx.rollback().await?;
             return Err(UpsertDonationPageError::NameTaken);
         }
-        super::AliasClaimOutcome::AlreadyAssigned => {
+        super::AliasClaimOutcome::AlreadyAssigned { alias } => {
             tx.rollback().await?;
-            return Err(UpsertDonationPageError::AliasAlreadyAssigned);
+            return Err(UpsertDonationPageError::AliasAlreadyAssigned { alias });
         }
         super::AliasClaimOutcome::Unchanged | super::AliasClaimOutcome::Claimed => {}
     }

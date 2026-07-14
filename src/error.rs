@@ -94,7 +94,9 @@ pub enum AppError {
     LiquidAddressAlreadyUsed,
     /// This wallet already owns a different permanent alias. Alias ownership
     /// is insert-only, so the client must keep using the existing value.
-    AliasAlreadyAssigned,
+    AliasAlreadyAssigned {
+        alias: String,
+    },
 
     // --- Capacity / rate-limit ---
     /// One source (IP, pubkey, etc.) is making too many requests.
@@ -186,7 +188,7 @@ impl AppError {
             | Self::RecoveryNotAvailable(_)
             | Self::BitcoinAddressAlreadyUsed
             | Self::LiquidAddressAlreadyUsed
-            | Self::AliasAlreadyAssigned => ErrorClass::Identity,
+            | Self::AliasAlreadyAssigned { .. } => ErrorClass::Identity,
 
             Self::RateLimitedSender
             | Self::RateLimitedRecipient
@@ -237,7 +239,7 @@ impl AppError {
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
-            Self::AliasAlreadyAssigned => "AliasAlreadyAssigned",
+            Self::AliasAlreadyAssigned { .. } => "AliasAlreadyAssigned",
 
             Self::RateLimitedSender => "RateLimitedSender",
             Self::RateLimitedRecipient => "RateLimitedRecipient",
@@ -308,8 +310,8 @@ impl std::fmt::Display for AppError {
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
-            Self::AliasAlreadyAssigned => {
-                write!(f, "a different permanent alias is already assigned")
+            Self::AliasAlreadyAssigned { alias } => {
+                write!(f, "permanent alias already assigned: {alias}")
             }
 
             Self::RateLimitedSender => write!(f, "rate limited (sender)"),
@@ -396,8 +398,8 @@ impl IntoResponse for AppError {
             AppError::LiquidAddressAlreadyUsed => {
                 "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
-            AppError::AliasAlreadyAssigned => {
-                "This wallet already owns a different permanent link name.".into()
+            AppError::AliasAlreadyAssigned { alias } => {
+                format!("This wallet permanently owns the link name {alias}.")
             }
 
             AppError::RateLimitedSender => "Request rate limit exceeded for this source. Retry later.".into(),
@@ -442,6 +444,7 @@ impl IntoResponse for AppError {
             AppError::NymAlreadyAssigned { nym, domain } => {
                 Some(json!({"nym": nym, "domain": domain}))
             }
+            AppError::AliasAlreadyAssigned { alias } => Some(json!({"alias": alias})),
             AppError::PurgeBlocked(n) => Some(json!({"pending_count": n})),
             AppError::ProofOfFundsRequired { min_sat } => Some(json!({"min_sat": min_sat})),
             _ => None,
@@ -456,7 +459,7 @@ impl IntoResponse for AppError {
             | AppError::NymAlreadyAssigned { .. }
             | AppError::BitcoinAddressAlreadyUsed
             | AppError::LiquidAddressAlreadyUsed
-            | AppError::AliasAlreadyAssigned => StatusCode::CONFLICT,
+            | AppError::AliasAlreadyAssigned { .. } => StatusCode::CONFLICT,
             AppError::ServiceUnavailable(_) | AppError::MoneyAdmissionUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -534,6 +537,24 @@ impl From<sqlx::Error> for AppError {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn alias_already_assigned_exposes_exact_owned_alias() {
+        let response = AppError::AliasAlreadyAssigned {
+            alias: "coffee".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read alias conflict response body");
+        let value: Value = serde_json::from_slice(&body).expect("parse alias conflict JSON");
+
+        assert_eq!(value["status"], "ERROR");
+        assert_eq!(value["code"], "AliasAlreadyAssigned");
+        assert_eq!(value["details"], json!({"alias": "coffee"}));
+    }
 
     #[tokio::test]
     async fn money_admission_response_is_generic_and_retryable() {

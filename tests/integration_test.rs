@@ -4318,6 +4318,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict:?}");
     assert_eq!(conflict["code"], "AliasAlreadyAssigned");
+    assert_eq!(conflict["details"], json!({"alias": alias}));
     let unchanged =
         pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
             .await
@@ -4523,15 +4524,23 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
     } else {
         pos_result.unwrap_err()
     };
-    assert!(matches!(
-        loser,
-        pay_service::db::UpsertDonationPageError::AliasAlreadyAssigned
-    ));
+    let owned_alias = match loser {
+        pay_service::db::UpsertDonationPageError::AliasAlreadyAssigned { alias } => alias,
+        other => panic!("unexpected losing alias error: {other:?}"),
+    };
 
     let claims: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM public_names WHERE kind = 'alias' AND owner_npub = ( \
              SELECT npub FROM users WHERE nym = 'aliasrace' \
          )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let canonical_alias: String = sqlx::query_scalar(
+        "SELECT name FROM public_names WHERE kind = 'alias' AND owner_npub = ( \
+             SELECT npub FROM users WHERE nym = 'aliasrace' \
+         ) AND canonical",
     )
     .fetch_one(&pool)
     .await
@@ -4542,6 +4551,7 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
             .await
             .unwrap();
     assert_eq!(claims, 1);
+    assert_eq!(owned_alias, canonical_alias);
     assert_eq!(
         surfaces, 1,
         "losing alias claim must not mutate its surface"
