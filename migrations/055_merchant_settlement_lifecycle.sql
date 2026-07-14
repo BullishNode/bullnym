@@ -800,6 +800,8 @@ DECLARE
     relation_name TEXT;
     relation_owner_oid OID;
     runtime_role_oid OID;
+    function_name TEXT;
+    function_owner_oid OID;
 BEGIN
     SELECT oid INTO STRICT runtime_role_oid FROM pg_roles WHERE rolname = runtime_role_name;
     EXECUTE format(
@@ -835,6 +837,82 @@ BEGIN
                 USING ERRCODE = '42501';
         END IF;
     END LOOP;
+
+    FOREACH function_name IN ARRAY ARRAY[
+        'guard_chain_swap_tx_attempt_immutable',
+        'require_review25_bitcoin_attempt_fee_authority',
+        'enforce_liquid_claim_replacement_lineage',
+        'guard_invoice_payment_event_evidence',
+        'reject_merchant_settlement_event_delete',
+        'enforce_merchant_settlement_checkpoint_write',
+        'enforce_merchant_settlement_retained_update',
+        'reject_merchant_settlement_delete'
+    ] LOOP
+        SELECT procedure_info.proowner
+          INTO STRICT function_owner_oid
+          FROM pg_proc procedure_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = procedure_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND procedure_info.proname = function_name
+           AND procedure_info.pronargs = 0;
+        IF function_owner_oid = runtime_role_oid
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'SET') THEN
+            RAISE EXCEPTION 'migration 055 failed protected owner boundary for function %',
+                function_name
+                USING ERRCODE = '42501';
+        END IF;
+    END LOOP;
+
+    IF EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_liquid_claim_replacement_lineage',
+                  '2c6eb8d351f5fe1330d101915e897b2984b91f747d31e879d31d555f18105f27'),
+              ('enforce_merchant_settlement_checkpoint_write',
+                  '5e8189d952b8a1f921bafc6da90c2ae658c46691b243f6bbd5e16d056bf7ca29'),
+              ('enforce_merchant_settlement_retained_update',
+                  '840d9f3ee9d6fb05f27a2fa9c56f583b411d34b47b92d3a27bc0089622d5ddd0'),
+              ('guard_chain_swap_tx_attempt_immutable',
+                  'a11b15a80a879cb5cc9b1b9f3a6c795d72c82263f53b01b1e52e4bb726f800d3'),
+              ('guard_invoice_payment_event_evidence',
+                  '893b3f4effa66be50635c1e6a7904783e85d52e30e015123f8438a8a62c295d8'),
+              ('reject_merchant_settlement_delete',
+                  '475959643f22379df0eb575f0c2410ee523fe9d15591c73838eecaba7ac9a875'),
+              ('reject_merchant_settlement_event_delete',
+                  '6da9435887b06e540a1833528587547bbee9a27dca5e42004d2bd576c1e32be8'),
+              ('require_review25_bitcoin_attempt_fee_authority',
+                  '33021f5da06d90a78139df9bacf9d29f84e8225f6f656d6968a1bc99ad169678')
+          ) required(function_name, body_sha256)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+               JOIN pg_language language_info
+                 ON language_info.oid = function_info.prolang
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND function_info.prokind = 'f'
+                AND function_info.prorettype = 'trigger'::REGTYPE
+                AND language_info.lanname = 'plpgsql'
+                AND function_info.provolatile = 'v'
+                AND NOT function_info.proisstrict
+                AND NOT function_info.prosecdef
+                AND NOT function_info.proleakproof
+                AND function_info.proparallel = 'u'
+                AND function_info.proconfig IS NULL
+                AND encode(
+                    sha256(convert_to(function_info.prosrc, 'UTF8')), 'hex'
+                ) = required.body_sha256
+         )
+    ) THEN
+        RAISE EXCEPTION 'migration 055 installed a non-canonical trigger function'
+            USING ERRCODE = '55000';
+    END IF;
+
     SELECT relowner INTO STRICT relation_owner_oid
       FROM pg_class
      WHERE oid = 'public.invoice_payment_events_accounting_sequence_seq'::REGCLASS

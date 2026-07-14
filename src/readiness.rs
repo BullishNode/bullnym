@@ -118,7 +118,17 @@ const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
      )";
 
 const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
-    "SELECT NOT EXISTS ( \
+    "WITH required_function_bodies(function_name, body_sha256) AS (VALUES \
+         ('enforce_liquid_claim_replacement_lineage', '2c6eb8d351f5fe1330d101915e897b2984b91f747d31e879d31d555f18105f27'), \
+         ('enforce_merchant_settlement_checkpoint_write', '5e8189d952b8a1f921bafc6da90c2ae658c46691b243f6bbd5e16d056bf7ca29'), \
+         ('enforce_merchant_settlement_retained_update', '840d9f3ee9d6fb05f27a2fa9c56f583b411d34b47b92d3a27bc0089622d5ddd0'), \
+         ('guard_chain_swap_tx_attempt_immutable', 'a11b15a80a879cb5cc9b1b9f3a6c795d72c82263f53b01b1e52e4bb726f800d3'), \
+         ('guard_invoice_payment_event_evidence', '893b3f4effa66be50635c1e6a7904783e85d52e30e015123f8438a8a62c295d8'), \
+         ('reject_merchant_settlement_delete', '475959643f22379df0eb575f0c2410ee523fe9d15591c73838eecaba7ac9a875'), \
+         ('reject_merchant_settlement_event_delete', '6da9435887b06e540a1833528587547bbee9a27dca5e42004d2bd576c1e32be8'), \
+         ('require_review25_bitcoin_attempt_fee_authority', '33021f5da06d90a78139df9bacf9d29f84e8225f6f656d6968a1bc99ad169678') \
+     ) \
+     SELECT NOT EXISTS ( \
          SELECT 1 \
            FROM (VALUES \
              ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_require_review25_fee_authority', 'require_review25_bitcoin_attempt_fee_authority', 7), \
@@ -148,66 +158,40 @@ const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
                  AND function_info.proname = required.function_name \
                  AND function_info.pronargs = 0 \
                  AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                 AND trigger_info.tgnargs = 0 \
+                 AND trigger_info.tgattr::TEXT = '' \
+                 AND trigger_info.tgqual IS NULL \
+                 AND trigger_info.tgconstraint = 0 \
+                 AND NOT trigger_info.tgdeferrable \
+                 AND NOT trigger_info.tginitdeferred \
                  AND NOT trigger_info.tgisinternal \
-                 AND trigger_info.tgenabled IN ('O', 'A') \
+                 AND trigger_info.tgenabled = 'O' \
           ) \
     ) \
-    AND EXISTS ( \
-        SELECT 1 \
-          FROM pg_trigger trigger_info \
-          JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
-          JOIN pg_namespace relation_namespace \
-            ON relation_namespace.oid = relation.relnamespace \
-          JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
-          JOIN pg_namespace function_namespace \
-            ON function_namespace.oid = function_info.pronamespace \
-         WHERE relation_namespace.nspname = 'public' \
-           AND function_namespace.nspname = 'public' \
-           AND relation.relname = 'chain_swap_tx_attempts' \
-           AND trigger_info.tgname = 'chain_swap_tx_attempts_require_review25_fee_authority' \
-           AND trigger_info.tgtype = 7 \
-           AND NOT trigger_info.tgisinternal \
-           AND trigger_info.tgenabled IN ('O', 'A') \
-           AND function_info.proname = 'require_review25_bitcoin_attempt_fee_authority' \
-           AND function_info.pronargs = 0 \
-           AND pg_get_functiondef(function_info.oid) LIKE \
-               '%IF NEW.fee_decision_purpose IS NULL THEN%' \
-           AND pg_get_functiondef(function_info.oid) LIKE \
-               '%IF NEW.purpose = ''liquid_claim'' THEN%' \
-           AND pg_get_functiondef(function_info.oid) LIKE \
-               '%parent.claim_fee_decision_policy_version%' \
-    ) \
     AND NOT EXISTS ( \
-        SELECT 1 \
-          FROM (VALUES \
-              ('fee_decision_purpose'), \
-              ('fee_decision_rail'), \
-              ('fee_decision_target'), \
-              ('fee_decision_source'), \
-              ('fee_decision_rate_sat_vb'), \
-              ('fee_decision_quoted_at_unix'), \
-              ('fee_decision_evaluated_at_unix'), \
-              ('fee_decision_freshness_age_secs'), \
-              ('fee_decision_freshness_max_age_secs'), \
-              ('fee_decision_provenance'), \
-              ('fee_decision_policy_floor_sat_vb'), \
-              ('fee_decision_policy_cap_sat_vb'), \
-              ('fee_decision_policy_version') \
-          ) required(column_name) \
+        SELECT 1 FROM required_function_bodies required \
          WHERE NOT EXISTS ( \
              SELECT 1 \
                FROM pg_proc function_info \
                JOIN pg_namespace function_namespace \
                  ON function_namespace.oid = function_info.pronamespace \
+               JOIN pg_language language_info \
+                 ON language_info.oid = function_info.prolang \
               WHERE function_namespace.nspname = 'public' \
-                AND function_info.proname = 'guard_chain_swap_tx_attempt_immutable' \
+                AND function_info.proname = required.function_name \
                 AND function_info.pronargs = 0 \
-                AND position( \
-                    format( \
-                        'NEW.%s IS DISTINCT FROM OLD.%s', \
-                        required.column_name, required.column_name \
-                    ) IN pg_get_functiondef(function_info.oid) \
-                ) > 0 \
+                AND function_info.prokind = 'f' \
+                AND function_info.prorettype = 'trigger'::REGTYPE \
+                AND language_info.lanname = 'plpgsql' \
+                AND function_info.provolatile = 'v' \
+                AND NOT function_info.proisstrict \
+                AND NOT function_info.prosecdef \
+                AND NOT function_info.proleakproof \
+                AND function_info.proparallel = 'u' \
+                AND function_info.proconfig IS NULL \
+                AND encode( \
+                    sha256(convert_to(function_info.prosrc, 'UTF8')), 'hex' \
+                ) = required.body_sha256 \
          ) \
     )";
 
@@ -1545,53 +1529,75 @@ mod tests {
             "function_namespace.nspname = 'public'",
             "function_info.pronargs = 0",
             "trigger_info.tgtype = required.trigger_type::SMALLINT",
+            "trigger_info.tgnargs = 0",
+            "trigger_info.tgattr::TEXT = ''",
+            "trigger_info.tgqual IS NULL",
+            "trigger_info.tgconstraint = 0",
+            "NOT trigger_info.tgdeferrable",
+            "NOT trigger_info.tginitdeferred",
             "NOT trigger_info.tgisinternal",
-            "trigger_info.tgenabled IN ('O', 'A')",
+            "trigger_info.tgenabled = 'O'",
         ] {
             assert!(
                 MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(exact_catalog_guard),
                 "missing trigger catalog guard: {exact_catalog_guard}"
             );
         }
-        for authority_body_marker in [
-            "IF NEW.fee_decision_purpose IS NULL THEN",
-            "IF NEW.purpose = ''liquid_claim'' THEN",
-            "parent.claim_fee_decision_policy_version",
-        ] {
-            assert!(
-                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(authority_body_marker),
-                "missing fee-authority body marker: {authority_body_marker}"
-            );
-        }
-        for immutable_column in [
-            "fee_decision_purpose",
-            "fee_decision_rail",
-            "fee_decision_target",
-            "fee_decision_source",
-            "fee_decision_rate_sat_vb",
-            "fee_decision_quoted_at_unix",
-            "fee_decision_evaluated_at_unix",
-            "fee_decision_freshness_age_secs",
-            "fee_decision_freshness_max_age_secs",
-            "fee_decision_provenance",
-            "fee_decision_policy_floor_sat_vb",
-            "fee_decision_policy_cap_sat_vb",
-            "fee_decision_policy_version",
+        for (function_name, body_sha256) in [
+            (
+                "enforce_liquid_claim_replacement_lineage",
+                "2c6eb8d351f5fe1330d101915e897b2984b91f747d31e879d31d555f18105f27",
+            ),
+            (
+                "enforce_merchant_settlement_checkpoint_write",
+                "5e8189d952b8a1f921bafc6da90c2ae658c46691b243f6bbd5e16d056bf7ca29",
+            ),
+            (
+                "enforce_merchant_settlement_retained_update",
+                "840d9f3ee9d6fb05f27a2fa9c56f583b411d34b47b92d3a27bc0089622d5ddd0",
+            ),
+            (
+                "guard_chain_swap_tx_attempt_immutable",
+                "a11b15a80a879cb5cc9b1b9f3a6c795d72c82263f53b01b1e52e4bb726f800d3",
+            ),
+            (
+                "guard_invoice_payment_event_evidence",
+                "893b3f4effa66be50635c1e6a7904783e85d52e30e015123f8438a8a62c295d8",
+            ),
+            (
+                "reject_merchant_settlement_delete",
+                "475959643f22379df0eb575f0c2410ee523fe9d15591c73838eecaba7ac9a875",
+            ),
+            (
+                "reject_merchant_settlement_event_delete",
+                "6da9435887b06e540a1833528587547bbee9a27dca5e42004d2bd576c1e32be8",
+            ),
+            (
+                "require_review25_bitcoin_attempt_fee_authority",
+                "33021f5da06d90a78139df9bacf9d29f84e8225f6f656d6968a1bc99ad169678",
+            ),
         ] {
             assert!(
                 MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL
-                    .contains(&format!("('{immutable_column}')")),
-                "missing immutable fee-decision guard: {immutable_column}"
+                    .contains(&format!("('{function_name}', '{body_sha256}')")),
+                "missing exact function body digest: {function_name}"
             );
         }
-        for immutable_body_guard in [
-            "guard_chain_swap_tx_attempt_immutable",
-            "NEW.%s IS DISTINCT FROM OLD.%s",
-            "pg_get_functiondef(function_info.oid)",
+        for function_catalog_guard in [
+            "function_info.prokind = 'f'",
+            "function_info.prorettype = 'trigger'::REGTYPE",
+            "language_info.lanname = 'plpgsql'",
+            "function_info.provolatile = 'v'",
+            "NOT function_info.proisstrict",
+            "NOT function_info.prosecdef",
+            "NOT function_info.proleakproof",
+            "function_info.proparallel = 'u'",
+            "function_info.proconfig IS NULL",
+            "sha256(convert_to(function_info.prosrc, 'UTF8'))",
         ] {
             assert!(
-                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(immutable_body_guard),
-                "missing immutable function-body guard: {immutable_body_guard}"
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(function_catalog_guard),
+                "missing exact function catalog guard: {function_catalog_guard}"
             );
         }
 

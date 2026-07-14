@@ -1514,6 +1514,114 @@ async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
 }
 
 #[tokio::test]
+async fn merchant_settlement_readiness_rejects_trigger_function_drift() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let canonical_function_definition: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef( \
+             'public.reject_merchant_settlement_delete()'::REGPROCEDURE \
+         )",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.reject_merchant_settlement_delete() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $drift$ \
+         BEGIN \
+             RETURN OLD; \
+         END \
+         $drift$",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let body_drift = readiness::schema_and_journal_ready(&runtime).await;
+    sqlx::query(&canonical_function_definition)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(
+        !body_drift.unwrap(),
+        "weakened delete function stayed ready"
+    );
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query("ALTER FUNCTION public.reject_merchant_settlement_delete() SECURITY DEFINER")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let security_drift = readiness::schema_and_journal_ready(&runtime).await;
+    sqlx::query("ALTER FUNCTION public.reject_merchant_settlement_delete() SECURITY INVOKER")
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(
+        !security_drift.unwrap(),
+        "security-definer trigger function stayed ready"
+    );
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let canonical_trigger_definition: String = sqlx::query_scalar(
+        "SELECT pg_get_triggerdef(trigger_info.oid, TRUE) \
+           FROM pg_trigger trigger_info \
+           JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+          WHERE namespace.nspname = 'public' \
+            AND relation.relname = 'merchant_settlement_checkpoints' \
+            AND trigger_info.tgname = 'merchant_settlement_checkpoint_reject_delete'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DROP TRIGGER merchant_settlement_checkpoint_reject_delete \
+         ON merchant_settlement_checkpoints",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER merchant_settlement_checkpoint_reject_delete \
+         BEFORE DELETE ON merchant_settlement_checkpoints \
+         FOR EACH ROW WHEN (FALSE) \
+         EXECUTE FUNCTION reject_merchant_settlement_delete()",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let conditional_trigger = readiness::schema_and_journal_ready(&runtime).await;
+    sqlx::query(
+        "DROP TRIGGER merchant_settlement_checkpoint_reject_delete \
+         ON merchant_settlement_checkpoints",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(&canonical_trigger_definition)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(
+        !conditional_trigger.unwrap(),
+        "conditional delete trigger stayed ready"
+    );
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let sequence_value: i64 = sqlx::query_scalar(
+        "SELECT nextval('public.invoice_payment_events_accounting_sequence_seq')",
+    )
+    .fetch_one(&runtime)
+    .await
+    .expect("runtime role must be able to consume the accounting BIGSERIAL default");
+    assert!(sequence_value > 0);
+}
+
+#[tokio::test]
 async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift() {
     let admin = test_pool().await;
     cleanup_db(&admin).await;
