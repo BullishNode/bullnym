@@ -52,6 +52,7 @@ pub enum ChainSwapRenegotiationStoreError {
     IdentityConflict { chain_swap_id: Uuid },
     CasMiss { chain_swap_id: Uuid },
     Busy { chain_swap_id: Uuid },
+    ParentNotEligible { chain_swap_id: Uuid },
     ParentAmountConflict { chain_swap_id: Uuid },
     ParentUpdateLost { chain_swap_id: Uuid },
 }
@@ -75,6 +76,10 @@ impl fmt::Debug for ChainSwapRenegotiationStoreError {
                 .finish(),
             Self::Busy { chain_swap_id } => f
                 .debug_struct("Busy")
+                .field("chain_swap_id", chain_swap_id)
+                .finish(),
+            Self::ParentNotEligible { chain_swap_id } => f
+                .debug_struct("ParentNotEligible")
                 .field("chain_swap_id", chain_swap_id)
                 .finish(),
             Self::ParentAmountConflict { chain_swap_id } => f
@@ -104,6 +109,9 @@ impl fmt::Display for ChainSwapRenegotiationStoreError {
             Self::Busy { .. } => {
                 f.write_str("renegotiation finalization is serialized by another swap worker")
             }
+            Self::ParentNotEligible { .. } => {
+                f.write_str("chain swap no longer permits a renegotiation accept request")
+            }
             Self::ParentAmountConflict { .. } => {
                 f.write_str("chain swap has conflicting accepted renegotiation amount")
             }
@@ -125,6 +133,7 @@ impl std::error::Error for ChainSwapRenegotiationStoreError {
             | Self::IdentityConflict { .. }
             | Self::CasMiss { .. }
             | Self::Busy { .. }
+            | Self::ParentNotEligible { .. }
             | Self::ParentAmountConflict { .. }
             | Self::ParentUpdateLost { .. } => None,
         }
@@ -278,6 +287,53 @@ pub async fn get_chain_swap_renegotiation(
     row.map(TryInto::try_into).transpose().map_err(Into::into)
 }
 
+async fn acquire_accept_parent_boundary(
+    tx: &mut Transaction<'_, Postgres>,
+    chain_swap_id: Uuid,
+) -> Result<(), ChainSwapRenegotiationStoreError> {
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut **tx)
+            .await?;
+    if got_lock {
+        Ok(())
+    } else {
+        Err(ChainSwapRenegotiationStoreError::Busy { chain_swap_id })
+    }
+}
+
+async fn load_parent_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    chain_swap_id: Uuid,
+) -> Result<RenegotiationParentDbRow, ChainSwapRenegotiationStoreError> {
+    sqlx::query_as::<_, RenegotiationParentDbRow>(
+        "SELECT status, renegotiated_server_lock_amount_sat \
+           FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ChainSwapRenegotiationStoreError::NotFound { chain_swap_id })
+}
+
+fn require_accept_eligible_parent(
+    chain_swap_id: Uuid,
+    parent: &RenegotiationParentDbRow,
+) -> Result<(), ChainSwapRenegotiationStoreError> {
+    if parent.renegotiated_server_lock_amount_sat.is_none()
+        && matches!(
+            parent.status.as_str(),
+            "pending" | "user_lock_mempool" | "user_lock_confirmed"
+        )
+    {
+        Ok(())
+    } else {
+        Err(ChainSwapRenegotiationStoreError::ParentNotEligible { chain_swap_id })
+    }
+}
+
 /// Commit `accept_requested` before returning to the caller.
 ///
 /// A caller may mutate Boltz only after this function returns `Ok`. This
@@ -293,7 +349,25 @@ pub async fn request_chain_swap_renegotiation_accept(
         expected_version,
         RenegotiationTransitionKind::RequestAccept,
     )?;
-    transition_chain_swap_renegotiation(pool, &transition).await
+    let mut tx = pool.begin().await?;
+    acquire_accept_parent_boundary(&mut tx, identity.chain_swap_id).await?;
+    let parent = load_parent_for_update(&mut tx, identity.chain_swap_id).await?;
+    let current = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
+    let disposition = current.plan_transition(&transition)?;
+    if disposition == TransitionDisposition::ExactRetry {
+        tx.commit().await?;
+        return Ok(RenegotiationTransitionOutcome {
+            operation: current,
+            disposition,
+        });
+    }
+    require_accept_eligible_parent(identity.chain_swap_id, &parent)?;
+    let operation = execute_transition_update(&mut tx, &transition).await?;
+    tx.commit().await?;
+    Ok(RenegotiationTransitionOutcome {
+        operation,
+        disposition,
+    })
 }
 
 /// Atomically replace an ambiguous quote+policy identity with independently
@@ -313,6 +387,8 @@ pub async fn request_changed_chain_swap_renegotiation_accept(
         .map_err(|_| RenegotiationDomainError::InvalidExpectedVersion)?;
 
     let mut tx = pool.begin().await?;
+    acquire_accept_parent_boundary(&mut tx, redrive.current_identity.chain_swap_id).await?;
+    let parent = load_parent_for_update(&mut tx, redrive.current_identity.chain_swap_id).await?;
     let current =
         load_operation_for_update(&mut tx, redrive.current_identity.chain_swap_id).await?;
     let disposition = redrive.plan(&current)?;
@@ -323,6 +399,7 @@ pub async fn request_changed_chain_swap_renegotiation_accept(
             disposition,
         });
     }
+    require_accept_eligible_parent(redrive.current_identity.chain_swap_id, &parent)?;
 
     let sql = format!(
         "UPDATE chain_swap_renegotiation_operations \
@@ -704,7 +781,41 @@ fn liquid_path_is_active(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::liquid_path_is_active;
+    use super::{liquid_path_is_active, require_accept_eligible_parent, RenegotiationParentDbRow};
+    use uuid::Uuid;
+
+    fn parent(status: &str, accepted_amount: Option<i64>) -> RenegotiationParentDbRow {
+        RenegotiationParentDbRow {
+            status: status.into(),
+            renegotiated_server_lock_amount_sat: accepted_amount,
+        }
+    }
+
+    #[test]
+    fn accept_intent_requires_exact_pre_liquid_parent_state() {
+        let id = Uuid::from_u128(1);
+        for status in ["pending", "user_lock_mempool", "user_lock_confirmed"] {
+            assert!(require_accept_eligible_parent(id, &parent(status, None)).is_ok());
+        }
+        for status in [
+            "server_lock_mempool",
+            "server_lock_confirmed",
+            "claiming",
+            "claimed",
+            "claim_failed",
+            "claim_stuck",
+            "refund_due",
+            "refunding",
+            "refunded",
+            "expired",
+        ] {
+            assert!(require_accept_eligible_parent(id, &parent(status, None)).is_err());
+        }
+        assert!(
+            require_accept_eligible_parent(id, &parent("user_lock_confirmed", Some(24_750)),)
+                .is_err()
+        );
+    }
 
     #[test]
     fn definite_decline_is_blocked_by_exact_liquid_progress_statuses() {

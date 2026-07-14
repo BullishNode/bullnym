@@ -771,13 +771,15 @@ pub(crate) enum DefiniteDeclineFinalization {
 pub(crate) enum RenegotiationStoreTransition {
     Applied(ChainSwapRenegotiationOperation),
     ExactRetry(ChainSwapRenegotiationOperation),
+    Blocked,
 }
 
 impl RenegotiationStoreTransition {
-    fn into_parts(self) -> (ChainSwapRenegotiationOperation, bool) {
+    fn into_parts(self) -> Option<(ChainSwapRenegotiationOperation, bool)> {
         match self {
-            Self::Applied(operation) => (operation, true),
-            Self::ExactRetry(operation) => (operation, false),
+            Self::Applied(operation) => Some((operation, true)),
+            Self::ExactRetry(operation) => Some((operation, false)),
+            Self::Blocked => None,
         }
     }
 }
@@ -861,17 +863,23 @@ impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
         identity: &RenegotiationIdentity,
         expected_version: u64,
     ) -> Result<RenegotiationStoreTransition, AppError> {
-        db::request_chain_swap_renegotiation_accept(self.pool, identity, expected_version)
+        match db::request_chain_swap_renegotiation_accept(self.pool, identity, expected_version)
             .await
-            .map(|outcome| match outcome.disposition {
+        {
+            Ok(outcome) => Ok(match outcome.disposition {
                 TransitionDisposition::Apply => {
                     RenegotiationStoreTransition::Applied(outcome.operation)
                 }
                 TransitionDisposition::ExactRetry => {
                     RenegotiationStoreTransition::ExactRetry(outcome.operation)
                 }
-            })
-            .map_err(|error| AppError::DbError(error.to_string()))
+            }),
+            Err(
+                db::ChainSwapRenegotiationStoreError::Busy { .. }
+                | db::ChainSwapRenegotiationStoreError::ParentNotEligible { .. },
+            ) => Ok(RenegotiationStoreTransition::Blocked),
+            Err(error) => Err(AppError::DbError(error.to_string())),
+        }
     }
 
     async fn request_changed_accept(
@@ -885,17 +893,21 @@ impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
             current.version,
         )
         .map_err(|error| AppError::ClaimError(error.to_string()))?;
-        db::request_changed_chain_swap_renegotiation_accept(self.pool, &redrive)
-            .await
-            .map(|outcome| match outcome.disposition {
+        match db::request_changed_chain_swap_renegotiation_accept(self.pool, &redrive).await {
+            Ok(outcome) => Ok(match outcome.disposition {
                 TransitionDisposition::Apply => {
                     RenegotiationStoreTransition::Applied(outcome.operation)
                 }
                 TransitionDisposition::ExactRetry => {
                     RenegotiationStoreTransition::ExactRetry(outcome.operation)
                 }
-            })
-            .map_err(|error| AppError::DbError(error.to_string()))
+            }),
+            Err(
+                db::ChainSwapRenegotiationStoreError::Busy { .. }
+                | db::ChainSwapRenegotiationStoreError::ParentNotEligible { .. },
+            ) => Ok(RenegotiationStoreTransition::Blocked),
+            Err(error) => Err(AppError::DbError(error.to_string())),
+        }
     }
 
     async fn mark_ambiguous(
@@ -1282,10 +1294,13 @@ where
             }
             RenegotiationState::Declined => return Ok(false),
             RenegotiationState::Quoted => {
-                let (requested, applied) = store
+                let Some((requested, applied)) = store
                     .request_accept(&operation.identity, operation.version)
                     .await?
-                    .into_parts();
+                    .into_parts()
+                else {
+                    return Ok(true);
+                };
                 if !applied {
                     return Ok(true);
                 }
@@ -1310,7 +1325,9 @@ where
                         .request_changed_accept(&operation, &replacement)
                         .await?
                 };
-                let (requested, applied) = requested.into_parts();
+                let Some((requested, applied)) = requested.into_parts() else {
+                    return Ok(true);
+                };
                 if !applied {
                     return Ok(true);
                 }
@@ -1332,14 +1349,17 @@ where
                         // redriven concurrently.
                         return Ok(true);
                     }
-                    let (ambiguous, applied) = store
+                    let Some((ambiguous, applied)) = store
                         .mark_ambiguous(
                             &operation.identity,
                             operation.version,
                             RenegotiationErrorClass::UnknownProviderOutcome,
                         )
                         .await?
-                        .into_parts();
+                        .into_parts()
+                    else {
+                        return Ok(true);
+                    };
                     if !applied {
                         return Ok(true);
                     }
@@ -1422,14 +1442,17 @@ where
             Err(error) => {
                 let invalid_or_stale =
                     error.kind == ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote;
-                let (ambiguous, applied) = store
+                let Some((ambiguous, applied)) = store
                     .mark_ambiguous(
                         &operation.identity,
                         operation.version,
                         renegotiation_error_class(error.kind),
                     )
                     .await?
-                    .into_parts();
+                    .into_parts()
+                else {
+                    return Ok(true);
+                };
                 if !applied {
                     return Ok(true);
                 }
@@ -1453,7 +1476,9 @@ where
                         .request_changed_accept(&operation, &replacement)
                         .await?
                 };
-                let (requested, applied) = requested.into_parts();
+                let Some((requested, applied)) = requested.into_parts() else {
+                    return Ok(true);
+                };
                 if !applied {
                     return Ok(true);
                 }

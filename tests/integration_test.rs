@@ -15169,6 +15169,36 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     assert_eq!(quoted.state, RenegotiationState::Quoted);
     assert_eq!(quoted.version, 1);
 
+    // A Liquid branch that wins after quote observation but before durable
+    // accept intent must close the provider-mutation boundary. The journal
+    // stays quoted and no version/attempt counter is invented.
+    sqlx::query("UPDATE chain_swap_records SET status = 'server_lock_confirmed' WHERE id = $1")
+        .bind(row.id)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let progressed_parent =
+        pay_service::db::request_chain_swap_renegotiation_accept(&runtime, &identity, 1)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        progressed_parent,
+        ChainSwapRenegotiationStoreError::ParentNotEligible { chain_swap_id }
+            if chain_swap_id == row.id
+    ));
+    let still_quoted = pay_service::db::get_chain_swap_renegotiation(&runtime, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_quoted.state, RenegotiationState::Quoted);
+    assert_eq!(still_quoted.version, 1);
+    assert_eq!(still_quoted.accept_attempt_count, 0);
+    sqlx::query("UPDATE chain_swap_records SET status = 'user_lock_confirmed' WHERE id = $1")
+        .bind(row.id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
     // Crash before intent commit: the transaction-local request vanishes and
     // a new process still observes the exact retryable quote.
     let mut before_intent = runtime.begin().await.unwrap();
