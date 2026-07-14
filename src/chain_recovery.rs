@@ -643,6 +643,15 @@ async fn prepare_or_reload_attempt(
     }
 
     faults.check(RecoveryFaultPoint::AfterJournalWriteBeforeCommit)?;
+    // The journal insert and parent transition are asynchronous database
+    // boundaries too.  A decision that expired while either was blocked must
+    // roll back with the transaction instead of becoming immutable replay
+    // authority merely because it was still fresh before the first write.
+    if !fee_record.authorizes_construction_now() {
+        return Err(AppError::RecoveryNotAvailable(
+            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+        ));
+    }
     tx.commit()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;

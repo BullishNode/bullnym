@@ -15611,6 +15611,34 @@ impl pay_service::chain_recovery::RecoveryFaultInjector for OneShotRecoveryFault
     }
 }
 
+struct DelayedRecoveryFault {
+    point: pay_service::chain_recovery::RecoveryFaultPoint,
+    delay: Duration,
+    fired: AtomicBool,
+}
+
+impl DelayedRecoveryFault {
+    fn at(point: pay_service::chain_recovery::RecoveryFaultPoint, delay: Duration) -> Self {
+        Self {
+            point,
+            delay,
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl pay_service::chain_recovery::RecoveryFaultInjector for DelayedRecoveryFault {
+    fn check(
+        &self,
+        point: pay_service::chain_recovery::RecoveryFaultPoint,
+    ) -> Result<(), AppError> {
+        if point == self.point && !self.fired.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        Ok(())
+    }
+}
+
 struct RecoveryJournalHarness {
     swap: pay_service::db::ChainSwapRecord,
     builder: Arc<FakeRecoveryBuilder>,
@@ -16084,6 +16112,73 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
         harness.broadcaster.calls.lock().await.as_slice(),
         &[committed.raw_tx_hex]
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_services, RecoveryFaultPoint,
+        BITCOIN_FEE_DECISION_PENDING_REASON,
+    };
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "feeexpires", [FakeBroadcastResult::Accept]).await;
+    let observation = LiveBitcoin::new(
+        SatPerVbyte::try_from(2.0).unwrap(),
+        1_000,
+        FeeProvenance::new("expiring-integration-test").unwrap(),
+    );
+    let expiring_decision = BitcoinFeePolicy::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        SatPerVbyte::try_from(500.0).unwrap(),
+        3,
+        900,
+    )
+    .unwrap()
+    .decide_typed(Some(&observation), None, 1_000)
+    .unwrap();
+    let delayed_commit = DelayedRecoveryFault::at(
+        RecoveryFaultPoint::AfterJournalWriteBeforeCommit,
+        Duration::from_millis(3_100),
+    );
+
+    let result = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &expiring_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &delayed_commit,
+    )
+    .await;
+
+    assert!(delayed_commit.fired.load(Ordering::SeqCst));
+    assert!(matches!(
+        result,
+        Err(AppError::RecoveryNotAvailable(reason))
+            if reason == BITCOIN_FEE_DECISION_PENDING_REASON
+    ));
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired construction authority must roll back the journal insert"
+    );
+    let swap = pay_service::db::get_chain_swap_by_id(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "refund_due");
+    assert!(swap.refund_txid.is_none());
 
     cleanup_db(&pool).await;
 }
