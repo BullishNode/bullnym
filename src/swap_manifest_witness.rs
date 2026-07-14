@@ -12,10 +12,11 @@ use std::fmt;
 use secp256k1::XOnlyPublicKey;
 
 use crate::swap_manifest::{
-    audit_append_only_manifest_set_v1, SwapManifestSetAuditV1, SwapManifestV1,
+    audit_append_only_manifest_set_v1, EncryptedSwapManifestV1, SwapManifestSetAuditV1,
+    SwapManifestV1,
 };
 use crate::swap_manifest_store::{
-    ManifestStoreError, RecoveryManifestStore, MAX_MANIFEST_FULL_SCAN_RESULTS,
+    ManifestObjectId, ManifestStoreError, RecoveryManifestStore, MAX_MANIFEST_FULL_SCAN_RESULTS,
 };
 
 /// Absolute number of records one witness load will authenticate and retain.
@@ -70,6 +71,40 @@ pub struct LoadedRecoveryWitnessV1 {
     audit: SwapManifestSetAuditV1,
 }
 
+/// One exact, authenticated external object reacquired for reconstruction.
+///
+/// The envelope is the original create-only byte string read from the witness,
+/// not a resealed copy. A stale-restore reconciler can therefore recreate the
+/// local delivery-ledger evidence and read-verify the same external object.
+/// Formatting is intentionally identity- and content-free.
+pub struct LoadedRecoveryWitnessRecordV1 {
+    manifest: SwapManifestV1,
+    encrypted_envelope: EncryptedSwapManifestV1,
+}
+
+impl LoadedRecoveryWitnessRecordV1 {
+    pub fn manifest(&self) -> &SwapManifestV1 {
+        &self.manifest
+    }
+
+    pub fn encrypted_envelope(&self) -> &EncryptedSwapManifestV1 {
+        &self.encrypted_envelope
+    }
+
+    pub fn into_parts(self) -> (SwapManifestV1, EncryptedSwapManifestV1) {
+        (self.manifest, self.encrypted_envelope)
+    }
+}
+
+impl fmt::Debug for LoadedRecoveryWitnessRecordV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedRecoveryWitnessRecordV1")
+            .field("manifest", &"<authenticated recovery evidence>")
+            .field("encrypted_envelope", &"<redacted>")
+            .finish()
+    }
+}
+
 impl LoadedRecoveryWitnessV1 {
     pub fn manifests(&self) -> &[SwapManifestV1] {
         &self.manifests
@@ -108,6 +143,7 @@ pub enum RecoveryWitnessLoadError {
     StoreObjectChanged,
     EnvelopeAuthenticationFailed,
     ObjectIdentityMismatch,
+    AuditedManifestChanged,
     AppendOnlySetInvalid,
 }
 
@@ -124,6 +160,9 @@ impl fmt::Display for RecoveryWitnessLoadError {
             Self::EnvelopeAuthenticationFailed => "recovery witness envelope authentication failed",
             Self::ObjectIdentityMismatch => {
                 "recovery witness object identity does not match its signed manifest"
+            }
+            Self::AuditedManifestChanged => {
+                "recovery witness object no longer matches the audited manifest"
             }
             Self::AppendOnlySetInvalid => "recovery witness append-only set is invalid",
         })
@@ -158,6 +197,52 @@ impl RecoveryManifestWitnessLoaderV1 {
         &self,
     ) -> Result<LoadedRecoveryWitnessV1, RecoveryWitnessLoadError> {
         self.load_bounded().await
+    }
+
+    /// Reacquire one exact object after a complete witness audit.
+    ///
+    /// The caller supplies a manifest returned by [`Self::load_quiescent`] and
+    /// must preserve the same creation-quiescent interval while stale-restore
+    /// reconstruction is in progress. The create-only store is read again,
+    /// the envelope is authenticated again, and the opened manifest must equal
+    /// the audited value byte-for-byte at the typed boundary. This retains one
+    /// exact envelope instead of multiplying peak startup memory by retaining
+    /// every encrypted object during the complete audit.
+    pub async fn load_exact_authenticated_record(
+        &self,
+        audited_manifest: &SwapManifestV1,
+    ) -> Result<LoadedRecoveryWitnessRecordV1, RecoveryWitnessLoadError> {
+        let object_id = ManifestObjectId::new(
+            audited_manifest.restore_identity.chain_swap_id,
+            audited_manifest.restore_identity.manifest_id,
+        )
+        .map_err(|_| RecoveryWitnessLoadError::ObjectIdentityMismatch)?;
+        let stored = self
+            .store
+            .get_v1(object_id)
+            .await
+            .map_err(|_| RecoveryWitnessLoadError::StoreReadFailed)?;
+        let encrypted_envelope = EncryptedSwapManifestV1::parse(stored.into_encoded())
+            .map_err(|_| RecoveryWitnessLoadError::EnvelopeAuthenticationFailed)?;
+        let manifest = SwapManifestV1::open(
+            encrypted_envelope.encoded(),
+            &self.secrets.encryption_key_id,
+            &self.secrets.encryption_key,
+            &self.secrets.expected_signer,
+        )
+        .map_err(|_| RecoveryWitnessLoadError::EnvelopeAuthenticationFailed)?;
+        if manifest.restore_identity.chain_swap_id != object_id.chain_swap_id()
+            || manifest.restore_identity.manifest_id != object_id.manifest_id()
+        {
+            return Err(RecoveryWitnessLoadError::ObjectIdentityMismatch);
+        }
+        if manifest != *audited_manifest {
+            return Err(RecoveryWitnessLoadError::AuditedManifestChanged);
+        }
+        Ok(LoadedRecoveryWitnessRecordV1 {
+            manifest,
+            encrypted_envelope,
+        })
     }
 
     async fn load_bounded(&self) -> Result<LoadedRecoveryWitnessV1, RecoveryWitnessLoadError> {
@@ -623,8 +708,13 @@ mod tests {
         let population_store = memory_store(inner.clone(), PREFIX);
         let signer = signing_key(0x11);
         let chain = three_manifest_chain();
+        let mut expected_envelopes = Vec::with_capacity(chain.len());
         for manifest in &chain {
-            store_manifest(&population_store, manifest, &signer).await;
+            expected_envelopes.push(
+                store_manifest(&population_store, manifest, &signer)
+                    .await
+                    .into_encoded(),
+            );
         }
 
         let list_prefix = Path::from(format!("{PREFIX}/v1"));
@@ -660,6 +750,35 @@ mod tests {
             .map(|manifest| manifest.restore_identity.manifest_sequence)
             .collect();
         assert_eq!(sequences, [1, 2, 3]);
+        for (offset, manifest) in loaded.manifests().iter().enumerate() {
+            let record = loader
+                .load_exact_authenticated_record(manifest)
+                .await
+                .unwrap();
+            assert_eq!(record.manifest(), manifest);
+            assert_eq!(
+                record.encrypted_envelope().encoded(),
+                expected_envelopes[offset]
+            );
+            let debug = format!("{record:?}");
+            assert!(!debug.contains(&expected_envelopes[offset]));
+            assert!(!debug.contains(&record.manifest().restore_identity.boltz_swap_id));
+        }
+
+        let mut changed_after_audit = loaded.manifests()[1].clone();
+        changed_after_audit
+            .merchant_policy
+            .merchant_nym
+            .push_str("-different");
+        let error = loader
+            .load_exact_authenticated_record(&changed_after_audit)
+            .await
+            .unwrap_err();
+        assert_eq!(error, RecoveryWitnessLoadError::AuditedManifestChanged);
+        assert!(error.source().is_none());
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&changed_after_audit.merchant_policy.merchant_nym));
+        assert!(!rendered.contains(&changed_after_audit.restore_identity.boltz_swap_id));
         assert_eq!(loaded.audit().manifest_count, 3);
         assert_eq!(loaded.audit().last_manifest_sequence, Some(3));
         assert_eq!(
