@@ -9,6 +9,111 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
+    "WITH required_columns(column_name, type_oid, ordinal) AS (VALUES \
+         ('fee_decision_purpose', 'text'::REGTYPE, 1), \
+         ('fee_decision_rail', 'text'::REGTYPE, 2), \
+         ('fee_decision_target', 'text'::REGTYPE, 3), \
+         ('fee_decision_source', 'text'::REGTYPE, 4), \
+         ('fee_decision_rate_sat_vb', 'float8'::REGTYPE, 5), \
+         ('fee_decision_quoted_at_unix', 'int8'::REGTYPE, 6), \
+         ('fee_decision_evaluated_at_unix', 'int8'::REGTYPE, 7), \
+         ('fee_decision_freshness_age_secs', 'int8'::REGTYPE, 8), \
+         ('fee_decision_freshness_max_age_secs', 'int8'::REGTYPE, 9), \
+         ('fee_decision_provenance', 'text'::REGTYPE, 10), \
+         ('fee_decision_policy_floor_sat_vb', 'float8'::REGTYPE, 11), \
+         ('fee_decision_policy_cap_sat_vb', 'float8'::REGTYPE, 12), \
+         ('fee_decision_policy_version', 'text'::REGTYPE, 13) \
+     ), validated_constraints AS ( \
+         SELECT constraint_info.conname, \
+                pg_get_expr( \
+                    constraint_info.conbin, constraint_info.conrelid, TRUE \
+                ) AS expression \
+           FROM pg_constraint constraint_info \
+           JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+          WHERE namespace.nspname = 'public' \
+            AND relation.relname = 'chain_swap_tx_attempts' \
+            AND relation.relkind = 'r' \
+            AND constraint_info.contype = 'c' \
+            AND constraint_info.convalidated \
+            AND constraint_info.conname IN ( \
+                'chain_swap_tx_attempts_fee_authority_shape_check', \
+                'chain_swap_tx_attempts_fee_authority_value_check' \
+            ) \
+     ), shape_constraint AS ( \
+         SELECT regexp_replace(expression, '[[:space:]]+', '', 'g') AS expression \
+           FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_shape_check' \
+     ), value_constraint AS ( \
+         SELECT expression \
+           FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_value_check' \
+     ), expected_shape AS ( \
+         SELECT 'num_nonnulls(' \
+                || string_agg(column_name, ',' ORDER BY ordinal) \
+                || ')' AS call \
+           FROM required_columns \
+     ) \
+     SELECT NOT EXISTS ( \
+         SELECT 1 FROM required_columns required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_attribute attribute \
+                JOIN pg_class relation ON relation.oid = attribute.attrelid \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND relation.relname = 'chain_swap_tx_attempts' \
+                 AND relation.relkind = 'r' \
+                 AND attribute.attname = required.column_name \
+                 AND attribute.atttypid = required.type_oid \
+                 AND attribute.atttypmod = -1 \
+                 AND NOT attribute.attnotnull \
+                 AND attribute.attnum > 0 \
+                 AND NOT attribute.attisdropped \
+          ) \
+     ) \
+     AND (SELECT COUNT(*) FROM validated_constraints) = 2 \
+     AND EXISTS ( \
+         SELECT 1 \
+           FROM shape_constraint \
+           CROSS JOIN expected_shape \
+          WHERE position(expected_shape.call IN shape_constraint.expression) > 0 \
+            AND position( \
+                '=ANY(ARRAY[0,13])' IN shape_constraint.expression \
+            ) > 0 \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM required_columns required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 FROM value_constraint \
+               WHERE position(required.column_name IN value_constraint.expression) > 0 \
+          ) \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 \
+           FROM (VALUES \
+             ('''btc_recovery'''), \
+             ('''bitcoin_recovery'''), \
+             ('''bitcoin'''), \
+             ('''fastestFee'''), \
+             ('''bitcoin_live'''), \
+             ('''bitcoin_last_known_good'''), \
+             ('''liquid_claim'''), \
+             ('''liquid_claim_replacement'''), \
+             ('''chain_liquid_claim'''), \
+             ('''liquid'''), \
+             ('''1'''), \
+             ('''liquid_live'''), \
+             ('''liquid_last_known_good'''), \
+             ('''review25-v1''') \
+           ) required(marker) \
+          WHERE NOT EXISTS ( \
+              SELECT 1 FROM value_constraint \
+               WHERE position(required.marker IN value_constraint.expression) > 0 \
+          ) \
+     )";
+
 const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
     "SELECT NOT EXISTS ( \
          SELECT 1 \
@@ -308,6 +413,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     if !schema_marker_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
+        || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
         || !merchant_settlement_privileges_present(pool).await?
     {
@@ -438,6 +544,12 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
 
 async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_PRIVILEGES_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn merchant_settlement_fee_schema_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL)
         .fetch_one(pool)
         .await
 }
@@ -1286,11 +1398,67 @@ mod tests {
         chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
         journal_privileges_ready, recovery_commitment_privileges_ready,
         swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
-        MERCHANT_SETTLEMENT_PRIVILEGES_SQL, MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
+        MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL, MERCHANT_SETTLEMENT_PRIVILEGES_SQL,
+        MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
     };
 
     #[test]
     fn merchant_settlement_readiness_matches_deploy_boundary() {
+        for (column, type_name, ordinal) in [
+            ("fee_decision_purpose", "text", 1),
+            ("fee_decision_rail", "text", 2),
+            ("fee_decision_target", "text", 3),
+            ("fee_decision_source", "text", 4),
+            ("fee_decision_rate_sat_vb", "float8", 5),
+            ("fee_decision_quoted_at_unix", "int8", 6),
+            ("fee_decision_evaluated_at_unix", "int8", 7),
+            ("fee_decision_freshness_age_secs", "int8", 8),
+            ("fee_decision_freshness_max_age_secs", "int8", 9),
+            ("fee_decision_provenance", "text", 10),
+            ("fee_decision_policy_floor_sat_vb", "float8", 11),
+            ("fee_decision_policy_cap_sat_vb", "float8", 12),
+            ("fee_decision_policy_version", "text", 13),
+        ] {
+            let exact_column = format!("('{column}', '{type_name}'::REGTYPE, {ordinal})");
+            assert!(
+                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(&exact_column),
+                "missing exact nullable fee column: {exact_column}"
+            );
+        }
+        for schema_guard in [
+            "attribute.atttypid = required.type_oid",
+            "attribute.atttypmod = -1",
+            "NOT attribute.attnotnull",
+            "constraint_info.contype = 'c'",
+            "constraint_info.convalidated",
+            "chain_swap_tx_attempts_fee_authority_shape_check",
+            "chain_swap_tx_attempts_fee_authority_value_check",
+            "num_nonnulls(",
+            "=ANY(ARRAY[0,13])",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(schema_guard),
+                "missing fee-schema guard: {schema_guard}"
+            );
+        }
+        for value_marker in [
+            "btc_recovery",
+            "bitcoin_recovery",
+            "bitcoin_live",
+            "bitcoin_last_known_good",
+            "liquid_claim",
+            "liquid_claim_replacement",
+            "chain_liquid_claim",
+            "liquid_live",
+            "liquid_last_known_good",
+            "review25-v1",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(value_marker),
+                "missing fee-value authority marker: {value_marker}"
+            );
+        }
+
         for (table, trigger, function, trigger_type) in [
             (
                 "chain_swap_tx_attempts",

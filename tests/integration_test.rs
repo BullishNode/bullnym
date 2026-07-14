@@ -130,6 +130,61 @@ async fn test_pool() -> PgPool {
         .expect("failed to connect to test database")
 }
 
+/// Exercise the complete deployment readiness contract as a non-owner role.
+/// The disposable database has no pre-053 deployment grants, so this role
+/// inherits the protected 053-055 grants from `bullnym_app` and receives only
+/// the legacy privileges that production provisioning supplies separately.
+async fn readiness_runtime_role_test_pool(admin: &PgPool) -> PgPool {
+    sqlx::query(
+        "DO $role$ BEGIN \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bullnym_readiness_test') THEN \
+                 CREATE ROLE bullnym_readiness_test NOLOGIN; \
+             END IF; \
+         END $role$",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query("GRANT bullnym_app TO bullnym_readiness_test")
+        .execute(admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO bullnym_readiness_test")
+        .execute(admin)
+        .await
+        .unwrap();
+    sqlx::query(
+        "GRANT INSERT, UPDATE ON TABLE \
+             invoice_direct_scan_heads, watcher_lane_progress \
+         TO bullnym_readiness_test",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "GRANT INSERT ON TABLE \
+             invoice_direct_payment_transitions, swap_key_allocations \
+         TO bullnym_readiness_test",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+
+    PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_readiness_test")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .expect("failed to connect deployment-shaped readiness test pool")
+}
+
 async fn named_single_connection_test_pool(application_name: &str) -> PgPool {
     let options = PgConnectOptions::from_str(&require_test_db())
         .expect("invalid TEST_DATABASE_URL")
@@ -1182,19 +1237,20 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 
 #[tokio::test]
 async fn readiness_rejects_schema_before_latest_migration() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
 
     sqlx::query(
         "ALTER TABLE swap_key_allocations RENAME CONSTRAINT \
          swap_key_allocations_derivation_identity_key \
          TO swap_key_allocations_derivation_identity_key_before_readiness_test",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
@@ -1202,7 +1258,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
          swap_key_allocations_derivation_identity_key_before_readiness_test \
          TO swap_key_allocations_derivation_identity_key",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
 
@@ -1213,7 +1269,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
         "055_merchant_settlement_lifecycle"
     );
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
@@ -1224,21 +1280,21 @@ async fn readiness_rejects_schema_before_latest_migration() {
     sqlx::query(
         "ALTER TABLE swap_key_allocations DISABLE TRIGGER swap_key_allocations_reject_delete",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (missing_delete_guard_status, missing_delete_guard_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE swap_key_allocations ENABLE TRIGGER swap_key_allocations_reject_delete",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
     assert_eq!(missing_delete_guard_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(missing_delete_guard_body["ready"], false);
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1250,23 +1306,23 @@ async fn readiness_rejects_schema_before_latest_migration() {
          chain_swap_records_creation_terms_shape_check \
          TO chain_swap_records_creation_terms_shape_check_before_readiness_test",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (missing_shape_guard_status, missing_shape_guard_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
          chain_swap_records_creation_terms_shape_check_before_readiness_test \
          TO chain_swap_records_creation_terms_shape_check",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
     assert_eq!(missing_shape_guard_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(missing_shape_guard_body["ready"], false);
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1277,25 +1333,172 @@ async fn readiness_rejects_schema_before_latest_migration() {
         "ALTER TABLE chain_swap_records DISABLE TRIGGER \
          chain_swap_records_reject_creation_terms_update",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (mutable_terms_status, mutable_terms_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE chain_swap_records ENABLE TRIGGER \
          chain_swap_records_reject_creation_terms_update",
     )
-    .execute(&pool)
+    .execute(&admin)
     .await
     .unwrap();
     assert_eq!(mutable_terms_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(mutable_terms_body["ready"], false);
 
-    let app = test_app(test_state(pool));
+    let app = test_app(test_state(runtime));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
+}
+
+#[tokio::test]
+async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let (shape_definition, value_definition) = sqlx::query_as::<_, (String, String)>(
+        "SELECT \
+            (SELECT pg_get_constraintdef(constraint_info.oid, TRUE) \
+               FROM pg_constraint constraint_info \
+               JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' \
+                AND relation.relname = 'chain_swap_tx_attempts' \
+                AND constraint_info.conname = \
+                    'chain_swap_tx_attempts_fee_authority_shape_check'), \
+            (SELECT pg_get_constraintdef(constraint_info.oid, TRUE) \
+               FROM pg_constraint constraint_info \
+               JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' \
+                AND relation.relname = 'chain_swap_tx_attempts' \
+                AND constraint_info.conname = \
+                    'chain_swap_tx_attempts_fee_authority_value_check')",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+
+    for (constraint_name, temporary_name) in [
+        (
+            "chain_swap_tx_attempts_fee_authority_shape_check",
+            "chain_swap_tx_attempts_fee_authority_shape_check_before_readiness_test",
+        ),
+        (
+            "chain_swap_tx_attempts_fee_authority_value_check",
+            "chain_swap_tx_attempts_fee_authority_value_check_before_readiness_test",
+        ),
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chain_swap_tx_attempts RENAME CONSTRAINT \
+             {constraint_name} TO {temporary_name}"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let renamed = readiness::schema_and_journal_ready(&runtime).await;
+        sqlx::query(&format!(
+            "ALTER TABLE chain_swap_tx_attempts RENAME CONSTRAINT \
+             {temporary_name} TO {constraint_name}"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+        assert!(!renamed.unwrap(), "renamed {constraint_name} stayed ready");
+        assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+    }
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts DROP CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_shape_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_shape_check CHECK ( \
+             num_nonnulls( \
+                 fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+                 fee_decision_source, fee_decision_rate_sat_vb, \
+                 fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+                 fee_decision_freshness_age_secs, \
+                 fee_decision_freshness_max_age_secs, fee_decision_provenance, \
+                 fee_decision_policy_floor_sat_vb, fee_decision_policy_cap_sat_vb, \
+                 fee_decision_policy_version \
+             ) IN (0, 12, 13) \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let weakened_shape = readiness::schema_and_journal_ready(&runtime).await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts DROP CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_shape_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_shape_check {shape_definition}"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    assert!(
+        !weakened_shape.unwrap(),
+        "weakened shape constraint stayed ready"
+    );
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts DROP CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_value_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_value_check CHECK ( \
+             fee_decision_purpose IS NULL \
+             OR fee_decision_policy_version = 'review25-v1' \
+         )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let weakened_value = readiness::schema_and_journal_ready(&runtime).await;
+    sqlx::query(
+        "ALTER TABLE chain_swap_tx_attempts DROP CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_value_check",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
+         chain_swap_tx_attempts_fee_authority_value_check {value_definition}"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    assert!(
+        !weakened_value.unwrap(),
+        "weakened value constraint stayed ready"
+    );
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
 }
 
 #[tokio::test]
