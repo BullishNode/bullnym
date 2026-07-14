@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=55
+EXPECTED_MIGRATION_COUNT=56
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "055_merchant_settlement_lifecycle.sql" ]] \
-  || die "unexpected migration-055 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "056_chain_swap_renegotiation_journal.sql" ]] \
+  || die "unexpected migration-056 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
