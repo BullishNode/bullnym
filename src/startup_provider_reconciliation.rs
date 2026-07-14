@@ -4,8 +4,9 @@
 //! PostgreSQL snapshot, and provider restore fetch one quiescent observation.
 //! The result is a process-startup admission fact only. The accepted creation
 //! permit may resume or repair already-persisted canonical obligations before
-//! yielding a clean guard; this module adds no reconstruction policy, worker,
-//! public endpoint, or recovery-evidence exposure of its own.
+//! yielding a clean guard. It reconstructs only exact authenticated current-v1
+//! obligations and their delivery-ledger rows; it adds no provider mutation,
+//! worker, public endpoint, or recovery-evidence exposure of its own.
 
 use std::fmt;
 use std::future::Future;
@@ -17,10 +18,12 @@ use crate::boltz_restore_fetch::BoltzRestoreFetcher;
 use crate::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1;
 use crate::chain_lockup_witness_audit::audit_manifest_set_against_chain_lockup_witness_v1;
 use crate::chain_swap_creation_permit::{ChainSwapCreationPermit, ChainSwapCreationPermitError};
+use crate::chain_swap_stale_restore::reconstruct_missing_manifested_chain_swaps_v1;
 use crate::recovery_shadow_audit::{
     RecoveryShadowAuditCoordinatorV1, RecoveryShadowBoltzFetcherV1, RecoveryShadowClassificationV1,
     RecoveryShadowReportV1,
 };
+use crate::swap_manifest_delivery_rebuild::rebuild_manifest_delivery_ledger_from_quiescent_witness_v1;
 use crate::swap_manifest_runtime::RecoveryManifestRuntimeV1;
 use crate::swap_manifest_witness::{
     RecoveryManifestWitnessLoaderV1, MAX_RECOVERY_WITNESS_RECORDS_V1,
@@ -38,6 +41,8 @@ pub struct StartupProviderReconciliationFactV1 {
     report: RecoveryShadowReportV1,
     chain_witness: StartupChainLockupWitnessReportV1,
     repaired_obligation_count: usize,
+    reconstructed_chain_swap_count: usize,
+    reconstructed_delivery_count: usize,
 }
 
 /// Identity-free summary of the complete Bitcoin-mainnet witness audit used
@@ -78,6 +83,16 @@ impl StartupProviderReconciliationFactV1 {
     pub fn repaired_obligation_count(&self) -> usize {
         self.repaired_obligation_count
     }
+
+    /// Missing signed current-v1 obligations restored before the clean audit.
+    pub fn reconstructed_chain_swap_count(&self) -> usize {
+        self.reconstructed_chain_swap_count
+    }
+
+    /// Missing migration-052 delivery rows rebuilt from the same witness.
+    pub fn reconstructed_delivery_count(&self) -> usize {
+        self.reconstructed_delivery_count
+    }
 }
 
 fn startup_sources_exact(
@@ -93,6 +108,8 @@ fn startup_sources_exact(
 pub enum StartupProviderReconciliationErrorV1 {
     CreationBoundaryUnavailable,
     RepairLimitExceeded,
+    ChainSwapReconstructionFailed,
+    DeliveryLedgerRebuildFailed,
     ThreeSourceAuditFailed,
     ChainWitnessAuditFailed,
     CreationBoundaryReleaseFailed,
@@ -105,6 +122,8 @@ impl fmt::Display for StartupProviderReconciliationErrorV1 {
                 "startup recovery creation boundary is unavailable"
             }
             Self::RepairLimitExceeded => "startup recovery repair limit was reached",
+            Self::ChainSwapReconstructionFailed => "startup chain-swap reconstruction failed",
+            Self::DeliveryLedgerRebuildFailed => "startup manifest delivery-ledger rebuild failed",
             Self::ThreeSourceAuditFailed => "startup recovery three-source audit failed",
             Self::ChainWitnessAuditFailed => "startup recovery chain witness audit failed",
             Self::CreationBoundaryReleaseFailed => {
@@ -123,8 +142,9 @@ impl std::error::Error for StartupProviderReconciliationErrorV1 {
 /// Run the accepted witness/local/provider audit under the same process-wide
 /// permit used by every chain-swap creation route.
 ///
-/// Holding the permit resumes any interrupted manifest delivery first and then
-/// prevents a new provider mutation from appearing between the three reads.
+/// Holding the permit resumes any interrupted manifest delivery, reconstructs
+/// only authenticated current-v1 rows, rebuilds their delivery evidence, and
+/// prevents a new provider mutation from appearing between the source reads.
 /// Classified differences are returned as a closed admission fact, while
 /// unavailable or invalid sources return a fixed source-free error.
 pub async fn reconcile_startup_provider_state_v1(
@@ -145,8 +165,20 @@ pub async fn reconcile_startup_provider_state_v1(
 
     let witness =
         RecoveryManifestWitnessLoaderV1::new(runtime.store().clone(), witness_open_secrets);
-    let provider = RecoveryShadowBoltzFetcherV1::new(fetcher, swap_master_key);
     let audit = async {
+        // A stale database can be missing both the canonical current-v1 row and
+        // its migration-052 delivery evidence. Reconstruct the signed source
+        // row first, then rebuild the ledger that foreign-keys to it, and only
+        // then take fresh local/provider/witness snapshots for admission.
+        let reconstruction =
+            reconstruct_missing_manifested_chain_swaps_v1(pool, &witness, fetcher, swap_master_key)
+                .await
+                .map_err(|_| StartupProviderReconciliationErrorV1::ChainSwapReconstructionFailed)?;
+        let delivery_rebuild =
+            rebuild_manifest_delivery_ledger_from_quiescent_witness_v1(pool, &witness)
+                .await
+                .map_err(|_| StartupProviderReconciliationErrorV1::DeliveryLedgerRebuildFailed)?;
+        let provider = RecoveryShadowBoltzFetcherV1::new(fetcher, swap_master_key);
         let (report, manifests) =
             RecoveryShadowAuditCoordinatorV1::new(witness, pool.clone(), provider)
                 .run_once_with_manifests()
@@ -170,6 +202,8 @@ pub async fn reconcile_startup_provider_state_v1(
                 spent_manifest_count: chain.spent_manifest_count,
                 conflicting_manifest_count: chain.conflicting_manifest_count,
             },
+            reconstruction.reconstructed_records,
+            delivery_rebuild.reconstructed_records,
         ))
     }
     .await;
@@ -179,11 +213,14 @@ pub async fn reconcile_startup_provider_state_v1(
         .await
         .map_err(|_| StartupProviderReconciliationErrorV1::CreationBoundaryReleaseFailed)?;
 
-    let (report, chain_witness) = audit?;
+    let (report, chain_witness, reconstructed_chain_swap_count, reconstructed_delivery_count) =
+        audit?;
     Ok(StartupProviderReconciliationFactV1 {
         report,
         chain_witness,
         repaired_obligation_count,
+        reconstructed_chain_swap_count,
+        reconstructed_delivery_count,
     })
 }
 
@@ -270,6 +307,8 @@ mod tests {
                 conflicting_manifest_count: 0,
             },
             repaired_obligation_count: 0,
+            reconstructed_chain_swap_count: 0,
+            reconstructed_delivery_count: 0,
         }
     }
 
@@ -278,6 +317,8 @@ mod tests {
         for error in [
             StartupProviderReconciliationErrorV1::CreationBoundaryUnavailable,
             StartupProviderReconciliationErrorV1::RepairLimitExceeded,
+            StartupProviderReconciliationErrorV1::ChainSwapReconstructionFailed,
+            StartupProviderReconciliationErrorV1::DeliveryLedgerRebuildFailed,
             StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
             StartupProviderReconciliationErrorV1::ChainWitnessAuditFailed,
             StartupProviderReconciliationErrorV1::CreationBoundaryReleaseFailed,
