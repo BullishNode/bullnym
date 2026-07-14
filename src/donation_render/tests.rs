@@ -309,6 +309,26 @@ fn pwa_shell_injects_config_and_og_placeholders() {
 }
 
 #[test]
+fn nym_avatar_url_uses_source_digest_as_cache_key() {
+    let first = nym_avatar_url("bullpay.ca", "alice", &"11".repeat(32));
+    let replacement = nym_avatar_url("bullpay.ca", "alice", &"22".repeat(32));
+
+    assert_eq!(
+        first,
+        format!(
+            "https://bullpay.ca/img/alice/avatar.webp?v={}",
+            "11".repeat(32)
+        )
+    );
+    assert_ne!(first, replacement);
+    assert_eq!(
+        first.split('?').next(),
+        replacement.split('?').next(),
+        "the historical nym-keyed image path remains compatible"
+    );
+}
+
+#[test]
 fn pwa_shell_escapes_manifest_href_attr() {
     // Defense-in-depth: the manifest href is HTML-attr-escaped before it lands
     // in the <link>. A valid slug can't contain quotes (is_valid_slug), so the
