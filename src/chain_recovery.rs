@@ -31,6 +31,7 @@ use secp256k1_musig::musig;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::builder_fee::BitcoinBuilderFeeDecision;
 use crate::chain_swap_action::{
@@ -798,10 +799,12 @@ async fn prepare_live_cooperative_operation(
         serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
             AppError::ClaimError(format!("invalid chain Boltz response JSON: {error}"))
         })?;
-    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|_| AppError::ClaimError("invalid chain refund key hex".into()))?;
+    let refund_key_bytes = Zeroizing::new(
+        hex::decode(&swap.refund_key_hex)
+            .map_err(|_| AppError::ClaimError("invalid chain refund key hex".into()))?,
+    );
     let secp = Secp256k1::new();
-    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
+    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(refund_key_bytes.as_slice())
         .map_err(|_| AppError::ClaimError("invalid chain refund secret key".into()))?;
     let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
     let refund_public_key = PublicKey::new(refund_keypair.public_key());
@@ -2106,9 +2109,11 @@ fn validate_automatic_unilateral_refund_witness(
     let refund_leaf = ScriptBuf::from_bytes(refund_leaf_bytes);
     let leaf_hash = TapLeafHash::from_script(&refund_leaf, LeafVersion::TapScript);
 
-    let key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
-    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
+    let key_bytes =
+        Zeroizing::new(hex::decode(&swap.refund_key_hex).map_err(|_| {
+            AppError::ClaimError("automatic recovery refund key is invalid".into())
+        })?);
+    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(key_bytes.as_slice())
         .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let refund_keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret_key);
@@ -2716,10 +2721,12 @@ async fn construct_live_refund(
     }
     swap.verify_creation_response_integrity()
         .map_err(AppError::ClaimError)?;
-    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?;
+    let refund_key_bytes = Zeroizing::new(
+        hex::decode(&swap.refund_key_hex)
+            .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?,
+    );
     let secp = Secp256k1::new();
-    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
+    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(refund_key_bytes.as_slice())
         .map_err(|e| AppError::ClaimError(format!("invalid chain refund secret key: {e}")))?;
     let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
     let refund_public_key = PublicKey::new(refund_keypair.public_key());
