@@ -2175,6 +2175,25 @@ struct PreparedChainClaimJournal {
     fee_rate_sat_vb: f64,
 }
 
+fn ensure_chain_claim_journal_fee_matches_actual(
+    journal_fee_amount_sat: u64,
+    journal_fee_rate_sat_vb: f64,
+    actual_fee_sat: i64,
+    actual_fee_rate_sat_vb: f64,
+) -> Result<(), AppError> {
+    let actual_fee_amount_sat = u64::try_from(actual_fee_sat).map_err(|_| {
+        AppError::ClaimError("Liquid chain claim fee is negative or unrepresentable".into())
+    })?;
+    if journal_fee_amount_sat != actual_fee_amount_sat
+        || journal_fee_rate_sat_vb.to_bits() != actual_fee_rate_sat_vb.to_bits()
+    {
+        return Err(AppError::ClaimError(format!(
+            "Liquid chain claim settlement fee {journal_fee_amount_sat} sat at {journal_fee_rate_sat_vb} sat/vB does not match exact signed transaction fee {actual_fee_amount_sat} sat at {actual_fee_rate_sat_vb} sat/vB"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistedChainClaimJournalMode {
     ConstructAndInsert,
@@ -2474,8 +2493,7 @@ async fn claim_chain_swap_inner(
         swap.claim_tx_hex.as_deref(),
         swap.claim_txid.as_deref(),
     )?;
-    let had_persisted_claim =
-        journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact;
+    let had_persisted_claim = journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact;
     require_terminal_chain_claim_journal(status, journal_mode)?;
     if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert
         && (fee_decision.is_none()
@@ -2654,13 +2672,18 @@ async fn claim_chain_swap_inner(
         let fee_record = new_journal.fee_authority.ok_or_else(|| {
             AppError::ClaimError("unjournaled chain claim is missing fee authority".into())
         })?;
-        let (actual_fee_sat, actual_fee_rate_sat_vb, actual_vbytes) =
-            liquid_actual_fee(&claim_tx)?;
+        let (actual_fee_sat, actual_fee_rate_sat_vb, actual_vbytes) = liquid_actual_fee(&claim_tx)?;
         ensure_actual_fee_authorized(
             "Liquid chain claim",
             actual_fee_sat,
             actual_vbytes,
             fee_record,
+        )?;
+        ensure_chain_claim_journal_fee_matches_actual(
+            prepared.fee_amount_sat,
+            prepared.fee_rate_sat_vb,
+            actual_fee_sat,
+            actual_fee_rate_sat_vb,
         )?;
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
@@ -2683,13 +2706,6 @@ async fn claim_chain_swap_inner(
                 reason: LIQUID_FEE_DECISION_PENDING_REASON,
             });
         }
-        db::insert_liquid_merchant_settlement_journal(&mut tx, &new_journal)
-            .await
-            .map_err(|error| {
-                AppError::DbError(format!(
-                    "insert Liquid merchant settlement journal: {error}"
-                ))
-            })?;
         let persisted = sqlx::query(
             "UPDATE chain_swap_records \
              SET claim_tx_hex = $2, claim_txid = $3, \

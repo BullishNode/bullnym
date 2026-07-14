@@ -39,6 +39,7 @@ fn settlement_record(
         claim_txid: matches!(chain, SettlementChain::Liquid)
             .then(|| settlement_txid('1').as_str().to_owned()),
         claim_tx_hex: None,
+        claim_fee_authority: db::LiquidClaimFeeAuthority::Legacy,
         claim_attempts: 0,
         last_claim_error: None,
         cooperative_refused: false,

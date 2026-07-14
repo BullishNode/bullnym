@@ -195,6 +195,22 @@ fn liquid_fee_authority_rejects_one_sat_under_and_over_the_exact_size_fee() {
 }
 
 #[test]
+fn chain_claim_journal_fee_must_match_exact_signed_transaction_tuple() {
+    let rate = 1_000.0 / 141.0;
+    assert!(ensure_chain_claim_journal_fee_matches_actual(1_000, rate, 1_000, rate).is_ok());
+
+    assert!(ensure_chain_claim_journal_fee_matches_actual(1_000, rate, -1, rate).is_err());
+    assert!(ensure_chain_claim_journal_fee_matches_actual(999, rate, 1_000, rate).is_err());
+    assert!(ensure_chain_claim_journal_fee_matches_actual(
+        1_000,
+        f64::from_bits(rate.to_bits() + 1),
+        1_000,
+        rate,
+    )
+    .is_err());
+}
+
+#[test]
 fn chain_claim_uses_validated_immutable_creation_destination() {
     let terms = valid_chain_creation_terms();
     assert_eq!(
