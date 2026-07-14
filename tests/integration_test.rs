@@ -17814,6 +17814,45 @@ struct RecoveryJournalHarness {
     expected_raw_hex: String,
 }
 
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct RecoveryReplaySnapshot {
+    parent_status: String,
+    parent_refund_txid: Option<String>,
+    parent_updated_at_micros: i64,
+    attempt_status: String,
+    broadcast_attempts: i32,
+    last_broadcast_result: Option<String>,
+    broadcast_at_micros: Option<i64>,
+    confirmed_at_micros: Option<i64>,
+    finalized_at_micros: Option<i64>,
+    attempt_updated_at_micros: i64,
+}
+
+async fn recovery_replay_snapshot(pool: &PgPool, chain_swap_id: Uuid) -> RecoveryReplaySnapshot {
+    sqlx::query_as(
+        "SELECT c.status AS parent_status, c.refund_txid AS parent_refund_txid, \
+                (EXTRACT(EPOCH FROM c.updated_at) * 1000000)::BIGINT \
+                    AS parent_updated_at_micros, \
+                a.status AS attempt_status, a.broadcast_attempts, \
+                a.last_broadcast_result, \
+                (EXTRACT(EPOCH FROM a.broadcast_at) * 1000000)::BIGINT \
+                    AS broadcast_at_micros, \
+                (EXTRACT(EPOCH FROM a.confirmed_at) * 1000000)::BIGINT \
+                    AS confirmed_at_micros, \
+                (EXTRACT(EPOCH FROM a.finalized_at) * 1000000)::BIGINT \
+                    AS finalized_at_micros, \
+                (EXTRACT(EPOCH FROM a.updated_at) * 1000000)::BIGINT \
+                    AS attempt_updated_at_micros \
+           FROM chain_swap_records c \
+           JOIN chain_swap_tx_attempts a ON a.chain_swap_id = c.id \
+          WHERE c.id = $1 AND a.purpose = 'btc_recovery'",
+    )
+    .bind(chain_swap_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn seed_recovery_journal_harness(
     pool: &PgPool,
     suffix: &str,
@@ -19248,6 +19287,121 @@ async fn automatic_fallback_worklist_redrives_refunding_journal_after_restart() 
         [harness.swap.id],
         "a broadcast transaction remains scheduled until terminal chain evidence adopts it"
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn exact_recovery_replay_preserves_stale_settlement_eligibility_and_evidence() {
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
+
+    const STALE_PARENT_UNIX: i64 = 946_684_800;
+    const STALE_ATTEMPT_UNIX: i64 = STALE_PARENT_UNIX + 1;
+    const SETTLEMENT_SCAN_EPOCH_MICROS: i64 = (STALE_PARENT_UNIX + 601) * 1_000_000;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "exact-replay-aging", [FakeBroadcastResult::Accept])
+            .await;
+
+    execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &harness.fee_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .unwrap();
+    let attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for status in ["broadcast", "confirmed", "finalized"] {
+        let stable_result = format!("settlement-owned {status} result");
+        sqlx::query(
+            "UPDATE chain_swap_records \
+                SET status = 'refunding', refund_txid = $2, \
+                    updated_at = to_timestamp($3) \
+              WHERE id = $1",
+        )
+        .bind(harness.swap.id)
+        .bind(&harness.expected_txid)
+        .bind(STALE_PARENT_UNIX)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE chain_swap_tx_attempts \
+                SET status = $2, last_broadcast_result = $3, \
+                    broadcast_at = to_timestamp($4), \
+                    confirmed_at = CASE WHEN $2 IN ('confirmed', 'finalized') \
+                                        THEN to_timestamp($4) ELSE NULL END, \
+                    finalized_at = CASE WHEN $2 = 'finalized' \
+                                        THEN to_timestamp($4) ELSE NULL END, \
+                    updated_at = to_timestamp($4) \
+              WHERE id = $1",
+        )
+        .bind(attempt.id)
+        .bind(status)
+        .bind(&stable_result)
+        .bind(STALE_ATTEMPT_UNIX)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before = recovery_replay_snapshot(&pool, harness.swap.id).await;
+        let due_before = pay_service::db::list_stale_refunding_chain_swaps(
+            &pool,
+            600,
+            SETTLEMENT_SCAN_EPOCH_MICROS,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            due_before.iter().map(|swap| swap.id).collect::<Vec<_>>(),
+            [harness.swap.id],
+            "{status} precondition must be eligible for settlement"
+        );
+
+        for replay_result in [
+            "first exact observation replay",
+            "second exact observation replay",
+        ] {
+            pay_service::db::complete_recovery_broadcast(
+                &pool,
+                attempt.id,
+                harness.swap.id,
+                &harness.expected_txid,
+                replay_result,
+            )
+            .await
+            .unwrap();
+        }
+
+        let after = recovery_replay_snapshot(&pool, harness.swap.id).await;
+        assert_eq!(after, before, "exact {status} replay mutated durable state");
+        let due_after = pay_service::db::list_stale_refunding_chain_swaps(
+            &pool,
+            600,
+            SETTLEMENT_SCAN_EPOCH_MICROS,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            due_after.iter().map(|swap| swap.id).collect::<Vec<_>>(),
+            [harness.swap.id],
+            "exact {status} replay postponed settlement eligibility"
+        );
+    }
 
     cleanup_db(&pool).await;
 }
