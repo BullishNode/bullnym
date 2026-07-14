@@ -812,6 +812,7 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
     let mut exact_sources = Vec::new();
     let mut bitcoin_timeout_height = None;
     let mut amount_relation = PrimaryBitcoinAmountRelationV1::Unknown;
+    let mut observed_primary_amount_sat = None;
     match (primary_target.as_ref(), bitcoin_snapshot.as_ref().ok()) {
         (Some(target), Some((snapshot, authority))) => {
             let projection =
@@ -823,6 +824,7 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
                     })?;
             projection.apply_to_reducer_evidence(&mut evidence);
             amount_relation = projection.amount_relation();
+            observed_primary_amount_sat = projection.observed_amount_sat();
             let projected =
                 classify_automatic_bitcoin_source(&projection, snapshot, recovery_attempt);
             evidence.bitcoin_source = projected.bitcoin_source;
@@ -892,6 +894,15 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
         amount_relation,
         renegotiation.as_ref(),
     );
+    if declined_wrong_amount_closes_original_liquid_path(
+        &evidence,
+        swap.id,
+        amount_relation,
+        observed_primary_amount_sat,
+        renegotiation.as_ref(),
+    ) {
+        evidence.liquid_path = LiquidPathEvidence::Unavailable;
+    }
 
     Ok(CollectedAutomaticFallbackEvidence {
         evidence,
@@ -1473,6 +1484,35 @@ fn classify_renegotiation(
     }
 }
 
+/// A definite provider refusal is durable protocol evidence that the original
+/// Liquid settlement will not be created for this exact wrong-amount funding.
+/// It closes only the otherwise-viable `NotObserved` path; every incomplete,
+/// mempool, mismatched-journal, accepted, or outspend state remains governed by
+/// the ordinary chain reducer. Live provider status is deliberately absent.
+fn declined_wrong_amount_closes_original_liquid_path(
+    evidence: &ChainSwapEvidence,
+    chain_swap_id: uuid::Uuid,
+    amount_relation: PrimaryBitcoinAmountRelationV1,
+    observed_primary_amount_sat: Option<u64>,
+    operation: Option<&ChainSwapRenegotiationOperation>,
+) -> bool {
+    evidence.quality == EvidenceQuality::CompleteAndAgreed
+        && evidence.bitcoin_source == BitcoinSourceEvidence::ConfirmedUnspent
+        && evidence.liquid_lock == LiquidLockEvidence::NotObserved
+        && evidence.liquid_claim_transaction == MerchantTransactionEvidence::None
+        && matches!(
+            amount_relation,
+            PrimaryBitcoinAmountRelationV1::Underfunded
+                | PrimaryBitcoinAmountRelationV1::Overfunded
+        )
+        && evidence.renegotiation == RenegotiationEvidence::ExplicitlyUnavailable
+        && operation.is_some_and(|operation| {
+            operation.state == RenegotiationState::Declined
+                && operation.identity.chain_swap_id == chain_swap_id
+                && Some(operation.identity.quoted_actual_amount_sat) == observed_primary_amount_sat
+        })
+}
+
 fn automatic_fallback_liquid_claim_transaction_evidence(
     swap: &ChainSwapRecord,
     persisted_intent_exists: bool,
@@ -1716,8 +1756,8 @@ fn exact_liquid_server_lock_script(
 mod tests {
     use super::*;
     use crate::chain_swap_action::{
-        recheck_chain_swap_execution_under_lock, ChainSwapAction, ChainSwapExecutionAction,
-        ChainSwapExecutionGate,
+        recheck_chain_swap_execution_under_lock, reduce_chain_swap_evidence, ChainSwapAction,
+        ChainSwapExecutionAction, ChainSwapExecutionGate,
     };
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -2026,6 +2066,220 @@ mod tests {
                 recheck_recovery_under_lock(&evidence) == RecoveryExecutionGate::Authorized,
                 state == State::Declined,
                 "state {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_decline_is_the_only_journal_state_that_closes_absent_liquid_before_timeout() {
+        use PrimaryBitcoinAmountRelationV1 as Amount;
+        use RenegotiationState as State;
+
+        let chain_swap_id = uuid::Uuid::from_u128(0x85);
+        for amount_relation in [Amount::Underfunded, Amount::Overfunded] {
+            for state in [
+                None,
+                Some(State::Quoted),
+                Some(State::AcceptRequested),
+                Some(State::Ambiguous),
+                Some(State::Accepted),
+                Some(State::Declined),
+            ] {
+                let operation = state.map(journal_operation);
+                let mut evidence = automatic_candidate();
+                evidence.bitcoin_timeout = BitcoinTimeoutEvidence::BeforeTimeout;
+                evidence.liquid_path = LiquidPathEvidence::Viable;
+                evidence.renegotiation =
+                    classify_renegotiation(None, amount_relation, operation.as_ref());
+                let closes = declined_wrong_amount_closes_original_liquid_path(
+                    &evidence,
+                    chain_swap_id,
+                    amount_relation,
+                    Some(900),
+                    operation.as_ref(),
+                );
+                assert_eq!(closes, state == Some(State::Declined), "state={state:?}");
+                if closes {
+                    evidence.liquid_path = LiquidPathEvidence::Unavailable;
+                }
+
+                let mut with_validated_cooperative_signature = evidence;
+                with_validated_cooperative_signature.cooperative_recovery =
+                    CooperativeRecoveryEvidence::Available;
+                assert_eq!(
+                    reduce_chain_swap_evidence(&with_validated_cooperative_signature),
+                    if closes {
+                        ChainSwapAction::RecoverBitcoin
+                    } else {
+                        ChainSwapAction::Observe
+                    },
+                    "amount_relation={amount_relation:?}, state={state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declined_liquid_closure_requires_exact_confirmed_agreed_chain_and_journal_identity() {
+        use PrimaryBitcoinAmountRelationV1 as Amount;
+
+        let chain_swap_id = uuid::Uuid::from_u128(0x85);
+        let declined = journal_operation(RenegotiationState::Declined);
+        let mut evidence = automatic_candidate();
+        evidence.bitcoin_timeout = BitcoinTimeoutEvidence::BeforeTimeout;
+        evidence.liquid_path = LiquidPathEvidence::Viable;
+        evidence.renegotiation = RenegotiationEvidence::ExplicitlyUnavailable;
+        let closes = |candidate: &ChainSwapEvidence,
+                      relation: Amount,
+                      observed_amount_sat: Option<u64>,
+                      operation: Option<&ChainSwapRenegotiationOperation>| {
+            declined_wrong_amount_closes_original_liquid_path(
+                candidate,
+                chain_swap_id,
+                relation,
+                observed_amount_sat,
+                operation,
+            )
+        };
+
+        assert!(closes(
+            &evidence,
+            Amount::Underfunded,
+            Some(900),
+            Some(&declined)
+        ));
+        assert!(closes(
+            &evidence,
+            Amount::Overfunded,
+            Some(900),
+            Some(&declined)
+        ));
+        for relation in [Amount::Exact, Amount::NotFunded, Amount::Unknown] {
+            assert!(!closes(&evidence, relation, Some(900), Some(&declined)));
+        }
+        for observed_amount_sat in [None, Some(899), Some(901)] {
+            assert!(!closes(
+                &evidence,
+                Amount::Underfunded,
+                observed_amount_sat,
+                Some(&declined)
+            ));
+        }
+        assert!(!declined_wrong_amount_closes_original_liquid_path(
+            &evidence,
+            uuid::Uuid::from_u128(0x86),
+            Amount::Underfunded,
+            Some(900),
+            Some(&declined),
+        ));
+
+        for (bitcoin_source, expected) in [
+            (BitcoinSourceEvidence::MempoolUnspent, false),
+            (BitcoinSourceEvidence::ConfirmedUnspent, true),
+        ] {
+            let mut candidate = evidence;
+            candidate.bitcoin_source = bitcoin_source;
+            assert_eq!(
+                closes(&candidate, Amount::Underfunded, Some(900), Some(&declined)),
+                expected,
+                "bitcoin_source={bitcoin_source:?}"
+            );
+        }
+        for quality in [
+            EvidenceQuality::Incomplete,
+            EvidenceQuality::BackendDisagreement,
+            EvidenceQuality::ProviderDisagreement,
+        ] {
+            let mut candidate = evidence;
+            candidate.quality = quality;
+            assert!(!closes(
+                &candidate,
+                Amount::Underfunded,
+                Some(900),
+                Some(&declined)
+            ));
+        }
+        for liquid_lock in [
+            LiquidLockEvidence::Unknown,
+            LiquidLockEvidence::MempoolUnspent,
+            LiquidLockEvidence::ConfirmedUnspent,
+            LiquidLockEvidence::SpentByMerchantClaim,
+            LiquidLockEvidence::SpentByProviderRefund,
+            LiquidLockEvidence::UnknownOutspend,
+        ] {
+            let mut candidate = evidence;
+            candidate.liquid_lock = liquid_lock;
+            assert!(
+                !closes(&candidate, Amount::Underfunded, Some(900), Some(&declined)),
+                "liquid_lock={liquid_lock:?}"
+            );
+        }
+        for transaction in [
+            MerchantTransactionEvidence::Prepared,
+            MerchantTransactionEvidence::Broadcast,
+            MerchantTransactionEvidence::Mempool,
+            MerchantTransactionEvidence::Confirmed,
+            MerchantTransactionEvidence::Finalized,
+            MerchantTransactionEvidence::Disputed,
+            MerchantTransactionEvidence::MerchantOutputMismatch,
+        ] {
+            let mut candidate = evidence;
+            candidate.liquid_claim_transaction = transaction;
+            assert!(
+                !closes(&candidate, Amount::Underfunded, Some(900), Some(&declined)),
+                "transaction={transaction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_decline_selects_cooperative_before_timeout_and_unilateral_at_timeout() {
+        use PrimaryBitcoinAmountRelationV1 as Amount;
+
+        let declined = journal_operation(RenegotiationState::Declined);
+        let mut evidence = automatic_candidate();
+        evidence.liquid_path = LiquidPathEvidence::Viable;
+        evidence.renegotiation = classify_renegotiation(None, Amount::Underfunded, Some(&declined));
+        assert!(declined_wrong_amount_closes_original_liquid_path(
+            &evidence,
+            uuid::Uuid::from_u128(0x85),
+            Amount::Underfunded,
+            Some(900),
+            Some(&declined),
+        ));
+        evidence.liquid_path = LiquidPathEvidence::Unavailable;
+        assert_eq!(evidence.provider_status, ProviderStatusEvidence::Unknown);
+
+        for (timeout, expected_path) in [
+            (
+                BitcoinTimeoutEvidence::BeforeTimeout,
+                Some(AutomaticFallbackConstructionPath::Cooperative),
+            ),
+            (
+                BitcoinTimeoutEvidence::Reached,
+                Some(AutomaticFallbackConstructionPath::Unilateral),
+            ),
+            (BitcoinTimeoutEvidence::Unknown, None),
+        ] {
+            evidence.bitcoin_timeout = timeout;
+            let packet = CollectedAutomaticFallbackEvidence {
+                evidence,
+                committed_destination: Some(
+                    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0".into(),
+                ),
+                exact_sources: vec![AutomaticFallbackSource {
+                    txid: "11".repeat(32),
+                    vout: 0,
+                    amount_sat: 900,
+                    script_pubkey_hex: "5120".to_owned() + &"22".repeat(32),
+                }],
+                bitcoin_timeout_height: Some(840_000),
+                dependencies_available: true,
+            };
+            assert_eq!(
+                packet.automatic_construction_path(),
+                expected_path,
+                "timeout={timeout:?}"
             );
         }
     }
