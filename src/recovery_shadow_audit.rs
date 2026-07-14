@@ -152,6 +152,26 @@ impl RecoveryShadowLineageClassificationsV1 {
     }
 }
 
+/// Relation between Boltz's validated global xpub restore high-water and the
+/// complete PostgreSQL allocation-registry high-water.
+///
+/// PostgreSQL may be ahead because allocations are durably reserved before a
+/// provider call and gaps are permanent. Boltz being ahead proves that the
+/// restored database omitted at least one provider-visible allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryShadowProviderLocalHighWaterRelationV1 {
+    BothEmpty,
+    Equal,
+    LocalAhead,
+    ProviderAhead,
+}
+
+impl RecoveryShadowProviderLocalHighWaterRelationV1 {
+    fn provider_is_ahead(self) -> bool {
+        self == Self::ProviderAhead
+    }
+}
+
 /// Sanitized manifest-versus-provider portion of one shadow report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryShadowBoltzReportV1 {
@@ -183,6 +203,7 @@ pub struct RecoveryShadowReportV1 {
     pub manifest_count: usize,
     pub manifest_lineage_count: usize,
     pub manifest_max_child_index: Option<i64>,
+    pub provider_local_high_water_relation: RecoveryShadowProviderLocalHighWaterRelationV1,
     pub boltz: RecoveryShadowBoltzReportV1,
     pub local: RecoveryShadowLocalReportV1,
     pub classification: RecoveryShadowClassificationV1,
@@ -433,10 +454,13 @@ fn build_report(
         .iter()
         .filter(|comparison| comparison.local_child_index.is_some())
         .count();
+    let provider_local_high_water_relation =
+        compare_provider_local_high_water(boltz_restore.max_child_index, local_max_child_index);
 
     let classification = if boltz_coverage == RecoveryShadowCoverageV1::Exact
         && local_coverage == RecoveryShadowCoverageV1::Exact
         && !lineage_classifications.has_differences()
+        && !provider_local_high_water_relation.provider_is_ahead()
     {
         RecoveryShadowClassificationV1::Consistent
     } else {
@@ -447,6 +471,7 @@ fn build_report(
         manifest_count: boltz_audit.manifest_set.manifest_count,
         manifest_lineage_count: boltz_audit.manifest_set.lineage_high_waters.len(),
         manifest_max_child_index,
+        provider_local_high_water_relation,
         boltz: RecoveryShadowBoltzReportV1 {
             validated_record_count: boltz_restore.records.len(),
             chain_record_count,
@@ -466,6 +491,25 @@ fn build_report(
             coverage: local_coverage,
         },
         classification,
+    }
+}
+
+fn compare_provider_local_high_water(
+    provider: Option<u32>,
+    local: Option<i64>,
+) -> RecoveryShadowProviderLocalHighWaterRelationV1 {
+    match (provider.map(i64::from), local) {
+        (None, None) => RecoveryShadowProviderLocalHighWaterRelationV1::BothEmpty,
+        (Some(provider), Some(local)) if provider == local => {
+            RecoveryShadowProviderLocalHighWaterRelationV1::Equal
+        }
+        (Some(provider), Some(local)) if provider < local => {
+            RecoveryShadowProviderLocalHighWaterRelationV1::LocalAhead
+        }
+        (None, Some(_)) => RecoveryShadowProviderLocalHighWaterRelationV1::LocalAhead,
+        (Some(_), None) | (Some(_), Some(_)) => {
+            RecoveryShadowProviderLocalHighWaterRelationV1::ProviderAhead
+        }
     }
 }
 
@@ -768,6 +812,8 @@ mod tests {
                 manifest_count: 0,
                 manifest_lineage_count: 0,
                 manifest_max_child_index: None,
+                provider_local_high_water_relation:
+                    RecoveryShadowProviderLocalHighWaterRelationV1::BothEmpty,
                 boltz: RecoveryShadowBoltzReportV1 {
                     validated_record_count: 0,
                     chain_record_count: 0,
@@ -945,6 +991,95 @@ mod tests {
         ] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn provider_local_high_water_relation_preserves_permanent_local_gaps() {
+        use RecoveryShadowProviderLocalHighWaterRelationV1 as Relation;
+
+        for (provider, local, expected) in [
+            (None, None, Relation::BothEmpty),
+            (Some(30), Some(30), Relation::Equal),
+            (Some(30), Some(31), Relation::LocalAhead),
+            (None, Some(31), Relation::LocalAhead),
+            (Some(30), Some(29), Relation::ProviderAhead),
+            (Some(30), None, Relation::ProviderAhead),
+        ] {
+            assert_eq!(compare_provider_local_high_water(provider, local), expected);
+        }
+    }
+
+    #[test]
+    fn local_ahead_and_manifest_missing_lineages_remain_differences() {
+        for classifications in [
+            RecoveryShadowLineageClassificationsV1 {
+                local_ahead: 1,
+                ..RecoveryShadowLineageClassificationsV1::default()
+            },
+            RecoveryShadowLineageClassificationsV1 {
+                manifest_missing: 1,
+                ..RecoveryShadowLineageClassificationsV1::default()
+            },
+        ] {
+            assert!(classifications.has_differences());
+        }
+    }
+
+    #[test]
+    fn provider_ahead_high_water_closes_otherwise_exact_startup_evidence() {
+        let manifest_set = SwapManifestSetAuditV1 {
+            manifest_count: 1,
+            last_manifest_sequence: Some(1),
+            last_manifest_id: Some(Uuid::from_u128(0x901)),
+            lineage_high_waters: vec![ManifestLineageHighWaterV1 {
+                root_fingerprint: ROOT_SENTINEL.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                child_index: 29,
+            }],
+        };
+        let provider = provider_set(vec![
+            provider_record("ExistingChainRecord", BoltzRestoreKind::Chain),
+            provider_record("MissingReverseRecord", BoltzRestoreKind::Reverse),
+        ]);
+        let boltz_audit = SwapManifestBoltzAuditV1 {
+            manifest_set: manifest_set.clone(),
+            provider_only_chain_swap_ids: Vec::new(),
+            provider_only_chain_record_count: 0,
+            provider_max_child_index: Some(30),
+        };
+        let local_audit = LocalChainSwapRecoveryAuditV1 {
+            manifest_set,
+            local_record_count: 1,
+            exact_match_count: 1,
+            manifest_only_chain_swap_ids: Vec::new(),
+            local_only_chain_swap_ids: Vec::new(),
+            lineage_high_waters: vec![LocalRecoveryLineageComparisonV1 {
+                root_fingerprint: ROOT_SENTINEL.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                signed_manifest_child_index: Some(29),
+                local_child_index: Some(29),
+                relation: LocalRecoveryHighWaterRelationV1::Equal,
+            }],
+        };
+
+        let report = build_report(&provider, &boltz_audit, &local_audit);
+
+        assert_eq!(report.boltz.coverage, RecoveryShadowCoverageV1::Exact);
+        assert_eq!(report.local.coverage, RecoveryShadowCoverageV1::Exact);
+        assert_eq!(report.local.lineage_classifications.equal, 1);
+        assert_eq!(
+            report.provider_local_high_water_relation,
+            RecoveryShadowProviderLocalHighWaterRelationV1::ProviderAhead
+        );
+        assert_eq!(
+            report.classification,
+            RecoveryShadowClassificationV1::DifferencesClassified
+        );
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("MissingReverseRecord"));
+        assert!(!debug.contains(ROOT_SENTINEL));
     }
 
     #[tokio::test]
