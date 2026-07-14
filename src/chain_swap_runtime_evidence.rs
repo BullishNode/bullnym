@@ -112,17 +112,15 @@ pub async fn collect_pending_expiry_evidence_under_lock(
         tokio::join!(provider_read, bitcoin_read, liquid_read);
     let provider_hint = provider_hint.ok();
     let primary_bitcoin = match (primary_target.as_ref(), bitcoin_snapshot) {
-        (Some(target), Some((snapshot, authority))) => {
-            project_primary_bitcoin_source_snapshot_v1(
-                target,
-                &snapshot,
-                provider_hint
-                    .as_ref()
-                    .and_then(|hint| hint.transaction_txid()),
-                authority,
-            )
-            .ok()
-        }
+        (Some(target), Some((snapshot, authority))) => project_primary_bitcoin_source_snapshot_v1(
+            target,
+            &snapshot,
+            provider_hint
+                .as_ref()
+                .and_then(|hint| hint.transaction_txid()),
+            authority,
+        )
+        .ok(),
         _ => None,
     };
 

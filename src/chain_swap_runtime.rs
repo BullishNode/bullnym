@@ -193,7 +193,8 @@ async fn apply_chain_swap_provider_effect_inner(
             let (provider_status, evidence) = match source {
                 LockedEvidenceSource::Runtime(state) => {
                     let collected =
-                        collect_pending_expiry_evidence_under_lock(state, &mut tx, &current).await?;
+                        collect_pending_expiry_evidence_under_lock(state, &mut tx, &current)
+                            .await?;
                     let provider_status = collected.provider_status.unwrap_or_default();
                     let evidence = normalized_evidence(
                         &provider_status,
@@ -207,7 +208,10 @@ async fn apply_chain_swap_provider_effect_inner(
                 LockedEvidenceSource::Supplied {
                     provider_status,
                     input,
-                } => (provider_status.to_owned(), normalized_evidence(provider_status, input)),
+                } => (
+                    provider_status.to_owned(),
+                    normalized_evidence(provider_status, input),
+                ),
             };
 
             let effect = provider_effect_for_evidence(&provider_status, &evidence);
@@ -247,9 +251,7 @@ async fn apply_chain_swap_provider_effect_inner(
     }
 }
 
-fn recheck_finalize_unfunded_under_lock(
-    evidence: &ChainSwapEvidence,
-) -> ChainSwapProviderEffect {
+fn recheck_finalize_unfunded_under_lock(evidence: &ChainSwapEvidence) -> ChainSwapProviderEffect {
     match recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::Finalize, evidence) {
         ChainSwapExecutionGate::Authorized if is_unfunded_expiry(evidence) => {
             ChainSwapProviderEffect::FinalizeUnfunded
