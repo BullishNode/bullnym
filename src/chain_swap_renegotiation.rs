@@ -303,9 +303,16 @@ impl ChainSwapRenegotiationOperation {
             validate_digest(digest, "terminal_response_digest")?;
         }
 
+        let request_follows_policy = accept_requested_at_unix
+            .is_some_and(|requested_at| requested_at >= identity.policy_validated_at_unix);
+        let terminal_follows_policy = terminal_observed_at_unix
+            .is_some_and(|terminal_at| terminal_at >= identity.policy_validated_at_unix);
+        let ambiguity_history_is_paired = ambiguous_at_unix.is_some() == last_error_class.is_some();
+
         let shape_is_valid = match state {
             RenegotiationState::Quoted => {
-                accept_attempt_count == 0
+                version == 1
+                    && accept_attempt_count == 0
                     && last_error_class.is_none()
                     && accept_requested_at_unix.is_none()
                     && ambiguous_at_unix.is_none()
@@ -314,34 +321,53 @@ impl ChainSwapRenegotiationOperation {
             }
             RenegotiationState::AcceptRequested => {
                 accept_attempt_count > 0
-                    && accept_requested_at_unix.is_some()
-                    && (ambiguous_at_unix.is_some() == last_error_class.is_some())
+                    && request_follows_policy
+                    && ambiguity_history_is_paired
+                    && ambiguous_at_unix
+                        .zip(accept_requested_at_unix)
+                        .is_none_or(|(ambiguous_at, requested_at)| ambiguous_at <= requested_at)
                     && terminal_response_digest.is_none()
                     && terminal_observed_at_unix.is_none()
             }
             RenegotiationState::Ambiguous => {
                 accept_attempt_count > 0
                     && last_error_class.is_some()
-                    && accept_requested_at_unix.is_some()
-                    && ambiguous_at_unix.is_some()
+                    && request_follows_policy
+                    && ambiguous_at_unix
+                        .zip(accept_requested_at_unix)
+                        .is_some_and(|(ambiguous_at, requested_at)| ambiguous_at >= requested_at)
                     && terminal_response_digest.is_none()
                     && terminal_observed_at_unix.is_none()
             }
             RenegotiationState::Accepted => {
                 accept_attempt_count > 0
-                    && accept_requested_at_unix.is_some()
-                    && (ambiguous_at_unix.is_some() == last_error_class.is_some())
+                    && request_follows_policy
+                    && ambiguity_history_is_paired
                     && terminal_response_digest.is_some()
-                    && terminal_observed_at_unix.is_some()
+                    && terminal_observed_at_unix
+                        .zip(accept_requested_at_unix)
+                        .is_some_and(|(terminal_at, requested_at)| terminal_at >= requested_at)
+                    && ambiguous_at_unix
+                        .zip(terminal_observed_at_unix)
+                        .is_none_or(|(ambiguous_at, terminal_at)| terminal_at >= ambiguous_at)
             }
             RenegotiationState::Declined => {
                 ((accept_attempt_count == 0
                     && accept_requested_at_unix.is_none()
                     && ambiguous_at_unix.is_none()
-                    && last_error_class.is_none())
+                    && last_error_class.is_none()
+                    && terminal_follows_policy)
                     || (accept_attempt_count > 0
-                        && accept_requested_at_unix.is_some()
-                        && (ambiguous_at_unix.is_some() == last_error_class.is_some())))
+                        && request_follows_policy
+                        && ambiguity_history_is_paired
+                        && terminal_observed_at_unix
+                            .zip(accept_requested_at_unix)
+                            .is_some_and(|(terminal_at, requested_at)| {
+                                terminal_at >= requested_at
+                            })
+                        && ambiguous_at_unix.zip(accept_requested_at_unix).is_none_or(
+                            |(ambiguous_at, requested_at)| ambiguous_at <= requested_at,
+                        )))
                     && terminal_response_digest.is_some()
                     && terminal_observed_at_unix.is_some()
             }
