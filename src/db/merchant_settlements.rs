@@ -16,8 +16,9 @@ use crate::{
         MerchantSettlementContext, MerchantSettlementPath,
     },
     merchant_settlement_lifecycle::{
-        SettlementAccountingState, SettlementBlock, SettlementChain, SettlementEvidenceHistory,
-        SettlementFinalityPolicy, SettlementLifecycleSnapshot, SettlementState, SettlementTxid,
+        MerchantSettlementLifecycle, SettlementAccountingState, SettlementBlock, SettlementChain,
+        SettlementEvidenceHistory, SettlementFinalityPolicy, SettlementLifecycleSnapshot,
+        SettlementState, SettlementTxid,
     },
     merchant_settlement_service::{
         MerchantSettlementAdoptionService, MerchantSettlementAdoptionSnapshot,
@@ -288,6 +289,22 @@ pub struct MerchantSettlementWorkItem {
     pub approved_destination: ApprovedMerchantDestination,
     pub liquid_blinding_key_hex: Option<String>,
     pub previous_confirmation: MerchantSettlementPreviousConfirmation,
+}
+
+/// Exact database facts consumed by the shared chain-swap execution reducer.
+///
+/// The caller already owns the per-swap advisory transaction. Loading these
+/// rows with `FOR UPDATE` makes a newly journaled recovery, a settlement
+/// checkpoint transition, and a claim replay mutually visible at one database
+/// boundary. Chain observations are deliberately not represented here.
+#[derive(Debug, Clone)]
+pub struct LiquidClaimExecutionFacts {
+    pub journal_txid: Option<String>,
+    pub journal_raw_transaction: Option<Vec<u8>>,
+    pub journal_source_prevouts: Option<Vec<MerchantSettlementSourcePrevout>>,
+    pub journal_status: Option<String>,
+    pub lifecycle: Option<MerchantSettlementLifecycle>,
+    pub replacement_present: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -590,11 +607,124 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     exact_liquid_journal_disposition(&row.status)
 }
 
+/// Load the immutable Liquid-claim journal family and its adoption lifecycle
+/// from the caller's already-open advisory transaction.
+///
+/// This is intentionally narrower than [`load_merchant_settlement_work_item`]:
+/// an execution gate needs only locked identity/lifecycle facts and must not
+/// open a second repeatable-read transaction while the parent row is locked.
+pub async fn load_liquid_claim_execution_facts_for_update(
+    connection: &mut PgConnection,
+    chain_swap_id: Uuid,
+    invoice_id: Uuid,
+    boltz_swap_id: &str,
+    policy: SettlementFinalityPolicy,
+) -> Result<LiquidClaimExecutionFacts, MerchantSettlementRepositoryError> {
+    if chain_swap_id.is_nil() || invoice_id.is_nil() || boltz_swap_id.is_empty() {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    }
+
+    let original =
+        load_liquid_journal_by_purpose(connection, chain_swap_id, "liquid_claim").await?;
+    let replacement =
+        load_liquid_journal_by_purpose(connection, chain_swap_id, "liquid_claim_replacement")
+            .await?;
+    let checkpoint: Option<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT journal_txid, snapshot_json \
+           FROM merchant_settlement_checkpoints \
+          WHERE chain_swap_id = $1 AND settlement_path = 'liquid_claim' \
+          FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    let Some(original) = original else {
+        if replacement.is_some() || checkpoint.is_some() {
+            return Err(MerchantSettlementRepositoryError::MissingJournal);
+        }
+        return Ok(LiquidClaimExecutionFacts {
+            journal_txid: None,
+            journal_raw_transaction: None,
+            journal_source_prevouts: None,
+            journal_status: None,
+            lifecycle: None,
+            replacement_present: false,
+        });
+    };
+
+    if let Some(replacement) = replacement.as_ref() {
+        if replacement.replaces_txid.as_deref() != Some(original.txid.as_str()) {
+            return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+        }
+    }
+
+    let lifecycle = match checkpoint {
+        None => None,
+        Some((checkpoint_journal_txid, snapshot_json)) => {
+            if checkpoint_journal_txid != original.txid {
+                return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+            }
+            let service = decode_service(snapshot_json, policy)?;
+            let context = service.context();
+            if context.chain_swap_id() != chain_swap_id
+                || context.invoice_id() != invoice_id
+                || context.boltz_swap_id() != boltz_swap_id
+                || context.path() != MerchantSettlementPath::LiquidClaim
+            {
+                return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+            }
+            let snapshot = service.lifecycle().snapshot();
+            validate_checkpoint_journal_family(
+                snapshot.journal_txid.as_str(),
+                snapshot
+                    .linked_replacement
+                    .as_ref()
+                    .map(|(parent, child)| (parent.as_str(), child.as_str())),
+                &original,
+                replacement.as_ref(),
+            )?;
+            Some(service.lifecycle().clone())
+        }
+    };
+
+    Ok(LiquidClaimExecutionFacts {
+        journal_txid: Some(original.txid),
+        journal_raw_transaction: Some(original.raw_transaction),
+        journal_source_prevouts: Some(original.source_prevouts),
+        journal_status: Some(original.status),
+        lifecycle,
+        replacement_present: replacement.is_some(),
+    })
+}
+
 /// Durably record that an exact Liquid claim broadcast is about to start. If
 /// the process dies after this commit, restart sees an ambiguous immutable
 /// attempt and can only replay the same bytes.
 pub async fn mark_liquid_merchant_settlement_broadcast_started(
     pool: &PgPool,
+    chain_swap_id: Uuid,
+    txid: &str,
+    purpose: &str,
+) -> Result<LiquidMerchantSettlementBroadcastStartDisposition, MerchantSettlementRepositoryError> {
+    let mut transaction = pool.begin().await?;
+    let disposition = mark_liquid_merchant_settlement_broadcast_started_locked(
+        &mut transaction,
+        chain_swap_id,
+        txid,
+        purpose,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(disposition)
+}
+
+/// Transaction-scoped form used by the ClaimLiquid executor after its second
+/// complete-evidence recheck. The caller holds the shared advisory lock and
+/// commits this write immediately before the network call, leaving no unlocked
+/// database interval between fresh authorization and durable broadcast intent.
+pub async fn mark_liquid_merchant_settlement_broadcast_started_locked(
+    connection: &mut PgConnection,
     chain_swap_id: Uuid,
     txid: &str,
     purpose: &str,
@@ -605,12 +735,11 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
     {
         return Err(MerchantSettlementRepositoryError::InvalidCommand);
     }
-    let mut transaction = pool.begin().await?;
     let parent: Option<(Option<String>, String)> = sqlx::query_as(
         "SELECT claim_txid, status FROM chain_swap_records WHERE id = $1 FOR UPDATE",
     )
     .bind(chain_swap_id)
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&mut *connection)
     .await?;
     let (parent_claim_txid, parent_status) =
         parent.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
@@ -621,7 +750,7 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
     .bind(chain_swap_id)
     .bind(txid)
     .bind(purpose)
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&mut *connection)
     .await?;
     let (attempt_id, attempt_txid, attempt_status) =
         row.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
@@ -633,12 +762,10 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
         &parent_status,
     )? {
         LiquidBroadcastStartAction::AlreadySettled => {
-            transaction.commit().await?;
-            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled);
+            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled)
         }
         LiquidBroadcastStartAction::Superseded => {
-            transaction.commit().await?;
-            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::Superseded);
+            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::Superseded)
         }
         LiquidBroadcastStartAction::Start => {}
     }
@@ -656,13 +783,12 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
     .bind(attempt_id)
     .bind(txid)
     .bind(&attempt_status)
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?
     .rows_affected();
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
-    transaction.commit().await?;
     Ok(LiquidMerchantSettlementBroadcastStartDisposition::Started)
 }
 

@@ -4,6 +4,10 @@
 //! wallet/address range nor persists funding allocations. Provider status and
 //! transaction ids remain outside the source facts assembled here.
 
+use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
+
+use boltz_client::elements;
 use boltz_client::network::LiquidChain;
 use boltz_client::swaps::boltz::{CreateChainResponse, Side};
 use boltz_client::swaps::liquid::LBtcSwapScript;
@@ -22,7 +26,10 @@ use crate::chain_swap_primary_source::{
 };
 use crate::db::{self, ChainSwapRecord, ChainSwapTxAttempt};
 use crate::error::AppError;
-use crate::utxo::LiquidScriptHistory;
+use crate::merchant_settlement_lifecycle::SettlementFinalityPolicy;
+use crate::utxo::{
+    LiquidHistorySnapshotLimits, LiquidHistorySnapshotOutcome, LiquidScriptHistory, UtxoBackend,
+};
 use crate::AppState;
 
 /// Owned snapshot handoff for the runtime reducer.
@@ -39,6 +46,497 @@ pub struct CollectedPendingExpiryEvidence {
     /// Canonical digest of the complete authority/tip/primary projection.
     /// Raw endpoint, transaction, address, and amount data are not exposed.
     pub primary_evidence_sha256: Option<String>,
+}
+
+/// One complete production snapshot for an irreversible Liquid claim check.
+/// All database facts were loaded after the caller acquired the shared
+/// advisory lock and reloaded the parent row with `FOR UPDATE`.
+#[derive(Debug)]
+pub struct CollectedChainClaimExecutionEvidence {
+    pub evidence: ChainSwapEvidence,
+    pub primary_bitcoin: Option<PrimaryBitcoinSourceProjectionV1>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiquidLockProjection {
+    quality: EvidenceQuality,
+    lock: LiquidLockEvidence,
+}
+
+struct LiquidServerLockTarget {
+    script: lwk_wollet::elements::Script,
+    blinding_key: elements::secp256k1_zkp::SecretKey,
+    expected_amount_sat: u64,
+}
+
+const CHAIN_CLAIM_LIQUID_SNAPSHOT_LIMITS: LiquidHistorySnapshotLimits =
+    LiquidHistorySnapshotLimits {
+        max_history_entries: 128,
+        max_block_heights: 128,
+    };
+
+/// Assemble the exact ClaimLiquid reducer input from one locked database
+/// boundary and fresh, independently verified chain snapshots.
+///
+/// Transport absence is expressed as incomplete evidence so the caller can
+/// return a non-mutating reducer decision. Persisted database corruption still
+/// returns an error because it is not a chain observation that may be retried
+/// as if nothing happened.
+pub async fn collect_chain_claim_execution_evidence_under_lock(
+    state: &AppState,
+    conn: &mut PgConnection,
+    swap: &ChainSwapRecord,
+) -> Result<CollectedChainClaimExecutionEvidence, AppError> {
+    let recovery_attempt = db::get_bitcoin_recovery_attempt_for_update(&mut *conn, swap.id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let delivery = db::get_delivered_manifest_for_chain_swap(&mut *conn, swap.id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let finality_policy = SettlementFinalityPolicy::new(
+        state.config.liquid_watcher.finality_confirmations,
+        state.config.bitcoin_watcher.confirmations_required,
+    )
+    .map_err(|error| {
+        AppError::ClaimError(format!(
+            "merchant settlement finality configuration is invalid: {error}"
+        ))
+    })?;
+    let settlement = db::load_liquid_claim_execution_facts_for_update(
+        &mut *conn,
+        swap.id,
+        swap.invoice_id,
+        &swap.boltz_swap_id,
+        finality_policy,
+    )
+    .await
+    .map_err(|error| {
+        AppError::DbError(format!("load locked Liquid claim execution facts: {error}"))
+    })?;
+
+    let mut evidence = ChainSwapEvidence {
+        quality: EvidenceQuality::CompleteAndAgreed,
+        provider_status: ProviderStatusEvidence::Unknown,
+        bitcoin_source: BitcoinSourceEvidence::Unknown,
+        liquid_lock: LiquidLockEvidence::Unknown,
+        liquid_path: LiquidPathEvidence::Unknown,
+        renegotiation: RenegotiationEvidence::Ambiguous,
+        recovery_destination: RecoveryDestinationEvidence::Missing,
+        cooperative_recovery: CooperativeRecoveryEvidence::Unknown,
+        bitcoin_timeout: BitcoinTimeoutEvidence::Unknown,
+        liquid_claim_transaction: liquid_claim_transaction_evidence(swap, &settlement),
+        bitcoin_recovery_transaction: recovery_transaction_evidence(recovery_attempt.as_ref()),
+    };
+    if swap
+        .creation_terms
+        .as_ref()
+        .is_some_and(|terms| terms.recovery_address_commitment_id.is_some())
+    {
+        evidence.recovery_destination = RecoveryDestinationEvidence::Committed;
+    }
+
+    let primary_target = delivery.and_then(|delivery| {
+        let expected_amount_sat = u64::try_from(swap.user_lock_amount_sat).ok()?;
+        PrimaryBitcoinSourceTargetV1::try_new(
+            delivery.manifest_sequence,
+            delivery.manifest_id,
+            delivery.chain_swap_id,
+            swap.lockup_address.clone(),
+            expected_amount_sat,
+        )
+        .ok()
+    });
+    let liquid_target = liquid_server_lock_target(swap).ok();
+
+    let provider_read = state
+        .boltz
+        .fresh_chain_swap_provider_hint(&swap.boltz_swap_id);
+    let bitcoin_read = async {
+        let adapter = state.bitcoin_lockup_witness_adapter.as_deref()?;
+        let target = primary_target.as_ref()?;
+        let snapshot = adapter
+            .load_chain_swap_snapshot(
+                target.manifest_id(),
+                target.chain_swap_id(),
+                target.lockup_address(),
+            )
+            .await
+            .ok()?;
+        let authority = if adapter.is_primary_authority(&snapshot) {
+            PrimaryBitcoinSourceAuthorityV1::SelfHostedNode
+        } else {
+            PrimaryBitcoinSourceAuthorityV1::UntrustedSingleBackend
+        };
+        Some((snapshot, authority))
+    };
+    let liquid_read = async {
+        let backend = state.utxo_backend.as_deref()?;
+        let target = liquid_target.as_ref()?;
+        collect_liquid_lock_projection(
+            backend,
+            target,
+            settlement
+                .journal_txid
+                .as_deref()
+                .zip(settlement.journal_raw_transaction.as_deref())
+                .zip(settlement.journal_source_prevouts.as_deref())
+                .map(|((txid, raw), sources)| (txid, raw, sources)),
+        )
+        .await
+        .ok()
+    };
+    let (provider_hint, bitcoin_snapshot, liquid_projection) =
+        tokio::join!(provider_read, bitcoin_read, liquid_read);
+    let provider_hint = provider_hint.ok();
+    evidence.provider_status = provider_hint
+        .as_ref()
+        .map(|hint| provider_status_evidence(hint.status()))
+        .unwrap_or(ProviderStatusEvidence::Unknown);
+
+    let primary_bitcoin = match (primary_target.as_ref(), bitcoin_snapshot) {
+        (Some(target), Some((snapshot, authority))) => project_primary_bitcoin_source_snapshot_v1(
+            target,
+            &snapshot,
+            provider_hint
+                .as_ref()
+                .and_then(|hint| hint.transaction_txid()),
+            authority,
+        )
+        .ok(),
+        _ => None,
+    };
+    match primary_bitcoin.as_ref() {
+        Some(primary) => primary.apply_to_reducer_evidence(&mut evidence),
+        None => evidence.quality = EvidenceQuality::Incomplete,
+    }
+    match liquid_projection {
+        Some(projection) => {
+            evidence.quality = merge_evidence_quality(evidence.quality, projection.quality);
+            evidence.liquid_lock = projection.lock;
+        }
+        None => {
+            evidence.quality =
+                merge_evidence_quality(evidence.quality, EvidenceQuality::Incomplete);
+            evidence.liquid_lock = LiquidLockEvidence::Unknown;
+        }
+    }
+    if matches!(
+        evidence.liquid_lock,
+        LiquidLockEvidence::MempoolUnspent | LiquidLockEvidence::ConfirmedUnspent
+    ) {
+        evidence.liquid_path = LiquidPathEvidence::Viable;
+        evidence.renegotiation = RenegotiationEvidence::NotRequired;
+    }
+
+    Ok(CollectedChainClaimExecutionEvidence {
+        evidence,
+        primary_bitcoin,
+    })
+}
+
+fn liquid_claim_transaction_evidence(
+    swap: &ChainSwapRecord,
+    facts: &db::LiquidClaimExecutionFacts,
+) -> MerchantTransactionEvidence {
+    if facts.replacement_present {
+        return MerchantTransactionEvidence::Disputed;
+    }
+    let journal = match (
+        facts.journal_txid.as_deref(),
+        facts.journal_status.as_deref(),
+    ) {
+        (None, None) if swap.claim_txid.is_none() && swap.claim_tx_hex.is_none() => {
+            MerchantTransactionEvidence::None
+        }
+        (None, None) => MerchantTransactionEvidence::Disputed,
+        (Some(txid), Some(status))
+            if swap.claim_txid.as_deref() == Some(txid) && swap.claim_tx_hex.is_some() =>
+        {
+            match status {
+                "constructed" | "broadcast_ambiguous" => MerchantTransactionEvidence::Prepared,
+                "broadcast" => MerchantTransactionEvidence::Broadcast,
+                "confirmed" => MerchantTransactionEvidence::Confirmed,
+                "finalized" => MerchantTransactionEvidence::Finalized,
+                _ => MerchantTransactionEvidence::Disputed,
+            }
+        }
+        _ => MerchantTransactionEvidence::Disputed,
+    };
+    let Some(lifecycle) = facts.lifecycle.as_ref() else {
+        return journal;
+    };
+    let lifecycle = MerchantTransactionEvidence::from_settlement_lifecycle(lifecycle);
+    if journal == lifecycle {
+        lifecycle
+    } else if facts.journal_status.as_deref() == Some("broadcast_ambiguous")
+        && journal == MerchantTransactionEvidence::Prepared
+        && lifecycle == MerchantTransactionEvidence::Disputed
+    {
+        // #83 writes `broadcast_ambiguous` atomically with an eviction/reorg
+        // checkpoint specifically to request same-byte redrive. Treat that
+        // exact durable pairing as prepared replay intent; every other
+        // lifecycle/journal disagreement remains disputed.
+        MerchantTransactionEvidence::Prepared
+    } else {
+        MerchantTransactionEvidence::Disputed
+    }
+}
+
+async fn collect_liquid_lock_projection(
+    backend: &dyn UtxoBackend,
+    target: &LiquidServerLockTarget,
+    journal: Option<(&str, &[u8], &[db::MerchantSettlementSourcePrevout])>,
+) -> Result<LiquidLockProjection, AppError> {
+    let snapshot = match backend
+        .liquid_history_snapshot(&target.script, &[], CHAIN_CLAIM_LIQUID_SNAPSHOT_LIMITS)
+        .await?
+    {
+        LiquidHistorySnapshotOutcome::Complete(snapshot) => snapshot,
+        LiquidHistorySnapshotOutcome::Incomplete(_) => {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::Incomplete,
+                lock: LiquidLockEvidence::Unknown,
+            })
+        }
+    };
+    if snapshot.authority.is_empty() {
+        return Ok(LiquidLockProjection {
+            quality: EvidenceQuality::Incomplete,
+            lock: LiquidLockEvidence::Unknown,
+        });
+    }
+
+    let mut heights = BTreeMap::new();
+    let mut transactions = Vec::with_capacity(snapshot.entries.len());
+    let mut raw_transactions = HashMap::new();
+    let mut spends = HashMap::<(String, u32), String>::new();
+    for entry in &snapshot.entries {
+        if heights
+            .insert(entry.txid.to_ascii_lowercase(), entry.height)
+            .is_some()
+        {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+            });
+        }
+        let raw = backend.get_raw_tx(&entry.txid).await?;
+        let transaction: elements::Transaction =
+            elements::encode::deserialize(&raw).map_err(|error| {
+                AppError::ElectrumError(format!("decode Liquid lock history: {error}"))
+            })?;
+        let actual_txid = transaction.txid().to_string();
+        if !actual_txid.eq_ignore_ascii_case(&entry.txid) {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+            });
+        }
+        raw_transactions.insert(actual_txid.to_ascii_lowercase(), raw);
+        for input in &transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let outpoint = (
+                input.previous_output.txid.to_string().to_ascii_lowercase(),
+                input.previous_output.vout,
+            );
+            if spends.insert(outpoint, actual_txid.clone()).is_some() {
+                return Ok(LiquidLockProjection {
+                    quality: EvidenceQuality::BackendDisagreement,
+                    lock: LiquidLockEvidence::UnknownOutspend,
+                });
+            }
+        }
+        transactions.push((entry.txid.to_ascii_lowercase(), transaction));
+    }
+
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut funding = Vec::new();
+    let mut total_amount_sat = 0u64;
+    for (txid, transaction) in &transactions {
+        for (vout, output) in transaction.output.iter().enumerate() {
+            if output.script_pubkey.as_bytes() != target.script.as_bytes() {
+                continue;
+            }
+            let opened = match output.unblind(&secp, target.blinding_key) {
+                Ok(opened) if opened.asset == elements::AssetId::LIQUID_BTC && opened.value > 0 => {
+                    opened
+                }
+                _ => {
+                    return Ok(LiquidLockProjection {
+                        quality: EvidenceQuality::BackendDisagreement,
+                        lock: LiquidLockEvidence::Unknown,
+                    })
+                }
+            };
+            total_amount_sat = match total_amount_sat.checked_add(opened.value) {
+                Some(total) => total,
+                None => {
+                    return Ok(LiquidLockProjection {
+                        quality: EvidenceQuality::BackendDisagreement,
+                        lock: LiquidLockEvidence::Unknown,
+                    })
+                }
+            };
+            funding.push((txid.as_str(), u32::try_from(vout).ok(), opened.value));
+        }
+    }
+    if funding.is_empty() {
+        if !snapshot.entries.is_empty() {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+            });
+        }
+        return Ok(LiquidLockProjection {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            lock: LiquidLockEvidence::NotObserved,
+        });
+    }
+    if total_amount_sat != target.expected_amount_sat
+        || funding.iter().any(|(_, vout, _)| vout.is_none())
+    {
+        return Ok(LiquidLockProjection {
+            quality: EvidenceQuality::ProviderDisagreement,
+            lock: LiquidLockEvidence::Unknown,
+        });
+    }
+    if let Some((_, _, sources)) = journal {
+        let target_script_hex = hex::encode(target.script.as_bytes());
+        let exact_sources = funding.iter().all(|(txid, vout, amount_sat)| {
+            sources.iter().any(|source| {
+                source.txid.eq_ignore_ascii_case(txid)
+                    && Some(source.vout) == *vout
+                    && source.amount_sat == *amount_sat
+                    && source
+                        .script_pubkey_hex
+                        .eq_ignore_ascii_case(&target_script_hex)
+            })
+        }) && sources.len() == funding.len();
+        if !exact_sources {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+            });
+        }
+    }
+
+    let mut unspent = 0usize;
+    let mut merchant_spent = 0usize;
+    let mut unknown_spent = 0usize;
+    let mut all_confirmed = true;
+    for (funding_txid, vout, _) in funding {
+        all_confirmed &= heights.get(funding_txid).is_some_and(|height| *height > 0);
+        match spends.get(&(funding_txid.to_owned(), vout.expect("validated above"))) {
+            None => unspent += 1,
+            Some(spender) => match journal {
+                Some((txid, expected_raw, _))
+                    if spender.eq_ignore_ascii_case(txid)
+                        && raw_transactions
+                            .get(&spender.to_ascii_lowercase())
+                            .is_some_and(|observed| observed.as_slice() == expected_raw) =>
+                {
+                    merchant_spent += 1
+                }
+                _ => unknown_spent += 1,
+            },
+        }
+    }
+    let lock = if unknown_spent > 0 || (unspent > 0 && merchant_spent > 0) {
+        LiquidLockEvidence::UnknownOutspend
+    } else if merchant_spent > 0 {
+        LiquidLockEvidence::SpentByMerchantClaim
+    } else if all_confirmed {
+        LiquidLockEvidence::ConfirmedUnspent
+    } else {
+        LiquidLockEvidence::MempoolUnspent
+    };
+    Ok(LiquidLockProjection {
+        quality: EvidenceQuality::CompleteAndAgreed,
+        lock,
+    })
+}
+
+fn liquid_server_lock_target(swap: &ChainSwapRecord) -> Result<LiquidServerLockTarget, AppError> {
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
+            AppError::ClaimError(format!("invalid chain creation response: {error}"))
+        })?;
+    let address = elements::Address::from_str(&response.claim_details.lockup_address)
+        .map_err(|error| AppError::ClaimError(format!("invalid Liquid server lock: {error}")))?;
+    if address.params != &elements::AddressParams::LIQUID || address.blinding_pubkey.is_none() {
+        return Err(AppError::ClaimError(
+            "Liquid server lock is not confidential mainnet".into(),
+        ));
+    }
+    let script = exact_liquid_server_lock_script(swap)?;
+    if script.as_bytes() != address.script_pubkey().as_bytes() {
+        return Err(AppError::ClaimError(
+            "derived Liquid server lock disagrees with committed address".into(),
+        ));
+    }
+    let blinding_key = response
+        .claim_details
+        .blinding_key
+        .as_deref()
+        .ok_or_else(|| AppError::ClaimError("Liquid server lock blinding key is missing".into()))?
+        .parse()
+        .map_err(|error| {
+            AppError::ClaimError(format!("invalid Liquid server lock blinding key: {error}"))
+        })?;
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let blinding_pubkey = elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &blinding_key);
+    if address.blinding_pubkey != Some(blinding_pubkey) {
+        return Err(AppError::ClaimError(
+            "Liquid server lock blinding key disagrees with committed address".into(),
+        ));
+    }
+    let expected_amount_sat = u64::try_from(swap.effective_server_lock_amount_sat())
+        .map_err(|_| AppError::ClaimError("invalid Liquid server lock amount".into()))?;
+    if expected_amount_sat == 0 {
+        return Err(AppError::ClaimError(
+            "invalid Liquid server lock amount".into(),
+        ));
+    }
+    Ok(LiquidServerLockTarget {
+        script,
+        blinding_key,
+        expected_amount_sat,
+    })
+}
+
+fn provider_status_evidence(status: &str) -> ProviderStatusEvidence {
+    match status {
+        "swap.expired"
+        | "transaction.lockupFailed"
+        | "transaction.failed"
+        | "transaction.refunded" => ProviderStatusEvidence::Expired,
+        "transaction.claimed" => ProviderStatusEvidence::SettlementHint,
+        "swap.created"
+        | "transaction.mempool"
+        | "transaction.confirmed"
+        | "transaction.server.mempool"
+        | "transaction.server.confirmed"
+        | "transaction.zeroconf.rejected" => ProviderStatusEvidence::Active,
+        _ => ProviderStatusEvidence::Unknown,
+    }
+}
+
+const fn merge_evidence_quality(left: EvidenceQuality, right: EvidenceQuality) -> EvidenceQuality {
+    use EvidenceQuality as Quality;
+    match (left, right) {
+        (Quality::BackendDisagreement, _) | (_, Quality::BackendDisagreement) => {
+            Quality::BackendDisagreement
+        }
+        (Quality::ProviderDisagreement, _) | (_, Quality::ProviderDisagreement) => {
+            Quality::ProviderDisagreement
+        }
+        (Quality::Incomplete, _) | (_, Quality::Incomplete) => Quality::Incomplete,
+        (Quality::CompleteAndAgreed, Quality::CompleteAndAgreed) => Quality::CompleteAndAgreed,
+    }
 }
 
 /// Assemble fresh evidence while the caller holds the existing per-swap
@@ -261,6 +759,56 @@ fn exact_liquid_server_lock_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_swap_action::{
+        recheck_chain_swap_execution_under_lock, ChainSwapAction, ChainSwapExecutionAction,
+        ChainSwapExecutionGate,
+    };
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct ClaimMutationCounts {
+        constructed: usize,
+        journaled: usize,
+        broadcast: usize,
+    }
+
+    fn claimable_evidence() -> ChainSwapEvidence {
+        ChainSwapEvidence {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            provider_status: ProviderStatusEvidence::Active,
+            bitcoin_source: BitcoinSourceEvidence::ConfirmedUnspent,
+            liquid_lock: LiquidLockEvidence::ConfirmedUnspent,
+            liquid_path: LiquidPathEvidence::Viable,
+            renegotiation: RenegotiationEvidence::NotRequired,
+            recovery_destination: RecoveryDestinationEvidence::Committed,
+            cooperative_recovery: CooperativeRecoveryEvidence::Unknown,
+            bitcoin_timeout: BitcoinTimeoutEvidence::BeforeTimeout,
+            liquid_claim_transaction: MerchantTransactionEvidence::None,
+            bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
+        }
+    }
+
+    fn simulate_two_gate_claim(
+        first: &ChainSwapEvidence,
+        second: &ChainSwapEvidence,
+        exact_prepared_replay: bool,
+    ) -> (ChainSwapExecutionGate, ClaimMutationCounts) {
+        let mut mutations = ClaimMutationCounts::default();
+        let first_gate =
+            recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::ClaimLiquid, first);
+        if first_gate != ChainSwapExecutionGate::Authorized {
+            return (first_gate, mutations);
+        }
+        if !exact_prepared_replay {
+            mutations.constructed += 1;
+            mutations.journaled += 1;
+        }
+        let second_gate =
+            recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::ClaimLiquid, second);
+        if second_gate == ChainSwapExecutionGate::Authorized {
+            mutations.broadcast += 1;
+        }
+        (second_gate, mutations)
+    }
 
     #[test]
     fn recovery_attempt_ambiguity_never_looks_absent_or_final() {
@@ -268,5 +816,81 @@ mod tests {
             recovery_transaction_evidence(None),
             MerchantTransactionEvidence::None
         );
+    }
+
+    #[test]
+    fn evidence_change_while_second_lock_is_awaited_blocks_broadcast() {
+        let first = claimable_evidence();
+        let mut after_wait = first;
+        after_wait.liquid_claim_transaction = MerchantTransactionEvidence::Prepared;
+        after_wait.quality = EvidenceQuality::Incomplete;
+
+        let (gate, mutations) = simulate_two_gate_claim(&first, &after_wait, false);
+        assert_eq!(
+            gate,
+            ChainSwapExecutionGate::Blocked(ChainSwapAction::Observe)
+        );
+        assert_eq!(mutations.constructed, 1);
+        assert_eq!(mutations.journaled, 1);
+        assert_eq!(mutations.broadcast, 0);
+    }
+
+    #[test]
+    fn newly_committed_recovery_intent_blocks_competing_claim_broadcast() {
+        let first = claimable_evidence();
+        let mut after_wait = first;
+        after_wait.liquid_claim_transaction = MerchantTransactionEvidence::Prepared;
+        after_wait.bitcoin_recovery_transaction = MerchantTransactionEvidence::Prepared;
+
+        let (gate, mutations) = simulate_two_gate_claim(&first, &after_wait, false);
+        assert_eq!(
+            gate,
+            ChainSwapExecutionGate::Blocked(ChainSwapAction::IntegrityHold)
+        );
+        assert_eq!(mutations.broadcast, 0);
+    }
+
+    #[test]
+    fn unknown_or_disagreed_backend_facts_mutate_nothing() {
+        for quality in [
+            EvidenceQuality::Incomplete,
+            EvidenceQuality::BackendDisagreement,
+            EvidenceQuality::ProviderDisagreement,
+        ] {
+            let mut blocked = claimable_evidence();
+            blocked.quality = quality;
+            let (gate, mutations) = simulate_two_gate_claim(&blocked, &blocked, false);
+            assert_eq!(
+                gate,
+                ChainSwapExecutionGate::Blocked(ChainSwapAction::Observe)
+            );
+            assert_eq!(mutations, ClaimMutationCounts::default());
+        }
+    }
+
+    #[test]
+    fn unknown_liquid_outspend_mutates_nothing_and_never_broadcasts() {
+        let mut blocked = claimable_evidence();
+        blocked.liquid_lock = LiquidLockEvidence::UnknownOutspend;
+        let (gate, mutations) = simulate_two_gate_claim(&blocked, &blocked, false);
+        assert_eq!(
+            gate,
+            ChainSwapExecutionGate::Blocked(ChainSwapAction::IntegrityHold)
+        );
+        assert_eq!(mutations, ClaimMutationCounts::default());
+    }
+
+    #[test]
+    fn duplicate_restart_replays_only_exact_prepared_claim() {
+        let mut prepared = claimable_evidence();
+        prepared.liquid_claim_transaction = MerchantTransactionEvidence::Prepared;
+
+        for _duplicate in 0..2 {
+            let (gate, mutations) = simulate_two_gate_claim(&prepared, &prepared, true);
+            assert_eq!(gate, ChainSwapExecutionGate::Authorized);
+            assert_eq!(mutations.constructed, 0);
+            assert_eq!(mutations.journaled, 0);
+            assert_eq!(mutations.broadcast, 1);
+        }
     }
 }
