@@ -8,6 +8,7 @@ use boltz_client::network::LiquidChain;
 use boltz_client::swaps::boltz::{CreateChainResponse, Side};
 use boltz_client::swaps::liquid::LBtcSwapScript;
 use boltz_client::Keypair;
+use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 
 use crate::chain_swap_action::{
@@ -31,6 +32,13 @@ pub struct CollectedPendingExpiryEvidence {
     pub provider_status: Option<String>,
     pub evidence: ChainSwapEvidence,
     pub primary_bitcoin: Option<PrimaryBitcoinSourceProjectionV1>,
+    /// Swap identity used to construct the primary projection.
+    pub primary_chain_swap_id: Option<uuid::Uuid>,
+    /// Stable tip bound to the independently loaded primary observation.
+    pub primary_tip_height: Option<u32>,
+    /// Canonical digest of the complete authority/tip/primary projection.
+    /// Raw endpoint, transaction, address, and amount data are not exposed.
+    pub primary_evidence_sha256: Option<String>,
 }
 
 /// Assemble fresh evidence while the caller holds the existing per-swap
@@ -111,16 +119,29 @@ pub async fn collect_pending_expiry_evidence_under_lock(
     let (provider_hint, bitcoin_snapshot, liquid_history) =
         tokio::join!(provider_read, bitcoin_read, liquid_read);
     let provider_hint = provider_hint.ok();
-    let primary_bitcoin = match (primary_target.as_ref(), bitcoin_snapshot) {
+    let primary_bitcoin = match (primary_target.as_ref(), bitcoin_snapshot.as_ref()) {
         (Some(target), Some((snapshot, authority))) => project_primary_bitcoin_source_snapshot_v1(
             target,
-            &snapshot,
+            snapshot,
             provider_hint
                 .as_ref()
                 .and_then(|hint| hint.transaction_txid()),
-            authority,
+            *authority,
         )
         .ok(),
+        _ => None,
+    };
+    let primary_tip_height = bitcoin_snapshot
+        .as_ref()
+        .map(|(snapshot, _)| snapshot.tip_height);
+    let primary_evidence_sha256 = match (
+        primary_target.as_ref(),
+        bitcoin_snapshot.as_ref(),
+        primary_bitcoin.as_ref(),
+    ) {
+        (Some(target), Some((snapshot, _)), Some(primary)) => {
+            primary_runtime_evidence_sha256(target, snapshot, primary).ok()
+        }
         _ => None,
     };
 
@@ -152,8 +173,45 @@ pub async fn collect_pending_expiry_evidence_under_lock(
     Ok(CollectedPendingExpiryEvidence {
         provider_status: provider_hint.map(|hint| hint.status().to_owned()),
         evidence,
+        primary_chain_swap_id: primary_bitcoin.as_ref().and_then(|_| {
+            primary_target
+                .as_ref()
+                .map(PrimaryBitcoinSourceTargetV1::chain_swap_id)
+        }),
         primary_bitcoin,
+        primary_tip_height,
+        primary_evidence_sha256,
     })
+}
+
+fn primary_runtime_evidence_sha256(
+    target: &PrimaryBitcoinSourceTargetV1,
+    snapshot: &crate::chain_lockup_witness_adapter::BitcoinMainnetLockupWitnessSnapshotV1,
+    primary: &PrimaryBitcoinSourceProjectionV1,
+) -> Result<String, AppError> {
+    let authority_sha256 = hex::encode(Sha256::digest(snapshot.authority().as_bytes()));
+    let value = serde_json::json!({
+        "formatVersion": 1,
+        "manifestId": target.manifest_id(),
+        "chainSwapId": target.chain_swap_id(),
+        "tipHeight": snapshot.tip_height,
+        "tipHash": snapshot.tip_hash,
+        "authoritySha256": authority_sha256,
+        "quality": format!("{:?}", primary.quality()),
+        "bitcoinSource": format!("{:?}", primary.bitcoin_source()),
+        "primaryTxid": primary.primary_txid(),
+        "expectedAmountSat": primary.expected_amount_sat(),
+        "observedAmountSat": primary.observed_amount_sat(),
+        "amountRelation": format!("{:?}", primary.amount_relation()),
+        "nonPrimaryTransactionCount": primary.non_primary_transaction_count(),
+    });
+    crate::canonical_json::canonical_json_and_sha256(&value)
+        .map(|(_, digest)| digest)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "primary runtime evidence is not canonical: {error}"
+            ))
+        })
 }
 
 fn recovery_transaction_evidence(

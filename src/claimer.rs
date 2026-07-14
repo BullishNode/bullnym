@@ -31,14 +31,23 @@ use boltz_client::Keypair;
 use crate::admission::WorkerReporter;
 use crate::boltz::{ChainSwapQuote, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
 use crate::builder_fee::LiquidBuilderFeeDecision;
-use crate::chain_swap_runtime::{
-    apply_chain_swap_provider_effect, apply_chain_swap_provider_effect_with_evidence,
-    ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
+use crate::chain_swap_action::{
+    reduce_chain_swap_evidence, BitcoinSourceEvidence, ChainSwapAction, EvidenceQuality,
+    LiquidLockEvidence, LiquidPathEvidence, MerchantTransactionEvidence, ProviderStatusEvidence,
+    RenegotiationEvidence,
 };
+use crate::chain_swap_primary_source::PrimaryBitcoinAmountRelationV1;
 use crate::chain_swap_renegotiation::{
     ChainSwapRenegotiationOperation, ChangedQuoteRedrive, RenegotiationErrorClass,
     RenegotiationIdentity, RenegotiationState, TransitionDisposition,
     VerifiedRenegotiationAcceptance,
+};
+use crate::chain_swap_runtime::{
+    apply_chain_swap_provider_effect, apply_chain_swap_provider_effect_with_evidence,
+    ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
+};
+use crate::chain_swap_runtime_evidence::{
+    collect_pending_expiry_evidence_under_lock, CollectedPendingExpiryEvidence,
 };
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
@@ -235,7 +244,6 @@ pub(crate) struct VerifiedPrimaryFundingObservation(VerifiedPrimaryFundingAmount
 
 impl VerifiedPrimaryFundingObservation {
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code, reason = "stacked #139 projection adoption seam")]
     pub(crate) fn new_complete_and_agreed(
         chain_swap_id: Uuid,
         observed_amount_sat: u64,
@@ -1591,6 +1599,10 @@ async fn reconcile_renegotiation_from_verified_server_lock_using<S: ChainSwapRen
 
 /// Reconcile a requested/ambiguous accept from independently verified Liquid
 /// chain progression. This performs no quote or accept provider call.
+#[allow(
+    dead_code,
+    reason = "awaiting the full Liquid output projection; raw provider progress cannot construct this capability"
+)]
 pub(crate) async fn reconcile_renegotiation_from_verified_server_lock(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -1598,6 +1610,147 @@ pub(crate) async fn reconcile_renegotiation_from_verified_server_lock(
 ) -> Result<ServerLockRenegotiationOutcome, AppError> {
     let store = PostgresChainSwapRenegotiationStore { pool: &state.db };
     reconcile_renegotiation_from_verified_server_lock_using(&store, swap, evidence).await
+}
+
+/// Convert one coherent, independently collected source snapshot into the
+/// narrow #38 capability. A provider status, provider txid, or expected amount
+/// alone can never construct this value.
+fn verified_primary_funding_observation_from_locked_evidence(
+    swap: &db::ChainSwapRecord,
+    collected: &CollectedPendingExpiryEvidence,
+) -> Result<Option<VerifiedPrimaryFundingObservation>, AppError> {
+    if collected.provider_status.as_deref() != Some("transaction.lockupFailed")
+        || collected.evidence.quality != EvidenceQuality::CompleteAndAgreed
+        || collected.evidence.liquid_lock != LiquidLockEvidence::NotObserved
+        || collected.evidence.liquid_claim_transaction != MerchantTransactionEvidence::None
+        || collected.evidence.bitcoin_recovery_transaction != MerchantTransactionEvidence::None
+    {
+        return Ok(None);
+    }
+
+    let Some(primary) = collected.primary_bitcoin.as_ref() else {
+        return Ok(None);
+    };
+    if collected.primary_chain_swap_id != Some(swap.id)
+        || u64::try_from(swap.user_lock_amount_sat).ok() != Some(primary.expected_amount_sat())
+        || primary.quality() != EvidenceQuality::CompleteAndAgreed
+        || !matches!(
+            primary.bitcoin_source(),
+            BitcoinSourceEvidence::MempoolUnspent | BitcoinSourceEvidence::ConfirmedUnspent
+        )
+        || !matches!(
+            primary.amount_relation(),
+            PrimaryBitcoinAmountRelationV1::Underfunded
+                | PrimaryBitcoinAmountRelationV1::Overfunded
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut gate = collected.evidence;
+    gate.provider_status = ProviderStatusEvidence::Expired;
+    gate.liquid_path = LiquidPathEvidence::Unavailable;
+    gate.renegotiation = RenegotiationEvidence::Available;
+    primary.apply_to_reducer_evidence(&mut gate);
+    if reduce_chain_swap_evidence(&gate) != ChainSwapAction::Renegotiate {
+        // In particular, an independently observed but still-mempool Bitcoin
+        // lock remains observational until a later fresh confirmed snapshot.
+        return Ok(None);
+    }
+
+    let (
+        Some(observed_amount_sat),
+        Some(primary_identity),
+        Some(authoritative_bitcoin_tip),
+        Some(primary_evidence_sha256),
+    ) = (
+        primary.observed_amount_sat(),
+        primary.primary_txid(),
+        collected.primary_tip_height,
+        collected.primary_evidence_sha256.as_deref(),
+    )
+    else {
+        return Ok(None);
+    };
+
+    VerifiedPrimaryFundingObservation::new_complete_and_agreed(
+        swap.id,
+        observed_amount_sat,
+        primary.expected_amount_sat(),
+        authoritative_bitcoin_tip,
+        current_unix_time()?,
+        primary_identity,
+        primary_evidence_sha256,
+    )
+    .map(Some)
+}
+
+/// Re-read the exact provider/Bitcoin/Liquid facts behind a raw
+/// `transaction.lockupFailed` delivery while holding the shared per-swap
+/// transaction boundary. The transaction is committed before quote/accept I/O
+/// starts; the durable journal executor reacquires the same lock for each
+/// mutation and accepted-parent commit.
+async fn collect_verified_primary_funding_for_renegotiation(
+    state: &AppState,
+    chain_swap_id: Uuid,
+) -> Result<Option<(db::ChainSwapRecord, VerifiedPrimaryFundingObservation)>, AppError> {
+    // Preserve the executable zero-provider-call boundary when either chain
+    // authority is absent. A bare webhook must stay read-only.
+    if state.bitcoin_lockup_witness_adapter.is_none() || state.utxo_backend.is_none() {
+        return Ok(None);
+    }
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+    if !got_lock {
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        return Ok(None);
+    }
+
+    let Some(current) = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+    else {
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        return Ok(None);
+    };
+    current
+        .verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let status = current.parsed_status().map_err(AppError::DbError)?;
+    if !matches!(
+        status,
+        ChainSwapStatus::Pending
+            | ChainSwapStatus::UserLockMempool
+            | ChainSwapStatus::UserLockConfirmed
+    ) {
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        return Ok(None);
+    }
+
+    let collected = collect_pending_expiry_evidence_under_lock(state, &mut tx, &current).await?;
+    let observation =
+        verified_primary_funding_observation_from_locked_evidence(&current, &collected)?;
+    tx.commit()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    Ok(observation.map(|observation| (current, observation)))
 }
 
 pub(crate) async fn handle_chain_swap_webhook(
@@ -1694,14 +1847,6 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
         return Ok(());
     }
 
-    // #139 will map its complete/agreed primary and Liquid projections into
-    // these narrow seams in a stacked integration commit. Keep the function
-    // items linked from the live claimer without executing either path from a
-    // bare webhook, which has no independently verified value evidence.
-    let _stacked_renegotiation_adoption_seams = (
-        adopt_verified_primary_funding_for_renegotiation,
-        reconcile_renegotiation_from_verified_server_lock,
-    );
     let Some(input) = chain_swap_provider_input(boltz_status) else {
         tracing::debug!(
             "ignoring chain-swap webhook status: {} for {}",
@@ -1826,10 +1971,46 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
                 | ChainSwapStatus::UserLockConfirmed
         )
     {
-        // This webhook is only a provider hint. Exact base 72d76ea has no
-        // independently verified primary-funding value, so it must make zero
-        // quote calls and cannot authorize FundingFailed/refund_due. #139 will
-        // map its complete/agreed projection into the guarded entrypoint above.
+        if let Some((current, observation)) =
+            collect_verified_primary_funding_for_renegotiation(state, swap.id).await?
+        {
+            match adopt_verified_primary_funding_for_renegotiation(
+                state,
+                &current,
+                boltz_status,
+                &observation,
+            )
+            .await?
+            {
+                RenegotiationAdoptionOutcome::OwnsProgress => {
+                    tracing::info!(
+                        event = "chain_swap_renegotiation_owns_progress",
+                        swap_id = %current.boltz_swap_id,
+                        invoice_id = %current.invoice_id,
+                        "durable wrong-amount renegotiation owns the next transition"
+                    );
+                }
+                RenegotiationAdoptionOutcome::ExplicitlyUnavailable => {
+                    tracing::info!(
+                        event = "chain_swap_renegotiation_explicitly_unavailable",
+                        swap_id = %current.boltz_swap_id,
+                        invoice_id = %current.invoice_id,
+                        "provider positively declined renegotiation; fallback remains reducer-gated"
+                    );
+                }
+                RenegotiationAdoptionOutcome::NotApplicable => {
+                    tracing::debug!(
+                        swap_id = %current.boltz_swap_id,
+                        "fresh primary evidence no longer requires renegotiation"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        // The incoming webhook remains only a trigger. Missing, stale,
+        // mempool-only, disagreeing, or incomplete evidence makes zero quote
+        // or accept calls and cannot authorize FundingFailed/refund_due.
         tracing::warn!(
             event = "chain_swap_renegotiation_waiting_for_verified_funding",
             swap_id = %swap.boltz_swap_id,

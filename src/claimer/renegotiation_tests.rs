@@ -1,5 +1,13 @@
 use super::*;
 
+use crate::chain_lockup_witness_audit::{
+    ChainLockupConflictFieldV1, ChainLockupFindingClassificationV1, ChainLockupInclusionV1,
+    ChainLockupManifestClassificationV1, ChainLockupManifestWitnessAuditV1, ChainLockupSpendV1,
+    ChainLockupWitnessFindingV1,
+};
+use crate::chain_swap_primary_source::{
+    project_primary_bitcoin_source_v1, PrimaryBitcoinSourceAuthorityV1,
+};
 use crate::chain_swap_renegotiation::{
     ChainSwapRenegotiationOperation, ChangedQuoteRedrive, RenegotiationBlockReason,
     RenegotiationErrorClass, RenegotiationFallbackGate, RenegotiationIdentity,
@@ -536,6 +544,7 @@ fn chain_swap(expected_amount_sat: i64) -> db::ChainSwapRecord {
         status: "user_lock_confirmed".into(),
         claim_txid: None,
         claim_tx_hex: None,
+        claim_fee_authority: db::LiquidClaimFeeAuthority::Legacy,
         claim_attempts: 0,
         last_claim_error: None,
         cooperative_refused: true,
@@ -561,6 +570,46 @@ fn chain_swap(expected_amount_sat: i64) -> db::ChainSwapRecord {
         refund_txid: None,
         created_at_unix: 1,
         updated_at_unix: 1,
+    }
+}
+
+fn collected_primary_mismatch(
+    swap: &db::ChainSwapRecord,
+    inclusion: ChainLockupInclusionV1,
+) -> CollectedPendingExpiryEvidence {
+    let txid = "ab".repeat(32);
+    let projection = project_primary_bitcoin_source_v1(
+        &ChainLockupManifestWitnessAuditV1 {
+            manifest_sequence: 1,
+            manifest_id: Uuid::from_u128(0x82),
+            chain_swap_id: swap.id,
+            expected_amount_sat: u64::try_from(swap.user_lock_amount_sat).unwrap(),
+            classification: ChainLockupManifestClassificationV1::Conflicting,
+            findings: vec![ChainLockupWitnessFindingV1 {
+                txid: txid.clone(),
+                vout: 0,
+                observed_amount_sat: 900,
+                inclusion,
+                spend: ChainLockupSpendV1::Unspent,
+                classification: ChainLockupFindingClassificationV1::Conflicting {
+                    fields: vec![ChainLockupConflictFieldV1::ExpectedAmount],
+                },
+            }],
+        },
+        Some(&txid),
+        PrimaryBitcoinSourceAuthorityV1::SelfHostedNode,
+    )
+    .unwrap();
+    let mut evidence = ChainSwapProviderEvidence::incomplete().evidence;
+    evidence.quality = EvidenceQuality::CompleteAndAgreed;
+    evidence.liquid_lock = LiquidLockEvidence::NotObserved;
+    CollectedPendingExpiryEvidence {
+        provider_status: Some("transaction.lockupFailed".into()),
+        evidence,
+        primary_bitcoin: Some(projection),
+        primary_chain_swap_id: Some(swap.id),
+        primary_tip_height: Some(900_000),
+        primary_evidence_sha256: Some(POLICY_DIGEST.into()),
     }
 }
 
@@ -710,6 +759,64 @@ async fn exact_primary_amount_is_ineligible_while_under_and_over_are_verified_mi
         assert_eq!(mismatch.observed_amount_sat, observed_amount_sat);
         assert_eq!(mismatch.expected_amount_sat, 1_000);
     }
+}
+
+#[test]
+fn runtime_projection_constructs_renegotiation_capability_only_after_confirmed_exact_identity() {
+    let swap = chain_swap(1_000);
+    let confirmed = collected_primary_mismatch(
+        &swap,
+        ChainLockupInclusionV1::Confirmed {
+            confirmations: 1,
+            block_height: 899_999,
+            block_hash: "cd".repeat(32),
+        },
+    );
+    let observation = verified_primary_funding_observation_from_locked_evidence(&swap, &confirmed)
+        .unwrap()
+        .expect("complete confirmed mismatch must reach the guarded journal executor");
+    let mismatch = observation.mismatch().unwrap();
+    assert_eq!(mismatch.chain_swap_id, swap.id);
+    assert_eq!(mismatch.observed_amount_sat, 900);
+    assert_eq!(mismatch.expected_amount_sat, 1_000);
+    assert_eq!(mismatch.authoritative_bitcoin_tip, 900_000);
+
+    let mempool = collected_primary_mismatch(&swap, ChainLockupInclusionV1::Mempool);
+    assert!(
+        verified_primary_funding_observation_from_locked_evidence(&swap, &mempool)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut crossed_identity = collected_primary_mismatch(
+        &swap,
+        ChainLockupInclusionV1::Confirmed {
+            confirmations: 1,
+            block_height: 899_999,
+            block_hash: "ef".repeat(32),
+        },
+    );
+    crossed_identity.primary_chain_swap_id = Some(Uuid::from_u128(0xdead));
+    assert!(
+        verified_primary_funding_observation_from_locked_evidence(&swap, &crossed_identity)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut stale_provider = collected_primary_mismatch(
+        &swap,
+        ChainLockupInclusionV1::Confirmed {
+            confirmations: 1,
+            block_height: 899_999,
+            block_hash: "12".repeat(32),
+        },
+    );
+    stale_provider.provider_status = Some("transaction.confirmed".into());
+    assert!(
+        verified_primary_funding_observation_from_locked_evidence(&swap, &stale_provider)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
