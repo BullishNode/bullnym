@@ -16823,7 +16823,13 @@ fn persisted_liquid_claim_fixture(
     response: &CreateChainResponse,
     merchant_address: &str,
     merchant_blinding_key_hex: &str,
-) -> (String, String, Arc<dyn pay_service::utxo::UtxoBackend>) {
+) -> (
+    String,
+    String,
+    i64,
+    f64,
+    Arc<dyn pay_service::utxo::UtxoBackend>,
+) {
     use boltz_client::elements;
 
     let secp = elements::secp256k1_zkp::Secp256k1::new();
@@ -16873,7 +16879,8 @@ fn persisted_liquid_claim_fixture(
         elements::secp256k1_zkp::SecretKey::from_str(merchant_blinding_key_hex).unwrap();
     let merchant_blinding_pubkey =
         elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &merchant_blinding_key);
-    let merchant_amount = source_amount - 1_000;
+    let fee_sat = 1_000_u64;
+    let merchant_amount = source_amount - fee_sat;
     let (merchant_output, _, _, _) = elements::TxOut::new_last_confidential(
         &mut rng,
         &secp,
@@ -16896,8 +16903,19 @@ fn persisted_liquid_claim_fixture(
             asset_issuance: elements::AssetIssuance::default(),
             witness: elements::TxInWitness::default(),
         }],
-        output: vec![merchant_output, elements::TxOut::new_fee(1_000, asset)],
+        output: vec![merchant_output, elements::TxOut::new_fee(fee_sat, asset)],
     };
+    let actual_fee_sat = i64::try_from(fee_sat).unwrap();
+    let discounted_vbytes = u64::try_from(claim_transaction.discount_vsize()).unwrap();
+    let actual_fee_rate_sat_vb = fee_sat as f64 / discounted_vbytes as f64;
+    assert!((0.1..=10.0).contains(&actual_fee_rate_sat_vb));
+    assert_eq!(
+        pay_service::fee_policy::SatPerVbyte::try_from(actual_fee_rate_sat_vb)
+            .unwrap()
+            .checked_fee_for_vbytes(discounted_vbytes)
+            .unwrap(),
+        fee_sat
+    );
     let claim_txid = claim_transaction.txid().to_string();
     let claim_tx_hex = hex::encode(elements::encode::serialize(&claim_transaction));
     let backend = Arc::new(FakeChainClaimSource {
@@ -16906,7 +16924,13 @@ fn persisted_liquid_claim_fixture(
             elements::encode::serialize(&source_transaction),
         )]),
     });
-    (claim_tx_hex, claim_txid, backend)
+    (
+        claim_tx_hex,
+        claim_txid,
+        actual_fee_sat,
+        actual_fee_rate_sat_vb,
+        backend,
+    )
 }
 
 async fn spawn_counting_liquid_broadcast_server(
@@ -16978,7 +17002,7 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     .unwrap();
     let merchant_address = invoice.liquid_address.as_deref().unwrap();
     let merchant_blinding_key = invoice.liquid_blinding_key_hex.as_deref().unwrap();
-    let (claim_tx_hex, claim_txid, backend) =
+    let (claim_tx_hex, claim_txid, claim_fee_sat, claim_fee_rate_sat_vb, backend) =
         persisted_liquid_claim_fixture(&response, merchant_address, merchant_blinding_key);
     // This fixture deliberately omits only the immutable transaction journal.
     // The parent bytes still carry a complete, valid Review-25 authority
@@ -16987,11 +17011,11 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     sqlx::query(
         "UPDATE chain_swap_records \
          SET status = 'claiming', claim_tx_hex = $2, claim_txid = $3, \
-             claim_actual_fee_sat = 100, claim_actual_fee_rate_sat_vb = 1.5, \
+             claim_actual_fee_sat = $4, claim_actual_fee_rate_sat_vb = $5, \
              claim_fee_decision_purpose = 'chain_liquid_claim', \
              claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
              claim_fee_decision_source = 'liquid_live', \
-             claim_fee_decision_rate_sat_vb = 1.5, \
+             claim_fee_decision_rate_sat_vb = $6, \
              claim_fee_decision_quoted_at_unix = 1700000100, \
              claim_fee_decision_evaluated_at_unix = 1700000105, \
              claim_fee_decision_freshness_age_secs = 5, \
@@ -17005,6 +17029,9 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     .bind(swap.id)
     .bind(&claim_tx_hex)
     .bind(&claim_txid)
+    .bind(claim_fee_sat)
+    .bind(claim_fee_rate_sat_vb)
+    .bind(claim_fee_rate_sat_vb)
     .execute(&pool)
     .await
     .unwrap();
@@ -17027,9 +17054,12 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     .unwrap_err();
 
     assert!(
-        error
-            .to_string()
-            .contains("merchant settlement transaction journal is incomplete"),
+        matches!(
+            &error,
+            AppError::DbError(message)
+                if message
+                    == "load exact Liquid merchant settlement journal: merchant settlement transaction journal is incomplete"
+        ),
         "unexpected retry error: {error}"
     );
     assert_eq!(broadcast_calls.load(Ordering::SeqCst), 0);
