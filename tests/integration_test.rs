@@ -6884,7 +6884,7 @@ async fn issue82_unfunded_finalize_is_exact_once_across_retry_restart_and_reorde
             )
             .await
             .unwrap(),
-            pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::Observed,
+            pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::AlreadyFinalized,
             "reordered_status={reordered_status}"
         );
     }
