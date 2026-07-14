@@ -1251,7 +1251,7 @@ fn validate_automatic_unilateral_refund_witness(
                 "automatic recovery input is not an exact unilateral refund witness".into(),
             ));
         }
-        if input.witness[1] != refund_leaf.as_bytes() {
+        if &input.witness[1] != refund_leaf.as_bytes() {
             return Err(AppError::ClaimError(
                 "automatic recovery witness uses a different refund leaf".into(),
             ));
