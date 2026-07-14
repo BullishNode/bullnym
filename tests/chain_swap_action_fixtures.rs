@@ -1,9 +1,10 @@
 use pay_service::chain_swap_action::{
-    recheck_recovery_under_lock, reduce_chain_swap_evidence, BitcoinSourceEvidence,
-    BitcoinTimeoutEvidence, ChainSwapAction, ChainSwapEvidence, CooperativeRecoveryEvidence,
-    EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence, MerchantTransactionEvidence,
-    ProviderStatusEvidence, RecoveryDestinationEvidence, RecoveryExecutionGate,
-    RenegotiationEvidence,
+    recheck_chain_swap_execution_under_lock, recheck_recovery_under_lock,
+    reduce_chain_swap_evidence, BitcoinSourceEvidence, BitcoinTimeoutEvidence, ChainSwapAction,
+    ChainSwapEvidence, ChainSwapExecutionAction, ChainSwapExecutionGate,
+    CooperativeRecoveryEvidence, EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence,
+    MerchantTransactionEvidence, ProviderStatusEvidence, RecoveryDestinationEvidence,
+    RecoveryExecutionGate, RenegotiationEvidence,
 };
 
 #[derive(Debug)]
@@ -808,5 +809,92 @@ fn under_lock_recheck_authorizes_only_a_still_current_recovery_decision() {
             "under-lock fixture: {}",
             fixture.name
         );
+    }
+}
+
+#[test]
+fn shared_under_lock_gate_authorizes_only_the_exact_irreversible_action() {
+    use BitcoinSourceEvidence as BitcoinSource;
+    use ChainSwapAction as Action;
+    use ChainSwapExecutionAction as Execution;
+    use ChainSwapExecutionGate as Gate;
+    use EvidenceQuality as Quality;
+    use LiquidLockEvidence as LiquidLock;
+    use MerchantTransactionEvidence as Transaction;
+
+    let recovery = recovery_candidate();
+
+    let mut claim = recovery_candidate();
+    claim.liquid_lock = LiquidLock::ConfirmedUnspent;
+
+    let mut expired_unfunded = recovery_candidate();
+    expired_unfunded.bitcoin_source = BitcoinSource::Unfunded;
+
+    let mut finalized_liquid_claim = recovery_candidate();
+    finalized_liquid_claim.liquid_lock = LiquidLock::SpentByMerchantClaim;
+    finalized_liquid_claim.liquid_claim_transaction = Transaction::Finalized;
+
+    let mut finalized_bitcoin_recovery = recovery_candidate();
+    finalized_bitcoin_recovery.bitcoin_source = BitcoinSource::SpentByRecoveryTransaction;
+    finalized_bitcoin_recovery.bitcoin_recovery_transaction = Transaction::Finalized;
+
+    for (requested, evidence) in [
+        (Execution::RecoverBitcoin, &recovery),
+        (Execution::ClaimLiquid, &claim),
+        (Execution::Finalize, &expired_unfunded),
+        (Execution::Finalize, &finalized_liquid_claim),
+        (Execution::Finalize, &finalized_bitcoin_recovery),
+    ] {
+        assert_eq!(
+            recheck_chain_swap_execution_under_lock(requested, evidence),
+            Gate::Authorized,
+            "requested={requested:?}, evidence={evidence:#?}"
+        );
+    }
+
+    for (requested, evidence, current) in [
+        (Execution::ClaimLiquid, &recovery, Action::RecoverBitcoin),
+        (Execution::RecoverBitcoin, &claim, Action::ClaimLiquid),
+        (Execution::ClaimLiquid, &expired_unfunded, Action::Finalize),
+    ] {
+        assert_eq!(
+            recheck_chain_swap_execution_under_lock(requested, evidence),
+            Gate::Blocked(current),
+            "requested={requested:?}, evidence={evidence:#?}"
+        );
+    }
+
+    for requested in [
+        Execution::ClaimLiquid,
+        Execution::RecoverBitcoin,
+        Execution::Finalize,
+    ] {
+        for quality in [
+            Quality::Incomplete,
+            Quality::BackendDisagreement,
+            Quality::ProviderDisagreement,
+        ] {
+            let mut uncertain = recovery_candidate();
+            uncertain.quality = quality;
+            assert_eq!(
+                recheck_chain_swap_execution_under_lock(requested, &uncertain),
+                Gate::Blocked(Action::Observe),
+                "requested={requested:?}, quality={quality:?}"
+            );
+        }
+
+        for (bitcoin_source, liquid_lock) in [
+            (BitcoinSource::UnknownOutspend, LiquidLock::NotObserved),
+            (BitcoinSource::ConfirmedUnspent, LiquidLock::UnknownOutspend),
+        ] {
+            let mut unknown_outspend = recovery_candidate();
+            unknown_outspend.bitcoin_source = bitcoin_source;
+            unknown_outspend.liquid_lock = liquid_lock;
+            assert_eq!(
+                recheck_chain_swap_execution_under_lock(requested, &unknown_outspend),
+                Gate::Blocked(Action::IntegrityHold),
+                "requested={requested:?}, source={bitcoin_source:?}, lock={liquid_lock:?}"
+            );
+        }
     }
 }

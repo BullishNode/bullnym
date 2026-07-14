@@ -191,13 +191,40 @@ pub struct ChainSwapEvidence {
     pub bitcoin_recovery_transaction: MerchantTransactionEvidence,
 }
 
-/// Result of the mandatory fallback recheck while the per-swap execution lock
-/// is held.
+/// Irreversible action a runtime path intends to execute after acquiring the
+/// shared per-swap advisory lock.
+///
+/// Keeping this narrower than [`ChainSwapAction`] prevents observation,
+/// renegotiation, and transaction-watching decisions from being mistaken for
+/// execution authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryExecutionGate {
+pub enum ChainSwapExecutionAction {
+    ClaimLiquid,
+    RecoverBitcoin,
+    Finalize,
+}
+
+impl ChainSwapExecutionAction {
+    /// Reducer action that must still be current at the under-lock recheck.
+    pub const fn reducer_action(self) -> ChainSwapAction {
+        match self {
+            Self::ClaimLiquid => ChainSwapAction::ClaimLiquid,
+            Self::RecoverBitcoin => ChainSwapAction::RecoverBitcoin,
+            Self::Finalize => ChainSwapAction::Finalize,
+        }
+    }
+}
+
+/// Result of the mandatory complete-evidence recheck while the shared
+/// per-swap execution lock is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapExecutionGate {
     Authorized,
     Blocked(ChainSwapAction),
 }
+
+/// Backwards-compatible name for the original recovery-only gate result.
+pub type RecoveryExecutionGate = ChainSwapExecutionGate;
 
 /// Reduce independently verified evidence to one forward-safe action.
 pub fn reduce_chain_swap_evidence(evidence: &ChainSwapEvidence) -> ChainSwapAction {
@@ -375,17 +402,29 @@ pub fn reduce_chain_swap_evidence(evidence: &ChainSwapEvidence) -> ChainSwapActi
     }
 }
 
-/// Re-run the reducer on evidence read while the per-swap execution lock is
-/// held. Only an unchanged `RecoverBitcoin` decision authorizes construction
-/// or broadcast; every other action sends the caller back through normal
-/// planning without executing fallback.
-pub fn recheck_recovery_under_lock(evidence: &ChainSwapEvidence) -> RecoveryExecutionGate {
+/// Re-run the reducer on a complete evidence snapshot assembled after the
+/// caller acquired the shared per-swap advisory lock.
+///
+/// Only the exact irreversible action requested by the caller is authorized.
+/// Every other current decision is returned to the dispatcher without
+/// executing stale work. In particular, unknown outspends remain the
+/// reducer's [`ChainSwapAction::IntegrityHold`] and close this gate.
+pub fn recheck_chain_swap_execution_under_lock(
+    requested: ChainSwapExecutionAction,
+    evidence: &ChainSwapEvidence,
+) -> ChainSwapExecutionGate {
     let action = reduce_chain_swap_evidence(evidence);
-    if action == ChainSwapAction::RecoverBitcoin {
-        RecoveryExecutionGate::Authorized
+    if action == requested.reducer_action() {
+        ChainSwapExecutionGate::Authorized
     } else {
-        RecoveryExecutionGate::Blocked(action)
+        ChainSwapExecutionGate::Blocked(action)
     }
+}
+
+/// Recovery-specific compatibility wrapper for callers that have not yet
+/// adopted the shared irreversible-action gate.
+pub fn recheck_recovery_under_lock(evidence: &ChainSwapEvidence) -> RecoveryExecutionGate {
+    recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::RecoverBitcoin, evidence)
 }
 
 const fn liquid_lock_is_unspent(lock: LiquidLockEvidence) -> bool {
