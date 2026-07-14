@@ -16,7 +16,7 @@ use object_store::{
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,6 +37,11 @@ use pay_service::boltz_transport::{
 };
 use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
+};
+use pay_service::chain_fault_harness::{
+    ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
+    ScriptedBitcoinRecoveryBackend as FakeBitcoinChain,
+    ScriptedBitcoinRecoveryBroadcaster as FakeRecoveryBroadcaster,
 };
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
@@ -16472,109 +16477,6 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FeeSensitiveRecover
     }
 }
 
-#[derive(Default)]
-struct FakeBitcoinChain {
-    transactions: Mutex<HashMap<String, Vec<u8>>>,
-    outspends: Mutex<HashMap<(String, u32), pay_service::chain_recovery::BitcoinOutspend>>,
-}
-
-#[async_trait]
-impl pay_service::chain_recovery::BitcoinRecoveryEvidence for FakeBitcoinChain {
-    async fn raw_transaction(&self, txid: &str) -> Result<Option<Vec<u8>>, AppError> {
-        Ok(self.transactions.lock().await.get(txid).cloned())
-    }
-
-    async fn outspend(
-        &self,
-        txid: &str,
-        vout: u32,
-    ) -> Result<pay_service::chain_recovery::BitcoinOutspend, AppError> {
-        Ok(self
-            .outspends
-            .lock()
-            .await
-            .get(&(txid.to_string(), vout))
-            .cloned()
-            .unwrap_or(pay_service::chain_recovery::BitcoinOutspend::Unspent))
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FakeBroadcastResult {
-    Accept,
-    AcceptResponseLost,
-    BackendUnavailable,
-    Reject,
-    WrongTxid,
-}
-
-struct FakeRecoveryBroadcaster {
-    chain: Arc<FakeBitcoinChain>,
-    source: (String, u32),
-    results: Mutex<VecDeque<FakeBroadcastResult>>,
-    calls: Mutex<Vec<String>>,
-}
-
-impl FakeRecoveryBroadcaster {
-    fn new(
-        chain: Arc<FakeBitcoinChain>,
-        source: (String, u32),
-        results: impl IntoIterator<Item = FakeBroadcastResult>,
-    ) -> Self {
-        Self {
-            chain,
-            source,
-            results: Mutex::new(results.into_iter().collect()),
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    async fn accepted(&self, raw_tx_hex: &str, expected_txid: &str) {
-        self.chain.transactions.lock().await.insert(
-            expected_txid.to_string(),
-            hex::decode(raw_tx_hex).expect("fake broadcaster receives valid hex"),
-        );
-        self.chain.outspends.lock().await.insert(
-            self.source.clone(),
-            pay_service::chain_recovery::BitcoinOutspend::Spent {
-                txid: expected_txid.to_string(),
-            },
-        );
-    }
-}
-
-#[async_trait]
-impl pay_service::chain_recovery::BitcoinRecoveryBroadcaster for FakeRecoveryBroadcaster {
-    async fn broadcast(&self, raw_tx_hex: &str, expected_txid: &str) -> Result<String, AppError> {
-        self.calls.lock().await.push(raw_tx_hex.to_string());
-        let result = self
-            .results
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or(FakeBroadcastResult::Accept);
-        match result {
-            FakeBroadcastResult::Accept => {
-                self.accepted(raw_tx_hex, expected_txid).await;
-                Ok(expected_txid.to_string())
-            }
-            FakeBroadcastResult::AcceptResponseLost => {
-                self.accepted(raw_tx_hex, expected_txid).await;
-                Err(AppError::ClaimError(
-                    "scripted broadcaster accepted the transaction but lost the response".into(),
-                ))
-            }
-            FakeBroadcastResult::BackendUnavailable => Err(AppError::ElectrumError(
-                "scripted Bitcoin broadcast backend unavailable".into(),
-            )),
-            FakeBroadcastResult::Reject => Err(AppError::ClaimError(
-                "scripted broadcaster rejected the transaction".into(),
-            )),
-            FakeBroadcastResult::WrongTxid => Ok("ab".repeat(32)),
-        }
-    }
-}
-
 struct OneShotRecoveryFault {
     point: pay_service::chain_recovery::RecoveryFaultPoint,
     fired: AtomicBool,
@@ -16709,10 +16611,12 @@ async fn seed_recovery_journal_harness(
     let expected_raw_hex = hex::encode(bitcoin::consensus::serialize(&recovery_tx));
 
     let chain = Arc::new(FakeBitcoinChain::default());
-    chain.transactions.lock().await.insert(
-        source_txid.clone(),
-        bitcoin::consensus::serialize(&source_tx),
-    );
+    chain
+        .insert_raw_transaction(
+            source_txid.clone(),
+            bitcoin::consensus::serialize(&source_tx),
+        )
+        .unwrap();
     let broadcaster = Arc::new(FakeRecoveryBroadcaster::new(
         chain.clone(),
         (source_txid.clone(), 0),
@@ -17988,7 +17892,7 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
 
     assert_eq!(txid, harness.expected_txid);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
     let final_swap = pay_service::db::get_chain_swap_by_id(&state.db, harness.swap.id)
         .await
         .unwrap()
@@ -18054,7 +17958,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             "fault {point:?} left the wrong commit state"
         );
         assert_eq!(
-            harness.broadcaster.calls.lock().await.len(),
+            harness.broadcaster.calls().len(),
             usize::from(point == RecoveryFaultPoint::AfterBroadcastCallBeforeOutcomeCommit),
             "fault {point:?} reached the broadcaster at the wrong boundary"
         );
@@ -18133,7 +18037,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             Some(harness.expected_txid.as_str())
         );
 
-        let calls = harness.broadcaster.calls.lock().await;
+        let calls = harness.broadcaster.calls();
         assert!(calls.iter().all(|raw| raw == &harness.expected_raw_hex));
         assert_eq!(
             harness.builder.calls.load(Ordering::SeqCst),
@@ -18324,7 +18228,7 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
         committed_fee_decision
     );
     assert_eq!(
-        harness.broadcaster.calls.lock().await.as_slice(),
+        harness.broadcaster.calls().as_slice(),
         &[committed.raw_tx_hex]
     );
 
@@ -18380,7 +18284,7 @@ async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
             if reason == BITCOIN_FEE_DECISION_PENDING_REASON
     ));
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18428,7 +18332,7 @@ async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_
             if reason == BITCOIN_FEE_DECISION_PENDING_REASON
     ));
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 0);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18455,7 +18359,7 @@ async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_
     .expect("a later accepted live decision must resume recovery construction");
     assert_eq!(txid, harness.expected_txid);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
 
     cleanup_db(&pool).await;
 }
@@ -18485,7 +18389,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
     .await
     .unwrap();
     assert_eq!(txid, harness.expected_txid);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
 
     // A complete retry is a read-only idempotent success.
     let retry = execute_journaled_recovery_with_services(
@@ -18500,7 +18404,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
     .await
     .unwrap();
     assert_eq!(retry, harness.expected_txid);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
     cleanup_db(&pool).await;
 }
@@ -18546,7 +18450,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
     )
     .await
     .unwrap();
-    let calls = harness.broadcaster.calls.lock().await;
+    let calls = harness.broadcaster.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0], harness.expected_raw_hex);
     assert_eq!(calls[1], harness.expected_raw_hex);
@@ -18724,7 +18628,7 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
     )
     .await;
     assert!(result.is_err());
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18762,8 +18666,9 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
     .await
     .is_err());
     let unknown_txid = "ab".repeat(32);
-    harness.chain.outspends.lock().await.insert(
-        (harness.source_txid.clone(), 0),
+    harness.chain.set_outspend(
+        harness.source_txid.clone(),
+        0,
         pay_service::chain_recovery::BitcoinOutspend::Spent {
             txid: unknown_txid.clone(),
         },
@@ -18780,7 +18685,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
     )
     .await;
     assert!(result.is_err());
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 0);
+    assert_eq!(harness.broadcaster.calls().len(), 0);
     let held = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
         .await
         .unwrap()
@@ -18836,7 +18741,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
     .await
     .unwrap();
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    let calls = harness.broadcaster.calls.lock().await;
+    let calls = harness.broadcaster.calls();
     assert!(!calls.is_empty());
     assert!(calls.iter().all(|raw| raw == &harness.expected_raw_hex));
     drop(calls);
@@ -18882,7 +18787,7 @@ async fn legacy_refunding_without_journal_is_never_reconstructed() {
     .await;
     assert!(result.is_err());
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 0);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await

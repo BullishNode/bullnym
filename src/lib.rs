@@ -11,6 +11,8 @@ pub mod builder_fee;
 pub(crate) mod canonical_json;
 pub mod certification;
 pub mod chain_fallback;
+#[doc(hidden)]
+pub mod chain_fault_harness;
 pub mod chain_lockup_witness_adapter;
 pub mod chain_lockup_witness_audit;
 pub mod chain_recovery;
