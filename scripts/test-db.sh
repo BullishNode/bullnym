@@ -26,6 +26,8 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
+EXPECTED_MIGRATION_COUNT=55
+MIGRATION_FILES=()
 
 usage() {
   cat <<'USAGE'
@@ -100,6 +102,23 @@ esac
 if ((CLEANUP_FAILURE_PROBE == 1 && KEEP == 1)); then
   die "--cleanup-failure-probe cannot be combined with --keep"
 fi
+
+mapfile -t MIGRATION_FILES < <(
+  find migrations -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | LC_ALL=C sort
+)
+[[ "${#MIGRATION_FILES[@]}" -eq "$EXPECTED_MIGRATION_COUNT" ]] \
+  || die "expected exactly $EXPECTED_MIGRATION_COUNT migrations, found ${#MIGRATION_FILES[@]}"
+for ((migration_number = 1; migration_number <= EXPECTED_MIGRATION_COUNT; migration_number += 1)); do
+  expected_prefix="$(printf '%03d_' "$migration_number")"
+  migration_name="${MIGRATION_FILES[migration_number - 1]}"
+  [[ "$migration_name" == "$expected_prefix"*.sql ]] \
+    || die "migration boundary is not contiguous at $expected_prefix (found $migration_name)"
+done
+[[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
+  || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
+[[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
+    "055_merchant_settlement_lifecycle.sql" ]] \
+  || die "unexpected migration-055 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -199,9 +218,10 @@ apply_migrations() {
   local database="$1"
   local with_hooks="$2"
   local count=0
-  local migration base before after
+  local migration migration_name base before after
 
-  for migration in migrations/*.sql; do
+  for migration_name in "${MIGRATION_FILES[@]}"; do
+    migration="migrations/$migration_name"
     base="$(basename "$migration" .sql)"
     before="tests/migration-hooks/${base}.before.sql"
     after="tests/migration-hooks/${base}.after.sql"
