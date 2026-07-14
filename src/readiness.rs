@@ -9,6 +9,619 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+const EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION: &str = concat!(
+    "num_nonnulls(fee_decision_purpose,fee_decision_rail,fee_decision_target,",
+    "fee_decision_source,fee_decision_rate_sat_vb,fee_decision_quoted_at_unix,",
+    "fee_decision_evaluated_at_unix,fee_decision_freshness_age_secs,",
+    "fee_decision_freshness_max_age_secs,fee_decision_provenance,",
+    "fee_decision_policy_floor_sat_vb,fee_decision_policy_cap_sat_vb,",
+    "fee_decision_policy_version)=ANY(ARRAY[0,13])"
+);
+
+const EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION: &str = concat!(
+    "fee_decision_purposeISNULLOR(purpose='btc_recovery'::textAND",
+    "fee_decision_purpose='bitcoin_recovery'::textAND",
+    "fee_decision_rail='bitcoin'::textANDfee_decision_target='fastestFee'::textAND",
+    "(fee_decision_source=ANY(ARRAY['bitcoin_live'::text,",
+    "'bitcoin_last_known_good'::text]))OR",
+    "(purpose=ANY(ARRAY['liquid_claim'::text,'liquid_claim_replacement'::text]))AND",
+    "fee_decision_purpose='chain_liquid_claim'::textAND",
+    "fee_decision_rail='liquid'::textANDfee_decision_target='1'::textAND",
+    "(fee_decision_source=ANY(ARRAY['liquid_live'::text,",
+    "'liquid_last_known_good'::text])))AND",
+    "fee_decision_rate_sat_vb>0::doubleprecisionAND",
+    "(fee_decision_rate_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_quoted_at_unix>=0AND",
+    "fee_decision_evaluated_at_unix>=fee_decision_quoted_at_unixAND",
+    "fee_decision_freshness_age_secs>=0ANDfee_decision_freshness_max_age_secs>0AND",
+    "(fee_decision_evaluated_at_unix-fee_decision_quoted_at_unix)=",
+    "fee_decision_freshness_age_secsAND",
+    "fee_decision_freshness_age_secs<=fee_decision_freshness_max_age_secsAND",
+    "btrim(fee_decision_provenance)<>''::textAND",
+    "octet_length(fee_decision_provenance)<=512AND",
+    "fee_decision_policy_floor_sat_vb>0::doubleprecisionAND",
+    "(fee_decision_policy_floor_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_policy_cap_sat_vb>=fee_decision_policy_floor_sat_vbAND",
+    "(fee_decision_policy_cap_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_rate_sat_vb>=fee_decision_policy_floor_sat_vbAND",
+    "fee_decision_rate_sat_vb<=fee_decision_policy_cap_sat_vbAND",
+    "fee_decision_policy_version='review25-v1'::text"
+);
+
+const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
+    "WITH required_columns(column_name, type_oid, ordinal) AS (VALUES \
+         ('fee_decision_purpose', 'text'::REGTYPE, 1), \
+         ('fee_decision_rail', 'text'::REGTYPE, 2), \
+         ('fee_decision_target', 'text'::REGTYPE, 3), \
+         ('fee_decision_source', 'text'::REGTYPE, 4), \
+         ('fee_decision_rate_sat_vb', 'float8'::REGTYPE, 5), \
+         ('fee_decision_quoted_at_unix', 'int8'::REGTYPE, 6), \
+         ('fee_decision_evaluated_at_unix', 'int8'::REGTYPE, 7), \
+         ('fee_decision_freshness_age_secs', 'int8'::REGTYPE, 8), \
+         ('fee_decision_freshness_max_age_secs', 'int8'::REGTYPE, 9), \
+         ('fee_decision_provenance', 'text'::REGTYPE, 10), \
+         ('fee_decision_policy_floor_sat_vb', 'float8'::REGTYPE, 11), \
+         ('fee_decision_policy_cap_sat_vb', 'float8'::REGTYPE, 12), \
+         ('fee_decision_policy_version', 'text'::REGTYPE, 13) \
+     ), validated_constraints AS ( \
+         SELECT constraint_info.conname, \
+                regexp_replace( \
+                    pg_get_expr( \
+                        constraint_info.conbin, constraint_info.conrelid, TRUE \
+                    ), \
+                    '[[:space:]]+', '', 'g' \
+                ) AS expression \
+           FROM pg_constraint constraint_info \
+           JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+          WHERE namespace.nspname = 'public' \
+            AND relation.relname = 'chain_swap_tx_attempts' \
+            AND relation.relkind = 'r' \
+            AND constraint_info.contype = 'c' \
+            AND constraint_info.convalidated \
+            AND constraint_info.conname IN ( \
+                'chain_swap_tx_attempts_fee_authority_shape_check', \
+                'chain_swap_tx_attempts_fee_authority_value_check' \
+            ) \
+     ) \
+     SELECT NOT EXISTS ( \
+         SELECT 1 FROM required_columns required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_attribute attribute \
+                JOIN pg_class relation ON relation.oid = attribute.attrelid \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND relation.relname = 'chain_swap_tx_attempts' \
+                 AND relation.relkind = 'r' \
+                 AND attribute.attname = required.column_name \
+                 AND attribute.atttypid = required.type_oid \
+                 AND attribute.atttypmod = -1 \
+                 AND NOT attribute.attnotnull \
+                 AND attribute.attnum > 0 \
+                 AND NOT attribute.attisdropped \
+          ) \
+     ) \
+     AND (SELECT COUNT(*) FROM validated_constraints) = 2 \
+     AND EXISTS ( \
+         SELECT 1 FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_shape_check' \
+            AND expression = $1 \
+     ) \
+     AND EXISTS ( \
+         SELECT 1 FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_value_check' \
+            AND expression = $2 \
+     )";
+
+const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
+    "WITH required_function_bodies(function_name, body_sha256) AS (VALUES \
+         ('enforce_liquid_claim_replacement_lineage', '2c6eb8d351f5fe1330d101915e897b2984b91f747d31e879d31d555f18105f27'), \
+         ('enforce_merchant_settlement_checkpoint_write', '5e8189d952b8a1f921bafc6da90c2ae658c46691b243f6bbd5e16d056bf7ca29'), \
+         ('enforce_merchant_settlement_retained_update', '840d9f3ee9d6fb05f27a2fa9c56f583b411d34b47b92d3a27bc0089622d5ddd0'), \
+         ('guard_chain_swap_tx_attempt_immutable', 'a11b15a80a879cb5cc9b1b9f3a6c795d72c82263f53b01b1e52e4bb726f800d3'), \
+         ('guard_invoice_payment_event_evidence', '893b3f4effa66be50635c1e6a7904783e85d52e30e015123f8438a8a62c295d8'), \
+         ('reject_merchant_settlement_delete', '475959643f22379df0eb575f0c2410ee523fe9d15591c73838eecaba7ac9a875'), \
+         ('reject_merchant_settlement_event_delete', '6da9435887b06e540a1833528587547bbee9a27dca5e42004d2bd576c1e32be8'), \
+         ('require_review25_bitcoin_attempt_fee_authority', '33021f5da06d90a78139df9bacf9d29f84e8225f6f656d6968a1bc99ad169678') \
+     ) \
+     SELECT NOT EXISTS ( \
+         SELECT 1 \
+           FROM (VALUES \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_require_review25_fee_authority', 'require_review25_bitcoin_attempt_fee_authority', 7), \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_immutable', 'guard_chain_swap_tx_attempt_immutable', 19), \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_validate_replacement', 'enforce_liquid_claim_replacement_lineage', 7), \
+             ('invoice_payment_events', 'invoice_payment_event_evidence_guard', 'guard_invoice_payment_event_evidence', 19), \
+             ('invoice_payment_events', 'invoice_payment_event_reject_merchant_settlement_delete', 'reject_merchant_settlement_event_delete', 11), \
+             ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_validate_write', 'enforce_merchant_settlement_checkpoint_write', 23), \
+             ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_reject_delete', 'reject_merchant_settlement_delete', 11), \
+             ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_validate_update', 'enforce_merchant_settlement_retained_update', 23), \
+             ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_reject_delete', 'reject_merchant_settlement_delete', 11) \
+           ) required(table_name, trigger_name, function_name, trigger_type) \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_trigger trigger_info \
+                JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+                JOIN pg_namespace relation_namespace \
+                  ON relation_namespace.oid = relation.relnamespace \
+                JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                JOIN pg_namespace function_namespace \
+                  ON function_namespace.oid = function_info.pronamespace \
+               WHERE relation_namespace.nspname = 'public' \
+                 AND function_namespace.nspname = 'public' \
+                 AND relation.relname = required.table_name \
+                 AND relation.relkind = 'r' \
+                 AND trigger_info.tgname = required.trigger_name \
+                 AND function_info.proname = required.function_name \
+                 AND function_info.pronargs = 0 \
+                 AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                 AND trigger_info.tgnargs = 0 \
+                 AND trigger_info.tgattr::TEXT = '' \
+                 AND trigger_info.tgqual IS NULL \
+                 AND trigger_info.tgconstraint = 0 \
+                 AND NOT trigger_info.tgdeferrable \
+                 AND NOT trigger_info.tginitdeferred \
+                 AND NOT trigger_info.tgisinternal \
+                 AND trigger_info.tgenabled = 'O' \
+          ) \
+    ) \
+    AND NOT EXISTS ( \
+        SELECT 1 FROM required_function_bodies required \
+         WHERE NOT EXISTS ( \
+             SELECT 1 \
+               FROM pg_proc function_info \
+               JOIN pg_namespace function_namespace \
+                 ON function_namespace.oid = function_info.pronamespace \
+               JOIN pg_language language_info \
+                 ON language_info.oid = function_info.prolang \
+              WHERE function_namespace.nspname = 'public' \
+                AND function_info.proname = required.function_name \
+                AND function_info.pronargs = 0 \
+                AND function_info.prokind = 'f' \
+                AND function_info.prorettype = 'trigger'::REGTYPE \
+                AND language_info.lanname = 'plpgsql' \
+                AND function_info.provolatile = 'v' \
+                AND NOT function_info.proisstrict \
+                AND NOT function_info.prosecdef \
+                AND NOT function_info.proleakproof \
+                AND function_info.proparallel = 'u' \
+                AND function_info.proconfig IS NULL \
+                AND encode( \
+                    sha256(convert_to(function_info.prosrc, 'UTF8')), 'hex' \
+                ) = required.body_sha256 \
+         ) \
+    )";
+
+const MERCHANT_SETTLEMENT_PRIVILEGES_SQL: &str =
+    "WITH required_tables(table_name) AS (VALUES \
+         ('chain_swap_tx_attempts'), \
+         ('invoice_payment_events'), \
+         ('merchant_settlement_checkpoints'), \
+         ('merchant_settlement_retained_outputs') \
+     ), required_functions(function_name) AS (VALUES \
+         ('guard_chain_swap_tx_attempt_immutable'), \
+         ('require_review25_bitcoin_attempt_fee_authority'), \
+         ('enforce_liquid_claim_replacement_lineage'), \
+         ('guard_invoice_payment_event_evidence'), \
+         ('reject_merchant_settlement_event_delete'), \
+         ('enforce_merchant_settlement_checkpoint_write'), \
+         ('enforce_merchant_settlement_retained_update'), \
+         ('reject_merchant_settlement_delete') \
+     ) \
+     SELECT NOT EXISTS ( \
+         SELECT 1 FROM required_tables required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_class relation \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND relation.relname = required.table_name \
+                 AND relation.relkind = 'r' \
+                 AND pg_get_userbyid(relation.relowner) <> current_user \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'USAGE') \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'SET') \
+                 AND has_table_privilege(current_user, relation.oid, 'SELECT') \
+                 AND has_table_privilege(current_user, relation.oid, 'INSERT') \
+                 AND has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'DELETE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+          ) \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 \
+           FROM pg_class relation \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           CROSS JOIN LATERAL aclexplode(COALESCE( \
+               relation.relacl, acldefault('r', relation.relowner) \
+           )) acl \
+          WHERE namespace.nspname = 'public' \
+            AND relation.relname IN (SELECT table_name FROM required_tables) \
+            AND acl.grantee = 0 \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM required_functions required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_proc function_info \
+                JOIN pg_namespace namespace \
+                  ON namespace.oid = function_info.pronamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND function_info.proname = required.function_name \
+                 AND function_info.pronargs = 0 \
+                 AND pg_get_userbyid(function_info.proowner) <> current_user \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(function_info.proowner), 'USAGE') \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(function_info.proowner), 'SET') \
+          ) \
+     ) \
+     AND EXISTS ( \
+         SELECT 1 \
+           FROM pg_class sequence_info \
+           JOIN pg_namespace namespace ON namespace.oid = sequence_info.relnamespace \
+          WHERE namespace.nspname = 'public' \
+            AND sequence_info.relname = 'invoice_payment_events_accounting_sequence_seq' \
+            AND sequence_info.relkind = 'S' \
+            AND pg_get_userbyid(sequence_info.relowner) <> current_user \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(sequence_info.relowner), 'USAGE') \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(sequence_info.relowner), 'SET') \
+            AND has_sequence_privilege(current_user, sequence_info.oid, 'USAGE') \
+            AND NOT has_sequence_privilege(current_user, sequence_info.oid, 'SELECT') \
+            AND NOT has_sequence_privilege(current_user, sequence_info.oid, 'UPDATE') \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM aclexplode(COALESCE( \
+                      sequence_info.relacl, acldefault('S', sequence_info.relowner) \
+                  )) acl \
+                 WHERE acl.grantee = 0 \
+            ) \
+     )";
+
+const CHAIN_SWAP_RENEGOTIATION_INVARIANTS_SQL: &str = r#"
+SELECT
+    COALESCE((
+        SELECT array_agg(
+                   format('%s:%s:%s', column_name, data_type, is_nullable)
+                   ORDER BY ordinal_position
+               ) = ARRAY[
+                   'chain_swap_id:uuid:NO',
+                   'state:text:NO',
+                   'quoted_actual_amount_sat:bigint:NO',
+                   'quote_response_digest:text:NO',
+                   'quote_observed_at:timestamp with time zone:NO',
+                   'policy_version:text:NO',
+                   'policy_evidence_digest:text:NO',
+                   'policy_validated_at:timestamp with time zone:NO',
+                   'accept_attempt_count:integer:NO',
+                   'last_error_class:text:YES',
+                   'version:bigint:NO',
+                   'accept_requested_at:timestamp with time zone:YES',
+                   'ambiguous_at:timestamp with time zone:YES',
+                   'terminal_response_digest:text:YES',
+                   'terminal_observed_at:timestamp with time zone:YES',
+                   'created_at:timestamp with time zone:NO',
+                   'updated_at:timestamp with time zone:NO'
+               ]::TEXT[]
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chain_swap_renegotiation_operations'
+    ), FALSE)
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('state', '''quoted''::text'),
+              ('accept_attempt_count', '0'),
+              ('version', '1'),
+              ('created_at', 'now()'),
+              ('updated_at', 'now()')
+          ) required(column_name, expected_default)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns column_info
+              WHERE column_info.table_schema = 'public'
+                AND column_info.table_name =
+                    'chain_swap_renegotiation_operations'
+                AND column_info.column_name = required.column_name
+                AND column_info.column_default = required.expected_default
+         )
+    )
+    AND (
+        SELECT COUNT(*)
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.contype = 'c'
+    ) = 9
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_renegotiation_state_check'),
+              ('chain_swap_renegotiation_quoted_amount_check'),
+              ('chain_swap_renegotiation_quote_digest_check'),
+              ('chain_swap_renegotiation_policy_evidence_check'),
+              ('chain_swap_renegotiation_attempt_count_check'),
+              ('chain_swap_renegotiation_error_class_check'),
+              ('chain_swap_renegotiation_version_check'),
+              ('chain_swap_renegotiation_terminal_digest_check'),
+              ('chain_swap_renegotiation_lifecycle_shape_check')
+          ) required(constraint_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                  to_regclass('public.chain_swap_renegotiation_operations')
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype = 'c'
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_operations_pkey'
+           AND constraint_info.contype = 'p'
+           AND constraint_info.convalidated
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint foreign_key
+         WHERE foreign_key.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND foreign_key.confrelid = to_regclass('public.chain_swap_records')
+           AND foreign_key.conname =
+               'chain_swap_renegotiation_operations_chain_fkey'
+           AND foreign_key.contype = 'f'
+           AND foreign_key.convalidated
+           AND foreign_key.confupdtype = 'r'
+           AND foreign_key.confdeltype = 'r'
+           AND NOT foreign_key.condeferrable
+           AND NOT foreign_key.condeferred
+    )
+    AND EXISTS (
+        SELECT 1
+         FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_error_class_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%timeout%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%transport%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%provider_server_error%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%malformed_response%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%backend_disagreement%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%local_commit_uncertainty%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%unknown_provider_outcome%'
+    )
+    AND EXISTS (
+        SELECT 1
+         FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_state_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%quoted%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%ambiguous%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%accepted%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%declined%'
+    )
+    AND EXISTS (
+        SELECT 1
+         FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_policy_evidence_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_version%[[:space:]]%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_evidence_digest%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%quote_observed_at%1970-01-01%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_validated_at >= quote_observed_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+         FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_lifecycle_shape_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested_at >= created_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested_at <= updated_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%ambiguous_at <= updated_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%terminal_observed_at >= created_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%terminal_observed_at <= updated_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+         JOIN pg_class index_relation
+            ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid =
+             to_regclass('public.chain_swap_renegotiation_operations')
+           AND index_relation.relname = 'chain_swap_renegotiation_active_idx'
+           AND NOT index_info.indisunique
+           AND index_info.indisvalid
+           AND pg_get_indexdef(index_info.indexrelid) LIKE
+               '%(updated_at, chain_swap_id)%'
+           AND pg_get_expr(index_info.indpred, index_info.indrelid) LIKE
+               '%accepted%declined%'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_renegotiation_validate_insert',
+                  'enforce_chain_swap_renegotiation_insert', 7),
+              ('chain_swap_renegotiation_validate_update',
+                  'enforce_chain_swap_renegotiation_update', 19),
+              ('chain_swap_renegotiation_reject_delete',
+                  'reject_chain_swap_renegotiation_delete', 11)
+          ) required(trigger_name, function_name, trigger_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
+              WHERE relation_namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
+                AND relation.relname = 'chain_swap_renegotiation_operations'
+                AND relation.relkind = 'r'
+                AND trigger_info.tgname = required.trigger_name
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled IN ('O', 'A')
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_renegotiation_insert'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.state <> ''quoted''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.version <> 1%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.quote_observed_at > persisted_at%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.policy_validated_at > persisted_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_renegotiation_update'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state IN (''accepted'', ''declined'')%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.version <> OLD.version + 1%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''accept_requested''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''accepted''%'
+           AND pg_get_functiondef(function_info.oid) NOT LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''declined''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.quote_response_digest%OLD.quote_response_digest%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.policy_evidence_digest%OLD.policy_evidence_digest%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'reject_chain_swap_renegotiation_delete'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%renegotiation operation evidence cannot be deleted%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'chain_swap_renegotiation_operations'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM aclexplode(COALESCE(
+                     relation.relacl, acldefault('r', relation.relowner)
+                 )) acl
+                WHERE acl.grantee = 0
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_chain_swap_renegotiation_insert'),
+              ('enforce_chain_swap_renegotiation_update'),
+              ('reject_chain_swap_renegotiation_delete')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM aclexplode(COALESCE(
+                          function_info.proacl,
+                          acldefault('f', function_info.proowner)
+                      )) acl
+                     WHERE acl.grantee = 0
+                       AND acl.privilege_type = 'EXECUTE'
+                )
+         )
+    )
+"#;
+
 type DirectLifecyclePrivileges = (
     Option<bool>,
     Option<bool>,
@@ -127,7 +740,13 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// HTTP readiness endpoint reuses the same predicate so deploy and runtime
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-    if !schema_marker_present(pool).await? || !swap_key_lineage_invariants_present(pool).await? {
+    if !schema_marker_present(pool).await?
+        || !swap_key_lineage_invariants_present(pool).await?
+        || !merchant_settlement_fee_schema_present(pool).await?
+        || !merchant_settlement_trigger_invariants_present(pool).await?
+        || !merchant_settlement_privileges_present(pool).await?
+        || !chain_swap_renegotiation_invariants_present(pool).await?
+    {
         return Ok(false);
     }
 
@@ -251,6 +870,36 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_PRIVILEGES_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn merchant_settlement_fee_schema_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL)
+        .bind(EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION)
+        .bind(EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION)
+        .fetch_one(pool)
+        .await
+}
+
+async fn merchant_settlement_trigger_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn chain_swap_renegotiation_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(CHAIN_SWAP_RENEGOTIATION_INVARIANTS_SQL)
+        .fetch_one(pool)
+        .await
 }
 
 /// Global #84 capability boundary. This does not assert that any particular
@@ -634,9 +1283,7 @@ fn swap_key_lineage_privileges_ready(
     )
 }
 
-fn chain_swap_record_privileges_ready(
-    (select, insert, update): ChainSwapRecordPrivileges,
-) -> bool {
+fn chain_swap_record_privileges_ready((select, insert, update): ChainSwapRecordPrivileges) -> bool {
     matches!(
         (select, insert, update),
         (Some(true), Some(true), Some(true))
@@ -1043,7 +1690,43 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   ) \
                   AND NOT t.tgisinternal \
                   AND t.tgenabled IN ('O', 'A') \
-            ) = 2",
+            ) = 2 \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND (table_name, column_name) IN ( \
+                      ('chain_swap_tx_attempts', 'replaces_txid'), \
+                      ('chain_swap_tx_attempts', 'destination_asset_id'), \
+                      ('chain_swap_tx_attempts', 'liquid_blinding_key_hex'), \
+                      ('invoice_payment_events', 'merchant_settlement_family_key'), \
+                      ('invoice_payment_events', 'merchant_chain_swap_id'), \
+                      ('invoice_payment_events', 'merchant_settlement_finalized') \
+                  ) \
+            ) = 6 \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.tables \
+                WHERE table_schema = 'public' \
+                  AND table_name IN ( \
+                      'merchant_settlement_checkpoints', \
+                      'merchant_settlement_retained_outputs' \
+                  ) \
+            ) = 2 \
+            AND ( \
+                SELECT COUNT(*) \
+                  FROM pg_constraint constraint_info \
+                  JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+                  JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+                 WHERE namespace.nspname = 'public' \
+                   AND constraint_info.convalidated \
+                   AND constraint_info.conname IN ( \
+                       'chain_swap_tx_attempts_replaces_fkey', \
+                       'invoice_payment_events_merchant_chain_swap_fkey', \
+                       'merchant_settlement_checkpoint_journal_fkey', \
+                       'merchant_settlement_retained_event_fkey', \
+                       'merchant_settlement_retained_journal_fkey', \
+                       'merchant_settlement_retained_checkpoint_fkey' \
+                   ) \
+            ) = 6",
     )
     .fetch_one(pool)
     .await
@@ -1055,7 +1738,262 @@ mod tests {
         chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
         journal_privileges_ready, recovery_commitment_privileges_ready,
         swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
+        EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION,
+        EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION, MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL,
+        MERCHANT_SETTLEMENT_PRIVILEGES_SQL, MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
     };
+
+    #[test]
+    fn merchant_settlement_readiness_matches_deploy_boundary() {
+        for (column, type_name, ordinal) in [
+            ("fee_decision_purpose", "text", 1),
+            ("fee_decision_rail", "text", 2),
+            ("fee_decision_target", "text", 3),
+            ("fee_decision_source", "text", 4),
+            ("fee_decision_rate_sat_vb", "float8", 5),
+            ("fee_decision_quoted_at_unix", "int8", 6),
+            ("fee_decision_evaluated_at_unix", "int8", 7),
+            ("fee_decision_freshness_age_secs", "int8", 8),
+            ("fee_decision_freshness_max_age_secs", "int8", 9),
+            ("fee_decision_provenance", "text", 10),
+            ("fee_decision_policy_floor_sat_vb", "float8", 11),
+            ("fee_decision_policy_cap_sat_vb", "float8", 12),
+            ("fee_decision_policy_version", "text", 13),
+        ] {
+            let exact_column = format!("('{column}', '{type_name}'::REGTYPE, {ordinal})");
+            assert!(
+                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(&exact_column),
+                "missing exact nullable fee column: {exact_column}"
+            );
+        }
+        for schema_guard in [
+            "attribute.atttypid = required.type_oid",
+            "attribute.atttypmod = -1",
+            "NOT attribute.attnotnull",
+            "constraint_info.contype = 'c'",
+            "constraint_info.convalidated",
+            "chain_swap_tx_attempts_fee_authority_shape_check",
+            "chain_swap_tx_attempts_fee_authority_value_check",
+            "regexp_replace(",
+            "expression = $1",
+            "expression = $2",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(schema_guard),
+                "missing fee-schema guard: {schema_guard}"
+            );
+        }
+        assert_eq!(
+            EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION,
+            concat!(
+                "num_nonnulls(fee_decision_purpose,fee_decision_rail,",
+                "fee_decision_target,fee_decision_source,fee_decision_rate_sat_vb,",
+                "fee_decision_quoted_at_unix,fee_decision_evaluated_at_unix,",
+                "fee_decision_freshness_age_secs,fee_decision_freshness_max_age_secs,",
+                "fee_decision_provenance,fee_decision_policy_floor_sat_vb,",
+                "fee_decision_policy_cap_sat_vb,fee_decision_policy_version)=",
+                "ANY(ARRAY[0,13])"
+            )
+        );
+        for value_marker in [
+            "btc_recovery",
+            "bitcoin_recovery",
+            "bitcoin_live",
+            "bitcoin_last_known_good",
+            "liquid_claim",
+            "liquid_claim_replacement",
+            "chain_liquid_claim",
+            "liquid_live",
+            "liquid_last_known_good",
+            "review25-v1",
+        ] {
+            assert!(
+                EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION.contains(value_marker),
+                "missing fee-value authority marker: {value_marker}"
+            );
+        }
+
+        for (table, trigger, function, trigger_type) in [
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_require_review25_fee_authority",
+                "require_review25_bitcoin_attempt_fee_authority",
+                7,
+            ),
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_immutable",
+                "guard_chain_swap_tx_attempt_immutable",
+                19,
+            ),
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_validate_replacement",
+                "enforce_liquid_claim_replacement_lineage",
+                7,
+            ),
+            (
+                "invoice_payment_events",
+                "invoice_payment_event_evidence_guard",
+                "guard_invoice_payment_event_evidence",
+                19,
+            ),
+            (
+                "invoice_payment_events",
+                "invoice_payment_event_reject_merchant_settlement_delete",
+                "reject_merchant_settlement_event_delete",
+                11,
+            ),
+            (
+                "merchant_settlement_checkpoints",
+                "merchant_settlement_checkpoint_validate_write",
+                "enforce_merchant_settlement_checkpoint_write",
+                23,
+            ),
+            (
+                "merchant_settlement_checkpoints",
+                "merchant_settlement_checkpoint_reject_delete",
+                "reject_merchant_settlement_delete",
+                11,
+            ),
+            (
+                "merchant_settlement_retained_outputs",
+                "merchant_settlement_retained_validate_update",
+                "enforce_merchant_settlement_retained_update",
+                23,
+            ),
+            (
+                "merchant_settlement_retained_outputs",
+                "merchant_settlement_retained_reject_delete",
+                "reject_merchant_settlement_delete",
+                11,
+            ),
+        ] {
+            let binding = format!("('{table}', '{trigger}', '{function}', {trigger_type})");
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(&binding),
+                "missing exact trigger binding: {binding}"
+            );
+        }
+        for exact_catalog_guard in [
+            "relation_namespace.nspname = 'public'",
+            "function_namespace.nspname = 'public'",
+            "function_info.pronargs = 0",
+            "trigger_info.tgtype = required.trigger_type::SMALLINT",
+            "trigger_info.tgnargs = 0",
+            "trigger_info.tgattr::TEXT = ''",
+            "trigger_info.tgqual IS NULL",
+            "trigger_info.tgconstraint = 0",
+            "NOT trigger_info.tgdeferrable",
+            "NOT trigger_info.tginitdeferred",
+            "NOT trigger_info.tgisinternal",
+            "trigger_info.tgenabled = 'O'",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(exact_catalog_guard),
+                "missing trigger catalog guard: {exact_catalog_guard}"
+            );
+        }
+        for (function_name, body_sha256) in [
+            (
+                "enforce_liquid_claim_replacement_lineage",
+                "2c6eb8d351f5fe1330d101915e897b2984b91f747d31e879d31d555f18105f27",
+            ),
+            (
+                "enforce_merchant_settlement_checkpoint_write",
+                "5e8189d952b8a1f921bafc6da90c2ae658c46691b243f6bbd5e16d056bf7ca29",
+            ),
+            (
+                "enforce_merchant_settlement_retained_update",
+                "840d9f3ee9d6fb05f27a2fa9c56f583b411d34b47b92d3a27bc0089622d5ddd0",
+            ),
+            (
+                "guard_chain_swap_tx_attempt_immutable",
+                "a11b15a80a879cb5cc9b1b9f3a6c795d72c82263f53b01b1e52e4bb726f800d3",
+            ),
+            (
+                "guard_invoice_payment_event_evidence",
+                "893b3f4effa66be50635c1e6a7904783e85d52e30e015123f8438a8a62c295d8",
+            ),
+            (
+                "reject_merchant_settlement_delete",
+                "475959643f22379df0eb575f0c2410ee523fe9d15591c73838eecaba7ac9a875",
+            ),
+            (
+                "reject_merchant_settlement_event_delete",
+                "6da9435887b06e540a1833528587547bbee9a27dca5e42004d2bd576c1e32be8",
+            ),
+            (
+                "require_review25_bitcoin_attempt_fee_authority",
+                "33021f5da06d90a78139df9bacf9d29f84e8225f6f656d6968a1bc99ad169678",
+            ),
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL
+                    .contains(&format!("('{function_name}', '{body_sha256}')")),
+                "missing exact function body digest: {function_name}"
+            );
+        }
+        for function_catalog_guard in [
+            "function_info.prokind = 'f'",
+            "function_info.prorettype = 'trigger'::REGTYPE",
+            "language_info.lanname = 'plpgsql'",
+            "function_info.provolatile = 'v'",
+            "NOT function_info.proisstrict",
+            "NOT function_info.prosecdef",
+            "NOT function_info.proleakproof",
+            "function_info.proparallel = 'u'",
+            "function_info.proconfig IS NULL",
+            "sha256(convert_to(function_info.prosrc, 'UTF8'))",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(function_catalog_guard),
+                "missing exact function catalog guard: {function_catalog_guard}"
+            );
+        }
+
+        for table in [
+            "chain_swap_tx_attempts",
+            "invoice_payment_events",
+            "merchant_settlement_checkpoints",
+            "merchant_settlement_retained_outputs",
+        ] {
+            assert!(MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(&format!("('{table}')")));
+        }
+        for function in [
+            "guard_chain_swap_tx_attempt_immutable",
+            "require_review25_bitcoin_attempt_fee_authority",
+            "enforce_liquid_claim_replacement_lineage",
+            "guard_invoice_payment_event_evidence",
+            "reject_merchant_settlement_event_delete",
+            "enforce_merchant_settlement_checkpoint_write",
+            "enforce_merchant_settlement_retained_update",
+            "reject_merchant_settlement_delete",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(&format!("('{function}')")),
+                "missing function owner guard: {function}"
+            );
+        }
+        for owner_guard in [
+            "relation.relowner) <> current_user",
+            "function_info.proowner) <> current_user",
+            "sequence_info.relowner) <> current_user",
+            "relation.relowner), 'USAGE'",
+            "relation.relowner), 'SET'",
+            "function_info.proowner), 'USAGE'",
+            "function_info.proowner), 'SET'",
+            "sequence_info.relowner), 'USAGE'",
+            "sequence_info.relowner), 'SET'",
+            "invoice_payment_events_accounting_sequence_seq",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(owner_guard),
+                "missing owner capability guard: {owner_guard}"
+            );
+        }
+        assert!(!MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains("'MEMBER'"));
+    }
 
     #[test]
     fn recovery_journal_requires_every_privilege() {

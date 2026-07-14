@@ -15,6 +15,7 @@ use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::{Address, Network, ScriptBuf, Transaction};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::chain_lockup_witness_audit::{
     audit_manifest_set_against_chain_lockup_witness_v1, ChainLockupInclusionV1, ChainLockupSpendV1,
@@ -181,6 +182,15 @@ impl BitcoinLockupWitnessAdapterV1 {
         &self.endpoints
     }
 
+    /// Whether this snapshot came from the configured primary authority rather
+    /// than a public failover. Only the primary carries the process contract
+    /// required to prove an empty history by itself.
+    pub fn is_primary_authority(&self, snapshot: &BitcoinMainnetLockupWitnessSnapshotV1) -> bool {
+        self.endpoints
+            .first()
+            .is_some_and(|primary| primary == snapshot.authority())
+    }
+
     /// Load a complete audit input. Every failed endpoint's partial vectors and
     /// caches are dropped before the next endpoint begins.
     pub async fn load_snapshot(
@@ -191,6 +201,45 @@ impl BitcoinLockupWitnessAdapterV1 {
         for endpoint in &self.endpoints {
             let mut authority = AuthorityScan::new(self, endpoint);
             if let Ok(snapshot) = authority.scan(manifests, &targets).await {
+                return Ok(snapshot);
+            }
+        }
+        Err(BitcoinLockupWitnessAdapterError::NoCompleteAuthority)
+    }
+
+    /// Load one complete address history for an already-persisted chain swap.
+    ///
+    /// The caller supplies the immutable manifest/swap association from the
+    /// delivered-manifest ledger. This avoids rescanning the full witness on
+    /// every reconciler tick while retaining the exact same bounded raw-byte,
+    /// inclusion, outspend, and stable-tip validation as startup recovery.
+    pub async fn load_chain_swap_snapshot(
+        &self,
+        manifest_id: Uuid,
+        chain_swap_id: Uuid,
+        lockup_address: &str,
+    ) -> Result<BitcoinMainnetLockupWitnessSnapshotV1, BitcoinLockupWitnessAdapterError> {
+        if manifest_id.is_nil() || chain_swap_id.is_nil() {
+            return Err(BitcoinLockupWitnessAdapterError::InvalidManifestTarget);
+        }
+        let canonical = crate::validators::canonical_btc_mainnet_address(lockup_address)
+            .map_err(|_| BitcoinLockupWitnessAdapterError::InvalidManifestTarget)?;
+        if canonical != lockup_address {
+            return Err(BitcoinLockupWitnessAdapterError::InvalidManifestTarget);
+        }
+        let address = Address::from_str(&canonical)
+            .map_err(|_| BitcoinLockupWitnessAdapterError::InvalidManifestTarget)?
+            .require_network(Network::Bitcoin)
+            .map_err(|_| BitcoinLockupWitnessAdapterError::InvalidManifestTarget)?;
+        let targets = [ManifestTarget {
+            manifest_id,
+            chain_swap_id,
+            address: canonical,
+            script_pubkey: address.script_pubkey(),
+        }];
+        for endpoint in &self.endpoints {
+            let mut authority = AuthorityScan::new(self, endpoint);
+            if let Ok(snapshot) = authority.scan_targets(&targets).await {
                 return Ok(snapshot);
             }
         }
@@ -337,6 +386,16 @@ impl<'a> AuthorityScan<'a> {
         manifests: &[SwapManifestV1],
         targets: &[ManifestTarget],
     ) -> Result<BitcoinMainnetLockupWitnessSnapshotV1, EndpointError> {
+        let snapshot = self.scan_targets(targets).await?;
+        audit_manifest_set_against_chain_lockup_witness_v1(manifests, &snapshot.observations)
+            .map_err(|_| EndpointError::InvalidEvidence)?;
+        Ok(snapshot)
+    }
+
+    async fn scan_targets(
+        &mut self,
+        targets: &[ManifestTarget],
+    ) -> Result<BitcoinMainnetLockupWitnessSnapshotV1, EndpointError> {
         let tip = self.fetch_tip().await?;
         self.canonical_blocks.insert(tip.height, tip.hash.clone());
         let mut observations = Vec::new();
@@ -393,9 +452,6 @@ impl<'a> AuthorityScan<'a> {
         if self.fetch_tip().await? != tip {
             return Err(EndpointError::ChangedSnapshot);
         }
-        audit_manifest_set_against_chain_lockup_witness_v1(manifests, &observations)
-            .map_err(|_| EndpointError::InvalidEvidence)?;
-
         Ok(BitcoinMainnetLockupWitnessSnapshotV1 {
             authority: self.endpoint.to_owned(),
             tip_height: tip.height,

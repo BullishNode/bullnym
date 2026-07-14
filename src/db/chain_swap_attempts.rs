@@ -65,6 +65,23 @@ pub struct ChainSwapTxAttempt {
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAttemptStateToken {
+    status: String,
+    broadcast_attempts: i32,
+    last_broadcast_result: Option<String>,
+}
+
+impl ChainSwapTxAttempt {
+    pub fn observed_state_token(&self) -> RecoveryAttemptStateToken {
+        RecoveryAttemptStateToken {
+            status: self.status.clone(),
+            broadcast_attempts: self.broadcast_attempts,
+            last_broadcast_result: self.last_broadcast_result.clone(),
+        }
+    }
+}
+
 const ATTEMPT_COLUMNS: &str = "id, chain_swap_id, purpose, raw_tx_hex, txid, source_prevouts, \
      destination_address, destination_script_hex, destination_vout, \
      destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
@@ -187,87 +204,483 @@ pub async fn get_bitcoin_recovery_attempt_for_update(
 /// Durably record that a broadcast call is about to happen.  A process death
 /// after this commit is deliberately ambiguous, and restart reconciliation
 /// must inspect the expected txid/source outpoints before replaying the same
-/// bytes.
+/// bytes. The returned token is read from the locked, updated row so a worker
+/// cannot predict it from a stale pre-lock snapshot.
 pub async fn mark_recovery_broadcast_started(
     pool: &PgPool,
     attempt_id: Uuid,
-) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+) -> Result<Option<RecoveryAttemptStateToken>, sqlx::Error> {
     let chain_swap_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT chain_swap_id FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND purpose = 'btc_recovery'",
+    )
+    .bind(attempt_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(chain_swap_id) = chain_swap_id else {
+        return Ok(None);
+    };
+    let mut tx = pool.begin().await?;
+    let parent: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, refund_txid FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((parent_status, parent_refund_txid)) = parent else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let attempt: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, txid FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND chain_swap_id = $2 AND purpose = 'btc_recovery' FOR UPDATE",
+    )
+    .bind(attempt_id)
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, txid)) = attempt else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let Some(next_status) = recovery_broadcast_start_next_status(
+        &parent_status,
+        parent_refund_txid.as_deref(),
+        &txid,
+        &status,
+    ) else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let updated: Option<(String, i32, Option<String>)> = sqlx::query_as(
         "UPDATE chain_swap_tx_attempts \
-            SET broadcast_attempts = broadcast_attempts + 1, \
+            SET status = $3, \
+                broadcast_attempts = broadcast_attempts + 1, \
                 first_broadcast_attempt_at = \
                     COALESCE(first_broadcast_attempt_at, NOW()), \
                 last_broadcast_attempt_at = NOW(), \
                 last_broadcast_result = 'attempt started', \
                 updated_at = NOW() \
-          WHERE id = $1 \
-            AND status IN ('constructed', 'broadcast_ambiguous') \
-          RETURNING chain_swap_id",
+          WHERE id = $1 AND chain_swap_id = $2 AND status = $4 \
+          RETURNING status, broadcast_attempts, last_broadcast_result",
     )
     .bind(attempt_id)
+    .bind(chain_swap_id)
+    .bind(next_status)
+    .bind(&status)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some(chain_swap_id) = chain_swap_id {
-        // The stale-recovery worker keys off the parent timestamp. Delay its
-        // next pass after every real broadcast call instead of hot-looping an
-        // old `refunding` row once it crosses the age threshold.
-        sqlx::query("UPDATE chain_swap_records SET updated_at = NOW() WHERE id = $1")
-            .bind(chain_swap_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(1)
-    } else {
+    let Some((status, broadcast_attempts, last_broadcast_result)) = updated else {
         tx.rollback().await?;
-        Ok(0)
+        return Ok(None);
+    };
+    // The stale-recovery worker keys off the parent timestamp. Delay its next
+    // pass after every real broadcast call instead of hot-looping an old
+    // `refunding` row once it crosses the age threshold.
+    sqlx::query("UPDATE chain_swap_records SET updated_at = NOW() WHERE id = $1")
+        .bind(chain_swap_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(RecoveryAttemptStateToken {
+        status,
+        broadcast_attempts,
+        last_broadcast_result,
+    }))
+}
+
+fn recovery_broadcast_start_next_status(
+    parent_status: &str,
+    parent_refund_txid: Option<&str>,
+    attempt_txid: &str,
+    attempt_status: &str,
+) -> Option<&'static str> {
+    if parent_status != "refunding" {
+        return None;
+    }
+    match attempt_status {
+        "constructed" | "broadcast_ambiguous"
+            if parent_refund_txid.is_none_or(|refund_txid| refund_txid == attempt_txid) =>
+        {
+            Some("broadcast_ambiguous")
+        }
+        "broadcast" if parent_refund_txid == Some(attempt_txid) => Some("broadcast"),
+        _ => None,
     }
 }
 
+#[cfg(test)]
+mod recovery_broadcast_start_tests {
+    use super::{
+        recovery_broadcast_completion_disposition, recovery_broadcast_start_next_status,
+        recovery_integrity_hold_allowed, RecoveryAttemptStateToken,
+        RecoveryBroadcastCompletionDisposition,
+    };
+
+    const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_TXID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn start_preserves_redrivable_wal_states_and_rejects_terminal_states() {
+        assert_eq!(
+            recovery_broadcast_start_next_status("refunding", None, TXID, "constructed"),
+            Some("broadcast_ambiguous")
+        );
+        assert_eq!(
+            recovery_broadcast_start_next_status(
+                "refunding",
+                Some(TXID),
+                TXID,
+                "broadcast_ambiguous",
+            ),
+            Some("broadcast_ambiguous")
+        );
+        assert_eq!(
+            recovery_broadcast_start_next_status("refunding", Some(TXID), TXID, "broadcast"),
+            Some("broadcast")
+        );
+        assert_eq!(
+            recovery_broadcast_start_next_status("refunding", None, TXID, "broadcast"),
+            None
+        );
+        for status in ["confirmed", "finalized", "integrity_hold", "unknown"] {
+            assert_eq!(
+                recovery_broadcast_start_next_status("refunding", Some(TXID), TXID, status),
+                None
+            );
+        }
+        for parent_status in ["refund_due", "refunded", "claiming", "claimed"] {
+            assert_eq!(
+                recovery_broadcast_start_next_status(parent_status, Some(TXID), TXID, "broadcast"),
+                None
+            );
+        }
+        assert_eq!(
+            recovery_broadcast_start_next_status("refunding", Some(OTHER_TXID), TXID, "broadcast",),
+            None
+        );
+    }
+
+    #[test]
+    fn completion_matrix_preserves_exact_already_settled_state() {
+        for (attempt_status, next) in [
+            ("constructed", "broadcast"),
+            ("broadcast_ambiguous", "broadcast"),
+            ("broadcast", "broadcast"),
+            ("confirmed", "confirmed"),
+            ("finalized", "finalized"),
+        ] {
+            assert_eq!(
+                recovery_broadcast_completion_disposition(
+                    "refunding",
+                    None,
+                    TXID,
+                    Some("bc1qdestination"),
+                    "bc1qdestination",
+                    attempt_status,
+                ),
+                RecoveryBroadcastCompletionDisposition::Complete(next),
+            );
+            assert_eq!(
+                recovery_broadcast_completion_disposition(
+                    "refunding",
+                    Some(TXID),
+                    TXID,
+                    Some("bc1qdestination"),
+                    "bc1qdestination",
+                    attempt_status,
+                ),
+                RecoveryBroadcastCompletionDisposition::Complete(next),
+            );
+        }
+        for attempt_status in ["broadcast", "confirmed", "finalized"] {
+            assert_eq!(
+                recovery_broadcast_completion_disposition(
+                    "refunded",
+                    Some(TXID),
+                    TXID,
+                    Some("bc1qdestination"),
+                    "bc1qdestination",
+                    attempt_status,
+                ),
+                RecoveryBroadcastCompletionDisposition::AlreadySettled,
+            );
+        }
+
+        for (parent_status, parent_txid, destination, attempt_status) in [
+            (
+                "refund_due",
+                Some(TXID),
+                Some("bc1qdestination"),
+                "broadcast",
+            ),
+            ("claimed", Some(TXID), Some("bc1qdestination"), "broadcast"),
+            (
+                "refunding",
+                Some(OTHER_TXID),
+                Some("bc1qdestination"),
+                "broadcast",
+            ),
+            ("refunded", None, Some("bc1qdestination"), "finalized"),
+            (
+                "refunded",
+                Some(OTHER_TXID),
+                Some("bc1qdestination"),
+                "finalized",
+            ),
+            (
+                "refunded",
+                Some(TXID),
+                Some("bc1qdestination"),
+                "constructed",
+            ),
+            (
+                "refunded",
+                Some(TXID),
+                Some("bc1qdestination"),
+                "broadcast_ambiguous",
+            ),
+            ("refunding", None, None, "broadcast"),
+            ("refunding", None, Some("bc1qother"), "broadcast"),
+            ("refunding", None, Some("bc1qdestination"), "integrity_hold"),
+            ("refunding", None, Some("bc1qdestination"), "unknown"),
+        ] {
+            assert_eq!(
+                recovery_broadcast_completion_disposition(
+                    parent_status,
+                    parent_txid,
+                    TXID,
+                    destination,
+                    "bc1qdestination",
+                    attempt_status,
+                ),
+                RecoveryBroadcastCompletionDisposition::Reject,
+            );
+        }
+    }
+
+    #[test]
+    fn integrity_hold_requires_the_exact_observed_attempt_token() {
+        let token = RecoveryAttemptStateToken {
+            status: "broadcast_ambiguous".to_owned(),
+            broadcast_attempts: 5,
+            last_broadcast_result: Some("attempt started".to_owned()),
+        };
+        assert!(recovery_integrity_hold_allowed(
+            "refunding",
+            None,
+            TXID,
+            Some("bc1qdestination"),
+            "bc1qdestination",
+            "broadcast_ambiguous",
+            5,
+            Some("attempt started"),
+            &token,
+        ));
+        let pre_broadcast = RecoveryAttemptStateToken {
+            status: "constructed".to_owned(),
+            broadcast_attempts: 0,
+            last_broadcast_result: None,
+        };
+        assert!(recovery_integrity_hold_allowed(
+            "refunding",
+            Some(TXID),
+            TXID,
+            Some("bc1qdestination"),
+            "bc1qdestination",
+            "constructed",
+            0,
+            None,
+            &pre_broadcast,
+        ));
+        for (status, attempts, result) in [
+            ("broadcast", 5, Some("attempt started")),
+            ("broadcast_ambiguous", 6, Some("attempt started")),
+            ("broadcast_ambiguous", 5, Some("newer result")),
+            ("confirmed", 5, Some("attempt started")),
+            ("finalized", 5, Some("attempt started")),
+            ("integrity_hold", 5, Some("attempt started")),
+        ] {
+            assert!(!recovery_integrity_hold_allowed(
+                "refunding",
+                None,
+                TXID,
+                Some("bc1qdestination"),
+                "bc1qdestination",
+                status,
+                attempts,
+                result,
+                &token,
+            ));
+        }
+        for (parent_status, parent_txid, refund_address) in [
+            ("refunded", Some(TXID), Some("bc1qdestination")),
+            ("refunding", Some(OTHER_TXID), Some("bc1qdestination")),
+            ("refunding", None, Some("bc1qother")),
+        ] {
+            assert!(!recovery_integrity_hold_allowed(
+                parent_status,
+                parent_txid,
+                TXID,
+                refund_address,
+                "bc1qdestination",
+                "broadcast_ambiguous",
+                5,
+                Some("attempt started"),
+                &token,
+            ));
+        }
+    }
+}
+
+/// Record one failed broadcast outcome only while that worker's durable start
+/// token is still current. A later redrive, completion, or integrity hold owns
+/// the row and makes this stale result a no-op.
 pub async fn mark_recovery_broadcast_ambiguous(
     pool: &PgPool,
     attempt_id: Uuid,
+    token: &RecoveryAttemptStateToken,
     result: &str,
 ) -> Result<u64, sqlx::Error> {
+    if token.status != "broadcast_ambiguous" {
+        return Ok(0);
+    }
     let result = sqlx::query(
         "UPDATE chain_swap_tx_attempts \
             SET status = 'broadcast_ambiguous', \
                 last_broadcast_result = $2, \
                 updated_at = NOW() \
           WHERE id = $1 \
-            AND status IN ('constructed', 'broadcast_ambiguous')",
+            AND status = $3 AND broadcast_attempts = $4 \
+            AND last_broadcast_result IS NOT DISTINCT FROM $5",
     )
     .bind(attempt_id)
     .bind(result)
+    .bind(&token.status)
+    .bind(token.broadcast_attempts)
+    .bind(token.last_broadcast_result.as_deref())
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
 
+/// Stop a live exact recovery attempt only if its parent and caller-observed
+/// state token are still current. Parent-before-attempt locking matches the
+/// settlement CAS; confirmation/finality or any intervening broadcast write
+/// makes the hold a no-op instead of overwriting newer evidence.
 pub async fn mark_recovery_integrity_hold(
     pool: &PgPool,
+    chain_swap_id: Uuid,
     attempt_id: Uuid,
+    purpose: &str,
+    expected_txid: &str,
+    token: &RecoveryAttemptStateToken,
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE chain_swap_tx_attempts \
-            SET status = 'integrity_hold', \
-                integrity_reason = $2, \
-                integrity_hold_at = COALESCE(integrity_hold_at, NOW()), \
-                updated_at = NOW() \
-          WHERE id = $1 \
-            AND status NOT IN ('confirmed', 'finalized')",
+    if purpose != "btc_recovery" || reason.trim().is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
+    let parent: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, refund_txid, refund_address \
+           FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((parent_status, parent_refund_txid, parent_refund_address)) = parent else {
+        tx.rollback().await?;
+        return Ok(0);
+    };
+    let attempt: Option<(String, i32, Option<String>, String)> = sqlx::query_as(
+        "SELECT status, broadcast_attempts, last_broadcast_result, destination_address \
+           FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND chain_swap_id = $2 AND purpose = $3 AND txid = $4 \
+          FOR UPDATE",
     )
     .bind(attempt_id)
-    .bind(reason)
-    .execute(pool)
+    .bind(chain_swap_id)
+    .bind(purpose)
+    .bind(expected_txid)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected())
+    let Some((status, broadcast_attempts, last_broadcast_result, attempt_destination)) = attempt
+    else {
+        tx.rollback().await?;
+        return Ok(0);
+    };
+    if !recovery_integrity_hold_allowed(
+        &parent_status,
+        parent_refund_txid.as_deref(),
+        expected_txid,
+        parent_refund_address.as_deref(),
+        &attempt_destination,
+        &status,
+        broadcast_attempts,
+        last_broadcast_result.as_deref(),
+        token,
+    ) {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    let rows = sqlx::query(
+        "UPDATE chain_swap_tx_attempts \
+            SET status = 'integrity_hold', integrity_reason = $7, \
+                integrity_hold_at = COALESCE(integrity_hold_at, NOW()), \
+                updated_at = NOW() \
+          WHERE id = $1 AND chain_swap_id = $2 AND purpose = $3 AND txid = $4 \
+            AND status = $5 AND broadcast_attempts = $6 \
+            AND last_broadcast_result IS NOT DISTINCT FROM $8",
+    )
+    .bind(attempt_id)
+    .bind(chain_swap_id)
+    .bind(purpose)
+    .bind(expected_txid)
+    .bind(&token.status)
+    .bind(token.broadcast_attempts)
+    .bind(reason)
+    .bind(token.last_broadcast_result.as_deref())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    tx.commit().await?;
+    Ok(1)
 }
 
-/// Atomically record a known broadcast transaction and mirror it to the
-/// compatibility chain-swap columns.  The destination equality predicate is
-/// the final database-side guard against redirecting a committed attempt.
+#[allow(clippy::too_many_arguments)]
+fn recovery_integrity_hold_allowed(
+    parent_status: &str,
+    parent_refund_txid: Option<&str>,
+    expected_txid: &str,
+    parent_refund_address: Option<&str>,
+    attempt_destination: &str,
+    current_status: &str,
+    current_broadcast_attempts: i32,
+    current_last_broadcast_result: Option<&str>,
+    token: &RecoveryAttemptStateToken,
+) -> bool {
+    parent_status == "refunding"
+        && parent_refund_txid.is_none_or(|refund_txid| refund_txid == expected_txid)
+        && parent_refund_address == Some(attempt_destination)
+        && matches!(
+            current_status,
+            "constructed" | "broadcast_ambiguous" | "broadcast"
+        )
+        && current_status == token.status.as_str()
+        && current_broadcast_attempts == token.broadcast_attempts
+        && current_last_broadcast_result == token.last_broadcast_result.as_deref()
+}
+
+/// Atomically record a known broadcast transaction and mirror its txid to the
+/// compatibility chain-swap columns. A live swap remains nonterminal
+/// `refunding`: exact merchant-output confirmation/finality owns the later
+/// transition. An exact already-`refunded` parent is an idempotent success.
+/// The destination equality predicate is the final database-side guard against
+/// redirecting a committed attempt.
 pub async fn complete_recovery_broadcast(
     pool: &PgPool,
     attempt_id: Uuid,
@@ -277,21 +690,84 @@ pub async fn complete_recovery_broadcast(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    let attempt_rows = sqlx::query(
-        "UPDATE chain_swap_tx_attempts \
-            SET status = CASE \
-                    WHEN status IN ('confirmed', 'finalized') THEN status \
-                    ELSE 'broadcast' END, \
-                broadcast_at = COALESCE(broadcast_at, NOW()), \
-                last_broadcast_result = $4, \
-                updated_at = NOW() \
-          WHERE id = $1 AND chain_swap_id = $2 AND txid = $3 \
-            AND status <> 'integrity_hold'",
+    // Match merchant-settlement CAS lock order: parent before attempt. The
+    // parent state is checked under its row lock before any attempt lock is
+    // acquired, so completion cannot race a finalized/refunded transition or
+    // deadlock against confirmation persistence.
+    let parent: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, refund_txid, refund_address \
+           FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((parent_status, parent_refund_txid, parent_refund_address)) = parent else {
+        return Err(sqlx::Error::Protocol(
+            "chain swap no longer matches its committed recovery attempt".into(),
+        ));
+    };
+    let parent_may_complete = (parent_status == "refunding"
+        && parent_refund_txid
+            .as_deref()
+            .is_none_or(|refund_txid| refund_txid == expected_txid))
+        || (parent_status == "refunded" && parent_refund_txid.as_deref() == Some(expected_txid));
+    if !parent_may_complete {
+        return Err(sqlx::Error::Protocol(
+            "chain swap no longer matches its committed recovery attempt".into(),
+        ));
+    }
+
+    let attempt: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, destination_address FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND chain_swap_id = $2 AND purpose = 'btc_recovery' \
+            AND txid = $3 FOR UPDATE",
     )
     .bind(attempt_id)
     .bind(chain_swap_id)
     .bind(expected_txid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((attempt_status, attempt_destination)) = attempt else {
+        return Err(sqlx::Error::Protocol(
+            "recovery attempt was missing, mismatched, or held".into(),
+        ));
+    };
+    let disposition = recovery_broadcast_completion_disposition(
+        &parent_status,
+        parent_refund_txid.as_deref(),
+        expected_txid,
+        parent_refund_address.as_deref(),
+        &attempt_destination,
+        &attempt_status,
+    );
+    let next_status = match disposition {
+        RecoveryBroadcastCompletionDisposition::Complete(status) => status,
+        RecoveryBroadcastCompletionDisposition::AlreadySettled => {
+            tx.commit().await?;
+            return Ok(());
+        }
+        RecoveryBroadcastCompletionDisposition::Reject => {
+            return Err(sqlx::Error::Protocol(
+                "recovery attempt was missing, mismatched, or held".into(),
+            ));
+        }
+    };
+
+    let attempt_rows = sqlx::query(
+        "UPDATE chain_swap_tx_attempts \
+            SET status = $4, \
+                broadcast_at = COALESCE(broadcast_at, NOW()), \
+                last_broadcast_result = $5, \
+                updated_at = NOW() \
+          WHERE id = $1 AND chain_swap_id = $2 AND txid = $3 \
+            AND purpose = 'btc_recovery' AND status = $6",
+    )
+    .bind(attempt_id)
+    .bind(chain_swap_id)
+    .bind(expected_txid)
+    .bind(next_status)
     .bind(result_text)
+    .bind(&attempt_status)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -302,20 +778,15 @@ pub async fn complete_recovery_broadcast(
     }
 
     let swap_rows = sqlx::query(
-        "UPDATE chain_swap_records cs \
-            SET status = 'refunded', refund_txid = $3, updated_at = NOW() \
-          FROM chain_swap_tx_attempts a \
-         WHERE cs.id = $2 \
-           AND a.id = $1 \
-           AND a.chain_swap_id = cs.id \
-           AND a.txid = $3 \
-           AND cs.refund_address = a.destination_address \
-           AND (cs.status = 'refunding' \
-                OR (cs.status = 'refunded' AND cs.refund_txid = $3))",
+        "UPDATE chain_swap_records \
+            SET refund_txid = $2, updated_at = NOW() \
+          WHERE id = $1 AND status = 'refunding' \
+            AND refund_address = $3 \
+            AND (refund_txid IS NULL OR refund_txid = $2)",
     )
-    .bind(attempt_id)
     .bind(chain_swap_id)
     .bind(expected_txid)
+    .bind(&attempt_destination)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -326,4 +797,52 @@ pub async fn complete_recovery_broadcast(
     }
 
     tx.commit().await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryBroadcastCompletionDisposition {
+    Complete(&'static str),
+    AlreadySettled,
+    Reject,
+}
+
+fn recovery_broadcast_completion_disposition(
+    parent_status: &str,
+    parent_refund_txid: Option<&str>,
+    expected_txid: &str,
+    parent_refund_address: Option<&str>,
+    attempt_destination: &str,
+    attempt_status: &str,
+) -> RecoveryBroadcastCompletionDisposition {
+    if parent_refund_address != Some(attempt_destination) {
+        return RecoveryBroadcastCompletionDisposition::Reject;
+    }
+    match (parent_status, parent_refund_txid, attempt_status) {
+        ("refunding", None, "constructed" | "broadcast_ambiguous" | "broadcast") => {
+            RecoveryBroadcastCompletionDisposition::Complete("broadcast")
+        }
+        ("refunding", Some(refund_txid), "constructed" | "broadcast_ambiguous" | "broadcast")
+            if refund_txid == expected_txid =>
+        {
+            RecoveryBroadcastCompletionDisposition::Complete("broadcast")
+        }
+        ("refunding", None, "confirmed") => {
+            RecoveryBroadcastCompletionDisposition::Complete("confirmed")
+        }
+        ("refunding", Some(refund_txid), "confirmed") if refund_txid == expected_txid => {
+            RecoveryBroadcastCompletionDisposition::Complete("confirmed")
+        }
+        ("refunding", None, "finalized") => {
+            RecoveryBroadcastCompletionDisposition::Complete("finalized")
+        }
+        ("refunding", Some(refund_txid), "finalized") if refund_txid == expected_txid => {
+            RecoveryBroadcastCompletionDisposition::Complete("finalized")
+        }
+        ("refunded", Some(refund_txid), "broadcast" | "confirmed" | "finalized")
+            if refund_txid == expected_txid =>
+        {
+            RecoveryBroadcastCompletionDisposition::AlreadySettled
+        }
+        _ => RecoveryBroadcastCompletionDisposition::Reject,
+    }
 }

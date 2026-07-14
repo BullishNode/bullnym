@@ -8,10 +8,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::str::FromStr;
 
+use bitcoin::{Address, Network};
+use uuid::Uuid;
+
+use crate::chain_lockup_witness_adapter::BitcoinMainnetLockupWitnessSnapshotV1;
 use crate::chain_lockup_witness_audit::{
     ChainLockupConflictFieldV1, ChainLockupFindingClassificationV1, ChainLockupInclusionV1,
-    ChainLockupManifestWitnessAuditV1, ChainLockupSpendV1,
+    ChainLockupManifestClassificationV1, ChainLockupManifestWitnessAuditV1, ChainLockupSpendV1,
+    ChainLockupWitnessChainV1, ChainLockupWitnessFindingV1,
     MAX_CHAIN_LOCKUP_WITNESS_OBSERVATIONS_PER_MANIFEST_V1,
 };
 use crate::chain_swap_action::{BitcoinSourceEvidence, ChainSwapEvidence, EvidenceQuality};
@@ -39,6 +45,75 @@ pub enum PrimaryBitcoinAmountRelationV1 {
     Exact,
     Underfunded,
     Overfunded,
+}
+
+/// Immutable target needed to project one fresh per-swap Bitcoin snapshot.
+///
+/// The manifest identity comes from the delivered-manifest ledger, while the
+/// address and amount come from the exact validated creation record. This is
+/// deliberately one target, not an address allocation or funding ledger.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrimaryBitcoinSourceTargetV1 {
+    manifest_sequence: u64,
+    manifest_id: Uuid,
+    chain_swap_id: Uuid,
+    lockup_address: String,
+    expected_amount_sat: u64,
+}
+
+impl fmt::Debug for PrimaryBitcoinSourceTargetV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrimaryBitcoinSourceTargetV1")
+            .field("manifest_sequence", &self.manifest_sequence)
+            .field("manifest_id", &self.manifest_id)
+            .field("chain_swap_id", &self.chain_swap_id)
+            .field("lockup_address", &REDACTED)
+            .field("expected_amount_sat", &REDACTED)
+            .finish()
+    }
+}
+
+impl PrimaryBitcoinSourceTargetV1 {
+    pub fn try_new(
+        manifest_sequence: u64,
+        manifest_id: Uuid,
+        chain_swap_id: Uuid,
+        lockup_address: String,
+        expected_amount_sat: u64,
+    ) -> Result<Self, PrimaryBitcoinSourceProjectionErrorV1> {
+        validate_expected_amount(expected_amount_sat)?;
+        if manifest_sequence == 0 || manifest_id.is_nil() || chain_swap_id.is_nil() {
+            return Err(PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence);
+        }
+        let canonical = crate::validators::canonical_btc_mainnet_address(&lockup_address)
+            .map_err(|_| PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence)?;
+        if canonical != lockup_address {
+            return Err(PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence);
+        }
+        Address::from_str(&canonical)
+            .map_err(|_| PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence)?
+            .require_network(Network::Bitcoin)
+            .map_err(|_| PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence)?;
+        Ok(Self {
+            manifest_sequence,
+            manifest_id,
+            chain_swap_id,
+            lockup_address,
+            expected_amount_sat,
+        })
+    }
+
+    pub fn manifest_id(&self) -> Uuid {
+        self.manifest_id
+    }
+
+    pub fn chain_swap_id(&self) -> Uuid {
+        self.chain_swap_id
+    }
+
+    pub fn lockup_address(&self) -> &str {
+        &self.lockup_address
+    }
 }
 
 /// One primary-transaction projection for the existing #82 reducer.
@@ -251,6 +326,148 @@ pub fn project_primary_bitcoin_source_v1(
         amount_relation,
         non_primary_transaction_count: candidates.len().saturating_sub(1),
     })
+}
+
+/// Project one adapter-validated, stable-tip snapshot into the shared reducer.
+///
+/// Provider data is still only an optional selector. Every observation must
+/// match the immutable per-swap target; wrong target identities or scripts are
+/// rejected rather than reclassified. A different amount remains explicit
+/// conflicting evidence so the existing renegotiation decision can consume it.
+pub fn project_primary_bitcoin_source_snapshot_v1(
+    target: &PrimaryBitcoinSourceTargetV1,
+    snapshot: &BitcoinMainnetLockupWitnessSnapshotV1,
+    provider_txid_hint: Option<&str>,
+    authority: PrimaryBitcoinSourceAuthorityV1,
+) -> Result<PrimaryBitcoinSourceProjectionV1, PrimaryBitcoinSourceProjectionErrorV1> {
+    let address = Address::from_str(&target.lockup_address)
+        .map_err(|_| PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence)?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence)?;
+    let expected_script = hex::encode(address.script_pubkey().as_bytes());
+    if snapshot.observations.len() > MAX_CHAIN_LOCKUP_WITNESS_OBSERVATIONS_PER_MANIFEST_V1 {
+        return Err(PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence);
+    }
+
+    let mut findings = Vec::with_capacity(snapshot.observations.len());
+    let mut seen_outpoints = BTreeSet::new();
+    let mut inclusions = BTreeMap::<String, ChainLockupInclusionV1>::new();
+    for observation in &snapshot.observations {
+        if observation.manifest_id != target.manifest_id
+            || observation.chain_swap_id != target.chain_swap_id
+            || observation.chain != ChainLockupWitnessChainV1::BitcoinMainnet
+            || observation.lockup_address != target.lockup_address
+            || observation.lockup_script_pubkey_hex != expected_script
+            || !valid_hash(&observation.txid)
+            || observation.amount_sat == 0
+            || observation.amount_sat > MAX_BITCOIN_MONEY_SAT
+            || !seen_outpoints.insert((observation.txid.as_str(), observation.vout))
+            || !consistent_inclusion(&mut inclusions, &observation.txid, &observation.inclusion)
+        {
+            return Err(PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence);
+        }
+        if let ChainLockupSpendV1::Spent {
+            spending_txid,
+            inclusion,
+        } = &observation.spend
+        {
+            if !valid_hash(spending_txid)
+                || spending_txid == &observation.txid
+                || !consistent_inclusion(&mut inclusions, spending_txid, inclusion)
+            {
+                return Err(PrimaryBitcoinSourceProjectionErrorV1::InvalidAuditedEvidence);
+            }
+        }
+
+        let classification = if observation.amount_sat != target.expected_amount_sat {
+            ChainLockupFindingClassificationV1::Conflicting {
+                fields: vec![ChainLockupConflictFieldV1::ExpectedAmount],
+            }
+        } else {
+            match (&observation.inclusion, &observation.spend) {
+                (_, ChainLockupSpendV1::Spent { .. }) => ChainLockupFindingClassificationV1::Spent,
+                (ChainLockupInclusionV1::Confirmed { .. }, ChainLockupSpendV1::Unspent) => {
+                    ChainLockupFindingClassificationV1::Confirmed
+                }
+                (ChainLockupInclusionV1::Mempool, ChainLockupSpendV1::Unspent) => {
+                    ChainLockupFindingClassificationV1::Unconfirmed
+                }
+            }
+        };
+        findings.push(ChainLockupWitnessFindingV1 {
+            txid: observation.txid.clone(),
+            vout: observation.vout,
+            observed_amount_sat: observation.amount_sat,
+            inclusion: observation.inclusion.clone(),
+            spend: observation.spend.clone(),
+            classification,
+        });
+    }
+    findings.sort_unstable_by(|left, right| {
+        left.txid
+            .cmp(&right.txid)
+            .then_with(|| left.vout.cmp(&right.vout))
+    });
+    let classification = summarize_snapshot_findings(&findings);
+    project_primary_bitcoin_source_v1(
+        &ChainLockupManifestWitnessAuditV1 {
+            manifest_sequence: target.manifest_sequence,
+            manifest_id: target.manifest_id,
+            chain_swap_id: target.chain_swap_id,
+            expected_amount_sat: target.expected_amount_sat,
+            classification,
+            findings,
+        },
+        provider_txid_hint,
+        authority,
+    )
+}
+
+fn consistent_inclusion(
+    inclusions: &mut BTreeMap<String, ChainLockupInclusionV1>,
+    txid: &str,
+    inclusion: &ChainLockupInclusionV1,
+) -> bool {
+    match inclusions.get(txid) {
+        Some(previous) => previous == inclusion,
+        None => {
+            inclusions.insert(txid.to_owned(), inclusion.clone());
+            true
+        }
+    }
+}
+
+fn summarize_snapshot_findings(
+    findings: &[ChainLockupWitnessFindingV1],
+) -> ChainLockupManifestClassificationV1 {
+    if findings.is_empty() {
+        return ChainLockupManifestClassificationV1::Missing;
+    }
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.classification,
+            ChainLockupFindingClassificationV1::Conflicting { .. }
+        )
+    }) {
+        return ChainLockupManifestClassificationV1::Conflicting;
+    }
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.classification,
+            ChainLockupFindingClassificationV1::Spent
+        )
+    }) {
+        return ChainLockupManifestClassificationV1::Spent;
+    }
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.classification,
+            ChainLockupFindingClassificationV1::Confirmed
+        )
+    }) {
+        return ChainLockupManifestClassificationV1::Confirmed;
+    }
+    ChainLockupManifestClassificationV1::Unconfirmed
 }
 
 fn collect_candidates(

@@ -9,6 +9,8 @@ import sys
 SCHEMA_046 = "046_chain_swap_tx_attempts"
 SCHEMA_047 = "047_direct_payment_lifecycle_foundation"
 SWAP_KEY_LINEAGE_VERSION = 50
+RECOVERY_COMMITMENT_VERSION = 53
+MERCHANT_SETTLEMENT_VERSION = 55
 
 
 def schema_version(marker: str) -> int | None:
@@ -53,6 +55,24 @@ def main() -> int:
             )
             return 1
 
+    if current_version is not None and current_version >= RECOVERY_COMMITMENT_VERSION:
+        if previous_version is None or previous_version < RECOVERY_COMMITMENT_VERSION:
+            print(
+                "rollback refused: migration 053 established a stopped-writer, "
+                "roll-forward-only recovery-commitment boundary",
+                file=sys.stderr,
+            )
+            return 1
+
+    if current_version is not None and current_version >= MERCHANT_SETTLEMENT_VERSION:
+        if previous_version is None or previous_version < MERCHANT_SETTLEMENT_VERSION:
+            print(
+                "rollback refused: migration 055 established a roll-forward-only "
+                "exact-settlement boundary",
+                file=sys.stderr,
+            )
+            return 1
+
     if previous_schema == SCHEMA_046 and current_schema == SCHEMA_047:
         if transition_count == 0:
             print("rollback allowed: migration 047 has no direct lifecycle history")
@@ -66,8 +86,8 @@ def main() -> int:
         return 1
 
     # Other schema boundaries retain the deployer's existing compatibility
-    # policy. The migration-050 floor above remains in force for every future
-    # lineage-aware schema marker.
+    # policy. The reviewed migration floors above remain in force for every
+    # future schema marker.
     print(
         "rollback allowed: no migration-047-specific boundary applies "
         f"({current_schema} -> {previous_schema})"

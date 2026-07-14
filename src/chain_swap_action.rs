@@ -7,6 +7,10 @@
 //! funded swap, and an action is never authorized from evidence that is
 //! ambiguous or disagreeing at the facts that action depends on.
 
+use crate::merchant_settlement_lifecycle::{
+    MerchantSettlementLifecycle, SettlementAccountingState, SettlementState,
+};
+
 /// The only actions the chain-swap evidence reducer can authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSwapAction {
@@ -130,6 +134,28 @@ pub enum MerchantTransactionEvidence {
 }
 
 impl MerchantTransactionEvidence {
+    /// Translate the validated merchant-settlement lifecycle into reducer
+    /// evidence. A demoted lifecycle remains disputed until independently
+    /// verified confirmation reactivates its accounting state; merely seeing
+    /// it broadcast or in mempool again cannot authorize settlement or a
+    /// competing fallback.
+    pub fn from_settlement_lifecycle(lifecycle: &MerchantSettlementLifecycle) -> Self {
+        if lifecycle.accounting_state() == SettlementAccountingState::Demoted {
+            return Self::Disputed;
+        }
+
+        match lifecycle.state() {
+            SettlementState::Constructed => Self::Prepared,
+            SettlementState::Broadcast => Self::Broadcast,
+            SettlementState::Mempool => Self::Mempool,
+            SettlementState::Confirmed { .. } => Self::Confirmed,
+            SettlementState::Finalized { .. } => Self::Finalized,
+            SettlementState::Replaced { .. }
+            | SettlementState::Evicted
+            | SettlementState::Reorged { .. } => Self::Disputed,
+        }
+    }
+
     const fn is_present(self) -> bool {
         !matches!(self, Self::None)
     }
@@ -165,13 +191,40 @@ pub struct ChainSwapEvidence {
     pub bitcoin_recovery_transaction: MerchantTransactionEvidence,
 }
 
-/// Result of the mandatory fallback recheck while the per-swap execution lock
-/// is held.
+/// Irreversible action a runtime path intends to execute after acquiring the
+/// shared per-swap advisory lock.
+///
+/// Keeping this narrower than [`ChainSwapAction`] prevents observation,
+/// renegotiation, and transaction-watching decisions from being mistaken for
+/// execution authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryExecutionGate {
+pub enum ChainSwapExecutionAction {
+    ClaimLiquid,
+    RecoverBitcoin,
+    Finalize,
+}
+
+impl ChainSwapExecutionAction {
+    /// Reducer action that must still be current at the under-lock recheck.
+    pub const fn reducer_action(self) -> ChainSwapAction {
+        match self {
+            Self::ClaimLiquid => ChainSwapAction::ClaimLiquid,
+            Self::RecoverBitcoin => ChainSwapAction::RecoverBitcoin,
+            Self::Finalize => ChainSwapAction::Finalize,
+        }
+    }
+}
+
+/// Result of the mandatory complete-evidence recheck while the shared
+/// per-swap execution lock is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapExecutionGate {
     Authorized,
     Blocked(ChainSwapAction),
 }
+
+/// Backwards-compatible name for the original recovery-only gate result.
+pub type RecoveryExecutionGate = ChainSwapExecutionGate;
 
 /// Reduce independently verified evidence to one forward-safe action.
 pub fn reduce_chain_swap_evidence(evidence: &ChainSwapEvidence) -> ChainSwapAction {
@@ -349,17 +402,29 @@ pub fn reduce_chain_swap_evidence(evidence: &ChainSwapEvidence) -> ChainSwapActi
     }
 }
 
-/// Re-run the reducer on evidence read while the per-swap execution lock is
-/// held. Only an unchanged `RecoverBitcoin` decision authorizes construction
-/// or broadcast; every other action sends the caller back through normal
-/// planning without executing fallback.
-pub fn recheck_recovery_under_lock(evidence: &ChainSwapEvidence) -> RecoveryExecutionGate {
+/// Re-run the reducer on a complete evidence snapshot assembled after the
+/// caller acquired the shared per-swap advisory lock.
+///
+/// Only the exact irreversible action requested by the caller is authorized.
+/// Every other current decision is returned to the dispatcher without
+/// executing stale work. In particular, unknown outspends remain the
+/// reducer's [`ChainSwapAction::IntegrityHold`] and close this gate.
+pub fn recheck_chain_swap_execution_under_lock(
+    requested: ChainSwapExecutionAction,
+    evidence: &ChainSwapEvidence,
+) -> ChainSwapExecutionGate {
     let action = reduce_chain_swap_evidence(evidence);
-    if action == ChainSwapAction::RecoverBitcoin {
-        RecoveryExecutionGate::Authorized
+    if action == requested.reducer_action() {
+        ChainSwapExecutionGate::Authorized
     } else {
-        RecoveryExecutionGate::Blocked(action)
+        ChainSwapExecutionGate::Blocked(action)
     }
+}
+
+/// Recovery-specific compatibility wrapper for callers that have not yet
+/// adopted the shared irreversible-action gate.
+pub fn recheck_recovery_under_lock(evidence: &ChainSwapEvidence) -> RecoveryExecutionGate {
+    recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::RecoverBitcoin, evidence)
 }
 
 const fn liquid_lock_is_unspent(lock: LiquidLockEvidence) -> bool {
@@ -462,4 +527,184 @@ fn reduce_confirmed_unspent(evidence: &ChainSwapEvidence) -> ChainSwapAction {
     }
 
     recovery_action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merchant_settlement_lifecycle::{
+        apply_settlement_evidence, SettlementBlock, SettlementChain, SettlementEvidence,
+        SettlementFinalityPolicy, SettlementTxid,
+    };
+
+    fn txid(character: char) -> SettlementTxid {
+        SettlementTxid::parse(&character.to_string().repeat(64)).unwrap()
+    }
+
+    fn block(height: u32, character: char) -> SettlementBlock {
+        SettlementBlock::new(height, &character.to_string().repeat(64)).unwrap()
+    }
+
+    fn advance(
+        lifecycle: &MerchantSettlementLifecycle,
+        evidence: SettlementEvidence,
+    ) -> MerchantSettlementLifecycle {
+        apply_settlement_evidence(lifecycle, &evidence, SettlementFinalityPolicy::default())
+            .unwrap()
+            .lifecycle
+    }
+
+    fn recovery_candidate() -> ChainSwapEvidence {
+        ChainSwapEvidence {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            provider_status: ProviderStatusEvidence::Expired,
+            bitcoin_source: BitcoinSourceEvidence::ConfirmedUnspent,
+            liquid_lock: LiquidLockEvidence::NotObserved,
+            liquid_path: LiquidPathEvidence::Unavailable,
+            renegotiation: RenegotiationEvidence::ExplicitlyUnavailable,
+            recovery_destination: RecoveryDestinationEvidence::Committed,
+            cooperative_recovery: CooperativeRecoveryEvidence::Available,
+            bitcoin_timeout: BitcoinTimeoutEvidence::BeforeTimeout,
+            liquid_claim_transaction: MerchantTransactionEvidence::None,
+            bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
+        }
+    }
+
+    fn finalized_liquid_lifecycle() -> MerchantSettlementLifecycle {
+        let lifecycle = MerchantSettlementLifecycle::new(SettlementChain::Liquid, txid('1'));
+        let confirmed = advance(
+            &lifecycle,
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        advance(
+            &confirmed,
+            SettlementEvidence::Finalized {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 2,
+            },
+        )
+    }
+
+    #[test]
+    fn lifecycle_mapping_drives_broadcast_confirmed_and_finalized_actions() {
+        let lifecycle = MerchantSettlementLifecycle::new(SettlementChain::Liquid, txid('1'));
+        assert_eq!(
+            MerchantTransactionEvidence::from_settlement_lifecycle(&lifecycle),
+            MerchantTransactionEvidence::Prepared
+        );
+
+        let broadcast = advance(
+            &lifecycle,
+            SettlementEvidence::Broadcast { txid: txid('1') },
+        );
+        let mut evidence = recovery_candidate();
+        evidence.liquid_lock = LiquidLockEvidence::ConfirmedUnspent;
+        evidence.liquid_claim_transaction =
+            MerchantTransactionEvidence::from_settlement_lifecycle(&broadcast);
+        assert_eq!(
+            evidence.liquid_claim_transaction,
+            MerchantTransactionEvidence::Broadcast
+        );
+        assert_eq!(
+            reduce_chain_swap_evidence(&evidence),
+            ChainSwapAction::WatchTransaction
+        );
+
+        let confirmed = advance(
+            &broadcast,
+            SettlementEvidence::Confirmed {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 1,
+            },
+        );
+        evidence.liquid_lock = LiquidLockEvidence::SpentByMerchantClaim;
+        evidence.liquid_claim_transaction =
+            MerchantTransactionEvidence::from_settlement_lifecycle(&confirmed);
+        assert_eq!(
+            evidence.liquid_claim_transaction,
+            MerchantTransactionEvidence::Confirmed
+        );
+        assert_eq!(
+            reduce_chain_swap_evidence(&evidence),
+            ChainSwapAction::WatchTransaction
+        );
+
+        let finalized = advance(
+            &confirmed,
+            SettlementEvidence::Finalized {
+                txid: txid('1'),
+                block: block(100, 'a'),
+                confirmations: 2,
+            },
+        );
+        evidence.liquid_claim_transaction =
+            MerchantTransactionEvidence::from_settlement_lifecycle(&finalized);
+        assert_eq!(
+            evidence.liquid_claim_transaction,
+            MerchantTransactionEvidence::Finalized
+        );
+        assert_eq!(
+            reduce_chain_swap_evidence(&evidence),
+            ChainSwapAction::Finalize
+        );
+    }
+
+    #[test]
+    fn replacement_eviction_and_reorg_demotion_block_finality_and_fallback() {
+        let finalized = finalized_liquid_lifecycle();
+        let replaced = advance(
+            &finalized,
+            SettlementEvidence::Replaced {
+                replaced_txid: txid('1'),
+                replacement_txid: txid('2'),
+            },
+        );
+        let evicted = advance(&finalized, SettlementEvidence::Evicted { txid: txid('1') });
+        let reorged = advance(
+            &finalized,
+            SettlementEvidence::Reorged {
+                txid: txid('1'),
+                previous_block: block(100, 'a'),
+            },
+        );
+        let rebroadcast_after_reorg =
+            advance(&reorged, SettlementEvidence::Broadcast { txid: txid('1') });
+        let mempool_after_eviction =
+            advance(&evicted, SettlementEvidence::Mempool { txid: txid('1') });
+
+        for (name, lifecycle) in [
+            ("replaced", replaced),
+            ("evicted", evicted),
+            ("reorged", reorged),
+            ("rebroadcast after reorg", rebroadcast_after_reorg),
+            ("mempool after eviction", mempool_after_eviction),
+        ] {
+            assert_eq!(
+                lifecycle.accounting_state(),
+                SettlementAccountingState::Demoted,
+                "{name}"
+            );
+            let mapped = MerchantTransactionEvidence::from_settlement_lifecycle(&lifecycle);
+            assert_eq!(mapped, MerchantTransactionEvidence::Disputed, "{name}");
+
+            let mut evidence = recovery_candidate();
+            evidence.liquid_claim_transaction = mapped;
+            assert_eq!(
+                reduce_chain_swap_evidence(&evidence),
+                ChainSwapAction::Observe,
+                "{name}"
+            );
+            assert_eq!(
+                recheck_recovery_under_lock(&evidence),
+                RecoveryExecutionGate::Blocked(ChainSwapAction::Observe),
+                "{name}"
+            );
+        }
+    }
 }

@@ -11,8 +11,8 @@ use boltz_client::bitcoin::secp256k1::Keypair;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, ChainPair, ChainSwapStates, CreateChainRequest, CreateChainResponse,
-    CreateReverseRequest, CreateReverseResponse, HeightResponse, Leaf, RevSwapStates, Side,
-    Webhook,
+    CreateReverseRequest, CreateReverseResponse, GetQuoteResponse, HeightResponse, Leaf,
+    RevSwapStates, Side, Webhook,
 };
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::{BtcSwapScript, LBtcSwapScript, PublicKey};
@@ -42,6 +42,111 @@ pub struct ChainSwapResult {
     pub canonical_response_json: String,
     pub creation_terms: ValidatedChainSwapCreationTerms,
 }
+
+/// Fresh provider hints consumed by the chain-swap evidence reducer.
+///
+/// Neither field is chain authority. The status selects a reducer branch and
+/// the optional transaction id may only select a transaction independently
+/// found by the configured Bitcoin evidence source.
+pub struct FreshChainSwapProviderHint {
+    status: String,
+    transaction_txid: Option<String>,
+}
+
+impl FreshChainSwapProviderHint {
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn transaction_txid(&self) -> Option<&str> {
+        self.transaction_txid.as_deref()
+    }
+}
+
+/// Canonical provider quote evidence for one wrong-amount chain swap.
+///
+/// The pinned Boltz client decodes the response before returning it. Preserve
+/// the canonical digest at this adapter boundary so the caller can journal the
+/// exact typed response it validated before any `accept_quote` mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSwapQuote {
+    pub amount_sat: u64,
+    pub response_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapQuoteProviderErrorKind {
+    RefundAlreadySigned,
+    FundingNotAmountRejected,
+    ExpiryMarginTooShort,
+    AboveMaximum,
+    BelowMinimum,
+    InvalidOrStaleQuote,
+    Timeout,
+    Transport,
+    ProviderServerError,
+    MalformedResponse,
+    UnknownProviderOutcome,
+}
+
+impl ChainSwapQuoteProviderErrorKind {
+    pub fn is_explicit_non_eligibility(self) -> bool {
+        matches!(
+            self,
+            Self::RefundAlreadySigned
+                | Self::FundingNotAmountRejected
+                | Self::ExpiryMarginTooShort
+                | Self::AboveMaximum
+                | Self::BelowMinimum
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSwapQuoteProviderError {
+    pub kind: ChainSwapQuoteProviderErrorKind,
+    /// Canonical digest of a decoded, pinned positive protocol outcome. Raw
+    /// response bodies, URLs, and unknown error text are never retained.
+    pub terminal_evidence_sha256: Option<String>,
+}
+
+impl std::fmt::Display for ChainSwapQuoteProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.kind {
+            ChainSwapQuoteProviderErrorKind::RefundAlreadySigned => {
+                "provider reports the refund was already signed"
+            }
+            ChainSwapQuoteProviderErrorKind::FundingNotAmountRejected => {
+                "provider reports primary funding was not rejected for its amount"
+            }
+            ChainSwapQuoteProviderErrorKind::ExpiryMarginTooShort => {
+                "provider reports insufficient expiry margin"
+            }
+            ChainSwapQuoteProviderErrorKind::AboveMaximum => {
+                "provider reports the amount is above its maximum"
+            }
+            ChainSwapQuoteProviderErrorKind::BelowMinimum => {
+                "provider reports the amount is below its minimum"
+            }
+            ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote => {
+                "provider reports the quote is invalid or stale"
+            }
+            ChainSwapQuoteProviderErrorKind::Timeout => "provider request timed out",
+            ChainSwapQuoteProviderErrorKind::Transport => "provider transport failed",
+            ChainSwapQuoteProviderErrorKind::ProviderServerError => {
+                "provider server request failed"
+            }
+            ChainSwapQuoteProviderErrorKind::MalformedResponse => {
+                "provider returned a malformed response"
+            }
+            ChainSwapQuoteProviderErrorKind::UnknownProviderOutcome => {
+                "provider outcome is unknown"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ChainSwapQuoteProviderError {}
 
 /// Complete non-secret provider evidence approved before a payer can see the
 /// Bitcoin address. The database copies this packet into immutable columns.
@@ -450,6 +555,8 @@ impl DerivedSwapKey {
 
 pub struct BoltzService {
     api: Option<BoltzApiClientV2>,
+    quote_api_url: Option<String>,
+    quote_http_client: Option<reqwest::Client>,
     swap_master_key: SwapMasterKey,
     webhook_url: Option<String>,
     provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime,
@@ -464,21 +571,23 @@ impl BoltzService {
         swap_master_key: SwapMasterKey,
         webhook_url: Option<String>,
     ) -> Self {
-        let api = crate::config::valid_http_endpoint(boltz_url)
+        let quote_http_client = crate::config::valid_http_endpoint(boltz_url)
             .then(|| reqwest::Client::builder().build().ok())
-            .flatten()
-            .map(|client| {
-                // Bound request-path Boltz calls: Boltz normally answers in
-                // <2s, so a 10s ceiling fails fast with a clean error when
-                // Boltz hangs instead of blocking past nginx's timeout.
-                BoltzApiClientV2::with_client(
-                    boltz_url.to_string(),
-                    client,
-                    Some(std::time::Duration::from_secs(10)),
-                )
-            });
+            .flatten();
+        let api = quote_http_client.clone().map(|client| {
+            // Bound request-path Boltz calls: Boltz normally answers in
+            // <2s, so a 10s ceiling fails fast with a clean error when
+            // Boltz hangs instead of blocking past nginx's timeout.
+            BoltzApiClientV2::with_client(
+                boltz_url.to_string(),
+                client,
+                Some(std::time::Duration::from_secs(10)),
+            )
+        });
         Self {
             api,
+            quote_api_url: quote_http_client.as_ref().map(|_| boltz_url.to_string()),
+            quote_http_client,
             swap_master_key,
             webhook_url,
             provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime::new(),
@@ -493,6 +602,25 @@ impl BoltzService {
     /// Shared provider-limit reader. Calls on this value are in-memory only.
     pub fn provider_limits(&self) -> &crate::provider_limits_runtime::ProviderLimitsRuntime {
         &self.provider_limits
+    }
+
+    /// Re-read the provider hints needed by an under-lock chain-swap decision
+    /// from one typed response. Transport and decode failures are returned so
+    /// callers classify them as incomplete evidence.
+    pub async fn fresh_chain_swap_provider_hint(
+        &self,
+        swap_id: &str,
+    ) -> Result<FreshChainSwapProviderHint, AppError> {
+        let api = self.api.as_ref().ok_or_else(|| {
+            AppError::BoltzError("Boltz client unavailable for chain-swap evidence".to_string())
+        })?;
+        let swap = api.get_swap(swap_id).await.map_err(|error| {
+            AppError::BoltzError(format!("fetch fresh chain-swap status: {error}"))
+        })?;
+        Ok(FreshChainSwapProviderHint {
+            status: swap.status,
+            transaction_txid: swap.transaction.map(|transaction| transaction.id),
+        })
     }
 
     async fn fetch_btc_to_lbtc_reverse_pair(
@@ -776,34 +904,197 @@ impl BoltzService {
         })
     }
 
-    /// Phase 3 refund-waterfall step 1: ask Boltz for the server-lockup amount
-    /// it will settle a mis-funded chain swap at, given the amount actually
-    /// locked. Boltz returns an error when the swap is no longer renegotiable
-    /// (too close to expiry, or a refund signature already exists) — the caller
-    /// treats that as "not renegotiable" and falls through to `refund_due`.
-    pub async fn get_chain_swap_quote(&self, swap_id: &str) -> Result<u64, AppError> {
-        let quote = self
-            .api()?
-            .get_quote(swap_id)
-            .await
-            .map_err(|e| AppError::BoltzError(format!("chain swap get_quote failed: {e}")))?;
-        Ok(quote.amount)
+    /// Ask Boltz for the server-lockup amount it will settle a verified
+    /// wrong-amount chain swap at. Exact pinned protocol refusals are distinct
+    /// from timeout, transport, 5xx, malformed, and unknown outcomes; only the
+    /// former can close this quote attempt, while ambiguity remains Observe.
+    pub async fn get_chain_swap_quote(
+        &self,
+        swap_id: &str,
+    ) -> Result<ChainSwapQuote, ChainSwapQuoteProviderError> {
+        let body = self
+            .chain_swap_quote_request(reqwest::Method::GET, swap_id, None)
+            .await?;
+        let response: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+                terminal_evidence_sha256: None,
+            })?;
+        if !response.is_object() {
+            return Err(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+                terminal_evidence_sha256: None,
+            });
+        }
+        let quote: GetQuoteResponse =
+            serde_json::from_value(response.clone()).map_err(|_| ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+                terminal_evidence_sha256: None,
+            })?;
+        let (_, response_sha256) = crate::canonical_json::canonical_json_and_sha256(&response)
+            .map_err(|_| ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+                terminal_evidence_sha256: None,
+            })?;
+        Ok(ChainSwapQuote {
+            amount_sat: quote.amount,
+            response_sha256,
+        })
     }
 
-    /// Phase 3 refund-waterfall step 2: accept a quote returned by
+    /// Accept a quote returned by
     /// [`Self::get_chain_swap_quote`] so Boltz proceeds to create its server
     /// lockup and the swap settles at `amount_sat`.
     pub async fn accept_chain_swap_quote(
         &self,
         swap_id: &str,
         amount_sat: u64,
-    ) -> Result<(), AppError> {
-        self.api()?
-            .accept_quote(swap_id, amount_sat)
-            .await
-            .map_err(|e| AppError::BoltzError(format!("chain swap accept_quote failed: {e}")))?;
-        Ok(())
+    ) -> Result<String, ChainSwapQuoteProviderError> {
+        let body = self
+            .chain_swap_quote_request(
+                reqwest::Method::POST,
+                swap_id,
+                Some(serde_json::json!({ "amount": amount_sat })),
+            )
+            .await?;
+        parse_chain_swap_quote_acceptance_response(&body)
     }
+
+    async fn chain_swap_quote_request(
+        &self,
+        method: reqwest::Method,
+        swap_id: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<String, ChainSwapQuoteProviderError> {
+        let client = self
+            .quote_http_client
+            .as_ref()
+            .ok_or(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::Transport,
+                terminal_evidence_sha256: None,
+            })?;
+        let base_url = self
+            .quote_api_url
+            .as_deref()
+            .ok_or(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::Transport,
+                terminal_evidence_sha256: None,
+            })?;
+        let url = format!(
+            "{}/swap/chain/{}/quote",
+            base_url.trim_end_matches('/'),
+            swap_id
+        );
+        let mut request = client
+            .request(method, url)
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ChainSwapQuoteProviderError {
+                kind: if error.is_timeout() {
+                    ChainSwapQuoteProviderErrorKind::Timeout
+                } else {
+                    ChainSwapQuoteProviderErrorKind::Transport
+                },
+                terminal_evidence_sha256: None,
+            })?;
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .map_err(|_| ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::Transport,
+                terminal_evidence_sha256: None,
+            })?;
+        if status.is_success() {
+            return Ok(response_body);
+        }
+        let error = if status.is_server_error() {
+            ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::ProviderServerError,
+                terminal_evidence_sha256: None,
+            }
+        } else {
+            classify_chain_swap_quote_protocol_error(&response_body).unwrap_or(
+                ChainSwapQuoteProviderError {
+                    kind: ChainSwapQuoteProviderErrorKind::UnknownProviderOutcome,
+                    terminal_evidence_sha256: None,
+                },
+            )
+        };
+        Err(error)
+    }
+}
+
+fn classify_chain_swap_quote_protocol_error(
+    response_body: &str,
+) -> Option<ChainSwapQuoteProviderError> {
+    let value: serde_json::Value = serde_json::from_str(response_body).ok()?;
+    let provider_error = value.get("error")?.as_str()?;
+    let kind = match provider_error {
+        "a refund for this swap was signed already" => {
+            ChainSwapQuoteProviderErrorKind::RefundAlreadySigned
+        }
+        "lockup transaction was not rejected because of the amount" => {
+            ChainSwapQuoteProviderErrorKind::FundingNotAmountRejected
+        }
+        "time until expiry too short" => ChainSwapQuoteProviderErrorKind::ExpiryMarginTooShort,
+        "invalid quote" => ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote,
+        dynamic if exact_u64_bound_message(dynamic, " exceeds maximal of ") => {
+            ChainSwapQuoteProviderErrorKind::AboveMaximum
+        }
+        dynamic if exact_u64_bound_message(dynamic, " is less than minimal of ") => {
+            ChainSwapQuoteProviderErrorKind::BelowMinimum
+        }
+        _ => return None,
+    };
+    let terminal_evidence_sha256 = crate::canonical_json::canonical_json_and_sha256(
+        &serde_json::json!({ "error": provider_error }),
+    )
+    .ok()
+    .map(|(_, digest)| digest)?;
+    Some(ChainSwapQuoteProviderError {
+        kind,
+        terminal_evidence_sha256: Some(terminal_evidence_sha256),
+    })
+}
+
+fn exact_u64_bound_message(message: &str, separator: &str) -> bool {
+    message
+        .split_once(separator)
+        .is_some_and(|(actual, bound)| {
+            [actual, bound].into_iter().all(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u64>().is_ok()
+            })
+        })
+}
+
+fn parse_chain_swap_quote_acceptance_response(
+    body: &str,
+) -> Result<String, ChainSwapQuoteProviderError> {
+    let response: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| ChainSwapQuoteProviderError {
+            kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+            terminal_evidence_sha256: None,
+        })?;
+    if !response.is_object() {
+        return Err(ChainSwapQuoteProviderError {
+            kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+            terminal_evidence_sha256: None,
+        });
+    }
+    crate::canonical_json::canonical_json_and_sha256(&response)
+        .map(|(_, digest)| digest)
+        .map_err(|_| ChainSwapQuoteProviderError {
+            kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
+            terminal_evidence_sha256: None,
+        })
 }
 
 #[cfg(test)]
@@ -823,6 +1114,77 @@ mod tests {
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn renegotiation_quote_protocol_classifier_accepts_only_pinned_exact_messages() {
+        let cases = [
+            (
+                "a refund for this swap was signed already",
+                ChainSwapQuoteProviderErrorKind::RefundAlreadySigned,
+            ),
+            (
+                "lockup transaction was not rejected because of the amount",
+                ChainSwapQuoteProviderErrorKind::FundingNotAmountRejected,
+            ),
+            (
+                "time until expiry too short",
+                ChainSwapQuoteProviderErrorKind::ExpiryMarginTooShort,
+            ),
+            (
+                "invalid quote",
+                ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote,
+            ),
+            (
+                "1001 exceeds maximal of 1000",
+                ChainSwapQuoteProviderErrorKind::AboveMaximum,
+            ),
+            (
+                "999 is less than minimal of 1000",
+                ChainSwapQuoteProviderErrorKind::BelowMinimum,
+            ),
+        ];
+        for (message, expected) in cases {
+            let body = serde_json::json!({ "error": message }).to_string();
+            let classified = classify_chain_swap_quote_protocol_error(&body).unwrap();
+            assert_eq!(classified.kind, expected);
+            assert!(classified
+                .terminal_evidence_sha256
+                .as_deref()
+                .is_some_and(is_lower_hex_32));
+        }
+
+        for rejected in [
+            "2.47: a refund for this swap was signed already",
+            "a refund for this swap was signed already ",
+            "time until expiry is too short",
+            "+1001 exceeds maximal of 1000",
+            "1001.0 exceeds maximal of 1000",
+            "1001 exceeds maximal of 1000 trailing",
+            "-1 is less than minimal of 1000",
+            "unknown",
+        ] {
+            let body = serde_json::json!({ "error": rejected }).to_string();
+            assert_eq!(classify_chain_swap_quote_protocol_error(&body), None);
+        }
+    }
+
+    #[test]
+    fn renegotiation_quote_acceptance_requires_a_json_object_and_canonicalizes_it() {
+        let first = parse_chain_swap_quote_acceptance_response(r#"{"z":2,"a":1}"#).unwrap();
+        let reordered =
+            parse_chain_swap_quote_acceptance_response(r#"{ "a": 1, "z": 2 }"#).unwrap();
+        assert_eq!(first, reordered);
+        assert!(is_lower_hex_32(&first));
+
+        for malformed in ["", "null", "true", "1", r#""accepted""#, "[]"] {
+            let error = parse_chain_swap_quote_acceptance_response(malformed).unwrap_err();
+            assert_eq!(
+                error.kind,
+                ChainSwapQuoteProviderErrorKind::MalformedResponse
+            );
+            assert_eq!(error.terminal_evidence_sha256, None);
+        }
+    }
 
     fn test_service(mnemonic: &str) -> BoltzService {
         let key = SwapMasterKey::from_mnemonic(mnemonic, None, Network::Mainnet).unwrap();

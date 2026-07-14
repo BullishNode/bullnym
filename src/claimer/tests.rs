@@ -195,6 +195,22 @@ fn liquid_fee_authority_rejects_one_sat_under_and_over_the_exact_size_fee() {
 }
 
 #[test]
+fn chain_claim_journal_fee_must_match_exact_signed_transaction_tuple() {
+    let rate = 1_000.0 / 141.0;
+    assert!(ensure_chain_claim_journal_fee_matches_actual(1_000, rate, 1_000, rate).is_ok());
+
+    assert!(ensure_chain_claim_journal_fee_matches_actual(1_000, rate, -1, rate).is_err());
+    assert!(ensure_chain_claim_journal_fee_matches_actual(999, rate, 1_000, rate).is_err());
+    assert!(ensure_chain_claim_journal_fee_matches_actual(
+        1_000,
+        f64::from_bits(rate.to_bits() + 1),
+        1_000,
+        rate,
+    )
+    .is_err());
+}
+
+#[test]
 fn chain_claim_uses_validated_immutable_creation_destination() {
     let terms = valid_chain_creation_terms();
     assert_eq!(
@@ -216,6 +232,50 @@ fn chain_claim_rejects_corrupt_creation_destination_policy() {
     let mut wrong_address = valid_chain_creation_terms();
     wrong_address.merchant_liquid_destination = "not-a-liquid-address".into();
     assert!(validated_chain_creation_destination(&wrong_address).is_err());
+}
+
+#[test]
+fn chain_claim_journal_mode_rejects_orphan_parent_state() {
+    assert_eq!(
+        persisted_chain_claim_journal_mode(None, None).unwrap(),
+        PersistedChainClaimJournalMode::ConstructAndInsert
+    );
+    assert_eq!(
+        persisted_chain_claim_journal_mode(Some("00"), Some("11")).unwrap(),
+        PersistedChainClaimJournalMode::DecodeAndLoadExact
+    );
+    assert!(persisted_chain_claim_journal_mode(Some("00"), None).is_err());
+    assert!(persisted_chain_claim_journal_mode(None, Some("11")).is_err());
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claimed,
+        PersistedChainClaimJournalMode::ConstructAndInsert,
+    )
+    .is_err());
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claimed,
+        PersistedChainClaimJournalMode::DecodeAndLoadExact,
+    )
+    .is_ok());
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claiming,
+        PersistedChainClaimJournalMode::ConstructAndInsert,
+    )
+    .is_ok());
+}
+
+#[test]
+fn persisted_chain_claim_without_exact_journal_fails_before_broadcast() {
+    let broadcast_calls = Cell::new(0usize);
+    let result = (|| -> Result<(), AppError> {
+        require_exact_persisted_chain_claim_journal::<()>(Err(
+            db::MerchantSettlementRepositoryError::MissingJournal,
+        ))?;
+        broadcast_calls.set(broadcast_calls.get() + 1);
+        Ok(())
+    })();
+
+    assert!(result.is_err());
+    assert_eq!(broadcast_calls.get(), 0);
 }
 
 #[test]
@@ -456,6 +516,138 @@ impl UtxoBackend for MockUtxoBackend {
     }
 }
 
+struct ChainClaimJournalFixture {
+    claim_tx: BtcLikeTransaction,
+    source_address: String,
+    source_blinding_key_hex: String,
+    merchant_address: String,
+    merchant_blinding_key_hex: String,
+    source_txid: String,
+    backend: Arc<dyn UtxoBackend>,
+}
+
+fn chain_claim_journal_fixture() -> ChainClaimJournalFixture {
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let mut rng = boltz_elements::secp256k1_zkp::rand::thread_rng();
+    let asset = boltz_elements::AssetId::LIQUID_BTC;
+    let address_template = boltz_elements::Address::from_str(
+        &valid_chain_creation_terms().merchant_liquid_destination,
+    )
+    .unwrap()
+    .to_unconfidential();
+
+    let source_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::new(&mut rng);
+    let source_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &source_blinding_key);
+    let source_address = address_template
+        .clone()
+        .to_confidential(source_blinding_pubkey);
+    let source_input_secrets = boltz_elements::TxOutSecrets::new(
+        asset,
+        boltz_elements::confidential::AssetBlindingFactor::new(&mut rng),
+        91_000,
+        boltz_elements::confidential::ValueBlindingFactor::new(&mut rng),
+    );
+    let (source_output, source_abf, source_vbf, _) = boltz_elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        91_000,
+        asset,
+        source_address.script_pubkey(),
+        source_blinding_pubkey,
+        &[source_input_secrets],
+        &[],
+    )
+    .unwrap();
+    let source_secrets = boltz_elements::TxOutSecrets::new(asset, source_abf, 91_000, source_vbf);
+    let source_transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![source_output],
+    };
+    let source_txid = source_transaction.txid();
+
+    let merchant_blinding_key = boltz_elements::secp256k1_zkp::SecretKey::new(&mut rng);
+    let merchant_blinding_pubkey =
+        boltz_elements::secp256k1_zkp::PublicKey::from_secret_key(&secp, &merchant_blinding_key);
+    let merchant_address = address_template.to_confidential(merchant_blinding_pubkey);
+    let (merchant_output, _, _, _) = boltz_elements::TxOut::new_last_confidential(
+        &mut rng,
+        &secp,
+        90_000,
+        asset,
+        merchant_address.script_pubkey(),
+        merchant_blinding_pubkey,
+        &[source_secrets],
+        &[],
+    )
+    .unwrap();
+    let claim_transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: vec![boltz_elements::TxIn {
+            previous_output: boltz_elements::OutPoint::new(source_txid, 0),
+            is_pegin: false,
+            script_sig: boltz_elements::Script::new(),
+            sequence: boltz_elements::Sequence::MAX,
+            asset_issuance: boltz_elements::AssetIssuance::default(),
+            witness: boltz_elements::TxInWitness::default(),
+        }],
+        output: vec![
+            merchant_output,
+            boltz_elements::TxOut::new_fee(1_000, asset),
+        ],
+    };
+    let backend = Arc::new(MockUtxoBackend {
+        raw_txs: HashMap::from([(
+            source_txid.to_string(),
+            boltz_elements::encode::serialize(&source_transaction),
+        )]),
+        find_calls: Mutex::new(vec![]),
+        spender: None,
+    });
+
+    ChainClaimJournalFixture {
+        claim_tx: BtcLikeTransaction::Liquid(claim_transaction),
+        source_address: source_address.to_string(),
+        source_blinding_key_hex: source_blinding_key.display_secret().to_string(),
+        merchant_address: merchant_address.to_string(),
+        merchant_blinding_key_hex: merchant_blinding_key.display_secret().to_string(),
+        source_txid: source_txid.to_string(),
+        backend,
+    }
+}
+
+#[tokio::test]
+async fn chain_claim_journal_preparation_binds_raw_sources_output_and_fee() {
+    let fixture = chain_claim_journal_fixture();
+    let prepared = prepare_chain_claim_settlement_journal(
+        &fixture.claim_tx,
+        &fixture.merchant_address,
+        &boltz_elements::AssetId::LIQUID_BTC.to_string(),
+        &fixture.merchant_blinding_key_hex,
+        &fixture.source_address,
+        &fixture.source_blinding_key_hex,
+        &fixture.backend,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(prepared.journal.amount_sat, 90_000);
+    assert_eq!(prepared.journal.vout, 0);
+    assert_eq!(prepared.fee_amount_sat, 1_000);
+    assert!(prepared.fee_rate_sat_vb.is_finite());
+    assert!(prepared.fee_rate_sat_vb > 0.0);
+    assert_eq!(prepared.journal.source_prevouts.len(), 1);
+    assert_eq!(
+        prepared.journal.source_prevouts[0].txid,
+        fixture.source_txid
+    );
+    assert_eq!(prepared.journal.source_prevouts[0].vout, 0);
+    assert_eq!(prepared.journal.source_prevouts[0].amount_sat, 91_000);
+}
+
 fn test_liquid_tx(
     input_outpoint: Option<elements::OutPoint>,
     script_pubkey: elements::Script,
@@ -643,14 +835,10 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
 }
 
 #[test]
-fn chain_swap_expired_is_not_terminal() {
-    // `swap.expired` is Boltz's wall-clock timer, not the on-chain lockup
-    // timeout — the server lockup stays claimable until timeoutBlockHeight.
-    // It must NOT map to terminal `Expired` (which abandoned claimable funds);
-    // it is folded by the shared transition as a one-way script-claim hint.
+fn chain_swap_expired_is_observation_only() {
     assert_eq!(
         chain_swap_provider_input("swap.expired"),
-        Some(db::ChainSwapProviderStatusInput::SwapExpired)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
 }
 
@@ -668,7 +856,7 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
     );
     assert_eq!(
         chain_swap_provider_input("transaction.refunded"),
-        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
     assert_eq!(
         chain_swap_provider_input("transaction.lockupFailed"),
@@ -676,7 +864,7 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
     );
     assert_eq!(
         chain_swap_provider_input("transaction.failed"),
-        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
 }
 

@@ -448,6 +448,29 @@ pub async fn get_manifest_delivery(
     row.map(TryInto::try_into).transpose()
 }
 
+/// Load the one delivered manifest identity bound to an existing chain swap.
+///
+/// This is a narrow runtime evidence lookup: it does not list the witness or
+/// allocate a new manifest. The schema's unique chain-swap association remains
+/// the authority for the single returned row.
+pub async fn get_delivered_manifest_for_chain_swap<'e, E>(
+    executor: E,
+    chain_swap_id: Uuid,
+) -> Result<Option<ChainSwapManifestDelivery>, ManifestDeliveryError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query_as::<_, ManifestDeliveryDbRow>(&format!(
+        "SELECT {DELIVERY_COLUMNS} \
+           FROM chain_swap_manifest_deliveries \
+          WHERE chain_swap_id = $1 AND delivery_state = 'delivered'"
+    ))
+    .bind(chain_swap_id)
+    .fetch_optional(executor)
+    .await?;
+    row.map(TryInto::try_into).transpose()
+}
+
 /// Read one bounded append-only audit page strictly after `after_sequence`.
 pub async fn list_manifest_delivery_audit(
     pool: &PgPool,

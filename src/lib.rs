@@ -9,12 +9,15 @@ pub mod boltz_restore_fetch;
 pub mod builder_fee;
 pub(crate) mod canonical_json;
 pub mod certification;
-pub mod chain_lockup_witness_audit;
 pub mod chain_lockup_witness_adapter;
+pub mod chain_lockup_witness_audit;
 pub mod chain_recovery;
 pub mod chain_swap_action;
+pub mod chain_swap_renegotiation;
 pub mod chain_swap_creation_permit;
 pub mod chain_swap_primary_source;
+pub mod chain_swap_runtime;
+pub mod chain_swap_runtime_evidence;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
@@ -26,8 +29,8 @@ pub mod donation_page;
 pub mod donation_render;
 pub mod error;
 pub mod esplora;
-pub mod fee_policy;
 pub mod fee_decision_record;
+pub mod fee_policy;
 pub mod fee_refresh_cycle;
 pub mod fee_runtime;
 pub mod gc;
@@ -38,6 +41,10 @@ pub mod liquid_fee_adapter;
 pub mod liquid_fee_sources;
 pub mod lnurl;
 pub mod local_chain_swap_recovery_audit;
+pub mod merchant_output_verifier;
+pub mod merchant_settlement_adoption;
+pub mod merchant_settlement_lifecycle;
+pub mod merchant_settlement_service;
 pub mod nostr;
 pub mod og_image;
 pub mod pricer;
@@ -80,6 +87,11 @@ pub struct AppState {
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub liquid_claim_client_factory: Option<Arc<claimer::LiquidClaimClientFactory>>,
     pub bitcoin_recovery_backend: Option<Arc<chain_recovery::BitcoinRecoveryBackend>>,
+    /// Read-only, bounded Bitcoin history authority retained for per-swap
+    /// chain-evidence reduction. Missing configuration keeps runtime decisions
+    /// observational; it never falls back to provider status.
+    pub bitcoin_lockup_witness_adapter:
+        Option<Arc<chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1>>,
     pub fee_runtime: Arc<fee_runtime::FeeRuntime>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,

@@ -15,8 +15,7 @@ use super::{
     insert_test_recovery_commitment, test_pool,
 };
 
-const RECOVERY_ADDRESS: &str =
-    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+const RECOVERY_ADDRESS: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 
 struct AllocationPair {
     root_fingerprint: String,

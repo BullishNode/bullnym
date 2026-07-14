@@ -47,6 +47,26 @@ expect_refused \
   049_watcher_lane_progress \
   051_future_lineage_aware_schema \
   0
+expect_allowed \
+  055_merchant_settlement_lifecycle \
+  055_merchant_settlement_lifecycle \
+  0
+expect_allowed \
+  055_merchant_settlement_lifecycle \
+  056_future_settlement_schema \
+  0
+expect_refused \
+  052_manifest_delivery_journal \
+  053_recovery_address_commitments \
+  0
+expect_refused \
+  054_fee_policy_authority \
+  055_merchant_settlement_lifecycle \
+  0
+expect_refused \
+  054_fee_policy_authority \
+  056_future_settlement_schema \
+  0
 expect_refused \
   malformed-previous-marker \
   050_swap_key_lineage \

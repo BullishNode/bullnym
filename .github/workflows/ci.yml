@@ -30,6 +30,7 @@ jobs:
           scripts/test-release-provenance.sh
           scripts/test-release-record.sh
           scripts/test-direct-lifecycle-rollback.sh
+          scripts/test-renegotiation-rollback.sh
 
       - name: Verify the resolved Boltz revision
         run: scripts/release-preflight.sh

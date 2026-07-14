@@ -88,6 +88,28 @@ pub enum BitcoinOutspend {
     Spent { txid: String },
 }
 
+/// Tx-specific Bitcoin chain position from one internally consistent Esplora
+/// tip/status/block read. `Absent` is positive evidence only when every
+/// configured endpoint returned a complete absent snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitcoinRecoveryTransactionStatus {
+    Absent,
+    Mempool,
+    Confirmed {
+        block_height: u32,
+        block_hash: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitcoinRecoveryStatusSnapshot {
+    pub tip_height: u32,
+    pub status: BitcoinRecoveryTransactionStatus,
+    /// Current canonical hash at the caller's prior positive height. `None`
+    /// means that height is above this authority's current tip.
+    pub prior_block_hash: Option<String>,
+}
+
 #[async_trait]
 pub trait BitcoinRecoveryEvidence: Send + Sync {
     /// Return exact raw bytes, `None` only when all configured backends
@@ -96,6 +118,20 @@ pub trait BitcoinRecoveryEvidence: Send + Sync {
     async fn raw_transaction(&self, txid: &str) -> Result<Option<Vec<u8>>, AppError>;
 
     async fn outspend(&self, txid: &str, vout: u32) -> Result<BitcoinOutspend, AppError>;
+
+    /// Fetch an internally consistent Esplora status/tip/block snapshot. The
+    /// fail-closed default preserves deterministic recovery-executor mocks;
+    /// merchant-settlement observation requires a backend that implements the
+    /// anchored contract.
+    async fn status_snapshot(
+        &self,
+        _txid: &str,
+        _prior_block_height: Option<u32>,
+    ) -> Result<BitcoinRecoveryStatusSnapshot, AppError> {
+        Err(AppError::ElectrumError(
+            "Bitcoin recovery backend does not provide anchored status snapshots".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -154,6 +190,13 @@ impl BitcoinRecoveryBackend {
 struct EsploraOutspend {
     spent: bool,
     txid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EsploraRecoveryTransactionStatus {
+    confirmed: bool,
+    block_height: Option<u32>,
+    block_hash: Option<String>,
 }
 
 #[async_trait]
@@ -245,6 +288,232 @@ impl BitcoinRecoveryEvidence for BitcoinRecoveryBackend {
             errors.join(" | ")
         )))
     }
+
+    async fn status_snapshot(
+        &self,
+        txid: &str,
+        prior_block_height: Option<u32>,
+    ) -> Result<BitcoinRecoveryStatusSnapshot, AppError> {
+        if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::ElectrumError(
+                "Bitcoin recovery status requested for an invalid txid".into(),
+            ));
+        }
+        let mut absent = None;
+        let mut absent_count = 0usize;
+        let mut errors = Vec::new();
+        for endpoint in &self.endpoints {
+            match fetch_bitcoin_recovery_status_snapshot(
+                &self.client,
+                endpoint,
+                txid,
+                prior_block_height,
+            )
+            .await
+            {
+                Ok(snapshot)
+                    if !matches!(snapshot.status, BitcoinRecoveryTransactionStatus::Absent) =>
+                {
+                    return Ok(snapshot);
+                }
+                Ok(snapshot) => {
+                    if absent.as_ref().is_some_and(|prior| prior != &snapshot) {
+                        errors.push(
+                            "configured Bitcoin recovery backends disagreed on absent anchors"
+                                .into(),
+                        );
+                        continue;
+                    }
+                    absent_count += 1;
+                    absent.get_or_insert(snapshot);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if absent_count == self.endpoints.len() {
+            return absent.ok_or_else(|| {
+                AppError::ElectrumError("Bitcoin recovery absent snapshot disappeared".into())
+            });
+        }
+        Err(AppError::ElectrumError(format!(
+            "Bitcoin transaction status is unknown for {txid}: {}",
+            errors.join(" | ")
+        )))
+    }
+}
+
+async fn fetch_bitcoin_recovery_status_snapshot(
+    client: &reqwest::Client,
+    endpoint: &str,
+    txid: &str,
+    prior_block_height: Option<u32>,
+) -> Result<BitcoinRecoveryStatusSnapshot, AppError> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let first_tip = fetch_esplora_tip(client, endpoint).await?;
+    let first_status = fetch_esplora_recovery_status(client, endpoint, txid).await?;
+    let status = normalize_esplora_recovery_status(first_status)?;
+    if let BitcoinRecoveryTransactionStatus::Confirmed {
+        block_height,
+        block_hash,
+    } = &status
+    {
+        if *block_height == 0 || *block_height > first_tip {
+            return Err(AppError::ElectrumError(
+                "Bitcoin recovery confirmed height is outside the observed tip".into(),
+            ));
+        }
+        let anchored = fetch_esplora_block_hash(client, endpoint, *block_height).await?;
+        if anchored != *block_hash {
+            return Err(AppError::ElectrumError(
+                "Bitcoin recovery status block hash disagrees with its height anchor".into(),
+            ));
+        }
+    }
+    let prior_block_hash = match prior_block_height {
+        Some(0) => {
+            return Err(AppError::ElectrumError(
+                "Bitcoin recovery prior block height must be positive".into(),
+            ));
+        }
+        Some(height) if height <= first_tip => match &status {
+            BitcoinRecoveryTransactionStatus::Confirmed {
+                block_height,
+                block_hash,
+            } if *block_height == height => Some(block_hash.clone()),
+            _ => Some(fetch_esplora_block_hash(client, endpoint, height).await?),
+        },
+        Some(_) | None => None,
+    };
+
+    let final_status = normalize_esplora_recovery_status(
+        fetch_esplora_recovery_status(client, endpoint, txid).await?,
+    )?;
+    if final_status != status {
+        return Err(AppError::ElectrumError(
+            "Bitcoin recovery status changed during anchored observation".into(),
+        ));
+    }
+    let final_tip = fetch_esplora_tip(client, endpoint).await?;
+    if final_tip != first_tip {
+        return Err(AppError::ElectrumError(
+            "Bitcoin recovery tip changed during anchored observation".into(),
+        ));
+    }
+    Ok(BitcoinRecoveryStatusSnapshot {
+        tip_height: first_tip,
+        status,
+        prior_block_hash,
+    })
+}
+
+async fn fetch_esplora_tip(client: &reqwest::Client, endpoint: &str) -> Result<u32, AppError> {
+    let response = client
+        .get(format!("{endpoint}/blocks/tip/height"))
+        .send()
+        .await
+        .map_err(|error| AppError::ElectrumError(format!("Bitcoin recovery tip: {error}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::ElectrumError(format!(
+            "Bitcoin recovery tip returned HTTP {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AppError::ElectrumError(format!("read Bitcoin recovery tip: {error}")))?;
+    body.trim()
+        .parse::<u32>()
+        .map_err(|_| AppError::ElectrumError("Bitcoin recovery tip is not a u32".into()))
+}
+
+async fn fetch_esplora_recovery_status(
+    client: &reqwest::Client,
+    endpoint: &str,
+    txid: &str,
+) -> Result<Option<EsploraRecoveryTransactionStatus>, AppError> {
+    let response = client
+        .get(format!("{endpoint}/tx/{txid}/status"))
+        .send()
+        .await
+        .map_err(|error| AppError::ElectrumError(format!("Bitcoin recovery status: {error}")))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(AppError::ElectrumError(format!(
+            "Bitcoin recovery status returned HTTP {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<EsploraRecoveryTransactionStatus>()
+        .await
+        .map(Some)
+        .map_err(|error| {
+            AppError::ElectrumError(format!("decode Bitcoin recovery status: {error}"))
+        })
+}
+
+fn normalize_esplora_recovery_status(
+    status: Option<EsploraRecoveryTransactionStatus>,
+) -> Result<BitcoinRecoveryTransactionStatus, AppError> {
+    let Some(status) = status else {
+        return Ok(BitcoinRecoveryTransactionStatus::Absent);
+    };
+    if !status.confirmed {
+        if status.block_height.is_some() || status.block_hash.is_some() {
+            return Err(AppError::ElectrumError(
+                "unconfirmed Bitcoin recovery status carried block identity".into(),
+            ));
+        }
+        return Ok(BitcoinRecoveryTransactionStatus::Mempool);
+    }
+    let block_height = status.block_height.ok_or_else(|| {
+        AppError::ElectrumError("confirmed Bitcoin recovery status omitted block height".into())
+    })?;
+    let block_hash = status
+        .block_hash
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|hash| hash.to_ascii_lowercase())
+        .ok_or_else(|| {
+            AppError::ElectrumError("confirmed Bitcoin recovery status omitted block hash".into())
+        })?;
+    Ok(BitcoinRecoveryTransactionStatus::Confirmed {
+        block_height,
+        block_hash,
+    })
+}
+
+async fn fetch_esplora_block_hash(
+    client: &reqwest::Client,
+    endpoint: &str,
+    height: u32,
+) -> Result<String, AppError> {
+    let response = client
+        .get(format!("{endpoint}/block-height/{height}"))
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::ElectrumError(format!("Bitcoin recovery block anchor: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ElectrumError(format!(
+            "Bitcoin recovery block anchor returned HTTP {}",
+            response.status()
+        )));
+    }
+    let hash = response
+        .text()
+        .await
+        .map_err(|error| AppError::ElectrumError(format!("read Bitcoin block anchor: {error}")))?;
+    let hash = hash.trim();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::ElectrumError(
+            "Bitcoin recovery block anchor is not a canonical hash".into(),
+        ));
+    }
+    Ok(hash.to_ascii_lowercase())
 }
 
 struct EsploraRecoveryBroadcaster {
@@ -427,6 +696,7 @@ async fn execute_journaled_recovery_with_builder_fee(
         return Ok(attempt.txid);
     }
 
+    let observed_token = attempt.observed_state_token();
     match reconcile_attempt_evidence(&attempt, evidence).await? {
         EvidenceDecision::ExpectedObserved(reason) => {
             complete_expected_attempt(pool, &attempt, &reason).await?;
@@ -438,9 +708,17 @@ async fn execute_journaled_recovery_with_builder_fee(
                 "source {}:{} spent by unexpected transaction {}",
                 source.txid, source.vout, spender
             );
-            let held = db::mark_recovery_integrity_hold(pool, attempt.id, &reason)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let held = db::mark_recovery_integrity_hold(
+                pool,
+                attempt.chain_swap_id,
+                attempt.id,
+                &attempt.purpose,
+                &attempt.txid,
+                &observed_token,
+                &reason,
+            )
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
             if held != 1 {
                 return Err(AppError::DbError(
                     "could not persist Bitcoin recovery integrity hold".into(),
@@ -459,15 +737,15 @@ async fn execute_journaled_recovery_with_builder_fee(
         }
     }
 
-    let started = db::mark_recovery_broadcast_started(pool, attempt.id)
+    let started_token = db::mark_recovery_broadcast_started(pool, attempt.id)
         .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    if started != 1 {
-        return Err(AppError::ClaimError(format!(
-            "recovery attempt {} is not broadcastable (status {})",
-            attempt.id, attempt.status
-        )));
-    }
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::ClaimError(format!(
+                "recovery attempt {} is not broadcastable (status {})",
+                attempt.id, attempt.status
+            ))
+        })?;
     faults.check(RecoveryFaultPoint::AfterBroadcastAttemptCommit)?;
 
     let broadcast_result = broadcaster
@@ -485,10 +763,18 @@ async fn execute_journaled_recovery_with_builder_fee(
                 "broadcaster returned txid {returned_txid}, expected {}",
                 attempt.txid
             );
-            reconcile_after_broadcast_error(pool, &attempt, evidence, AppError::ClaimError(error))
-                .await
+            reconcile_after_broadcast_error(
+                pool,
+                &attempt,
+                &started_token,
+                evidence,
+                AppError::ClaimError(error),
+            )
+            .await
         }
-        Err(error) => reconcile_after_broadcast_error(pool, &attempt, evidence, error).await,
+        Err(error) => {
+            reconcile_after_broadcast_error(pool, &attempt, &started_token, evidence, error).await
+        }
     }
 }
 
@@ -1012,6 +1298,7 @@ async fn reconcile_attempt_evidence(
 async fn reconcile_after_broadcast_error(
     pool: &sqlx::PgPool,
     attempt: &ChainSwapTxAttempt,
+    started_token: &db::RecoveryAttemptStateToken,
     evidence: &dyn BitcoinRecoveryEvidence,
     error: AppError,
 ) -> Result<String, AppError> {
@@ -1031,9 +1318,17 @@ async fn reconcile_after_broadcast_error(
                 "source {}:{} spent by unexpected transaction {} after broadcast ambiguity",
                 source.txid, source.vout, spender
             );
-            let held = db::mark_recovery_integrity_hold(pool, attempt.id, &reason)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let held = db::mark_recovery_integrity_hold(
+                pool,
+                attempt.chain_swap_id,
+                attempt.id,
+                &attempt.purpose,
+                &attempt.txid,
+                started_token,
+                &reason,
+            )
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
             if held != 1 {
                 return Err(AppError::DbError(
                     "could not persist Bitcoin recovery integrity hold".into(),
@@ -1052,7 +1347,7 @@ async fn reconcile_after_broadcast_error(
         }
         Ok(EvidenceDecision::Unspent) => {
             let result = format!("broadcast outcome ambiguous: {error_text}");
-            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
+            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, started_token, &result)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             // Preserve the broadcaster's typed failure scope after the
@@ -1064,7 +1359,7 @@ async fn reconcile_after_broadcast_error(
             let result = format!(
                 "broadcast outcome ambiguous: {error_text}; evidence unavailable: {evidence_error}"
             );
-            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
+            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, started_token, &result)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             // Evidence is now the strongest reason the outcome cannot be
@@ -1189,10 +1484,23 @@ mod tests {
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use boltz_client::util::fees::Fee;
 
-    use super::{bitcoin_recovery_fee, validate_reloaded_fee_intent, BitcoinRecoveryBackend};
+    use super::{
+        bitcoin_recovery_fee, validate_reloaded_fee_intent, BitcoinRecoveryBackend,
+        BitcoinRecoveryEvidence, BitcoinRecoveryTransactionStatus,
+    };
     use crate::builder_fee::BitcoinBuilderFeeDecision;
     use crate::db::{BitcoinRecoveryFeeAuthority, RecoverySourcePrevout};
     use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::get,
+        Router,
+    };
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     fn bitcoin_builder_fee(rate: f64) -> BitcoinBuilderFeeDecision {
         let observation = LiveBitcoin::new(
@@ -1247,6 +1555,80 @@ mod tests {
             let decision = bitcoin_builder_fee(rate);
             assert_eq!(relative_fee_rate(bitcoin_recovery_fee(decision)), rate);
         }
+    }
+
+    #[derive(Clone)]
+    struct MockEsploraState {
+        tip: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        status: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        block: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockEsploraState {
+        fn new(
+            tip: impl IntoIterator<Item = (StatusCode, String)>,
+            status: impl IntoIterator<Item = (StatusCode, String)>,
+            block: impl IntoIterator<Item = (StatusCode, String)>,
+        ) -> Self {
+            Self {
+                tip: Arc::new(Mutex::new(tip.into_iter().collect())),
+                status: Arc::new(Mutex::new(status.into_iter().collect())),
+                block: Arc::new(Mutex::new(block.into_iter().collect())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    fn next_response(queue: &Mutex<VecDeque<(StatusCode, String)>>) -> (StatusCode, String) {
+        queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("mock Esplora response queue is complete")
+    }
+
+    async fn mock_tip(State(state): State<MockEsploraState>) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push("tip".into());
+        next_response(&state.tip)
+    }
+
+    async fn mock_status(
+        State(state): State<MockEsploraState>,
+        Path(_txid): Path<String>,
+    ) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push("status".into());
+        next_response(&state.status)
+    }
+
+    async fn mock_block(
+        State(state): State<MockEsploraState>,
+        Path(height): Path<u32>,
+    ) -> (StatusCode, String) {
+        state.calls.lock().unwrap().push(format!("block:{height}"));
+        next_response(&state.block)
+    }
+
+    async fn spawn_mock_esplora(state: MockEsploraState) -> String {
+        let app = Router::new()
+            .route("/blocks/tip/height", get(mock_tip))
+            .route("/tx/:txid/status", get(mock_status))
+            .route("/block-height/:height", get(mock_block))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Esplora");
+        let address = listener.local_addr().expect("mock Esplora address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock Esplora");
+        });
+        format!("http://{address}")
+    }
+
+    fn confirmed_status(height: u32, hash: &str) -> String {
+        format!(r#"{{"confirmed":true,"block_height":{height},"block_hash":"{hash}"}}"#)
     }
 
     #[test]
@@ -1326,5 +1708,144 @@ mod tests {
                 "http://127.0.0.1:3000".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_anchors_one_endpoint_and_rechecks_status_and_tip() {
+        let block_hash = "aa".repeat(32);
+        let state = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::OK, confirmed_status(99, &block_hash)),
+                (StatusCode::OK, confirmed_status(99, &block_hash)),
+            ],
+            [(StatusCode::OK, block_hash.clone())],
+        );
+        let endpoint = spawn_mock_esplora(state.clone()).await;
+        let backend = BitcoinRecoveryBackend::try_new(vec![endpoint]).unwrap();
+        let txid = "11".repeat(32);
+
+        let snapshot = backend.status_snapshot(&txid, Some(99)).await.unwrap();
+
+        assert_eq!(snapshot.tip_height, 100);
+        assert_eq!(snapshot.prior_block_hash, Some(block_hash.clone()));
+        assert_eq!(
+            snapshot.status,
+            BitcoinRecoveryTransactionStatus::Confirmed {
+                block_height: 99,
+                block_hash,
+            }
+        );
+        assert_eq!(
+            state.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "block:99", "status", "tip"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_rejects_block_mismatch_and_toctou() {
+        let claimed_hash = "aa".repeat(32);
+        let anchored_hash = "bb".repeat(32);
+        let mismatch = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [(StatusCode::OK, confirmed_status(99, &claimed_hash))],
+            [(StatusCode::OK, anchored_hash)],
+        );
+        let mismatch_backend =
+            BitcoinRecoveryBackend::try_new(vec![spawn_mock_esplora(mismatch.clone()).await])
+                .unwrap();
+        assert!(mismatch_backend
+            .status_snapshot(&"22".repeat(32), None)
+            .await
+            .is_err());
+        assert_eq!(
+            mismatch.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "block:99"]
+        );
+
+        let toctou = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [
+                (StatusCode::OK, r#"{"confirmed":false}"#.into()),
+                (StatusCode::OK, confirmed_status(100, &claimed_hash)),
+            ],
+            [],
+        );
+        let toctou_backend =
+            BitcoinRecoveryBackend::try_new(vec![spawn_mock_esplora(toctou.clone()).await])
+                .unwrap();
+        assert!(toctou_backend
+            .status_snapshot(&"33".repeat(32), None)
+            .await
+            .is_err());
+        assert_eq!(
+            toctou.calls.lock().unwrap().as_slice(),
+            ["tip", "status", "status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_snapshot_requires_all_endpoints_for_positive_absence() {
+        let absent_a = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let absent_b = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let endpoints = vec![
+            spawn_mock_esplora(absent_a).await,
+            spawn_mock_esplora(absent_b).await,
+        ];
+        let backend = BitcoinRecoveryBackend::try_new(endpoints).unwrap();
+        let snapshot = backend
+            .status_snapshot(&"44".repeat(32), None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, BitcoinRecoveryTransactionStatus::Absent);
+
+        let absent = MockEsploraState::new(
+            [
+                (StatusCode::OK, "100".into()),
+                (StatusCode::OK, "100".into()),
+            ],
+            [
+                (StatusCode::NOT_FOUND, String::new()),
+                (StatusCode::NOT_FOUND, String::new()),
+            ],
+            [],
+        );
+        let uncertain = MockEsploraState::new(
+            [(StatusCode::OK, "100".into())],
+            [(StatusCode::SERVICE_UNAVAILABLE, "unavailable".into())],
+            [],
+        );
+        let backend = BitcoinRecoveryBackend::try_new(vec![
+            spawn_mock_esplora(absent).await,
+            spawn_mock_esplora(uncertain).await,
+        ])
+        .unwrap();
+        assert!(backend
+            .status_snapshot(&"55".repeat(32), None)
+            .await
+            .is_err());
     }
 }
