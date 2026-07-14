@@ -15722,7 +15722,7 @@ async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) ->
         }],
         output: vec![
             lwk_wollet::elements::TxOut {
-                asset: lwk_wollet::elements::confidential::Asset::Explicit(asset.clone()),
+                asset: lwk_wollet::elements::confidential::Asset::Explicit(asset),
                 value: lwk_wollet::elements::confidential::Value::Explicit(1_000),
                 nonce: lwk_wollet::elements::confidential::Nonce::Null,
                 script_pubkey: destination_script,
