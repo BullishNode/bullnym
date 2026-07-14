@@ -61,8 +61,7 @@ impl fmt::Debug for MempoolFeeSourceIdentity {
     }
 }
 
-/// A narrow client for the mempool-compatible Recommended Fees (Precise)
-/// endpoint.
+/// A narrow client for the mempool-compatible Precise Fees endpoint.
 ///
 /// Construction accepts only a credential-free HTTPS base endpoint. The
 /// adapter deliberately does not choose fallbacks or make spending decisions.
@@ -389,6 +388,21 @@ impl OrderedMempoolFeeSources {
 
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
+    }
+
+    /// Whether persisted provenance names this exact adapter contract and one
+    /// of the currently configured source identities.
+    pub(crate) fn authorizes_provenance(&self, provenance: &FeeProvenance) -> bool {
+        let expected_prefix = MempoolFeeObservationSource::ConfiguredPreciseFees.stable_label();
+        provenance
+            .expose_for_persistence()
+            .strip_prefix(expected_prefix)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .is_some_and(|source_identity| {
+                self.sources.iter().any(|source| {
+                    source.source_identity.expose_for_persistence() == source_identity
+                })
+            })
     }
 
     pub async fn observe_first_acceptable<F>(
@@ -732,7 +746,6 @@ mod tests {
             let adapter = MempoolFastestFeeAdapter::new(&source.endpoint)
                 .expect("configured production API base must be valid");
             assert_eq!(adapter.precise_fees_url.as_str(), expected_precise_url);
-            assert!(!adapter.precise_fees_url.path().contains("recommended"));
         }
     }
 
@@ -1064,6 +1077,38 @@ mod tests {
         .expect("oversized source identity must fail");
         assert_eq!(error, MempoolFeeAdapterError::InvalidSourceIdentity);
         assert!(!error.to_string().contains(&oversized));
+    }
+
+    #[test]
+    fn configured_source_set_authorizes_only_precise_provenance_from_a_current_identity() {
+        let sources = OrderedMempoolFeeSources::new(vec![
+            MempoolFastestFeeAdapter::new_with_source_identity(
+                "primary",
+                "https://one.example/api",
+            )
+            .unwrap(),
+            MempoolFastestFeeAdapter::new_with_source_identity(
+                "secondary",
+                "https://two.example/api",
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        for authorized in [
+            "mempool_precise_fastest_fee:primary",
+            "mempool_precise_fastest_fee:secondary",
+        ] {
+            assert!(sources.authorizes_provenance(&FeeProvenance::new(authorized).unwrap()));
+        }
+        for rejected in [
+            "mempool_precise_fastest_fee:removed",
+            "mempool_precise_fastest_fee:",
+            "mempool_precise_fastest_fee:primary:extra",
+            "legacy-bitcoin-route:primary",
+        ] {
+            assert!(!sources.authorizes_provenance(&FeeProvenance::new(rejected).unwrap()));
+        }
     }
 
     #[tokio::test]

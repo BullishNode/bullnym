@@ -7,13 +7,18 @@
 
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::fee_policy::{
-    BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness, FeeObservationSource, FeeProvenance,
-    FeeRail, LiquidFeeDecision, LiquidFeePolicy, SatPerVbyte,
+    BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness, FeeObservationSource, FeePolicyError,
+    FeeProvenance, FeeRail, LiquidFeeDecision, LiquidFeePolicy, SatPerVbyte,
 };
 
 pub const FEE_POLICY_VERSION: &str = "review25-v1";
+
+fn construction_authority_remaining(age_secs: u64, max_age_secs: u64) -> Option<Duration> {
+    max_age_secs.checked_sub(age_secs).map(Duration::from_secs)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeeConstructionPurpose {
@@ -61,7 +66,7 @@ impl FeeQuoteTarget {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct FeeDecisionRecord {
     purpose: FeeConstructionPurpose,
     source: FeeObservationSource,
@@ -73,6 +78,26 @@ pub struct FeeDecisionRecord {
     provenance: FeeProvenance,
     policy_floor: SatPerVbyte,
     policy_cap: SatPerVbyte,
+    /// Process-local only: never persisted and deliberately omitted from
+    /// diagnostics. It measures elapsed pool/lock/construction time without
+    /// comparing production wall time to synthetic compatibility fixtures.
+    construction_authority_captured_at: Instant,
+    construction_authority_remaining: Duration,
+}
+
+impl PartialEq for FeeDecisionRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.purpose == other.purpose
+            && self.source == other.source
+            && self.rate == other.rate
+            && self.quoted_at_unix == other.quoted_at_unix
+            && self.evaluated_at_unix == other.evaluated_at_unix
+            && self.freshness_age_secs == other.freshness_age_secs
+            && self.freshness_max_age_secs == other.freshness_max_age_secs
+            && self.provenance == other.provenance
+            && self.policy_floor == other.policy_floor
+            && self.policy_cap == other.policy_cap
+    }
 }
 
 impl FeeDecisionRecord {
@@ -156,6 +181,9 @@ impl FeeDecisionRecord {
         policy_cap: SatPerVbyte,
         evaluated_at_unix: u64,
     ) -> Result<Self, FeeDecisionRecordError> {
+        if rate < policy_floor || rate > policy_cap {
+            return Err(FeeDecisionRecordError::DecisionOutsidePolicyBounds);
+        }
         let FeeFreshness::Fresh {
             age_secs,
             max_age_secs,
@@ -166,6 +194,9 @@ impl FeeDecisionRecord {
         if quoted_at_unix.checked_add(age_secs) != Some(evaluated_at_unix) {
             return Err(FeeDecisionRecordError::EvaluationClockMismatch);
         }
+        let construction_authority_remaining =
+            construction_authority_remaining(age_secs, max_age_secs)
+                .ok_or(FeeDecisionRecordError::DecisionNotFresh)?;
         Ok(Self {
             purpose,
             source,
@@ -177,6 +208,8 @@ impl FeeDecisionRecord {
             provenance,
             policy_floor,
             policy_cap,
+            construction_authority_captured_at: Instant::now(),
+            construction_authority_remaining,
         })
     }
 
@@ -216,6 +249,19 @@ impl FeeDecisionRecord {
         self.freshness_max_age_secs
     }
 
+    /// Whether the decision's process-local monotonic window still authorizes
+    /// new bytes at the supplied instant. Persisted wall-clock evidence remains
+    /// unchanged and is not consulted again after initial policy acceptance.
+    fn authorizes_construction_at(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.construction_authority_captured_at)
+            .is_some_and(|elapsed| elapsed <= self.construction_authority_remaining)
+    }
+
+    /// Recheck fee authority after any pool/lock/construction delay.
+    pub(crate) fn authorizes_construction_now(&self) -> bool {
+        self.authorizes_construction_at(Instant::now())
+    }
+
     pub fn provenance_for_persistence(&self) -> &str {
         self.provenance.expose_for_persistence()
     }
@@ -226,6 +272,16 @@ impl FeeDecisionRecord {
 
     pub const fn policy_cap(&self) -> SatPerVbyte {
         self.policy_cap
+    }
+
+    /// Exact fee the accepted decision permits for the returned transaction's
+    /// final virtual size. The pinned boltz-client constructor uses
+    /// `ceil(rate * estimated_vsize)` and its cooperative/script witnesses are
+    /// fixed-size, so the returned size must reproduce that integer fee. Record
+    /// construction has already proven that the decision lies within the
+    /// persisted policy floor and cap.
+    pub(crate) fn exact_authorized_fee_sat(&self, vbytes: u64) -> Result<u64, FeePolicyError> {
+        self.rate.checked_fee_for_vbytes(vbytes)
     }
 
     pub const fn policy_version(&self) -> &'static str {
@@ -263,6 +319,7 @@ pub enum FeeDecisionRecordError {
         source: FeeObservationSource,
     },
     DecisionNotFresh,
+    DecisionOutsidePolicyBounds,
     EvaluationClockMismatch,
 }
 
@@ -276,6 +333,9 @@ impl fmt::Display for FeeDecisionRecordError {
                 formatter.write_str("fee decision source belongs to another rail")
             }
             Self::DecisionNotFresh => formatter.write_str("fee decision is not fresh"),
+            Self::DecisionOutsidePolicyBounds => {
+                formatter.write_str("fee decision rate is outside the recorded policy bounds")
+            }
             Self::EvaluationClockMismatch => {
                 formatter.write_str("fee decision evaluation clock does not match freshness")
             }
@@ -364,6 +424,150 @@ mod tests {
         let diagnostic = format!("{record:?}");
         assert!(diagnostic.contains("<redacted>"));
         assert!(!diagnostic.contains("secret-endpoint"));
+        assert!(!diagnostic.contains("construction_authority"));
+    }
+
+    #[test]
+    fn construction_authority_uses_remaining_freshness_on_a_monotonic_deadline() {
+        let policy = BitcoinFeePolicy::new(rate(1.0), rate(100.0), 30, 300).unwrap();
+        let decision = policy
+            .decide_typed(
+                Some(&LiveBitcoin::new(
+                    rate(12.5),
+                    1_000,
+                    provenance("mempool_precise_fastest_fee:primary"),
+                )),
+                None,
+                1_007,
+            )
+            .unwrap();
+        let record = FeeDecisionRecord::from_bitcoin(
+            FeeConstructionPurpose::BitcoinRecovery,
+            &decision,
+            &policy,
+            1_007,
+        )
+        .unwrap();
+
+        assert_eq!(
+            construction_authority_remaining(7, 30),
+            Some(Duration::from_secs(23))
+        );
+        assert_eq!(
+            construction_authority_remaining(0, u64::MAX),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert!(construction_authority_remaining(31, 30).is_none());
+        let captured_at = record.construction_authority_captured_at;
+        let deadline = captured_at
+            .checked_add(record.construction_authority_remaining)
+            .unwrap();
+        assert!(!record
+            .authorizes_construction_at(captured_at.checked_sub(Duration::from_nanos(1)).unwrap()));
+        assert!(record.authorizes_construction_at(captured_at));
+        assert!(record.authorizes_construction_at(deadline));
+        assert!(!record
+            .authorizes_construction_at(deadline.checked_add(Duration::from_nanos(1)).unwrap()));
+    }
+
+    #[test]
+    fn persisted_authority_equality_ignores_the_process_local_deadline() {
+        let policy = BitcoinFeePolicy::new(rate(1.0), rate(100.0), 30, 300).unwrap();
+        let decision = policy
+            .decide_typed(
+                Some(&LiveBitcoin::new(
+                    rate(12.5),
+                    1_000,
+                    provenance("mempool_precise_fastest_fee:primary"),
+                )),
+                None,
+                1_007,
+            )
+            .unwrap();
+        let record = FeeDecisionRecord::from_bitcoin(
+            FeeConstructionPurpose::BitcoinRecovery,
+            &decision,
+            &policy,
+            1_007,
+        )
+        .unwrap();
+        let mut same_persisted_authority = record.clone();
+        assert_eq!(
+            record.construction_authority_captured_at,
+            same_persisted_authority.construction_authority_captured_at
+        );
+        assert_eq!(
+            record.construction_authority_remaining,
+            same_persisted_authority.construction_authority_remaining
+        );
+        same_persisted_authority.construction_authority_captured_at = same_persisted_authority
+            .construction_authority_captured_at
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(record, same_persisted_authority);
+        same_persisted_authority.freshness_max_age_secs += 1;
+        assert_ne!(record, same_persisted_authority);
+    }
+
+    #[test]
+    fn exact_size_fee_authority_rejects_underpay_and_overpay() {
+        let policy = BitcoinFeePolicy::new(rate(1.0), rate(100.0), 30, 300).unwrap();
+        let decision = policy
+            .decide_typed(
+                Some(&LiveBitcoin::new(
+                    rate(12.5),
+                    1_000,
+                    provenance("mempool_precise_fastest_fee:primary"),
+                )),
+                None,
+                1_000,
+            )
+            .unwrap();
+        let record = FeeDecisionRecord::from_bitcoin(
+            FeeConstructionPurpose::BitcoinRecovery,
+            &decision,
+            &policy,
+            1_000,
+        )
+        .unwrap();
+
+        // boltz-client computes ceil(12.5 sat/vB * 141 vB) = 1_763 sat.
+        let exact = record.exact_authorized_fee_sat(141).unwrap();
+        assert_eq!(exact, 1_763);
+        assert_ne!(1_762, exact);
+        assert_ne!(1_764, exact);
+    }
+
+    #[test]
+    fn record_rejects_decision_outside_the_supplied_policy_bounds() {
+        let authorizing_policy = BitcoinFeePolicy::new(rate(1.0), rate(100.0), 30, 300).unwrap();
+        let decision = authorizing_policy
+            .decide_typed(
+                Some(&LiveBitcoin::new(
+                    rate(12.5),
+                    1_000,
+                    provenance("mempool_precise_fastest_fee:primary"),
+                )),
+                None,
+                1_000,
+            )
+            .unwrap();
+
+        for supplied_policy in [
+            BitcoinFeePolicy::new(rate(1.0), rate(10.0), 30, 300).unwrap(),
+            BitcoinFeePolicy::new(rate(20.0), rate(100.0), 30, 300).unwrap(),
+        ] {
+            assert_eq!(
+                FeeDecisionRecord::from_bitcoin(
+                    FeeConstructionPurpose::BitcoinRecovery,
+                    &decision,
+                    &supplied_policy,
+                    1_000,
+                ),
+                Err(FeeDecisionRecordError::DecisionOutsidePolicyBounds)
+            );
+        }
     }
 
     #[test]

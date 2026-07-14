@@ -4,7 +4,7 @@ use std::str::FromStr;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::mark_user_used;
+use super::{mark_user_used, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow};
 
 pub const CLAIM_IN_FLIGHT_LEASE: &str = "2 minutes";
 
@@ -288,6 +288,10 @@ pub struct SwapRecord {
     /// nonces + asset/value blinding factors). Cleared by the bump-fee
     /// retry path.
     pub claim_tx_hex: Option<String>,
+    /// All-null for unjournaled rows and immutable pre-054 claim bytes; a
+    /// complete, validated schema-054 packet for every newer claim journal.
+    #[sqlx(flatten, try_from = "LiquidClaimFeeAuthorityRow")]
+    pub claim_fee_authority: LiquidClaimFeeAuthority,
     /// 'cooperative' (MuSig2 keypath, requires Boltz cosign) or 'script'
     /// (preimage-revealing script-path). The script path is the only
     /// recovery once Boltz status reaches `swap.expired`.
@@ -330,7 +334,16 @@ impl SwapRecord {
 const SWAP_RECORD_COLUMNS: &str =
     "id, nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
      preimage_hex, claim_key_hex, boltz_response_json, status, claim_txid, \
-     claim_tx_hex, claim_path, claim_attempts, \
+     claim_tx_hex, claim_actual_fee_sat, claim_actual_fee_rate_sat_vb, \
+     claim_fee_decision_purpose, claim_fee_decision_rail, \
+     claim_fee_decision_target, claim_fee_decision_source, \
+     claim_fee_decision_rate_sat_vb, claim_fee_decision_quoted_at_unix, \
+     claim_fee_decision_evaluated_at_unix, \
+     claim_fee_decision_freshness_age_secs, \
+     claim_fee_decision_freshness_max_age_secs, claim_fee_decision_provenance, \
+     claim_fee_decision_policy_floor_sat_vb, \
+     claim_fee_decision_policy_cap_sat_vb, claim_fee_decision_policy_version, \
+     claim_path, claim_attempts, \
      last_claim_error, cooperative_refused, invoice_id";
 
 pub async fn get_swap_by_boltz_id(

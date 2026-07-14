@@ -15312,6 +15312,13 @@ const JOURNAL_DESTINATION_ADDRESS: &str =
     "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 
 fn bitcoin_fee_decision(rate: f64) -> pay_service::fee_policy::BitcoinFeeDecision {
+    bitcoin_fee_decision_with_cap(rate, 500.0)
+}
+
+fn bitcoin_fee_decision_with_cap(
+    rate: f64,
+    cap: f64,
+) -> pay_service::fee_policy::BitcoinFeeDecision {
     use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
 
     let observation = LiveBitcoin::new(
@@ -15319,9 +15326,15 @@ fn bitcoin_fee_decision(rate: f64) -> pay_service::fee_policy::BitcoinFeeDecisio
         1_000,
         FeeProvenance::new("integration-test").unwrap(),
     );
-    BitcoinFeePolicy::default()
-        .decide_typed(Some(&observation), None, 1_000)
-        .unwrap()
+    BitcoinFeePolicy::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        SatPerVbyte::try_from(cap).unwrap(),
+        120,
+        900,
+    )
+    .unwrap()
+    .decide_typed(Some(&observation), None, 1_000)
+    .unwrap()
 }
 
 fn midrange_bitcoin_fee_decision() -> pay_service::fee_policy::BitcoinFeeDecision {
@@ -15367,8 +15380,43 @@ async fn persisted_recovery_fee_decision(
 
 struct FakeRecoveryBuilder {
     transaction: BtcLikeTransaction,
+    source_amount_sat: u64,
     calls: AtomicUsize,
     fee_rates: Mutex<Vec<f64>>,
+}
+
+impl FakeRecoveryBuilder {
+    fn construct_for_fee_decision(
+        &self,
+        fee_decision: pay_service::builder_fee::BitcoinBuilderFeeDecision,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        let BtcLikeTransaction::Bitcoin(mut transaction) = self.transaction.clone() else {
+            return Err(AppError::ClaimError(
+                "scripted Bitcoin recovery template is not Bitcoin".into(),
+            ));
+        };
+        let final_vbytes = u64::try_from(transaction.vsize()).map_err(|_| {
+            AppError::ClaimError("scripted Bitcoin recovery virtual size exceeds u64".into())
+        })?;
+        let fee_sat = fee_decision
+            .rate()
+            .checked_fee_for_vbytes(final_vbytes)
+            .map_err(|error| {
+                AppError::ClaimError(format!("scripted Bitcoin recovery fee is invalid: {error}"))
+            })?;
+        let destination_sat = self
+            .source_amount_sat
+            .checked_sub(fee_sat)
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| {
+                AppError::ClaimError("scripted fee consumes the recovery output".into())
+            })?;
+        let destination = transaction.output.get_mut(0).ok_or_else(|| {
+            AppError::ClaimError("scripted Bitcoin recovery has no destination output".into())
+        })?;
+        destination.value = bitcoin::Amount::from_sat(destination_sat);
+        Ok(BtcLikeTransaction::Bitcoin(transaction))
+    }
 }
 
 #[async_trait]
@@ -15384,7 +15432,7 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FakeRecoveryBuilder
             .lock()
             .await
             .push(fee_decision.rate().as_f64());
-        Ok(self.transaction.clone())
+        self.construct_for_fee_decision(fee_decision)
     }
 }
 
@@ -15563,6 +15611,34 @@ impl pay_service::chain_recovery::RecoveryFaultInjector for OneShotRecoveryFault
     }
 }
 
+struct DelayedRecoveryFault {
+    point: pay_service::chain_recovery::RecoveryFaultPoint,
+    delay: Duration,
+    fired: AtomicBool,
+}
+
+impl DelayedRecoveryFault {
+    fn at(point: pay_service::chain_recovery::RecoveryFaultPoint, delay: Duration) -> Self {
+        Self {
+            point,
+            delay,
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl pay_service::chain_recovery::RecoveryFaultInjector for DelayedRecoveryFault {
+    fn check(
+        &self,
+        point: pay_service::chain_recovery::RecoveryFaultPoint,
+    ) -> Result<(), AppError> {
+        if point == self.point && !self.fired.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        Ok(())
+    }
+}
+
 struct RecoveryJournalHarness {
     swap: pay_service::db::ChainSwapRecord,
     builder: Arc<FakeRecoveryBuilder>,
@@ -15605,7 +15681,8 @@ async fn seed_recovery_journal_harness(
         }],
     };
     let source_txid = source_tx.compute_txid().to_string();
-    let recovery_tx = bitcoin::Transaction {
+    let fee_decision = midrange_bitcoin_fee_decision();
+    let recovery_template = bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
@@ -15618,9 +15695,23 @@ async fn seed_recovery_journal_harness(
             witness: bitcoin::Witness::new(),
         }],
         output: vec![bitcoin::TxOut {
-            value: bitcoin::Amount::from_sat(99_000),
+            value: bitcoin::Amount::from_sat(1),
             script_pubkey: destination_script,
         }],
+    };
+    let builder = Arc::new(FakeRecoveryBuilder {
+        transaction: BtcLikeTransaction::Bitcoin(recovery_template),
+        source_amount_sat: 100_000,
+        calls: AtomicUsize::new(0),
+        fee_rates: Mutex::new(Vec::new()),
+    });
+    let BtcLikeTransaction::Bitcoin(recovery_tx) = builder
+        .construct_for_fee_decision(pay_service::builder_fee::BitcoinBuilderFeeDecision::from(
+            &fee_decision,
+        ))
+        .unwrap()
+    else {
+        unreachable!("scripted recovery builder returns a Bitcoin transaction")
     };
     let expected_txid = recovery_tx.compute_txid().to_string();
     let expected_raw_hex = hex::encode(bitcoin::consensus::serialize(&recovery_tx));
@@ -15630,11 +15721,6 @@ async fn seed_recovery_journal_harness(
         source_txid.clone(),
         bitcoin::consensus::serialize(&source_tx),
     );
-    let builder = Arc::new(FakeRecoveryBuilder {
-        transaction: BtcLikeTransaction::Bitcoin(recovery_tx),
-        calls: AtomicUsize::new(0),
-        fee_rates: Mutex::new(Vec::new()),
-    });
     let broadcaster = Arc::new(FakeRecoveryBroadcaster::new(
         chain.clone(),
         (source_txid.clone(), 0),
@@ -15666,7 +15752,7 @@ async fn seed_recovery_journal_harness(
     RecoveryJournalHarness {
         swap,
         builder,
-        fee_decision: midrange_bitcoin_fee_decision(),
+        fee_decision,
         chain,
         broadcaster,
         source_txid,
@@ -15968,7 +16054,10 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
 
     // Estimator movement after the journal commit cannot authorize new bytes
     // or rewrite the decision evidence bound to the committed transaction.
-    let moved_estimator_decision = bitcoin_fee_decision(7.0);
+    // This decision is valid under its originating policy but outside the
+    // compatibility seam's default 500 sat/vB cap. Existing-byte replay must
+    // ignore it rather than rebuilding current construction authority.
+    let moved_estimator_decision = bitcoin_fee_decision_with_cap(750.0, 1_000.0);
     let replay_fault =
         OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
     let replay_result = execute_journaled_recovery_with_services(
@@ -16023,6 +16112,73 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
         harness.broadcaster.calls.lock().await.as_slice(),
         &[committed.raw_tx_hex]
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_services, RecoveryFaultPoint,
+        BITCOIN_FEE_DECISION_PENDING_REASON,
+    };
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "feeexpires", [FakeBroadcastResult::Accept]).await;
+    let observation = LiveBitcoin::new(
+        SatPerVbyte::try_from(2.0).unwrap(),
+        1_000,
+        FeeProvenance::new("expiring-integration-test").unwrap(),
+    );
+    let expiring_decision = BitcoinFeePolicy::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        SatPerVbyte::try_from(500.0).unwrap(),
+        3,
+        900,
+    )
+    .unwrap()
+    .decide_typed(Some(&observation), None, 1_000)
+    .unwrap();
+    let delayed_commit = DelayedRecoveryFault::at(
+        RecoveryFaultPoint::AfterJournalWriteBeforeCommit,
+        Duration::from_millis(3_100),
+    );
+
+    let result = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &expiring_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &delayed_commit,
+    )
+    .await;
+
+    assert!(delayed_commit.fired.load(Ordering::SeqCst));
+    assert!(matches!(
+        result,
+        Err(AppError::RecoveryNotAvailable(reason))
+            if reason == BITCOIN_FEE_DECISION_PENDING_REASON
+    ));
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired construction authority must roll back the journal insert"
+    );
+    let swap = pay_service::db::get_chain_swap_by_id(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "refund_due");
+    assert!(swap.refund_txid.is_none());
 
     cleanup_db(&pool).await;
 }
@@ -16268,6 +16424,7 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
         .script_pubkey();
     let bad_builder = FakeRecoveryBuilder {
         transaction: BtcLikeTransaction::Bitcoin(transaction),
+        source_amount_sat: 100_000,
         calls: AtomicUsize::new(0),
         fee_rates: Mutex::new(Vec::new()),
     };

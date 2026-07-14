@@ -734,6 +734,7 @@ mod tests {
                 status: "pending".into(),
                 claim_txid: None,
                 claim_tx_hex: None,
+                claim_fee_authority: crate::db::LiquidClaimFeeAuthority::Legacy,
                 claim_attempts: 0,
                 last_claim_error: None,
                 cooperative_refused: false,
