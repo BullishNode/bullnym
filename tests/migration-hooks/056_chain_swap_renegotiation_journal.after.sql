@@ -217,9 +217,8 @@ BEGIN
         UPDATE chain_swap_renegotiation_operations
            SET state = 'accept_requested',
                accept_attempt_count = 1,
-               accept_requested_at = '2020-07-13 12:02:00+00',
-               version = 2,
-               updated_at = '2020-07-13 12:02:00+00'
+               accept_requested_at = clock_timestamp(),
+               version = 2
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
         RAISE EXCEPTION USING ERRCODE = 'P5601',
             MESSAGE = 'simulated crash before accept intent commit';
@@ -244,9 +243,8 @@ $$;
 UPDATE chain_swap_renegotiation_operations
    SET state = 'accept_requested',
        accept_attempt_count = 1,
-       accept_requested_at = '2020-07-13 12:02:00+00',
-       version = 2,
-       updated_at = '2020-07-13 12:02:00+00'
+       accept_requested_at = clock_timestamp(),
+       version = 2
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
 DO $$
@@ -255,9 +253,8 @@ BEGIN
         UPDATE chain_swap_renegotiation_operations
            SET state = 'accepted',
                terminal_response_digest = repeat('c', 64),
-               terminal_observed_at = '2020-07-13 12:03:00+00',
-               version = 3,
-               updated_at = '2020-07-13 12:03:00+00'
+               terminal_observed_at = clock_timestamp(),
+               version = 3
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
         RAISE EXCEPTION USING ERRCODE = 'P5602',
             MESSAGE = 'simulated crash before terminal result commit';
@@ -272,7 +269,7 @@ BEGIN
            AND state = 'accept_requested'
            AND accept_attempt_count = 1
            AND version = 2
-           AND accept_requested_at = '2020-07-13 12:02:00+00'::TIMESTAMPTZ
+           AND accept_requested_at IS NOT NULL
            AND terminal_response_digest IS NULL
            AND terminal_observed_at IS NULL
     ) THEN
@@ -285,9 +282,8 @@ $$;
 UPDATE chain_swap_renegotiation_operations
    SET state = 'ambiguous',
        last_error_class = 'transport',
-       ambiguous_at = '2020-07-13 12:03:30+00',
-       version = 3,
-       updated_at = '2020-07-13 12:03:30+00'
+       ambiguous_at = clock_timestamp(),
+       version = 3
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
 DO $$
@@ -297,9 +293,8 @@ BEGIN
            SET state = 'declined',
                last_error_class = 'transport',
                terminal_response_digest = repeat('d', 64),
-               terminal_observed_at = '2020-07-13 12:04:00+00',
-               version = 4,
-               updated_at = '2020-07-13 12:04:00+00'
+               terminal_observed_at = clock_timestamp(),
+               version = 4
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
         RAISE EXCEPTION 'migration 056 allowed ambiguous to become declined';
     EXCEPTION WHEN object_not_in_prerequisite_state THEN
@@ -324,9 +319,8 @@ UPDATE chain_swap_renegotiation_operations
    SET state = 'accepted',
        last_error_class = 'transport',
        terminal_response_digest = repeat('c', 64),
-       terminal_observed_at = '2020-07-13 12:04:30+00',
-       version = 4,
-       updated_at = '2020-07-13 12:04:30+00'
+       terminal_observed_at = clock_timestamp(),
+       version = 4
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
 -- Policy decline is a terminal, pre-attempt outcome. Identity and terminal
@@ -345,9 +339,8 @@ UPDATE chain_swap_renegotiation_operations
    SET state = 'declined',
        last_error_class = NULL,
        terminal_response_digest = repeat('1', 64),
-       terminal_observed_at = '2020-07-13 12:05:30+00',
-       version = 2,
-       updated_at = '2020-07-13 12:05:30+00'
+       terminal_observed_at = clock_timestamp(),
+       version = 2
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000013';
 
 DO $$
