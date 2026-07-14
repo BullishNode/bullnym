@@ -2478,6 +2478,9 @@ mod tests {
 
     #[test]
     fn liquid_broadcast_start_requires_claiming_parent() {
+        const CHILD: &str =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+
         assert_eq!(LIQUID_BROADCAST_START_PARENT_STATUS, "claiming");
         for attempt_status in ["constructed", "broadcast_ambiguous", "broadcast"] {
             assert_eq!(
