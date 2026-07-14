@@ -460,20 +460,50 @@ SELECT (
     AND NOT EXISTS (
         SELECT 1
           FROM (VALUES
-              ('chain_swap_tx_attempts_require_review25_fee_authority'),
-              ('chain_swap_tx_attempts_immutable'),
-              ('chain_swap_tx_attempts_validate_replacement'),
-              ('invoice_payment_event_reject_merchant_settlement_delete'),
-              ('merchant_settlement_checkpoint_validate_write'),
-              ('merchant_settlement_checkpoint_reject_delete'),
-              ('merchant_settlement_retained_validate_update'),
-              ('merchant_settlement_retained_reject_delete')
-          ) required(trigger_name)
+              ('chain_swap_tx_attempts',
+                  'chain_swap_tx_attempts_require_review25_fee_authority',
+                  'require_review25_bitcoin_attempt_fee_authority', 7),
+              ('chain_swap_tx_attempts',
+                  'chain_swap_tx_attempts_immutable',
+                  'guard_chain_swap_tx_attempt_immutable', 19),
+              ('chain_swap_tx_attempts',
+                  'chain_swap_tx_attempts_validate_replacement',
+                  'enforce_liquid_claim_replacement_lineage', 7),
+              ('invoice_payment_events',
+                  'invoice_payment_event_evidence_guard',
+                  'guard_invoice_payment_event_evidence', 19),
+              ('invoice_payment_events',
+                  'invoice_payment_event_reject_merchant_settlement_delete',
+                  'reject_merchant_settlement_event_delete', 11),
+              ('merchant_settlement_checkpoints',
+                  'merchant_settlement_checkpoint_validate_write',
+                  'enforce_merchant_settlement_checkpoint_write', 23),
+              ('merchant_settlement_checkpoints',
+                  'merchant_settlement_checkpoint_reject_delete',
+                  'reject_merchant_settlement_delete', 11),
+              ('merchant_settlement_retained_outputs',
+                  'merchant_settlement_retained_validate_update',
+                  'enforce_merchant_settlement_retained_update', 23),
+              ('merchant_settlement_retained_outputs',
+                  'merchant_settlement_retained_reject_delete',
+                  'reject_merchant_settlement_delete', 11)
+          ) required(table_name, trigger_name, function_name, trigger_type)
          WHERE NOT EXISTS (
-             SELECT 1 FROM pg_trigger
-              WHERE tgname = required.trigger_name
-                AND NOT tgisinternal
-                AND tgenabled IN ('O', 'A')
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace namespace
+                 ON namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info
+                 ON function_info.oid = trigger_info.tgfoid
+              WHERE namespace.nspname = 'public'
+                AND relation.relname = required.table_name
+                AND trigger_info.tgname = required.trigger_name
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled IN ('O', 'A')
          )
     )
     AND EXISTS (
@@ -537,7 +567,13 @@ SELECT (
         SELECT 1
           FROM (VALUES
               ('guard_chain_swap_tx_attempt_immutable'),
-              ('require_review25_bitcoin_attempt_fee_authority')
+              ('require_review25_bitcoin_attempt_fee_authority'),
+              ('enforce_liquid_claim_replacement_lineage'),
+              ('guard_invoice_payment_event_evidence'),
+              ('reject_merchant_settlement_event_delete'),
+              ('enforce_merchant_settlement_checkpoint_write'),
+              ('enforce_merchant_settlement_retained_update'),
+              ('reject_merchant_settlement_delete')
           ) required(function_name)
          WHERE NOT EXISTS (
              SELECT 1
