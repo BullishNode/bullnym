@@ -150,11 +150,22 @@ The probe must print successful boundaries for 053, 055, 056, 057, 058, and
 059. It
 proves the typed canonical/tombstone registry, runtime ACL/trigger contract,
 canonical active-nym rule, surface descriptor independence, and absence of the
-obsolete alias column/index. `/ready` must then report expected schema marker
-`059_remove_surface_alias`. Before 059, an unresolved preflight may be left in
-place while writers are unfrozen and the deployment is regrouped. After 059,
-automatic binary rollback is forbidden; repair or roll forward with a
-compatible binary or restore the validated pre-059 backup.
+obsolete alias column/index. Before applying later migrations, a 059 binary's
+`/ready` reports `059_remove_surface_alias`. Before 059, an unresolved
+preflight may be left in place while writers are unfrozen and the deployment
+is regrouped. After 059, automatic binary rollback is forbidden; repair or roll
+forward with a compatible binary or restore the validated pre-059 backup.
+
+## Migration 060 private LNURL comment foundation
+
+Apply `060_lnurl_private_comment_intents.sql` as the privileged schema owner
+with `--set runtime_role=bullnym_app`. It adds an append-only private intent
+ledger and column-scoped runtime grants; it does not activate payer-comment
+callback or merchant-history routes. The matching binary expects schema marker
+`060_lnurl_private_comment_intents` and refuses readiness when the ledger,
+guards, or private ACL boundary is missing. Because the foundation is additive
+and intentionally unrouted, rollback from a 060 binary to a 059-aware binary
+does not remove or mutate ledger rows.
 
 `bullnym.allow_public_name_delete=on` is a schema-owner-only emergency escape
 hatch for a validated database restore/repair. The runtime role has no table

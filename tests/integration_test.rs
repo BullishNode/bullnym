@@ -756,6 +756,13 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    // Private comment intents reject ordinary DELETE and deliberately outlive
+    // their source user/swap rows. The disposable database owner truncates the
+    // ledger solely for per-test isolation.
+    sqlx::query("TRUNCATE lnurl_comment_intents")
+        .execute(pool)
+        .await
+        .ok();
     // Migration-055 evidence rejects ordinary DELETE and has restrictive
     // parent FKs. The isolated database owner must truncate the complete
     // dependency family atomically before removing operational parent rows.
@@ -1413,7 +1420,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "059_remove_surface_alias"
+        "060_lnurl_private_comment_intents"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -1539,7 +1546,10 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["expected_schema_marker"], "059_remove_surface_alias");
+    assert_eq!(
+        body["expected_schema_marker"],
+        "060_lnurl_private_comment_intents"
+    );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -10374,6 +10384,232 @@ async fn create_test_user(pool: &PgPool, nym: &str) -> String {
         .await
         .unwrap();
     npub
+}
+
+#[tokio::test]
+async fn lnurl_private_comment_intent_is_exact_retry_safe_and_evidence_gated() {
+    use pay_service::db::{
+        bind_lnurl_comment_instruction, bind_lnurl_comment_instruction_in_tx,
+        bind_lnurl_comment_payment_evidence, bind_lnurl_comment_payment_evidence_in_tx,
+        list_received_lnurl_comments_for_authenticated_merchant, persist_lnurl_comment_intent,
+        LnurlCommentPersistenceError, NewLnurlCommentIntent, PurgeOutcome,
+    };
+    use pay_service::lnurl_comment::{LnurlCommentIntentKey, LnurlCommentRail, LnurlPayerComment};
+
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let nym = "commentmerchant";
+    let owner_npub = create_test_user(&admin, nym).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let key = LnurlCommentIntentKey::from_digest([0x60; 32]);
+    let exact_text = "Table seven — café e\u{301}";
+    let comment = LnurlPayerComment::try_from(exact_text.to_string()).unwrap();
+    let new_intent = NewLnurlCommentIntent {
+        owner_npub: &owner_npub,
+        nym,
+        idempotency_key: &key,
+        amount_msat: 42_000,
+        comment: &comment,
+    };
+
+    let persisted = persist_lnurl_comment_intent(&runtime, &new_intent)
+        .await
+        .unwrap();
+    assert_eq!(persisted.comment().as_str(), exact_text);
+    assert!(persisted.instruction.is_none());
+    assert!(persisted.payment_evidence.is_none());
+
+    let exact_retry = persist_lnurl_comment_intent(&runtime, &new_intent)
+        .await
+        .unwrap();
+    assert_eq!(exact_retry.intent_id, persisted.intent_id);
+    assert_eq!(exact_retry.created_at_unix, persisted.created_at_unix);
+
+    let mismatched_comment =
+        LnurlPayerComment::try_from("different private text".to_string()).unwrap();
+    let mismatch = persist_lnurl_comment_intent(
+        &runtime,
+        &NewLnurlCommentIntent {
+            comment: &mismatched_comment,
+            ..new_intent
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        mismatch,
+        LnurlCommentPersistenceError::RetryMismatch
+    ));
+
+    let before_payment =
+        list_received_lnurl_comments_for_authenticated_merchant(&runtime, &owner_npub, 10)
+            .await
+            .unwrap();
+    assert!(before_payment.is_empty());
+
+    let instruction_reference = "boltz-m12-private-comment-1";
+    let mut rolled_back_instruction = runtime.begin().await.unwrap();
+    let tentative = bind_lnurl_comment_instruction_in_tx(
+        &mut rolled_back_instruction,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+    )
+    .await
+    .unwrap();
+    assert!(tentative.instruction.is_some());
+    rolled_back_instruction.rollback().await.unwrap();
+    assert!(persist_lnurl_comment_intent(&runtime, &new_intent)
+        .await
+        .unwrap()
+        .instruction
+        .is_none());
+
+    let instructed = bind_lnurl_comment_instruction(
+        &runtime,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+    )
+    .await
+    .unwrap();
+    let bound_at = instructed.instruction.as_ref().unwrap().bound_at_unix;
+
+    let instruction_retry = bind_lnurl_comment_instruction(
+        &runtime,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        instruction_retry
+            .instruction
+            .as_ref()
+            .unwrap()
+            .bound_at_unix,
+        bound_at
+    );
+    let instruction_mismatch = bind_lnurl_comment_instruction(
+        &runtime,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Liquid,
+        "outpoint:0",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        instruction_mismatch,
+        LnurlCommentPersistenceError::InstructionMismatch
+    ));
+
+    // Reconnect and deactivate the source identity before late evidence. The
+    // private intent remains exact-retry readable and can still be completed
+    // by the authoritative reducer after restart/archive.
+    runtime.close().await;
+    assert!(matches!(
+        pay_service::db::purge_user(&admin, &owner_npub)
+            .await
+            .unwrap(),
+        PurgeOutcome::Purged(_)
+    ));
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let restart_retry = persist_lnurl_comment_intent(&runtime, &new_intent)
+        .await
+        .unwrap();
+    assert_eq!(restart_retry.intent_id, persisted.intent_id);
+    assert_eq!(
+        restart_retry.instruction.as_ref().unwrap().reference(),
+        instruction_reference
+    );
+
+    let evidence_reference = "liquid-claim-txid-m12-1";
+    let mut evidence_tx = runtime.begin().await.unwrap();
+    let evidenced = bind_lnurl_comment_payment_evidence_in_tx(
+        &mut evidence_tx,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+        evidence_reference,
+    )
+    .await
+    .unwrap();
+    evidence_tx.commit().await.unwrap();
+    let evidenced_at = evidenced
+        .payment_evidence
+        .as_ref()
+        .unwrap()
+        .evidenced_at_unix;
+
+    let evidence_retry = bind_lnurl_comment_payment_evidence(
+        &runtime,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+        evidence_reference,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        evidence_retry
+            .payment_evidence
+            .as_ref()
+            .unwrap()
+            .evidenced_at_unix,
+        evidenced_at
+    );
+    let evidence_mismatch = bind_lnurl_comment_payment_evidence(
+        &runtime,
+        &owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        instruction_reference,
+        "different-payment-evidence",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        evidence_mismatch,
+        LnurlCommentPersistenceError::PaymentEvidenceMismatch
+    ));
+
+    let received =
+        list_received_lnurl_comments_for_authenticated_merchant(&runtime, &owner_npub, 10)
+            .await
+            .unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].intent_id, persisted.intent_id);
+    assert_eq!(received[0].comment().as_str(), exact_text);
+    assert!(received[0].payment_evidence.is_some());
+
+    // The runtime can advance bindings but cannot mutate payer text.
+    let unauthorized_comment_update = sqlx::query(
+        "UPDATE lnurl_comment_intents SET comment = 'replacement' \
+         WHERE intent_id = $1",
+    )
+    .bind(persisted.intent_id)
+    .execute(&runtime)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        unauthorized_comment_update
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("42501")
+    );
+
+    runtime.close().await;
+    cleanup_db(&admin).await;
 }
 
 async fn insert_test_invoice(
