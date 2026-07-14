@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::{direct_payments, InvoiceAccountingTolerances};
 use crate::{
+    fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord},
     merchant_output_verifier::{
         ApprovedMerchantDestination, MerchantAsset, PersistableMerchantTransactionJournal,
     },
@@ -111,7 +112,46 @@ pub struct MerchantSettlementJournalRow {
     pub fee_amount_sat: u64,
     pub fee_rate_sat_vb: f64,
     pub liquid_blinding_key_hex: Option<String>,
+    pub fee_authority: Option<MerchantSettlementFeeAuthority>,
     pub status: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct MerchantSettlementFeeAuthority {
+    pub purpose: String,
+    pub rail: String,
+    pub target: String,
+    pub source: String,
+    pub rate_sat_vb: f64,
+    pub quoted_at_unix: i64,
+    pub evaluated_at_unix: i64,
+    pub freshness_age_secs: i64,
+    pub freshness_max_age_secs: i64,
+    pub provenance: String,
+    pub policy_floor_sat_vb: f64,
+    pub policy_cap_sat_vb: f64,
+    pub policy_version: String,
+}
+
+impl fmt::Debug for MerchantSettlementFeeAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MerchantSettlementFeeAuthority")
+            .field("purpose", &self.purpose)
+            .field("rail", &self.rail)
+            .field("target", &self.target)
+            .field("source", &self.source)
+            .field("rate_sat_vb", &self.rate_sat_vb)
+            .field("quoted_at_unix", &self.quoted_at_unix)
+            .field("evaluated_at_unix", &self.evaluated_at_unix)
+            .field("freshness_age_secs", &self.freshness_age_secs)
+            .field("freshness_max_age_secs", &self.freshness_max_age_secs)
+            .field("provenance", &"<redacted>")
+            .field("policy_floor_sat_vb", &self.policy_floor_sat_vb)
+            .field("policy_cap_sat_vb", &self.policy_cap_sat_vb)
+            .field("policy_version", &self.policy_version)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -124,6 +164,9 @@ pub struct NewLiquidMerchantSettlementJournal<'a> {
     pub fee_amount_sat: u64,
     pub fee_rate_sat_vb: f64,
     pub liquid_blinding_key_hex: &'a str,
+    /// Present only while making new bytes durable. Exact-byte redrive loads
+    /// the already-persisted authority and never asks for a new decision.
+    pub fee_authority: Option<&'a FeeDecisionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,13 +214,105 @@ struct JournalDbRow {
     fee_amount_sat: i64,
     fee_rate_sat_vb: f64,
     liquid_blinding_key_hex: Option<String>,
+    fee_decision_purpose: Option<String>,
+    fee_decision_rail: Option<String>,
+    fee_decision_target: Option<String>,
+    fee_decision_source: Option<String>,
+    fee_decision_rate_sat_vb: Option<f64>,
+    fee_decision_quoted_at_unix: Option<i64>,
+    fee_decision_evaluated_at_unix: Option<i64>,
+    fee_decision_freshness_age_secs: Option<i64>,
+    fee_decision_freshness_max_age_secs: Option<i64>,
+    fee_decision_provenance: Option<String>,
+    fee_decision_policy_floor_sat_vb: Option<f64>,
+    fee_decision_policy_cap_sat_vb: Option<f64>,
+    fee_decision_policy_version: Option<String>,
     status: String,
+}
+
+impl JournalDbRow {
+    fn fee_authority(
+        &self,
+    ) -> Result<Option<MerchantSettlementFeeAuthority>, MerchantSettlementRepositoryError> {
+        let present = [
+            self.fee_decision_purpose.is_some(),
+            self.fee_decision_rail.is_some(),
+            self.fee_decision_target.is_some(),
+            self.fee_decision_source.is_some(),
+            self.fee_decision_rate_sat_vb.is_some(),
+            self.fee_decision_quoted_at_unix.is_some(),
+            self.fee_decision_evaluated_at_unix.is_some(),
+            self.fee_decision_freshness_age_secs.is_some(),
+            self.fee_decision_freshness_max_age_secs.is_some(),
+            self.fee_decision_provenance.is_some(),
+            self.fee_decision_policy_floor_sat_vb.is_some(),
+            self.fee_decision_policy_cap_sat_vb.is_some(),
+            self.fee_decision_policy_version.is_some(),
+        ]
+        .into_iter()
+        .filter(|is_present| *is_present)
+        .count();
+        if present == 0 {
+            return Ok(None);
+        }
+        if present != 13 {
+            return Err(MerchantSettlementRepositoryError::MissingJournal);
+        }
+        Ok(Some(MerchantSettlementFeeAuthority {
+            purpose: self
+                .fee_decision_purpose
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            rail: self
+                .fee_decision_rail
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            target: self
+                .fee_decision_target
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            source: self
+                .fee_decision_source
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            rate_sat_vb: self
+                .fee_decision_rate_sat_vb
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            quoted_at_unix: self
+                .fee_decision_quoted_at_unix
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            evaluated_at_unix: self
+                .fee_decision_evaluated_at_unix
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            freshness_age_secs: self
+                .fee_decision_freshness_age_secs
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            freshness_max_age_secs: self
+                .fee_decision_freshness_max_age_secs
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            provenance: self
+                .fee_decision_provenance
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            policy_floor_sat_vb: self
+                .fee_decision_policy_floor_sat_vb
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            policy_cap_sat_vb: self
+                .fee_decision_policy_cap_sat_vb
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+            policy_version: self
+                .fee_decision_policy_version
+                .clone()
+                .ok_or(MerchantSettlementRepositoryError::MissingJournal)?,
+        }))
+    }
 }
 
 impl TryFrom<JournalDbRow> for MerchantSettlementJournalRow {
     type Error = MerchantSettlementRepositoryError;
 
     fn try_from(row: JournalDbRow) -> Result<Self, Self::Error> {
+        let fee_authority = row.fee_authority()?;
         let raw_transaction = hex::decode(&row.raw_tx_hex)
             .map_err(|_| MerchantSettlementRepositoryError::MissingJournal)?;
         let source_prevouts = serde_json::from_value(row.source_prevouts)
@@ -212,6 +347,7 @@ impl TryFrom<JournalDbRow> for MerchantSettlementJournalRow {
             fee_amount_sat,
             fee_rate_sat_vb: row.fee_rate_sat_vb,
             liquid_blinding_key_hex: row.liquid_blinding_key_hex,
+            fee_authority,
             status: row.status,
         })
     }
@@ -220,7 +356,12 @@ impl TryFrom<JournalDbRow> for MerchantSettlementJournalRow {
 const JOURNAL_COLUMNS: &str = "id, chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, \
     source_prevouts, destination_address, destination_script_hex, destination_asset_id, \
     destination_amount_sat, destination_vout, fee_amount_sat, fee_rate_sat_vb, \
-    liquid_blinding_key_hex, status";
+    liquid_blinding_key_hex, fee_decision_purpose, fee_decision_rail, \
+    fee_decision_target, fee_decision_source, fee_decision_rate_sat_vb, \
+    fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+    fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+    fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+    fee_decision_policy_cap_sat_vb, fee_decision_policy_version, status";
 
 /// Insert the immutable Liquid claim/replacement intent before broadcast. The
 /// next migration widens migration 046's purpose constraint and adds the
@@ -230,6 +371,7 @@ pub async fn insert_liquid_merchant_settlement_journal(
     journal: &NewLiquidMerchantSettlementJournal<'_>,
 ) -> Result<MerchantSettlementJournalRow, MerchantSettlementRepositoryError> {
     validate_new_liquid_journal(journal)?;
+    let fee_authority = persisted_liquid_fee_authority(journal.fee_authority)?;
     let purpose = if journal.replaces_txid.is_some() {
         "liquid_claim_replacement"
     } else {
@@ -256,8 +398,14 @@ pub async fn insert_liquid_merchant_settlement_journal(
              chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
              destination_address, destination_script_hex, destination_asset_id, \
              destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
-             liquid_blinding_key_hex\
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+             liquid_blinding_key_hex, fee_decision_purpose, fee_decision_rail, \
+             fee_decision_target, fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version\
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,\
+                   $18,$19,$20,$21,$22,$23,$24,$25,$26,$27) \
          ON CONFLICT (chain_swap_id, purpose) DO NOTHING \
          RETURNING {JOURNAL_COLUMNS}"
     ))
@@ -284,6 +432,19 @@ pub async fn insert_liquid_merchant_settlement_journal(
     )
     .bind(journal.fee_rate_sat_vb)
     .bind(journal.liquid_blinding_key_hex)
+    .bind(&fee_authority.purpose)
+    .bind(&fee_authority.rail)
+    .bind(&fee_authority.target)
+    .bind(&fee_authority.source)
+    .bind(fee_authority.rate_sat_vb)
+    .bind(fee_authority.quoted_at_unix)
+    .bind(fee_authority.evaluated_at_unix)
+    .bind(fee_authority.freshness_age_secs)
+    .bind(fee_authority.freshness_max_age_secs)
+    .bind(&fee_authority.provenance)
+    .bind(fee_authority.policy_floor_sat_vb)
+    .bind(fee_authority.policy_cap_sat_vb)
+    .bind(&fee_authority.policy_version)
     .fetch_optional(&mut *connection)
     .await?;
     let row = match inserted {
@@ -293,6 +454,12 @@ pub async fn insert_liquid_merchant_settlement_journal(
             .ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?,
     };
     assert_liquid_journal_matches(&row, journal, purpose)?;
+    if !matches!(
+        row.fee_authority.as_ref(),
+        Some(persisted) if fee_authority_matches(persisted, &fee_authority)
+    ) {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
     Ok(row)
 }
 
@@ -321,6 +488,9 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     .ok_or(MerchantSettlementRepositoryError::MissingJournal)?
     .try_into()?;
     assert_liquid_journal_matches(&row, journal, purpose)?;
+    if row.fee_authority.is_none() {
+        return Err(MerchantSettlementRepositoryError::MissingJournal);
+    }
     Ok(row)
 }
 
@@ -419,6 +589,53 @@ fn assert_liquid_journal_matches(
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
     Ok(())
+}
+
+fn persisted_liquid_fee_authority(
+    record: Option<&FeeDecisionRecord>,
+) -> Result<MerchantSettlementFeeAuthority, MerchantSettlementRepositoryError> {
+    let record = record.ok_or(MerchantSettlementRepositoryError::InvalidCommand)?;
+    if record.purpose() != FeeConstructionPurpose::ChainLiquidClaim {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    }
+    Ok(MerchantSettlementFeeAuthority {
+        purpose: record.purpose().as_str().to_owned(),
+        rail: record.rail().as_str().to_owned(),
+        target: record.target().as_str().to_owned(),
+        source: record.source().as_str().to_owned(),
+        rate_sat_vb: record.rate().as_f64(),
+        quoted_at_unix: i64::try_from(record.quoted_at_unix())
+            .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
+        evaluated_at_unix: i64::try_from(record.evaluated_at_unix())
+            .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
+        freshness_age_secs: i64::try_from(record.freshness_age_secs())
+            .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
+        freshness_max_age_secs: i64::try_from(record.freshness_max_age_secs())
+            .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?,
+        provenance: record.provenance_for_persistence().to_owned(),
+        policy_floor_sat_vb: record.policy_floor().as_f64(),
+        policy_cap_sat_vb: record.policy_cap().as_f64(),
+        policy_version: record.policy_version().to_owned(),
+    })
+}
+
+fn fee_authority_matches(
+    persisted: &MerchantSettlementFeeAuthority,
+    expected: &MerchantSettlementFeeAuthority,
+) -> bool {
+    persisted.purpose == expected.purpose
+        && persisted.rail == expected.rail
+        && persisted.target == expected.target
+        && persisted.source == expected.source
+        && persisted.rate_sat_vb.to_bits() == expected.rate_sat_vb.to_bits()
+        && persisted.quoted_at_unix == expected.quoted_at_unix
+        && persisted.evaluated_at_unix == expected.evaluated_at_unix
+        && persisted.freshness_age_secs == expected.freshness_age_secs
+        && persisted.freshness_max_age_secs == expected.freshness_max_age_secs
+        && persisted.provenance == expected.provenance
+        && persisted.policy_floor_sat_vb.to_bits() == expected.policy_floor_sat_vb.to_bits()
+        && persisted.policy_cap_sat_vb.to_bits() == expected.policy_cap_sat_vb.to_bits()
+        && persisted.policy_version == expected.policy_version
 }
 
 fn validate_new_liquid_journal(
@@ -1625,6 +1842,7 @@ fn canonical_hash(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
     use crate::merchant_settlement_lifecycle::{
         apply_settlement_evidence, MerchantSettlementLifecycle, SettlementEvidence,
     };
@@ -1634,6 +1852,17 @@ mod tests {
     const BLOCK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ASSET: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const BLINDING_KEY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    fn liquid_fee_record(purpose: FeeConstructionPurpose) -> FeeDecisionRecord {
+        let policy = LiquidFeePolicy::default();
+        let live = LiveLiquid::new(
+            SatPerVbyte::try_from(0.5).unwrap(),
+            1_000,
+            FeeProvenance::new("merchant-settlement-unit-live").unwrap(),
+        );
+        let decision = policy.decide_typed(Some(&live), None, 1_005).unwrap();
+        FeeDecisionRecord::from_liquid(purpose, &decision, &policy, 1_005).unwrap()
+    }
 
     fn journal(purpose: &str, txid: &str) -> MerchantSettlementJournalRow {
         MerchantSettlementJournalRow {
@@ -1656,8 +1885,39 @@ mod tests {
             fee_amount_sat: 200,
             fee_rate_sat_vb: 1.5,
             liquid_blinding_key_hex: Some(BLINDING_KEY.to_owned()),
+            fee_authority: None,
             status: "constructed".to_owned(),
         }
+    }
+
+    #[test]
+    fn new_liquid_journal_requires_exact_chain_claim_fee_authority() {
+        assert!(matches!(
+            persisted_liquid_fee_authority(None),
+            Err(MerchantSettlementRepositoryError::InvalidCommand)
+        ));
+        let reverse = liquid_fee_record(FeeConstructionPurpose::ReverseLiquidClaim);
+        assert!(matches!(
+            persisted_liquid_fee_authority(Some(&reverse)),
+            Err(MerchantSettlementRepositoryError::InvalidCommand)
+        ));
+
+        let chain = liquid_fee_record(FeeConstructionPurpose::ChainLiquidClaim);
+        let authority = persisted_liquid_fee_authority(Some(&chain)).unwrap();
+        assert_eq!(authority.purpose, "chain_liquid_claim");
+        assert_eq!(authority.rail, "liquid");
+        assert_eq!(authority.target, "1");
+        assert_eq!(authority.source, "liquid_live");
+        assert_eq!(authority.rate_sat_vb, 0.5);
+        assert_eq!(authority.quoted_at_unix, 1_000);
+        assert_eq!(authority.evaluated_at_unix, 1_005);
+        assert_eq!(authority.freshness_age_secs, 5);
+        assert_eq!(authority.policy_version, "review25-v1");
+        assert!(fee_authority_matches(&authority, &authority));
+
+        let mut changed = authority.clone();
+        changed.provenance.push_str("-changed");
+        assert!(!fee_authority_matches(&authority, &changed));
     }
 
     #[test]

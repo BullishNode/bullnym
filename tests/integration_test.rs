@@ -130,6 +130,82 @@ async fn test_pool() -> PgPool {
         .expect("failed to connect to test database")
 }
 
+/// Exercise runtime ACL/readiness contracts as the non-owner role installed
+/// by the disposable migration harness. Schema mutation and cleanup continue
+/// through [`test_pool`], whose owner privileges must never be mistaken for
+/// the production role's restricted capability set.
+async fn runtime_role_test_pool() -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .expect("failed to connect restricted runtime-role test pool")
+}
+
+/// Model the legacy ACLs provisioned around the application role by the
+/// deployment topology. Migrations 053-055 deliberately own only their new
+/// least-privilege grants, while the fresh disposable database has no earlier
+/// deployment step from which `bullnym_app` could inherit visibility of the
+/// pre-053 schema marker.
+async fn readiness_runtime_role_test_pool(admin: &PgPool) -> PgPool {
+    sqlx::query(
+        "DO $role$ BEGIN \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bullnym_readiness_test') THEN \
+                 CREATE ROLE bullnym_readiness_test NOLOGIN; \
+             END IF; \
+         END $role$",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query("GRANT bullnym_app TO bullnym_readiness_test")
+        .execute(admin)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO bullnym_readiness_test")
+        .execute(admin)
+        .await
+        .unwrap();
+    sqlx::query(
+        "GRANT INSERT, UPDATE ON TABLE \
+             invoice_direct_scan_heads, watcher_lane_progress \
+         TO bullnym_readiness_test",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "GRANT INSERT ON TABLE \
+             invoice_direct_payment_transitions, swap_key_allocations \
+         TO bullnym_readiness_test",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+
+    PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_readiness_test")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .expect("failed to connect deployment-shaped readiness test pool")
+}
+
 async fn named_single_connection_test_pool(application_name: &str) -> PgPool {
     let options = PgConnectOptions::from_str(&require_test_db())
         .expect("invalid TEST_DATABASE_URL")
@@ -1184,6 +1260,7 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 async fn readiness_rejects_schema_before_latest_migration() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
+    let runtime = readiness_runtime_role_test_pool(&pool).await;
 
     sqlx::query(
         "ALTER TABLE swap_key_allocations RENAME CONSTRAINT \
@@ -1194,7 +1271,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     .await
     .unwrap();
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (pre_migration_status, pre_migration_body) = get_path(&app, "/ready").await;
 
     sqlx::query(
@@ -1213,7 +1290,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
         "055_merchant_settlement_lifecycle"
     );
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
@@ -1227,7 +1304,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     .execute(&pool)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (missing_delete_guard_status, missing_delete_guard_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE swap_key_allocations ENABLE TRIGGER swap_key_allocations_reject_delete",
@@ -1238,7 +1315,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(missing_delete_guard_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(missing_delete_guard_body["ready"], false);
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1253,7 +1330,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     .execute(&pool)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (missing_shape_guard_status, missing_shape_guard_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE chain_swap_records RENAME CONSTRAINT \
@@ -1266,7 +1343,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(missing_shape_guard_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(missing_shape_guard_body["ready"], false);
 
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1280,7 +1357,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     .execute(&pool)
     .await
     .unwrap();
-    let app = test_app(test_state(pool.clone()));
+    let app = test_app(test_state(runtime.clone()));
     let (mutable_terms_status, mutable_terms_body) = get_path(&app, "/ready").await;
     sqlx::query(
         "ALTER TABLE chain_swap_records ENABLE TRIGGER \
@@ -1292,7 +1369,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(mutable_terms_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(mutable_terms_body["ready"], false);
 
-    let app = test_app(test_state(pool));
+    let app = test_app(test_state(runtime));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
@@ -1322,19 +1399,7 @@ async fn recovery_commitment_readiness_fails_closed_on_acl_fk_and_trigger_drift(
         .await
         .unwrap();
 
-    let runtime = PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect(|connection, _metadata| {
-            Box::pin(async move {
-                sqlx::query("SET ROLE bullnym_app")
-                    .execute(&mut *connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect(&require_test_db())
-        .await
-        .unwrap();
+    let runtime = runtime_role_test_pool().await;
 
     assert!(readiness::recovery_commitment_ready(&runtime)
         .await
@@ -5396,7 +5461,9 @@ async fn chain_cooperative_refusal_commits_with_one_connection() {
         3_600,
     )
     .await;
-    // Same deterministic local classifier trigger as the reverse refusal test.
+    // Same deterministic classifier phrase as the reverse test. The guarded
+    // chain seam refuses valid provider evidence and network I/O; its malformed
+    // packet reaches the shared durable-refusal boundary only in test mode.
     let swap_id = seed_claimable_chain_pool_swap(
         &admin,
         invoice.id,
@@ -15740,8 +15807,23 @@ async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) ->
     let txid = transaction.txid().to_string();
     let raw_tx_hex = hex::encode(lwk_wollet::elements::encode::serialize(&transaction));
     sqlx::query(
-        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
-             claim_txid = $3, updated_at = NOW() WHERE id = $1",
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', claim_tx_hex = $2, claim_txid = $3, \
+             claim_actual_fee_sat = 100, claim_actual_fee_rate_sat_vb = 1.5, \
+             claim_fee_decision_purpose = 'chain_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = 1.5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1', \
+             updated_at = NOW() \
+         WHERE id = $1",
     )
     .bind(swap.id)
     .bind(&raw_tx_hex)
@@ -15754,8 +15836,19 @@ async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) ->
              chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
              destination_address, destination_script_hex, destination_asset_id, \
              destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
-             liquid_blinding_key_hex\
-         ) VALUES ($1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,1000,100,1.5,$8)",
+             liquid_blinding_key_hex, \
+             fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+             fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version\
+         ) VALUES (\
+             $1,'liquid_claim',NULL,$2,$3,$4,$5,$6,$7,0,1000,100,1.5,$8, \
+             'chain_liquid_claim','liquid','1','liquid_live',1.5, \
+             1700000100,1700000105,5,60,'integration-test-liquid-live', \
+             0.1,10.0,'review25-v1'\
+         )",
     )
     .bind(swap.id)
     .bind(&raw_tx_hex)
@@ -16027,9 +16120,27 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     let merchant_blinding_key = invoice.liquid_blinding_key_hex.as_deref().unwrap();
     let (claim_tx_hex, claim_txid, backend) =
         persisted_liquid_claim_fixture(&response, merchant_address, merchant_blinding_key);
+    // This fixture deliberately omits only the immutable transaction journal.
+    // The parent bytes still carry a complete, valid Review-25 authority
+    // packet; otherwise migration 054 correctly rejects the setup before the
+    // missing-journal retry boundary can be exercised.
     sqlx::query(
-        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
-             claim_txid = $3 WHERE id = $1",
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', claim_tx_hex = $2, claim_txid = $3, \
+             claim_actual_fee_sat = 100, claim_actual_fee_rate_sat_vb = 1.5, \
+             claim_fee_decision_purpose = 'chain_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = 1.5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1' \
+         WHERE id = $1",
     )
     .bind(swap.id)
     .bind(&claim_tx_hex)
@@ -19549,9 +19660,7 @@ impl AtomicManifestPersistenceFixture {
                     liquid_network: &terms.liquid_network,
                     liquid_asset_id: &terms.liquid_asset_id,
                     merchant_liquid_destination: &terms.merchant_liquid_destination,
-                    merchant_emergency_btc_address: terms
-                        .merchant_emergency_btc_address
-                        .as_deref(),
+                    merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
                 },
                 recovery_address_commitment_id: terms.recovery_address_commitment_id,
             },
@@ -20907,6 +21016,8 @@ async fn issue84_chain_invoice(
 ) -> pay_service::db::Invoice {
     let liquid_address =
         pay_service::descriptor::derive_address(TEST_DESCRIPTOR, liquid_address_index).unwrap();
+    let liquid_blinding_key_hex =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
     pay_service::db::insert_invoice(
         pool,
         &pay_service::db::NewInvoice {
@@ -20928,7 +21039,7 @@ async fn issue84_chain_invoice(
             accept_liquid: true,
             bitcoin_address: None,
             liquid_address: Some(&liquid_address),
-            liquid_blinding_key_hex: Some("11".repeat(32).as_str()),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
             expires_in_secs: 3_600,
         },
     )
@@ -20984,8 +21095,7 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
     .unwrap();
     assert!(mismatched.is_none());
 
-    invoice.npub_owner =
-        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
+    invoice.npub_owner = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
     let recipient_mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
         Some(nym),
@@ -22410,14 +22520,9 @@ fn invoice_route_manifest_runtime(
 
 async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
     let npub = create_test_user(pool, nym).await;
-    let recovery_address_commitment_id = insert_test_recovery_commitment(
-        pool,
-        &npub,
-        ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
-        1,
-        0x88,
-    )
-    .await;
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(pool, &npub, ATOMIC_MANIFEST_EMERGENCY_ADDRESS, 1, 0x88)
+            .await;
     pay_service::db::upsert_donation_page(
         pool,
         &pay_service::db::UpsertDonationPage {
