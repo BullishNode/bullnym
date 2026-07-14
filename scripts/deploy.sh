@@ -177,6 +177,11 @@ migration_055_boundary_ready() {
     "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
+migration_056_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-056-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
 automatic_binary_rollback_allowed() {
   local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
@@ -302,6 +307,17 @@ Stop payservice and every database writer, apply migration 055 with
 --set runtime_role=bullnym_app as the distinct privileged schema owner, and
 resolve every zero-legacy claim-journal blocker without fabricating evidence.
 Then rerun this script.
+EOF
+    exit 1
+  fi
+fi
+if [[ -f "$REPO/migrations/056_chain_swap_renegotiation_journal.sql" ]]; then
+  if ! migration_056_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 056 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, apply migration 056 with
+--set runtime_role=bullnym_app as the distinct privileged schema owner, then
+rerun this script. Never fabricate operation rows for historical renegotiations.
 EOF
     exit 1
   fi

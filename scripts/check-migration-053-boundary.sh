@@ -13,11 +13,20 @@ env_file="${1:-/etc/bullnym/bullnym.env}"
 expected_runtime_role="${2:-bullnym_app}"
 expected_database="${3:-bullnym}"
 require_migration_055="${REQUIRE_MIGRATION_055:-0}"
+require_migration_056="${REQUIRE_MIGRATION_056:-0}"
 
 [[ "$require_migration_055" == "0" || "$require_migration_055" == "1" ]] || {
   echo "migration boundary: REQUIRE_MIGRATION_055 must be 0 or 1" >&2
   exit 2
 }
+[[ "$require_migration_056" == "0" || "$require_migration_056" == "1" ]] || {
+  echo "migration boundary: REQUIRE_MIGRATION_056 must be 0 or 1" >&2
+  exit 2
+}
+if [[ "$require_migration_056" == "1" && "$require_migration_055" != "1" ]]; then
+  echo "migration boundary: REQUIRE_MIGRATION_056 requires REQUIRE_MIGRATION_055=1" >&2
+  exit 2
+fi
 
 [[ -f "$env_file" && ! -L "$env_file" && -O "$env_file" && -r "$env_file" ]] || {
   echo "migration-053 boundary: runtime environment is not a protected owned file: $env_file" >&2
@@ -711,7 +720,360 @@ SQL
   }
 fi
 
+if [[ "$require_migration_056" == "1" ]]; then
+  migration_056_ready="$(
+    clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+      --quiet --tuples-only --no-align <<'SQL'
+SELECT (
+    COALESCE((
+        SELECT array_agg(
+                   format('%s:%s:%s', column_name, data_type, is_nullable)
+                   ORDER BY ordinal_position
+               ) = ARRAY[
+                   'chain_swap_id:uuid:NO',
+                   'state:text:NO',
+                   'quoted_actual_amount_sat:bigint:NO',
+                   'quote_response_digest:text:NO',
+                   'quote_observed_at:timestamp with time zone:NO',
+                   'policy_version:text:NO',
+                   'policy_evidence_digest:text:NO',
+                   'policy_validated_at:timestamp with time zone:NO',
+                   'accept_attempt_count:integer:NO',
+                   'last_error_class:text:YES',
+                   'version:bigint:NO',
+                   'accept_requested_at:timestamp with time zone:YES',
+                   'ambiguous_at:timestamp with time zone:YES',
+                   'terminal_response_digest:text:YES',
+                   'terminal_observed_at:timestamp with time zone:YES',
+                   'created_at:timestamp with time zone:NO',
+                   'updated_at:timestamp with time zone:NO'
+               ]::TEXT[]
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chain_swap_renegotiation_operations'
+    ), FALSE)
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('state', '''quoted''::text'),
+              ('accept_attempt_count', '0'),
+              ('version', '1'),
+              ('created_at', 'now()'),
+              ('updated_at', 'now()')
+          ) required(column_name, expected_default)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns column_info
+              WHERE column_info.table_schema = 'public'
+                AND column_info.table_name =
+                    'chain_swap_renegotiation_operations'
+                AND column_info.column_name = required.column_name
+                AND column_info.column_default = required.expected_default
+         )
+    )
+    AND (
+        SELECT COUNT(*)
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.contype = 'c'
+    ) = 9
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_renegotiation_state_check'),
+              ('chain_swap_renegotiation_quoted_amount_check'),
+              ('chain_swap_renegotiation_quote_digest_check'),
+              ('chain_swap_renegotiation_policy_evidence_check'),
+              ('chain_swap_renegotiation_attempt_count_check'),
+              ('chain_swap_renegotiation_error_class_check'),
+              ('chain_swap_renegotiation_version_check'),
+              ('chain_swap_renegotiation_terminal_digest_check'),
+              ('chain_swap_renegotiation_lifecycle_shape_check')
+          ) required(constraint_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                  'public.chain_swap_renegotiation_operations'::REGCLASS
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype = 'c'
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_operations_pkey'
+           AND constraint_info.contype = 'p'
+           AND constraint_info.convalidated
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint foreign_key
+         WHERE foreign_key.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND foreign_key.confrelid = 'public.chain_swap_records'::REGCLASS
+           AND foreign_key.conname =
+               'chain_swap_renegotiation_operations_chain_fkey'
+           AND foreign_key.contype = 'f'
+           AND foreign_key.convalidated
+           AND foreign_key.confupdtype = 'r'
+           AND foreign_key.confdeltype = 'r'
+           AND NOT foreign_key.condeferrable
+           AND NOT foreign_key.condeferred
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_error_class_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%timeout%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%transport%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%provider_server_error%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%malformed_response%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%backend_disagreement%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%unknown_provider_outcome%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_state_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%quoted%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%ambiguous%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%accepted%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE '%declined%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_policy_evidence_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_version%[[:space:]]%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_evidence_digest%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%quote_observed_at%1970-01-01%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%policy_validated_at >= quote_observed_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint constraint_info
+         WHERE constraint_info.conrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND constraint_info.conname =
+               'chain_swap_renegotiation_lifecycle_shape_check'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested_at >= created_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%accept_requested_at <= updated_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%ambiguous_at <= updated_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%terminal_observed_at >= created_at%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%terminal_observed_at <= updated_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation
+            ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid =
+             'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND index_relation.relname = 'chain_swap_renegotiation_active_idx'
+           AND NOT index_info.indisunique
+           AND index_info.indisvalid
+           AND pg_get_indexdef(index_info.indexrelid) LIKE
+               '%(updated_at, chain_swap_id)%'
+           AND pg_get_expr(index_info.indpred, index_info.indrelid) LIKE
+               '%accepted%declined%'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_renegotiation_validate_insert',
+                  'enforce_chain_swap_renegotiation_insert', 7),
+              ('chain_swap_renegotiation_validate_update',
+                  'enforce_chain_swap_renegotiation_update', 19),
+              ('chain_swap_renegotiation_reject_delete',
+                  'reject_chain_swap_renegotiation_delete', 11)
+          ) required(trigger_name, function_name, trigger_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
+              WHERE relation_namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
+                AND relation.relname = 'chain_swap_renegotiation_operations'
+                AND relation.relkind = 'r'
+                AND trigger_info.tgname = required.trigger_name
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled IN ('O', 'A')
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_renegotiation_insert'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.state <> ''quoted''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.version <> 1%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.quote_observed_at > persisted_at%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.policy_validated_at > persisted_at%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_renegotiation_update'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state IN (''accepted'', ''declined'')%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.version <> OLD.version + 1%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''accept_requested''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''accepted''%'
+           AND pg_get_functiondef(function_info.oid) NOT LIKE
+               '%OLD.state = ''ambiguous'' AND NEW.state = ''declined''%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.quote_response_digest%OLD.quote_response_digest%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.policy_evidence_digest%OLD.policy_evidence_digest%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'reject_chain_swap_renegotiation_delete'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%renegotiation operation evidence cannot be deleted%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'chain_swap_renegotiation_operations'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM aclexplode(COALESCE(
+                     relation.relacl, acldefault('r', relation.relowner)
+                 )) acl
+                WHERE acl.grantee = 0
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_chain_swap_renegotiation_insert'),
+              ('enforce_chain_swap_renegotiation_update'),
+              ('reject_chain_swap_renegotiation_delete')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM aclexplode(COALESCE(
+                          function_info.proacl,
+                          acldefault('f', function_info.proowner)
+                      )) acl
+                     WHERE acl.grantee = 0
+                       AND acl.privilege_type = 'EXECUTE'
+                )
+         )
+    )
+)::INT;
+SQL
+  )"
+  [[ "$migration_056_ready" == "1" ]] || {
+    echo "migration-056 boundary: schema, state machine, owner, or ACL invariant failed" >&2
+    exit 1
+  }
+fi
+
 echo "migration 053 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 if [[ "$require_migration_055" == "1" ]]; then
   echo "migration 055 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+fi
+if [[ "$require_migration_056" == "1" ]]; then
+  echo "migration 056 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 fi

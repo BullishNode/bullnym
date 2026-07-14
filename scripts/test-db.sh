@@ -231,7 +231,8 @@ apply_migrations() {
     fi
     if [[ "$base" == "053_recovery_address_commitments" \
        || "$base" == "054_fee_policy_authority" \
-       || "$base" == "055_merchant_settlement_lifecycle" ]]; then
+       || "$base" == "055_merchant_settlement_lifecycle" \
+       || "$base" == "056_chain_swap_renegotiation_journal" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"
