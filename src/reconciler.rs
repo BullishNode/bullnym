@@ -1679,6 +1679,15 @@ async fn run_one_chain_tick(
                     | crate::chain_fallback::AutomaticFallbackScheduleOutcome::Missing
                     | crate::chain_fallback::AutomaticFallbackScheduleOutcome::IneligibleStatus(_),
                 ) => {}
+                Ok(
+                    crate::chain_fallback::AutomaticFallbackScheduleOutcome::LegacyWithoutRecoveryContract,
+                ) => {
+                    tracing::debug!(
+                        event = "automatic_fallback_legacy_excluded",
+                        chain_swap_id = %swap.id,
+                        "historical pre-contract obligation remains on provider reconciliation only"
+                    );
+                }
                 Err(error) => {
                     health.observe_app_error(&error);
                     tracing::warn!(

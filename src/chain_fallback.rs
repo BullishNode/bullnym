@@ -34,6 +34,11 @@ pub enum AutomaticFallbackScheduleOutcome {
     Busy,
     Missing,
     IneligibleStatus(ChainSwapStatus),
+    /// Historical pre-053 obligations have no immutable recovery-address
+    /// contract by construction. They remain provider-reconciled, but cannot
+    /// participate in the automatic fallback lane and must not make the
+    /// current post-053 admission contract appear unhealthy.
+    LegacyWithoutRecoveryContract,
 }
 
 /// Rebuild #82 evidence and publish a queue marker only after an exact positive
@@ -83,6 +88,26 @@ pub async fn schedule_automatic_fallback(
             .await
             .map_err(|error| AppError::DbError(error.to_string()))?;
         return Ok(AutomaticFallbackScheduleOutcome::IneligibleStatus(status));
+    }
+
+    let (recovery_address_commitment_id, merchant_emergency_btc_address) = swap
+        .creation_terms
+        .as_ref()
+        .map(|terms| {
+            (
+                terms.recovery_address_commitment_id,
+                terms.merchant_emergency_btc_address.as_deref(),
+            )
+        })
+        .unwrap_or((None, None));
+    if !has_automatic_fallback_recovery_contract(
+        recovery_address_commitment_id,
+        merchant_emergency_btc_address,
+    ) {
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        return Ok(AutomaticFallbackScheduleOutcome::LegacyWithoutRecoveryContract);
     }
 
     let recovery_attempt = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
@@ -161,6 +186,13 @@ const fn schedule_candidate_status(status: ChainSwapStatus) -> bool {
             | ChainSwapStatus::ServerLockConfirmed
             | ChainSwapStatus::RefundDue
     )
+}
+
+fn has_automatic_fallback_recovery_contract(
+    recovery_address_commitment_id: Option<Uuid>,
+    merchant_emergency_btc_address: Option<&str>,
+) -> bool {
+    recovery_address_commitment_id.is_some() && merchant_emergency_btc_address.is_some()
 }
 
 /// Exercise the global authorities needed by every automatic fallback even
@@ -360,6 +392,24 @@ mod tests {
         ] {
             assert!(!schedule_candidate_status(status));
         }
+    }
+
+    #[test]
+    fn historical_rows_without_the_post_053_contract_are_not_fallback_candidates() {
+        let commitment_id = Uuid::from_u128(1);
+        assert!(!has_automatic_fallback_recovery_contract(None, None));
+        assert!(!has_automatic_fallback_recovery_contract(
+            Some(commitment_id),
+            None,
+        ));
+        assert!(!has_automatic_fallback_recovery_contract(
+            None,
+            Some("bc1qlegacy")
+        ));
+        assert!(has_automatic_fallback_recovery_contract(
+            Some(commitment_id),
+            Some("bc1qcommitted")
+        ));
     }
 
     #[test]
