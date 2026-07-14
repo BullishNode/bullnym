@@ -16199,6 +16199,14 @@ async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_paren
     cleanup_db(&pool).await;
     let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "broadcast").await;
 
+    pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+    )
+    .await
+    .unwrap();
     pay_service::db::mark_liquid_merchant_settlement_broadcast(
         &pool,
         swap_id,
@@ -16311,6 +16319,14 @@ async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_paren
 
     let (settled_swap_id, settled_txid) =
         seed_liquid_merchant_settlement_attempt(&pool, "settled").await;
+    pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+        &pool,
+        settled_swap_id,
+        &settled_txid,
+        "liquid_claim",
+    )
+    .await
+    .unwrap();
     pay_service::db::mark_liquid_merchant_settlement_broadcast(
         &pool,
         settled_swap_id,
@@ -16376,7 +16392,7 @@ async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_paren
     .await
     .unwrap();
     assert_eq!(settled_metadata.0, "finalized");
-    assert_eq!(settled_metadata.1, 3);
+    assert_eq!(settled_metadata.1, 1);
     assert_eq!(
         settled_metadata.2.as_deref(),
         Some("finalized retry observed")
