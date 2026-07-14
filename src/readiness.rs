@@ -9,6 +9,48 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+const EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION: &str = concat!(
+    "num_nonnulls(fee_decision_purpose,fee_decision_rail,fee_decision_target,",
+    "fee_decision_source,fee_decision_rate_sat_vb,fee_decision_quoted_at_unix,",
+    "fee_decision_evaluated_at_unix,fee_decision_freshness_age_secs,",
+    "fee_decision_freshness_max_age_secs,fee_decision_provenance,",
+    "fee_decision_policy_floor_sat_vb,fee_decision_policy_cap_sat_vb,",
+    "fee_decision_policy_version)=ANY(ARRAY[0,13])"
+);
+
+const EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION: &str = concat!(
+    "fee_decision_purposeISNULLOR(purpose='btc_recovery'::textAND",
+    "fee_decision_purpose='bitcoin_recovery'::textAND",
+    "fee_decision_rail='bitcoin'::textANDfee_decision_target='fastestFee'::textAND",
+    "(fee_decision_source=ANY(ARRAY['bitcoin_live'::text,",
+    "'bitcoin_last_known_good'::text]))OR",
+    "(purpose=ANY(ARRAY['liquid_claim'::text,'liquid_claim_replacement'::text]))AND",
+    "fee_decision_purpose='chain_liquid_claim'::textAND",
+    "fee_decision_rail='liquid'::textANDfee_decision_target='1'::textAND",
+    "(fee_decision_source=ANY(ARRAY['liquid_live'::text,",
+    "'liquid_last_known_good'::text])))AND",
+    "fee_decision_rate_sat_vb>0::doubleprecisionAND",
+    "(fee_decision_rate_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_quoted_at_unix>=0AND",
+    "fee_decision_evaluated_at_unix>=fee_decision_quoted_at_unixAND",
+    "fee_decision_freshness_age_secs>=0ANDfee_decision_freshness_max_age_secs>0AND",
+    "(fee_decision_evaluated_at_unix-fee_decision_quoted_at_unix)=",
+    "fee_decision_freshness_age_secsAND",
+    "fee_decision_freshness_age_secs<=fee_decision_freshness_max_age_secsAND",
+    "btrim(fee_decision_provenance)<>''::textAND",
+    "octet_length(fee_decision_provenance)<=512AND",
+    "fee_decision_policy_floor_sat_vb>0::doubleprecisionAND",
+    "(fee_decision_policy_floor_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_policy_cap_sat_vb>=fee_decision_policy_floor_sat_vbAND",
+    "(fee_decision_policy_cap_sat_vb<>ALL(ARRAY['NaN'::doubleprecision,",
+    "'Infinity'::doubleprecision,'-Infinity'::doubleprecision]))AND",
+    "fee_decision_rate_sat_vb>=fee_decision_policy_floor_sat_vbAND",
+    "fee_decision_rate_sat_vb<=fee_decision_policy_cap_sat_vbAND",
+    "fee_decision_policy_version='review25-v1'::text"
+);
+
 const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
     "WITH required_columns(column_name, type_oid, ordinal) AS (VALUES \
          ('fee_decision_purpose', 'text'::REGTYPE, 1), \
@@ -26,8 +68,11 @@ const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
          ('fee_decision_policy_version', 'text'::REGTYPE, 13) \
      ), validated_constraints AS ( \
          SELECT constraint_info.conname, \
-                pg_get_expr( \
-                    constraint_info.conbin, constraint_info.conrelid, TRUE \
+                regexp_replace( \
+                    pg_get_expr( \
+                        constraint_info.conbin, constraint_info.conrelid, TRUE \
+                    ), \
+                    '[[:space:]]+', '', 'g' \
                 ) AS expression \
            FROM pg_constraint constraint_info \
            JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
@@ -41,19 +86,6 @@ const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
                 'chain_swap_tx_attempts_fee_authority_shape_check', \
                 'chain_swap_tx_attempts_fee_authority_value_check' \
             ) \
-     ), shape_constraint AS ( \
-         SELECT regexp_replace(expression, '[[:space:]]+', '', 'g') AS expression \
-           FROM validated_constraints \
-          WHERE conname = 'chain_swap_tx_attempts_fee_authority_shape_check' \
-     ), value_constraint AS ( \
-         SELECT expression \
-           FROM validated_constraints \
-          WHERE conname = 'chain_swap_tx_attempts_fee_authority_value_check' \
-     ), expected_shape AS ( \
-         SELECT 'num_nonnulls(' \
-                || string_agg(column_name, ',' ORDER BY ordinal) \
-                || ')' AS call \
-           FROM required_columns \
      ) \
      SELECT NOT EXISTS ( \
          SELECT 1 FROM required_columns required \
@@ -75,43 +107,14 @@ const MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL: &str =
      ) \
      AND (SELECT COUNT(*) FROM validated_constraints) = 2 \
      AND EXISTS ( \
-         SELECT 1 \
-           FROM shape_constraint \
-           CROSS JOIN expected_shape \
-          WHERE position(expected_shape.call IN shape_constraint.expression) > 0 \
-            AND position( \
-                '=ANY(ARRAY[0,13])' IN shape_constraint.expression \
-            ) > 0 \
+         SELECT 1 FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_shape_check' \
+            AND expression = $1 \
      ) \
-     AND NOT EXISTS ( \
-         SELECT 1 FROM required_columns required \
-          WHERE NOT EXISTS ( \
-              SELECT 1 FROM value_constraint \
-               WHERE position(required.column_name IN value_constraint.expression) > 0 \
-          ) \
-     ) \
-     AND NOT EXISTS ( \
-         SELECT 1 \
-           FROM (VALUES \
-             ('''btc_recovery'''), \
-             ('''bitcoin_recovery'''), \
-             ('''bitcoin'''), \
-             ('''fastestFee'''), \
-             ('''bitcoin_live'''), \
-             ('''bitcoin_last_known_good'''), \
-             ('''liquid_claim'''), \
-             ('''liquid_claim_replacement'''), \
-             ('''chain_liquid_claim'''), \
-             ('''liquid'''), \
-             ('''1'''), \
-             ('''liquid_live'''), \
-             ('''liquid_last_known_good'''), \
-             ('''review25-v1''') \
-           ) required(marker) \
-          WHERE NOT EXISTS ( \
-              SELECT 1 FROM value_constraint \
-               WHERE position(required.marker IN value_constraint.expression) > 0 \
-          ) \
+     AND EXISTS ( \
+         SELECT 1 FROM validated_constraints \
+          WHERE conname = 'chain_swap_tx_attempts_fee_authority_value_check' \
+            AND expression = $2 \
      )";
 
 const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
@@ -550,6 +553,8 @@ async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<b
 
 async fn merchant_settlement_fee_schema_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL)
+        .bind(EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION)
+        .bind(EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION)
         .fetch_one(pool)
         .await
 }
@@ -1398,8 +1403,9 @@ mod tests {
         chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
         journal_privileges_ready, recovery_commitment_privileges_ready,
         swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
-        MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL, MERCHANT_SETTLEMENT_PRIVILEGES_SQL,
-        MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
+        EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION,
+        EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION, MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL,
+        MERCHANT_SETTLEMENT_PRIVILEGES_SQL, MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
     };
 
     #[test]
@@ -1433,14 +1439,27 @@ mod tests {
             "constraint_info.convalidated",
             "chain_swap_tx_attempts_fee_authority_shape_check",
             "chain_swap_tx_attempts_fee_authority_value_check",
-            "num_nonnulls(",
-            "=ANY(ARRAY[0,13])",
+            "regexp_replace(",
+            "expression = $1",
+            "expression = $2",
         ] {
             assert!(
                 MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(schema_guard),
                 "missing fee-schema guard: {schema_guard}"
             );
         }
+        assert_eq!(
+            EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION,
+            concat!(
+                "num_nonnulls(fee_decision_purpose,fee_decision_rail,",
+                "fee_decision_target,fee_decision_source,fee_decision_rate_sat_vb,",
+                "fee_decision_quoted_at_unix,fee_decision_evaluated_at_unix,",
+                "fee_decision_freshness_age_secs,fee_decision_freshness_max_age_secs,",
+                "fee_decision_provenance,fee_decision_policy_floor_sat_vb,",
+                "fee_decision_policy_cap_sat_vb,fee_decision_policy_version)=",
+                "ANY(ARRAY[0,13])"
+            )
+        );
         for value_marker in [
             "btc_recovery",
             "bitcoin_recovery",
@@ -1454,7 +1473,7 @@ mod tests {
             "review25-v1",
         ] {
             assert!(
-                MERCHANT_SETTLEMENT_FEE_SCHEMA_SQL.contains(value_marker),
+                EXPECTED_MERCHANT_SETTLEMENT_FEE_VALUE_EXPRESSION.contains(value_marker),
                 "missing fee-value authority marker: {value_marker}"
             );
         }

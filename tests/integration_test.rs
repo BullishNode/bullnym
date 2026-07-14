@@ -1362,9 +1362,20 @@ async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
 
     assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
 
-    let (shape_definition, value_definition) = sqlx::query_as::<_, (String, String)>(
-        "SELECT \
+    let (shape_definition, shape_expression, value_definition, value_expression) =
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT \
             (SELECT pg_get_constraintdef(constraint_info.oid, TRUE) \
+               FROM pg_constraint constraint_info \
+               JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' \
+                AND relation.relname = 'chain_swap_tx_attempts' \
+                AND constraint_info.conname = \
+                    'chain_swap_tx_attempts_fee_authority_shape_check'), \
+            (SELECT pg_get_expr( \
+                        constraint_info.conbin, constraint_info.conrelid, TRUE \
+                    ) \
                FROM pg_constraint constraint_info \
                JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
@@ -1379,11 +1390,21 @@ async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
               WHERE namespace.nspname = 'public' \
                 AND relation.relname = 'chain_swap_tx_attempts' \
                 AND constraint_info.conname = \
+                    'chain_swap_tx_attempts_fee_authority_value_check'), \
+            (SELECT pg_get_expr( \
+                        constraint_info.conbin, constraint_info.conrelid, TRUE \
+                    ) \
+               FROM pg_constraint constraint_info \
+               JOIN pg_class relation ON relation.oid = constraint_info.conrelid \
+               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' \
+                AND relation.relname = 'chain_swap_tx_attempts' \
+                AND constraint_info.conname = \
                     'chain_swap_tx_attempts_fee_authority_value_check')",
-    )
-    .fetch_one(&admin)
-    .await
-    .unwrap();
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap();
 
     for (constraint_name, temporary_name) in [
         (
@@ -1422,20 +1443,12 @@ async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
     .execute(&admin)
     .await
     .unwrap();
-    sqlx::query(
+    sqlx::query(&format!(
         "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
          chain_swap_tx_attempts_fee_authority_shape_check CHECK ( \
-             num_nonnulls( \
-                 fee_decision_purpose, fee_decision_rail, fee_decision_target, \
-                 fee_decision_source, fee_decision_rate_sat_vb, \
-                 fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
-                 fee_decision_freshness_age_secs, \
-                 fee_decision_freshness_max_age_secs, fee_decision_provenance, \
-                 fee_decision_policy_floor_sat_vb, fee_decision_policy_cap_sat_vb, \
-                 fee_decision_policy_version \
-             ) IN (0, 12, 13) \
-         )",
-    )
+             ({shape_expression}) OR fee_decision_purpose IS NOT NULL \
+         )"
+    ))
     .execute(&admin)
     .await
     .unwrap();
@@ -1468,13 +1481,12 @@ async fn merchant_settlement_fee_schema_readiness_rejects_constraint_drift() {
     .execute(&admin)
     .await
     .unwrap();
-    sqlx::query(
+    sqlx::query(&format!(
         "ALTER TABLE chain_swap_tx_attempts ADD CONSTRAINT \
          chain_swap_tx_attempts_fee_authority_value_check CHECK ( \
-             fee_decision_purpose IS NULL \
-             OR fee_decision_policy_version = 'review25-v1' \
-         )",
-    )
+             ({value_expression}) OR fee_decision_purpose IS NOT NULL \
+         )"
+    ))
     .execute(&admin)
     .await
     .unwrap();
