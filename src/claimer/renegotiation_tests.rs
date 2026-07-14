@@ -1284,10 +1284,11 @@ async fn duplicate_runtime_and_server_lock_race_converge_with_at_most_one_provid
         .fallback_gate()
         .blocks_bitcoin_fallback());
 
+    let owning_worker_observer = FaultObserver::never_fail();
     let owning_worker = try_renegotiate_chain_swap_with_verified_mismatch_using(
         &provider_first_store,
         &provider_first,
-        &FaultObserver::never_fail(),
+        &owning_worker_observer,
         &swap,
         "transaction.lockupFailed",
         &evidence,
@@ -1378,18 +1379,20 @@ async fn duplicate_runtime_and_server_lock_race_converge_with_at_most_one_provid
         .unwrap(),
         ServerLockRenegotiationOutcome::LiquidPathWon
     );
+    let first_replay_observer = FaultObserver::never_fail();
     let first_replay = try_renegotiate_chain_swap_with_verified_mismatch_using(
         &server_first_store,
         &server_first,
-        &FaultObserver::never_fail(),
+        &first_replay_observer,
         &swap,
         "transaction.lockupFailed",
         &evidence,
     );
+    let second_replay_observer = FaultObserver::never_fail();
     let second_replay = try_renegotiate_chain_swap_with_verified_mismatch_using(
         &server_first_store,
         &server_first,
-        &FaultObserver::never_fail(),
+        &second_replay_observer,
         &swap,
         "transaction.lockupFailed",
         &evidence,
