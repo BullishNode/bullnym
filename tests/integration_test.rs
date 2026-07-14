@@ -1117,10 +1117,12 @@ async fn successful_reverse_barrier_handler(
     axum::Json(request): axum::Json<Value>,
 ) -> axum::Json<Value> {
     state.calls.fetch_add(1, Ordering::SeqCst);
+    let mut response = state.response.clone();
+    response["onchainAmount"] = request.get("onchainAmount").cloned().unwrap_or(Value::Null);
     state.requests.lock().await.push(request);
     state.request_barrier.wait().await;
     state.release_barrier.wait().await;
-    axum::Json(state.response)
+    axum::Json(response)
 }
 
 async fn spawn_successful_reverse_barrier_server(
@@ -7377,6 +7379,8 @@ async fn chain_offer_missing_runtime_refuses_before_key_or_provider_mutation() {
         .unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lightning_pr"], "");
+    assert!(body["lightning_amount_sat"].is_null());
+    assert_eq!(body["liquid_amount_sat"], 25_000);
     assert!(body["bitcoin_chain_address"].is_null(), "{body}");
     assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
     assert_eq!(
@@ -7712,7 +7716,7 @@ async fn lazy_lightning_offer_lock_contention_fails_fast_without_mutation_and_re
 
     // Seed a reusable offer so the post-contention request can prove the
     // ordinary idempotent path still works without depending on Boltz output.
-    let bolt11 = fresh_bolt11(1_000);
+    let bolt11 = fresh_bolt11(1_050);
     record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
@@ -7801,6 +7805,7 @@ async fn lazy_lightning_offer_lock_contention_fails_fast_without_mutation_and_re
             .expect("lazy Lightning offer retry did not complete after lock release");
     assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
     assert_eq!(retry_body["pr"], bolt11);
+    assert_eq!(retry_body["lightning_amount_sat"], 1_050);
     assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&pool)
@@ -7841,7 +7846,7 @@ async fn reusable_lightning_offer_progresses_with_one_pool_connection() {
         .await
         .unwrap();
 
-    let bolt11 = fresh_bolt11(1_000);
+    let bolt11 = fresh_bolt11(1_050);
     record_pre_050_reverse_fixture(
         &admin,
         &pay_service::db::NewSwapRecord {
@@ -7886,6 +7891,7 @@ async fn reusable_lightning_offer_progresses_with_one_pool_connection() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
+    assert_eq!(body["lightning_amount_sat"], 1_050);
     let (second_status, second_body) =
         tokio::time::timeout(Duration::from_secs(2), post_json(&app, &path, json!({})))
             .await
@@ -7937,7 +7943,7 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .await
         .unwrap();
 
-    let bolt11 = fresh_bolt11(1_000);
+    let bolt11 = fresh_bolt11(1_050);
     let provider =
         spawn_successful_reverse_barrier_server("LAZY_OFFER_CANCEL_RETRY_1", &bolt11).await;
     let mut config = test_config();
@@ -7971,6 +7977,7 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .expect("lazy-offer retry task failed");
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
+    assert_eq!(body["lightning_amount_sat"], 1_050);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
     let allocation_count: i64 = sqlx::query_scalar(
@@ -8150,7 +8157,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     .await
     .unwrap();
 
-    let replacement_bolt11 = fresh_replacement_bolt11(1_000);
+    let replacement_bolt11 = fresh_replacement_bolt11(1_050);
     let provider = spawn_successful_reverse_barrier_server(
         "LAZY_OFFER_TERMINAL_REPLACEMENT_1",
         &replacement_bolt11,
@@ -8183,10 +8190,13 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
         .expect("replacement offer request task failed");
     assert_eq!(offer_status, StatusCode::OK, "{offer}");
     assert_eq!(offer["pr"], replacement_bolt11);
+    assert_eq!(offer["lightning_amount_sat"], 1_050);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["invoiceAmount"], 1_000);
+    assert!(requests[0].get("invoiceAmount").is_none());
+    assert_eq!(requests[0]["onchainAmount"], 1_020);
+    assert_eq!(requests[0]["pairHash"], "11".repeat(32));
     let requested_claim_public_key = requests[0]["claimPublicKey"]
         .as_str()
         .expect("reverse request claimPublicKey")
@@ -8303,7 +8313,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     assert_eq!(before.status, "partially_paid");
     assert_eq!(before.presentation_status.as_deref(), Some("partial"));
 
-    let stale_bolt11 = fresh_bolt11(600);
+    let stale_bolt11 = fresh_bolt11(649);
     let provider =
         spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", &stale_bolt11).await;
     let mut config = test_config();
@@ -8335,7 +8345,9 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["invoiceAmount"], 600);
+    assert!(requests[0].get("invoiceAmount").is_none());
+    assert_eq!(requests[0]["onchainAmount"], 620);
+    assert_eq!(requests[0]["pairHash"], "11".repeat(32));
     drop(requests);
 
     let recorded: (String, i64, Option<uuid::Uuid>, Option<i64>, String) = sqlx::query_as(
@@ -8400,7 +8412,7 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
     .await
     .unwrap();
 
-    let bolt11 = fresh_bolt11(600);
+    let bolt11 = fresh_bolt11(649);
     let provider =
         spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", &bolt11).await;
     let mut config = test_config();
@@ -8439,6 +8451,7 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
         .expect("offer request task failed");
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["pr"], bolt11);
+    assert_eq!(body["lightning_amount_sat"], 649);
 
     let terminalized = tokio::time::timeout(Duration::from_secs(2), terminalizer)
         .await
@@ -8477,7 +8490,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
         .await
         .unwrap();
 
-    let stale_bolt11 = fresh_bolt11(1_000);
+    let stale_bolt11 = fresh_bolt11(1_050);
     let provider =
         spawn_successful_reverse_barrier_server("LAZY_OFFER_EXPIRY_RACE_1", &stale_bolt11).await;
     let mut config = test_config();
@@ -8518,7 +8531,9 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["invoiceAmount"], 1_000);
+    assert!(requests[0].get("invoiceAmount").is_none());
+    assert_eq!(requests[0]["onchainAmount"], 1_020);
+    assert_eq!(requests[0]["pairHash"], "11".repeat(32));
     drop(requests);
 
     let recorded: (String, i64, Option<uuid::Uuid>, Option<i64>, String) = sqlx::query_as(
@@ -8557,7 +8572,7 @@ async fn closed_admission_returns_existing_reusable_lightning_offer() {
         .await
         .unwrap();
 
-    let bolt11 = fresh_bolt11(1_000);
+    let bolt11 = fresh_bolt11(1_050);
     record_pre_050_reverse_fixture(
         &pool,
         &pay_service::db::NewSwapRecord {
@@ -8597,6 +8612,7 @@ async fn closed_admission_returns_existing_reusable_lightning_offer() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
+    assert_eq!(body["lightning_amount_sat"], 1_050);
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&pool)
             .await
@@ -18968,6 +18984,7 @@ async fn public_status_never_leaks_recovery_state() {
             "stage {stage}: a recovering swap is not a payable offer"
         );
         assert!(body["bitcoin_chain_bip21"].is_null(), "stage {stage}");
+        assert!(body["bitcoin_chain_amount_sat"].is_null(), "stage {stage}");
         let ss = body["settlement_status"].as_str().unwrap_or("");
         assert!(
             allowed_settlement.contains(&ss),
@@ -24356,6 +24373,7 @@ async fn invoice_chain_offer_returns_only_after_manifest_delivery() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lightning_pr"], "");
     assert_eq!(body["bitcoin_chain_address"], expected_lockup_address);
+    assert_eq!(body["bitcoin_chain_amount_sat"], 25_431);
     let payer_bip21 = body["bitcoin_chain_bip21"].as_str().unwrap();
     assert!(payer_bip21.starts_with(&format!(
         "bitcoin:{}?amount=0.00025431&",
@@ -24364,6 +24382,26 @@ async fn invoice_chain_offer_returns_only_after_manifest_delivery() {
     assert_ne!(
         payer_bip21,
         provider_response.lockup_details.bip21.as_deref().unwrap()
+    );
+    let invoice_id = body["invoice_id"].as_str().unwrap();
+    let (status_code, status_body) =
+        get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
+    assert_eq!(status_code, StatusCode::OK, "{status_body}");
+    assert_eq!(
+        status_body["bitcoin_chain_address"],
+        expected_lockup_address
+    );
+    assert_eq!(status_body["bitcoin_chain_bip21"], payer_bip21);
+    assert_eq!(status_body["bitcoin_chain_amount_sat"], 25_431);
+    assert_eq!(status_body["remaining_amount_sat"], 25_000);
+    assert!(status_body["lightning_amount_sat"].is_null());
+    assert_eq!(status_body["liquid_amount_sat"], 25_000);
+    let (render_status, html) = get_text_path(&app, &format!("/{nym}/i/{invoice_id}")).await;
+    assert_eq!(render_status, StatusCode::OK, "{html}");
+    assert!(html.contains("INITIAL_BITCOIN_CHAIN_AMOUNT_SAT = 25431"));
+    assert!(html.contains("currentBitcoinChainAmountSat"));
+    assert!(
+        html.contains("Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs")
     );
 
     let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestDelivered1")
@@ -24436,6 +24474,7 @@ async fn invoice_chain_offer_staging_failure_withholds_offer_and_retains_provide
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["bitcoin_chain_address"].is_null(), "{body}");
     assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_amount_sat"].is_null(), "{body}");
     let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestStagingFailure1")
         .await
         .unwrap()
@@ -24494,6 +24533,7 @@ async fn invoice_chain_offer_delivery_failure_withholds_offer_and_retains_provid
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["bitcoin_chain_address"].is_null(), "{body}");
     assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
+    assert!(body["bitcoin_chain_amount_sat"].is_null(), "{body}");
     let row = pay_service::db::get_chain_swap_by_boltz_id(&pool, "InvoiceManifestDeliveryFailure1")
         .await
         .unwrap()

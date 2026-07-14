@@ -204,11 +204,31 @@ fn chain_bip21_formats_whole_bitcoin_without_rounding() {
 }
 
 #[test]
+fn public_chain_amount_requires_a_positive_non_decreasing_gross_up() {
+    assert_eq!(
+        validated_payer_chain_amount_sat(10_431, 10_000),
+        Some(10_431)
+    );
+    assert_eq!(
+        validated_payer_chain_amount_sat(10_000, 10_000),
+        Some(10_000)
+    );
+    for (user, server) in [(9_999, 10_000), (0, 0), (1, 0), (-1, 1)] {
+        assert_eq!(
+            validated_payer_chain_amount_sat(user, server),
+            None,
+            "invalid public amount pair {user}/{server} was exposed"
+        );
+    }
+}
+
+#[test]
 fn permit_release_failure_keeps_the_persisted_chain_offer_visible() {
     let retained = retain_persisted_offer_after_permit_release(
         BitcoinChainOffer {
             lockup_address: "bc1qpersistedoffer".to_owned(),
             lockup_bip21: Some("bitcoin:bc1qpersistedoffer?amount=0.00001000".to_owned()),
+            payer_amount_sat: 1_000,
         },
         Err(ChainSwapCreationPermitError::ReleaseFailed),
     );
@@ -243,6 +263,10 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
         accept_ln: true,
         accept_liquid: true,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: Some(2_500),
         bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
@@ -297,6 +321,10 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         accept_ln: true,
         accept_liquid: true,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: Some(10_000),
         bitcoin_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
@@ -334,10 +362,14 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
         accept_ln: true,
         accept_liquid: true,
         bitcoin_chain_address: Some("bc1qboltzlockup"),
+        bitcoin_chain_amount_sat: Some(10_100),
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: Some(10_000),
         bitcoin_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_address_js: js_string_literal(Some("bc1qboltzlockup")).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(Some(
-            "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address",
+            "bitcoin:bc1qboltzlockup?amount=0.00010100&label=Send%20to%20L-BTC%20address",
         ))
         .unwrap(),
         liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
@@ -347,10 +379,19 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
     let html = tpl.render().expect("template renders");
     assert!(html.contains("id=\"rail-btc\""));
     assert!(html.contains("INITIAL_BITCOIN_CHAIN_ADDRESS = \"bc1qboltzlockup\""));
-    assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010000\\u0026label=Send%20to%20L-BTC%20address\""));
+    assert!(html.contains("INITIAL_BITCOIN_CHAIN_BIP21 = \"bitcoin:bc1qboltzlockup?amount=0.00010100\\u0026label=Send%20to%20L-BTC%20address\""));
+    assert!(html.contains("INITIAL_BITCOIN_CHAIN_AMOUNT_SAT = 10100"));
     assert!(html.contains("return bip21 || btcUri(address, amountSat);"));
     assert!(html.contains("currentBitcoinChainAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || null"));
     assert!(html.contains("return currentBitcoinChainAddress || currentBitcoinDirectAddress;"));
+    assert!(html.contains("? currentBitcoinChainAmountSat\n                    : currentAmountSat"));
+    assert!(
+        html.contains("Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs")
+    );
+    let lightning = html.find("id=\"rail-lightning\"").unwrap();
+    let liquid = html.find("id=\"rail-liquid\"").unwrap();
+    let bitcoin = html.find("id=\"rail-btc\"").unwrap();
+    assert!(lightning < liquid && liquid < bitcoin);
 }
 
 #[test]
@@ -376,6 +417,10 @@ fn template_liquid_uri_pins_lbtc_asset() {
         accept_ln: false,
         accept_liquid: true,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: Some(10_000),
         bitcoin_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
@@ -414,6 +459,10 @@ fn invoice_template_escapes_user_text_and_js_literals() {
         accept_ln: false,
         accept_liquid: false,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: None,
         bitcoin_address_js: js_string_literal(Some(attack)).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
@@ -452,6 +501,10 @@ fn hide_owner_suppresses_nym_in_rendered_header() {
         accept_ln: true,
         accept_liquid: false,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: None,
         bitcoin_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
@@ -591,7 +644,9 @@ fn template_status_poll_replaces_nullable_bitcoin_offer_state() {
         .expect("template renders");
 
     assert!(html.contains("currentBitcoinDirectAddress = data.bitcoin_address || null;"));
-    assert!(html.contains("currentBitcoinChainAddress = data.bitcoin_chain_address || null;"));
+    assert!(html.contains("Number.isSafeInteger(data.bitcoin_chain_amount_sat)"));
+    assert!(html.contains("nextBitcoinChainAddress && nextBitcoinChainAmountSat !== null"));
+    assert!(html.contains("currentBitcoinChainAmountSat = currentBitcoinChainAddress"));
     assert!(html.contains("currentBitcoinChainBip21 = currentBitcoinChainAddress"));
     assert!(html
         .contains("const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null;"));
@@ -664,6 +719,10 @@ fn payment_template_fixture(
         accept_ln: true,
         accept_liquid: true,
         bitcoin_chain_address: None,
+        bitcoin_chain_amount_sat: None,
+        lightning_pr_js: js_string_literal(None).unwrap(),
+        lightning_amount_sat: None,
+        liquid_amount_sat: Some(2_500),
         bitcoin_address_js: js_string_literal(Some("bc1qexample")).unwrap(),
         bitcoin_chain_address_js: js_string_literal(None).unwrap(),
         bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),

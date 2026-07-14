@@ -44,13 +44,17 @@ export function railLabel(rail: string | null): string {
 export interface RailAvailabilityInput {
   acceptLn: boolean | undefined
   lightningPr: string | null
+  lightningAmountSat: number | null
   acceptLiquid: boolean | undefined
   liquidAddress: string | null
+  liquidAmountSat: number | null
   acceptBtc: boolean | undefined
   /** Direct mainnet BTC address (gated on accept_btc). */
   bitcoinAddress: string | null
   /** BTC→L-BTC chain-swap lockup address; payable regardless of accept_btc. */
   bitcoinChainAddress: string | null
+  /** Exact payer-side amount paired with the chain-swap lockup. */
+  bitcoinChainAmountSat: number | null
 }
 
 export interface RailAvailability {
@@ -60,9 +64,21 @@ export interface RailAvailability {
 }
 
 export function availableRails(input: RailAvailabilityInput): RailAvailability {
+  const completeLightningOffer =
+    !!input.lightningPr &&
+    Number.isSafeInteger(input.lightningAmountSat) &&
+    (input.lightningAmountSat ?? 0) > 0
+  const completeLiquidOffer =
+    !!input.liquidAddress &&
+    Number.isSafeInteger(input.liquidAmountSat) &&
+    (input.liquidAmountSat ?? 0) > 0
+  const completeChainOffer =
+    !!input.bitcoinChainAddress &&
+    Number.isSafeInteger(input.bitcoinChainAmountSat) &&
+    (input.bitcoinChainAmountSat ?? 0) > 0
   return {
-    lightning: (input.acceptLn ?? true) && !!input.lightningPr,
-    liquid: (input.acceptLiquid ?? true) && !!input.liquidAddress,
-    bitcoin: !!input.bitcoinChainAddress || ((input.acceptBtc ?? true) && !!input.bitcoinAddress),
+    lightning: (input.acceptLn ?? true) && completeLightningOffer,
+    liquid: (input.acceptLiquid ?? true) && completeLiquidOffer,
+    bitcoin: completeChainOffer || ((input.acceptBtc ?? true) && !!input.bitcoinAddress),
   }
 }

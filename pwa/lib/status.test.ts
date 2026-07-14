@@ -33,10 +33,13 @@ function makeStatus(overrides: Partial<InvoiceStatus> = {}): InvoiceStatus {
     paid_at_unix: null,
     paid_amount_sat: null,
     lightning_pr: null,
+    lightning_amount_sat: null,
     liquid_address: null,
+    liquid_amount_sat: null,
     bitcoin_address: null,
     bitcoin_chain_address: null,
     bitcoin_chain_bip21: null,
+    bitcoin_chain_amount_sat: null,
     accept_btc: true,
     accept_ln: true,
     accept_liquid: true,
@@ -301,6 +304,7 @@ describe('Bitcoin payment payload transitions', () => {
       makeStatus({
         bitcoin_chain_address: 'bc1qfullamountlockup',
         bitcoin_chain_bip21: 'bitcoin:bc1qfullamountlockup?amount=0.00010800',
+        bitcoin_chain_amount_sat: 10_800,
       }),
     )
     expect(offered.chainAddress).toBe('bc1qfullamountlockup')
@@ -313,9 +317,10 @@ describe('Bitcoin payment payload transitions', () => {
         remaining_amount_sat: 4_000,
         bitcoin_chain_address: null,
         bitcoin_chain_bip21: null,
+        bitcoin_chain_amount_sat: null,
       }),
     )
-    expect(partial).toEqual({ directAddress: null, chainAddress: null, chainBip21: null })
+    expect(partial).toEqual({ directAddress: null, chainAddress: null, chainBip21: null, chainAmountSat: null })
   })
 
   it('clears a chain offer that is no longer pending while preserving direct BTC separately', () => {
@@ -324,12 +329,49 @@ describe('Bitcoin payment payload transitions', () => {
         bitcoin_address: 'bc1qmerchantdirect',
         bitcoin_chain_address: null,
         bitcoin_chain_bip21: 'bitcoin:bc1qstalechain?amount=0.00010800',
+        bitcoin_chain_amount_sat: 10_800,
       }),
     )
     expect(next).toEqual({
       directAddress: 'bc1qmerchantdirect',
       chainAddress: null,
       chainBip21: null,
+      chainAmountSat: null,
+    })
+  })
+
+  it('fails closed when an address has no exact positive payer amount', () => {
+    for (const bitcoin_chain_amount_sat of [null, 0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      const next = bitcoinPaymentPayloadFromStatus(
+        makeStatus({
+          bitcoin_chain_address: 'bc1qamountlesschain',
+          bitcoin_chain_bip21: null,
+          bitcoin_chain_amount_sat,
+        }),
+      )
+      expect(next).toEqual({
+        directAddress: null,
+        chainAddress: null,
+        chainBip21: null,
+        chainAmountSat: null,
+      })
+    }
+  })
+
+  it('keeps an exact amount when BIP21 is absent so fallback construction is safe', () => {
+    expect(
+      bitcoinPaymentPayloadFromStatus(
+        makeStatus({
+          bitcoin_chain_address: 'bc1qfallbackchain',
+          bitcoin_chain_bip21: null,
+          bitcoin_chain_amount_sat: 11_234,
+        }),
+      ),
+    ).toEqual({
+      directAddress: null,
+      chainAddress: 'bc1qfallbackchain',
+      chainBip21: null,
+      chainAmountSat: 11_234,
     })
   })
 })

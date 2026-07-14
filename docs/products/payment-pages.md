@@ -86,7 +86,13 @@ The public payment page for a linked checkout remains `GET /:nym/i/:id`.
 | Bitcoin | Boltz BTC lockup address | LBTC claimed from the chain swap to the checkout Liquid address. |
 
 Payment Page Bitcoin is a BTC-to-LBTC Boltz chain swap. It is not direct
-Bitcoin invoice settlement.
+Bitcoin invoice settlement. Payment tabs are ordered Lightning, Liquid, then
+Bitcoin. Each tab displays the exact typed payer amount. Lightning includes the
+reverse-swap gross-up needed for the merchant to net face value; Liquid uses
+the exact remainder; and Bitcoin keeps the merchant invoice amount distinct
+from the exact payer lock: it shows `bitcoin_chain_amount_sat` as the manual-send/QR
+amount and discloses the swap-cost delta. If that exact typed amount is absent,
+the chain offer is withheld rather than rebuilt from the invoice amount.
 
 ## Archiving
 

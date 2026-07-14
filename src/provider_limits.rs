@@ -83,6 +83,12 @@ impl ReversePairObservation {
             return Err(ReversePairValidationError::InvalidPairRate);
         }
 
+        if !self.quote.fees.percentage.is_finite()
+            || !(0.0..100.0).contains(&self.quote.fees.percentage)
+        {
+            return Err(ReversePairValidationError::InvalidPercentageFee);
+        }
+
         let minimum_sat = self.quote.limits.minimal;
         let maximum_sat = self.quote.limits.maximal;
         if minimum_sat == 0 {
@@ -90,6 +96,11 @@ impl ReversePairObservation {
         }
         if maximum_sat < minimum_sat {
             return Err(ReversePairValidationError::MaximumBelowMinimum);
+        }
+        if self.quote.fees.miner_fees.lockup > maximum_sat
+            || self.quote.fees.miner_fees.claim > maximum_sat
+        {
+            return Err(ReversePairValidationError::MinerFeeAboveMaximum);
         }
 
         let maximum_zero_conf_sat = match self.zero_conf {
@@ -124,6 +135,9 @@ impl ReversePairObservation {
             minimum_msat,
             maximum_msat,
             maximum_zero_conf_msat,
+            percentage_fee: self.quote.fees.percentage,
+            lockup_fee_sat: self.quote.fees.miner_fees.lockup,
+            claim_fee_sat: self.quote.fees.miner_fees.claim,
             source: self.source,
             observed_at: self.observed_at,
         })
@@ -146,6 +160,8 @@ pub enum ReversePairValidationError {
     InvalidPairRate,
     MinimumIsZero,
     MaximumBelowMinimum,
+    InvalidPercentageFee,
+    MinerFeeAboveMaximum,
     ZeroConfAboveMaximum,
     ZeroConfBelowMinimum,
     MinimumMsatOverflow,
@@ -161,6 +177,8 @@ impl fmt::Display for ReversePairValidationError {
             Self::InvalidPairRate => "invalid_pair_rate",
             Self::MinimumIsZero => "minimum_is_zero",
             Self::MaximumBelowMinimum => "maximum_below_minimum",
+            Self::InvalidPercentageFee => "invalid_percentage_fee",
+            Self::MinerFeeAboveMaximum => "miner_fee_above_maximum",
             Self::ZeroConfAboveMaximum => "zero_conf_above_maximum",
             Self::ZeroConfBelowMinimum => "zero_conf_below_minimum",
             Self::MinimumMsatOverflow => "minimum_msat_overflow",
@@ -179,9 +197,76 @@ pub struct ReversePairSnapshot {
     minimum_msat: u64,
     maximum_msat: u64,
     maximum_zero_conf_msat: Option<u64>,
+    percentage_fee: f64,
+    lockup_fee_sat: u64,
+    claim_fee_sat: u64,
     source: ReversePairSource,
     observed_at: Instant,
 }
+
+/// Exact fixed-checkout reverse-swap economics from one fresh, validated pair.
+///
+/// The merchant amount is the value that must remain after Bullnym claims the
+/// Liquid lockup. `onchain_amount_sat` therefore includes the provider's claim
+/// fee budget, and `payer_amount_sat` additionally includes Boltz's percentage
+/// and lockup fees. The BOLT11 principal must equal `payer_amount_sat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedCheckoutReverseQuote {
+    pair_hash: String,
+    merchant_amount_sat: u64,
+    payer_amount_sat: u64,
+    onchain_amount_sat: u64,
+    claim_fee_budget_sat: u64,
+}
+
+impl FixedCheckoutReverseQuote {
+    pub fn pair_hash(&self) -> &str {
+        &self.pair_hash
+    }
+
+    pub const fn merchant_amount_sat(&self) -> u64 {
+        self.merchant_amount_sat
+    }
+
+    pub const fn payer_amount_sat(&self) -> u64 {
+        self.payer_amount_sat
+    }
+
+    pub const fn onchain_amount_sat(&self) -> u64 {
+        self.onchain_amount_sat
+    }
+
+    pub const fn claim_fee_budget_sat(&self) -> u64 {
+        self.claim_fee_budget_sat
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedCheckoutReverseQuoteError {
+    SnapshotUnavailable(LightningAddressUnavailable),
+    MerchantAmountZero,
+    AmountOverflow,
+    AmountOutsideProviderLimits,
+    NonExactAmountCalculation,
+}
+
+impl fmt::Display for FixedCheckoutReverseQuoteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::SnapshotUnavailable(_) => "snapshot_unavailable",
+            Self::MerchantAmountZero => "merchant_amount_zero",
+            Self::AmountOverflow => "amount_overflow",
+            Self::AmountOutsideProviderLimits => "amount_outside_provider_limits",
+            Self::NonExactAmountCalculation => "non_exact_amount_calculation",
+        };
+        write!(
+            formatter,
+            "fixed checkout reverse quote unavailable: {code}"
+        )
+    }
+}
+
+impl std::error::Error for FixedCheckoutReverseQuoteError {}
 
 /// Current in-process snapshot value. This is not a cache implementation.
 #[derive(Debug, Clone, Default)]
@@ -277,6 +362,85 @@ fn current_snapshot(
         return Err(LightningAddressUnavailable::SnapshotStale);
     }
     Ok(snapshot)
+}
+
+/// Price one fixed checkout from merchant face value to the exact Lightning
+/// principal using the same fresh reverse-pair packet for every fee input.
+///
+/// Boltz defines reverse pricing as
+/// `onchain = invoice - ceil(invoice * percentage) - lockup_fee`. We target an
+/// onchain value of `merchant + claim_fee_budget`, then select the smallest
+/// invoice principal that produces that exact integer result. This keeps the
+/// source-wallet routing fee outside the invoice, as required by Lightning.
+pub fn fixed_checkout_reverse_quote(
+    state: &ReversePairSnapshotState,
+    merchant_amount_sat: u64,
+    now: Instant,
+    maximum_age: Duration,
+) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
+    if merchant_amount_sat == 0 {
+        return Err(FixedCheckoutReverseQuoteError::MerchantAmountZero);
+    }
+    let snapshot = current_snapshot(state, now, maximum_age)
+        .map_err(FixedCheckoutReverseQuoteError::SnapshotUnavailable)?;
+    let onchain_amount_sat = merchant_amount_sat
+        .checked_add(snapshot.claim_fee_sat)
+        .ok_or(FixedCheckoutReverseQuoteError::AmountOverflow)?;
+    let numerator = onchain_amount_sat
+        .checked_add(snapshot.lockup_fee_sat)
+        .ok_or(FixedCheckoutReverseQuoteError::AmountOverflow)?;
+    let denominator = 1.0 - snapshot.percentage_fee / 100.0;
+    let candidate = (numerator as f64 / denominator).ceil();
+    if !candidate.is_finite() || candidate <= 0.0 || candidate >= u64::MAX as f64 {
+        return Err(FixedCheckoutReverseQuoteError::AmountOverflow);
+    }
+    let mut payer_amount_sat = candidate as u64;
+
+    let produced_onchain = |payer_amount_sat: u64| -> Option<u64> {
+        // Match boltz-client's ReverseFees::boltz operation order exactly so
+        // a floating-point boundary cannot differ by one sat between local
+        // validation and the provider contract.
+        let percentage_fee = ((snapshot.percentage_fee / 100.0) * payer_amount_sat as f64).ceil();
+        if !percentage_fee.is_finite() || percentage_fee < 0.0 || percentage_fee >= u64::MAX as f64
+        {
+            return None;
+        }
+        payer_amount_sat
+            .checked_sub(percentage_fee as u64)?
+            .checked_sub(snapshot.lockup_fee_sat)
+    };
+
+    // The closed-form candidate can land one sat high at a floating-point or
+    // ceil boundary. Walk only across that boundary and require exact integer
+    // equality; never expose a quote that merely approximates merchant value.
+    while payer_amount_sat > 0
+        && produced_onchain(payer_amount_sat - 1).is_some_and(|amount| amount >= onchain_amount_sat)
+    {
+        payer_amount_sat -= 1;
+    }
+    while produced_onchain(payer_amount_sat).is_some_and(|amount| amount < onchain_amount_sat) {
+        payer_amount_sat = payer_amount_sat
+            .checked_add(1)
+            .ok_or(FixedCheckoutReverseQuoteError::AmountOverflow)?;
+    }
+    if produced_onchain(payer_amount_sat) != Some(onchain_amount_sat) {
+        return Err(FixedCheckoutReverseQuoteError::NonExactAmountCalculation);
+    }
+    let (minimum_sat, maximum_sat) = (
+        snapshot.minimum_msat / MSAT_PER_SAT,
+        snapshot.maximum_msat / MSAT_PER_SAT,
+    );
+    if payer_amount_sat < minimum_sat || payer_amount_sat > maximum_sat {
+        return Err(FixedCheckoutReverseQuoteError::AmountOutsideProviderLimits);
+    }
+
+    Ok(FixedCheckoutReverseQuote {
+        pair_hash: snapshot.pair_hash.clone(),
+        merchant_amount_sat,
+        payer_amount_sat,
+        onchain_amount_sat,
+        claim_fee_budget_sat: snapshot.claim_fee_sat,
+    })
 }
 
 /// Intersect product policy with one fresh provider snapshot.
@@ -469,8 +633,86 @@ mod tests {
         assert_eq!(snapshot.minimum_msat, 100_000);
         assert_eq!(snapshot.maximum_msat, 25_000_000_000);
         assert_eq!(snapshot.maximum_zero_conf_msat, None);
+        assert_eq!(snapshot.percentage_fee, 0.25);
+        assert_eq!(snapshot.lockup_fee_sat, 27);
+        assert_eq!(snapshot.claim_fee_sat, 20);
         assert_eq!(snapshot.source, ReversePairSource::BoltzV2ReversePairs);
         assert_eq!(snapshot.observed_at, now);
+    }
+
+    #[test]
+    fn fixed_checkout_quote_grosses_up_every_server_side_cost_exactly() {
+        let now = Instant::now();
+        let quote = fixed_checkout_reverse_quote(
+            &state(
+                now,
+                100,
+                25_000_000,
+                ProviderZeroConfLimit::NotReportedByReversePairContract,
+            ),
+            1_000,
+            now,
+            FRESH_FOR,
+        )
+        .unwrap();
+
+        assert_eq!(quote.pair_hash(), HASH);
+        assert_eq!(quote.merchant_amount_sat(), 1_000);
+        assert_eq!(quote.claim_fee_budget_sat(), 20);
+        assert_eq!(quote.onchain_amount_sat(), 1_020);
+        assert_eq!(quote.payer_amount_sat(), 1_050);
+        // ceil(1_050 * 0.25%) = 3; 1_050 - 3 - 27 = 1_020.
+        assert_eq!(1_050 - 3 - 27, quote.onchain_amount_sat());
+    }
+
+    #[test]
+    fn fixed_checkout_quote_fails_closed_without_fresh_in_range_economics() {
+        let now = Instant::now();
+        assert_eq!(
+            fixed_checkout_reverse_quote(
+                &ReversePairSnapshotState::Missing,
+                1_000,
+                now,
+                FRESH_FOR,
+            )
+            .unwrap_err(),
+            FixedCheckoutReverseQuoteError::SnapshotUnavailable(
+                LightningAddressUnavailable::SnapshotMissing,
+            )
+        );
+        assert_eq!(
+            fixed_checkout_reverse_quote(
+                &state(
+                    now,
+                    100,
+                    1_049,
+                    ProviderZeroConfLimit::NotReportedByReversePairContract,
+                ),
+                1_000,
+                now,
+                FRESH_FOR,
+            )
+            .unwrap_err(),
+            FixedCheckoutReverseQuoteError::AmountOutsideProviderLimits,
+        );
+        assert_eq!(
+            fixed_checkout_reverse_quote(
+                &state(
+                    now.checked_sub(FRESH_FOR + Duration::from_nanos(1))
+                        .unwrap(),
+                    100,
+                    25_000_000,
+                    ProviderZeroConfLimit::NotReportedByReversePairContract,
+                ),
+                1_000,
+                now,
+                FRESH_FOR,
+            )
+            .unwrap_err(),
+            FixedCheckoutReverseQuoteError::SnapshotUnavailable(
+                LightningAddressUnavailable::SnapshotStale,
+            )
+        );
     }
 
     #[test]
@@ -519,6 +761,20 @@ mod tests {
             assert_eq!(
                 observation.validate().unwrap_err(),
                 ReversePairValidationError::InvalidPairRate
+            );
+        }
+
+        for invalid_percentage in [-0.1, 100.0, f64::NAN, f64::INFINITY] {
+            let mut observation = observation(
+                now,
+                100,
+                1_000,
+                ProviderZeroConfLimit::NotReportedByReversePairContract,
+            );
+            observation.quote.fees.percentage = invalid_percentage;
+            assert_eq!(
+                observation.validate().unwrap_err(),
+                ReversePairValidationError::InvalidPercentageFee
             );
         }
     }

@@ -105,6 +105,18 @@
             color: #000;
             border-color: var(--accent);
         }
+        .rail-amount-instruction {
+            font-size: 22px;
+            font-weight: 600;
+            text-align: center;
+            margin-top: 12px;
+        }
+        .rail-cost-note {
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+            margin-top: 4px;
+        }
         .copy-row {
             display: flex;
             gap: 8px;
@@ -184,12 +196,15 @@
         {% if rails_payable %}
             <div class="meta">
                 Accepted:
+                {% if accept_ln %}<span>Lightning</span>{% endif %}
+                {% match liquid_amount_sat %}
+                    {% when Some with (_) %}<span>Liquid</span>
+                    {% when None %}
+                {% endmatch %}
                 {% match bitcoin_chain_address %}
                     {% when Some with (_) %}<span>BTC</span>
                     {% when None %}{% if accept_btc %}<span>BTC</span>{% endif %}
                 {% endmatch %}
-                {% if accept_ln %}<span>Lightning</span>{% endif %}
-                {% if accept_liquid %}<span>Liquid</span>{% endif %}
             </div>
         {% endif %}
 
@@ -214,12 +229,18 @@
 
                 <div class="rail-toggle">
                     {% if accept_ln %}<button id="rail-lightning" type="button">Lightning</button>{% endif %}
+                    {% match liquid_amount_sat %}
+                        {% when Some with (_) %}<button id="rail-liquid" type="button">Liquid</button>
+                        {% when None %}
+                    {% endmatch %}
                     {% match bitcoin_chain_address %}
                         {% when Some with (_) %}<button id="rail-btc" type="button">BTC</button>
                         {% when None %}{% if accept_btc %}<button id="rail-btc" type="button">BTC</button>{% endif %}
                     {% endmatch %}
-                    {% if accept_liquid %}<button id="rail-liquid" type="button">Liquid</button>{% endif %}
                 </div>
+
+                <div class="rail-amount-instruction" id="rail-amount-instruction" hidden></div>
+                <div class="rail-cost-note" id="rail-cost-note" hidden></div>
 
                 <div class="qr-wrap" id="qr-wrap">
                     <div class="qr-placeholder">Loading offer…</div>
@@ -327,10 +348,14 @@
             const ACCEPT_BTC = {{ accept_btc }};
             const ACCEPT_LN = {{ accept_ln }};
             const ACCEPT_LIQUID = {{ accept_liquid }};
+            const INITIAL_LIGHTNING_PR = {{ lightning_pr_js|safe }};
+            const INITIAL_LIGHTNING_AMOUNT_SAT = {% match lightning_amount_sat %}{% when Some with (amount) %}{{ amount }}{% when None %}null{% endmatch %};
             const INITIAL_BITCOIN_ADDRESS = {{ bitcoin_address_js|safe }};
             const INITIAL_BITCOIN_CHAIN_ADDRESS = {{ bitcoin_chain_address_js|safe }};
             const INITIAL_BITCOIN_CHAIN_BIP21 = {{ bitcoin_chain_bip21_js|safe }};
+            const INITIAL_BITCOIN_CHAIN_AMOUNT_SAT = {% match bitcoin_chain_amount_sat %}{% when Some with (amount) %}{{ amount }}{% when None %}null{% endmatch %};
             const INITIAL_LIQUID_ADDRESS = {{ liquid_address_js|safe }};
+            const INITIAL_LIQUID_AMOUNT_SAT = {% match liquid_amount_sat %}{% when Some with (amount) %}{{ amount }}{% when None %}null{% endmatch %};
             const TERMINAL_STATUSES = new Set([
                 "paid", "underpaid", "overpaid", "expired", "cancelled"
             ]);
@@ -381,13 +406,32 @@
             const payloadText = document.getElementById('payload-text');
             const copyBtn = document.getElementById('copy-btn');
             const countdown = document.getElementById('countdown');
+            const railAmountInstruction = document.getElementById('rail-amount-instruction');
+            const railCostNote = document.getElementById('rail-cost-note');
 
-            let currentRail = ACCEPT_LN ? 'lightning' : ((ACCEPT_BTC || INITIAL_BITCOIN_CHAIN_ADDRESS) ? 'bitcoin' : 'liquid');
-            let currentLightningPr = null;
+            let currentRail = ACCEPT_LN
+                ? 'lightning'
+                : (INITIAL_LIQUID_ADDRESS && Number.isSafeInteger(INITIAL_LIQUID_AMOUNT_SAT) && INITIAL_LIQUID_AMOUNT_SAT > 0
+                    ? 'liquid'
+                    : 'bitcoin');
+            let currentLightningAmountSat = Number.isSafeInteger(INITIAL_LIGHTNING_AMOUNT_SAT) && INITIAL_LIGHTNING_AMOUNT_SAT > 0
+                ? INITIAL_LIGHTNING_AMOUNT_SAT
+                : null;
+            let currentLightningPr = INITIAL_LIGHTNING_PR && currentLightningAmountSat !== null
+                ? INITIAL_LIGHTNING_PR
+                : null;
             let currentBitcoinDirectAddress = INITIAL_BITCOIN_ADDRESS || null;
             let currentBitcoinChainAddress = INITIAL_BITCOIN_CHAIN_ADDRESS || null;
             let currentBitcoinChainBip21 = INITIAL_BITCOIN_CHAIN_BIP21 || null;
-            let currentLiquidAddress = INITIAL_LIQUID_ADDRESS || null;
+            let currentBitcoinChainAmountSat = Number.isSafeInteger(INITIAL_BITCOIN_CHAIN_AMOUNT_SAT) && INITIAL_BITCOIN_CHAIN_AMOUNT_SAT > 0
+                ? INITIAL_BITCOIN_CHAIN_AMOUNT_SAT
+                : null;
+            let currentLiquidAmountSat = Number.isSafeInteger(INITIAL_LIQUID_AMOUNT_SAT) && INITIAL_LIQUID_AMOUNT_SAT > 0
+                ? INITIAL_LIQUID_AMOUNT_SAT
+                : null;
+            let currentLiquidAddress = INITIAL_LIQUID_ADDRESS && currentLiquidAmountSat !== null
+                ? INITIAL_LIQUID_ADDRESS
+                : null;
             let currentRailsPayable = {{ rails_payable }};
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
@@ -406,9 +450,75 @@
                 return currentBitcoinChainAddress || currentBitcoinDirectAddress;
             }
 
+            function clearRailAmountInstruction() {
+                if (railAmountInstruction) {
+                    railAmountInstruction.textContent = '';
+                    railAmountInstruction.hidden = true;
+                }
+                if (railCostNote) {
+                    railCostNote.textContent = '';
+                    railCostNote.hidden = true;
+                }
+            }
+
+            function renderBitcoinAmountInstruction(amountSat, isChainOffer) {
+                if (!railAmountInstruction || !Number.isSafeInteger(amountSat) || amountSat <= 0) {
+                    clearRailAmountInstruction();
+                    return;
+                }
+                railAmountInstruction.textContent = `Send ${new Intl.NumberFormat().format(amountSat)} sats`;
+                railAmountInstruction.hidden = false;
+                if (!railCostNote) return;
+                if (isChainOffer) {
+                    const swapCostSat = amountSat - currentAmountSat;
+                    if (!Number.isSafeInteger(swapCostSat) || swapCostSat < 0) {
+                        clearRailAmountInstruction();
+                        return;
+                    }
+                    railCostNote.textContent = `Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs; your wallet may add its own Bitcoin network fee.`;
+                } else {
+                    railCostNote.textContent = 'Your wallet may add its own Bitcoin network fee.';
+                }
+                railCostNote.hidden = false;
+            }
+
+            function renderLightningAmountInstruction() {
+                if (!railAmountInstruction || !Number.isSafeInteger(currentLightningAmountSat) || currentLightningAmountSat <= 0) {
+                    clearRailAmountInstruction();
+                    return false;
+                }
+                railAmountInstruction.textContent = `Send ${new Intl.NumberFormat().format(currentLightningAmountSat)} sats`;
+                railAmountInstruction.hidden = false;
+                if (railCostNote) {
+                    const swapCostSat = currentLightningAmountSat - currentAmountSat;
+                    if (!Number.isSafeInteger(swapCostSat) || swapCostSat < 0) {
+                        clearRailAmountInstruction();
+                        return false;
+                    }
+                    railCostNote.textContent = `Includes ${new Intl.NumberFormat().format(swapCostSat)} sats in swap costs; your wallet may add its own Lightning routing fee.`;
+                    railCostNote.hidden = false;
+                }
+                return true;
+            }
+
+            function renderLiquidAmountInstruction() {
+                if (!railAmountInstruction || !Number.isSafeInteger(currentLiquidAmountSat) || currentLiquidAmountSat <= 0) {
+                    clearRailAmountInstruction();
+                    return false;
+                }
+                railAmountInstruction.textContent = `Send ${new Intl.NumberFormat().format(currentLiquidAmountSat)} sats`;
+                railAmountInstruction.hidden = false;
+                if (railCostNote) {
+                    railCostNote.textContent = 'Your wallet may add its own Liquid network fee.';
+                    railCostNote.hidden = false;
+                }
+                return true;
+            }
+
             function renderBitcoinPayload() {
                 const address = activeBitcoinAddress();
                 if (!address) {
+                    clearRailAmountInstruction();
                     clearQr('Bitcoin address unavailable');
                     return;
                 }
@@ -416,7 +526,16 @@
                 // server returned. Direct BTC may synthesize an exact-remaining
                 // URI; a withdrawn chain lockup may not.
                 const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null;
-                setQrPayload(bitcoinPayload(address, bip21, currentAmountSat));
+                const amountSat = currentBitcoinChainAddress
+                    ? currentBitcoinChainAmountSat
+                    : currentAmountSat;
+                if (!Number.isSafeInteger(amountSat) || amountSat <= 0) {
+                    clearRailAmountInstruction();
+                    clearQr('Bitcoin amount unavailable');
+                    return;
+                }
+                renderBitcoinAmountInstruction(amountSat, !!currentBitcoinChainAddress);
+                setQrPayload(bitcoinPayload(address, bip21, amountSat));
             }
 
             function liquidUri(address, amountSat) {
@@ -447,7 +566,7 @@
                 if (railLiquid) railLiquid.classList.toggle('active', rail === 'liquid');
 
                 if (rail === 'lightning') {
-                    if (currentLightningPr) {
+                    if (currentLightningPr && renderLightningAmountInstruction()) {
                         setQrPayload(currentLightningPr);
                     } else if (currentRailsPayable) {
                         clearQr('Loading Lightning offer…');
@@ -458,8 +577,8 @@
                 } else if (rail === 'bitcoin') {
                     renderBitcoinPayload();
                 } else {
-                    if (currentLiquidAddress) {
-                        setQrPayload(liquidUri(currentLiquidAddress, currentAmountSat));
+                    if (currentLiquidAddress && renderLiquidAmountInstruction()) {
+                        setQrPayload(liquidUri(currentLiquidAddress, currentLiquidAmountSat));
                     } else {
                         clearQr('Liquid address unavailable');
                     }
@@ -483,16 +602,37 @@
                 // Replace the complete nullable snapshot before any status
                 // branch can return. In particular, partial+pending must not
                 // retain a full-amount Lightning or Bitcoin chain offer.
-                currentLightningPr = data.lightning_pr || null;
-                currentLiquidAddress = data.liquid_address || null;
+                const nextLightningAmountSat = Number.isSafeInteger(data.lightning_amount_sat) && data.lightning_amount_sat > 0
+                    ? data.lightning_amount_sat
+                    : null;
+                currentLightningPr = data.lightning_pr && nextLightningAmountSat !== null
+                    ? data.lightning_pr
+                    : null;
+                currentLightningAmountSat = currentLightningPr ? nextLightningAmountSat : null;
+                const nextLiquidAmountSat = Number.isSafeInteger(data.liquid_amount_sat) && data.liquid_amount_sat > 0
+                    ? data.liquid_amount_sat
+                    : null;
+                currentLiquidAddress = data.liquid_address && nextLiquidAmountSat !== null
+                    ? data.liquid_address
+                    : null;
+                currentLiquidAmountSat = currentLiquidAddress ? nextLiquidAmountSat : null;
                 currentBitcoinDirectAddress = data.bitcoin_address || null;
-                currentBitcoinChainAddress = data.bitcoin_chain_address || null;
+                const nextBitcoinChainAmountSat = Number.isSafeInteger(data.bitcoin_chain_amount_sat) && data.bitcoin_chain_amount_sat > 0
+                    ? data.bitcoin_chain_amount_sat
+                    : null;
+                const nextBitcoinChainAddress = data.bitcoin_chain_address || null;
+                currentBitcoinChainAddress = nextBitcoinChainAddress && nextBitcoinChainAmountSat !== null
+                    ? nextBitcoinChainAddress
+                    : null;
+                currentBitcoinChainAmountSat = currentBitcoinChainAddress
+                    ? nextBitcoinChainAmountSat
+                    : null;
                 currentBitcoinChainBip21 = currentBitcoinChainAddress
                     ? (data.bitcoin_chain_bip21 || null)
                     : null;
 
                 if (currentRail === 'lightning') {
-                    if (currentLightningPr) {
+                    if (currentLightningPr && renderLightningAmountInstruction()) {
                         setQrPayload(currentLightningPr);
                     } else if (ACCEPT_LN && statusAllowsPaymentRails(data)) {
                         clearQr('Refreshing Lightning offer…');
@@ -501,8 +641,8 @@
                         clearQr('Payment in progress…');
                     }
                 } else if (currentRail === 'liquid') {
-                    if (currentLiquidAddress) {
-                        setQrPayload(liquidUri(currentLiquidAddress, currentAmountSat));
+                    if (currentLiquidAddress && renderLiquidAmountInstruction()) {
+                        setQrPayload(liquidUri(currentLiquidAddress, currentLiquidAmountSat));
                     } else {
                         clearQr('Liquid address unavailable');
                     }
@@ -519,10 +659,14 @@
                         { method: 'POST' }
                     );
                     const data = await res.json();
-                    if (data.pr) {
+                    const amountSat = Number.isSafeInteger(data.lightning_amount_sat) && data.lightning_amount_sat > 0
+                        ? data.lightning_amount_sat
+                        : null;
+                    if (data.pr && amountSat !== null) {
                         currentLightningPr = data.pr;
+                        currentLightningAmountSat = amountSat;
                         if (currentRail === 'lightning') {
-                            setQrPayload(currentLightningPr);
+                            if (renderLightningAmountInstruction()) setQrPayload(currentLightningPr);
                         }
                     } else {
                         clearQr('Lightning offer unavailable');
@@ -533,8 +677,8 @@
             }
 
             if (railLightning) railLightning.addEventListener('click', () => setRail('lightning'));
-            if (railBtc) railBtc.addEventListener('click', () => setRail('bitcoin'));
             if (railLiquid) railLiquid.addEventListener('click', () => setRail('liquid'));
+            if (railBtc) railBtc.addEventListener('click', () => setRail('bitcoin'));
             if (copyBtn && payloadText) {
                 copyBtn.addEventListener('click', async () => {
                     const text = payloadText.textContent;

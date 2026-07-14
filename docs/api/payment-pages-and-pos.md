@@ -152,18 +152,32 @@ Response:
 {
   "invoice_id": "00000000-0000-0000-0000-000000000000",
   "lightning_pr": "lnbc...",
+  "lightning_amount_sat": 10050,
   "liquid_address": "lq1...",
+  "liquid_amount_sat": 10000,
   "bitcoin_chain_address": "bc1...",
   "bitcoin_chain_bip21": "bitcoin:bc1...?amount=0.0001",
+  "bitcoin_chain_amount_sat": 10000,
   "expires_at_unix": 1760604800
 }
 ```
 
 Checkout invoices have a fixed outer lifetime of seven days. The example
-`expires_at_unix` is illustrative; clients must use the returned value. Bitcoin
-fields may be null. When present on checkout they are Boltz BTC-to-Liquid
-chain-swap addresses, not direct merchant BTC addresses. `lightning_pr` is a
-non-null string but can be empty when eager Boltz reverse-swap creation fails;
+`expires_at_unix` is illustrative; clients must use the returned value. Every
+payload and typed amount is adopted or withdrawn as one instruction.
+`lightning_amount_sat` is the exact BOLT11 principal and includes the
+provider-side reverse-swap costs needed for the merchant to net the checkout
+face value; a payer wallet can add its own Lightning routing fee.
+`liquid_amount_sat` is the exact direct-Liquid amount. Bitcoin fields may be
+null. `bitcoin_chain_address` and
+`bitcoin_chain_amount_sat` are an all-or-none payer instruction; the amount is
+the exact validated Bitcoin user lock and may exceed the merchant invoice
+amount because the payer bears the swap cost. `bitcoin_chain_bip21` normally
+carries that same amount, but clients must use `bitcoin_chain_amount_sat` when
+constructing a fallback URI or displaying a manual-send instruction. These are
+Boltz BTC-to-Liquid chain-swap addresses, not direct merchant BTC addresses.
+`lightning_pr` is a non-null string but can be empty (with a null typed amount)
+when eager Boltz reverse-swap creation fails;
 the Liquid checkout remains valid and the client should later call
 `POST /api/v1/invoices/:id/lightning` to obtain a BOLT11. Creating a checkout
 allocates payment resources and is rate-limited; do not create one merely to

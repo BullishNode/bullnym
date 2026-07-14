@@ -548,9 +548,19 @@ const MAX_INVOICE_NOTE_LEN: usize = 280;
 pub struct CreateInvoiceResponse {
     pub invoice_id: Uuid,
     pub lightning_pr: String,
+    /// Exact BOLT11 principal paired with `lightning_pr`. Null when no
+    /// complete, validated fixed-checkout offer is available.
+    pub lightning_amount_sat: Option<i64>,
     pub liquid_address: String,
+    /// Exact direct-Liquid amount paired with `liquid_address`.
+    pub liquid_amount_sat: Option<i64>,
     pub bitcoin_chain_address: Option<String>,
     pub bitcoin_chain_bip21: Option<String>,
+    /// Exact Bitcoin amount the payer must lock for the chain-swap rail.
+    /// This is the validated Boltz `user_lock_amount_sat`, which can be
+    /// greater than the merchant-facing invoice amount under payer-pays
+    /// pricing. It is present only with a complete chain-swap offer.
+    pub bitcoin_chain_amount_sat: Option<i64>,
     pub expires_at_unix: i64,
 }
 
@@ -781,10 +791,15 @@ async fn create_anonymous_for_kind(
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    let lightning_pr = match create_lightning_offer(&state, Some(&nym), amount_sat as u64, &invoice)
-        .await
+    let lightning_offer = match create_lightning_offer(
+        &state,
+        Some(&nym),
+        amount_sat as u64,
+        &invoice,
+    )
+    .await
     {
-        Ok(pr) => pr,
+        Ok(offer) => Some(offer),
         Err(e) => {
             // Boltz's reverse-swap service can be transiently unavailable
             // (e.g. 502 / timeout while Boltz is under load). Do NOT fail the
@@ -800,7 +815,7 @@ async fn create_anonymous_for_kind(
                 invoice_id = %invoice.id,
                 "eager Lightning offer unavailable; returning checkout invoice with Liquid rail, client will fetch the LN offer lazily: {e}",
             );
-            String::new()
+            None
         }
     };
     let bitcoin_chain_offer =
@@ -817,12 +832,22 @@ async fn create_anonymous_for_kind(
 
     Ok(Json(CreateInvoiceResponse {
         invoice_id: invoice.id,
-        lightning_pr,
+        lightning_pr: lightning_offer
+            .as_ref()
+            .map(|offer| offer.pr.clone())
+            .unwrap_or_default(),
+        lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
         liquid_address,
+        liquid_amount_sat: Some(amount_sat),
         bitcoin_chain_address: bitcoin_chain_offer
             .as_ref()
             .map(|offer| offer.lockup_address.clone()),
-        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
+        bitcoin_chain_bip21: bitcoin_chain_offer
+            .as_ref()
+            .and_then(|offer| offer.lockup_bip21.clone()),
+        bitcoin_chain_amount_sat: bitcoin_chain_offer
+            .as_ref()
+            .map(|offer| offer.payer_amount_sat),
         expires_at_unix: invoice.expires_at_unix,
     }))
 }
@@ -972,6 +997,10 @@ struct InvoicePaymentTpl<'a> {
     accept_ln: bool,
     accept_liquid: bool,
     bitcoin_chain_address: Option<&'a str>,
+    bitcoin_chain_amount_sat: Option<i64>,
+    lightning_pr_js: String,
+    lightning_amount_sat: Option<i64>,
+    liquid_amount_sat: Option<i64>,
     bitcoin_address_js: String,
     bitcoin_chain_address_js: String,
     bitcoin_chain_bip21_js: String,
@@ -1220,6 +1249,8 @@ async fn render_invoice_template(
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
     let rails_payable = invoice_payment_rails_are_payable(&inv);
+    let lightning_offer =
+        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
     let bitcoin_chain_offer = if rails_payable {
         db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
             .await?
@@ -1235,13 +1266,17 @@ async fn render_invoice_template(
         inv.nym_owner.as_deref().unwrap_or("")
     };
     let is_unlinked = inv.nym_owner.is_none();
-    let bitcoin_chain_address = bitcoin_chain_offer
+    let bitcoin_chain_offer = bitcoin_chain_offer
         .as_ref()
-        .map(|offer| offer.lockup_address.as_str());
-    let bitcoin_chain_bip21 = bitcoin_chain_offer
-        .as_ref()
-        .and_then(|offer| offer.lockup_bip21.as_deref());
+        .and_then(payer_exposable_bitcoin_chain_offer);
+    let bitcoin_chain_address = bitcoin_chain_offer.map(|offer| offer.lockup_address);
+    let bitcoin_chain_bip21 = bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21);
+    let bitcoin_chain_amount_sat = bitcoin_chain_offer.map(|offer| offer.payer_amount_sat);
     let direct_addresses = public_direct_payment_addresses(&inv);
+    let liquid_amount_sat = direct_addresses
+        .liquid
+        .filter(|_| rails_payable && remaining_sat > 0)
+        .map(|_| remaining_sat);
     let tpl = InvoicePaymentTpl {
         nym,
         is_unlinked,
@@ -1266,6 +1301,12 @@ async fn render_invoice_template(
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
         bitcoin_chain_address,
+        bitcoin_chain_amount_sat,
+        lightning_pr_js: js_string_literal(
+            lightning_offer.as_ref().map(|offer| offer.pr.as_str()),
+        )?,
+        lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
+        liquid_amount_sat,
         bitcoin_address_js: js_string_literal(direct_addresses.bitcoin)?,
         bitcoin_chain_address_js: js_string_literal(bitcoin_chain_address)?,
         bitcoin_chain_bip21_js: js_string_literal(bitcoin_chain_bip21)?,
@@ -1313,11 +1354,18 @@ pub struct InvoiceStatusResponse {
     pub paid_at_unix: Option<i64>,
     pub paid_amount_sat: Option<i64>,
     pub lightning_pr: Option<String>,
+    /// Exact BOLT11 principal paired with `lightning_pr`.
+    pub lightning_amount_sat: Option<i64>,
     pub liquid_address: Option<String>,
+    /// Exact direct-Liquid amount paired with `liquid_address`.
+    pub liquid_amount_sat: Option<i64>,
     pub bitcoin_address: Option<String>,
     pub bitcoin_direct_observations: Vec<BitcoinDirectObservationResponse>,
     pub bitcoin_chain_address: Option<String>,
     pub bitcoin_chain_bip21: Option<String>,
+    /// Exact payer-side Bitcoin lock amount for `bitcoin_chain_address`.
+    /// Null whenever the chain offer is absent or internally inconsistent.
+    pub bitcoin_chain_amount_sat: Option<i64>,
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
@@ -1374,13 +1422,17 @@ pub async fn status(
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
     let rails_payable = invoice_payment_rails_are_payable(&inv);
-    let lightning_pr = latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
+    let lightning_offer =
+        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
     let bitcoin_chain_offer = if rails_payable {
         db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
             .await?
     } else {
         None
     };
+    let bitcoin_chain_offer = bitcoin_chain_offer
+        .as_ref()
+        .and_then(payer_exposable_bitcoin_chain_offer);
     let tolerance_sat = payment_tolerance_sat(
         &inv,
         db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
@@ -1407,6 +1459,10 @@ pub async fn status(
     let direct_addresses = public_direct_payment_addresses(&inv);
     let bitcoin_address = direct_addresses.bitcoin.map(str::to_owned);
     let liquid_address = direct_addresses.liquid.map(str::to_owned);
+    let liquid_amount_sat = liquid_address
+        .as_ref()
+        .filter(|_| rails_payable && remaining_sat > 0)
+        .map(|_| remaining_sat);
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -1424,14 +1480,16 @@ pub async fn status(
         paid_via: inv.paid_via,
         paid_at_unix: inv.paid_at_unix,
         paid_amount_sat: inv.paid_amount_sat,
-        lightning_pr,
+        lightning_pr: lightning_offer.as_ref().map(|offer| offer.pr.clone()),
+        lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
+        liquid_amount_sat,
         liquid_address,
         bitcoin_address,
         bitcoin_direct_observations,
-        bitcoin_chain_address: bitcoin_chain_offer
-            .as_ref()
-            .map(|offer| offer.lockup_address.clone()),
-        bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
+        bitcoin_chain_address: bitcoin_chain_offer.map(|offer| offer.lockup_address.to_owned()),
+        bitcoin_chain_bip21: bitcoin_chain_offer
+            .and_then(|offer| offer.lockup_bip21.map(str::to_owned)),
+        bitcoin_chain_amount_sat: bitcoin_chain_offer.map(|offer| offer.payer_amount_sat),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
@@ -1445,6 +1503,7 @@ pub async fn status(
 #[derive(Serialize)]
 pub struct LightningOfferResponse {
     pub pr: String,
+    pub lightning_amount_sat: i64,
 }
 
 pub async fn fetch_lightning_offer(
@@ -1489,12 +1548,40 @@ pub async fn fetch_lightning_offer(
         ));
     }
 
-    let pr = ensure_reusable_lightning_offer(&state, &inv)
+    let offer = ensure_reusable_lightning_offer(&state, &inv)
         .await?
         .ok_or_else(|| {
             AppError::InvalidAmount("invoice expired; no Lightning offer available".into())
         })?;
-    Ok(Json(LightningOfferResponse { pr }))
+    Ok(Json(LightningOfferResponse {
+        pr: offer.pr,
+        lightning_amount_sat: offer.payer_amount_sat,
+    }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LightningOffer {
+    pr: String,
+    payer_amount_sat: i64,
+}
+
+/// Reconstruct the exact public payer instruction from persisted BOLT11
+/// authority. Historical face-value reverse swaps are deliberately withheld:
+/// fixed checkout requires a distinct provider-cost gross-up.
+fn fixed_checkout_lightning_offer(pr: String, merchant_amount_sat: i64) -> Option<LightningOffer> {
+    let invoice = Bolt11Invoice::from_str(&pr).ok()?;
+    let amount_msat = invoice.amount_milli_satoshis()?;
+    if amount_msat % 1_000 != 0 {
+        return None;
+    }
+    let payer_amount_sat = i64::try_from(amount_msat / 1_000).ok()?;
+    if merchant_amount_sat <= 0 || payer_amount_sat <= merchant_amount_sat {
+        return None;
+    }
+    Some(LightningOffer {
+        pr,
+        payer_amount_sat,
+    })
 }
 
 /// Return the latest still-payable BOLT11 for an invoice, refreshing it
@@ -1506,7 +1593,7 @@ pub async fn fetch_lightning_offer(
 async fn ensure_reusable_lightning_offer(
     state: &AppState,
     inv: &db::Invoice,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<LightningOffer>, AppError> {
     if !invoice_payment_rails_are_payable(inv) || !inv.accept_ln {
         return Ok(None);
     }
@@ -1568,8 +1655,11 @@ async fn ensure_reusable_lightning_offer(
     let latest = db::latest_lightning_pr_for_invoice(&mut *connection, inv.id).await?;
     if let Some((pr, pr_amount_sat)) = latest {
         if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, now) {
+            let offer = fixed_checkout_lightning_offer(pr, amount_sat);
             connection.unlock().await?;
-            return Ok(Some(pr));
+            if offer.is_some() {
+                return Ok(offer);
+            }
         }
         tracing::info!(
             invoice_id = %current.id,
@@ -1672,7 +1762,7 @@ async fn ensure_reusable_lightning_offer(
                 .into(),
         ));
     }
-    Ok(Some(prepared.lightning_pr))
+    Ok(Some(prepared.public_offer()))
 }
 
 /// Read-only counterpart to `ensure_reusable_lightning_offer`.
@@ -1685,7 +1775,7 @@ async fn latest_reusable_lightning_offer<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     inv: &db::Invoice,
     amount_sat: i64,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<LightningOffer>, AppError> {
     if !invoice_payment_rails_are_payable(inv) || !inv.accept_ln {
         return Ok(None);
     }
@@ -1699,7 +1789,7 @@ async fn latest_reusable_lightning_offer<'e, E: sqlx::PgExecutor<'e>>(
         return Ok(None);
     };
     if pr_amount_sat == amount_sat && bolt11_is_reusable_at(&pr, unix_now()) {
-        Ok(Some(pr))
+        Ok(fixed_checkout_lightning_offer(pr, amount_sat))
     } else {
         Ok(None)
     }
@@ -1806,12 +1896,20 @@ fn percent_encode_query_value(value: &str) -> String {
 struct PreparedLightningOffer {
     swap_id: String,
     lightning_pr: String,
+    payer_amount_sat: i64,
     preimage_hex: String,
     claim_key_hex: String,
     boltz_response_json: String,
 }
 
 impl PreparedLightningOffer {
+    fn public_offer(&self) -> LightningOffer {
+        LightningOffer {
+            pr: self.lightning_pr.clone(),
+            payer_amount_sat: self.payer_amount_sat,
+        }
+    }
+
     fn as_new_swap_record<'a>(
         &'a self,
         swap_nym: Option<&'a str>,
@@ -1855,7 +1953,7 @@ async fn request_lightning_offer(
 
     let result = state
         .boltz
-        .create_reverse_swap(
+        .create_fixed_checkout_reverse_swap(
             derived_key,
             amount_sat,
             boltz_description.description.as_deref(),
@@ -1863,12 +1961,16 @@ async fn request_lightning_offer(
         )
         .await?;
 
+    let payer_amount_sat = i64::try_from(result.payer_amount_sat)
+        .map_err(|_| AppError::BoltzError("fixed checkout payer amount exceeds i64".into()))?;
+    let swap = result.swap;
     Ok(PreparedLightningOffer {
-        swap_id: result.swap_id,
-        lightning_pr: result.invoice,
-        preimage_hex: hex::encode(&result.preimage),
-        claim_key_hex: hex::encode(result.claim_keypair.secret_bytes()),
-        boltz_response_json: serde_json::to_string(&result.boltz_response).map_err(|e| {
+        swap_id: swap.swap_id,
+        lightning_pr: swap.invoice,
+        payer_amount_sat,
+        preimage_hex: hex::encode(&swap.preimage),
+        claim_key_hex: hex::encode(swap.claim_keypair.secret_bytes()),
+        boltz_response_json: serde_json::to_string(&swap.boltz_response).map_err(|e| {
             AppError::BoltzError(format!("failed to serialize boltz response: {e}"))
         })?,
     })
@@ -1883,7 +1985,7 @@ async fn create_lightning_offer(
     swap_nym: Option<&str>,
     amount_sat: u64,
     invoice: &db::Invoice,
-) -> Result<String, AppError> {
+) -> Result<LightningOffer, AppError> {
     state
         .admission
         .enforce(Rail::LightningReverse)
@@ -1934,12 +2036,50 @@ async fn create_lightning_offer(
     if let Some(nym) = swap_nym {
         db::touch_user_callback(&state.db, nym).await;
     }
-    Ok(prepared.lightning_pr)
+    Ok(prepared.public_offer())
 }
 
 struct BitcoinChainOffer {
     lockup_address: String,
     lockup_bip21: Option<String>,
+    payer_amount_sat: i64,
+}
+
+/// Borrowed, all-or-none public projection of one persisted payer offer.
+///
+/// Gross-up is valid only when the exact payer lock amount is positive and at
+/// least the merchant/server lock amount. If historical/corrupt data violates
+/// that relationship, withhold the entire chain instruction instead of
+/// exposing an address with no trustworthy amount.
+#[derive(Clone, Copy)]
+struct PayerExposableBitcoinChainOffer<'a> {
+    lockup_address: &'a str,
+    lockup_bip21: Option<&'a str>,
+    payer_amount_sat: i64,
+}
+
+fn payer_exposable_bitcoin_chain_offer(
+    swap: &db::ChainSwapRecord,
+) -> Option<PayerExposableBitcoinChainOffer<'_>> {
+    if swap.lockup_address.is_empty() {
+        return None;
+    }
+    Some(PayerExposableBitcoinChainOffer {
+        lockup_address: &swap.lockup_address,
+        lockup_bip21: swap.lockup_bip21.as_deref(),
+        payer_amount_sat: validated_payer_chain_amount_sat(
+            swap.user_lock_amount_sat,
+            swap.server_lock_amount_sat,
+        )?,
+    })
+}
+
+fn validated_payer_chain_amount_sat(
+    user_lock_amount_sat: i64,
+    server_lock_amount_sat: i64,
+) -> Option<i64> {
+    (server_lock_amount_sat > 0 && user_lock_amount_sat >= server_lock_amount_sat)
+        .then_some(user_lock_amount_sat)
 }
 
 fn retain_persisted_offer_after_permit_release(
@@ -2137,6 +2277,11 @@ async fn create_bitcoin_chain_offer(
         result.user_lock_amount_sat,
         &public_url,
     );
+    let payer_amount_sat = i64::try_from(result.user_lock_amount_sat).map_err(|_| {
+        AppError::BoltzError(
+            "validated chain-swap payer amount is outside the response range".into(),
+        )
+    })?;
 
     crate::swap_manifest_persistence::persist_created_chain_swap(
         &state.db,
@@ -2163,6 +2308,7 @@ async fn create_bitcoin_chain_offer(
     let offer = BitcoinChainOffer {
         lockup_address: result.lockup_address,
         lockup_bip21: Some(lockup_bip21),
+        payer_amount_sat,
     };
     let release = creation_permit.release().await;
     Ok(Some(retain_persisted_offer_after_permit_release(
