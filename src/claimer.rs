@@ -1575,7 +1575,10 @@ async fn claim_swap_inner(
         ));
     }
 
-    if swap.claim_tx_hex.is_none() && (fee_decision.is_none() || fee_record.is_none()) {
+    if swap.claim_tx_hex.is_none()
+        && (fee_decision.is_none()
+            || fee_record.is_none_or(|record| !record.authorizes_construction_now()))
+    {
         return Ok(ClaimOutcome::PendingFeeUnavailable {
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
         });
@@ -1597,7 +1600,16 @@ async fn claim_swap_inner(
         match BtcLikeTransaction::from_hex(chain, hex)
             .map_err(|e| AppError::ClaimError(format!("decode persisted claim_tx: {e}")))
         {
-            Ok(tx) => tx,
+            Ok(claim_tx) => {
+                if let Err(error) = validate_replayed_liquid_claim_fee_authority(
+                    &swap.claim_fee_authority,
+                    FeeConstructionPurpose::ReverseLiquidClaim,
+                    &claim_tx,
+                ) {
+                    return commit_claim_preparation_error(tx, error).await;
+                }
+                claim_tx
+            }
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
@@ -1642,7 +1654,14 @@ async fn claim_swap_inner(
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
-        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&constructed)?;
+        let (actual_fee_sat, actual_fee_rate_sat_vb, actual_vbytes) =
+            liquid_actual_fee(&constructed)?;
+        ensure_actual_fee_authorized(
+            "Liquid reverse claim",
+            actual_fee_sat,
+            actual_vbytes,
+            fee_record,
+        )?;
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
             fee_record.quoted_at_unix(),
@@ -1669,6 +1688,11 @@ async fn claim_swap_inner(
         } else {
             "script"
         };
+        if !fee_record.authorizes_construction_now() {
+            return Ok(ClaimOutcome::PendingFeeUnavailable {
+                reason: LIQUID_FEE_DECISION_PENDING_REASON,
+            });
+        }
         // `WHERE claim_tx_hex IS NULL` makes this a no-op if a concurrent
         // attempt persisted first (defensive — the advisory lock should
         // have prevented this; the guard is there to fail closed).
@@ -1746,6 +1770,15 @@ async fn claim_swap_inner(
     tx.commit()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    // Cross the commit boundary before selecting bytes for broadcast. The
+    // transaction built above is only an expectation now; reload the durable
+    // journal and compare the full canonical serialization, including witness
+    // bytes that the Liquid txid does not commit to. This makes a successful
+    // commit (rather than process memory) the broadcast authority, while
+    // retaining the same bytes across retries.
+    let expected_hex = serialize_claim_tx_hex(&claim_tx)?;
+    let claim_tx = reload_reverse_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
 
     // Broadcast outside the lock.
     //
@@ -2094,7 +2127,10 @@ async fn claim_chain_swap_inner(
         return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
     }
 
-    if swap.claim_tx_hex.is_none() && (fee_decision.is_none() || fee_record.is_none()) {
+    if swap.claim_tx_hex.is_none()
+        && (fee_decision.is_none()
+            || fee_record.is_none_or(|record| !record.authorizes_construction_now()))
+    {
         return Ok(ClaimOutcome::PendingFeeUnavailable {
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
         });
@@ -2128,7 +2164,16 @@ async fn claim_chain_swap_inner(
         match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
             .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))
         {
-            Ok(tx) => tx,
+            Ok(claim_tx) => {
+                if let Err(error) = validate_replayed_liquid_claim_fee_authority(
+                    &swap.claim_fee_authority,
+                    FeeConstructionPurpose::ChainLiquidClaim,
+                    &claim_tx,
+                ) {
+                    return commit_claim_preparation_error(tx, error).await;
+                }
+                claim_tx
+            }
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
@@ -2167,7 +2212,14 @@ async fn claim_chain_swap_inner(
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
-        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&constructed)?;
+        let (actual_fee_sat, actual_fee_rate_sat_vb, actual_vbytes) =
+            liquid_actual_fee(&constructed)?;
+        ensure_actual_fee_authorized(
+            "Liquid chain claim",
+            actual_fee_sat,
+            actual_vbytes,
+            fee_record,
+        )?;
         let quoted_at = checked_fee_i64(
             "claim_fee_decision_quoted_at_unix",
             fee_record.quoted_at_unix(),
@@ -2189,6 +2241,11 @@ async fn claim_chain_swap_inner(
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         };
         let txid = btc_like_txid(&constructed);
+        if !fee_record.authorizes_construction_now() {
+            return Ok(ClaimOutcome::PendingFeeUnavailable {
+                reason: LIQUID_FEE_DECISION_PENDING_REASON,
+            });
+        }
         let persisted = sqlx::query(
             "UPDATE chain_swap_records \
              SET claim_tx_hex = $2, claim_txid = $3, \
@@ -2259,6 +2316,13 @@ async fn claim_chain_swap_inner(
     tx.commit()
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+
+    // As on the reverse path, only bytes reloaded from the committed journal
+    // may reach the broadcaster. The expected serialization detects any
+    // disagreement between the locked preparation and the post-commit row,
+    // including witness-only changes that do not alter the txid.
+    let expected_hex = serialize_claim_tx_hex(&claim_tx)?;
+    let claim_tx = reload_chain_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
 
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
@@ -2852,7 +2916,101 @@ fn btc_like_txid(tx: &BtcLikeTransaction) -> String {
     }
 }
 
-fn liquid_actual_fee(tx: &BtcLikeTransaction) -> Result<(i64, f64), AppError> {
+fn validate_reloaded_liquid_claim(
+    context: &str,
+    expected_hex: &str,
+    persisted_txid: Option<&str>,
+    persisted_hex: Option<&str>,
+) -> Result<BtcLikeTransaction, AppError> {
+    let persisted_hex = persisted_hex.ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "committed {context} claim bytes disappeared before broadcast"
+        ))
+    })?;
+    let persisted_txid = persisted_txid.ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "committed {context} claim txid disappeared before broadcast"
+        ))
+    })?;
+    if !persisted_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(AppError::ClaimError(format!(
+            "committed {context} claim bytes changed across the commit boundary"
+        )));
+    }
+    let transaction =
+        BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), persisted_hex).map_err(
+            |error| {
+                AppError::ClaimError(format!(
+                    "decode committed {context} claim transaction: {error}"
+                ))
+            },
+        )?;
+    let decoded_txid = btc_like_txid(&transaction);
+    if !decoded_txid.eq_ignore_ascii_case(persisted_txid) {
+        return Err(AppError::ClaimError(format!(
+            "committed {context} claim bytes do not match the committed txid"
+        )));
+    }
+    let canonical_hex = serialize_claim_tx_hex(&transaction)?;
+    if !canonical_hex.eq_ignore_ascii_case(persisted_hex) {
+        return Err(AppError::ClaimError(format!(
+            "committed {context} claim bytes are not a canonical transaction encoding"
+        )));
+    }
+    Ok(transaction)
+}
+
+async fn reload_reverse_claim_for_broadcast(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+    expected_hex: &str,
+) -> Result<BtcLikeTransaction, AppError> {
+    let persisted = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT claim_txid, claim_tx_hex FROM swap_records WHERE id = $1",
+    )
+    .bind(swap_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?
+    .ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "reverse swap {swap_id} disappeared before claim broadcast"
+        ))
+    })?;
+    validate_reloaded_liquid_claim(
+        "reverse",
+        expected_hex,
+        persisted.0.as_deref(),
+        persisted.1.as_deref(),
+    )
+}
+
+async fn reload_chain_claim_for_broadcast(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+    expected_hex: &str,
+) -> Result<BtcLikeTransaction, AppError> {
+    let persisted = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT claim_txid, claim_tx_hex FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?
+    .ok_or_else(|| {
+        AppError::ClaimError(format!(
+            "chain swap {chain_swap_id} disappeared before claim broadcast"
+        ))
+    })?;
+    validate_reloaded_liquid_claim(
+        "chain",
+        expected_hex,
+        persisted.0.as_deref(),
+        persisted.1.as_deref(),
+    )
+}
+
+fn liquid_actual_fee(tx: &BtcLikeTransaction) -> Result<(i64, f64, u64), AppError> {
     let BtcLikeTransaction::Liquid(transaction) = tx else {
         return Err(AppError::ClaimError(
             "Liquid claim builder returned a non-Liquid transaction".into(),
@@ -2894,9 +3052,65 @@ fn liquid_actual_fee(tx: &BtcLikeTransaction) -> Result<(i64, f64), AppError> {
             "constructed Liquid claim has zero discounted virtual size".into(),
         ));
     }
+    let discounted_vbytes = u64::try_from(vsize).map_err(|_| {
+        AppError::ClaimError("Liquid claim discounted virtual size exceeds u64".into())
+    })?;
     let fee_sat_i64 = i64::try_from(fee_sat)
         .map_err(|_| AppError::ClaimError("Liquid claim fee exceeds BIGINT storage".into()))?;
-    Ok((fee_sat_i64, fee_sat as f64 / vsize as f64))
+    Ok((
+        fee_sat_i64,
+        fee_sat as f64 / vsize as f64,
+        discounted_vbytes,
+    ))
+}
+
+fn ensure_actual_fee_authorized(
+    context: &str,
+    actual_fee_sat: i64,
+    actual_vbytes: u64,
+    fee_record: &FeeDecisionRecord,
+) -> Result<(), AppError> {
+    let actual_fee_sat = u64::try_from(actual_fee_sat)
+        .map_err(|_| AppError::ClaimError(format!("{context} fee is negative")))?;
+    let exact_fee_sat = fee_record
+        .exact_authorized_fee_sat(actual_vbytes)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "{context} fee bound cannot be represented for {actual_vbytes} vbytes: {error}"
+            ))
+        })?;
+    if actual_fee_sat != exact_fee_sat {
+        return Err(AppError::ClaimError(format!(
+            "{context} fee {actual_fee_sat} sat does not match exact accepted decision fee {exact_fee_sat} sat for {actual_vbytes} vbytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_replayed_liquid_claim_fee_authority(
+    authority: &db::LiquidClaimFeeAuthority,
+    expected_purpose: FeeConstructionPurpose,
+    claim_tx: &BtcLikeTransaction,
+) -> Result<(), AppError> {
+    // Pre-054 bytes are intentionally replayable without inventing authority
+    // that did not exist at construction time. Every complete post-054 packet
+    // is instead checked against values rederived from the exact stored bytes.
+    if authority.is_legacy() {
+        return Ok(());
+    }
+    let (actual_fee_sat, actual_fee_rate_sat_vb, discounted_vbytes) = liquid_actual_fee(claim_tx)?;
+    authority
+        .validate_replayed_claim(
+            expected_purpose,
+            actual_fee_sat,
+            actual_fee_rate_sat_vb,
+            discounted_vbytes,
+        )
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "invalid persisted Liquid claim fee authority: {error}"
+            ))
+        })
 }
 
 fn checked_fee_i64(field: &'static str, value: u64) -> Result<i64, AppError> {

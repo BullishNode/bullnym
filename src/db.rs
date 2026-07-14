@@ -1,3 +1,4 @@
+mod bitcoin_recovery_fee_authority;
 mod chain_swap_attempts;
 mod chain_swaps;
 mod direct_payments;
@@ -5,6 +6,7 @@ mod donation_pages;
 mod fee_observations;
 mod fee_runtime_persistence;
 mod invoices;
+mod liquid_claim_fee_authority;
 mod local_chain_swap_recovery_snapshot;
 mod manifest_deliveries;
 mod manifest_staging_evidence;
@@ -16,6 +18,7 @@ mod swaps;
 mod users;
 mod watcher;
 
+pub use bitcoin_recovery_fee_authority::*;
 pub use chain_swap_attempts::*;
 pub use chain_swaps::*;
 pub use direct_payments::*;
@@ -23,6 +26,7 @@ pub use donation_pages::*;
 pub use fee_observations::*;
 pub use fee_runtime_persistence::*;
 pub use invoices::*;
+pub use liquid_claim_fee_authority::*;
 pub use local_chain_swap_recovery_snapshot::*;
 pub use manifest_deliveries::*;
 pub use manifest_staging_evidence::*;

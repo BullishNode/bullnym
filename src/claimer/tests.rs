@@ -116,11 +116,38 @@ fn liquid_actual_fee_uses_discounted_virtual_size_basis() {
     };
     assert_ne!(transaction.vsize(), transaction.discount_vsize());
 
-    let (fee_sat, rate_sat_vb) =
+    let (fee_sat, rate_sat_vb, discounted_vbytes) =
         liquid_actual_fee(&BtcLikeTransaction::Liquid(transaction.clone())).unwrap();
 
     assert_eq!(fee_sat, 1_000);
     assert_eq!(rate_sat_vb, 1_000.0 / transaction.discount_vsize() as f64);
+    assert_eq!(discounted_vbytes, transaction.discount_vsize() as u64);
+}
+
+#[test]
+fn liquid_fee_authority_rejects_one_sat_under_and_over_the_exact_size_fee() {
+    let policy = LiquidFeePolicy::default();
+    let observation = LiveLiquid::new(
+        SatPerVbyte::try_from(0.5).unwrap(),
+        1_000,
+        FeeProvenance::new("claimer-exact-fee-test").unwrap(),
+    );
+    let decision = policy
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap();
+    let record = FeeDecisionRecord::from_liquid(
+        FeeConstructionPurpose::ReverseLiquidClaim,
+        &decision,
+        &policy,
+        1_000,
+    )
+    .unwrap();
+
+    // ceil(0.5 sat/vB * 141 vB) = 71 sat.
+    assert!(ensure_actual_fee_authorized("test claim", 71, 141, &record).is_ok());
+    for unauthorized in [70, 72] {
+        assert!(ensure_actual_fee_authorized("test claim", unauthorized, 141, &record).is_err());
+    }
 }
 
 #[test]
@@ -438,6 +465,40 @@ fn test_boltz_liquid_tx(
             script_pubkey,
             witness: boltz_elements::TxOutWitness::default(),
         }],
+    }
+}
+
+#[test]
+fn reloaded_liquid_claim_requires_exact_committed_bytes_and_txid() {
+    let outpoint = boltz_elements::OutPoint::new("00".repeat(32).parse().expect("test txid"), 0);
+    let transaction = BtcLikeTransaction::Liquid(test_boltz_liquid_tx(
+        Some(outpoint),
+        boltz_elements::Script::from(vec![0x51]),
+    ));
+    let txid = btc_like_txid(&transaction);
+    let hex = serialize_claim_tx_hex(&transaction).unwrap();
+
+    let reloaded = validate_reloaded_liquid_claim("test", &hex, Some(&txid), Some(&hex)).unwrap();
+    assert_eq!(btc_like_txid(&reloaded), txid);
+
+    let other_txid = "00".repeat(32);
+    let mut witness_changed = match transaction {
+        BtcLikeTransaction::Liquid(transaction) => transaction,
+        BtcLikeTransaction::Bitcoin(_) => unreachable!("test transaction is Liquid"),
+    };
+    witness_changed.input[0].witness.script_witness = vec![vec![1]];
+    assert_eq!(witness_changed.txid().to_string(), txid);
+    let witness_changed_hex =
+        serialize_claim_tx_hex(&BtcLikeTransaction::Liquid(witness_changed)).unwrap();
+
+    for result in [
+        validate_reloaded_liquid_claim("test", &hex, None, Some(&hex)),
+        validate_reloaded_liquid_claim("test", &hex, Some(&txid), None),
+        validate_reloaded_liquid_claim("test", &hex, Some(&other_txid), Some(&hex)),
+        validate_reloaded_liquid_claim("test", &hex, Some(&txid), Some(&witness_changed_hex)),
+        validate_reloaded_liquid_claim("test", "00", Some(&txid), Some("00")),
+    ] {
+        assert!(matches!(result, Err(AppError::ClaimError(_))));
     }
 }
 

@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 use crate::fee_decision_record::FeeDecisionRecord;
 
+use super::{BitcoinRecoveryFeeAuthority, BitcoinRecoveryFeeAuthorityRow};
+
 /// Complete previous-output evidence for one Bitcoin recovery input.  Keeping
 /// the amount and script with the outpoint makes the journal independently
 /// auditable and supplies the exact material a later explicit replacement
@@ -45,21 +47,10 @@ pub struct ChainSwapTxAttempt {
     pub destination_amount_sat: i64,
     pub fee_amount_sat: i64,
     pub fee_rate_sat_vb: f64,
-    /// Nullable only for immutable attempts journaled before migration 054.
-    /// The database requires the complete metadata shape on every new insert.
-    pub fee_decision_purpose: Option<String>,
-    pub fee_decision_rail: Option<String>,
-    pub fee_decision_target: Option<String>,
-    pub fee_decision_source: Option<String>,
-    pub fee_decision_rate_sat_vb: Option<f64>,
-    pub fee_decision_quoted_at_unix: Option<i64>,
-    pub fee_decision_evaluated_at_unix: Option<i64>,
-    pub fee_decision_freshness_age_secs: Option<i64>,
-    pub fee_decision_freshness_max_age_secs: Option<i64>,
-    pub fee_decision_provenance: Option<String>,
-    pub fee_decision_policy_floor_sat_vb: Option<f64>,
-    pub fee_decision_policy_cap_sat_vb: Option<f64>,
-    pub fee_decision_policy_version: Option<String>,
+    /// All-null for immutable pre-054 attempts; a complete, validated
+    /// schema-054 decision packet for every newer journal entry.
+    #[sqlx(flatten, try_from = "BitcoinRecoveryFeeAuthorityRow")]
+    pub fee_authority: BitcoinRecoveryFeeAuthority,
     pub status: String,
     pub broadcast_attempts: i32,
     pub last_broadcast_result: Option<String>,

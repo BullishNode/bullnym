@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::ClaimFailureOutcome;
+use super::{ClaimFailureOutcome, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSwapStatus {
@@ -644,6 +644,10 @@ pub struct ChainSwapRecord {
     pub status: String,
     pub claim_txid: Option<String>,
     pub claim_tx_hex: Option<String>,
+    /// All-null for unjournaled rows and immutable pre-054 claim bytes; a
+    /// complete, validated schema-054 packet for every newer claim journal.
+    #[sqlx(flatten, try_from = "LiquidClaimFeeAuthorityRow")]
+    pub claim_fee_authority: LiquidClaimFeeAuthority,
     pub claim_attempts: i32,
     pub last_claim_error: Option<String>,
     pub cooperative_refused: bool,
@@ -724,7 +728,16 @@ const CHAIN_SWAP_RECORD_COLUMNS: &str =
     "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
-     claim_tx_hex, claim_attempts, last_claim_error, cooperative_refused, \
+     claim_tx_hex, claim_actual_fee_sat, claim_actual_fee_rate_sat_vb, \
+     claim_fee_decision_purpose, claim_fee_decision_rail, \
+     claim_fee_decision_target, claim_fee_decision_source, \
+     claim_fee_decision_rate_sat_vb, claim_fee_decision_quoted_at_unix, \
+     claim_fee_decision_evaluated_at_unix, \
+     claim_fee_decision_freshness_age_secs, \
+     claim_fee_decision_freshness_max_age_secs, claim_fee_decision_provenance, \
+     claim_fee_decision_policy_floor_sat_vb, \
+     claim_fee_decision_policy_cap_sat_vb, claim_fee_decision_policy_version, \
+     claim_attempts, last_claim_error, cooperative_refused, \
      CASE WHEN pinned_pair_hash IS NULL THEN NULL ELSE jsonb_build_object( \
          'pinned_pair_hash', pinned_pair_hash, \
          'canonical_pair_quote_json', canonical_pair_quote_json, \

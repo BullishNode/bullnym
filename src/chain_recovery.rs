@@ -333,13 +333,7 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<String, AppError> {
-    let fee_record = fee_decision
-        .map(bitcoin_fee_record_for_compatibility_seam)
-        .transpose()?;
-    let construction_fee = match fee_decision.zip(fee_record.as_ref()) {
-        Some((decision, record)) => RecoveryConstructionFee::new(decision, record),
-        None => RecoveryConstructionFee::unavailable(),
-    };
+    let construction_fee = RecoveryConstructionFee::compatibility(fee_decision);
     execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
@@ -355,6 +349,7 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
 struct RecoveryConstructionFee<'a> {
     builder_decision: Option<BitcoinBuilderFeeDecision>,
     record: Option<&'a FeeDecisionRecord>,
+    compatibility_record: Option<Result<FeeDecisionRecord, AppError>>,
 }
 
 impl<'a> RecoveryConstructionFee<'a> {
@@ -362,6 +357,18 @@ impl<'a> RecoveryConstructionFee<'a> {
         Self {
             builder_decision: Some(BitcoinBuilderFeeDecision::from(decision)),
             record: Some(record),
+            compatibility_record: None,
+        }
+    }
+
+    fn compatibility(decision: Option<&BitcoinFeeDecision>) -> Self {
+        Self {
+            builder_decision: decision.map(BitcoinBuilderFeeDecision::from),
+            record: None,
+            // Capture the monotonic authority before any pool/lock wait, but
+            // defer an unusable-record error until the core proves that no
+            // committed bytes exist to replay.
+            compatibility_record: decision.map(bitcoin_fee_record_for_compatibility_seam),
         }
     }
 
@@ -369,6 +376,7 @@ impl<'a> RecoveryConstructionFee<'a> {
         Self {
             builder_decision: None,
             record: None,
+            compatibility_record: None,
         }
     }
 }
@@ -386,8 +394,7 @@ async fn execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
         builder,
-        construction_fee.builder_decision,
-        construction_fee.record,
+        construction_fee,
         evidence,
         faults,
     )
@@ -489,8 +496,7 @@ async fn prepare_or_reload_attempt(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
-    fee_decision: Option<BitcoinBuilderFeeDecision>,
-    fee_record: Option<&FeeDecisionRecord>,
+    construction_fee: RecoveryConstructionFee<'_>,
     evidence: &dyn BitcoinRecoveryEvidence,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<ChainSwapTxAttempt, AppError> {
@@ -521,6 +527,9 @@ async fn prepare_or_reload_attempt(
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
     if let Some(attempt) = existing {
+        // Validate the immutable bytes and their construction-time authority
+        // before repairing any parent lifecycle state.
+        validate_reloaded_attempt(&attempt)?;
         if attempt.status == "integrity_hold" {
             return Err(AppError::ClaimError(format!(
                 "recovery attempt is on integrity hold: {}",
@@ -586,23 +595,44 @@ async fn prepare_or_reload_attempt(
     let destination = swap.refund_address.clone().ok_or_else(|| {
         AppError::ClaimError("chain swap recovery has no committed destination".into())
     })?;
-    let fee_decision = fee_decision.ok_or_else(|| {
+    // Compatibility authority was captured before the pool/lock wait, but its
+    // result is deliberately inspected only after the existing-journal branch:
+    // replay never consults new-construction authority.
+    let compatibility_record = construction_fee.compatibility_record.transpose()?;
+    let fee_decision = construction_fee.builder_decision.ok_or_else(|| {
         AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
     })?;
-    let fee_record = fee_record.ok_or_else(|| {
-        AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
-    })?;
+    let fee_record = construction_fee
+        .record
+        .or(compatibility_record.as_ref())
+        .ok_or_else(|| {
+            AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
+        })?;
+    if !fee_record.authorizes_construction_now() {
+        return Err(AppError::RecoveryNotAvailable(
+            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+        ));
+    }
 
     faults.check(RecoveryFaultPoint::BeforeConstruction)?;
     let transaction = builder.construct(&swap, &destination, fee_decision).await?;
     let prepared =
-        validate_constructed_attempt(&swap, &destination, &transaction, evidence).await?;
+        validate_constructed_attempt(&swap, &destination, &transaction, fee_record, evidence)
+            .await?;
     faults.check(RecoveryFaultPoint::AfterConstructionBeforeJournal)?;
+    if !fee_record.authorizes_construction_now() {
+        return Err(AppError::RecoveryNotAvailable(
+            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+        ));
+    }
 
     let new_attempt = prepared.as_new(swap.id, fee_record);
     let attempt = db::insert_bitcoin_recovery_attempt(&mut tx, &new_attempt)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    // A faulty builder or inconsistent decision must roll back with the
+    // journal instead of committing an unreplayable immutable attempt.
+    validate_reloaded_attempt(&attempt)?;
     let rows = db::mark_chain_swap_refunding(&mut *tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -623,6 +653,7 @@ async fn validate_constructed_attempt(
     swap: &ChainSwapRecord,
     destination: &str,
     transaction: &BtcLikeTransaction,
+    fee_record: &FeeDecisionRecord,
     evidence: &dyn BitcoinRecoveryEvidence,
 ) -> Result<PreparedAttempt, AppError> {
     let BtcLikeTransaction::Bitcoin(tx) = transaction else {
@@ -728,6 +759,21 @@ async fn validate_constructed_attempt(
             "Bitcoin recovery transaction has zero virtual size".into(),
         ));
     }
+    let vbytes = u64::try_from(vsize).map_err(|_| {
+        AppError::ClaimError("Bitcoin recovery virtual size exceeds fee-policy range".into())
+    })?;
+    let exact_fee_sat = fee_record
+        .exact_authorized_fee_sat(vbytes)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "Bitcoin recovery fee bound cannot be represented for {vbytes} vbytes: {error}"
+            ))
+        })?;
+    if fee_amount_sat != exact_fee_sat {
+        return Err(AppError::ClaimError(format!(
+            "Bitcoin recovery fee {fee_amount_sat} sat does not match exact accepted decision fee {exact_fee_sat} sat for {vbytes} vbytes"
+        )));
+    }
     let raw_tx_hex = hex::encode(serialize(tx));
     let txid = tx.compute_txid().to_string();
     let destination_amount_sat = i64::try_from(tx.output[0].value.to_sat()).map_err(|_| {
@@ -815,12 +861,18 @@ fn validate_reloaded_attempt(attempt: &ChainSwapTxAttempt) -> Result<(), AppErro
             "journaled recovery bytes do not match the journaled txid".into(),
         ));
     }
+    let destination_vout = usize::try_from(attempt.destination_vout).map_err(|_| {
+        AppError::ClaimError("journaled recovery destination vout is negative".into())
+    })?;
     let output = tx
         .output
-        .get(attempt.destination_vout as usize)
+        .get(destination_vout)
         .ok_or_else(|| AppError::ClaimError("journaled recovery output is missing".into()))?;
+    let destination_amount_sat = i64::try_from(output.value.to_sat()).map_err(|_| {
+        AppError::ClaimError("journaled recovery destination amount exceeds database range".into())
+    })?;
     if hex::encode(output.script_pubkey.as_bytes()) != attempt.destination_script_hex
-        || output.value.to_sat() as i64 != attempt.destination_amount_sat
+        || destination_amount_sat != attempt.destination_amount_sat
     {
         return Err(AppError::ClaimError(
             "journaled recovery bytes do not match the committed merchant output".into(),
@@ -840,7 +892,73 @@ fn validate_reloaded_attempt(attempt: &ChainSwapTxAttempt) -> Result<(), AppErro
             "journaled recovery bytes do not match the committed source outpoints".into(),
         ));
     }
+    validate_reloaded_fee_intent(
+        &attempt.source_prevouts.0,
+        &tx,
+        attempt.fee_amount_sat,
+        attempt.fee_rate_sat_vb,
+        &attempt.fee_authority,
+    )?;
     Ok(())
+}
+
+fn validate_reloaded_fee_intent(
+    source_prevouts: &[RecoverySourcePrevout],
+    tx: &Transaction,
+    stored_fee_amount_sat: i64,
+    stored_fee_rate_sat_vb: f64,
+    fee_authority: &db::BitcoinRecoveryFeeAuthority,
+) -> Result<(), AppError> {
+    let total_input_sat = source_prevouts.iter().try_fold(0u64, |sum, source| {
+        sum.checked_add(source.amount_sat)
+            .ok_or_else(|| AppError::ClaimError("journaled recovery input amount overflow".into()))
+    })?;
+    let total_output_sat = tx.output.iter().try_fold(0u64, |sum, output| {
+        sum.checked_add(output.value.to_sat())
+            .ok_or_else(|| AppError::ClaimError("journaled recovery output amount overflow".into()))
+    })?;
+    let derived_fee_amount_sat =
+        total_input_sat
+            .checked_sub(total_output_sat)
+            .ok_or_else(|| {
+                AppError::ClaimError(
+                    "journaled recovery transaction spends more than its recorded inputs".into(),
+                )
+            })?;
+    if derived_fee_amount_sat == 0 {
+        return Err(AppError::ClaimError(
+            "journaled recovery transaction has a zero miner fee".into(),
+        ));
+    }
+    let stored_fee_amount_sat = u64::try_from(stored_fee_amount_sat).map_err(|_| {
+        AppError::ClaimError("journaled recovery fee amount is outside database range".into())
+    })?;
+    if stored_fee_amount_sat != derived_fee_amount_sat {
+        return Err(AppError::ClaimError(
+            "journaled recovery bytes do not match the committed fee amount".into(),
+        ));
+    }
+    let final_vsize = tx.vsize();
+    if final_vsize == 0 {
+        return Err(AppError::ClaimError(
+            "journaled recovery transaction has zero virtual size".into(),
+        ));
+    }
+    let derived_fee_rate_sat_vb = derived_fee_amount_sat as f64 / final_vsize as f64;
+    if stored_fee_rate_sat_vb.to_bits() != derived_fee_rate_sat_vb.to_bits() {
+        return Err(AppError::ClaimError(
+            "journaled recovery bytes do not match the committed fee rate".into(),
+        ));
+    }
+    let final_vbytes = u64::try_from(final_vsize)
+        .map_err(|_| AppError::ClaimError("journaled recovery virtual size exceeds u64".into()))?;
+    fee_authority
+        .validate_replayed_fee(derived_fee_amount_sat, final_vbytes)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "invalid journaled Bitcoin recovery fee authority: {error}"
+            ))
+        })
 }
 
 enum EvidenceDecision {
@@ -1057,10 +1175,14 @@ async fn construct_live_refund(
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use boltz_client::util::fees::Fee;
 
-    use super::{bitcoin_recovery_fee, BitcoinRecoveryBackend};
+    use super::{bitcoin_recovery_fee, validate_reloaded_fee_intent, BitcoinRecoveryBackend};
     use crate::builder_fee::BitcoinBuilderFeeDecision;
+    use crate::db::{BitcoinRecoveryFeeAuthority, RecoverySourcePrevout};
     use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
 
     fn bitcoin_builder_fee(rate: f64) -> BitcoinBuilderFeeDecision {
@@ -1082,6 +1204,32 @@ mod tests {
         }
     }
 
+    fn replay_fee_fixture() -> (Transaction, Vec<RecoverySourcePrevout>, i64, f64) {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let fee_amount_sat = 1_000;
+        let fee_rate_sat_vb = fee_amount_sat as f64 / tx.vsize() as f64;
+        let sources = vec![RecoverySourcePrevout {
+            txid: OutPoint::null().txid.to_string(),
+            vout: 0,
+            amount_sat: 10_000,
+            script_pubkey_hex: String::new(),
+        }];
+        (tx, sources, fee_amount_sat, fee_rate_sat_vb)
+    }
+
     #[test]
     fn bitcoin_recovery_preserves_upstream_min_midrange_and_max_rates() {
         // Representative upstream policy boundary values. This construction
@@ -1090,6 +1238,57 @@ mod tests {
             let decision = bitcoin_builder_fee(rate);
             assert_eq!(relative_fee_rate(bitcoin_recovery_fee(decision)), rate);
         }
+    }
+
+    #[test]
+    fn legacy_replay_still_binds_raw_fee_amount_and_exact_rate() {
+        let (tx, sources, fee_amount_sat, fee_rate_sat_vb) = replay_fee_fixture();
+        validate_reloaded_fee_intent(
+            &sources,
+            &tx,
+            fee_amount_sat,
+            fee_rate_sat_vb,
+            &BitcoinRecoveryFeeAuthority::Legacy,
+        )
+        .unwrap();
+
+        assert!(validate_reloaded_fee_intent(
+            &sources,
+            &tx,
+            fee_amount_sat - 1,
+            fee_rate_sat_vb,
+            &BitcoinRecoveryFeeAuthority::Legacy,
+        )
+        .is_err());
+        assert!(validate_reloaded_fee_intent(
+            &sources,
+            &tx,
+            fee_amount_sat,
+            f64::from_bits(fee_rate_sat_vb.to_bits() + 1),
+            &BitcoinRecoveryFeeAuthority::Legacy,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replay_fee_derivation_subtracts_every_output() {
+        let (mut tx, sources, fee_amount_sat, _) = replay_fee_fixture();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        });
+        // Match the enlarged transaction's vsize while retaining the old fee
+        // amount. An implementation that ignored the extra output would now
+        // pass both stored fee checks; the correct all-output sum rejects it.
+        let rate_if_extra_output_were_ignored = fee_amount_sat as f64 / tx.vsize() as f64;
+        assert!(validate_reloaded_fee_intent(
+            &sources,
+            &tx,
+            fee_amount_sat,
+            rate_if_extra_output_were_ignored,
+            &BitcoinRecoveryFeeAuthority::Legacy,
+        )
+        .is_err());
     }
 
     #[test]
