@@ -140,10 +140,10 @@ fn reduce_chain_swap_provider_status(
                 ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed
             )
         {
-            // Expiry/failure can arrive before local payer-lock evidence. The
-            // one-way refusal fact is not recovery authority by itself, but it
-            // combines with a later user lock exactly as the opposite delivery
-            // order does.
+            // A concrete funding failure can arrive before local payer-lock
+            // evidence. The one-way failure fact is not recovery authority by
+            // itself, but it combines with a later user lock exactly as the
+            // opposite delivery order does.
             return ChainSwapProviderDecision {
                 status: ChainSwapStatus::RefundDue,
                 cooperative_refused,
@@ -184,8 +184,13 @@ fn reduce_chain_swap_provider_status(
                     cooperative_refused: true,
                 }
             }
-            ChainSwapStatus::Pending
-            | ChainSwapStatus::ServerLockMempool
+            // Pending provider expiry is not independent chain evidence and
+            // must remain a true no-op even if this fold is called directly.
+            ChainSwapStatus::Pending => ChainSwapProviderDecision {
+                status: current,
+                cooperative_refused,
+            },
+            ChainSwapStatus::ServerLockMempool
             | ChainSwapStatus::ServerLockConfirmed
             | ChainSwapStatus::Claiming
             | ChainSwapStatus::ClaimFailed => ChainSwapProviderDecision {
@@ -348,8 +353,8 @@ mod provider_transition_tests {
                 ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
                     (ChainSwapStatus::RefundDue, true)
                 }
-                ChainSwapStatus::Pending
-                | ChainSwapStatus::ServerLockMempool
+                ChainSwapStatus::Pending => (current, false),
+                ChainSwapStatus::ServerLockMempool
                 | ChainSwapStatus::ServerLockConfirmed
                 | ChainSwapStatus::Claiming
                 | ChainSwapStatus::ClaimFailed => (current, true),
@@ -424,45 +429,77 @@ mod provider_transition_tests {
     }
 
     #[test]
-    fn early_failure_or_expiry_combines_with_later_user_lock_in_either_order() {
-        for failure in [
-            ChainSwapProviderStatusInput::FundingFailed,
-            ChainSwapProviderStatusInput::SwapExpired,
-        ] {
-            let failure_first =
-                reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, failure);
-            assert_eq!(failure_first.status, ChainSwapStatus::Pending);
-            assert!(failure_first.cooperative_refused);
-            assert_eq!(
-                reduce_chain_swap_provider_status(
-                    failure_first.status,
-                    failure_first.cooperative_refused,
-                    failure,
-                ),
-                failure_first,
-                "duplicate failure evidence must be a no-op"
-            );
-            let user_after = reduce_chain_swap_provider_status(
+    fn early_funding_failure_combines_with_later_user_lock_in_either_order() {
+        let failure = ChainSwapProviderStatusInput::FundingFailed;
+        let failure_first =
+            reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, failure);
+        assert_eq!(failure_first.status, ChainSwapStatus::Pending);
+        assert!(failure_first.cooperative_refused);
+        assert_eq!(
+            reduce_chain_swap_provider_status(
                 failure_first.status,
                 failure_first.cooperative_refused,
-                ChainSwapProviderStatusInput::UserLockConfirmed,
-            );
-
-            let user_first = reduce_chain_swap_provider_status(
-                ChainSwapStatus::Pending,
-                false,
-                ChainSwapProviderStatusInput::UserLockConfirmed,
-            );
-            let failure_after = reduce_chain_swap_provider_status(
-                user_first.status,
-                user_first.cooperative_refused,
                 failure,
-            );
+            ),
+            failure_first,
+            "duplicate failure evidence must be a no-op"
+        );
+        let user_after = reduce_chain_swap_provider_status(
+            failure_first.status,
+            failure_first.cooperative_refused,
+            ChainSwapProviderStatusInput::UserLockConfirmed,
+        );
 
-            assert_eq!(user_after, failure_after, "failure={failure:?}");
-            assert_eq!(user_after.status, ChainSwapStatus::RefundDue);
-            assert!(user_after.cooperative_refused);
-        }
+        let user_first = reduce_chain_swap_provider_status(
+            ChainSwapStatus::Pending,
+            false,
+            ChainSwapProviderStatusInput::UserLockConfirmed,
+        );
+        let failure_after = reduce_chain_swap_provider_status(
+            user_first.status,
+            user_first.cooperative_refused,
+            failure,
+        );
+
+        assert_eq!(user_after, failure_after);
+        assert_eq!(user_after.status, ChainSwapStatus::RefundDue);
+        assert!(user_after.cooperative_refused);
+    }
+
+    #[test]
+    fn pending_expiry_is_not_recovery_authority() {
+        let expiry = ChainSwapProviderStatusInput::SwapExpired;
+        let expiry_first =
+            reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, expiry);
+        assert_eq!(
+            expiry_first,
+            ChainSwapProviderDecision {
+                status: ChainSwapStatus::Pending,
+                cooperative_refused: false,
+            }
+        );
+        assert_eq!(
+            reduce_chain_swap_provider_status(
+                expiry_first.status,
+                expiry_first.cooperative_refused,
+                expiry,
+            ),
+            expiry_first,
+            "duplicate pending expiry must remain a no-op"
+        );
+
+        let user_after = reduce_chain_swap_provider_status(
+            expiry_first.status,
+            expiry_first.cooperative_refused,
+            ChainSwapProviderStatusInput::UserLockConfirmed,
+        );
+        assert_eq!(user_after.status, ChainSwapStatus::UserLockConfirmed);
+        assert!(!user_after.cooperative_refused);
+
+        // Keep the funded branch unchanged in this narrow integration slice.
+        let expiry_after_user = reduce_chain_swap_provider_status(user_after.status, false, expiry);
+        assert_eq!(expiry_after_user.status, ChainSwapStatus::RefundDue);
+        assert!(expiry_after_user.cooperative_refused);
     }
 }
 

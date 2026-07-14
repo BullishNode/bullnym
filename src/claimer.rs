@@ -783,13 +783,13 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
             db::ChainSwapProviderStatusInput::UserLockMempool
                 | db::ChainSwapProviderStatusInput::UserLockConfirmed
         ) {
-            // The failure/expiry observation may have committed first. In
-            // that delivery order the user-lock fold moves Pending directly
-            // to RefundDue, so re-drive the invoice projection before the
-            // early return. This is intentionally keyed to the current local
-            // payer-lock evidence: failure hints alone never make an invoice
-            // look funded, while a retry after cancellation between the row
-            // commit and this side effect remains safe and convergent.
+            // A concrete funding-failure observation may have committed first.
+            // In that delivery order the user-lock fold moves Pending directly
+            // to RefundDue, so re-drive the invoice projection before the early
+            // return. This is intentionally keyed to the current local payer-lock
+            // evidence: failure hints alone never make an invoice look funded,
+            // while a retry after cancellation between the row commit and this
+            // side effect remains safe and convergent.
             invoice::flip_invoice_on_bitcoin_boltz_in_progress(
                 &state.db,
                 swap.id,

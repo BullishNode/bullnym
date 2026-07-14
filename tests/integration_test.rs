@@ -6121,8 +6121,8 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
         pending_expiry.current_status,
         pay_service::db::ChainSwapStatus::Pending
     );
-    assert!(pending_expiry.changed);
-    assert!(pending_expiry.cooperative_refused);
+    assert!(!pending_expiry.changed);
+    assert!(!pending_expiry.cooperative_refused);
     let duplicate_expiry = pay_service::db::apply_chain_swap_provider_status(
         &pool,
         row.id,
@@ -6142,8 +6142,9 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .unwrap();
     assert_eq!(
         user_after_expiry.current_status,
-        pay_service::db::ChainSwapStatus::RefundDue
+        pay_service::db::ChainSwapStatus::UserLockMempool
     );
+    assert!(!user_after_expiry.cooperative_refused);
 
     sqlx::query(
         "UPDATE chain_swap_records \
