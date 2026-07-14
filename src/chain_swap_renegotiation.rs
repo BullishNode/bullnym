@@ -184,7 +184,9 @@ impl RenegotiationIdentity {
     }
 }
 
-/// Persisted per-swap operation. Quote and policy evidence remain immutable.
+/// Persisted per-swap operation. Quote and policy evidence identify the current
+/// attempt and may change only through the explicit ambiguous changed-quote
+/// redrive CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainSwapRenegotiationOperation {
     pub identity: RenegotiationIdentity,
@@ -203,6 +205,113 @@ pub struct ChainSwapRenegotiationOperation {
 impl ChainSwapRenegotiationOperation {
     pub fn terminal_response_digest(&self) -> Option<&str> {
         self.terminal_response_digest.as_deref()
+    }
+
+    /// Durable gate consumed by recovery orchestration. Every non-declined
+    /// operation blocks Bitcoin fallback; elapsed time and retry count never
+    /// convert unresolved provider state into proof that Liquid is dead.
+    pub fn fallback_gate(&self) -> RenegotiationFallbackGate {
+        match self.state {
+            RenegotiationState::Quoted => {
+                RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::QuotePending)
+            }
+            RenegotiationState::AcceptRequested => {
+                RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::AcceptRequested)
+            }
+            RenegotiationState::Ambiguous => {
+                RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::Ambiguous)
+            }
+            RenegotiationState::Accepted => {
+                RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::AcceptedAwaitingLiquid)
+            }
+            RenegotiationState::Declined => RenegotiationFallbackGate::ExplicitlyDeclined,
+        }
+    }
+
+    /// Restart action derived only from durable state. Provider calls and
+    /// chain observations happen outside this pure decision boundary.
+    pub fn restart_action(&self) -> RenegotiationRestartAction {
+        match self.state {
+            RenegotiationState::Quoted => RenegotiationRestartAction::RequestAccept,
+            RenegotiationState::AcceptRequested => {
+                RenegotiationRestartAction::ObserveUntilReconciled
+            }
+            RenegotiationState::Ambiguous => {
+                RenegotiationRestartAction::ReobserveAndRevalidateQuote
+            }
+            RenegotiationState::Accepted => RenegotiationRestartAction::RepairParentOrReturn,
+            RenegotiationState::Declined => RenegotiationRestartAction::FallThrough,
+        }
+    }
+
+    pub fn reconcile(
+        &self,
+        observation: RenegotiationReconciliationObservation,
+    ) -> Result<RenegotiationReconciliationDecision, RenegotiationDomainError> {
+        observation.validate()?;
+        if self.state == RenegotiationState::Accepted {
+            return Ok(RenegotiationReconciliationDecision::AlreadyAccepted);
+        }
+        if self.state == RenegotiationState::Declined {
+            return Ok(RenegotiationReconciliationDecision::FallThrough);
+        }
+
+        match observation {
+            RenegotiationReconciliationObservation::AcceptanceConfirmed { evidence } => {
+                if evidence.identity() != &self.identity {
+                    return Err(RenegotiationDomainError::AcceptanceEvidenceMismatch);
+                }
+                if self.state == RenegotiationState::Quoted {
+                    // A Liquid lock before durable accept intent wins the race,
+                    // but cannot prove this quoted amount was accepted.
+                    Ok(RenegotiationReconciliationDecision::LiquidPathWon)
+                } else {
+                    Ok(RenegotiationReconciliationDecision::RecordAccepted { evidence })
+                }
+            }
+            RenegotiationReconciliationObservation::SameQuoteStillValid => {
+                Ok(RenegotiationReconciliationDecision::RequestCurrentQuoteAccept)
+            }
+            RenegotiationReconciliationObservation::ChangedQuoteValid {
+                replacement_identity,
+            } => {
+                if self.state != RenegotiationState::Ambiguous {
+                    return Ok(RenegotiationReconciliationDecision::Observe);
+                }
+                ChangedQuoteRedrive::new(
+                    self.identity.clone(),
+                    replacement_identity.clone(),
+                    self.version,
+                )?;
+                Ok(
+                    RenegotiationReconciliationDecision::RequestChangedQuoteAccept {
+                        replacement_identity,
+                    },
+                )
+            }
+            RenegotiationReconciliationObservation::DefinitelyUnavailable {
+                terminal_response_digest,
+            } => {
+                if self.state == RenegotiationState::Ambiguous {
+                    // Ambiguous remote mutation is never rewritten as decline.
+                    Ok(RenegotiationReconciliationDecision::Observe)
+                } else {
+                    Ok(RenegotiationReconciliationDecision::RecordDeclined {
+                        terminal_response_digest,
+                    })
+                }
+            }
+            RenegotiationReconciliationObservation::Ambiguous { error_class } => {
+                if self.state == RenegotiationState::AcceptRequested {
+                    Ok(RenegotiationReconciliationDecision::RecordAmbiguous { error_class })
+                } else {
+                    Ok(RenegotiationReconciliationDecision::Observe)
+                }
+            }
+            RenegotiationReconciliationObservation::NoNewEvidence => {
+                Ok(RenegotiationReconciliationDecision::Observe)
+            }
+        }
     }
 
     pub fn plan_transition(
@@ -392,6 +501,222 @@ impl ChainSwapRenegotiationOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenegotiationBlockReason {
+    QuotePending,
+    AcceptRequested,
+    Ambiguous,
+    AcceptedAwaitingLiquid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenegotiationFallbackGate {
+    Blocked(RenegotiationBlockReason),
+    ExplicitlyDeclined,
+}
+
+impl RenegotiationFallbackGate {
+    pub fn blocks_bitcoin_fallback(self) -> bool {
+        matches!(self, Self::Blocked(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenegotiationRestartAction {
+    RequestAccept,
+    ObserveUntilReconciled,
+    ReobserveAndRevalidateQuote,
+    RepairParentOrReturn,
+    FallThrough,
+}
+
+/// Independently verified provider/chain progression for the exact accepted
+/// quote. The accepted amount and quote digest must match the immutable current
+/// identity; the stored quote alone can never manufacture this evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRenegotiationAcceptance {
+    identity: RenegotiationIdentity,
+    accepted_actual_amount_sat: u64,
+    accepted_quote_response_digest: String,
+    terminal_response_digest: String,
+}
+
+impl VerifiedRenegotiationAcceptance {
+    pub fn new(
+        identity: RenegotiationIdentity,
+        accepted_actual_amount_sat: u64,
+        accepted_quote_response_digest: impl Into<String>,
+        terminal_response_digest: impl Into<String>,
+    ) -> Result<Self, RenegotiationDomainError> {
+        identity.validate()?;
+        let evidence = Self {
+            identity,
+            accepted_actual_amount_sat,
+            accepted_quote_response_digest: accepted_quote_response_digest.into(),
+            terminal_response_digest: terminal_response_digest.into(),
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn identity(&self) -> &RenegotiationIdentity {
+        &self.identity
+    }
+
+    pub fn accepted_actual_amount_sat(&self) -> u64 {
+        self.accepted_actual_amount_sat
+    }
+
+    pub fn accepted_quote_response_digest(&self) -> &str {
+        &self.accepted_quote_response_digest
+    }
+
+    pub fn terminal_response_digest(&self) -> &str {
+        &self.terminal_response_digest
+    }
+
+    fn validate(&self) -> Result<(), RenegotiationDomainError> {
+        self.identity.validate()?;
+        validate_digest(
+            &self.accepted_quote_response_digest,
+            "accepted_quote_response_digest",
+        )?;
+        validate_digest(&self.terminal_response_digest, "terminal_response_digest")?;
+        if self.accepted_actual_amount_sat != self.identity.quoted_actual_amount_sat
+            || self.accepted_quote_response_digest != self.identity.quote_response_digest
+        {
+            return Err(RenegotiationDomainError::AcceptanceEvidenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenegotiationReconciliationObservation {
+    AcceptanceConfirmed {
+        evidence: VerifiedRenegotiationAcceptance,
+    },
+    SameQuoteStillValid,
+    ChangedQuoteValid {
+        replacement_identity: RenegotiationIdentity,
+    },
+    DefinitelyUnavailable {
+        terminal_response_digest: String,
+    },
+    Ambiguous {
+        error_class: RenegotiationErrorClass,
+    },
+    NoNewEvidence,
+}
+
+impl RenegotiationReconciliationObservation {
+    fn validate(&self) -> Result<(), RenegotiationDomainError> {
+        match self {
+            Self::AcceptanceConfirmed { evidence } => evidence.validate(),
+            Self::DefinitelyUnavailable {
+                terminal_response_digest,
+            } => validate_digest(terminal_response_digest, "terminal_response_digest"),
+            Self::ChangedQuoteValid {
+                replacement_identity,
+            } => replacement_identity.validate(),
+            Self::SameQuoteStillValid | Self::Ambiguous { .. } | Self::NoNewEvidence => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenegotiationReconciliationDecision {
+    RequestCurrentQuoteAccept,
+    RequestChangedQuoteAccept {
+        replacement_identity: RenegotiationIdentity,
+    },
+    RecordAccepted {
+        evidence: VerifiedRenegotiationAcceptance,
+    },
+    RecordDeclined {
+        terminal_response_digest: String,
+    },
+    RecordAmbiguous {
+        error_class: RenegotiationErrorClass,
+    },
+    LiquidPathWon,
+    AlreadyAccepted,
+    FallThrough,
+    Observe,
+}
+
+/// CAS command for the only legal quote-identity replacement. Prior
+/// ambiguity/error/attempt facts remain on the one operation row; retaining
+/// every superseded quote identity would require a separate history table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedQuoteRedrive {
+    pub current_identity: RenegotiationIdentity,
+    pub replacement_identity: RenegotiationIdentity,
+    pub expected_version: u64,
+}
+
+impl ChangedQuoteRedrive {
+    pub fn new(
+        current_identity: RenegotiationIdentity,
+        replacement_identity: RenegotiationIdentity,
+        expected_version: u64,
+    ) -> Result<Self, RenegotiationDomainError> {
+        current_identity.validate()?;
+        replacement_identity.validate()?;
+        if current_identity.chain_swap_id != replacement_identity.chain_swap_id {
+            return Err(RenegotiationDomainError::ReplacementQuoteWrongSwap);
+        }
+        if current_identity == replacement_identity {
+            return Err(RenegotiationDomainError::ReplacementQuoteUnchanged);
+        }
+        if replacement_identity.quote_observed_at_unix < current_identity.quote_observed_at_unix {
+            return Err(RenegotiationDomainError::ReplacementQuoteRegressed);
+        }
+        if expected_version == 0 || expected_version > i64::MAX as u64 {
+            return Err(RenegotiationDomainError::InvalidExpectedVersion);
+        }
+        Ok(Self {
+            current_identity,
+            replacement_identity,
+            expected_version,
+        })
+    }
+
+    pub fn plan(
+        &self,
+        operation: &ChainSwapRenegotiationOperation,
+    ) -> Result<TransitionDisposition, RenegotiationDomainError> {
+        if operation.identity == self.replacement_identity
+            && operation.state == RenegotiationState::AcceptRequested
+            && self.expected_version.checked_add(1) == Some(operation.version)
+        {
+            return Ok(TransitionDisposition::ExactRetry);
+        }
+        if operation.identity != self.current_identity {
+            return Err(RenegotiationDomainError::IdentityMismatch);
+        }
+        if operation.version != self.expected_version {
+            return Err(RenegotiationDomainError::StaleVersion {
+                expected: self.expected_version,
+                actual: operation.version,
+            });
+        }
+        if operation.state != RenegotiationState::Ambiguous {
+            return Err(RenegotiationDomainError::IllegalTransition {
+                from: operation.state,
+                to: RenegotiationState::AcceptRequested,
+            });
+        }
+        if operation.version == i64::MAX as u64 {
+            return Err(RenegotiationDomainError::VersionExhausted);
+        }
+        if operation.accept_attempt_count == i32::MAX as u32 {
+            return Err(RenegotiationDomainError::AttemptCountExhausted);
+        }
+        Ok(TransitionDisposition::Apply)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenegotiationTransition {
     pub identity: RenegotiationIdentity,
@@ -512,6 +837,10 @@ pub enum RenegotiationDomainError {
     },
     VersionExhausted,
     AttemptCountExhausted,
+    ReplacementQuoteWrongSwap,
+    ReplacementQuoteUnchanged,
+    ReplacementQuoteRegressed,
+    AcceptanceEvidenceMismatch,
 }
 
 impl fmt::Display for RenegotiationDomainError {
@@ -556,6 +885,18 @@ impl fmt::Display for RenegotiationDomainError {
             }
             Self::AttemptCountExhausted => {
                 f.write_str("renegotiation accept attempts exhausted PostgreSQL INTEGER")
+            }
+            Self::ReplacementQuoteWrongSwap => {
+                f.write_str("replacement renegotiation quote belongs to a different swap")
+            }
+            Self::ReplacementQuoteUnchanged => {
+                f.write_str("replacement renegotiation quote is unchanged")
+            }
+            Self::ReplacementQuoteRegressed => {
+                f.write_str("replacement renegotiation quote predates current quote evidence")
+            }
+            Self::AcceptanceEvidenceMismatch => {
+                f.write_str("renegotiation acceptance evidence does not match current quote")
             }
         }
     }

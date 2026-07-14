@@ -258,28 +258,46 @@ CREATE FUNCTION enforce_chain_swap_renegotiation_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
-BEGIN
-    IF ROW(
-        NEW.chain_swap_id,
+DECLARE
+    transitioned_at TIMESTAMPTZ := clock_timestamp();
+    quote_policy_identity_changed BOOLEAN := ROW(
         NEW.quoted_actual_amount_sat,
         NEW.quote_response_digest,
         NEW.quote_observed_at,
         NEW.policy_version,
         NEW.policy_evidence_digest,
-        NEW.policy_validated_at,
-        NEW.created_at
+        NEW.policy_validated_at
     ) IS DISTINCT FROM ROW(
-        OLD.chain_swap_id,
         OLD.quoted_actual_amount_sat,
         OLD.quote_response_digest,
         OLD.quote_observed_at,
         OLD.policy_version,
         OLD.policy_evidence_digest,
-        OLD.policy_validated_at,
-        OLD.created_at
-    ) THEN
-        RAISE EXCEPTION 'renegotiation quote and policy identity is immutable'
+        OLD.policy_validated_at
+    );
+    changed_quote_redrive BOOLEAN :=
+        OLD.state = 'ambiguous' AND NEW.state = 'accept_requested';
+BEGIN
+    IF NEW.chain_swap_id IS DISTINCT FROM OLD.chain_swap_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'renegotiation operation identity is immutable'
             USING ERRCODE = '55000';
+    END IF;
+    IF quote_policy_identity_changed AND NOT changed_quote_redrive THEN
+        RAISE EXCEPTION 'renegotiation quote and policy identity changes only on ambiguous redrive'
+            USING ERRCODE = '55000';
+    END IF;
+    IF quote_policy_identity_changed THEN
+        IF ROW(NEW.quoted_actual_amount_sat, NEW.quote_response_digest)
+               IS NOT DISTINCT FROM
+           ROW(OLD.quoted_actual_amount_sat, OLD.quote_response_digest)
+           OR NEW.quote_observed_at < OLD.quote_observed_at
+           OR NEW.policy_validated_at < NEW.quote_observed_at
+           OR NEW.quote_observed_at > transitioned_at
+           OR NEW.policy_validated_at > transitioned_at THEN
+            RAISE EXCEPTION 'changed quote redrive requires fresh exact quote and policy evidence'
+                USING ERRCODE = '23514';
+        END IF;
     END IF;
 
     -- Exact retries are idempotent, including after a terminal outcome.
@@ -383,7 +401,7 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    NEW.updated_at := clock_timestamp();
+    NEW.updated_at := transitioned_at;
     RETURN NEW;
 END
 $$;
