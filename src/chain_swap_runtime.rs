@@ -95,14 +95,19 @@ pub fn decide_chain_swap_provider_effect(
     input: ChainSwapProviderEvidence<'_>,
 ) -> ChainSwapProviderEffect {
     let evidence = normalized_evidence(provider_status, input);
-    provider_effect_for_evidence(&evidence)
+    provider_effect_for_evidence(provider_status, &evidence)
 }
 
-fn provider_effect_for_evidence(evidence: &ChainSwapEvidence) -> ChainSwapProviderEffect {
+fn provider_effect_for_evidence(
+    provider_status: &str,
+    evidence: &ChainSwapEvidence,
+) -> ChainSwapProviderEffect {
     match reduce_chain_swap_evidence(evidence) {
         ChainSwapAction::Observe => ChainSwapProviderEffect::Observe,
         ChainSwapAction::IntegrityHold => ChainSwapProviderEffect::IntegrityHold,
-        ChainSwapAction::Finalize if is_unfunded_expiry(evidence) => {
+        ChainSwapAction::Finalize
+            if provider_status == "swap.expired" && is_unfunded_expiry(evidence) =>
+        {
             ChainSwapProviderEffect::FinalizeUnfunded
         }
         action => ChainSwapProviderEffect::Reconcile(action),
@@ -185,26 +190,27 @@ async fn apply_chain_swap_provider_effect_inner(
             Ok(ChainSwapProviderApplyOutcome::AlreadyFinalized)
         }
         ChainSwapStatus::Pending => {
-            let evidence = match source {
+            let (provider_status, evidence) = match source {
                 LockedEvidenceSource::Runtime(state) => {
                     let collected =
                         collect_pending_expiry_evidence_under_lock(state, &mut tx, &current).await?;
-                    let provider_status = collected.provider_status.as_deref().unwrap_or("");
-                    normalized_evidence(
-                        provider_status,
+                    let provider_status = collected.provider_status.unwrap_or_default();
+                    let evidence = normalized_evidence(
+                        &provider_status,
                         ChainSwapProviderEvidence {
                             evidence: collected.evidence,
                             primary_bitcoin: collected.primary_bitcoin.as_ref(),
                         },
-                    )
+                    );
+                    (provider_status, evidence)
                 }
                 LockedEvidenceSource::Supplied {
                     provider_status,
                     input,
-                } => normalized_evidence(provider_status, input),
+                } => (provider_status.to_owned(), normalized_evidence(provider_status, input)),
             };
 
-            let effect = provider_effect_for_evidence(&evidence);
+            let effect = provider_effect_for_evidence(&provider_status, &evidence);
             if effect != ChainSwapProviderEffect::FinalizeUnfunded {
                 tx.commit().await?;
                 return Ok(non_mutating_outcome(effect));
@@ -395,6 +401,11 @@ mod tests {
         assert_eq!(
             decide_chain_swap_provider_effect("swap.created", input),
             ChainSwapProviderEffect::Observe
+        );
+        assert_eq!(
+            decide_chain_swap_provider_effect("transaction.failed", input),
+            ChainSwapProviderEffect::Reconcile(ChainSwapAction::Finalize),
+            "only the exact fresh swap.expired status may retire a pending offer"
         );
     }
 
