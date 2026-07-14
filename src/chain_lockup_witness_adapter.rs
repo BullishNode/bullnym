@@ -197,10 +197,11 @@ impl BitcoinLockupWitnessAdapterV1 {
     /// This deliberately does not fail over: automatic-fallback admission uses
     /// the configured primary as its self-hosted authority contract, while
     /// public failovers remain useful only for observing/draining existing
-    /// obligations. A deterministic unspendable P2WSH target exercises the
+    /// obligations. An ephemeral unspendable P2WSH target exercises the
     /// address-history API as well as the bounded tip/canonical-block recheck;
     /// a tip-only probe could falsely open admission when payment-specific
-    /// source evidence is unavailable.
+    /// source evidence is unavailable. Fresh randomness prevents a public
+    /// fixed probe address from becoming an admission-denial target.
     pub async fn primary_authority_health_check(
         &self,
     ) -> Result<(), BitcoinLockupWitnessAdapterError> {
@@ -208,16 +209,19 @@ impl BitcoinLockupWitnessAdapterV1 {
             .endpoints
             .first()
             .ok_or(BitcoinLockupWitnessAdapterError::InvalidConfiguration)?;
+        let manifest_id = Uuid::new_v4();
+        let chain_swap_id = Uuid::new_v4();
         let witness_script = ScriptBuf::from_bytes({
             let mut bytes = Vec::with_capacity(34);
             bytes.extend_from_slice(&[0x6a, 0x20]); // OP_RETURN PUSH32
-            bytes.extend_from_slice(&[0x85; 32]);
+            bytes.extend_from_slice(manifest_id.as_bytes());
+            bytes.extend_from_slice(chain_swap_id.as_bytes());
             bytes
         });
         let address = Address::p2wsh(&witness_script, Network::Bitcoin);
         let targets = [ManifestTarget {
-            manifest_id: Uuid::nil(),
-            chain_swap_id: Uuid::nil(),
+            manifest_id,
+            chain_swap_id,
             address: address.to_string(),
             script_pubkey: address.script_pubkey(),
         }];
