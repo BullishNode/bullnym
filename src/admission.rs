@@ -466,8 +466,10 @@ impl MoneyAdmission {
     /// Callers cannot supply a bare boolean or a freely constructed report:
     /// the accepted fact has private fields and is produced only after the
     /// bounded startup reconciliation has validated all three recovery
-    /// sources and the Bitcoin lockup witness. Any source failure or any
-    /// classified disagreement closes the fact synchronously.
+    /// sources and the Bitcoin lockup witness. Any source failure, invalid
+    /// witness, or structural target disagreement closes the fact
+    /// synchronously. A validated amount mismatch belongs to the existing
+    /// obligation's reducer and does not globally close unrelated creation.
     pub fn apply_provider_recovery_reconciliation_v1(
         &self,
         result: Result<
