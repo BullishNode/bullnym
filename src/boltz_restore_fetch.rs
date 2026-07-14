@@ -22,7 +22,10 @@ pub const MAX_BOLTZ_RESTORE_LIST_BYTES: usize = 1024 * 1024;
 /// The pinned summary is one integer (including `-1`), so 4 KiB is ample headroom.
 pub const MAX_BOLTZ_RESTORE_INDEX_BYTES: usize = 4 * 1024;
 
-const BOLTZ_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
+const BOLTZ_RESTORE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// The maximum-gap restore scan is intentionally heavier than establishing the
+// HTTPS connection. Keep its whole-request budget separate and bounded.
+const BOLTZ_RESTORE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const JSON_MEDIA_TYPE: &str = "application/json";
 // `SwapMasterKey::get_master_xpub` returns the already-derived swap-account
 // xpub. Boltz must therefore append each direct child index to `m`, rather than
@@ -148,7 +151,12 @@ pub struct BoltzRestoreFetcher {
 
 impl BoltzRestoreFetcher {
     pub fn new(base_url: &str) -> Result<Self, BoltzRestoreFetchError> {
-        Self::build(base_url, BOLTZ_RESTORE_TIMEOUT, false)
+        Self::build(
+            base_url,
+            BOLTZ_RESTORE_CONNECT_TIMEOUT,
+            BOLTZ_RESTORE_REQUEST_TIMEOUT,
+            false,
+        )
     }
 
     /// Deterministic integration-test transport. Production construction above
@@ -158,7 +166,12 @@ impl BoltzRestoreFetcher {
     pub fn from_loopback_for_integration_tests(
         base_url: &str,
     ) -> Result<Self, BoltzRestoreFetchError> {
-        Self::build(base_url, BOLTZ_RESTORE_TIMEOUT, true)
+        Self::build(
+            base_url,
+            BOLTZ_RESTORE_CONNECT_TIMEOUT,
+            BOLTZ_RESTORE_REQUEST_TIMEOUT,
+            true,
+        )
     }
 
     /// Fetch the pinned restore list and summary, validate every record against
@@ -198,7 +211,8 @@ impl BoltzRestoreFetcher {
 
     fn build(
         base_url: &str,
-        timeout: Duration,
+        connect_timeout: Duration,
+        request_timeout: Duration,
         allow_loopback_http: bool,
     ) -> Result<Self, BoltzRestoreFetchError> {
         let base_url = normalize_base_url(base_url, allow_loopback_http)?;
@@ -210,8 +224,8 @@ impl BoltzRestoreFetcher {
             .map_err(|_| BoltzRestoreFetchError::InvalidBaseUrl)?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(timeout)
-            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .build()
             .map_err(|_| BoltzRestoreFetchError::ClientInitialization)?;
         Ok(Self {
@@ -292,8 +306,16 @@ impl BoltzRestoreFetcher {
     }
 
     #[cfg(test)]
-    fn new_for_test(base_url: &str, timeout: Duration) -> Result<Self, BoltzRestoreFetchError> {
-        Self::build(base_url, timeout, true)
+    fn new_for_test(
+        base_url: &str,
+        request_timeout: Duration,
+    ) -> Result<Self, BoltzRestoreFetchError> {
+        Self::build(
+            base_url,
+            BOLTZ_RESTORE_CONNECT_TIMEOUT,
+            request_timeout,
+            true,
+        )
     }
 }
 
@@ -620,6 +642,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_and_whole_request_timeouts_are_independent() {
+        let (mut records, index) = valid_responses();
+        records.delay = Duration::from_millis(60);
+        let server = FakeServer::spawn(records, index).await;
+        let client = BoltzRestoreFetcher::build(
+            &server.base_url,
+            Duration::from_millis(20),
+            Duration::from_millis(250),
+            true,
+        )
+        .unwrap();
+
+        let validated = client.fetch_and_validate(&master_key()).await.unwrap();
+        assert_eq!(validated.records.len(), 2);
+        assert_eq!(validated.max_child_index, Some(102));
+    }
+
+    #[tokio::test]
     async fn slow_provider_is_cut_off_by_the_request_timeout() {
         let (mut records, index) = valid_responses();
         records.delay = Duration::from_millis(200);
@@ -720,6 +760,14 @@ mod tests {
                 endpoint: BoltzRestoreEndpoint::Records
             }
         );
+    }
+
+    #[test]
+    fn production_timeout_policy_keeps_connect_fast_and_restore_bounded() {
+        assert_eq!(BOLTZ_RESTORE_CONNECT_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(BOLTZ_RESTORE_REQUEST_TIMEOUT, Duration::from_secs(10));
+        assert!(BOLTZ_RESTORE_REQUEST_TIMEOUT > BOLTZ_RESTORE_CONNECT_TIMEOUT);
+        assert!(BOLTZ_RESTORE_REQUEST_TIMEOUT <= Duration::from_secs(10));
     }
 
     #[test]
