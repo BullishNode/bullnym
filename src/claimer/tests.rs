@@ -835,9 +835,7 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
 }
 
 #[test]
-fn chain_swap_expired_is_not_terminal() {
-    // Locally pending expiry is intercepted by the shared evidence reducer.
-    // Every other branch treats the raw status as a non-authoritative hint.
+fn chain_swap_expired_is_observation_only() {
     assert_eq!(
         chain_swap_provider_input("swap.expired"),
         Some(db::ChainSwapProviderStatusInput::Observe)
@@ -867,17 +865,6 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
     assert_eq!(
         chain_swap_provider_input("transaction.failed"),
         Some(db::ChainSwapProviderStatusInput::Observe)
-    );
-}
-
-#[test]
-fn malformed_renegotiation_quote_amounts_remain_ambiguous() {
-    assert!(validate_chain_swap_quote_amount(0).is_err());
-    assert!(validate_chain_swap_quote_amount((i64::MAX as u64) + 1).is_err());
-    assert_eq!(validate_chain_swap_quote_amount(1).unwrap(), 1);
-    assert_eq!(
-        validate_chain_swap_quote_amount(i64::MAX as u64).unwrap(),
-        i64::MAX
     );
 }
 

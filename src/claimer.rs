@@ -456,191 +456,6 @@ async fn dispatch_webhook(
     Ok("ok")
 }
 
-/// Phase 3 refund waterfall — attempt to renegotiate a mis-funded chain swap
-/// (Boltz `transaction.lockupFailed`) to the amount the payer actually locked,
-/// via Boltz get_quote/accept_quote, so it settles automatically instead of
-/// requiring a manual/self-claim refund.
-///
-/// Returns `Ok(())` when the swap is renegotiated, already owned by another
-/// waterfall step, or no longer eligible for this operation. Every malformed,
-/// unavailable, or ambiguous quote is an error so the observation remains
-/// retryable. This function never authorizes Bitcoin recovery: an explicit
-/// protocol decline is only one input to the shared complete-evidence reducer.
-///
-/// Serialized against the claim / customer-self-claim (Phase 4) paths via the
-/// shared `chain-claim:<id>` advisory lock, so a renegotiation cannot interleave
-/// with a concurrent claim of the same swap.
-async fn try_renegotiate_chain_swap(
-    state: &AppState,
-    swap: &db::ChainSwapRecord,
-) -> Result<(), AppError> {
-    // Idempotency for a re-delivered `lockupFailed` webhook: the swap is already
-    // renegotiated and settling — do nothing and do NOT re-refund.
-    if swap.renegotiated_server_lock_amount_sat.is_some() {
-        return Ok(());
-    }
-
-    // Step 1: read-only quote (no lock). An error may be a transport failure,
-    // response loss, or an explicit refusal; without durable evidence that
-    // distinguishes those cases it must remain retryable.
-    let quote_amount = match state.boltz.get_chain_swap_quote(&swap.boltz_swap_id).await {
-        Ok(amount) => amount,
-        Err(e) => {
-            tracing::warn!(
-                event = "chain_swap_renegotiation_quote_ambiguous",
-                swap_id = %swap.boltz_swap_id,
-                error = %e,
-                "chain swap get_quote failed ambiguously; preserving the normal path for retry"
-            );
-            return Err(e);
-        }
-    };
-    let quote_amount_i64 = validate_chain_swap_quote_amount(quote_amount).map_err(|error| {
-        tracing::warn!(
-            event = "chain_swap_renegotiation_bad_quote",
-            swap_id = %swap.boltz_swap_id,
-            quote_amount,
-            %error,
-            "boltz returned a malformed renegotiation quote; preserving ambiguous evidence"
-        );
-        error
-    })?;
-
-    // Steps 2-3 under the shared per-swap advisory lock so a concurrent claim
-    // cannot interleave. accept_quote is a network call held inside the locked
-    // transaction — acceptable for this rare failure path in exchange for strict
-    // serialization. NOTE: a crash in the window between Boltz accepting the
-    // quote and this transaction committing would leave the DB without the
-    // renegotiated amount, so a later settle would credit the stale original
-    // server-lock; reconciling the credited amount from Boltz `get_swap` at
-    // settle time is a tracked robustness follow-up.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    let lock_key = format!("chain-claim:{}", swap.id);
-    let got_lock: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
-            .bind(&lock_key)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
-    if !got_lock {
-        // Another waterfall step (claim / self-claim / concurrent renegotiation)
-        // owns this swap — let it decide the outcome; do not refund here.
-        tracing::debug!(
-            "renegotiate: lock held for {}, skipping",
-            swap.boltz_swap_id
-        );
-        return Ok(());
-    }
-
-    // Re-read under the advisory lock WITH a row lock (FOR UPDATE) so this
-    // read-modify-write serializes against the lock-free `update_chain_swap_status`
-    // webhook writers as well as the claim path. Bail if another path already
-    // renegotiated, terminalized, or flagged the swap `refund_due` between the
-    // quote and acquiring the lock.
-    let current = db::get_chain_swap_by_id_for_update(&mut *tx, swap.id)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {}", swap.id)))?;
-    if current.renegotiated_server_lock_amount_sat.is_some() {
-        return Ok(());
-    }
-    let current_status = current.parsed_status().map_err(AppError::DbError)?;
-    if current_status.is_terminal() {
-        return Ok(());
-    }
-    if matches!(
-        current_status,
-        ChainSwapStatus::ServerLockMempool
-            | ChainSwapStatus::ServerLockConfirmed
-            | ChainSwapStatus::Claiming
-            | ChainSwapStatus::ClaimFailed
-    ) {
-        // A late server lock is stronger than the older lockup-failure hint.
-        // Its Liquid claim branch owns progress now; never mutate provider
-        // terms from reordered failure evidence.
-        return Ok(());
-    }
-    if matches!(
-        current_status,
-        ChainSwapStatus::RefundDue | ChainSwapStatus::Refunding
-    ) {
-        // Already an operator-visible refund case (`refund_due`) or a customer
-        // self-claim refund in flight (`refunding`). Do NOT resurrect it to a
-        // live state or accept a quote against a swap whose BTC is being
-        // refunded; leave the waterfall where it is.
-        return Ok(());
-    }
-
-    // Accept the quote, then persist — both inside the locked transaction. On an
-    // accept failure we do NOT fall through to `refund_due`: the failure may be
-    // an ambiguous transport error AFTER Boltz already accepted (it is now
-    // settling), so flagging `refund_due` would corrupt the operator surface and
-    // risk a double-refund. Leaving the swap live is fund-safe — it either
-    // settles (crediting the amount reconciled at claim time) or remains for a
-    // later complete chain-evidence reduction. Provider expiry alone cannot
-    // select the Bitcoin recovery branch.
-    if let Err(e) = state
-        .boltz
-        .accept_chain_swap_quote(&swap.boltz_swap_id, quote_amount)
-        .await
-    {
-        tracing::warn!(
-            event = "chain_swap_renegotiation_accept_failed",
-            swap_id = %swap.boltz_swap_id,
-            invoice_id = %swap.invoice_id,
-            error = %e,
-            "boltz accept_quote failed (ambiguous — Boltz may have accepted); leaving swap live for reconciler/expiry backstop, NOT flagging refund_due (operator P1)"
-        );
-        return Ok(());
-    }
-    let rows = db::mark_chain_swap_renegotiated(&mut *tx, swap.id, quote_amount_i64)
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    tx.commit()
-        .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-
-    if rows == 1 {
-        tracing::warn!(
-            event = "chain_swap_renegotiated",
-            swap_id = %swap.boltz_swap_id,
-            invoice_id = %swap.invoice_id,
-            original_server_lock_sat = swap.server_lock_amount_sat,
-            renegotiated_server_lock_sat = quote_amount,
-            "chain swap renegotiated to actual locked amount; settling normally (merchant credited the renegotiated amount, operator P2)"
-        );
-    } else {
-        // accept_quote succeeded but the guarded UPDATE recorded 0 rows — the
-        // renegotiated amount is NOT persisted (row was concurrently
-        // terminalized/refund_due, or already renegotiated). Same money-safety
-        // class as the crash window: a later settle could credit the stale
-        // original. Loud so operators can reconcile against Boltz `get_swap`.
-        tracing::error!(
-            event = "chain_swap_renegotiation_accepted_not_recorded",
-            swap_id = %swap.boltz_swap_id,
-            invoice_id = %swap.invoice_id,
-            renegotiated_server_lock_sat = quote_amount,
-            "boltz accepted the renegotiation quote but no row was updated; reconcile credited amount against Boltz get_swap before trusting settlement (operator P1)"
-        );
-    }
-    Ok(())
-}
-
-fn validate_chain_swap_quote_amount(amount_sat: u64) -> Result<i64, AppError> {
-    i64::try_from(amount_sat)
-        .ok()
-        .filter(|amount| *amount > 0)
-        .ok_or_else(|| {
-            AppError::BoltzError(format!(
-                "chain swap renegotiation quote is malformed: amount {amount_sat} is outside 1..=i64::MAX"
-            ))
-        })
-}
-
 pub(crate) async fn handle_chain_swap_webhook(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -793,13 +608,10 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
             db::ChainSwapProviderStatusInput::UserLockMempool
                 | db::ChainSwapProviderStatusInput::UserLockConfirmed
         ) {
-            // A concrete funding-failure observation may have committed first.
-            // In that delivery order the user-lock fold moves Pending directly
-            // to RefundDue, so re-drive the invoice projection before the early
-            // return. This is intentionally keyed to the current local payer-lock
-            // evidence: failure hints alone never make an invoice look funded,
-            // while a retry after cancellation between the row commit and this
-            // side effect remains safe and convergent.
+            // A RefundDue row may have been selected by the shared evidence
+            // reducer or may predate this fail-closed fold. Re-drive the invoice
+            // projection for an independently delivered user-lock hint, but do
+            // not let the hint create or strengthen recovery eligibility.
             invoice::flip_invoice_on_bitcoin_boltz_in_progress(
                 &state.db,
                 swap.id,
@@ -817,17 +629,6 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
                 swap_id = %swap.boltz_swap_id,
                 invoice_id = %swap.invoice_id,
                 "chain swap is refund_due but Boltz now reports claimed; refund must be gated on Boltz not-claimed before broadcast (Phase 4)"
-            );
-        } else if transition.changed {
-            tracing::warn!(
-                event = "chain_swap_refund_due",
-                swap_id = %swap.boltz_swap_id,
-                invoice_id = %swap.invoice_id,
-                nym = ?swap.nym,
-                amount_sat = swap.user_lock_amount_sat,
-                lockup_address = %swap.lockup_address,
-                boltz_status,
-                "confirmed local user-lock evidence plus provider expiry/failure made Bitcoin recovery eligible (operator P1)"
             );
         } else {
             tracing::debug!(
@@ -862,34 +663,6 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
             "chain swap.expired received; retaining the forward-most funded branch"
         );
         try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
-        return Ok(());
-    }
-
-    if boltz_status == "transaction.lockupFailed"
-        && matches!(
-            status,
-            ChainSwapStatus::Pending
-                | ChainSwapStatus::UserLockMempool
-                | ChainSwapStatus::UserLockConfirmed
-        )
-    {
-        // A provider `transaction.lockupFailed` hint may trigger a renegotiation
-        // attempt, but it cannot authorize recovery. Malformed or unavailable
-        // quote responses remain retryable; any later RecoverBitcoin decision
-        // must come from complete independent chain evidence.
-        if let Err(e) = try_renegotiate_chain_swap(state, swap).await {
-            tracing::warn!(
-                event = "chain_swap_renegotiation_error",
-                swap_id = %swap.boltz_swap_id,
-                invoice_id = %swap.invoice_id,
-                error = %e,
-                "chain swap renegotiation attempt errored; leaving evidence retryable"
-            );
-            return Err(e);
-        }
-        // A successful renegotiation, concurrent owner, or terminal row has no
-        // recovery side effect here. An independently assembled snapshot must
-        // drive any later RecoverBitcoin decision through the shared reducer.
         return Ok(());
     }
 
@@ -994,18 +767,16 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
             Some(db::ChainSwapProviderStatusInput::ServerLockConfirmed)
         }
         // Locally pending `swap.expired` observations are intercepted before
-        // this mapper and reduced from independently assembled evidence. Raw
-        // expiry/failure/refund statuses remain hints for every other branch;
-        // they cannot authorize `refund_due` without the shared evidence gate.
+        // this mapper and reduced from independently assembled evidence. Every
+        // other raw expiry remains an observation-only trigger.
         // 0-conf rejection is NOT a failure: Boltz just wants a confirmation
         // before proceeding, then the swap continues normally. Treat it as a
         // (re)sighting of the user lockup in the mempool — previously this was
         // terminalized as `lockup_failed`, killing a payment that would settle.
         "transaction.zeroconf.rejected" => Some(db::ChainSwapProviderStatusInput::UserLockMempool),
         "swap.expired" => Some(db::ChainSwapProviderStatusInput::Observe),
-        // Renegotiation runs before a lockup-failure observation can authorize
-        // recovery, so the first atomic fold is read-only. An explicit decline
-        // is folded as FundingFailed afterward.
+        // The durable migration-056 renegotiation journal owns quote/accept
+        // execution. Bare provider status cannot start that network workflow.
         "transaction.lockupFailed" | "transaction.claimed" => {
             Some(db::ChainSwapProviderStatusInput::Observe)
         }

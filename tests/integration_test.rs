@@ -6012,9 +6012,9 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .await
     .unwrap();
 
-    // A provider failure while still pending is only a hint. It cannot make
-    // Bitcoin recovery eligible or leave a refusal fact that later combines
-    // with a user-lock observation.
+    // A provider failure while still pending is only a reconciliation hint. It
+    // cannot mutate lifecycle state or retain a bit that later authorizes
+    // Bitcoin recovery.
     let pending_failure = pay_service::db::apply_chain_swap_provider_status(
         &pool,
         row.id,
@@ -6178,8 +6178,8 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     assert!(!expiry_after_user.changed);
     assert!(!expiry_after_user.cooperative_refused);
 
-    // A later valid server lock advances the still-live normal Liquid path;
-    // the earlier provider expiry hint created no recovery branch to revoke.
+    // A later server-lock observation can still advance the ordinary provider
+    // progress projection; no recovery branch was ever created.
     let late_server = pay_service::db::apply_chain_swap_provider_status(
         &pool,
         row.id,
@@ -6256,10 +6256,13 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
 }
 
 #[tokio::test]
-async fn issue82_provider_failure_hint_never_authorizes_recovery_in_either_order() {
+async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let app = test_app(test_state(pool.clone()));
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let app = test_app(test_state_with_config(pool.clone(), config));
     let npub = create_test_user(&pool, "chainprojectionorder").await;
     let invoice = insert_test_invoice(
         &pool,
@@ -6291,7 +6294,14 @@ async fn issue82_provider_failure_hint_never_authorizes_recovery_in_either_order
     .await
     .unwrap();
 
-    for failure_status in ["transaction.failed"] {
+    // The counting Boltz endpoint returns 503 to every request. HTTP 200 plus a
+    // zero count for lockupFailed proves this production webhook boundary made
+    // no legacy get_quote/accept_quote call.
+    for failure_status in [
+        "transaction.failed",
+        "transaction.refunded",
+        "transaction.lockupFailed",
+    ] {
         sqlx::query(
             "UPDATE chain_swap_records \
              SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",
@@ -6330,6 +6340,10 @@ async fn issue82_provider_failure_hint_never_authorizes_recovery_in_either_order
             .unwrap();
         assert_eq!(pending_failure.status, "pending", "{failure_status}");
         assert!(!pending_failure.cooperative_refused, "{failure_status}");
+        assert_eq!(
+            pending_failure.renegotiated_server_lock_amount_sat, None,
+            "{failure_status}"
+        );
         let not_yet_funded = pay_service::db::get_invoice_by_id(&pool, invoice.id)
             .await
             .unwrap()
@@ -6496,6 +6510,13 @@ async fn issue82_provider_failure_hint_never_authorizes_recovery_in_either_order
             "{failure_status}"
         );
     }
+
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        0,
+        "provider failure hints must not start legacy renegotiation network I/O"
+    );
+    provider_task.abort();
 
     cleanup_db(&pool).await;
 }
