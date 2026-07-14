@@ -9,7 +9,7 @@ BEGIN
 
     UPDATE chain_swap_records
        SET renegotiated_server_lock_amount_sat = 24750,
-           renegotiated_at = '2026-07-13 12:00:00+00'::TIMESTAMPTZ
+           renegotiated_at = '2020-07-13 12:00:00+00'::TIMESTAMPTZ
      WHERE id = '53000000-0000-0000-0000-000000000012';
     IF NOT FOUND THEN
         RAISE EXCEPTION 'migration 056 historical renegotiation fixture is unavailable';

@@ -4,6 +4,7 @@ use pay_service::chain_swap_renegotiation::{
     RenegotiationDomainError, RenegotiationErrorClass, RenegotiationIdentity, RenegotiationState,
     RenegotiationTransition, RenegotiationTransitionKind,
 };
+use pay_service::db::ChainSwapRenegotiationStoreError;
 use uuid::Uuid;
 
 fn exact_identity() -> RenegotiationIdentity {
@@ -132,5 +133,19 @@ fn persisted_state_and_sanitized_error_vocabulary_is_exact() {
     assert_eq!(
         RenegotiationErrorClass::from_str("provider response body").unwrap_err(),
         RenegotiationDomainError::InvalidStoredErrorClass
+    );
+}
+
+#[test]
+fn database_error_debug_never_exposes_quote_evidence() {
+    let secret = "secret quote evidence";
+    let error = ChainSwapRenegotiationStoreError::Database(sqlx::Error::Protocol(secret.into()));
+    let debug = format!("{error:?}");
+
+    assert_eq!(debug, "Database(<redacted>)");
+    assert!(!debug.contains(secret));
+    assert_eq!(
+        error.to_string(),
+        "renegotiation operation database request failed"
     );
 }
