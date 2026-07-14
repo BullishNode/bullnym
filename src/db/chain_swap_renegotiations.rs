@@ -701,3 +701,44 @@ fn liquid_path_is_active(status: &str) -> bool {
             | "claim_stuck"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::liquid_path_is_active;
+
+    #[test]
+    fn definite_decline_is_blocked_by_exact_liquid_progress_statuses() {
+        for status in [
+            "server_lock_mempool",
+            "server_lock_confirmed",
+            "claiming",
+            "claimed",
+            "claim_failed",
+            "claim_stuck",
+        ] {
+            assert!(
+                liquid_path_is_active(status),
+                "{status} must keep the Liquid branch authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn definite_decline_does_not_invent_liquid_progress() {
+        for status in [
+            "pending",
+            "user_lock_mempool",
+            "user_lock_confirmed",
+            "refund_due",
+            "refunding",
+            "refunded",
+            "expired",
+            "lockup_failed",
+        ] {
+            assert!(
+                !liquid_path_is_active(status),
+                "{status} is not independently observed Liquid progression"
+            );
+        }
+    }
+}
