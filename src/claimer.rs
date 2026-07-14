@@ -1090,8 +1090,6 @@ fn validate_renegotiation_preconditions(
         || pair.hash != creation.pinned_pair_hash
         || pair.limits.minimal == 0
         || pair.limits.maximal < pair.limits.minimal
-        || evidence.observed_amount_sat < pair.limits.minimal
-        || evidence.observed_amount_sat > pair.limits.maximal
     {
         return Err(AppError::ClaimError(
             "renegotiation evidence violates immutable provider pair limits".into(),

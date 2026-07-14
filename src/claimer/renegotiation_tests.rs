@@ -509,12 +509,20 @@ fn primary_mismatch(
 }
 
 fn chain_swap(expected_amount_sat: i64) -> db::ChainSwapRecord {
+    chain_swap_with_pair_limits(expected_amount_sat, 1, 25_000_000)
+}
+
+fn chain_swap_with_pair_limits(
+    expected_amount_sat: i64,
+    minimal: u64,
+    maximal: u64,
+) -> db::ChainSwapRecord {
     let pair: ChainPair = serde_json::from_value(serde_json::json!({
         "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "rate": 1.0,
         "limits": {
-            "maximal": 25_000_000,
-            "minimal": 1,
+            "maximal": maximal,
+            "minimal": minimal,
             "maximalZeroConf": 0
         },
         "fees": {
@@ -891,6 +899,63 @@ async fn under_and_over_funding_commit_intent_before_provider_acceptance() {
                 RenegotiationCheckpoint::AcceptanceCommitted,
             ]
         );
+    }
+}
+
+#[tokio::test]
+async fn creation_pair_bounds_never_preempt_the_live_quote_protocol() {
+    let swap = chain_swap_with_pair_limits(1_000, 950, 1_050);
+
+    let below_minimum = primary_mismatch(900, 1_000);
+    let store = MemoryStore::default();
+    let provider = FakeProvider::new(
+        [Ok(quote(890, QUOTE_DIGEST))],
+        [Ok(TERMINAL_DIGEST.to_string())],
+    );
+    assert!(try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &store,
+        &provider,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &below_minimum,
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ProviderCall::GetQuote(swap.boltz_swap_id.clone()),
+            ProviderCall::AcceptQuote {
+                swap_id: swap.boltz_swap_id.clone(),
+                amount_sat: 890,
+            },
+        ]
+    );
+
+    for (observed_amount_sat, kind) in [
+        (900, ChainSwapQuoteProviderErrorKind::BelowMinimum),
+        (1_100, ChainSwapQuoteProviderErrorKind::AboveMaximum),
+    ] {
+        let store = MemoryStore::default();
+        let provider =
+            FakeProvider::new([Err(quote_error(kind, Some(TERMINAL_DIGEST)))], Vec::new());
+        let evidence = primary_mismatch(observed_amount_sat, 1_000);
+        assert!(!try_renegotiate_chain_swap_with_verified_mismatch_using(
+            &store,
+            &provider,
+            &FaultObserver::never_fail(),
+            &swap,
+            "transaction.lockupFailed",
+            &evidence,
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            provider.calls(),
+            vec![ProviderCall::GetQuote(swap.boltz_swap_id.clone())]
+        );
+        assert!(store.operation().is_none());
     }
 }
 
