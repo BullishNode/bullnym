@@ -1428,12 +1428,29 @@ async fn apply_commands(
                 mutate_event(tx, snapshot, identity, "active", None, Some(false)).await?
             }
             MerchantSettlementPersistenceCommand::Deactivate(identity) => {
+                let deactivated_txid = snapshot
+                    .retained
+                    .iter()
+                    .find(|retained| &retained.intent.identity == identity)
+                    .map(|retained| retained.evidence.txid())
+                    .ok_or(MerchantSettlementRepositoryError::InvalidCommand)?;
+                let linked_replacement = snapshot
+                    .lifecycle
+                    .linked_replacement
+                    .as_ref()
+                    .map(|(parent, child)| (parent.as_str(), child.as_str()));
+                let reason = deactivation_reason(
+                    &snapshot.lifecycle.state,
+                    linked_replacement,
+                    snapshot.lifecycle.active_txid.as_str(),
+                    deactivated_txid,
+                )?;
                 mutate_event(
                     tx,
                     snapshot,
                     identity,
                     "inactive",
-                    Some(demotion_reason(&snapshot.lifecycle.state)),
+                    Some(reason),
                     Some(false),
                 )
                 .await?
@@ -1784,12 +1801,24 @@ fn previous_confirmation(
     }
 }
 
-fn demotion_reason(state: &SettlementState) -> &'static str {
+fn deactivation_reason(
+    state: &SettlementState,
+    linked_replacement: Option<(&str, &str)>,
+    active_txid: &str,
+    deactivated_txid: &str,
+) -> Result<&'static str, MerchantSettlementRepositoryError> {
+    if linked_replacement
+        .is_some_and(|(parent, child)| parent == deactivated_txid && child == active_txid)
+    {
+        return Ok("replaced");
+    }
+    if deactivated_txid != active_txid {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    }
     match state {
-        SettlementState::Replaced { .. } => "replaced",
-        SettlementState::Evicted => "evicted",
-        SettlementState::Reorged { .. } => "reorged",
-        _ => "not_confirmed",
+        SettlementState::Evicted => Ok("evicted"),
+        SettlementState::Reorged { .. } => Ok("reorged"),
+        _ => Err(MerchantSettlementRepositoryError::InvalidCommand),
     }
 }
 
@@ -2746,6 +2775,47 @@ mod tests {
                 Err(MerchantSettlementRepositoryError::MissingJournal)
             ));
         }
+    }
+
+    #[test]
+    fn deactivation_reason_preserves_replacement_lineage_after_child_progress() {
+        const CHILD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        for state in [
+            SettlementState::Mempool,
+            SettlementState::Confirmed {
+                block: SettlementBlock::new(100, BLOCK_A).unwrap(),
+                confirmations: 1,
+                required_confirmations: 2,
+            },
+        ] {
+            assert_eq!(
+                deactivation_reason(&state, Some((TXID, CHILD)), CHILD, TXID).unwrap(),
+                "replaced"
+            );
+        }
+
+        assert_eq!(
+            deactivation_reason(&SettlementState::Evicted, None, TXID, TXID).unwrap(),
+            "evicted"
+        );
+        assert_eq!(
+            deactivation_reason(
+                &SettlementState::Reorged {
+                    previous_block: SettlementBlock::new(100, BLOCK_A).unwrap(),
+                },
+                Some((TXID, CHILD)),
+                CHILD,
+                CHILD,
+            )
+            .unwrap(),
+            "reorged"
+        );
+
+        assert!(matches!(
+            deactivation_reason(&SettlementState::Mempool, None, CHILD, TXID),
+            Err(MerchantSettlementRepositoryError::InvalidCommand)
+        ));
     }
 
     #[test]
