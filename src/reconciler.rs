@@ -1666,6 +1666,14 @@ async fn run_one_chain_tick(
                         "automatic Bitcoin fallback authority is unavailable; new chain admission remains closed"
                     );
                 }
+                Ok(crate::chain_fallback::AutomaticFallbackScheduleOutcome::IntegrityHold) => {
+                    health.systemic_failure = true;
+                    tracing::error!(
+                        event = "automatic_fallback_integrity_hold",
+                        chain_swap_id = %swap.id,
+                        "automatic Bitcoin fallback evidence requires operator integrity review; new chain admission remains closed"
+                    );
+                }
                 Ok(
                     crate::chain_fallback::AutomaticFallbackScheduleOutcome::Busy
                     | crate::chain_fallback::AutomaticFallbackScheduleOutcome::Missing

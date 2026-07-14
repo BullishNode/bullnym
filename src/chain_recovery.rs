@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::builder_fee::BitcoinBuilderFeeDecision;
+use crate::chain_swap_action::{reduce_chain_swap_evidence, ChainSwapAction};
 use crate::chain_swap_runtime_evidence::{
     collect_automatic_fallback_evidence_under_lock, CollectedAutomaticFallbackEvidence,
 };
@@ -846,6 +847,12 @@ async fn prepare_or_reload_attempt(
                 ));
             }
             if !collected.authorizes_automatic_recovery() {
+                if reduce_chain_swap_evidence(&collected.evidence) == ChainSwapAction::IntegrityHold
+                {
+                    return Err(AppError::ClaimError(
+                        "automatic fallback evidence requires an integrity hold".into(),
+                    ));
+                }
                 return Err(AppError::RecoveryNotAvailable(
                     "automatic fallback evidence no longer authorizes recovery".into(),
                 ));
@@ -1070,6 +1077,11 @@ async fn broadcast_automatic_attempt_under_lock(
         ));
     }
     if !collected.authorizes_automatic_recovery() {
+        if reduce_chain_swap_evidence(&collected.evidence) == ChainSwapAction::IntegrityHold {
+            return Err(AppError::ClaimError(
+                "automatic fallback evidence requires an integrity hold before broadcast".into(),
+            ));
+        }
         return Err(AppError::RecoveryNotAvailable(
             "automatic fallback evidence changed before broadcast".into(),
         ));

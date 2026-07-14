@@ -30,6 +30,7 @@ pub enum AutomaticFallbackScheduleOutcome {
     AlreadyExecuting,
     Deferred(ChainSwapAction),
     EvidenceUnavailable(ChainSwapAction),
+    IntegrityHold,
     Busy,
     Missing,
     IneligibleStatus(ChainSwapStatus),
@@ -102,6 +103,12 @@ pub async fn schedule_automatic_fallback(
         return Ok(AutomaticFallbackScheduleOutcome::EvidenceUnavailable(
             action,
         ));
+    }
+    if action == ChainSwapAction::IntegrityHold {
+        tx.commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        return Ok(AutomaticFallbackScheduleOutcome::IntegrityHold);
     }
     if !collected.authorizes_automatic_recovery() {
         tx.commit()
