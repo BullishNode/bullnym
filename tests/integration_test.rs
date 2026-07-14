@@ -13398,25 +13398,77 @@ async fn confirmed_lightning_address_history_advances_cursor_and_fulfills_once()
 // --- Invoice lifecycle / watcher database coverage ---
 
 #[tokio::test]
-async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
+async fn invoice_expiry_gc_terminalizes_only_safe_past_deadline_projections() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "invoicegc").await;
 
     let expired_unpaid =
         insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredunpaid", -10).await;
-    let expired_in_progress =
-        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredinprogress", -10).await;
+    let stale_in_progress =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1staleinprogress", -10).await;
+    let pending_direct =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1pendingdirect", -10).await;
+    let pending_partial =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1pendingpartial", 60).await;
+    let expired_partial =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpartial", 60).await;
     let expired_paid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpaid", -10).await;
     let fresh_unpaid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1freshunpaid", 60).await;
 
+    sqlx::query("UPDATE invoices SET status = 'in_progress' WHERE id = $1")
+        .bind(stale_in_progress.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::db::mark_invoice_in_progress_for_component(
         &pool,
-        expired_in_progress.id,
+        pending_direct.id,
         pay_service::db::InvoiceInProgressComponent::Direct,
     )
     .await
     .unwrap();
+    pay_service::db::record_invoice_payment(
+        &pool,
+        pending_partial.id,
+        liquid_direct_evidence(
+            "liquid_direct:acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac:0",
+            400,
+            "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac",
+            0,
+            "lq1pendingpartial",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    pay_service::db::mark_invoice_settlement_status(&pool, Some(pending_partial.id), "pending")
+        .await
+        .unwrap();
+    pay_service::db::record_invoice_payment(
+        &pool,
+        expired_partial.id,
+        liquid_direct_evidence(
+            "liquid_direct:abababababababababababababababababababababababababababababababab:0",
+            400,
+            "abababababababababababababababababababababababababababababababab",
+            0,
+            "lq1expiredpartial",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '10 seconds' WHERE id = $1")
+        .bind(expired_partial.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '10 seconds' WHERE id = $1")
+        .bind(pending_partial.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::db::record_invoice_payment(
         &pool,
         expired_paid.id,
@@ -13435,13 +13487,25 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 0)
         .await
         .unwrap();
-    assert_eq!(expired_count, 2);
+    assert_eq!(expired_count, 3);
 
     let expired_unpaid = pay_service::db::get_invoice_by_id(&pool, expired_unpaid.id)
         .await
         .unwrap()
         .unwrap();
-    let expired_in_progress = pay_service::db::get_invoice_by_id(&pool, expired_in_progress.id)
+    let stale_in_progress = pay_service::db::get_invoice_by_id(&pool, stale_in_progress.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_direct = pay_service::db::get_invoice_by_id(&pool, pending_direct.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_partial = pay_service::db::get_invoice_by_id(&pool, pending_partial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired_partial = pay_service::db::get_invoice_by_id(&pool, expired_partial.id)
         .await
         .unwrap()
         .unwrap();
@@ -13455,9 +13519,126 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
         .unwrap();
 
     assert_eq!(expired_unpaid.status, "expired");
-    assert_eq!(expired_in_progress.status, "expired");
+    assert_eq!(stale_in_progress.status, "expired");
+    assert_eq!(pending_direct.status, "in_progress");
+    assert_eq!(pending_direct.direct_settlement_status, "pending");
+    assert_eq!(pending_direct.settlement_status, "pending");
+    assert_eq!(pending_partial.status, "partially_paid");
+    assert_eq!(
+        pending_partial.presentation_status.as_deref(),
+        Some("partial")
+    );
+    assert_eq!(pending_partial.swap_settlement_status, "pending");
+    assert_eq!(pending_partial.settlement_status, "pending");
+    assert_eq!(expired_partial.status, "underpaid");
+    assert_eq!(expired_partial.paid_amount_sat, Some(400));
     assert_eq!(expired_paid.status, "paid");
     assert_eq!(fresh_unpaid.status, "unpaid");
+
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        0,
+        "replaying the sweep must not rewrite terminal or pending rows"
+    );
+    assert_eq!(
+        pay_service::db::mark_invoice_settlement_status(&pool, Some(pending_partial.id), "none",)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        1,
+        "a later sweep may terminalize the partial after settlement clears"
+    );
+    let resolved = pay_service::db::get_invoice_by_id(&pool, pending_partial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.status, "underpaid");
+    assert_eq!(resolved.paid_amount_sat, Some(400));
+    assert_eq!(resolved.swap_settlement_status, "none");
+    assert_eq!(resolved.settlement_status, "none");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "invoicegccas").await;
+    let invoice = insert_test_invoice(&pool, "invoicegccas", &npub, "lq1invoicegccas", -10).await;
+
+    // Model the watcher's transaction boundary: it owns the shared projection
+    // lock and the invoice row, but its pending evidence is not committed yet.
+    let mut watcher = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(pay_service::db::invoice_lightning_lock_key(invoice.id))
+        .execute(&mut *watcher)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET status = 'in_progress', \
+             settlement_status = 'pending', direct_settlement_status = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&mut *watcher)
+    .await
+    .unwrap();
+
+    let expiry_pool = named_single_connection_test_pool("invoice-expiry-cas-test").await;
+    let expiry_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&expiry_pool)
+        .await
+        .unwrap();
+    let expiry_task_pool = expiry_pool.clone();
+    let expiry = tokio::spawn(async move {
+        pay_service::db::expire_invoices_past_deadline(&expiry_task_pool, 0).await
+    });
+
+    let observed_row_lock_wait = observe_recovery_lock_wait(
+        &pool,
+        expiry_backend_pid,
+        "%UPDATE invoices SET status = CASE%",
+    )
+    .await
+    .unwrap();
+    if !observed_row_lock_wait {
+        watcher.rollback().await.unwrap();
+        let premature = tokio::time::timeout(Duration::from_secs(10), expiry)
+            .await
+            .expect("expiry task did not finish after rollback")
+            .expect("expiry task panicked");
+        expiry_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("expiry did not wait for the watcher row lock: {premature:?}");
+    }
+
+    watcher.commit().await.unwrap();
+    let expired_count = tokio::time::timeout(Duration::from_secs(10), expiry)
+        .await
+        .expect("expiry task did not finish after watcher commit")
+        .expect("expiry task panicked")
+        .unwrap();
+    expiry_pool.close().await;
+    assert_eq!(
+        expired_count, 0,
+        "the UPDATE predicate must be rechecked against committed watcher evidence"
+    );
+
+    let pending = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, "in_progress");
+    assert_eq!(pending.direct_settlement_status, "pending");
+    assert_eq!(pending.settlement_status, "pending");
 
     cleanup_db(&pool).await;
 }

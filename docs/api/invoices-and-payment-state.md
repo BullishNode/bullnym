@@ -306,7 +306,11 @@ starts at 2-3 seconds while visible, backs off, and suspends in the background.
 terminalized asynchronously by periodic GC (every 10 minutes with the shipped
 configuration). Consequently, status can remain `unpaid`, `in_progress`, or
 `partially_paid` briefly after the deadline; a partial becomes `underpaid`, and
-the other eligible states become `expired` on the sweep.
+the other eligible states become `expired` on the sweep. GC closes only an
+exact `unpaid` presentation with `settlement_status: none`; a pending or
+otherwise non-empty settlement projection remains open for its watcher or
+reconciler to resolve. A partial likewise waits while settlement is pending and
+becomes `underpaid` only after settlement is `none` or `settled`.
 
 The status endpoint independently suppresses an expired reusable Lightning
 offer, and the Lightning offer endpoint refuses to mint one after the deadline.
