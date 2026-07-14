@@ -7380,7 +7380,7 @@ async fn chain_offer_missing_runtime_refuses_before_key_or_provider_mutation() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lightning_pr"], "");
     assert!(body["lightning_amount_sat"].is_null());
-    assert_eq!(body["liquid_amount_sat"], 25_000);
+    assert_eq!(body["liquid_amount_sat"], 1_000);
     assert!(body["bitcoin_chain_address"].is_null(), "{body}");
     assert!(body["bitcoin_chain_bip21"].is_null(), "{body}");
     assert_eq!(
