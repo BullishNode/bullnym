@@ -16,9 +16,10 @@
 //! output lifecycle rather than fields invented inside recovery code.
 //!
 //! Amount mismatches are classified as conflicting with the original payer
-//! instruction, not discarded. A later obligation reducer may still classify
-//! underpayment, overpayment, or repeated funding. This audit never decides
-//! whether to recover funds or admit new swaps.
+//! instruction, not discarded. The #82 source selector identifies Boltz's one
+//! primary funding transaction; later transactions to the same old address do
+//! not become additional Liquid settlements. This audit never decides whether
+//! to recover funds or admit new swaps.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
