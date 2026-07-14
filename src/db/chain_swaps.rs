@@ -1678,6 +1678,35 @@ pub async fn record_chain_swap_claim_failure(
 ) -> Result<ClaimFailureOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
+    let parent: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, claim_txid FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((parent_status, claim_txid)) = parent else {
+        tx.commit().await?;
+        return Ok(ClaimFailureOutcome::NoOp);
+    };
+    let attempt_status = if let Some(claim_txid) = claim_txid.as_deref() {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM chain_swap_tx_attempts \
+              WHERE chain_swap_id = $1 AND txid = $2 \
+                AND purpose IN ('liquid_claim','liquid_claim_replacement') \
+              FOR UPDATE",
+        )
+        .bind(id)
+        .bind(claim_txid)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        None
+    };
+    if !chain_claim_failure_may_advance(&parent_status, attempt_status.as_deref()) {
+        tx.commit().await?;
+        return Ok(ClaimFailureOutcome::NoOp);
+    }
+
     let bumped: Option<(i32,)> = sqlx::query_as(
         "UPDATE chain_swap_records \
          SET claim_attempts = claim_attempts + 1, \
@@ -1723,6 +1752,51 @@ pub async fn record_chain_swap_claim_failure(
 
     tx.commit().await?;
     Ok(outcome)
+}
+
+fn chain_claim_failure_may_advance(parent_status: &str, attempt_status: Option<&str>) -> bool {
+    matches!(
+        parent_status,
+        "server_lock_mempool" | "server_lock_confirmed" | "claiming" | "claim_failed"
+    ) && !matches!(attempt_status, Some("confirmed" | "finalized"))
+}
+
+#[cfg(test)]
+mod claim_failure_tests {
+    use super::chain_claim_failure_may_advance;
+
+    #[test]
+    fn stale_failure_advances_only_live_unsettled_claims() {
+        for parent in [
+            "server_lock_mempool",
+            "server_lock_confirmed",
+            "claiming",
+            "claim_failed",
+        ] {
+            assert!(chain_claim_failure_may_advance(parent, None), "{parent}");
+            assert!(chain_claim_failure_may_advance(
+                parent,
+                Some("broadcast")
+            ));
+            for attempt in ["confirmed", "finalized"] {
+                assert!(!chain_claim_failure_may_advance(parent, Some(attempt)));
+            }
+        }
+        for parent in [
+            "pending",
+            "user_lock_mempool",
+            "user_lock_confirmed",
+            "claimed",
+            "claim_stuck",
+            "expired",
+            "lockup_failed",
+            "refunded",
+            "refund_due",
+            "refunding",
+        ] {
+            assert!(!chain_claim_failure_may_advance(parent, None), "{parent}");
+        }
+    }
 }
 
 /// Funded chain swaps stranded in `claim_stuck` whose slow-recovery backoff is

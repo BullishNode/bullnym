@@ -2102,21 +2102,16 @@ async fn claim_chain_swap_with_guard(
                     last_error = %err_str,
                     "chain swap reached max_claim_attempts; transitioned to claim_stuck"
                 );
-                let row = db::get_chain_swap_by_id(pool, chain_swap_id)
+                db::mark_chain_swap_invoice_claim_stuck_if_current(pool, chain_swap_id)
                     .await
-                    .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
-                if let Some(row) = row {
-                    db::mark_invoice_settlement_status(pool, Some(row.invoice_id), "claim_stuck")
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(
-                                event = "invoice_chain_swap_claim_stuck_mark_failed",
-                                swap_id = %chain_swap_id,
-                                "failed to mark invoice settlement_status=claim_stuck: {e}"
-                            );
-                            AppError::DbError(e.to_string())
-                        })?;
-                }
+                    .map_err(|e| {
+                        tracing::error!(
+                            event = "invoice_chain_swap_claim_stuck_mark_failed",
+                            swap_id = %chain_swap_id,
+                            "failed to publish guarded invoice claim_stuck state: {e}"
+                        );
+                        AppError::DbError(e.to_string())
+                    })?;
             }
             Ok(db::ClaimFailureOutcome::Scheduled) => {
                 tracing::warn!(

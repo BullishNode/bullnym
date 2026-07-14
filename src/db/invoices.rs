@@ -1554,6 +1554,103 @@ pub async fn mark_invoice_settlement_status(
     Ok(rows)
 }
 
+/// Publish a chain-claim failure projection only while the exact obligation is
+/// still stuck. The invoice lock is acquired before the parent and attempt,
+/// matching exact settlement CAS order so whichever transaction wins first
+/// determines the projection and the loser becomes a no-op.
+pub async fn mark_chain_swap_invoice_claim_stuck_if_current(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let Some(invoice_id): Option<Uuid> =
+        sqlx::query_scalar("SELECT invoice_id FROM chain_swap_records WHERE id = $1")
+            .bind(chain_swap_id)
+            .fetch_optional(pool)
+            .await?
+    else {
+        return Ok(0);
+    };
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, invoice_id).await?;
+    let parent: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT invoice_id, status, claim_txid FROM chain_swap_records \
+          WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((locked_invoice_id, parent_status, claim_txid)) = parent else {
+        tx.commit().await?;
+        return Ok(0);
+    };
+    if locked_invoice_id != invoice_id {
+        return Err(sqlx::Error::Protocol(
+            "chain swap invoice changed while publishing claim failure".into(),
+        ));
+    }
+    let attempt_status = if let Some(claim_txid) = claim_txid.as_deref() {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM chain_swap_tx_attempts \
+              WHERE chain_swap_id = $1 AND txid = $2 \
+                AND purpose IN ('liquid_claim','liquid_claim_replacement') \
+              FOR UPDATE",
+        )
+        .bind(chain_swap_id)
+        .bind(claim_txid)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        None
+    };
+    if !chain_claim_stuck_projection_allowed(&parent_status, attempt_status.as_deref()) {
+        tx.commit().await?;
+        return Ok(0);
+    }
+    let rows = sqlx::query(
+        "UPDATE invoices SET settlement_status = 'claim_stuck', \
+             swap_settlement_status = 'claim_stuck' \
+          WHERE id = $1 AND status NOT IN ('expired', 'cancelled')",
+    )
+    .bind(invoice_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(rows)
+}
+
+fn chain_claim_stuck_projection_allowed(
+    parent_status: &str,
+    attempt_status: Option<&str>,
+) -> bool {
+    parent_status == "claim_stuck"
+        && !matches!(attempt_status, Some("confirmed" | "finalized"))
+}
+
+#[cfg(test)]
+mod chain_claim_stuck_projection_tests {
+    use super::chain_claim_stuck_projection_allowed;
+
+    #[test]
+    fn projection_requires_current_stuck_unsettled_obligation() {
+        for attempt in [None, Some("constructed"), Some("broadcast_ambiguous")] {
+            assert!(chain_claim_stuck_projection_allowed(
+                "claim_stuck",
+                attempt
+            ));
+        }
+        for attempt in [Some("confirmed"), Some("finalized")] {
+            assert!(!chain_claim_stuck_projection_allowed(
+                "claim_stuck",
+                attempt
+            ));
+        }
+        for parent in ["claiming", "claim_failed", "claimed", "refunded"] {
+            assert!(!chain_claim_stuck_projection_allowed(parent, None));
+        }
+    }
+}
+
 pub async fn mark_invoice_settlement_status_for_swap(
     pool: &PgPool,
     swap_id: Uuid,
