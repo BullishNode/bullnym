@@ -355,10 +355,6 @@ fn validate_chain_record(
         return invalid(record, "chain claim and refund key indexes are identical");
     }
 
-    let amount = claim
-        .amount
-        .filter(|amount| *amount > 0)
-        .ok_or_else(|| invalid_error(record, "chain claim amount is missing or zero"))?;
     let (claim_keypair, claim_key) = derive_restore_key(
         swap_master_key,
         record,
@@ -404,7 +400,7 @@ fn validate_chain_record(
 
     let reconstructed = CreateChainResponse {
         id: record.id.clone(),
-        claim_details: restore_claim_to_chain_details(record, claim, amount)?,
+        claim_details: restore_claim_to_chain_details(record, claim)?,
         lockup_details: restore_refund_to_chain_details(record, refund)?,
     };
     reconstructed
@@ -624,14 +620,17 @@ fn expected_refund_script(sender: &PublicKey, timeout_block_height: u32) -> Scri
 fn restore_claim_to_chain_details(
     record: &SwapRestoreResponse,
     details: &ClaimDetails,
-    amount: u64,
 ) -> Result<ChainSwapDetails, BoltzRestoreValidationError> {
     Ok(ChainSwapDetails {
         swap_tree: details.tree.clone(),
         lockup_address: details.lockup_address.clone(),
         server_public_key: parse_public_key(record, &details.server_public_key)?,
         timeout_block_height: details.timeout_block_height,
-        amount,
+        // Boltz's restore contract makes this field optional, and
+        // `CreateChainResponse::validate` does not use it to bind the script or
+        // address. Recovery amounts come from signed/local evidence, never this
+        // provider response, so do not promote it into authority here.
+        amount: 0,
         blinding_key: details.blinding_key.clone(),
         refund_address: None,
         claim_address: None,
@@ -964,6 +963,27 @@ mod tests {
             validated.validate_reported_high_water(&reported).unwrap(),
             Some(102)
         );
+    }
+
+    #[test]
+    fn optional_chain_amount_is_not_recovery_authority_but_reverse_amount_remains_required() {
+        let baseline = serialized_fixture();
+        let expected = validate_restore_records(&master_key(), &baseline).unwrap();
+        for amount in [None, Some(0), Some(u64::MAX)] {
+            let mut records = baseline.clone();
+            records[1].claim_details.as_mut().unwrap().amount = amount;
+            assert_eq!(
+                validate_restore_records(&master_key(), &records).unwrap(),
+                expected,
+                "chain restore amount unexpectedly changed validated recovery identity",
+            );
+        }
+
+        for amount in [None, Some(0)] {
+            let mut records = baseline.clone();
+            records[0].claim_details.as_mut().unwrap().amount = amount;
+            assert_error_contains(&records, "reverse claim amount is missing or zero");
+        }
     }
 
     #[test]
