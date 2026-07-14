@@ -251,7 +251,8 @@ BEGIN
           FROM pg_class
          WHERE oid = format('public.%I', relation_name)::REGCLASS;
         IF relation_owner_oid = runtime_role_oid
-           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET')
            OR NOT has_table_privilege('bullnym_app', format('public.%I', relation_name), 'SELECT')
            OR NOT has_table_privilege('bullnym_app', format('public.%I', relation_name), 'INSERT')
            OR NOT has_table_privilege('bullnym_app', format('public.%I', relation_name), 'UPDATE')
@@ -275,7 +276,8 @@ BEGIN
            AND procedure_info.proname = function_name
            AND procedure_info.pronargs = 0;
         IF function_owner_oid = runtime_role_oid
-           OR pg_has_role(runtime_role_oid, function_owner_oid, 'MEMBER') THEN
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'SET') THEN
             RAISE EXCEPTION 'migration 055 retained unsafe function owner for %',
                 function_name;
         END IF;
@@ -286,7 +288,8 @@ BEGIN
      WHERE oid = 'public.invoice_payment_events_accounting_sequence_seq'::REGCLASS
        AND relkind = 'S';
     IF relation_owner_oid = runtime_role_oid
-       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET')
        OR NOT has_sequence_privilege(
            'bullnym_app',
            'public.invoice_payment_events_accounting_sequence_seq',

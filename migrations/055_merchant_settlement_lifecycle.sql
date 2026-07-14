@@ -51,7 +51,8 @@ BEGIN
     END IF;
     SELECT oid INTO STRICT executor_role_oid FROM pg_roles WHERE rolname = current_user;
     IF runtime_role_oid = executor_role_oid
-       OR pg_has_role(runtime_role_oid, executor_role_oid, 'MEMBER') THEN
+       OR pg_has_role(runtime_role_oid, executor_role_oid, 'USAGE')
+       OR pg_has_role(runtime_role_oid, executor_role_oid, 'SET') THEN
         RAISE EXCEPTION 'migration 055 runtime role % can assume its schema owner %',
             quote_ident(runtime_role_name), quote_ident(current_user)
             USING ERRCODE = '42501';
@@ -81,7 +82,8 @@ BEGIN
                AND relation.relkind = 'r';
         END IF;
         IF relation_owner_oid = runtime_role_oid
-           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER') THEN
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET') THEN
             RAISE EXCEPTION 'migration 055 runtime role % owns or can assume owner of %',
                 quote_ident(runtime_role_name), relation_name
                 USING ERRCODE = '42501';
@@ -109,7 +111,8 @@ BEGIN
        AND relation.relname = 'invoice_payment_events_accounting_sequence_seq'
        AND relation.relkind = 'S';
     IF relation_owner_oid = runtime_role_oid
-       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER') THEN
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET') THEN
         RAISE EXCEPTION 'migration 055 runtime role owns or can assume the accounting sequence owner'
             USING ERRCODE = '42501';
     END IF;
@@ -140,7 +143,8 @@ BEGIN
            AND procedure_info.proname = function_name
            AND procedure_info.pronargs = 0;
         IF function_owner_oid = runtime_role_oid
-           OR pg_has_role(runtime_role_oid, function_owner_oid, 'MEMBER') THEN
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, function_owner_oid, 'SET') THEN
             RAISE EXCEPTION 'migration 055 runtime role owns or can assume owner of function %',
                 function_name
                 USING ERRCODE = '42501';
@@ -818,7 +822,8 @@ BEGIN
         SELECT relowner INTO STRICT relation_owner_oid
           FROM pg_class WHERE oid = format('public.%I', relation_name)::REGCLASS;
         IF relation_owner_oid = runtime_role_oid
-           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+           OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET')
            OR NOT has_table_privilege(runtime_role_name, format('public.%I', relation_name), 'SELECT')
            OR NOT has_table_privilege(runtime_role_name, format('public.%I', relation_name), 'INSERT')
            OR NOT has_table_privilege(runtime_role_name, format('public.%I', relation_name), 'UPDATE')
@@ -835,7 +840,8 @@ BEGIN
      WHERE oid = 'public.invoice_payment_events_accounting_sequence_seq'::REGCLASS
        AND relkind = 'S';
     IF relation_owner_oid = runtime_role_oid
-       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET')
        OR NOT has_sequence_privilege(
            runtime_role_name,
            'public.invoice_payment_events_accounting_sequence_seq',

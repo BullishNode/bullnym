@@ -164,7 +164,8 @@ SELECT current_user,
        current_database(),
        COALESCE((
            SELECT pg_get_userbyid(ledger.relowner) <> current_user
-              AND NOT pg_has_role(current_user, pg_get_userbyid(ledger.relowner), 'MEMBER')
+              AND NOT pg_has_role(current_user, pg_get_userbyid(ledger.relowner), 'USAGE')
+              AND NOT pg_has_role(current_user, pg_get_userbyid(ledger.relowner), 'SET')
               AND has_table_privilege(current_user, ledger.oid, 'SELECT')
               AND has_table_privilege(current_user, ledger.oid, 'INSERT')
               AND NOT has_table_privilege(current_user, ledger.oid, 'UPDATE')
@@ -274,7 +275,10 @@ SELECT current_user,
                            ON namespace.oid = relation.relnamespace
                          JOIN pg_proc function_info
                            ON function_info.oid = trigger_info.tgfoid
+                         JOIN pg_namespace function_namespace
+                           ON function_namespace.oid = function_info.pronamespace
                         WHERE namespace.nspname = 'public'
+                          AND function_namespace.nspname = 'public'
                           AND relation.relname = required.table_name
                           AND trigger_info.tgname = required.trigger_name
                           AND function_info.proname = required.function_name
@@ -590,7 +594,12 @@ SELECT (
                 AND NOT pg_has_role(
                     current_user,
                     pg_get_userbyid(function_info.proowner),
-                    'MEMBER'
+                    'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'SET'
                 )
          )
     )
@@ -610,7 +619,8 @@ SELECT (
                 AND relation.relname = required.table_name
                 AND relation.relkind = 'r'
                 AND pg_get_userbyid(relation.relowner) <> current_user
-                AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'MEMBER')
+                AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'USAGE')
+                AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'SET')
                 AND has_table_privilege(current_user, relation.oid, 'SELECT')
                 AND has_table_privilege(current_user, relation.oid, 'INSERT')
                 AND has_table_privilege(current_user, relation.oid, 'UPDATE')
@@ -649,7 +659,12 @@ SELECT (
            AND NOT pg_has_role(
                current_user,
                pg_get_userbyid(sequence_info.relowner),
-               'MEMBER'
+               'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user,
+               pg_get_userbyid(sequence_info.relowner),
+               'SET'
            )
            AND has_sequence_privilege(
                current_user,
