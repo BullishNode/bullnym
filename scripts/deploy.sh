@@ -442,7 +442,8 @@ EOF
     exit 1
   fi
 fi
-if [[ -f "$REPO/migrations/058_permanent_public_names.sql" ]]; then
+if [[ -f "$REPO/migrations/058_permanent_public_names.sql" \
+   && ! -f "$REPO/migrations/059_remove_surface_alias.sql" ]]; then
   if ! migration_058_boundary_ready; then
     cat >&2 <<'EOF'
 deployment refused before build: migration 058 is absent or its exact immutable public-name boundary could not be verified.
