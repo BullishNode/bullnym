@@ -288,6 +288,23 @@ pub trait UtxoBackend: Send + Sync {
         ))
     }
 
+    /// Return one stable snapshot only after two distinct Liquid authorities
+    /// independently agree on the exact script history and block anchors.
+    /// Automatic Bitcoin fallback may use an empty history as irreversible
+    /// evidence, so the ordinary single-authority failover API above is not a
+    /// sufficient authorization boundary. Alternate/test backends fail closed
+    /// unless they implement this stronger contract explicitly.
+    async fn automatic_fallback_liquid_history_snapshot(
+        &self,
+        _script_pubkey: &elements::Script,
+        _prior_block_heights: &[i32],
+        _limits: LiquidHistorySnapshotLimits,
+    ) -> Result<LiquidHistorySnapshotOutcome, AppError> {
+        Err(AppError::ElectrumError(
+            "backend does not provide agreed Liquid history snapshots".into(),
+        ))
+    }
+
     /// Find the transaction that spends `(txid:vout)` for a known Liquid
     /// script. Used by claim recovery when a rebroadcast says already-spent
     /// but our expected claim txid is absent.
@@ -716,6 +733,63 @@ impl UtxoBackend for ElectrumClient {
         Ok(outcome)
     }
 
+    async fn automatic_fallback_liquid_history_snapshot(
+        &self,
+        script_pubkey: &elements::Script,
+        prior_block_heights: &[i32],
+        limits: LiquidHistorySnapshotLimits,
+    ) -> Result<LiquidHistorySnapshotOutcome, AppError> {
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
+        let urls = self.urls.clone();
+        let prior_block_heights = prior_block_heights.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut snapshots = Vec::with_capacity(2);
+            for url in urls {
+                let client = match electrum_client::Client::from_config(
+                    &url,
+                    electrum_client::Config::builder().timeout(Some(10)).build(),
+                ) {
+                    Ok(client) => client,
+                    Err(_) => continue,
+                };
+                match fetch_liquid_history_snapshot(
+                    &client,
+                    &scripthash_hex,
+                    &prior_block_heights,
+                    limits,
+                ) {
+                    Ok(LiquidHistorySnapshotOutcome::Complete(mut snapshot)) => {
+                        snapshot.authority = sanitized_liquid_authority(&url);
+                        snapshots.push(snapshot);
+                        if snapshots.len() == 2 {
+                            break;
+                        }
+                    }
+                    Ok(LiquidHistorySnapshotOutcome::Incomplete(limit)) => {
+                        return Ok(LiquidHistorySnapshotOutcome::Incomplete(limit));
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let [left, right] = snapshots.as_slice() else {
+                return Err(AppError::ElectrumError(
+                    "fewer than two Liquid authorities completed the fallback snapshot".into(),
+                ));
+            };
+            agree_liquid_history_snapshots(left, right)
+                .map(LiquidHistorySnapshotOutcome::Complete)
+                .ok_or_else(|| {
+                    AppError::ElectrumError(
+                        "Liquid authorities disagree on fallback history evidence".into(),
+                    )
+                })
+        })
+        .await
+        .map_err(|error| {
+            AppError::ElectrumError(format!("agreed Liquid history snapshot join: {error}"))
+        })?
+    }
+
     async fn find_spending_txid(
         &self,
         script_pubkey: &elements::Script,
@@ -977,6 +1051,32 @@ fn sanitized_liquid_authority(url: &str) -> String {
         "liquid-electrum:{}",
         hex::encode(Sha256::digest(url.as_bytes()))
     )
+}
+
+fn agree_liquid_history_snapshots(
+    left: &LiquidHistorySnapshot,
+    right: &LiquidHistorySnapshot,
+) -> Option<LiquidHistorySnapshot> {
+    if left.authority == right.authority
+        || left.entries != right.entries
+        || left.anchored_block_hashes != right.anchored_block_hashes
+    {
+        return None;
+    }
+    let mut authorities = [left.authority.as_str(), right.authority.as_str()];
+    authorities.sort_unstable();
+    let authority = format!(
+        "liquid-electrum-agreement:{}",
+        hex::encode(Sha256::digest(authorities.join("|").as_bytes()))
+    );
+    Some(LiquidHistorySnapshot {
+        authority,
+        // Authorities can be sampled a few seconds apart. The lower tip is
+        // the strongest height both snapshots independently reached.
+        tip_height: left.tip_height.min(right.tip_height),
+        entries: left.entries.clone(),
+        anchored_block_hashes: left.anchored_block_hashes.clone(),
+    })
 }
 
 /// Decode raw Liquid transaction bytes and confirm they are the transaction

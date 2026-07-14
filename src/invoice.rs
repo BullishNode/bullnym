@@ -1486,12 +1486,11 @@ fn validate_btc_refund_address(addr: &str) -> Result<(), AppError> {
 
 /// Merchant-authenticated chain-swap recovery. The invoice-owning merchant
 /// signs `(invoice_id, btc_address, timestamp)` with their nym key; bullnym
-/// verifies the signature + ownership (exactly like `cancel_linked`), then
-/// refunds the stuck BTC lockup to the signed `btc_address`. Because only the
-/// nym owner holds the key, a bystander who knows the public invoice URL cannot
-/// call this (closes G13). The destination is immutable first-write-wins and is
-/// inside the signed payload, so it cannot be redirected. Idempotent: a retried
-/// request after success returns the same txid.
+/// verifies the signature + ownership (exactly like `cancel_linked`). The
+/// supplied address must byte-equal the historical #84 commitment copied into
+/// the swap before payer exposure. This endpoint is therefore only a signed
+/// same-destination retry/diagnostic; it can never select or override the
+/// automatic fallback destination. Idempotent retries return the same txid.
 pub async fn recover_chain_swap(
     State(state): State<AppState>,
     Path((nym, id_str)): Path<(String, String)>,
@@ -1613,15 +1612,54 @@ pub async fn recover_chain_swap(
         ));
     }
 
-    // First-write-wins: commit the destination before any broadcast (G14).
-    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, &req.btc_address).await?;
+    let creation_terms = swap.creation_terms.as_ref().ok_or_else(|| {
+        AppError::RecoveryNotAvailable(
+            "this payment has no immutable recovery-address commitment".into(),
+        )
+    })?;
+    let commitment_id = creation_terms
+        .recovery_address_commitment_id
+        .ok_or_else(|| {
+            AppError::RecoveryNotAvailable(
+                "this payment has no immutable recovery-address commitment".into(),
+            )
+        })?;
+    let committed_address = creation_terms
+        .merchant_emergency_btc_address
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::RecoveryNotAvailable(
+                "this payment has no immutable recovery-address commitment".into(),
+            )
+        })?;
+    let commitment = db::select_recovery_address_commitment_by_id(&state.db, commitment_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::RecoveryNotAvailable(
+                "this payment's recovery-address commitment is unavailable".into(),
+            )
+        })?;
+    if commitment.npub.as_str() != req.npub
+        || commitment.canonical_btc_address() != committed_address
+        || req.btc_address != committed_address
+    {
+        return Err(AppError::RecoveryNotAvailable(
+            "recovery address differs from this payment's immutable commitment".into(),
+        ));
+    }
+
+    // Materialize the already-approved destination for the legacy journal
+    // column. This is not a late address decision: equality with #84 was
+    // established above, and the write remains first-write-wins.
+    let rows = db::set_chain_swap_refund_address(&state.db, swap.id, committed_address).await?;
     if rows == 0 {
         // Address already set, or the swap left `refund_due`. Disambiguate.
         let cur = db::get_chain_swap_by_id(&state.db, swap.id)
             .await?
             .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
         match cur.refund_address.as_deref() {
-            Some(existing) if existing == req.btc_address => { /* idempotent: proceed */ }
+            Some(existing) if existing == committed_address => { /* idempotent: proceed */ }
             Some(_) => {
                 return Err(AppError::RecoveryNotAvailable(
                     "a different recovery address was already committed for this payment".into(),
@@ -1643,11 +1681,11 @@ pub async fn recover_chain_swap(
         "merchant chain-swap recovery authorized"
     );
 
-    // Re-read the address-populated row and execute the recovery under the lock.
-    let swap = db::get_chain_swap_by_id(&state.db, swap.id)
-        .await?
-        .ok_or_else(|| AppError::RecoveryNotAvailable("chain swap not found".into()))?;
-    let txid = crate::claimer::execute_chain_swap_refund(&state, &swap).await?;
+    // A signed retry is only another trigger for the same automatic execution
+    // path. It cannot substitute provider status or the authenticated request
+    // for the complete fresh #82 packet rebuilt under the shared lock.
+    let txid =
+        crate::chain_recovery::execute_journaled_recovery_automatically(&state, swap.id).await?;
     Ok(Json(RecoverResponse {
         status: "recovered".into(),
         txid,

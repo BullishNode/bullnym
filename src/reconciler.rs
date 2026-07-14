@@ -1469,7 +1469,11 @@ async fn run_one_chain_tick(
                             continue;
                         }
                     }
-                    match crate::claimer::execute_chain_swap_refund(state, &swap).await {
+                    match crate::chain_recovery::execute_journaled_recovery_automatically(
+                        state, swap.id,
+                    )
+                    .await
+                    {
                         Ok(txid) => tracing::warn!(
                             event = "chain_swap_recovery_resumed",
                             swap_id = %swap.boltz_swap_id,
@@ -1622,6 +1626,59 @@ async fn run_one_chain_tick(
                     );
                     cursors[1].visit(swap.id);
                     continue;
+                }
+            }
+            match crate::chain_fallback::schedule_automatic_fallback(state, swap.id).await {
+                Ok(
+                    crate::chain_fallback::AutomaticFallbackScheduleOutcome::Scheduled
+                    | crate::chain_fallback::AutomaticFallbackScheduleOutcome::AlreadyDue,
+                ) => {
+                    tracing::warn!(
+                        event = "automatic_fallback_due",
+                        chain_swap_id = %swap.id,
+                        "independent under-lock evidence scheduled automatic Bitcoin fallback"
+                    );
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+                Ok(crate::chain_fallback::AutomaticFallbackScheduleOutcome::AlreadyExecuting) => {
+                    cursors[1].visit(swap.id);
+                    continue;
+                }
+                Ok(crate::chain_fallback::AutomaticFallbackScheduleOutcome::Deferred(action)) => {
+                    tracing::debug!(
+                        event = "automatic_fallback_observed",
+                        chain_swap_id = %swap.id,
+                        ?action,
+                        "automatic Bitcoin fallback remains ineligible"
+                    );
+                }
+                Ok(
+                    crate::chain_fallback::AutomaticFallbackScheduleOutcome::EvidenceUnavailable(
+                        action,
+                    ),
+                ) => {
+                    health.systemic_failure = true;
+                    tracing::warn!(
+                        event = "automatic_fallback_evidence_unavailable",
+                        chain_swap_id = %swap.id,
+                        ?action,
+                        "automatic Bitcoin fallback authority is unavailable; new chain admission remains closed"
+                    );
+                }
+                Ok(
+                    crate::chain_fallback::AutomaticFallbackScheduleOutcome::Busy
+                    | crate::chain_fallback::AutomaticFallbackScheduleOutcome::Missing
+                    | crate::chain_fallback::AutomaticFallbackScheduleOutcome::IneligibleStatus(_),
+                ) => {}
+                Err(error) => {
+                    health.observe_app_error(&error);
+                    tracing::warn!(
+                        event = "automatic_fallback_evidence_deferred",
+                        chain_swap_id = %swap.id,
+                        error = %error,
+                        "automatic Bitcoin fallback evidence failed closed"
+                    );
                 }
             }
             tokio::select! {

@@ -20,7 +20,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
     donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl, nostr, og_image,
     pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration, registration,
@@ -710,6 +710,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.admission.reporter(admission::Worker::ChainReconciler),
         );
         tracing::info!("chain reconciler started (shares reconciler config)");
+
+        // Automatic Bitcoin fallback is a distinct existing-obligation
+        // executor. It consumes only #82-authorized due markers and remains
+        // active when admission closes; provider polling never decides or
+        // broadcasts from this task.
+        let _automatic_fallback_task = chain_fallback::spawn_automatic_fallback_executor(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+            state
+                .admission
+                .reporter(admission::Worker::AutomaticFallback),
+        );
+        tracing::info!("automatic Bitcoin fallback executor started");
 
         // Settlement-repair: re-records invoice payment events for reverse
         // (Lightning) swaps that reached `claimed` but whose invoice flip never

@@ -649,7 +649,11 @@ fn renegotiation_and_recovery_boundaries_are_exhaustive() {
             Timeout::BeforeTimeout,
             Action::Observe,
         ),
-        (Cooperative::Unknown, Timeout::Reached, Action::Observe),
+        (
+            Cooperative::Unknown,
+            Timeout::Reached,
+            Action::RecoverBitcoin,
+        ),
         (
             Cooperative::Available,
             Timeout::Unknown,

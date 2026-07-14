@@ -9110,7 +9110,7 @@ async fn closed_admission_rejects_absent_and_expired_lazy_lightning_without_muta
 }
 
 #[tokio::test]
-async fn closed_admission_does_not_block_recovery_before_boltz_failure() {
+async fn closed_admission_does_not_authorize_legacy_uncommitted_recovery() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let nym = "recoverclosed";
@@ -9160,19 +9160,14 @@ async fn closed_admission_does_not_block_recovery_before_boltz_failure() {
         body,
         json!({
             "status": "ERROR",
-            "code": "BoltzError",
-            "reason": "Lightning swap service is unavailable."
+            "code": "RecoveryNotAvailable",
+            "reason": "This payment has no recoverable on-chain funds, or a recovery was already completed to a different address."
         })
-    );
-    assert_ne!(body["code"], "ServiceUnavailable");
-    assert_ne!(
-        body["reason"],
-        "This payment method is temporarily unavailable. Try again later."
     );
     assert_eq!(
         provider_calls.load(Ordering::SeqCst),
-        1,
-        "recovery must reach the Boltz safety pre-check exactly once"
+        0,
+        "legacy recovery must be rejected before provider interaction"
     );
     let persisted = pay_service::db::get_chain_swap_by_id(&pool, swap.id)
         .await
@@ -9180,9 +9175,8 @@ async fn closed_admission_does_not_block_recovery_before_boltz_failure() {
         .unwrap();
     assert_eq!(persisted.status, "refund_due");
     assert_eq!(
-        persisted.refund_address.as_deref(),
-        Some(JOURNAL_DESTINATION_ADDRESS),
-        "the signed first-write recovery destination must survive provider failure"
+        persisted.refund_address, None,
+        "a late signed request cannot materialize an uncommitted destination"
     );
     provider_task.abort();
     let _ = provider_task.await;

@@ -191,6 +191,34 @@ impl BitcoinLockupWitnessAdapterV1 {
             .is_some_and(|primary| primary == snapshot.authority())
     }
 
+    /// Prove that the configured primary Bitcoin witness authority can supply
+    /// one internally stable chain view right now.
+    ///
+    /// This deliberately does not fail over: automatic-fallback admission uses
+    /// the configured primary as its self-hosted authority contract, while
+    /// public failovers remain useful only for observing/draining existing
+    /// obligations. An empty target set still exercises the primary's bounded
+    /// tip and canonical-block recheck without inventing a payment address or
+    /// treating another endpoint as equivalent authority.
+    pub async fn primary_authority_health_check(
+        &self,
+    ) -> Result<(), BitcoinLockupWitnessAdapterError> {
+        let primary = self
+            .endpoints
+            .first()
+            .ok_or(BitcoinLockupWitnessAdapterError::InvalidConfiguration)?;
+        let mut authority = AuthorityScan::new(self, primary);
+        let snapshot = authority
+            .scan_targets(&[])
+            .await
+            .map_err(|_| BitcoinLockupWitnessAdapterError::NoCompleteAuthority)?;
+        if self.is_primary_authority(&snapshot) {
+            Ok(())
+        } else {
+            Err(BitcoinLockupWitnessAdapterError::NoCompleteAuthority)
+        }
+    }
+
     /// Load a complete audit input. Every failed endpoint's partial vectors and
     /// caches are dropped before the next endpoint begins.
     pub async fn load_snapshot(

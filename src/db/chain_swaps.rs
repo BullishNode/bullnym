@@ -1203,6 +1203,88 @@ pub async fn list_refund_due_chain_swaps(
     .await
 }
 
+/// Bounded oldest-first worklist for the automatic #85 executor.
+///
+/// Eligibility is intentionally only a scheduling hint: every returned swap
+/// must reacquire the shared advisory lock and rebuild the complete #82 packet
+/// before construction or replay. Keeping this query independent of admission
+/// lets already-created obligations drain while new-money admission is closed.
+///
+/// `after_id` is a fair-work cursor, not execution authority. Rows after its
+/// `(created_at, id)` position are returned first and the ordering then wraps to
+/// the oldest row. A permanently deferred oldest page therefore cannot starve
+/// newer obligations, while a fresh process still begins oldest-first.
+pub(crate) const AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL: &str = "WITH cursor AS ( \
+         SELECT created_at, id \
+           FROM chain_swap_records \
+          WHERE id = $2 \
+     ), ordered AS ( \
+         SELECT candidate.* \
+           FROM chain_swap_records candidate \
+           LEFT JOIN cursor ON TRUE \
+          WHERE candidate.status = 'refund_due' \
+          ORDER BY CASE \
+                       WHEN cursor.id IS NULL \
+                         OR (candidate.created_at, candidate.id) \
+                            > (cursor.created_at, cursor.id) \
+                       THEN 0 ELSE 1 \
+                   END, \
+                   candidate.created_at ASC, candidate.id ASC \
+          LIMIT $1 \
+     ) \
+     SELECT {columns} FROM ordered";
+
+pub async fn list_automatic_fallback_due_chain_swaps(
+    pool: &PgPool,
+    limit: u32,
+    after_id: Option<Uuid>,
+) -> Result<Vec<ChainSwapRecord>, sqlx::Error> {
+    let sql = AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL.replace("{columns}", CHAIN_SWAP_RECORD_COLUMNS);
+    sqlx::query_as::<_, ChainSwapRecord>(&sql)
+        .bind(i64::from(limit))
+        .bind(after_id)
+        .fetch_all(pool)
+        .await
+}
+
+#[cfg(test)]
+mod automatic_fallback_worklist_tests {
+    use super::AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL;
+
+    fn modeled_fair_page(mut due: Vec<u8>, after: Option<u8>, limit: usize) -> Vec<u8> {
+        due.sort_by_key(|position| {
+            let is_after_cursor = after.is_none_or(|cursor| *position > cursor);
+            (!is_after_cursor, *position)
+        });
+        due.truncate(limit);
+        due
+    }
+
+    #[test]
+    fn due_worklist_is_oldest_first_then_wraps_after_its_cursor() {
+        assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL.contains(
+            "(candidate.created_at, candidate.id) \
+                            > (cursor.created_at, cursor.id)"
+        ));
+        assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL.contains("THEN 0 ELSE 1"));
+        assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL
+            .contains("candidate.created_at ASC, candidate.id ASC"));
+    }
+
+    #[test]
+    fn deferred_oldest_page_cannot_starve_newer_due_rows() {
+        let still_due = vec![1, 2, 3, 4, 5];
+
+        assert_eq!(modeled_fair_page(still_due.clone(), None, 2), [1, 2]);
+        // Rows 1 and 2 remain due, but advancing the cursor still exposes the
+        // next bounded page rather than repeatedly selecting that blocked
+        // oldest prefix.
+        assert_eq!(modeled_fair_page(still_due.clone(), Some(2), 2), [3, 4]);
+        assert_eq!(modeled_fair_page(still_due.clone(), Some(4), 2), [5, 1]);
+        assert_eq!(modeled_fair_page(still_due, Some(5), 2), [1, 2]);
+    }
+}
+
 /// The `refund_due` chain swap for an invoice, if any (Phase 4). Used by the
 /// customer self-claim endpoint to locate the swap whose BTC is refundable.
 /// There is at most one refundable chain swap per invoice in practice; newest

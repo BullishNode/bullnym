@@ -351,6 +351,33 @@ where
     row.map(TryInto::try_into).transpose()
 }
 
+/// Select one immutable commitment by the identity copied into a chain swap.
+///
+/// Automatic recovery must use the exact historical commitment retained by
+/// the swap, not the merchant's current (possibly rotated) default address.
+/// The generic executor lets the recovery gate perform this read inside the
+/// same transaction and row/advisory-lock boundary as its final decision.
+pub async fn select_recovery_address_commitment_by_id<'e, E>(
+    executor: E,
+    commitment_id: Uuid,
+) -> Result<Option<RecoveryAddressCommitment>, RecoveryAddressCommitmentError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    if commitment_id.is_nil() {
+        return Err(RecoveryAddressCommitmentError::CorruptCommitmentId { commitment_id });
+    }
+    let row = sqlx::query_as::<_, RecoveryAddressCommitmentDbRow>(&format!(
+        "SELECT {COMMITMENT_COLUMNS} \
+           FROM recovery_address_commitments \
+          WHERE commitment_id = $1"
+    ))
+    .bind(commitment_id)
+    .fetch_optional(executor)
+    .await?;
+    row.map(TryInto::try_into).transpose()
+}
+
 fn validate_registration(
     registration: &VerifiedRecoveryAddressRegistration,
 ) -> Result<(), RecoveryAddressCommitmentError> {

@@ -754,3 +754,39 @@ async fn raw_tx_integrity_mismatch_fails_over_to_the_next_authority() {
     assert_eq!(wrong_server.await.unwrap(), "blockchain.transaction.get");
     assert_eq!(valid_server.await.unwrap(), "blockchain.transaction.get");
 }
+
+fn agreed_snapshot(authority: &str, tip_height: i32) -> LiquidHistorySnapshot {
+    let mut anchored_block_hashes = BTreeMap::new();
+    anchored_block_hashes.insert(100, "11".repeat(32));
+    LiquidHistorySnapshot {
+        authority: authority.into(),
+        tip_height,
+        entries: vec![LiquidHistoryEntry {
+            txid: "22".repeat(32),
+            height: 100,
+            block_hash: Some("11".repeat(32)),
+        }],
+        anchored_block_hashes,
+    }
+}
+
+#[test]
+fn automatic_fallback_agreement_uses_the_lower_common_tip() {
+    let agreed = agree_liquid_history_snapshots(
+        &agreed_snapshot("authority-a", 110),
+        &agreed_snapshot("authority-b", 112),
+    )
+    .expect("distinct authorities with identical history should agree");
+    assert_eq!(agreed.tip_height, 110);
+    assert!(agreed.authority.starts_with("liquid-electrum-agreement:"));
+}
+
+#[test]
+fn automatic_fallback_agreement_rejects_one_authority_or_changed_history() {
+    let left = agreed_snapshot("authority-a", 110);
+    assert!(agree_liquid_history_snapshots(&left, &left).is_none());
+
+    let mut changed = agreed_snapshot("authority-b", 110);
+    changed.entries[0].txid = "33".repeat(32);
+    assert!(agree_liquid_history_snapshots(&left, &changed).is_none());
+}
