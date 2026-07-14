@@ -16398,6 +16398,14 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "cas").await;
+    pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+    )
+    .await
+    .unwrap();
     pay_service::db::mark_liquid_merchant_settlement_broadcast(
         &pool,
         swap_id,
