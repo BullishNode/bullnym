@@ -15481,6 +15481,180 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
 }
 
 #[tokio::test]
+async fn initial_chain_swap_quote_refusal_is_atomic_idempotent_and_liquid_guarded() {
+    use pay_service::chain_swap_renegotiation::{RenegotiationIdentity, RenegotiationState};
+    use pay_service::db::RecordDeclinedRenegotiationOutcome;
+
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "initialquoterefusal").await;
+    let invoice = insert_test_invoice(
+        &admin,
+        "initialquoterefusal",
+        &npub,
+        "lq1initialquoterefusal",
+        60,
+    )
+    .await;
+    let first = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("initialquoterefusal"),
+            boltz_swap_id: "initial-quote-refusal",
+            lockup_address: "bc1qinitialquoterefusal",
+            lockup_bip21: None,
+            user_lock_amount_sat: 25_000,
+            server_lock_amount_sat: 24_750,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"initial-quote-refusal\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let guarded = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("initialquoterefusal"),
+            boltz_swap_id: "initial-quote-refusal-liquid-won",
+            lockup_address: "bc1qinitialquoterefusalliquid",
+            lockup_bip21: None,
+            user_lock_amount_sat: 25_000,
+            server_lock_amount_sat: 24_750,
+            preimage_hex: "44".repeat(32).as_str(),
+            claim_key_hex: "55".repeat(32).as_str(),
+            refund_key_hex: "66".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"initial-quote-refusal-liquid-won\"}",
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE chain_swap_records SET status = 'server_lock_confirmed' WHERE id = $1")
+        .bind(guarded.id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let identity = RenegotiationIdentity::new(
+        first.id,
+        24_000,
+        "aa".repeat(32),
+        now - 2,
+        "issue38-primary-mismatch-v1",
+        "bb".repeat(32),
+        now - 1,
+    )
+    .unwrap();
+    let guarded_identity = RenegotiationIdentity::new(
+        guarded.id,
+        24_000,
+        "cc".repeat(32),
+        now - 2,
+        "issue38-primary-mismatch-v1",
+        "dd".repeat(32),
+        now - 1,
+    )
+    .unwrap();
+    let terminal_digest = "ee".repeat(32);
+
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+
+    let applied = pay_service::db::record_initial_definite_declined_chain_swap_renegotiation(
+        &runtime,
+        &identity,
+        &terminal_digest,
+    )
+    .await
+    .unwrap();
+    let operation = match applied {
+        RecordDeclinedRenegotiationOutcome::Applied(operation) => operation,
+        other => panic!("unexpected first refusal outcome: {other:?}"),
+    };
+    assert_eq!(operation.state, RenegotiationState::Declined);
+    assert_eq!(operation.version, 2);
+    assert_eq!(operation.accept_attempt_count, 0);
+    assert!(operation.accept_requested_at_unix.is_none());
+    assert!(operation.ambiguous_at_unix.is_none());
+    assert_eq!(
+        operation.terminal_response_digest(),
+        Some(terminal_digest.as_str())
+    );
+
+    let retry = pay_service::db::record_initial_definite_declined_chain_swap_renegotiation(
+        &runtime,
+        &identity,
+        &terminal_digest,
+    )
+    .await
+    .unwrap();
+    let retried = match retry {
+        RecordDeclinedRenegotiationOutcome::ExactRetry(operation) => operation,
+        other => panic!("unexpected refusal retry outcome: {other:?}"),
+    };
+    assert_eq!(retried, operation);
+
+    let persisted = pay_service::db::get_chain_swap_renegotiation(&runtime, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted, operation);
+    let parent_amount: Option<i64> = sqlx::query_scalar(
+        "SELECT renegotiated_server_lock_amount_sat FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(first.id)
+    .fetch_one(&runtime)
+    .await
+    .unwrap();
+    assert_eq!(parent_amount, None);
+
+    let late_liquid = pay_service::db::record_initial_definite_declined_chain_swap_renegotiation(
+        &runtime,
+        &guarded_identity,
+        "ff".repeat(32),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        late_liquid,
+        RecordDeclinedRenegotiationOutcome::LiquidPathActive
+    );
+    assert!(
+        pay_service::db::get_chain_swap_renegotiation(&runtime, guarded.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    runtime.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
 async fn ready_to_claim_chain_swaps_includes_retry_rows_with_claim_txid() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

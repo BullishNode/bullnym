@@ -708,6 +708,8 @@ async fn dispatch_webhook(
 pub(crate) enum RenegotiationCheckpoint {
     QuoteObservedBeforePersistence,
     QuotePersisted,
+    ExplicitDeclineObservedBeforePersistence,
+    ExplicitDeclinePersisted,
     AcceptRequested,
     ProviderAcceptedResponse,
     BeforeAcceptanceCommit,
@@ -801,6 +803,12 @@ pub(crate) trait ChainSwapRenegotiationStore: Send + Sync {
         identity: &RenegotiationIdentity,
     ) -> Result<ChainSwapRenegotiationOperation, AppError>;
 
+    async fn record_initial_decline(
+        &self,
+        identity: &RenegotiationIdentity,
+        terminal_response_digest: &str,
+    ) -> Result<DefiniteDeclineFinalization, AppError>;
+
     async fn request_accept(
         &self,
         identity: &RenegotiationIdentity,
@@ -858,6 +866,29 @@ impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
         db::persist_quoted_chain_swap_renegotiation(self.pool, identity)
             .await
             .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn record_initial_decline(
+        &self,
+        identity: &RenegotiationIdentity,
+        terminal_response_digest: &str,
+    ) -> Result<DefiniteDeclineFinalization, AppError> {
+        use db::RecordDeclinedRenegotiationOutcome as DbOutcome;
+
+        db::record_initial_definite_declined_chain_swap_renegotiation(
+            self.pool,
+            identity,
+            terminal_response_digest,
+        )
+        .await
+        .map(|outcome| match outcome {
+            DbOutcome::Applied(operation) | DbOutcome::ExactRetry(operation) => {
+                DefiniteDeclineFinalization::Declined(Box::new(operation))
+            }
+            DbOutcome::Busy => DefiniteDeclineFinalization::Busy,
+            DbOutcome::LiquidPathActive => DefiniteDeclineFinalization::LiquidPathActive,
+        })
+        .map_err(|error| AppError::DbError(error.to_string()))
     }
 
     async fn request_accept(
@@ -1006,6 +1037,23 @@ fn renegotiation_error_class(error: ChainSwapQuoteProviderErrorKind) -> Renegoti
     }
 }
 
+fn explicit_non_eligibility_code(
+    kind: ChainSwapQuoteProviderErrorKind,
+) -> Result<&'static str, AppError> {
+    match kind {
+        ChainSwapQuoteProviderErrorKind::RefundAlreadySigned => Ok("refund_already_signed"),
+        ChainSwapQuoteProviderErrorKind::FundingNotAmountRejected => {
+            Ok("funding_not_amount_rejected")
+        }
+        ChainSwapQuoteProviderErrorKind::ExpiryMarginTooShort => Ok("expiry_margin_too_short"),
+        ChainSwapQuoteProviderErrorKind::AboveMaximum => Ok("above_maximum"),
+        ChainSwapQuoteProviderErrorKind::BelowMinimum => Ok("below_minimum"),
+        _ => Err(AppError::ClaimError(
+            "provider outcome is not explicit renegotiation non-eligibility".into(),
+        )),
+    }
+}
+
 fn policy_evidence_digest(
     swap: &db::ChainSwapRecord,
     evidence: &VerifiedPrimaryFundingAmountMismatch,
@@ -1053,6 +1101,58 @@ fn policy_evidence_digest(
         .map_err(|error| {
             AppError::ClaimError(format!(
                 "renegotiation policy evidence is not canonical: {error}"
+            ))
+        })
+}
+
+fn initial_decline_policy_evidence_digest(
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+    outcome_code: &str,
+    terminal_response_sha256: &str,
+    pair: &ChainPair,
+    canonical_pair_sha256: &str,
+) -> Result<String, AppError> {
+    let primary_identity_sha256 = hex::encode(Sha256::digest(evidence.primary_identity.as_bytes()));
+    let value = serde_json::json!({
+        "policyVersion": RENEGOTIATION_POLICY_VERSION,
+        "chainSwapId": swap.id,
+        "boltzSwapIdSha256": hex::encode(Sha256::digest(swap.boltz_swap_id.as_bytes())),
+        "primaryFunding": {
+            "quality": "complete_and_agreed",
+            "chainSwapId": evidence.chain_swap_id,
+            "identitySha256": primary_identity_sha256,
+            "evidenceSha256": evidence.primary_evidence_sha256,
+            "observedAmountSat": evidence.observed_amount_sat,
+            "expectedAmountSat": evidence.expected_amount_sat,
+            "authoritativeBitcoinTip": evidence.authoritative_bitcoin_tip,
+            "observedAtUnix": evidence.observed_at_unix,
+        },
+        "providerInitialNonEligibility": {
+            "outcome": outcome_code,
+            "terminalResponseSha256": terminal_response_sha256,
+            "journalIdentityAmountSat": evidence.observed_amount_sat,
+        },
+        "pinnedPair": {
+            "hash": pair.hash,
+            "canonicalSha256": canonical_pair_sha256,
+            "minimal": pair.limits.minimal,
+            "maximal": pair.limits.maximal,
+            "maximalZeroConf": pair.limits.maximal_zero_conf,
+            "percentageFee": pair.fees.percentage,
+            "serverMinerFee": pair.fees.miner_fees.server,
+            "userClaimMinerFee": pair.fees.miner_fees.user.claim,
+            "userLockupMinerFee": pair.fees.miner_fees.user.lockup,
+        },
+        "bitcoinTimeoutHeight": swap.creation_terms.as_ref().map(|terms| terms.btc_timeout_height),
+        "minimumRemainingBitcoinBlocks": RENEGOTIATION_MIN_REMAINING_BTC_BLOCKS,
+        "maximumPrimaryObservationAgeSeconds": RENEGOTIATION_MAX_PRIMARY_OBSERVATION_AGE_SECS,
+    });
+    crate::canonical_json::canonical_json_and_sha256(&value)
+        .map(|(_, digest)| digest)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "initial renegotiation decline evidence is not canonical: {error}"
             ))
         })
 }
@@ -1146,6 +1246,49 @@ fn validate_renegotiation_policy(
     .map_err(|error| AppError::ClaimError(error.to_string()))
 }
 
+fn validate_initial_decline_policy(
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+    error: &ChainSwapQuoteProviderError,
+) -> Result<(RenegotiationIdentity, String), AppError> {
+    let outcome_code = explicit_non_eligibility_code(error.kind)?;
+    let terminal_response_digest = error
+        .terminal_evidence_sha256
+        .as_deref()
+        .filter(|digest| is_lower_sha256(digest))
+        .ok_or_else(|| {
+            AppError::ClaimError(
+                "explicit renegotiation refusal lacks canonical terminal evidence".into(),
+            )
+        })?;
+    let (pair, canonical_pair_sha256) = validate_renegotiation_preconditions(swap, evidence)?;
+    if evidence.observed_amount_sat == 0 || evidence.observed_amount_sat > i64::MAX as u64 {
+        return Err(AppError::ClaimError(
+            "initial renegotiation decline amount is outside the durable journal range".into(),
+        ));
+    }
+    let policy_digest = initial_decline_policy_evidence_digest(
+        swap,
+        evidence,
+        outcome_code,
+        terminal_response_digest,
+        &pair,
+        &canonical_pair_sha256,
+    )?;
+    let observed_at_unix = current_unix_time()?;
+    let identity = RenegotiationIdentity::new(
+        swap.id,
+        evidence.observed_amount_sat,
+        terminal_response_digest,
+        observed_at_unix,
+        RENEGOTIATION_POLICY_VERSION,
+        policy_digest,
+        observed_at_unix,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    Ok((identity, terminal_response_digest.to_owned()))
+}
+
 fn same_validated_quote(
     current: &RenegotiationIdentity,
     candidate: &RenegotiationIdentity,
@@ -1160,13 +1303,18 @@ fn provider_error(error: &ChainSwapQuoteProviderError) -> AppError {
     AppError::BoltzError(error.to_string())
 }
 
+enum LoadedRenegotiation {
+    Operation(Box<ChainSwapRenegotiationOperation>),
+    Blocked,
+}
+
 async fn load_or_observe_renegotiation<S, P, O>(
     store: &S,
     provider: &P,
     observer: &O,
     swap: &db::ChainSwapRecord,
     evidence: &VerifiedPrimaryFundingAmountMismatch,
-) -> Result<Option<ChainSwapRenegotiationOperation>, AppError>
+) -> Result<LoadedRenegotiation, AppError>
 where
     S: ChainSwapRenegotiationStore,
     P: ChainSwapRenegotiationProvider,
@@ -1174,7 +1322,7 @@ where
 {
     if let Some(current) = store.get(swap.id).await? {
         if current.state.is_terminal() {
-            return Ok(Some(current));
+            return Ok(LoadedRenegotiation::Operation(Box::new(current)));
         }
         let persisted_quote = ChainSwapQuote {
             amount_sat: current.identity.quoted_actual_amount_sat,
@@ -1190,19 +1338,32 @@ where
                     .into(),
             ));
         }
-        return Ok(Some(current));
+        return Ok(LoadedRenegotiation::Operation(Box::new(current)));
     }
 
     let quote = match provider.get_quote(&swap.boltz_swap_id).await {
         Ok(quote) => quote,
         Err(error) if error.kind.is_explicit_non_eligibility() => {
+            let (identity, terminal_response_digest) =
+                validate_initial_decline_policy(swap, evidence, &error)?;
             tracing::info!(
                 event = "chain_swap_renegotiation_explicitly_unavailable",
                 swap_id = %swap.boltz_swap_id,
                 reason = %error,
                 "verified wrong-amount swap is not eligible for provider renegotiation"
             );
-            return Ok(None);
+            observer.reached(RenegotiationCheckpoint::ExplicitDeclineObservedBeforePersistence)?;
+            return match store
+                .record_initial_decline(&identity, &terminal_response_digest)
+                .await?
+            {
+                DefiniteDeclineFinalization::Declined(operation) => {
+                    observer.reached(RenegotiationCheckpoint::ExplicitDeclinePersisted)?;
+                    Ok(LoadedRenegotiation::Operation(operation))
+                }
+                DefiniteDeclineFinalization::Busy
+                | DefiniteDeclineFinalization::LiquidPathActive => Ok(LoadedRenegotiation::Blocked),
+            };
         }
         Err(error) => return Err(provider_error(&error)),
     };
@@ -1210,7 +1371,7 @@ where
     observer.reached(RenegotiationCheckpoint::QuoteObservedBeforePersistence)?;
     let operation = store.persist_quoted(&identity).await?;
     observer.reached(RenegotiationCheckpoint::QuotePersisted)?;
-    Ok(Some(operation))
+    Ok(LoadedRenegotiation::Operation(Box::new(operation)))
 }
 
 async fn repair_or_confirm_accepted<S: ChainSwapRenegotiationStore>(
@@ -1276,11 +1437,11 @@ where
     // pair/limit disagreement before the first provider request.
     validate_renegotiation_preconditions(swap, evidence)?;
 
-    let Some(mut operation) =
-        load_or_observe_renegotiation(store, provider, observer, swap, evidence).await?
-    else {
-        return Ok(false);
-    };
+    let mut operation =
+        match load_or_observe_renegotiation(store, provider, observer, swap, evidence).await? {
+            LoadedRenegotiation::Operation(operation) => *operation,
+            LoadedRenegotiation::Blocked => return Ok(true),
+        };
     let mut changed_quote_redriven = false;
     let mut accept_prepared_in_process = false;
 
