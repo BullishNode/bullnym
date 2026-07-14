@@ -516,7 +516,9 @@ pub struct ChainSwapRecord {
     /// Customer-supplied BTC refund address (Phase 4), first-write-wins and
     /// immutable once set. NULL until the customer submits one.
     pub refund_address: Option<String>,
-    /// Broadcast customer-refund transaction id (Phase 4), NULL until refunded.
+    /// Broadcast customer-refund transaction id (Phase 4). This may be stored
+    /// while the parent remains `refunding`; public recovery status reveals it
+    /// only after terminal `refunded` chain evidence.
     pub refund_txid: Option<String>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
@@ -1392,7 +1394,9 @@ pub async fn list_recoverable_chain_swaps_for_npub(
                          cs.server_lock_amount_sat) AS effective_server_lock_amount_sat, \
                 cs.lockup_address, \
                 cs.refund_address, \
-                cs.refund_txid, \
+                CASE WHEN cs.status = 'refunded' \
+                     THEN cs.refund_txid ELSE NULL \
+                END AS refund_txid, \
                 EXTRACT(EPOCH FROM cs.created_at)::BIGINT AS swap_created_at_unix, \
                 EXTRACT(EPOCH FROM cs.updated_at)::BIGINT AS swap_updated_at_unix, \
                 i.status AS invoice_status, \
