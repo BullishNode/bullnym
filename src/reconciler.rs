@@ -1065,6 +1065,49 @@ fn slow_recovery_backoff_secs(slow_attempts: i32, base_secs: u64, cap_secs: u64)
         .min(cap_secs)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowRecoveryRail {
+    Reverse,
+    Chain,
+}
+
+/// Build one fair, combined page across both recovery rails. Alternation keeps
+/// a continuously full rail from starving the other; if one is empty, the
+/// other consumes the remaining budget.
+fn slow_recovery_rail_schedule(
+    reverse_count: usize,
+    chain_count: usize,
+    limit: u32,
+) -> Vec<SlowRecoveryRail> {
+    let maximum = limit as usize;
+    let capacity = maximum.min(reverse_count.saturating_add(chain_count));
+    let mut schedule = Vec::with_capacity(capacity);
+    let mut reverse_remaining = reverse_count;
+    let mut chain_remaining = chain_count;
+    let mut prefer_reverse = true;
+
+    while schedule.len() < maximum && (reverse_remaining > 0 || chain_remaining > 0) {
+        let rail = if prefer_reverse {
+            if reverse_remaining > 0 {
+                SlowRecoveryRail::Reverse
+            } else {
+                SlowRecoveryRail::Chain
+            }
+        } else if chain_remaining > 0 {
+            SlowRecoveryRail::Chain
+        } else {
+            SlowRecoveryRail::Reverse
+        };
+        match rail {
+            SlowRecoveryRail::Reverse => reverse_remaining -= 1,
+            SlowRecoveryRail::Chain => chain_remaining -= 1,
+        }
+        schedule.push(rail);
+        prefer_reverse = !prefer_reverse;
+    }
+    schedule
+}
+
 async fn run_slow_recovery_tick(
     state: &AppState,
     config: &ReconcilerConfig,
@@ -1083,58 +1126,72 @@ async fn run_slow_recovery_tick(
     let cap = config.slow_recovery_backoff_cap_secs;
     let fetch_limit = sentinel_limit(limit);
 
-    // Reverse rail.
     let reverse = db::list_claim_stuck_swaps_for_slow_retry(&state.db, fetch_limit).await?;
     let reverse_fetched = reverse.len();
-    for (id, boltz_swap_id, slow_attempts) in reverse.into_iter().take(limit as usize) {
-        if cancel.is_cancelled() {
-            return Ok(ScanOutcome::Cancelled);
-        }
-        reporter.progress();
-        let backoff = slow_recovery_backoff_secs(slow_attempts, base, cap);
-        let revived =
-            db::revive_claim_stuck_swap_for_slow_retry(&state.db, id, max_attempts, backoff)
-                .await?;
-        if revived == 1 {
-            tracing::warn!(
-                event = "slow_recovery_revived",
-                rail = "lightning_boltz_reverse",
-                swap_id = %boltz_swap_id,
-                slow_attempt = slow_attempts + 1,
-                "reviving funded claim_stuck reverse swap into the claim sweep"
-            );
-        }
-    }
     if cancel.is_cancelled() {
         return Ok(ScanOutcome::Cancelled);
     }
-
-    // Chain rail.
     let chain = db::list_claim_stuck_chain_swaps_for_slow_retry(&state.db, fetch_limit).await?;
     let chain_fetched = chain.len();
-    for (id, boltz_swap_id, slow_attempts) in chain.into_iter().take(limit as usize) {
+    let schedule = slow_recovery_rail_schedule(reverse_fetched, chain_fetched, limit);
+    let mut reverse = reverse.into_iter();
+    let mut chain = chain.into_iter();
+
+    for rail in schedule {
         if cancel.is_cancelled() {
             return Ok(ScanOutcome::Cancelled);
         }
+        let candidate = match rail {
+            SlowRecoveryRail::Reverse => reverse.next(),
+            SlowRecoveryRail::Chain => chain.next(),
+        };
+        let Some((id, boltz_swap_id, slow_attempts)) = candidate else {
+            tracing::error!(
+                event = "slow_recovery_schedule_invariant_failed",
+                ?rail,
+                "slow-recovery schedule exceeded its fetched rows"
+            );
+            return Ok(ScanOutcome::Failed);
+        };
         reporter.progress();
         let backoff = slow_recovery_backoff_secs(slow_attempts, base, cap);
-        let revived =
-            db::revive_claim_stuck_chain_swap_for_slow_retry(&state.db, id, max_attempts, backoff)
-                .await?;
+        let revived = match rail {
+            SlowRecoveryRail::Reverse => {
+                db::revive_claim_stuck_swap_for_slow_retry(&state.db, id, max_attempts, backoff)
+                    .await?
+            }
+            SlowRecoveryRail::Chain => {
+                db::revive_claim_stuck_chain_swap_for_slow_retry(
+                    &state.db,
+                    id,
+                    max_attempts,
+                    backoff,
+                )
+                .await?
+            }
+        };
         if revived == 1 {
+            let rail_name = match rail {
+                SlowRecoveryRail::Reverse => "lightning_boltz_reverse",
+                SlowRecoveryRail::Chain => "bitcoin_boltz_chain",
+            };
             tracing::warn!(
                 event = "slow_recovery_revived",
-                rail = "bitcoin_boltz_chain",
+                rail = rail_name,
                 swap_id = %boltz_swap_id,
                 slow_attempt = slow_attempts + 1,
-                "reviving funded claim_stuck chain swap into the claim sweep"
+                "reviving funded claim_stuck swap into the claim sweep"
             );
         }
     }
     if cancel.is_cancelled() {
         return Ok(ScanOutcome::Cancelled);
     }
-    Ok(scan_outcome(limit, reverse_fetched, true).merge(scan_outcome(limit, chain_fetched, true)))
+    Ok(scan_outcome(
+        limit,
+        reverse_fetched.saturating_add(chain_fetched),
+        true,
+    ))
 }
 
 async fn run_settlement_repair_tick(

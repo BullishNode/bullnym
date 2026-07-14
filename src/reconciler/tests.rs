@@ -585,6 +585,33 @@ fn slow_recovery_backoff_grows_and_caps() {
 }
 
 #[test]
+fn slow_recovery_uses_one_fair_budget_across_both_rails() {
+    use SlowRecoveryRail::{Chain, Reverse};
+
+    assert_eq!(
+        slow_recovery_rail_schedule(10, 10, 5),
+        vec![Reverse, Chain, Reverse, Chain, Reverse]
+    );
+    assert_eq!(
+        slow_recovery_rail_schedule(1, 10, 4),
+        vec![Reverse, Chain, Chain, Chain]
+    );
+    assert_eq!(
+        slow_recovery_rail_schedule(0, 10, 3),
+        vec![Chain, Chain, Chain]
+    );
+    assert!(slow_recovery_rail_schedule(10, 10, 0).is_empty());
+}
+
+#[test]
+fn combined_slow_recovery_sentinel_reports_remaining_work() {
+    let limit = 5;
+
+    assert_eq!(scan_outcome(limit, 3 + 2, true), ScanOutcome::Succeeded);
+    assert_eq!(scan_outcome(limit, 3 + 3, true), ScanOutcome::Progress);
+}
+
+#[test]
 fn capped_scan_outcome_uses_limit_plus_one_as_the_progress_sentinel() {
     let limit = 10;
 
