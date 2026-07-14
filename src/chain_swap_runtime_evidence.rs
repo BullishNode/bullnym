@@ -680,7 +680,10 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
         recovery_destination: RecoveryDestinationEvidence::Missing,
         cooperative_recovery: CooperativeRecoveryEvidence::Unknown,
         bitcoin_timeout: BitcoinTimeoutEvidence::Unknown,
-        liquid_claim_transaction: liquid_claim_transaction_evidence(swap, liquid_intent_exists),
+        liquid_claim_transaction: automatic_fallback_liquid_claim_transaction_evidence(
+            swap,
+            liquid_intent_exists,
+        ),
         bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
     };
 
@@ -994,7 +997,7 @@ fn classify_automatic_bitcoin_source(
     result
 }
 
-struct LiquidServerLockTarget {
+struct AutomaticFallbackLiquidServerLockTarget {
     script: elements::Script,
     blinding_key: elements::secp256k1_zkp::SecretKey,
     asset_id: elements::AssetId,
@@ -1006,7 +1009,7 @@ struct LiquidServerLockTarget {
 
 fn exact_liquid_server_lock_target(
     swap: &ChainSwapRecord,
-) -> Result<LiquidServerLockTarget, AppError> {
+) -> Result<AutomaticFallbackLiquidServerLockTarget, AppError> {
     let script = exact_liquid_server_lock_script(swap)?;
     let response: CreateChainResponse =
         serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
@@ -1066,7 +1069,7 @@ fn exact_liquid_server_lock_target(
             "Liquid refund leaf does not bind the pinned provider key and timeout".into(),
         ));
     }
-    Ok(LiquidServerLockTarget {
+    Ok(AutomaticFallbackLiquidServerLockTarget {
         script,
         blinding_key,
         asset_id,
@@ -1077,7 +1080,7 @@ fn exact_liquid_server_lock_target(
     })
 }
 
-struct LiquidLockProjection {
+struct AutomaticFallbackLiquidLockProjection {
     quality: EvidenceQuality,
     lock: LiquidLockEvidence,
     transaction: MerchantTransactionEvidence,
@@ -1086,15 +1089,16 @@ struct LiquidLockProjection {
 
 async fn classify_liquid_server_lock(
     backend: &dyn UtxoBackend,
-    target: &LiquidServerLockTarget,
+    target: &AutomaticFallbackLiquidServerLockTarget,
     snapshot: &LiquidHistorySnapshot,
     swap: &ChainSwapRecord,
     liquid_intent_exists: bool,
     finality_confirmations: u32,
-) -> Result<LiquidLockProjection, AppError> {
-    let claim_intent = liquid_claim_transaction_evidence(swap, liquid_intent_exists);
+) -> Result<AutomaticFallbackLiquidLockProjection, AppError> {
+    let claim_intent =
+        automatic_fallback_liquid_claim_transaction_evidence(swap, liquid_intent_exists);
     if snapshot.entries.is_empty() {
-        return Ok(LiquidLockProjection {
+        return Ok(AutomaticFallbackLiquidLockProjection {
             quality: EvidenceQuality::CompleteAndAgreed,
             lock: LiquidLockEvidence::NotObserved,
             transaction: claim_intent,
@@ -1118,7 +1122,7 @@ async fn classify_liquid_server_lock(
             .to_string()
             .eq_ignore_ascii_case(&entry.txid)
         {
-            return Ok(LiquidLockProjection {
+            return Ok(AutomaticFallbackLiquidLockProjection {
                 quality: EvidenceQuality::BackendDisagreement,
                 lock: LiquidLockEvidence::Unknown,
                 transaction: claim_intent,
@@ -1148,7 +1152,7 @@ async fn classify_liquid_server_lock(
         }
     }
     if invalid_candidate || candidates.len() != 1 {
-        return Ok(LiquidLockProjection {
+        return Ok(AutomaticFallbackLiquidLockProjection {
             quality: if invalid_candidate {
                 EvidenceQuality::BackendDisagreement
             } else {
@@ -1171,7 +1175,7 @@ async fn classify_liquid_server_lock(
             .to_string()
             .eq_ignore_ascii_case(&entry.txid)
         {
-            return Ok(LiquidLockProjection {
+            return Ok(AutomaticFallbackLiquidLockProjection {
                 quality: EvidenceQuality::BackendDisagreement,
                 lock: LiquidLockEvidence::Unknown,
                 transaction: claim_intent,
@@ -1190,7 +1194,7 @@ async fn classify_liquid_server_lock(
         }
     }
     if spenders.is_empty() {
-        return Ok(LiquidLockProjection {
+        return Ok(AutomaticFallbackLiquidLockProjection {
             quality: EvidenceQuality::CompleteAndAgreed,
             lock: if funding.height > 0 {
                 LiquidLockEvidence::ConfirmedUnspent
@@ -1202,7 +1206,7 @@ async fn classify_liquid_server_lock(
         });
     }
     if spenders.len() != 1 {
-        return Ok(LiquidLockProjection {
+        return Ok(AutomaticFallbackLiquidLockProjection {
             quality: EvidenceQuality::BackendDisagreement,
             lock: LiquidLockEvidence::UnknownOutspend,
             transaction: claim_intent,
@@ -1220,7 +1224,7 @@ async fn classify_liquid_server_lock(
             spender_transaction,
         )
     {
-        return Ok(LiquidLockProjection {
+        return Ok(AutomaticFallbackLiquidLockProjection {
             quality: EvidenceQuality::CompleteAndAgreed,
             lock: LiquidLockEvidence::SpentByProviderRefund,
             transaction: claim_intent,
@@ -1231,7 +1235,7 @@ async fn classify_liquid_server_lock(
     // A txid alone is not #83-compatible raw-transaction authority. A
     // non-final, cooperative, malformed, wrong-leaf, or wrong-key outspend is
     // an integrity stop rather than guessed provider-refund evidence.
-    Ok(LiquidLockProjection {
+    Ok(AutomaticFallbackLiquidLockProjection {
         quality: EvidenceQuality::CompleteAndAgreed,
         lock: LiquidLockEvidence::UnknownOutspend,
         transaction: claim_intent,
@@ -1270,7 +1274,7 @@ fn liquid_history_entry_is_finalized(
 /// so classification requires the raw witness's taproot commitment and
 /// provider signature, not merely a matching funding outpoint.
 fn validates_exact_liquid_provider_refund(
-    target: &LiquidServerLockTarget,
+    target: &AutomaticFallbackLiquidServerLockTarget,
     funding_txid: &str,
     funding_vout: u32,
     funding_output: &elements::TxOut,
@@ -1382,7 +1386,7 @@ fn classify_renegotiation(
     }
 }
 
-fn liquid_claim_transaction_evidence(
+fn automatic_fallback_liquid_claim_transaction_evidence(
     swap: &ChainSwapRecord,
     persisted_intent_exists: bool,
 ) -> MerchantTransactionEvidence {
@@ -1676,7 +1680,7 @@ mod tests {
     }
 
     fn signed_provider_refund_fixture() -> (
-        LiquidServerLockTarget,
+        AutomaticFallbackLiquidServerLockTarget,
         String,
         u32,
         elements::TxOut,
@@ -1770,7 +1774,7 @@ mod tests {
             control_block.serialize(),
         ];
 
-        let target = LiquidServerLockTarget {
+        let target = AutomaticFallbackLiquidServerLockTarget {
             script,
             blinding_key: elements::secp256k1_zkp::SecretKey::from_slice(&[5_u8; 32]).unwrap(),
             asset_id,
