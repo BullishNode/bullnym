@@ -496,7 +496,10 @@ SELECT (
                  ON namespace.oid = relation.relnamespace
                JOIN pg_proc function_info
                  ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
               WHERE namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
                 AND relation.relname = required.table_name
                 AND trigger_info.tgname = required.trigger_name
                 AND function_info.proname = required.function_name
