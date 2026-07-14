@@ -54,3 +54,23 @@ fn special_chars_rejected() {
     assert!(!NYM_REGEX.is_match("user.name"));
     assert!(!NYM_REGEX.is_match("user!name"));
 }
+
+#[test]
+fn verification_npub_requires_a_canonical_lowercase_xonly_key() {
+    const GENERATOR_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    assert!(validate_verification_npub(GENERATOR_X).is_ok());
+
+    for invalid in [
+        GENERATOR_X.to_ascii_uppercase(),
+        "f".repeat(64),
+        "a".repeat(63),
+        "g".repeat(64),
+    ] {
+        let error = validate_verification_npub(&invalid).unwrap_err();
+        assert!(
+            matches!(error, AppError::AuthError(_)),
+            "accepted {invalid}"
+        );
+    }
+}

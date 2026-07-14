@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -78,9 +78,9 @@ use bitcoin::script::Builder;
 use bitcoin::ScriptBuf;
 use boltz_client::network::{BitcoinChain, LiquidChain, Network};
 use boltz_client::swaps::boltz::{
-    ChainPair, ChainSwapDetails, CreateChainResponse, GetChainPairsResponse, GetSwapResponse,
-    HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair, Side, SwapTree,
-    SwapType,
+    ChainPair, ChainSwapDetails, CreateChainResponse, CreateReverseResponse, GetChainPairsResponse,
+    GetSwapResponse, HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair,
+    Side, SwapTree, SwapType,
 };
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
@@ -475,14 +475,16 @@ fn fresh_bolt11(amount_sat: u64) -> String {
         .to_string()
 }
 
-fn fresh_replacement_bolt11(amount_sat: u64) -> String {
-    let private_key = SecretKey::from_slice(&[44; 32]).unwrap();
-    let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-terminal-replacement-test");
+fn fresh_bolt11_for_payment_hash(
+    amount_sat: u64,
+    payment_hash: bitcoin::hashes::sha256::Hash,
+) -> String {
+    let private_key = SecretKey::from_slice(&[45; 32]).unwrap();
     InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
-        .description("Bullnym terminal replacement test".into())
+        .description("Bullnym protocol-valid reverse fixture".into())
         .payment_hash(payment_hash)
-        .payment_secret(PaymentSecret([26; 32]))
+        .payment_secret(PaymentSecret([27; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp()))
         .expiry_time(Duration::from_secs(3_600))
         .min_final_cltv_expiry_delta(144)
@@ -1122,17 +1124,92 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
 
 #[derive(Clone)]
 struct SuccessfulReverseBarrierState {
-    response: Value,
+    swap_id: String,
+    invoice_amount_sat: u64,
+    next_key_index: Arc<AtomicU64>,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
+    invoices: Arc<Mutex<Vec<String>>>,
     request_barrier: Arc<Barrier>,
     release_barrier: Arc<Barrier>,
+}
+
+fn protocol_valid_reverse_response(
+    swap_id: &str,
+    invoice: String,
+    claim_public_key: BoltzPublicKey,
+    preimage: &Preimage,
+    onchain_amount_sat: u64,
+) -> CreateReverseResponse {
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    const TIMEOUT_HEIGHT: u32 = 2_000_000;
+
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let refund_keypair = master.derive_swapkey(9_999).unwrap();
+    let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
+    let claim_script = Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(preimage.hash160.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&claim_public_key.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+    let refund_script = Builder::new()
+        .push_x_only_key(&refund_public_key.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(TIMEOUT_HEIGHT))
+        .push_opcode(OP_CLTV)
+        .into_script();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let lockup_address = LBtcSwapScript {
+        swap_type: SwapType::ReverseSubmarine,
+        side: None,
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(TIMEOUT_HEIGHT),
+        sender_pubkey: refund_public_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+
+    CreateReverseResponse {
+        id: swap_id.to_owned(),
+        invoice: Some(invoice),
+        swap_tree: SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(claim_script.as_bytes()),
+                version: 0xc4,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(refund_script.as_bytes()),
+                version: 0xc4,
+            },
+            covenant_claim_leaf: None,
+        },
+        lockup_address,
+        refund_public_key,
+        timeout_block_height: TIMEOUT_HEIGHT,
+        onchain_amount: onchain_amount_sat,
+        blinding_key: Some(BLINDING_KEY.into()),
+    }
 }
 
 struct SuccessfulReverseBarrierServer {
     base_url: String,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
+    invoices: Arc<Mutex<Vec<String>>>,
     request_barrier: Arc<Barrier>,
     release_barrier: Arc<Barrier>,
     task: tokio::task::JoinHandle<()>,
@@ -1151,6 +1228,15 @@ impl SuccessfulReverseBarrierServer {
             .expect("Boltz reverse response handler did not reach the release barrier");
     }
 
+    async fn latest_invoice(&self) -> String {
+        self.invoices
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("Boltz reverse fixture did not produce an invoice")
+    }
+
     async fn shutdown(self) {
         self.task.abort();
         let _ = self.task.await;
@@ -1162,17 +1248,50 @@ async fn successful_reverse_barrier_handler(
     axum::Json(request): axum::Json<Value>,
 ) -> axum::Json<Value> {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    let mut response = state.response.clone();
-    response["onchainAmount"] = request.get("onchainAmount").cloned().unwrap_or(Value::Null);
+    let key_index = state.next_key_index.fetch_add(1, Ordering::SeqCst);
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(key_index).unwrap();
+    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+    let preimage = Preimage::from_swap_key(&claim_keypair);
+    let claim_public_key_string = claim_public_key.to_string();
+    let preimage_hash_string = preimage.sha256.to_string();
+    assert_eq!(
+        request["claimPublicKey"].as_str(),
+        Some(claim_public_key_string.as_str()),
+        "fixture key index did not match the production request"
+    );
+    assert_eq!(
+        request["preimageHash"].as_str(),
+        Some(preimage_hash_string.as_str()),
+        "fixture preimage did not match the production request"
+    );
+
+    let invoice = fresh_bolt11_for_payment_hash(state.invoice_amount_sat, preimage.sha256);
+    let response = protocol_valid_reverse_response(
+        &state.swap_id,
+        invoice.clone(),
+        claim_public_key,
+        &preimage,
+        request["onchainAmount"]
+            .as_u64()
+            .expect("fixed checkout request onchainAmount"),
+    );
+    state.invoices.lock().await.push(invoice);
     state.requests.lock().await.push(request);
     state.request_barrier.wait().await;
     state.release_barrier.wait().await;
-    axum::Json(response)
+    axum::Json(serde_json::to_value(response).unwrap())
 }
 
 async fn spawn_successful_reverse_barrier_server(
     swap_id: &str,
-    bolt11: &str,
+    invoice_amount_sat: u64,
+    first_key_index: u64,
 ) -> SuccessfulReverseBarrierServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1180,23 +1299,16 @@ async fn spawn_successful_reverse_barrier_server(
     let address = listener.local_addr().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let invoices = Arc::new(Mutex::new(Vec::new()));
     let request_barrier = Arc::new(Barrier::new(2));
     let release_barrier = Arc::new(Barrier::new(2));
     let state = SuccessfulReverseBarrierState {
-        response: json!({
-            "id": swap_id,
-            "invoice": bolt11,
-            "swapTree": {
-                "claimLeaf": {"output": "51", "version": 192},
-                "refundLeaf": {"output": "51", "version": 192}
-            },
-            "lockupAddress": "lq1qqtestreversebarrier",
-            "refundPublicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-            "timeoutBlockHeight": 2_000_000,
-            "onchainAmount": 1
-        }),
+        swap_id: swap_id.to_owned(),
+        invoice_amount_sat,
+        next_key_index: Arc::new(AtomicU64::new(first_key_index)),
         calls: calls.clone(),
         requests: requests.clone(),
+        invoices: invoices.clone(),
         request_barrier: request_barrier.clone(),
         release_barrier: release_barrier.clone(),
     };
@@ -1212,6 +1324,7 @@ async fn spawn_successful_reverse_barrier_server(
         base_url: format!("http://{address}"),
         calls,
         requests,
+        invoices,
         request_barrier,
         release_barrier,
         task,
@@ -5018,6 +5131,53 @@ async fn register_nip05_resolves_verification_npub() {
 }
 
 #[tokio::test]
+async fn register_rejects_uppercase_verification_npub_before_persistence() {
+    const UPPERCASE_VERIFICATION_NPUB: &str =
+        "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state_with_nip05(pool.clone()));
+
+    let secp = Secp256k1::new();
+    let auth_keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (auth_xonly, _) = auth_keypair.x_only_public_key();
+    let auth_npub = auth_xonly.to_string();
+    let (signature, timestamp) = sign_register_with_verification_keypair(
+        &auth_keypair,
+        &auth_npub,
+        "uppercaseverify",
+        TEST_DESCRIPTOR,
+        UPPERCASE_VERIFICATION_NPUB,
+    );
+
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "uppercaseverify",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": auth_npub,
+            "verification_npub": UPPERCASE_VERIFICATION_NPUB,
+            "signature": signature,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "AuthError");
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nym = 'uppercaseverify'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn register_duplicate_nym_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -5267,6 +5427,72 @@ async fn webhook_skips_terminal_swaps() {
         .unwrap()
         .unwrap();
     assert_eq!(swap.status, "claimed");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn settled_webhook_schedules_unclaimed_reverse_recovery() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let app = test_app(state);
+
+    let (npub, _, _) = sign_registration("settledunclaimed", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "settledunclaimed", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("settledunclaimed"),
+            boltz_swap_id: "SETTLED_WITHOUT_LOCAL_CLAIM",
+            address: Some("lq1settledunclaimed"),
+            address_index: Some(0),
+            amount_sat: 1_000,
+            invoice: "lnbc-settled-unclaimed",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "SETTLED_WITHOUT_LOCAL_CLAIM",
+                "status": "invoice.settled"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let recovered = pay_service::db::get_swap_by_boltz_id(&pool, "SETTLED_WITHOUT_LOCAL_CLAIM")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, "lockup_confirmed");
+    assert_eq!(recovered.claim_attempts, 0);
+    let scheduled: bool = sqlx::query_scalar(
+        "SELECT next_claim_attempt_at IS NOT NULL FROM swap_records WHERE id = $1",
+    )
+    .bind(recovered.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        scheduled,
+        "settled provider evidence must leave a durable automatic recovery obligation"
+    );
 
     cleanup_db(&pool).await;
 }
@@ -8663,9 +8889,15 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .await
         .unwrap();
 
-    let bolt11 = fresh_bolt11(1_050);
-    let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_CANCEL_RETRY_1", &bolt11).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&admin)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "LAZY_OFFER_CANCEL_RETRY_1",
+        1_050,
+        first_key_index,
+    )
+    .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let constrained = constrained_test_pool(1, None);
@@ -8695,6 +8927,7 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .await
         .expect("retry could not acquire the single-connection pool after cancellation")
         .expect("lazy-offer retry task failed");
+    let bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
     assert_eq!(body["lightning_amount_sat"], 1_050);
@@ -8877,10 +9110,13 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     .await
     .unwrap();
 
-    let replacement_bolt11 = fresh_replacement_bolt11(1_050);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider = spawn_successful_reverse_barrier_server(
         "LAZY_OFFER_TERMINAL_REPLACEMENT_1",
-        &replacement_bolt11,
+        1_050,
+        first_key_index,
     )
     .await;
     let mut config = test_config();
@@ -8908,6 +9144,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
         .await
         .expect("replacement offer request did not finish")
         .expect("replacement offer request task failed");
+    let replacement_bolt11 = provider.latest_invoice().await;
     assert_eq!(offer_status, StatusCode::OK, "{offer}");
     assert_eq!(offer["pr"], replacement_bolt11);
     assert_eq!(offer["lightning_amount_sat"], 1_050);
@@ -9033,9 +9270,12 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     assert_eq!(before.status, "partially_paid");
     assert_eq!(before.presentation_status.as_deref(), Some("partial"));
 
-    let stale_bolt11 = fresh_bolt11(649);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", &stale_bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", 649, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9058,6 +9298,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
         .await
         .expect("lazy offer request did not finish after provider release")
         .expect("lazy offer request task failed");
+    let stale_bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert!(body.get("pr").is_none(), "stale offer escaped: {body}");
@@ -9132,9 +9373,12 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
     .await
     .unwrap();
 
-    let bolt11 = fresh_bolt11(649);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", &bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", 649, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9169,6 +9413,7 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
         .await
         .expect("offer request did not finish after commit release")
         .expect("offer request task failed");
+    let bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["pr"], bolt11);
     assert_eq!(body["lightning_amount_sat"], 649);
@@ -9210,9 +9455,12 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
         .await
         .unwrap();
 
-    let stale_bolt11 = fresh_bolt11(1_050);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_EXPIRY_RACE_1", &stale_bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_EXPIRY_RACE_1", 1_050, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9244,6 +9492,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
         .await
         .expect("lazy offer request did not finish after provider release")
         .expect("lazy offer request task failed");
+    let stale_bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert!(body.get("pr").is_none(), "stale offer escaped: {body}");
@@ -13351,25 +13600,77 @@ async fn confirmed_lightning_address_history_advances_cursor_and_fulfills_once()
 // --- Invoice lifecycle / watcher database coverage ---
 
 #[tokio::test]
-async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
+async fn invoice_expiry_gc_terminalizes_only_safe_past_deadline_projections() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "invoicegc").await;
 
     let expired_unpaid =
         insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredunpaid", -10).await;
-    let expired_in_progress =
-        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredinprogress", -10).await;
+    let stale_in_progress =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1staleinprogress", -10).await;
+    let pending_direct =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1pendingdirect", -10).await;
+    let pending_partial =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1pendingpartial", 60).await;
+    let expired_partial =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpartial", 60).await;
     let expired_paid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpaid", -10).await;
     let fresh_unpaid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1freshunpaid", 60).await;
 
+    sqlx::query("UPDATE invoices SET status = 'in_progress' WHERE id = $1")
+        .bind(stale_in_progress.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::db::mark_invoice_in_progress_for_component(
         &pool,
-        expired_in_progress.id,
+        pending_direct.id,
         pay_service::db::InvoiceInProgressComponent::Direct,
     )
     .await
     .unwrap();
+    pay_service::db::record_invoice_payment(
+        &pool,
+        pending_partial.id,
+        liquid_direct_evidence(
+            "liquid_direct:acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac:0",
+            400,
+            "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac",
+            0,
+            "lq1pendingpartial",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    pay_service::db::mark_invoice_settlement_status(&pool, Some(pending_partial.id), "pending")
+        .await
+        .unwrap();
+    pay_service::db::record_invoice_payment(
+        &pool,
+        expired_partial.id,
+        liquid_direct_evidence(
+            "liquid_direct:abababababababababababababababababababababababababababababababab:0",
+            400,
+            "abababababababababababababababababababababababababababababababab",
+            0,
+            "lq1expiredpartial",
+        ),
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '10 seconds' WHERE id = $1")
+        .bind(expired_partial.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '10 seconds' WHERE id = $1")
+        .bind(pending_partial.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::db::record_invoice_payment(
         &pool,
         expired_paid.id,
@@ -13388,13 +13689,25 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
     let expired_count = pay_service::db::expire_invoices_past_deadline(&pool, 0)
         .await
         .unwrap();
-    assert_eq!(expired_count, 2);
+    assert_eq!(expired_count, 3);
 
     let expired_unpaid = pay_service::db::get_invoice_by_id(&pool, expired_unpaid.id)
         .await
         .unwrap()
         .unwrap();
-    let expired_in_progress = pay_service::db::get_invoice_by_id(&pool, expired_in_progress.id)
+    let stale_in_progress = pay_service::db::get_invoice_by_id(&pool, stale_in_progress.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_direct = pay_service::db::get_invoice_by_id(&pool, pending_direct.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_partial = pay_service::db::get_invoice_by_id(&pool, pending_partial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired_partial = pay_service::db::get_invoice_by_id(&pool, expired_partial.id)
         .await
         .unwrap()
         .unwrap();
@@ -13408,9 +13721,126 @@ async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
         .unwrap();
 
     assert_eq!(expired_unpaid.status, "expired");
-    assert_eq!(expired_in_progress.status, "expired");
+    assert_eq!(stale_in_progress.status, "expired");
+    assert_eq!(pending_direct.status, "in_progress");
+    assert_eq!(pending_direct.direct_settlement_status, "pending");
+    assert_eq!(pending_direct.settlement_status, "pending");
+    assert_eq!(pending_partial.status, "partially_paid");
+    assert_eq!(
+        pending_partial.presentation_status.as_deref(),
+        Some("partial")
+    );
+    assert_eq!(pending_partial.swap_settlement_status, "pending");
+    assert_eq!(pending_partial.settlement_status, "pending");
+    assert_eq!(expired_partial.status, "underpaid");
+    assert_eq!(expired_partial.paid_amount_sat, Some(400));
     assert_eq!(expired_paid.status, "paid");
     assert_eq!(fresh_unpaid.status, "unpaid");
+
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        0,
+        "replaying the sweep must not rewrite terminal or pending rows"
+    );
+    assert_eq!(
+        pay_service::db::mark_invoice_settlement_status(&pool, Some(pending_partial.id), "none",)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        1,
+        "a later sweep may terminalize the partial after settlement clears"
+    );
+    let resolved = pay_service::db::get_invoice_by_id(&pool, pending_partial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.status, "underpaid");
+    assert_eq!(resolved.paid_amount_sat, Some(400));
+    assert_eq!(resolved.swap_settlement_status, "none");
+    assert_eq!(resolved.settlement_status, "none");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn invoice_expiry_gc_rechecks_projection_after_concurrent_watcher_commit() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "invoicegccas").await;
+    let invoice = insert_test_invoice(&pool, "invoicegccas", &npub, "lq1invoicegccas", -10).await;
+
+    // Model the watcher's transaction boundary: it owns the shared projection
+    // lock and the invoice row, but its pending evidence is not committed yet.
+    let mut watcher = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(pay_service::db::invoice_lightning_lock_key(invoice.id))
+        .execute(&mut *watcher)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE invoices SET status = 'in_progress', \
+             settlement_status = 'pending', direct_settlement_status = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&mut *watcher)
+    .await
+    .unwrap();
+
+    let expiry_pool = named_single_connection_test_pool("invoice-expiry-cas-test").await;
+    let expiry_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&expiry_pool)
+        .await
+        .unwrap();
+    let expiry_task_pool = expiry_pool.clone();
+    let expiry = tokio::spawn(async move {
+        pay_service::db::expire_invoices_past_deadline(&expiry_task_pool, 0).await
+    });
+
+    let observed_row_lock_wait = observe_recovery_lock_wait(
+        &pool,
+        expiry_backend_pid,
+        "%UPDATE invoices SET status = CASE%",
+    )
+    .await
+    .unwrap();
+    if !observed_row_lock_wait {
+        watcher.rollback().await.unwrap();
+        let premature = tokio::time::timeout(Duration::from_secs(10), expiry)
+            .await
+            .expect("expiry task did not finish after rollback")
+            .expect("expiry task panicked");
+        expiry_pool.close().await;
+        cleanup_db(&pool).await;
+        panic!("expiry did not wait for the watcher row lock: {premature:?}");
+    }
+
+    watcher.commit().await.unwrap();
+    let expired_count = tokio::time::timeout(Duration::from_secs(10), expiry)
+        .await
+        .expect("expiry task did not finish after watcher commit")
+        .expect("expiry task panicked")
+        .unwrap();
+    expiry_pool.close().await;
+    assert_eq!(
+        expired_count, 0,
+        "the UPDATE predicate must be rechecked against committed watcher evidence"
+    );
+
+    let pending = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, "in_progress");
+    assert_eq!(pending.direct_settlement_status, "pending");
+    assert_eq!(pending.settlement_status, "pending");
 
     cleanup_db(&pool).await;
 }

@@ -45,7 +45,7 @@ impl Default for GcConfig {
             tick_secs: 600,         // 10 min
             retention_secs: 86_400, // 24 h — well past the longest 1h window
             checkout_partial_terminal_grace_secs: 900,
-            payment_grace_secs: 3_600, // 1 h
+            payment_grace_secs: 3_600,        // 1 h
             outpoint_pending_ttl_secs: 3_600, // 1 h
         }
     }
@@ -122,10 +122,11 @@ async fn prune_nym_access_events(pool: &PgPool, retention_secs: u64) -> u64 {
     }
 }
 
-/// Flip unpaid invoices past `expires_at + payment_grace_secs` to 'expired'.
-/// Set-based idempotent UPDATE: re-runs are safe, and settled rows are excluded
-/// by the predicate. The grace window keeps a late-confirming payment
-/// creditable instead of expiring it out from under the watcher.
+/// Close evidence-free invoices past `expires_at + payment_grace_secs`.
+/// Set-based idempotent UPDATE: re-runs are safe, and payment/settlement
+/// projections are excluded by the predicate. The grace window keeps a
+/// late-confirming payment creditable instead of expiring it out from under
+/// the watcher.
 async fn expire_invoices_past_deadline(pool: &PgPool, payment_grace_secs: u64) -> u64 {
     match db::expire_invoices_past_deadline(pool, payment_grace_secs).await {
         Ok(n) => n,

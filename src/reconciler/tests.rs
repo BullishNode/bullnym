@@ -527,8 +527,8 @@ fn boltz_invoice_settled_when_we_did_not_claim_schedules_retry() {
         let swap = fixture(our);
         assert_eq!(
             decide_action(&swap, "invoice.settled"),
-            ReconcilerAction::ScheduleImmediateClaim,
-            "status {our} should schedule claimer recovery"
+            ReconcilerAction::RecoverSettledWithoutLocalClaim,
+            "status {our} should remain alertable while scheduling claimer recovery"
         );
     }
 }

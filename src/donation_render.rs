@@ -399,6 +399,14 @@ fn social_meta_tags(header: &str, description: &str, public_url: &str, image_url
     )
 }
 
+/// The historical nym-keyed avatar path is overwritten in place on upload, so
+/// the source-image digest must participate in the URL. Keep the stable path
+/// for installed Page/POS compatibility while making each uploaded image a
+/// distinct browser/shared-cache key.
+fn nym_avatar_url(domain: &str, nym: &str, source_sha256: &str) -> String {
+    format!("https://{domain}/img/{nym}/avatar.webp?v={source_sha256}")
+}
+
 async fn stored_generated_og_url(
     image_root: &str,
     domain: &str,
@@ -702,7 +710,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
             Some(nym.to_string()),
             page.avatar_sha256
                 .as_ref()
-                .map(|_| format!("https://{domain}/img/{nym}/avatar.webp")),
+                .map(|hash| nym_avatar_url(domain, nym, hash)),
             page.og_sha256
                 .as_ref()
                 .map(|hash| format!("https://{domain}/img/{nym}/og.jpg?v={hash}")),

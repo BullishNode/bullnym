@@ -190,6 +190,78 @@ fn invalid_chain_response(reason: impl Into<String>) -> AppError {
     AppError::BoltzError(format!("invalid chain swap response: {}", reason.into()))
 }
 
+fn invalid_reverse_response(reason: impl Into<String>) -> AppError {
+    AppError::BoltzError(format!("invalid reverse swap response: {}", reason.into()))
+}
+
+fn validate_exact_reverse_leaf(
+    name: &str,
+    actual: &Leaf,
+    expected_script: &ScriptBuf,
+) -> Result<(), AppError> {
+    if actual.version != LIQUID_TAPSCRIPT_LEAF_VERSION {
+        return Err(invalid_reverse_response(format!(
+            "{name} leaf version must be {LIQUID_TAPSCRIPT_LEAF_VERSION:#04x}"
+        )));
+    }
+
+    let expected_len = expected_script.as_bytes().len();
+    if actual.output.len() != expected_len.saturating_mul(2) {
+        return Err(invalid_reverse_response(format!(
+            "{name} leaf has an unexpected encoded length"
+        )));
+    }
+    let mut decoded = vec![0_u8; expected_len];
+    hex::decode_to_slice(&actual.output, &mut decoded).map_err(|_| {
+        invalid_reverse_response(format!("{name} leaf is not exact hexadecimal script bytes"))
+    })?;
+    if decoded != expected_script.as_bytes() {
+        return Err(invalid_reverse_response(format!(
+            "{name} leaf does not match the requested reverse contract"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate every provider-controlled field that binds a reverse creation to
+/// the locally derived claim secret before the response can be persisted.
+///
+/// The pinned SDK validates the invoice payment hash and reconstructs the
+/// Liquid address from the response. It intentionally parses only the
+/// hashlock and timelock out of the returned leaves, so compare the complete
+/// standard scripts and Elements leaf versions here as well. This prevents a
+/// response with extra or substituted script instructions from passing solely
+/// because those two parsed values still look valid.
+fn validate_reverse_creation_response(
+    response: &CreateReverseResponse,
+    preimage: &Preimage,
+    claim_public_key: &PublicKey,
+) -> Result<(), AppError> {
+    if response.swap_tree.covenant_claim_leaf.is_some() {
+        return Err(invalid_reverse_response(
+            "unexpected covenant claim leaf for a non-covenant request",
+        ));
+    }
+    validate_exact_reverse_leaf(
+        "claim",
+        &response.swap_tree.claim_leaf,
+        &expected_claim_script(preimage.hash160, claim_public_key),
+    )?;
+    validate_exact_reverse_leaf(
+        "refund",
+        &response.swap_tree.refund_leaf,
+        &expected_refund_script(&response.refund_public_key, response.timeout_block_height),
+    )?;
+
+    response
+        .validate(
+            preimage,
+            claim_public_key,
+            Chain::Liquid(LiquidChain::Liquid),
+        )
+        .map_err(|error| invalid_reverse_response(format!("contract validation failed: {error}")))
+}
+
 fn exact_bolt11_amount_sat(invoice: &str) -> Result<u64, AppError> {
     let invoice = Bolt11Invoice::from_str(invoice)
         .map_err(|error| AppError::BoltzError(format!("invalid BOLT11 invoice: {error}")))?;
@@ -799,6 +871,8 @@ impl BoltzService {
             provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?
         };
 
+        validate_reverse_creation_response(&response, &preimage, &claim_public_key)?;
+
         let invoice = response
             .invoice
             .clone()
@@ -878,8 +952,11 @@ impl BoltzService {
                 .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
         );
         let response = provider_result.map_err(|error| {
-            AppError::BoltzError(format!("fixed checkout reverse swap request failed: {error}"))
+            AppError::BoltzError(format!(
+                "fixed checkout reverse swap request failed: {error}"
+            ))
         })?;
+        validate_reverse_creation_response(&response, &preimage, &claim_public_key)?;
         let invoice = response
             .invoice
             .clone()
@@ -1211,11 +1288,14 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use boltz_client::network::Network;
-    use boltz_client::swaps::boltz::{ChainSwapDetails, SwapTree, SwapType};
+    use boltz_client::swaps::boltz::{ChainSwapDetails, CreateReverseResponse, SwapTree, SwapType};
     use boltz_client::{ZKKeyPair, ZKSecp256k1};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use secp256k1::{Secp256k1, SecretKey};
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1508,6 +1588,271 @@ mod tests {
             )
         ));
         fixture.shutdown().await;
+    }
+
+    #[derive(Clone)]
+    struct ReverseCreationFixtureState {
+        pair_response: Value,
+        creation_response: Value,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ReverseCreationFixture {
+        base_url: String,
+        calls: Arc<Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ReverseCreationFixture {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    async fn reverse_creation_pairs_handler(
+        State(state): State<ReverseCreationFixtureState>,
+    ) -> Json<Value> {
+        state.calls.lock().unwrap().push("GET /swap/reverse".into());
+        Json(state.pair_response)
+    }
+
+    async fn reverse_creation_handler(
+        State(state): State<ReverseCreationFixtureState>,
+        Json(_request): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .unwrap()
+            .push("POST /swap/reverse".into());
+        Json(state.creation_response)
+    }
+
+    async fn spawn_reverse_creation_fixture(
+        response: &CreateReverseResponse,
+    ) -> ReverseCreationFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = ReverseCreationFixtureState {
+            pair_response: json!({
+                "BTC": {
+                    "L-BTC": {
+                        "hash": "11".repeat(32),
+                        "rate": 1.0,
+                        "limits": {"minimal": 100, "maximal": 2_000},
+                        "fees": {
+                            "percentage": 0.25,
+                            "minerFees": {"lockup": 27, "claim": 20}
+                        }
+                    }
+                }
+            }),
+            creation_response: serde_json::to_value(response).unwrap(),
+            calls: calls.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/swap/reverse",
+                get(reverse_creation_pairs_handler).post(reverse_creation_handler),
+            )
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ReverseCreationFixture {
+            base_url: format!("http://{address}"),
+            calls,
+            task,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ReverseCreationMutation {
+        Valid,
+        InvoiceHash,
+        ClaimScript,
+        LockupAddress,
+    }
+
+    fn reverse_creation_invoice(
+        payment_hash: bitcoin::hashes::sha256::Hash,
+        amount_sat: u64,
+    ) -> String {
+        let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .amount_milli_satoshis(amount_sat * 1_000)
+            .description("Bullnym reverse validation test".into())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([24; 32]))
+            .duration_since_epoch(Duration::from_secs(1_700_000_000))
+            .expiry_time(Duration::from_secs(3_600))
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+            .unwrap()
+            .to_string()
+    }
+
+    fn reverse_creation_response(mutation: ReverseCreationMutation) -> CreateReverseResponse {
+        const CLAIM_KEY_INDEX: u64 = 42;
+        const BLINDING_KEY: &str =
+            "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+        const TIMEOUT_HEIGHT: u32 = 2_000_000;
+
+        let master = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+        let claim_keypair = master.derive_swapkey(CLAIM_KEY_INDEX).unwrap();
+        let claim_public_key = PublicKey::new(claim_keypair.public_key());
+        let preimage = Preimage::from_swap_key(&claim_keypair);
+        let alternate_keypair = master.derive_swapkey(CLAIM_KEY_INDEX + 1).unwrap();
+        let alternate_preimage = Preimage::from_swap_key(&alternate_keypair);
+        let refund_keypair = master.derive_swapkey(9_999).unwrap();
+        let refund_public_key = PublicKey::new(refund_keypair.public_key());
+        let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+
+        let mut claim_script = expected_claim_script(preimage.hash160, &claim_public_key);
+        if matches!(mutation, ReverseCreationMutation::ClaimScript) {
+            let mut bytes = claim_script.into_bytes();
+            let final_opcode = bytes.last_mut().expect("non-empty claim script");
+            *final_opcode ^= 1;
+            claim_script = ScriptBuf::from_bytes(bytes);
+        }
+        let refund_script = expected_refund_script(&refund_public_key, TIMEOUT_HEIGHT);
+        let valid_address = LBtcSwapScript {
+            swap_type: SwapType::ReverseSubmarine,
+            side: None,
+            funding_addrs: None,
+            hashlock: preimage.hash160,
+            receiver_pubkey: claim_public_key,
+            locktime: boltz_client::elements::LockTime::from_consensus(TIMEOUT_HEIGHT),
+            sender_pubkey: refund_public_key,
+            blinding_key,
+        }
+        .to_address(LiquidChain::Liquid)
+        .unwrap()
+        .to_string();
+        let lockup_address = if matches!(mutation, ReverseCreationMutation::LockupAddress) {
+            LBtcSwapScript {
+                swap_type: SwapType::ReverseSubmarine,
+                side: None,
+                funding_addrs: None,
+                hashlock: alternate_preimage.hash160,
+                receiver_pubkey: claim_public_key,
+                locktime: boltz_client::elements::LockTime::from_consensus(TIMEOUT_HEIGHT),
+                sender_pubkey: refund_public_key,
+                blinding_key,
+            }
+            .to_address(LiquidChain::Liquid)
+            .unwrap()
+            .to_string()
+        } else {
+            valid_address
+        };
+        let invoice_hash = if matches!(mutation, ReverseCreationMutation::InvoiceHash) {
+            alternate_preimage.sha256
+        } else {
+            preimage.sha256
+        };
+
+        CreateReverseResponse {
+            id: "ReverseValidationTransport1".into(),
+            invoice: Some(reverse_creation_invoice(invoice_hash, 1_050)),
+            swap_tree: SwapTree {
+                claim_leaf: Leaf {
+                    output: hex::encode(claim_script.as_bytes()),
+                    version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+                },
+                refund_leaf: Leaf {
+                    output: hex::encode(refund_script.as_bytes()),
+                    version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+                },
+                covenant_claim_leaf: None,
+            },
+            lockup_address,
+            refund_public_key,
+            timeout_block_height: TIMEOUT_HEIGHT,
+            onchain_amount: 1_020,
+            blinding_key: Some(BLINDING_KEY.into()),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ReverseCreationPath {
+        Ordinary,
+        FixedCheckout,
+    }
+
+    async fn reverse_creation_transport_outcome(
+        mutation: ReverseCreationMutation,
+        path: ReverseCreationPath,
+    ) -> Result<String, AppError> {
+        let response = reverse_creation_response(mutation);
+        let fixture = spawn_reverse_creation_fixture(&response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        if matches!(path, ReverseCreationPath::FixedCheckout) {
+            assert_eq!(
+                service.refresh_provider_limits().await,
+                crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+            );
+        }
+        let derived_key = service.derive_swap_key(42).unwrap();
+        let outcome = match path {
+            ReverseCreationPath::Ordinary => service
+                .create_reverse_swap(derived_key, 1_050, None, None)
+                .await
+                .map(|swap| swap.invoice),
+            ReverseCreationPath::FixedCheckout => service
+                .create_fixed_checkout_reverse_swap(derived_key, 1_000, None, None)
+                .await
+                .map(|swap| swap.swap.invoice),
+        };
+        let expected_calls = match path {
+            ReverseCreationPath::Ordinary => vec!["POST /swap/reverse".to_string()],
+            ReverseCreationPath::FixedCheckout => vec![
+                "GET /swap/reverse".to_string(),
+                "POST /swap/reverse".to_string(),
+            ],
+        };
+        assert_eq!(fixture.calls(), expected_calls);
+        fixture.shutdown().await;
+        outcome
+    }
+
+    #[tokio::test]
+    async fn reverse_creation_validates_invoice_script_and_address_across_http_transport() {
+        for path in [
+            ReverseCreationPath::Ordinary,
+            ReverseCreationPath::FixedCheckout,
+        ] {
+            let valid = reverse_creation_response(ReverseCreationMutation::Valid)
+                .invoice
+                .unwrap();
+            assert_eq!(
+                reverse_creation_transport_outcome(ReverseCreationMutation::Valid, path)
+                    .await
+                    .unwrap(),
+                valid,
+                "valid response failed on {path:?}"
+            );
+
+            for mutation in [
+                ReverseCreationMutation::InvoiceHash,
+                ReverseCreationMutation::ClaimScript,
+                ReverseCreationMutation::LockupAddress,
+            ] {
+                let error = reverse_creation_transport_outcome(mutation, path)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("invalid reverse swap response"),
+                    "{path:?} accepted {mutation:?}: {error}"
+                );
+            }
+        }
     }
 
     fn dynamic_chain_creation_response(

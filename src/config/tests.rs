@@ -202,11 +202,102 @@ fn pricer_cache_must_be_positive_and_within_freshness_bound() {
 }
 
 #[test]
+fn pricer_request_timeout_must_be_positive() {
+    let mut config = production_base_config();
+    config.pricer.request_timeout_ms = 0;
+
+    let error = config
+        .validate_for_runtime("development", false)
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "pricer.request_timeout_ms must be > 0");
+}
+
+#[test]
 fn donation_image_default_dimension_bounds_decode_memory() {
     let cfg = DonationConfig::default();
 
     assert_eq!(cfg.image_max_dimension, 5_000);
     assert_eq!(cfg.image_max_pixels, 12_000_000);
+}
+
+#[test]
+fn donation_output_dimensions_must_be_positive() {
+    for (avatar_size, og_width, og_height, expected) in [
+        (
+            0,
+            DEFAULT_DONATION_OG_WIDTH,
+            DEFAULT_DONATION_OG_HEIGHT,
+            "donation.avatar_size must be > 0",
+        ),
+        (
+            DEFAULT_DONATION_AVATAR_SIZE,
+            0,
+            DEFAULT_DONATION_OG_HEIGHT,
+            "donation.og_width must be > 0",
+        ),
+        (
+            DEFAULT_DONATION_AVATAR_SIZE,
+            DEFAULT_DONATION_OG_WIDTH,
+            0,
+            "donation.og_height must be > 0",
+        ),
+    ] {
+        let mut config = production_base_config();
+        config.donation.avatar_size = avatar_size;
+        config.donation.og_width = og_width;
+        config.donation.og_height = og_height;
+
+        let error = config
+            .validate_for_runtime("development", false)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn donation_output_dimensions_must_fit_configured_memory_bounds() {
+    let mut config = production_base_config();
+    config.donation.avatar_size = config.donation.image_max_dimension + 1;
+    assert_eq!(
+        config
+            .validate_for_runtime("development", false)
+            .unwrap_err()
+            .to_string(),
+        "donation.avatar_size must be <= donation.image_max_dimension"
+    );
+
+    let mut config = production_base_config();
+    config.donation.og_width = config.donation.image_max_dimension + 1;
+    assert_eq!(
+        config
+            .validate_for_runtime("development", false)
+            .unwrap_err()
+            .to_string(),
+        "donation.og_width must be <= donation.image_max_dimension"
+    );
+
+    let mut config = production_base_config();
+    config.donation.avatar_size = 4_000;
+    assert_eq!(
+        config
+            .validate_for_runtime("development", false)
+            .unwrap_err()
+            .to_string(),
+        "donation.avatar_size squared must be <= donation.image_max_pixels"
+    );
+
+    let mut config = production_base_config();
+    config.donation.og_width = 4_000;
+    config.donation.og_height = 4_000;
+    assert_eq!(
+        config
+            .validate_for_runtime("development", false)
+            .unwrap_err()
+            .to_string(),
+        "donation.og_width * donation.og_height must be <= donation.image_max_pixels"
+    );
 }
 
 fn production_base_config() -> Config {

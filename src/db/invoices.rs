@@ -1837,17 +1837,19 @@ pub async fn cancel_invoice(pool: &PgPool, id: Uuid) -> Result<(u64, String), sq
     Ok((rows, status))
 }
 
-/// Background sweep: flip every unpaid OR in_progress invoice past its
-/// outer deadline to 'expired'. Idempotent (set-based UPDATE; predicate
-/// excludes already-terminal rows). Run from `gc.rs` on the periodic GC
-/// cycle.
+/// Background sweep: close invoices past their outer deadline only when the
+/// server-owned projections prove that no payment or settlement is pending.
+/// Idempotent (set-based UPDATE; predicate excludes already-terminal rows).
+/// Run from `gc.rs` on the periodic GC cycle.
 ///
 /// `in_progress` is included because a payer may broadcast a tx that
 /// makes it to mempool (flipping the row to in_progress) but never
-/// confirms (RBF replaced, mempool eviction, low-fee drop). After the
-/// outer expiry we want the row out of the active corpus regardless of
-/// its mempool stage. Backed by the partial index
-/// `invoices_unpaid_or_inprog_expiry_idx` (migration 021).
+/// confirms (RBF replaced, mempool eviction, low-fee drop). Such a row becomes
+/// expiry-eligible only after the watcher clears its settlement projection.
+/// A concurrent watcher update conflicts on the invoice row; PostgreSQL then
+/// rechecks this predicate against the committed projection before updating.
+/// Backed by the partial index `invoices_unpaid_or_inprog_expiry_idx`
+/// (migration 021).
 pub async fn expire_invoices_past_deadline(
     pool: &PgPool,
     payment_grace_secs: u64,
@@ -1857,8 +1859,18 @@ pub async fn expire_invoices_past_deadline(
             WHEN status = 'partially_paid' THEN 'underpaid' \
             ELSE 'expired' \
          END \
-         WHERE status IN ('unpaid', 'in_progress', 'partially_paid') \
-           AND expires_at < NOW() - ($1 || ' seconds')::interval",
+         WHERE expires_at < NOW() - ($1 || ' seconds')::interval \
+           AND ( \
+             ( \
+               status IN ('unpaid', 'in_progress') \
+               AND presentation_status = 'unpaid' \
+               AND settlement_status = 'none' \
+             ) \
+             OR ( \
+               status = 'partially_paid' \
+               AND settlement_status IN ('none', 'settled') \
+             ) \
+           )",
     )
     .bind(payment_grace_secs as i64)
     .execute(pool)

@@ -123,7 +123,7 @@ payment, status, settlement, or recovery limits.
 {
   "nym": "alice",
   "ct_descriptor": "ct(...)#checksum",
-  "verification_npub": "<optional 64 hex>",
+  "verification_npub": "<optional canonical lowercase 64 hex>",
   "npub": "<64 hex auth key>",
   "timestamp": 1760000000,
   "signature": "<128 hex>"

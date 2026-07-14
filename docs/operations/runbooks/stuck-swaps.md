@@ -49,6 +49,7 @@ Also alert on these structured events:
 | `swap_claim_stuck` | Reverse swap exhausted its fast retry budget. |
 | `chain_swap_claim_stuck` | Chain swap exhausted its fast retry budget. |
 | `slow_recovery_revived` | Slow recovery returned a funded swap to the claim sweep. |
+| `reverse_swap_settled_without_local_claim` | Provider reports the Lightning invoice settled while Bullnym has not recorded a merchant claim; automatic claim/outspend recovery was scheduled. |
 | `swap_lockup_refunded` | Provider spent the reverse-swap Liquid lockup before Bullnym claimed it. |
 | `chain_swap_refund_due` | Payer BTC is recoverable but merchant settlement did not complete. |
 | `chain_swap_claimed_while_refunding` | Conflicting provider/refund evidence; investigate immediately. |

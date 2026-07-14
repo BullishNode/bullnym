@@ -287,6 +287,19 @@ fn rejects_long_header() {
 }
 
 #[test]
+fn header_limit_is_explicitly_utf8_bytes() {
+    let mut req = make_req();
+    req.header = "é".repeat(MAX_HEADER_LEN / 2);
+    assert_eq!(req.header.len(), MAX_HEADER_LEN);
+    assert!(validate_req(&req).is_ok());
+
+    req.header.push('é');
+    assert_eq!(req.header.chars().count(), MAX_HEADER_LEN / 2 + 1);
+    assert_eq!(req.header.len(), MAX_HEADER_LEN + 2);
+    assert!(validate_req(&req).is_err());
+}
+
+#[test]
 fn rejects_long_description() {
     let mut req = make_req();
     req.description = "a".repeat(MAX_DESCRIPTION_BYTES + 1);
@@ -304,6 +317,30 @@ fn explicit_payment_page_requires_a_short_description() {
     assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
 
     req.description = "   ".to_string();
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+}
+
+#[test]
+fn payment_page_description_has_independent_grapheme_and_utf8_byte_caps() {
+    let mut req = make_req();
+    req.kind = Some(db::KIND_PAYMENT_PAGE.to_string());
+
+    // Each family is one user-perceived character but 25 UTF-8 bytes. Twenty
+    // families fit both contracts; the twenty-first exceeds only the byte cap.
+    req.description = "👨‍👩‍👧‍👦".repeat(20);
+    assert_eq!(og_image::description_grapheme_count(&req.description), 20);
+    assert_eq!(req.description.len(), 500);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
+
+    req.description.push_str("👨‍👩‍👧‍👦");
+    assert_eq!(og_image::description_grapheme_count(&req.description), 21);
+    assert_eq!(req.description.len(), 525);
+    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
+
+    // ASCII isolates the grapheme cap: it exceeds 120 visible characters
+    // while remaining far below the independent 512-byte safety ceiling.
+    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES + 1);
+    assert!(req.description.len() < og_image::DESCRIPTION_MAX_BYTES);
     assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
 }
 
