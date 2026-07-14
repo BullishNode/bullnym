@@ -29,7 +29,8 @@ use boltz_client::Keypair;
 use crate::admission::WorkerReporter;
 use crate::builder_fee::LiquidBuilderFeeDecision;
 use crate::chain_swap_runtime::{
-    apply_chain_swap_provider_effect, ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
+    apply_chain_swap_provider_effect, apply_chain_swap_provider_effect_with_evidence,
+    ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
 };
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
@@ -658,14 +659,18 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
         .parsed_status()
         .map_err(|error| AppError::DbError(format!("invalid persisted chain status: {error}")))?;
     if boltz_status == "swap.expired" && observed_local_status == ChainSwapStatus::Pending {
-        let outcome = apply_chain_swap_provider_effect(
-            &state.db,
-            swap.id,
-            boltz_status,
-            provider_evidence.unwrap_or_else(ChainSwapProviderEvidence::incomplete),
-        )
-        .await
-        .map_err(|error| AppError::DbError(error.to_string()))?;
+        let outcome = match provider_evidence {
+            Some(evidence) => {
+                apply_chain_swap_provider_effect_with_evidence(
+                    &state.db,
+                    swap.id,
+                    boltz_status,
+                    evidence,
+                )
+                .await?
+            }
+            None => apply_chain_swap_provider_effect(state, swap.id, boltz_status).await?,
+        };
         match outcome {
             ChainSwapProviderApplyOutcome::Finalized => {
                 tracing::info!(

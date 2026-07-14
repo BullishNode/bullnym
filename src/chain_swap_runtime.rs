@@ -11,13 +11,17 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::chain_swap_action::{
-    reduce_chain_swap_evidence, BitcoinSourceEvidence, ChainSwapAction, ChainSwapEvidence,
+    recheck_chain_swap_execution_under_lock, reduce_chain_swap_evidence, BitcoinSourceEvidence,
+    ChainSwapAction, ChainSwapEvidence, ChainSwapExecutionAction, ChainSwapExecutionGate,
     CooperativeRecoveryEvidence, EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence,
     MerchantTransactionEvidence, ProviderStatusEvidence, RecoveryDestinationEvidence,
     RenegotiationEvidence,
 };
 use crate::chain_swap_primary_source::PrimaryBitcoinSourceProjectionV1;
+use crate::chain_swap_runtime_evidence::collect_pending_expiry_evidence_under_lock;
 use crate::db::{self, ChainSwapStatus};
+use crate::error::AppError;
+use crate::AppState;
 
 /// One caller-assembled evidence snapshot plus the independently projected
 /// primary Bitcoin transaction.
@@ -91,43 +95,72 @@ pub fn decide_chain_swap_provider_effect(
     input: ChainSwapProviderEvidence<'_>,
 ) -> ChainSwapProviderEffect {
     let evidence = normalized_evidence(provider_status, input);
-    match reduce_chain_swap_evidence(&evidence) {
+    provider_effect_for_evidence(&evidence)
+}
+
+fn provider_effect_for_evidence(evidence: &ChainSwapEvidence) -> ChainSwapProviderEffect {
+    match reduce_chain_swap_evidence(evidence) {
         ChainSwapAction::Observe => ChainSwapProviderEffect::Observe,
         ChainSwapAction::IntegrityHold => ChainSwapProviderEffect::IntegrityHold,
-        ChainSwapAction::Finalize if is_unfunded_expiry(&evidence) => {
+        ChainSwapAction::Finalize if is_unfunded_expiry(evidence) => {
             ChainSwapProviderEffect::FinalizeUnfunded
         }
         action => ChainSwapProviderEffect::Reconcile(action),
     }
 }
 
-/// Apply the narrow provider-observation effect.
+/// Apply a pending provider-expiry trigger from fresh evidence collected inside
+/// the existing per-swap execution boundary.
 ///
-/// Only a complete, agreed, independently projected unfunded expiry can write,
-/// and even then only `pending -> expired`. The update shares the existing
-/// `chain-claim:<uuid>` advisory-lock namespace with Liquid claim and Bitcoin
-/// recovery preparation, reloads the row under `FOR UPDATE`, and is an exact
-/// no-op on duplicate delivery.
+/// The incoming status only triggers the read. It is never reduction authority:
+/// the collector must return a fresh provider status together with complete
+/// chain evidence after the advisory lock and row reload.
 pub async fn apply_chain_swap_provider_effect(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    _incoming_status: &str,
+) -> Result<ChainSwapProviderApplyOutcome, AppError> {
+    apply_chain_swap_provider_effect_inner(
+        &state.db,
+        chain_swap_id,
+        LockedEvidenceSource::Runtime(state),
+    )
+    .await
+}
+
+/// Deterministic integration seam. Supplied evidence is normalized and gated
+/// only after the same advisory lock and `FOR UPDATE` reload as production.
+#[doc(hidden)]
+pub async fn apply_chain_swap_provider_effect_with_evidence(
     pool: &PgPool,
     chain_swap_id: Uuid,
     provider_status: &str,
     input: ChainSwapProviderEvidence<'_>,
-) -> Result<ChainSwapProviderApplyOutcome, sqlx::Error> {
-    let effect = decide_chain_swap_provider_effect(provider_status, input);
-    match effect {
-        ChainSwapProviderEffect::Observe => {
-            return Ok(ChainSwapProviderApplyOutcome::Observed);
-        }
-        ChainSwapProviderEffect::Reconcile(action) => {
-            return Ok(ChainSwapProviderApplyOutcome::Reconcile(action));
-        }
-        ChainSwapProviderEffect::IntegrityHold => {
-            return Ok(ChainSwapProviderApplyOutcome::IntegrityHold);
-        }
-        ChainSwapProviderEffect::FinalizeUnfunded => {}
-    }
+) -> Result<ChainSwapProviderApplyOutcome, AppError> {
+    apply_chain_swap_provider_effect_inner(
+        pool,
+        chain_swap_id,
+        LockedEvidenceSource::Supplied {
+            provider_status,
+            input,
+        },
+    )
+    .await
+}
 
+enum LockedEvidenceSource<'a> {
+    Runtime(&'a AppState),
+    Supplied {
+        provider_status: &'a str,
+        input: ChainSwapProviderEvidence<'a>,
+    },
+}
+
+async fn apply_chain_swap_provider_effect_inner(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    source: LockedEvidenceSource<'_>,
+) -> Result<ChainSwapProviderApplyOutcome, AppError> {
     let mut tx = pool.begin().await?;
     let lock_key = format!("chain-claim:{chain_swap_id}");
     let got_lock: bool =
@@ -144,12 +177,7 @@ pub async fn apply_chain_swap_provider_effect(
         tx.commit().await?;
         return Ok(ChainSwapProviderApplyOutcome::Missing);
     };
-    let current_status = current.parsed_status().map_err(|error| {
-        sqlx::Error::Protocol(format!(
-            "invalid persisted chain swap status for {}: {error}",
-            current.id
-        ))
-    })?;
+    let current_status = current.parsed_status().map_err(AppError::DbError)?;
 
     match current_status {
         ChainSwapStatus::Expired => {
@@ -157,6 +185,39 @@ pub async fn apply_chain_swap_provider_effect(
             Ok(ChainSwapProviderApplyOutcome::AlreadyFinalized)
         }
         ChainSwapStatus::Pending => {
+            let evidence = match source {
+                LockedEvidenceSource::Runtime(state) => {
+                    let collected =
+                        collect_pending_expiry_evidence_under_lock(state, &mut tx, &current).await?;
+                    let provider_status = collected.provider_status.as_deref().unwrap_or("");
+                    normalized_evidence(
+                        provider_status,
+                        ChainSwapProviderEvidence {
+                            evidence: collected.evidence,
+                            primary_bitcoin: collected.primary_bitcoin.as_ref(),
+                        },
+                    )
+                }
+                LockedEvidenceSource::Supplied {
+                    provider_status,
+                    input,
+                } => normalized_evidence(provider_status, input),
+            };
+
+            let effect = provider_effect_for_evidence(&evidence);
+            if effect != ChainSwapProviderEffect::FinalizeUnfunded {
+                tx.commit().await?;
+                return Ok(non_mutating_outcome(effect));
+            }
+
+            match recheck_finalize_unfunded_under_lock(&evidence) {
+                ChainSwapProviderEffect::FinalizeUnfunded => {}
+                blocked => {
+                    tx.commit().await?;
+                    return Ok(non_mutating_outcome(blocked));
+                }
+            }
+
             let updated = sqlx::query(
                 "UPDATE chain_swap_records \
                  SET status = 'expired', updated_at = NOW() \
@@ -166,7 +227,7 @@ pub async fn apply_chain_swap_provider_effect(
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() != 1 {
-                return Err(sqlx::Error::Protocol(format!(
+                return Err(AppError::DbError(format!(
                     "locked pending chain swap changed before unfunded finalization: {chain_swap_id}"
                 )));
             }
@@ -176,6 +237,39 @@ pub async fn apply_chain_swap_provider_effect(
         status => {
             tx.commit().await?;
             Ok(ChainSwapProviderApplyOutcome::StateChanged(status))
+        }
+    }
+}
+
+fn recheck_finalize_unfunded_under_lock(
+    evidence: &ChainSwapEvidence,
+) -> ChainSwapProviderEffect {
+    match recheck_chain_swap_execution_under_lock(ChainSwapExecutionAction::Finalize, evidence) {
+        ChainSwapExecutionGate::Authorized if is_unfunded_expiry(evidence) => {
+            ChainSwapProviderEffect::FinalizeUnfunded
+        }
+        ChainSwapExecutionGate::Authorized => {
+            ChainSwapProviderEffect::Reconcile(ChainSwapAction::Finalize)
+        }
+        ChainSwapExecutionGate::Blocked(ChainSwapAction::Observe) => {
+            ChainSwapProviderEffect::Observe
+        }
+        ChainSwapExecutionGate::Blocked(ChainSwapAction::IntegrityHold) => {
+            ChainSwapProviderEffect::IntegrityHold
+        }
+        ChainSwapExecutionGate::Blocked(action) => ChainSwapProviderEffect::Reconcile(action),
+    }
+}
+
+fn non_mutating_outcome(effect: ChainSwapProviderEffect) -> ChainSwapProviderApplyOutcome {
+    match effect {
+        ChainSwapProviderEffect::Observe => ChainSwapProviderApplyOutcome::Observed,
+        ChainSwapProviderEffect::Reconcile(action) => {
+            ChainSwapProviderApplyOutcome::Reconcile(action)
+        }
+        ChainSwapProviderEffect::IntegrityHold => ChainSwapProviderApplyOutcome::IntegrityHold,
+        ChainSwapProviderEffect::FinalizeUnfunded => {
+            unreachable!("finalization cannot be converted to a non-mutating outcome")
         }
     }
 }
@@ -301,6 +395,33 @@ mod tests {
         assert_eq!(
             decide_chain_swap_provider_effect("swap.created", input),
             ChainSwapProviderEffect::Observe
+        );
+    }
+
+    #[test]
+    fn under_lock_gate_blocks_stale_finalization_after_a_liquid_lock_appears() {
+        let primary = unfunded_projection();
+        let planned = ChainSwapProviderEvidence {
+            evidence: base_evidence(),
+            primary_bitcoin: Some(&primary),
+        };
+        assert_eq!(
+            decide_chain_swap_provider_effect("swap.expired", planned),
+            ChainSwapProviderEffect::FinalizeUnfunded
+        );
+
+        let mut reread = base_evidence();
+        reread.liquid_lock = LiquidLockEvidence::ConfirmedUnspent;
+        let reread = normalized_evidence(
+            "swap.expired",
+            ChainSwapProviderEvidence {
+                evidence: reread,
+                primary_bitcoin: Some(&primary),
+            },
+        );
+        assert_eq!(
+            recheck_finalize_unfunded_under_lock(&reread),
+            ChainSwapProviderEffect::Reconcile(ChainSwapAction::ClaimLiquid)
         );
     }
 
