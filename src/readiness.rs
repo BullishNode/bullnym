@@ -9,6 +9,127 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
+    "SELECT NOT EXISTS ( \
+         SELECT 1 \
+           FROM (VALUES \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_require_review25_fee_authority', 'require_review25_bitcoin_attempt_fee_authority', 7), \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_immutable', 'guard_chain_swap_tx_attempt_immutable', 19), \
+             ('chain_swap_tx_attempts', 'chain_swap_tx_attempts_validate_replacement', 'enforce_liquid_claim_replacement_lineage', 7), \
+             ('invoice_payment_events', 'invoice_payment_event_evidence_guard', 'guard_invoice_payment_event_evidence', 19), \
+             ('invoice_payment_events', 'invoice_payment_event_reject_merchant_settlement_delete', 'reject_merchant_settlement_event_delete', 11), \
+             ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_validate_write', 'enforce_merchant_settlement_checkpoint_write', 23), \
+             ('merchant_settlement_checkpoints', 'merchant_settlement_checkpoint_reject_delete', 'reject_merchant_settlement_delete', 11), \
+             ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_validate_update', 'enforce_merchant_settlement_retained_update', 23), \
+             ('merchant_settlement_retained_outputs', 'merchant_settlement_retained_reject_delete', 'reject_merchant_settlement_delete', 11) \
+           ) required(table_name, trigger_name, function_name, trigger_type) \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_trigger trigger_info \
+                JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+                JOIN pg_namespace relation_namespace \
+                  ON relation_namespace.oid = relation.relnamespace \
+                JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                JOIN pg_namespace function_namespace \
+                  ON function_namespace.oid = function_info.pronamespace \
+               WHERE relation_namespace.nspname = 'public' \
+                 AND function_namespace.nspname = 'public' \
+                 AND relation.relname = required.table_name \
+                 AND relation.relkind = 'r' \
+                 AND trigger_info.tgname = required.trigger_name \
+                 AND function_info.proname = required.function_name \
+                 AND function_info.pronargs = 0 \
+                 AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                 AND NOT trigger_info.tgisinternal \
+                 AND trigger_info.tgenabled IN ('O', 'A') \
+          ) \
+    )";
+
+const MERCHANT_SETTLEMENT_PRIVILEGES_SQL: &str =
+    "WITH required_tables(table_name) AS (VALUES \
+         ('chain_swap_tx_attempts'), \
+         ('invoice_payment_events'), \
+         ('merchant_settlement_checkpoints'), \
+         ('merchant_settlement_retained_outputs') \
+     ), required_functions(function_name) AS (VALUES \
+         ('guard_chain_swap_tx_attempt_immutable'), \
+         ('require_review25_bitcoin_attempt_fee_authority'), \
+         ('enforce_liquid_claim_replacement_lineage'), \
+         ('guard_invoice_payment_event_evidence'), \
+         ('reject_merchant_settlement_event_delete'), \
+         ('enforce_merchant_settlement_checkpoint_write'), \
+         ('enforce_merchant_settlement_retained_update'), \
+         ('reject_merchant_settlement_delete') \
+     ) \
+     SELECT NOT EXISTS ( \
+         SELECT 1 FROM required_tables required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_class relation \
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND relation.relname = required.table_name \
+                 AND relation.relkind = 'r' \
+                 AND pg_get_userbyid(relation.relowner) <> current_user \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'USAGE') \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(relation.relowner), 'SET') \
+                 AND has_table_privilege(current_user, relation.oid, 'SELECT') \
+                 AND has_table_privilege(current_user, relation.oid, 'INSERT') \
+                 AND has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'DELETE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                 AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+          ) \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 \
+           FROM pg_class relation \
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           CROSS JOIN LATERAL aclexplode(COALESCE( \
+               relation.relacl, acldefault('r', relation.relowner) \
+           )) acl \
+          WHERE namespace.nspname = 'public' \
+            AND relation.relname IN (SELECT table_name FROM required_tables) \
+            AND acl.grantee = 0 \
+     ) \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM required_functions required \
+          WHERE NOT EXISTS ( \
+              SELECT 1 \
+                FROM pg_proc function_info \
+                JOIN pg_namespace namespace \
+                  ON namespace.oid = function_info.pronamespace \
+               WHERE namespace.nspname = 'public' \
+                 AND function_info.proname = required.function_name \
+                 AND function_info.pronargs = 0 \
+                 AND pg_get_userbyid(function_info.proowner) <> current_user \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(function_info.proowner), 'USAGE') \
+                 AND NOT pg_has_role(current_user, pg_get_userbyid(function_info.proowner), 'SET') \
+          ) \
+     ) \
+     AND EXISTS ( \
+         SELECT 1 \
+           FROM pg_class sequence_info \
+           JOIN pg_namespace namespace ON namespace.oid = sequence_info.relnamespace \
+          WHERE namespace.nspname = 'public' \
+            AND sequence_info.relname = 'invoice_payment_events_accounting_sequence_seq' \
+            AND sequence_info.relkind = 'S' \
+            AND pg_get_userbyid(sequence_info.relowner) <> current_user \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(sequence_info.relowner), 'USAGE') \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(sequence_info.relowner), 'SET') \
+            AND has_sequence_privilege(current_user, sequence_info.oid, 'USAGE') \
+            AND NOT has_sequence_privilege(current_user, sequence_info.oid, 'SELECT') \
+            AND NOT has_sequence_privilege(current_user, sequence_info.oid, 'UPDATE') \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM aclexplode(COALESCE( \
+                      sequence_info.relacl, acldefault('S', sequence_info.relowner) \
+                  )) acl \
+                 WHERE acl.grantee = 0 \
+            ) \
+     )";
+
 type DirectLifecyclePrivileges = (
     Option<bool>,
     Option<bool>,
@@ -129,6 +250,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     if !schema_marker_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
+        || !merchant_settlement_trigger_invariants_present(pool).await?
         || !merchant_settlement_privileges_present(pool).await?
     {
         return Ok(false);
@@ -257,28 +379,17 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
 }
 
 async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "WITH required(table_name) AS (VALUES \
-             ('chain_swap_tx_attempts'), \
-             ('invoice_payment_events'), \
-             ('merchant_settlement_checkpoints'), \
-             ('merchant_settlement_retained_outputs') \
-         ) \
-         SELECT COUNT(*) = 4 \
-            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'SELECT')) \
-            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'INSERT')) \
-            AND BOOL_AND(has_table_privilege(current_user, relation.oid, 'UPDATE')) \
-            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'DELETE')) \
-            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')) \
-            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')) \
-            AND BOOL_AND(NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')) \
-           FROM required \
-           JOIN pg_class relation ON relation.relname = required.table_name \
-           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
-          WHERE namespace.nspname = 'public' AND relation.relkind = 'r'",
-    )
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_PRIVILEGES_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn merchant_settlement_trigger_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL)
+        .fetch_one(pool)
+        .await
 }
 
 /// Global #84 capability boundary. This does not assert that any particular
@@ -662,9 +773,7 @@ fn swap_key_lineage_privileges_ready(
     )
 }
 
-fn chain_swap_record_privileges_ready(
-    (select, insert, update): ChainSwapRecordPrivileges,
-) -> bool {
+fn chain_swap_record_privileges_ready((select, insert, update): ChainSwapRecordPrivileges) -> bool {
     matches!(
         (select, insert, update),
         (Some(true), Some(true), Some(true))
@@ -1107,20 +1216,6 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                        'merchant_settlement_retained_journal_fkey', \
                        'merchant_settlement_retained_checkpoint_fkey' \
                    ) \
-            ) = 6 \
-            AND ( \
-                SELECT COUNT(*) \
-                  FROM pg_trigger trigger_info \
-                 WHERE trigger_info.tgname IN ( \
-                     'chain_swap_tx_attempts_validate_replacement', \
-                     'invoice_payment_event_reject_merchant_settlement_delete', \
-                     'merchant_settlement_checkpoint_validate_write', \
-                     'merchant_settlement_checkpoint_reject_delete', \
-                     'merchant_settlement_retained_validate_update', \
-                     'merchant_settlement_retained_reject_delete' \
-                 ) \
-                   AND NOT trigger_info.tgisinternal \
-                   AND trigger_info.tgenabled IN ('O', 'A') \
             ) = 6",
     )
     .fetch_one(pool)
@@ -1133,7 +1228,129 @@ mod tests {
         chain_swap_record_privileges_ready, direct_lifecycle_privileges_ready,
         journal_privileges_ready, recovery_commitment_privileges_ready,
         swap_key_lineage_privileges_ready, watcher_lane_privileges_ready,
+        MERCHANT_SETTLEMENT_PRIVILEGES_SQL, MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL,
     };
+
+    #[test]
+    fn merchant_settlement_readiness_matches_deploy_boundary() {
+        for (table, trigger, function, trigger_type) in [
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_require_review25_fee_authority",
+                "require_review25_bitcoin_attempt_fee_authority",
+                7,
+            ),
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_immutable",
+                "guard_chain_swap_tx_attempt_immutable",
+                19,
+            ),
+            (
+                "chain_swap_tx_attempts",
+                "chain_swap_tx_attempts_validate_replacement",
+                "enforce_liquid_claim_replacement_lineage",
+                7,
+            ),
+            (
+                "invoice_payment_events",
+                "invoice_payment_event_evidence_guard",
+                "guard_invoice_payment_event_evidence",
+                19,
+            ),
+            (
+                "invoice_payment_events",
+                "invoice_payment_event_reject_merchant_settlement_delete",
+                "reject_merchant_settlement_event_delete",
+                11,
+            ),
+            (
+                "merchant_settlement_checkpoints",
+                "merchant_settlement_checkpoint_validate_write",
+                "enforce_merchant_settlement_checkpoint_write",
+                23,
+            ),
+            (
+                "merchant_settlement_checkpoints",
+                "merchant_settlement_checkpoint_reject_delete",
+                "reject_merchant_settlement_delete",
+                11,
+            ),
+            (
+                "merchant_settlement_retained_outputs",
+                "merchant_settlement_retained_validate_update",
+                "enforce_merchant_settlement_retained_update",
+                23,
+            ),
+            (
+                "merchant_settlement_retained_outputs",
+                "merchant_settlement_retained_reject_delete",
+                "reject_merchant_settlement_delete",
+                11,
+            ),
+        ] {
+            let binding = format!("('{table}', '{trigger}', '{function}', {trigger_type})");
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(&binding),
+                "missing exact trigger binding: {binding}"
+            );
+        }
+        for exact_catalog_guard in [
+            "relation_namespace.nspname = 'public'",
+            "function_namespace.nspname = 'public'",
+            "function_info.pronargs = 0",
+            "trigger_info.tgtype = required.trigger_type::SMALLINT",
+            "NOT trigger_info.tgisinternal",
+            "trigger_info.tgenabled IN ('O', 'A')",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(exact_catalog_guard),
+                "missing trigger catalog guard: {exact_catalog_guard}"
+            );
+        }
+
+        for table in [
+            "chain_swap_tx_attempts",
+            "invoice_payment_events",
+            "merchant_settlement_checkpoints",
+            "merchant_settlement_retained_outputs",
+        ] {
+            assert!(MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(&format!("('{table}')")));
+        }
+        for function in [
+            "guard_chain_swap_tx_attempt_immutable",
+            "require_review25_bitcoin_attempt_fee_authority",
+            "enforce_liquid_claim_replacement_lineage",
+            "guard_invoice_payment_event_evidence",
+            "reject_merchant_settlement_event_delete",
+            "enforce_merchant_settlement_checkpoint_write",
+            "enforce_merchant_settlement_retained_update",
+            "reject_merchant_settlement_delete",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(&format!("('{function}')")),
+                "missing function owner guard: {function}"
+            );
+        }
+        for owner_guard in [
+            "relation.relowner) <> current_user",
+            "function_info.proowner) <> current_user",
+            "sequence_info.relowner) <> current_user",
+            "relation.relowner), 'USAGE'",
+            "relation.relowner), 'SET'",
+            "function_info.proowner), 'USAGE'",
+            "function_info.proowner), 'SET'",
+            "sequence_info.relowner), 'USAGE'",
+            "sequence_info.relowner), 'SET'",
+            "invoice_payment_events_accounting_sequence_seq",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains(owner_guard),
+                "missing owner capability guard: {owner_guard}"
+            );
+        }
+        assert!(!MERCHANT_SETTLEMENT_PRIVILEGES_SQL.contains("'MEMBER'"));
+    }
 
     #[test]
     fn recovery_journal_requires_every_privilege() {
