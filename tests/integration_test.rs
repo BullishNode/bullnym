@@ -399,8 +399,23 @@ fn test_app(state: AppState) -> Router {
             get(donation_render::manifest_pos),
         )
         .route("/:nym/pos", get(donation_render::render_pos))
+        .route("/a/:slug", get(donation_render::render_alias))
+        .route("/a/:slug/pos", get(donation_render::render_alias_pos))
+        .route(
+            "/a/:slug/manifest.webmanifest",
+            get(donation_render::manifest_alias),
+        )
+        .route(
+            "/a/:slug/pos/manifest.webmanifest",
+            get(donation_render::manifest_alias_pos),
+        )
         .route("/:nym/invoice", post(invoice::create_anonymous))
         .route("/:nym/pos/invoice", post(invoice::create_anonymous_pos))
+        .route("/a/:slug/invoice", post(invoice::create_anonymous_alias))
+        .route(
+            "/a/:slug/pos/invoice",
+            post(invoice::create_anonymous_alias_pos),
+        )
         .route("/register", post(registration::register))
         .route("/register", put(registration::update_registration))
         .route(
@@ -427,6 +442,8 @@ fn test_app(state: AppState) -> Router {
             axum::routing::delete(invoice::cancel_unlinked),
         )
         .route("/:nym/i/:id", get(invoice::render_payment))
+        .route("/a/:slug/i/:id", get(invoice::render_payment_alias))
+        .route("/a/:slug/pos/i/:id", get(invoice::render_payment_alias))
         .route("/invoice/:id", get(invoice::render_unlinked_payment))
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
@@ -695,6 +712,7 @@ struct DonationSaveSignFields<'a> {
     pos_mode: Option<bool>,
     ct_descriptor: Option<&'a str>,
     kind: Option<&'a str>,
+    alias: Option<&'a str>,
 }
 
 fn sign_donation_page_save_with_keypair(
@@ -724,6 +742,9 @@ fn sign_donation_page_save_with_keypair(
     }
     if let Some(kind) = save.kind {
         fields.push(kind);
+    }
+    if let Some(alias) = save.alias {
+        fields.push(alias);
     }
     sign_la_action(keypair, "donation-page-save", npub, nym, &fields)
 }
@@ -799,7 +820,12 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM users").execute(pool).await.ok();
+    // Permanent names reject row DELETE. The disposable database owner uses
+    // one atomic DDL reset for both sides of the owner FK solely for isolation.
+    sqlx::query("TRUNCATE users, public_names CASCADE")
+        .execute(pool)
+        .await
+        .ok();
 }
 
 /// Seed a row that deliberately models a database created before migration
@@ -1273,13 +1299,37 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "057_chain_swap_cooperative_signing_operations"
+        "059_remove_surface_alias"
     );
 
     let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+
+    // Migration 058 is incomplete if immutable ownership can be released,
+    // even when the registry columns and uniqueness constraints remain.
+    sqlx::query("ALTER TABLE public_names DISABLE TRIGGER public_names_reject_mutation")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (mutable_names_status, mutable_names_body) = get_path(&app, "/ready").await;
+    sqlx::query("ALTER TABLE public_names ENABLE TRIGGER public_names_reject_mutation")
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(mutable_names_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_names_body["ready"], false);
+
+    let app = test_app(test_state(runtime.clone()));
+    let (restored_names_status, restored_names_body) = get_path(&app, "/ready").await;
+    assert_eq!(
+        restored_names_status,
+        StatusCode::OK,
+        "body: {restored_names_body}"
+    );
+    assert_eq!(restored_names_body["ready"], true);
 
     // A nonredundant immutability member is part of the marker too: retaining
     // the tables and unique constraints is not enough if an allocation can be
@@ -1359,6 +1409,36 @@ async fn readiness_rejects_schema_before_latest_migration() {
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
     assert_eq!(restored_body["ready"], true);
+}
+
+#[tokio::test]
+async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+
+    sqlx::query("ALTER TABLE donation_pages ADD COLUMN alias TEXT")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (status, body) = get_path(&app, "/ready").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["expected_schema_marker"], "059_remove_surface_alias");
+
+    sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
+        .execute(&admin)
+        .await
+        .unwrap();
+    runtime.close().await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(runtime));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
+    assert_eq!(restored_body["ready"], true);
+
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]
@@ -3658,6 +3738,7 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            alias: None,
         },
     );
 
@@ -3915,6 +3996,7 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -3973,6 +4055,7 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             pos_mode: Some(true),
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -4036,6 +4119,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -4067,6 +4151,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: Some("pos"),
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -4105,6 +4190,412 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
 }
 
 #[tokio::test]
+async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availability() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "aliasowner";
+    let alias = "shared-shop";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Shared Page",
+            description: "Permanent alias Page",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            alias: Some(alias),
+        },
+    );
+    let (status, page) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Shared Page", "description": "Permanent alias Page",
+            "display_currency": "USD", "enabled": true,
+            "kind": "payment_page", "alias": alias,
+            "timestamp": timestamp, "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page:?}");
+    assert_eq!(page["alias"], alias);
+    assert_eq!(page["public_url"], "https://test.example.com/a/shared-shop");
+
+    // The second surface reuses the exact same owner-level alias. This is an
+    // idempotent ownership retry, not a second claim.
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Shared POS",
+            description: "Permanent alias POS",
+            display_currency: "CRC",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some(pay_service::db::KIND_POS),
+            alias: Some(alias),
+        },
+    );
+    let (status, pos) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Shared POS", "description": "Permanent alias POS",
+            "display_currency": "CRC", "enabled": true,
+            "kind": "pos", "alias": alias,
+            "timestamp": timestamp, "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pos:?}");
+    assert_eq!(pos["alias"], alias);
+    assert_eq!(
+        pos["public_url"],
+        "https://test.example.com/a/shared-shop/pos"
+    );
+
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public_names WHERE owner_npub = $1 AND kind = 'alias'",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(claims, 1);
+
+    // A different value is a forbidden rename. The rejected transaction must
+    // not mutate the existing Page row.
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Must Not Commit",
+            description: "Rejected rename",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            alias: Some("different-shop"),
+        },
+    );
+    let (status, conflict) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Must Not Commit", "description": "Rejected rename",
+            "display_currency": "USD", "enabled": true,
+            "kind": "payment_page", "alias": "different-shop",
+            "timestamp": timestamp, "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict:?}");
+    assert_eq!(conflict["code"], "AliasAlreadyAssigned");
+    let unchanged =
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged.header, "Shared Page");
+
+    let (signature, timestamp) = sign_donation_page_save_with_keypair(
+        &keypair,
+        &npub,
+        nym,
+        DonationSaveSignFields {
+            header: "Must Still Not Commit",
+            description: "Empty is not a clear",
+            display_currency: "USD",
+            website: "",
+            twitter: "",
+            instagram: "",
+            enabled: true,
+            pos_mode: None,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            alias: Some(""),
+        },
+    );
+    let (_, empty_alias) = put_json(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
+            "header": "Must Still Not Commit", "description": "Empty is not a clear",
+            "display_currency": "USD", "enabled": true,
+            "kind": "payment_page", "alias": "",
+            "timestamp": timestamp, "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(empty_alias["code"], "DonationPageInvalid");
+    assert_eq!(
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE,)
+            .await
+            .unwrap()
+            .unwrap()
+            .header,
+        "Shared Page"
+    );
+
+    // Nyms and aliases share one namespace. A different owner cannot claim
+    // this alias and a new alias cannot reuse an existing nym.
+    create_test_user(&pool, "otherowner").await;
+    let colliding_surface = pay_service::db::UpsertDonationPage {
+        nym: "otherowner",
+        kind: pay_service::db::KIND_PAYMENT_PAGE,
+        ct_descriptor: Some(TEST_DESCRIPTOR),
+        header: "Collision",
+        description: "Must not commit",
+        display_currency: "USD",
+        website: None,
+        twitter: None,
+        instagram: None,
+        pos_mode: None,
+        enabled: true,
+        generated_og_template_version: None,
+        alias: Some(alias),
+    };
+    assert!(matches!(
+        pay_service::db::upsert_donation_page(&pool, &colliding_surface).await,
+        Err(pay_service::db::UpsertDonationPageError::NameTaken)
+    ));
+    let nym_collision = pay_service::db::UpsertDonationPage {
+        alias: Some(nym),
+        ..colliding_surface
+    };
+    assert!(matches!(
+        pay_service::db::upsert_donation_page(&pool, &nym_collision).await,
+        Err(pay_service::db::UpsertDonationPageError::NameTaken)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM donation_pages WHERE nym = 'otherowner'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    let (status, page_html) = get_text_path(&app, "/a/shared-shop").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page_html.contains(r#"const BASE = "/a/shared-shop""#));
+    assert!(!page_html.contains(nym), "alias Page leaked its owning nym");
+    let (status, pos_html) = get_text_path(&app, "/a/shared-shop/pos").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(pos_html.contains(r#"const BASE = "/a/shared-shop/pos""#));
+    assert!(!pos_html.contains(nym), "alias POS leaked its owning nym");
+
+    let (status, _, page_manifest) =
+        get_json_with_headers(&app, "/a/shared-shop/manifest.webmanifest").await;
+    assert_eq!(status, StatusCode::OK, "{page_manifest:?}");
+    assert_eq!(page_manifest["start_url"], "/a/shared-shop");
+    let (status, _, pos_manifest) =
+        get_json_with_headers(&app, "/a/shared-shop/pos/manifest.webmanifest").await;
+    assert_eq!(status, StatusCode::OK, "{pos_manifest:?}");
+    assert_eq!(pos_manifest["start_url"], "/a/shared-shop/pos");
+
+    // Lightning Address availability is independent: taking it offline does
+    // not remove the alias or either surface route.
+    sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1")
+        .bind(&npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_text_path(&app, "/a/shared-shop").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_text_path(&app, "/a/shared-shop/pos").await.0,
+        StatusCode::OK
+    );
+    let (status, offline_checkout) = post_json(
+        &app,
+        "/a/shared-shop/pos/invoice",
+        json!({ "amount_sat": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{offline_checkout:?}");
+    assert!(
+        offline_checkout["liquid_address"]
+            .as_str()
+            .is_some_and(|address| !address.is_empty()),
+        "offline Lightning Address must not disable POS checkout"
+    );
+
+    // Archiving only Page preserves the permanent claim and live POS route.
+    pay_service::db::archive_donation_page(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public_names WHERE name = $1 AND owner_npub = $2",
+        )
+        .bind(alias)
+        .bind(&npub)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        get_text_path(&app, "/a/shared-shop/pos").await.0,
+        StatusCode::OK
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "aliasrace").await;
+
+    let page = pay_service::db::UpsertDonationPage {
+        nym: "aliasrace",
+        kind: pay_service::db::KIND_PAYMENT_PAGE,
+        ct_descriptor: Some(TEST_DESCRIPTOR),
+        header: "Page winner",
+        description: "Page race",
+        display_currency: "USD",
+        website: None,
+        twitter: None,
+        instagram: None,
+        pos_mode: None,
+        enabled: true,
+        generated_og_template_version: None,
+        alias: Some("page-choice"),
+    };
+    let pos = pay_service::db::UpsertDonationPage {
+        nym: "aliasrace",
+        kind: pay_service::db::KIND_POS,
+        ct_descriptor: Some(TEST_DESCRIPTOR),
+        header: "POS winner",
+        description: "POS race",
+        display_currency: "USD",
+        website: None,
+        twitter: None,
+        instagram: None,
+        pos_mode: None,
+        enabled: true,
+        generated_og_template_version: None,
+        alias: Some("pos-choice"),
+    };
+
+    let (page_result, pos_result) = tokio::join!(
+        pay_service::db::upsert_donation_page(&pool, &page),
+        pay_service::db::upsert_donation_page(&pool, &pos),
+    );
+    assert_ne!(page_result.is_ok(), pos_result.is_ok());
+    let loser = if let Err(error) = page_result {
+        error
+    } else {
+        pos_result.unwrap_err()
+    };
+    assert!(matches!(
+        loser,
+        pay_service::db::UpsertDonationPageError::AliasAlreadyAssigned
+    ));
+
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public_names WHERE kind = 'alias' AND owner_npub = ( \
+             SELECT npub FROM users WHERE nym = 'aliasrace' \
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let surfaces: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM donation_pages WHERE nym = 'aliasrace'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(claims, 1);
+    assert_eq!(
+        surfaces, 1,
+        "losing alias claim must not mutate its surface"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_alias_legacy_page_fallback_remains_payable_while_la_is_offline() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "aliasfallback").await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "aliasfallback",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: None,
+            header: "Fallback Page",
+            description: "Legacy descriptor compatibility",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: Some("fallback-shop"),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1")
+        .bind(npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, invoice) = post_json(
+        &app,
+        "/a/fallback-shop/invoice",
+        json!({ "amount_sat": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{invoice:?}");
+    assert!(invoice["liquid_address"]
+        .as_str()
+        .is_some_and(|address| !address.is_empty()));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn pos_save_without_descriptor_is_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -4133,6 +4624,7 @@ async fn pos_save_without_descriptor_is_rejected() {
             pos_mode: None,
             ct_descriptor: None,
             kind: Some("pos"),
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -4180,6 +4672,7 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
             pos_mode: None,
             ct_descriptor: Some(TEST_DESCRIPTOR),
             kind: None,
+            alias: None,
         },
     );
     let (status, body) = put_json(
@@ -4539,8 +5032,9 @@ async fn register_duplicate_nym_rejected() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "NameTaken");
 
     cleanup_db(&pool).await;
 }
@@ -9370,7 +9864,7 @@ async fn delete_registration_deactivates_user() {
 // --- Nym lifecycle tests ---
 
 #[tokio::test]
-async fn reregister_after_delete_succeeds() {
+async fn reregister_different_nym_after_delete_is_permanently_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -9407,18 +9901,16 @@ async fn reregister_after_delete_succeeds() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Re-register with new nym, same npub
+    // A different nym can never replace the permanent claim, even while the
+    // Lightning Address product is offline.
     let (new_sig, new_timestamp) =
         sign_register_with_keypair(&keypair, &npub, "lifecycle2", TEST_DESCRIPTOR);
     let (status, body) = post_json(&app, "/register", json!({
         "nym": "lifecycle2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": new_sig, "timestamp": new_timestamp,
     })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["nym"], "lifecycle2");
-
-    // New nym resolves
-    let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle2").await;
-    assert_eq!(body["tag"], "payRequest");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "NymAlreadyAssigned");
+    assert_eq!(body["details"]["nym"], "lifecycle1");
 
     // Old nym does not resolve
     let (_, body) = get_path(&app, "/.well-known/lnurlp/lifecycle1").await;
@@ -9480,7 +9972,7 @@ async fn reregister_same_nym_after_delete() {
 }
 
 #[tokio::test]
-async fn register_while_active_rejected() {
+async fn register_different_nym_while_online_is_permanently_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -9510,8 +10002,10 @@ async fn register_while_active_rejected() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["status"], "ERROR");
+    assert_eq!(body["code"], "NymAlreadyAssigned");
+    assert_eq!(body["details"]["nym"], "active1");
 
     cleanup_db(&pool).await;
 }
@@ -17331,57 +17825,15 @@ fn schnorr_sign_verify_roundtrip() {
     );
 }
 
-/// Two concurrent registers from the same npub, when only one slot remains
-/// under the lifetime cap, must result in exactly one Created and one
-/// non-success response — never two Createds (which would overshoot the cap)
-/// and never InternalError (the bug pre-advisory-lock).
+/// Two concurrent first claims by one npub must produce exactly one permanent
+/// nym and one typed ownership conflict.
 #[tokio::test]
-async fn register_concurrent_does_not_exceed_cap() {
+async fn permanent_nym_contract_concurrent_same_owner_claims_exactly_one() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
 
-    // One keypair → one npub for all calls.
-    let (npub_hex, _, _, kp) = sign_registration_with_keypair("filler-0", TEST_DESCRIPTOR);
-
-    // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
-    // creating + deactivating filler rows. Goes through the atomic flow
-    // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-0",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-        0,
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pay_service::db::register_user_atomic(
-        &pool,
-        &npub_hex,
-        "filler-1",
-        TEST_DESCRIPTOR,
-        None,
-        3,
-        0,
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Two concurrent register calls — only one slot remains. Without the
-    // advisory lock, both would pass `used < cap` (read=2) and both would
-    // INSERT, leaving 4 lifetime rows. With the lock, the loser sees either
-    // the active nym created by the winner or the exhausted lifetime cap.
+    let (npub_hex, _, _, kp) = sign_registration_with_keypair("conc-a", TEST_DESCRIPTOR);
     let (sig_a, timestamp_a) =
         sign_register_with_keypair(&kp, &npub_hex, "conc-a", TEST_DESCRIPTOR);
     let (sig_b, timestamp_b) =
@@ -17415,14 +17867,8 @@ async fn register_concurrent_does_not_exceed_cap() {
 
     let success_count =
         (status_a == StatusCode::CREATED) as u32 + (status_b == StatusCode::CREATED) as u32;
-    let guarded_reject_count = matches!(
-        body_a["code"].as_str(),
-        Some("NymQuotaExceeded" | "KeyAlreadyRegistered")
-    ) as u32
-        + matches!(
-            body_b["code"].as_str(),
-            Some("NymQuotaExceeded" | "KeyAlreadyRegistered")
-        ) as u32;
+    let guarded_reject_count = (body_a["code"] == "NymAlreadyAssigned") as u32
+        + (body_b["code"] == "NymAlreadyAssigned") as u32;
 
     assert_eq!(
         success_count, 1,
@@ -17430,7 +17876,7 @@ async fn register_concurrent_does_not_exceed_cap() {
     );
     assert_eq!(
         guarded_reject_count, 1,
-        "the other should be rejected by the atomic registration guard; got a={body_a} b={body_b}"
+        "the other should see the permanent owner conflict; got a={body_a} b={body_b}"
     );
     // The bug we're guarding against: race-loser returning a generic
     // InternalError because the cap check happened outside the atomic tx.
@@ -17440,13 +17886,405 @@ async fn register_concurrent_does_not_exceed_cap() {
         "must not return InternalError under contention; got {codes:?}"
     );
 
-    // DB invariant: exactly cap rows under this npub.
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public_names \
+         WHERE owner_npub = $1 AND kind = 'nym'",
+    )
+    .bind(&npub_hex)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
         .bind(&npub_hex)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 3, "lifetime cap must hold under contention");
+    assert_eq!((claims, users), (1, 1));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state_with_nip05(pool.clone()));
+    let (npub, signature, timestamp, keypair) =
+        sign_registration_with_keypair("permanent-life", TEST_DESCRIPTOR);
+
+    let (status, first) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "permanent-life",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "verification_npub": npub,
+            "signature": signature,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(first["quota"], json!({"used": 1, "cap": 1, "remaining": 0}));
+    assert_eq!(first["nip05"], "permanent-life@test.example.com");
+
+    sqlx::query("UPDATE users SET next_addr_idx = 7 WHERE npub = $1")
+        .bind(&npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for kind in [
+        pay_service::db::KIND_PAYMENT_PAGE,
+        pay_service::db::KIND_POS,
+    ] {
+        pay_service::db::upsert_donation_page(
+            &pool,
+            &pay_service::db::UpsertDonationPage {
+                nym: "permanent-life",
+                kind,
+                ct_descriptor: Some(TEST_DESCRIPTOR),
+                header: "Permanent merchant",
+                description: "Independent product state",
+                display_currency: "USD",
+                website: None,
+                twitter: None,
+                instagram: None,
+                pos_mode: None,
+                enabled: true,
+                generated_og_template_version: None,
+                alias: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let initial_user: (Uuid, String, Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT id, ct_descriptor, verification_npub, next_addr_idx, is_active \
+         FROM users WHERE npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let initial_claim: (String, String, String) = sqlx::query_as(
+        "SELECT name, kind, claimed_at::TEXT \
+         FROM public_names WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let initial_surfaces: Vec<(String, bool, bool, String)> = sqlx::query_as(
+        "SELECT kind, enabled, archived_at IS NULL, updated_at::TEXT \
+         FROM donation_pages WHERE nym = 'permanent-life' ORDER BY kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    // Omission of verification_npub deliberately signs the shorter compatible
+    // request shape. An exact online retry must not clear or rewrite anything.
+    let (retry_signature, retry_timestamp) = sign_la_action(
+        &keypair,
+        "register",
+        &npub,
+        "permanent-life",
+        &[TEST_DESCRIPTOR],
+    );
+    let (retry_status, retry) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "permanent-life",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "signature": retry_signature,
+            "timestamp": retry_timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::CREATED);
+    assert_eq!(retry["nip05"], "permanent-life@test.example.com");
+    let after_retry: (Uuid, String, Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT id, ct_descriptor, verification_npub, next_addr_idx, is_active \
+         FROM users WHERE npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_retry, initial_user);
+
+    let (delete_signature, delete_timestamp) =
+        sign_delete_with_keypair(&keypair, &npub, "permanent-life");
+    let (delete_status, deleted) = delete_request(
+        &app,
+        json!({
+            "npub": npub,
+            "nym": "permanent-life",
+            "signature": delete_signature,
+            "timestamp": delete_timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(
+        deleted["quota"],
+        json!({"used": 1, "cap": 1, "remaining": 0})
+    );
+    let online: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE npub = $1")
+        .bind(&npub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!online);
+    let after_delete_claim: (String, String, String) = sqlx::query_as(
+        "SELECT name, kind, claimed_at::TEXT \
+         FROM public_names WHERE owner_npub = $1",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_delete_claim, initial_claim);
+    let after_delete_surfaces: Vec<(String, bool, bool, String)> = sqlx::query_as(
+        "SELECT kind, enabled, archived_at IS NULL, updated_at::TEXT \
+         FROM donation_pages WHERE nym = 'permanent-life' ORDER BY kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_delete_surfaces, initial_surfaces);
+    let (_, unavailable) = get_path(&app, "/.well-known/lnurlp/permanent-life").await;
+    assert_eq!(unavailable["code"], "NymNotFound");
+
+    let (reactivate_signature, reactivate_timestamp) =
+        sign_register_with_keypair(&keypair, &npub, "permanent-life", TEST_DESCRIPTOR);
+    let (reactivate_status, _) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "permanent-life",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "verification_npub": npub,
+            "signature": reactivate_signature,
+            "timestamp": reactivate_timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(reactivate_status, StatusCode::CREATED);
+    let reactivated: (Uuid, i32, bool) =
+        sqlx::query_as("SELECT id, next_addr_idx, is_active FROM users WHERE npub = $1")
+            .bind(&npub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reactivated, (initial_user.0, 7, true));
+    let after_reactivation_surfaces: Vec<(String, bool, bool, String)> = sqlx::query_as(
+        "SELECT kind, enabled, archived_at IS NULL, updated_at::TEXT \
+         FROM donation_pages WHERE nym = 'permanent-life' ORDER BY kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_reactivation_surfaces, initial_surfaces);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_nym_contract_shared_namespace_and_cross_owner_race() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (alias_owner_npub, _, _) = sign_registration("alias-owner", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "alias-owner", &alias_owner_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public_names (name, owner_npub, kind) \
+         VALUES ('shared-alias', $1, 'alias')",
+    )
+    .bind(&alias_owner_npub)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (alias_collision_npub, alias_collision_signature, alias_collision_timestamp) =
+        sign_registration("shared-alias", TEST_DESCRIPTOR);
+    let (alias_collision_status, alias_collision) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "shared-alias",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": alias_collision_npub,
+            "verification_npub": alias_collision_npub,
+            "signature": alias_collision_signature,
+            "timestamp": alias_collision_timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(alias_collision_status, StatusCode::CONFLICT);
+    assert_eq!(alias_collision["code"], "NameTaken");
+
+    let (npub_a, signature_a, timestamp_a) = sign_registration("shared-race", TEST_DESCRIPTOR);
+    let (npub_b, signature_b, timestamp_b) = sign_registration("shared-race", TEST_DESCRIPTOR);
+    let request_a = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "shared-race",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub_a,
+            "verification_npub": npub_a,
+            "signature": signature_a,
+            "timestamp": timestamp_a,
+        }),
+    );
+    let request_b = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "shared-race",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub_b,
+            "verification_npub": npub_b,
+            "signature": signature_b,
+            "timestamp": timestamp_b,
+        }),
+    );
+    let ((status_a, body_a), (status_b, body_b)) = tokio::join!(request_a, request_b);
+    assert_eq!(
+        (status_a == StatusCode::CREATED) as u8 + (status_b == StatusCode::CREATED) as u8,
+        1
+    );
+    assert_eq!(
+        (body_a["code"] == "NameTaken") as u8 + (body_b["code"] == "NameTaken") as u8,
+        1
+    );
+    let shared_claims: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public_names WHERE name = 'shared-race'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let shared_users: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nym = 'shared-race'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((shared_claims, shared_users), (1, 1));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn grandfathered_tombstones_verify_history_but_never_drive_live_routes() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let (npub, _, _) = sign_registration("canonical-owner", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "canonical-owner", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    // Model the exact rows migration 059 is allowed to create before its
+    // runtime insert trigger exists. Test-only replication role is local to
+    // this transaction and leaves every declarative constraint enabled.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public_names \
+             (name, owner_npub, kind, canonical, grandfathered) \
+         VALUES \
+             ('historical-tombstone', $1, 'nym', FALSE, TRUE), \
+             ('historical-alias', $1, 'alias', FALSE, TRUE)",
+    )
+    .bind(&npub)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (nym, npub, ct_descriptor, is_active) \
+         VALUES ('historical-tombstone', $1, 'historical-descriptor', FALSE)",
+    )
+    .bind(&npub)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO donation_pages \
+             (nym, kind, ct_descriptor, header, description, \
+              display_currency, enabled) \
+         VALUES \
+             ('historical-tombstone', 'payment_page', \
+              'historical-descriptor', 'Historical', 'Tombstone surface', \
+              'USD', TRUE)",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let owner = pay_service::db::get_user_by_npub_any(&pool, &npub)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.nym, "canonical-owner");
+    assert_eq!(
+        pay_service::db::count_lifetime_nyms_by_npub(&pool, &npub)
+            .await
+            .unwrap(),
+        1,
+        "compatibility quota counts the one canonical product identity"
+    );
+
+    assert!(
+        pay_service::db::get_donation_page_by_nym(
+            &pool,
+            "historical-tombstone",
+            pay_service::db::KIND_PAYMENT_PAGE,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a tombstone nym must never select a payable surface"
+    );
+    assert!(
+        pay_service::db::get_donation_page_by_alias(
+            &pool,
+            "historical-alias",
+            pay_service::db::KIND_PAYMENT_PAGE,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a tombstone alias must never select a payable surface"
+    );
+    assert!(
+        pay_service::db::alias_owns_nym(&pool, "historical-alias", "historical-tombstone",)
+            .await
+            .unwrap(),
+        "typed tombstones remain authoritative for old invoice verification"
+    );
+
+    let activation =
+        sqlx::query("UPDATE users SET is_active = TRUE WHERE nym = 'historical-tombstone'")
+            .execute(&pool)
+            .await
+            .expect_err("a tombstone must not become an active Lightning Address");
+    assert!(matches!(
+        activation,
+        sqlx::Error::Database(ref error)
+            if error.constraint() == Some("users_active_nym_must_be_canonical")
+    ));
 
     cleanup_db(&pool).await;
 }
@@ -26155,7 +26993,7 @@ async fn install_invoice_route_staging_drift(pool: &PgPool) {
     drop_invoice_route_staging_drift(pool).await;
     sqlx::query(
         "CREATE FUNCTION invoice_route_staging_drift() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN NEW.nym := NEW.nym || '-persisted-drift'; RETURN NEW; END $$",
+         BEGIN NEW.nym := NEW.nym || '-d'; RETURN NEW; END $$",
     )
     .execute(pool)
     .await
@@ -26290,7 +27128,7 @@ async fn invoice_chain_offer_staging_failure_withholds_offer_and_retains_provide
     seed_invoice_route_page(&pool, nym).await;
     // Keep the deliberate post-validation nym drift database-valid so this
     // test reaches manifest staging after the canonical row commits.
-    create_test_user(&pool, "invoicemanifeststagingfailure-persisted-drift").await;
+    create_test_user(&pool, "invoicemanifeststagingfailure-d").await;
 
     let first_child_index = pay_service::db::swap_key_seq_next_value(&pool)
         .await
@@ -26322,10 +27160,7 @@ async fn invoice_chain_offer_staging_failure_withholds_offer_and_retains_provide
         .unwrap()
         .unwrap();
     assert_eq!(row.status, "pending");
-    assert_eq!(
-        row.nym.as_deref(),
-        Some("invoicemanifeststagingfailure-persisted-drift")
-    );
+    assert_eq!(row.nym.as_deref(), Some("invoicemanifeststagingfailure-d"));
     assert_eq!(row.boltz_response_json, expected_provider_json);
     assert_eq!(
         pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)

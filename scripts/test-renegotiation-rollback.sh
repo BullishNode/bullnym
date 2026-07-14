@@ -85,11 +85,25 @@ expect_allowed() {
     || fail "rollback unexpectedly refused from $candidate to $previous"
 }
 
-expect_refusal 055_merchant_settlement_lifecycle 056_chain_swap_renegotiation_journal \
+expect_refusal \
+  055_merchant_settlement_lifecycle \
+  056_chain_swap_renegotiation_journal \
   'migration 056 is a roll-forward-only renegotiation-intent boundary'
-expect_refusal 055_merchant_settlement_lifecycle 057_chain_swap_cooperative_signing_operations \
+expect_refusal \
+  055_merchant_settlement_lifecycle \
+  057_chain_swap_cooperative_signing_operations \
   'migration 056 is a roll-forward-only renegotiation-intent boundary'
-expect_refusal 056_chain_swap_renegotiation_journal 057_chain_swap_cooperative_signing_operations \
+expect_refusal \
+  055_merchant_settlement_lifecycle \
+  058_permanent_public_names \
+  'migration 056 is a roll-forward-only renegotiation-intent boundary'
+expect_refusal \
+  056_chain_swap_renegotiation_journal \
+  057_chain_swap_cooperative_signing_operations \
+  'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
+expect_refusal \
+  056_chain_swap_renegotiation_journal \
+  058_permanent_public_names \
   'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
 rollback_writer_stopped=0
 cooperative_query_fails=1
@@ -145,5 +159,16 @@ check_line="$(grep -n -m1 'require_no_nonterminal_cooperative_operations "deploy
 [[ "$stop_line" =~ ^[0-9]+$ && "$check_line" =~ ^[0-9]+$ \
     && "$stop_line" -lt "$check_line" ]] \
   || fail "forward deploy must stop the current writer before its compatibility check"
+
+rollback_writer_stopped=1
+cooperative_query_fails=0
+cooperative_count=0
+expect_allowed 057_chain_swap_cooperative_signing_operations 058_permanent_public_names
+expect_allowed 058_permanent_public_names 058_permanent_public_names
+expect_refusal \
+  058_permanent_public_names \
+  059_remove_surface_alias \
+  'migration 059 removes mutable per-surface alias authority'
+expect_allowed 059_remove_surface_alias 059_remove_surface_alias
 
 echo "renegotiation rollback checks passed"

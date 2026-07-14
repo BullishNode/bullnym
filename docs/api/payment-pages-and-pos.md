@@ -27,7 +27,7 @@ Options and implications:
 
 | Field | Wire/update semantics | Consequence |
 |---|---|---|
-| `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent row, descriptor, alias, and public workflow. Explicitly send it in new clients. |
+| `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent row, descriptor, and public workflow. Both rows derive the owner's one optional permanent alias. Explicitly send it in new clients. |
 | `header` | Required, 1-80 UTF-8 bytes. | Replaces the stored value on every save. |
 | `description` | Required JSON string. Payment Page saves require 1-120 user-perceived Unicode characters and at most 512 UTF-8 bytes, including when `kind` is omitted and therefore defaults to `payment_page`. POS keeps the optional 0-280-byte contract. | Replaces the stored short description and the text rendered into social-preview metadata/images. Omission is a framework deserialization error. |
 | `display_currency` | Required canonical uppercase supported code. | Replaces the stored value and controls display/fiat checkout; fetch supported currencies first. |
@@ -35,11 +35,11 @@ Options and implications:
 | `twitter` | ASCII letters/digits/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
 | `instagram` | ASCII letters/digits/dot/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
 | `enabled` | Required boolean; signed as `1` or `0`. | False retains configuration but public payment use is disabled. It is not archival deletion. |
-| `ct_descriptor` | Non-empty descriptor replaces it; omitted/null/empty preserves it on update. POS creation requires non-empty; Payment Page creation may omit it and fall back to the nym descriptor. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. Empty string is appended to the signature even though storage preserves the descriptor. |
+| `ct_descriptor` | Non-empty descriptor replaces it; omitted/null/empty preserves it on update. POS creation requires non-empty; Payment Page creation may omit it and fall back to the permanent nym descriptor even while the Lightning Address is offline. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. Empty string is appended to the signature even though storage preserves the descriptor. |
 | `pos_mode` | Legacy non-null boolean; omitted/null preserves it on update and is not appended to the signature. | New integrations should use `kind`; sending it changes the signed bytes. |
-| `alias` omitted/null | Preserve the current alias; no trailing signed field. | Maintains old-client compatibility. |
-| `alias: ""` | Clear; append an empty terminal signed field. | Removes the alias route. |
-| non-empty `alias` | Claim/change; append it as the terminal field. | Globally unique 1-32 lowercase/digit/hyphen slug served at `/a/<alias>`. This is branding, not anonymity. |
+| `alias` omitted/null | Preserve the permanent owner-level claim; no trailing signed field. | Maintains old-client compatibility without creating a synthetic alias. |
+| `alias: ""` | Append the empty terminal signed field, then reject with `DonationPageInvalid`. | Empty is never a clear/release operation. |
+| non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different owner value returns `AliasAlreadyAssigned`; a reserved string returns `NameTaken`. |
 
 Every successful save clears `archived_at`, so saving an archived surface
 reactivates it. The request body limit is 8 KiB. Length checks use UTF-8 byte
@@ -69,7 +69,8 @@ Response is a `DonationPageView`:
 
 Share `public_url`; do not compose paths client-side. Alias pages intentionally
 omit the nym from rendered configuration and payment descriptions, but readable
-aliases remain enumerable.
+aliases remain enumerable. A POS response uses `/a/<alias>/pos`; a Payment Page
+response uses `/a/<alias>`.
 
 ## `GET /donation-page/:nym?kind=payment_page|pos`
 
@@ -83,6 +84,9 @@ Body: `nym`, `npub`, optional `kind`, `timestamp`, `signature`. Archival is a
 soft delete of only the selected surface. Omitted `kind` archives the Payment
 Page for legacy compatibility. The nym and other surface are unaffected. A
 later successful save of that `(nym, kind)` automatically unarchives it.
+Archival never mutates permanent nym/alias ownership or the other surface.
+Page/POS management and checkout remain authorized while the owner's Lightning
+Address is offline.
 
 Bullnym does not provide an image-upload API. `avatar_sha256` and `og_sha256`
 in a `DonationPageView` are legacy read-only fields for previously stored media.
@@ -93,16 +97,19 @@ in a `DonationPageView` are legacy read-only fields for previously stored media.
 |---|---|---|
 | `GET` | `/:nym` | Payment Page PWA |
 | `GET` | `/:nym/pos` | POS PWA |
-| `GET` | `/a/:slug` | Alias-selected Payment Page or POS PWA |
+| `GET` | `/a/:slug` | Alias-selected Payment Page PWA |
+| `GET` | `/a/:slug/pos` | Alias-selected POS PWA |
 | `GET` | `/:nym/manifest.webmanifest` | Payment Page manifest |
 | `GET` | `/:nym/pos/manifest.webmanifest` | POS manifest |
-| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected surface manifest |
+| `GET` | `/a/:slug/manifest.webmanifest` | Alias-selected Payment Page manifest |
+| `GET` | `/a/:slug/pos/manifest.webmanifest` | Alias-selected POS manifest |
 | `GET` | `/sw.js` | Service worker from the configured PWA distribution |
 | `GET` | `/pwa-assets/*` | Static PWA distribution files |
 | `POST` | `/:nym/invoice` | Payment Page checkout |
 | `POST` | `/:nym/pos/invoice` | POS checkout |
-| `POST` | `/a/:slug/invoice` | Alias-selected checkout |
-| `GET` | `/:nym/i/:id`, `/a/:slug/i/:id` | Linked payment page |
+| `POST` | `/a/:slug/invoice` | Alias-selected Payment Page checkout |
+| `POST` | `/a/:slug/pos/invoice` | Alias-selected POS checkout |
+| `GET` | `/:nym/i/:id`, `/a/:slug/i/:id`, `/a/:slug/pos/i/:id` | Linked payment page |
 
 The page and manifest routes are registered only when `features.payment_pages`
 is enabled. A manifest is returned only for an enabled, non-archived surface;

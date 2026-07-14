@@ -1,12 +1,14 @@
 # Public Name Reservation Policy: Nyms and Aliases
 
-- Status: Proposed
+- Status: Superseded by RFC-003
 - Owner: Unassigned
 - Affected repositories: `bullnym`, `bullbitcoin-mobile`
 - Last updated: 2026-07-11
 
-The design record was captured before implementation; default nym-fallback
-behavior was confirmed on 2026-07-11.
+This is a historical research/design record. Its active/inactive alias and
+mutable-clear alternatives are not implementation guidance. The accepted
+insert-only canonical/tombstone cutover decision is
+[RFC-003](003-permanent-public-names.md).
 
 This document preserves the product discussion, external research, current-code
 audit, preferred direction, implementation outline, and remaining decisions for

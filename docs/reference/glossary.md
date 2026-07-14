@@ -2,9 +2,10 @@
 
 | Term | Meaning |
 |---|---|
-| nym | Public Bullnym namespace and Lightning Address local part owned by an authentication `npub` |
+| nym | Permanent Bullnym namespace and Lightning Address local part; exactly one is owned by an authentication `npub` |
+| alias | Optional permanent web name in the shared nym/alias namespace; exactly one may be owned by an npub and is shared by Page/POS |
 | Payment Page | Public payer-entered checkout at `/:nym` or `/a/:alias`; legacy code/table names use “donation page” |
-| POS | Public cashier-entered checkout backed by a separate surface descriptor |
+| POS | Public cashier-entered checkout at `/:nym/pos` or `/a/:alias/pos`, backed by a separate surface descriptor |
 | wallet invoice | Merchant-created receivable with concrete settlement addresses |
 | checkout invoice | Payer-created Payment Page or POS session |
 | CT descriptor | Confidential Transactions descriptor from which Bullnym derives blinded Liquid receive addresses but not merchant spending keys |

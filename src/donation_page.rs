@@ -59,9 +59,8 @@ static INSTAGRAM_HANDLE_REGEX: LazyLock<Regex> =
 /// same URL-safe shape. Underscore is intentionally excluded (which is also
 /// what keeps `payment_page` from ever validating as an alias — see the
 /// signed-field confusion guard).
-static ALIAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap()
-});
+static ALIAS_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap());
 
 // --- Request / response wire types ---
 
@@ -89,11 +88,11 @@ pub struct SaveDonationPageRequest {
     /// `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Merchant-chosen public URL slug for this surface, served at
-    /// `/a/<alias>`, decoupled from the nym. Optional and the NEWEST trailing
+    /// Optional permanent owner-level public slug, shared by Page and POS.
+    /// It is the NEWEST trailing
     /// field in the signed payload (after `kind`), so any client that omits it
-    /// verifies against the older byte layout. Tri-state: absent leaves the
-    /// stored alias unchanged, `""` clears it, a non-empty value claims it.
+    /// verifies against the older byte layout. Omission preserves the claim,
+    /// an empty value is invalid, and a non-empty value claims it once.
     /// See `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub alias: Option<String>,
@@ -129,8 +128,7 @@ pub struct DonationPageView {
     pub is_archived: bool,
     pub avatar_sha256: Option<String>,
     pub og_sha256: Option<String>,
-    /// Merchant-chosen alias slug for this surface, if one is claimed. `None`
-    /// means the surface is only reachable via its nym path.
+    /// Permanent owner-level alias shared by Page and POS, if claimed.
     pub alias: Option<String>,
     /// Public URL the user can share. When an alias is set this is the
     /// nym-free `/a/<alias>` link (the whole point of the feature); otherwise
@@ -142,6 +140,9 @@ pub struct DonationPageView {
 impl DonationPageView {
     fn from_row(row: db::DonationPage, domain: &str) -> Self {
         let public_url = match row.alias.as_deref() {
+            Some(alias) if row.kind == db::KIND_POS => {
+                format!("https://{domain}/a/{alias}/pos")
+            }
             Some(alias) => format!("https://{domain}/a/{alias}"),
             None if row.kind == db::KIND_POS => format!("https://{domain}/{}/pos", row.nym),
             None => format!("https://{domain}/{}", row.nym),
@@ -316,12 +317,12 @@ fn save_payload_fields<'a>(
     fields
 }
 
-/// Confirm the signing npub owns `nym` AND the user row is currently active.
-/// Returns the user record on success.
+/// Confirm permanent nym ownership. Page/POS availability is independent of
+/// Lightning Address availability, so an offline LA owner remains authorized.
 async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
-    let user = db::get_user_by_npub(&state.db, npub)
+    let user = db::get_user_by_npub_any(&state.db, npub)
         .await?
-        .ok_or_else(|| AppError::AuthError("no active registration for this key".to_string()))?;
+        .ok_or_else(|| AppError::AuthError("no permanent registration for this key".to_string()))?;
     if user.nym != nym {
         return Err(AppError::AuthError(
             "signer does not own this nym".to_string(),
@@ -376,11 +377,15 @@ pub async fn save(
     // Charset excludes "payment_page" (underscore) and descriptors; the
     // reserved-alias blocklist rejects "0"/"1"/"pos" and brand names.
     //
-    // Tri-state for the upsert: absent leaves the stored alias unchanged,
-    // `Some("")` clears it, a validated non-empty value claims it.
-    let alias_update: Option<Option<&str>> = match req.alias.as_deref() {
+    // The alias is a permanent insert-only owner claim. Omission is a no-op;
+    // empty is never a clear operation.
+    let alias_update: Option<&str> = match req.alias.as_deref() {
         None => None,
-        Some("") => Some(None),
+        Some("") => {
+            return Err(AppError::DonationPageInvalid(
+                "alias cannot be empty or cleared once claimed".to_string(),
+            ));
+        }
         Some(s) => {
             if !ALIAS_REGEX.is_match(s) {
                 return Err(AppError::DonationPageInvalid(
@@ -394,7 +399,7 @@ pub async fn save(
                     "this link name is reserved; choose another".to_string(),
                 ));
             }
-            Some(Some(s))
+            Some(s)
         }
     };
 
@@ -404,7 +409,13 @@ pub async fn save(
     // Lightning-Address cursor fallback, so it would hard-fail at allocation.
     // Reject at save time — there are no legacy POS clients to grandfather
     // (KR-1).
-    if kind == db::KIND_POS && req.ct_descriptor.as_deref().filter(|s| !s.is_empty()).is_none() {
+    if kind == db::KIND_POS
+        && req
+            .ct_descriptor
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
         return Err(AppError::DonationPageInvalid(
             "a POS surface requires ct_descriptor".to_string(),
         ));
@@ -482,7 +493,12 @@ pub async fn save(
             alias: alias_update,
         },
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        db::UpsertDonationPageError::Database(error) => AppError::from(error),
+        db::UpsertDonationPageError::NameTaken => AppError::NameTaken,
+        db::UpsertDonationPageError::AliasAlreadyAssigned => AppError::AliasAlreadyAssigned,
+    })?;
 
     if kind == db::KIND_PAYMENT_PAGE {
         match tokio::time::timeout(
@@ -537,7 +553,7 @@ pub async fn save(
     // copies exist so `/a/<alias>` can serve avatar/OG without the nym in the
     // URL. New uploads already dual-write; this backfills images uploaded
     // before that shipped. Best-effort and non-fatal.
-    if matches!(alias_update, Some(Some(_))) {
+    if alias_update.is_some() {
         backfill_alias_image_hashes(&state, &row).await;
     }
 
@@ -846,9 +862,9 @@ pub async fn upload_image(
         &processed.source_sha256,
     )
     .await?
-            .ok_or_else(|| {
-                AppError::DonationPageNotFound("donation page disappeared mid-upload".to_string())
-            })?;
+    .ok_or_else(|| {
+        AppError::DonationPageNotFound("donation page disappeared mid-upload".to_string())
+    })?;
 
     Ok(Json(DonationPageView::from_row(row, &state.config.domain)))
 }

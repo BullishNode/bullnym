@@ -43,7 +43,8 @@ rather than a custodial money transmission service.
 |---|---|---|
 | `npub` | 64-character hex x-only secp256k1 authentication public key. Despite the field name, this is not a bech32 `npub1...`. | Possession of its private key controls registration, surfaces, and wallet invoices. Use a dedicated deterministically recoverable key. |
 | `verification_npub` | Optional, separate 64-character hex key published through NIP-05. | Keeping it separate prevents the server authentication identity from becoming a public social identity. |
-| nym | A 1-32 character public namespace and Lightning Address local part. | A deactivated nym remains reserved to its original identity. It is not released for reuse. |
+| nym | A 1-32 character permanent public namespace and Lightning Address local part. | One per npub; offline status never releases or changes ownership. |
+| alias | Optional 1-32 character permanent web name in the same namespace as nyms. | One per npub, shared by Page/POS; never cleared, renamed, or released. |
 | CT descriptor | Liquid confidential descriptor from which the server derives fresh addresses. | The server can derive and unblind payments in that descriptor. Use a dedicated Bullnym wallet, not a general-purpose wallet. |
 | Payment Page | Public `/<nym>` or `/a/<alias>` checkout surface. | Can use a dedicated descriptor; legacy rows may fall back to the Lightning Address descriptor. |
 | POS | Public `/<nym>/pos` or `/a/<alias>` terminal. | Requires its own descriptor and never falls back to the Lightning Address descriptor. |

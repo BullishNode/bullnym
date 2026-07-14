@@ -19,8 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 static TEST_SERIAL: Mutex<()> = Mutex::const_new(());
-const RECOVERY_ADDRESS: &str =
-    "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+const RECOVERY_ADDRESS: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 
 fn require_test_db() -> String {
     std::env::var("TEST_DATABASE_URL")
@@ -38,7 +37,8 @@ async fn test_pool() -> PgPool {
 async fn cleanup(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE chain_swap_manifest_deliveries, chain_swap_records, \
-         recovery_address_commitments, invoices, users, swap_key_allocations CASCADE",
+         recovery_address_commitments, invoices, users, public_names, \
+         swap_key_allocations CASCADE",
     )
     .execute(pool)
     .await

@@ -599,10 +599,7 @@ pub async fn create_anonymous_pos(
     create_anonymous_for_kind(state, nym, db::KIND_POS, None, peer_opt, headers, req).await
 }
 
-/// POST /a/:slug/invoice — keyless checkout for an alias surface. Resolves the
-/// slug to its `(nym, kind)` row and runs the same anonymous flow as the
-/// nym-path routes, kind-scoped to the resolved surface — so one route serves
-/// both the alias Payment Page and the alias POS without exposing the nym.
+/// POST /a/:slug/invoice — keyless Payment Page checkout under an alias.
 pub async fn create_anonymous_alias(
     State(state): State<AppState>,
     Path(slug): Path<String>,
@@ -610,16 +607,36 @@ pub async fn create_anonymous_alias(
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
-    let page = db::get_donation_page_by_alias(&state.db, &slug)
+    create_anonymous_alias_for_kind(state, slug, db::KIND_PAYMENT_PAGE, peer_opt, headers, req)
+        .await
+}
+
+/// POST /a/:slug/pos/invoice — keyless POS checkout selected through the same
+/// permanent owner-level alias.
+pub async fn create_anonymous_alias_pos(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateAnonymousRequest>,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    create_anonymous_alias_for_kind(state, slug, db::KIND_POS, peer_opt, headers, req).await
+}
+
+async fn create_anonymous_alias_for_kind(
+    state: AppState,
+    slug: String,
+    kind: &'static str,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    req: CreateAnonymousRequest,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    let page = db::get_donation_page_by_alias(&state.db, &slug, kind)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(slug.clone()))?;
     if !page.enabled || page.is_archived {
         return Err(AppError::DonationPageNotFound(slug));
     }
-    // Recover the &'static kind for the shared implementation. The row's kind
-    // is always a canonical value, so this never fails in practice.
-    let kind = db::normalize_kind(&page.kind)
-        .ok_or_else(|| AppError::DonationPageNotFound(slug.clone()))?;
     create_anonymous_for_kind(state, page.nym, kind, Some(slug), peer_opt, headers, req).await
 }
 
@@ -684,7 +701,7 @@ async fn create_anonymous_for_kind(
     if !page.enabled || page.is_archived {
         return Err(AppError::DonationPageNotFound(nym.clone()));
     }
-    let owner = db::get_active_user_by_nym(&state.db, &nym)
+    let owner = db::get_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
@@ -742,7 +759,7 @@ async fn create_anonymous_for_kind(
                 {
                     return Err(AppError::DonationPageNotFound(nym.clone()));
                 }
-                let (address, index) = db::allocate_next_liquid_for_active_nym(
+                let (address, index) = db::allocate_next_liquid_for_permanent_nym(
                     &state.db,
                     &nym,
                     |ct_descriptor, idx| {
@@ -1210,10 +1227,6 @@ pub async fn render_payment_alias(
     State(state): State<AppState>,
     Path((slug, id_str)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let page = db::get_donation_page_by_alias(&state.db, &slug)
-        .await?
-        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
-
     let id = parse_invoice_id(&id_str)?;
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
@@ -1222,7 +1235,10 @@ pub async fn render_payment_alias(
     // The invoice must belong to the nym that owns this alias. Mismatch (or a
     // cross-alias lookup) returns the same wire copy as a missing id — never
     // reveal existence, and never leak the nym.
-    if inv.nym_owner.as_deref() != Some(page.nym.as_str()) {
+    let Some(nym_owner) = inv.nym_owner.as_deref() else {
+        return Err(AppError::InvoiceNotFound(id_str));
+    };
+    if !db::alias_owns_nym(&state.db, &slug, nym_owner).await? {
         return Err(AppError::InvoiceNotFound(id_str));
     }
 

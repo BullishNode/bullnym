@@ -22,9 +22,14 @@ pub async fn get_user_by_nym<'e, E: sqlx::PgExecutor<'e>>(
     nym: &str,
 ) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE nym = $1",
+        "SELECT users.id, users.nym, users.npub, users.verification_npub, \
+                users.ct_descriptor, users.next_addr_idx, users.is_active \
+         FROM users \
+         JOIN public_names \
+           ON public_names.name = users.nym \
+          AND public_names.owner_npub = users.npub \
+          AND public_names.kind = 'nym' \
+         WHERE users.nym = $1",
     )
     .bind(nym)
     .fetch_optional(executor)
@@ -33,9 +38,14 @@ pub async fn get_user_by_nym<'e, E: sqlx::PgExecutor<'e>>(
 
 pub async fn get_active_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE nym = $1 AND is_active = TRUE",
+        "SELECT users.id, users.nym, users.npub, users.verification_npub, \
+                users.ct_descriptor, users.next_addr_idx, users.is_active \
+         FROM users \
+         JOIN public_names \
+           ON public_names.name = users.nym \
+          AND public_names.owner_npub = users.npub \
+          AND public_names.kind = 'nym' \
+         WHERE users.nym = $1 AND users.is_active = TRUE",
     )
     .bind(nym)
     .fetch_optional(pool)
@@ -44,9 +54,35 @@ pub async fn get_active_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<U
 
 pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE npub = $1 AND is_active = TRUE",
+        "SELECT users.id, users.nym, users.npub, users.verification_npub, \
+                users.ct_descriptor, users.next_addr_idx, users.is_active \
+         FROM users \
+         JOIN public_names \
+           ON public_names.name = users.nym \
+          AND public_names.owner_npub = users.npub \
+          AND public_names.kind = 'nym' \
+          AND public_names.canonical \
+         WHERE users.npub = $1 AND users.is_active = TRUE",
+    )
+    .bind(npub)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Resolve permanent nym ownership without coupling it to Lightning Address
+/// availability. Page/POS management and routing remain available while the
+/// owner's LA row is offline.
+pub async fn get_user_by_npub_any(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "SELECT users.id, users.nym, users.npub, users.verification_npub, \
+                users.ct_descriptor, users.next_addr_idx, users.is_active \
+         FROM users \
+         JOIN public_names \
+           ON public_names.name = users.nym \
+          AND public_names.owner_npub = users.npub \
+          AND public_names.kind = 'nym' \
+          AND public_names.canonical \
+         WHERE users.npub = $1",
     )
     .bind(npub)
     .fetch_optional(pool)
@@ -58,10 +94,15 @@ pub async fn get_inactive_user_by_npub(
     npub: &str,
 ) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE npub = $1 AND is_active = FALSE \
-         ORDER BY created_at DESC LIMIT 1",
+        "SELECT users.id, users.nym, users.npub, users.verification_npub, \
+                users.ct_descriptor, users.next_addr_idx, users.is_active \
+         FROM users \
+         JOIN public_names \
+           ON public_names.name = users.nym \
+          AND public_names.owner_npub = users.npub \
+          AND public_names.kind = 'nym' \
+          AND public_names.canonical \
+         WHERE users.npub = $1 AND users.is_active = FALSE",
     )
     .bind(npub)
     .fetch_optional(pool)
@@ -84,14 +125,16 @@ pub async fn mark_user_used<'e, E: sqlx::PgExecutor<'e>>(
     Ok(())
 }
 
-/// Total nyms ever registered under this npub (active + inactive). Used
-/// to enforce `max_lifetime_nyms_per_npub` so one key can't squat the
-/// namespace via dereg/rereg cycles.
+/// Canonical permanent nym claims for this npub. Historical tombstones remain
+/// reserved, but do not consume the compatibility API's current-name count.
 pub async fn count_lifetime_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
-        .bind(npub)
-        .fetch_one(pool)
-        .await
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public_names \
+         WHERE owner_npub = $1 AND kind = 'nym' AND canonical",
+    )
+    .bind(npub)
+    .fetch_one(pool)
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,7 +143,10 @@ pub struct PreviousNym {
     pub created_at: String,
 }
 
-/// One round trip: `(active_nym, previous_nyms_most_recent_first, used_count)`.
+/// One round trip: `(online_nym, compatibility_offline_nyms, used_count)`.
+/// `previous_nyms` remains populated for an offline permanent nym so current
+/// clients can still discover and reactivate it; it no longer implies release
+/// or eligibility to choose another name.
 pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
@@ -111,13 +157,31 @@ pub async fn lookup_status_by_npub(
         Option<i64>,
     ) = sqlx::query_as(
         "SELECT \
-                (SELECT nym FROM users WHERE npub = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1) \
+                (SELECT public_names.name \
+                   FROM public_names \
+                   JOIN users \
+                     ON users.npub = public_names.owner_npub \
+                    AND users.nym = public_names.name \
+                  WHERE public_names.owner_npub = $1 \
+                    AND public_names.kind = 'nym' \
+                    AND public_names.canonical \
+                    AND users.is_active = TRUE) \
                     AS active_nym, \
-                (SELECT json_agg(json_build_object('nym', nym, 'created_at', created_at) \
-                                 ORDER BY created_at DESC) \
-                   FROM users WHERE npub = $1 AND is_active = FALSE) \
+                (SELECT json_agg(json_build_object( \
+                                     'nym', public_names.name, \
+                                     'created_at', public_names.claimed_at \
+                                 ) ORDER BY public_names.claimed_at DESC) \
+                   FROM public_names \
+                   LEFT JOIN users \
+                     ON users.npub = public_names.owner_npub \
+                    AND users.nym = public_names.name \
+                  WHERE public_names.owner_npub = $1 \
+                    AND public_names.kind = 'nym' \
+                    AND public_names.canonical \
+                    AND COALESCE(users.is_active, FALSE) = FALSE) \
                     AS previous_nyms, \
-                (SELECT COUNT(*) FROM users WHERE npub = $1) AS used",
+                (SELECT COUNT(*) FROM public_names \
+                  WHERE owner_npub = $1 AND kind = 'nym' AND canonical) AS used",
     )
     .bind(npub)
     .fetch_one(pool)
@@ -129,29 +193,26 @@ pub async fn lookup_status_by_npub(
     ))
 }
 
-/// Outcome of `register_user_atomic`. Mirrors the three branches of the
-/// register handler so the caller can map each to the right `AppError`.
+/// Outcome of one permanent-nym registration transaction.
 pub enum RegisterOutcome {
     /// New user row inserted.
     Created(User),
-    /// Existing inactive row reactivated (caller asked for the same nym they
-    /// previously held).
+    /// Existing offline Lightning Address brought online under the same nym.
     Reactivated(User),
-    /// This npub already has an active row under `nym`. Caller maps to
-    /// `AppError::KeyAlreadyRegistered`.
-    KeyAlreadyRegistered { nym: String },
-    /// Inserting would push past the lifetime cap. Caller maps to
-    /// `AppError::NymQuotaExceeded`. Carries `used` so the error envelope
-    /// can ship the same `quota` object the mobile sees on lookup.
-    QuotaExceeded { used: i64, cap: i64 },
+    /// Exact online retry. No descriptor, key, cursor, timestamp, or row was
+    /// mutated.
+    Idempotent(User),
+    /// This npub permanently owns a different nym.
+    NymAlreadyAssigned { nym: String },
+    /// The requested string is permanently reserved as either kind.
+    NameTaken,
     /// Activating this registration would exceed the configured global active
     /// user ceiling. The count and activation are serialized across npubs.
     ActiveUserCapacityReached { active: i64, cap: i64 },
 }
 
-/// Atomic register flow. Serializes concurrent registers from the same npub
-/// via `pg_advisory_xact_lock(hashtext(npub))` so the cap check, the
-/// active-row check, and the INSERT/UPDATE all observe a consistent view.
+/// Atomic register flow. Serializes concurrent requests from the same npub so
+/// ownership lookup, availability transition, and first claim share one view.
 ///
 /// Advisory-lock keyspace audit (Kumulynja PLAN-3): the rate-limit code in
 /// `record_and_count_rate_limit_atomic` and `record_and_count_distinct_nyms_atomic`
@@ -167,7 +228,7 @@ pub async fn register_user_atomic(
     nym: &str,
     ct_descriptor: &str,
     verification_npub: Option<&str>,
-    lifetime_cap: i64,
+    _legacy_cap: i64,
     max_active_users: i64,
 ) -> Result<RegisterOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -185,72 +246,84 @@ pub async fn register_user_atomic(
         .execute(&mut *tx)
         .await?;
 
-    // Re-check inside the lock — another tx may have inserted the active row
-    // while we were waiting.
-    let active = sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE npub = $1 AND is_active = TRUE",
-    )
-    .bind(npub)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(active) = active {
-        tx.rollback().await?;
-        return Ok(RegisterOutcome::KeyAlreadyRegistered { nym: active.nym });
-    }
-
-    let prior_inactive = sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, verification_npub, \
-                ct_descriptor, next_addr_idx, is_active \
-         FROM users WHERE npub = $1 AND is_active = FALSE \
-         ORDER BY created_at DESC LIMIT 1",
+    let permanent_nym: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM public_names \
+         WHERE owner_npub = $1 AND kind = 'nym' AND canonical",
     )
     .bind(npub)
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some(prior) = prior_inactive.as_ref().filter(|u| u.nym == nym) {
+    if let Some(permanent_nym) = permanent_nym {
+        if permanent_nym != nym {
+            tx.rollback().await?;
+            return Ok(RegisterOutcome::NymAlreadyAssigned { nym: permanent_nym });
+        }
+
+        let existing = sqlx::query_as::<_, User>(
+            "SELECT id, nym, npub, verification_npub, \
+                    ct_descriptor, next_addr_idx, is_active \
+             FROM users WHERE npub = $1 AND nym = $2",
+        )
+        .bind(npub)
+        .bind(nym)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(existing) = existing {
+            if existing.is_active {
+                tx.commit().await?;
+                return Ok(RegisterOutcome::Idempotent(existing));
+            }
+
+            if let Some(outcome) = active_user_capacity_outcome(&mut tx, max_active_users).await? {
+                tx.rollback().await?;
+                return Ok(outcome);
+            }
+
+            // Keep the row identity and cursor stable. An offline wallet may
+            // supply a restored descriptor, so only Lightning-specific state
+            // is refreshed as availability turns online.
+            let user = sqlx::query_as::<_, User>(
+                "UPDATE users \
+                    SET ct_descriptor = $3, verification_npub = $4, is_active = TRUE \
+                  WHERE npub = $1 AND nym = $2 AND is_active = FALSE \
+                  RETURNING id, nym, npub, verification_npub, \
+                            ct_descriptor, next_addr_idx, is_active",
+            )
+            .bind(npub)
+            .bind(nym)
+            .bind(ct_descriptor)
+            .bind(verification_npub)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
+                .bind(&user.nym)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(RegisterOutcome::Reactivated(user));
+        }
+
+        // The permanent ownership row intentionally survives exceptional
+        // operational-user purges. Recreate only the same owner's same nym.
         if let Some(outcome) = active_user_capacity_outcome(&mut tx, max_active_users).await? {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        // Reactivate same nym. Keep next_addr_idx monotonic: historical
-        // invoices/reservations may still hold addresses from this descriptor,
-        // and rewinding can collide with the global single-use address index.
-        let user = sqlx::query_as::<_, User>(
-            "UPDATE users SET ct_descriptor = $3, verification_npub = $4, is_active = TRUE \
-             WHERE npub = $1 AND nym = $2 AND is_active = FALSE \
-             RETURNING id, nym, npub, verification_npub, \
-                       ct_descriptor, next_addr_idx, is_active",
-        )
-        .bind(npub)
-        .bind(&prior.nym)
-        .bind(ct_descriptor)
-        .bind(verification_npub)
-        .fetch_one(&mut *tx)
-        .await?;
-        // Descriptor may have changed, so cached outpoint→addr_index mappings
-        // can point into the wrong keyspace. Drop them.
-        sqlx::query("DELETE FROM outpoint_addresses WHERE nym = $1")
-            .bind(&user.nym)
-            .execute(&mut *tx)
-            .await?;
+        let user = insert_user(&mut tx, npub, nym, ct_descriptor, verification_npub).await?;
         tx.commit().await?;
         return Ok(RegisterOutcome::Reactivated(user));
     }
 
-    // Cap check inside the lock.
-    let used: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE npub = $1")
-        .bind(npub)
-        .fetch_one(&mut *tx)
-        .await?;
-    if used >= lifetime_cap {
+    let name_is_reserved: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public_names WHERE name = $1)")
+            .bind(nym)
+            .fetch_one(&mut *tx)
+            .await?;
+    if name_is_reserved {
         tx.rollback().await?;
-        return Ok(RegisterOutcome::QuotaExceeded {
-            used,
-            cap: lifetime_cap,
-        });
+        return Ok(RegisterOutcome::NameTaken);
     }
 
     if let Some(outcome) = active_user_capacity_outcome(&mut tx, max_active_users).await? {
@@ -258,8 +331,48 @@ pub async fn register_user_atomic(
         return Ok(outcome);
     }
 
-    let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (nym, npub, ct_descriptor, verification_npub) VALUES ($1, $2, $3, $4) \
+    let claim = sqlx::query(
+        "INSERT INTO public_names (name, owner_npub, kind) \
+         VALUES ($1, $2, 'nym')",
+    )
+    .bind(nym)
+    .bind(npub)
+    .execute(&mut *tx)
+    .await;
+    if let Err(error) = claim {
+        let constraint = database_constraint(&error);
+        tx.rollback().await?;
+        if matches!(constraint, Some("public_names_shared_namespace_key")) {
+            return Ok(RegisterOutcome::NameTaken);
+        }
+        if matches!(constraint, Some("public_names_owner_kind_lifetime_key")) {
+            return Ok(RegisterOutcome::NymAlreadyAssigned { nym: String::new() });
+        }
+        return Err(error);
+    }
+
+    let user = insert_user(&mut tx, npub, nym, ct_descriptor, verification_npub).await?;
+    tx.commit().await?;
+    Ok(RegisterOutcome::Created(user))
+}
+
+fn database_constraint(error: &sqlx::Error) -> Option<&str> {
+    match error {
+        sqlx::Error::Database(database_error) => database_error.constraint(),
+        _ => None,
+    }
+}
+
+async fn insert_user(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    npub: &str,
+    nym: &str,
+    ct_descriptor: &str,
+    verification_npub: Option<&str>,
+) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "INSERT INTO users (nym, npub, ct_descriptor, verification_npub) \
+         VALUES ($1, $2, $3, $4) \
          RETURNING id, nym, npub, verification_npub, \
                    ct_descriptor, next_addr_idx, is_active",
     )
@@ -267,10 +380,8 @@ pub async fn register_user_atomic(
     .bind(npub)
     .bind(ct_descriptor)
     .bind(verification_npub)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(RegisterOutcome::Created(user))
+    .fetch_one(&mut **tx)
+    .await
 }
 
 async fn active_user_capacity_outcome(
@@ -298,18 +409,22 @@ pub async fn create_user(
     npub: &str,
     ct_descriptor: &str,
 ) -> Result<User, sqlx::Error> {
-    // No verification_npub: NIP-05 is opt-in and left NULL unless a client
-    // deliberately registers a dedicated verification key (see ISS-S-01).
-    sqlx::query_as::<_, User>(
-        "INSERT INTO users (nym, npub, ct_descriptor) VALUES ($1, $2, $3) \
-         RETURNING id, nym, npub, verification_npub, \
-                   ct_descriptor, next_addr_idx, is_active",
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(npub)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO public_names (name, owner_npub, kind) \
+         VALUES ($1, $2, 'nym')",
     )
     .bind(nym)
     .bind(npub)
-    .bind(ct_descriptor)
-    .fetch_one(pool)
-    .await
+    .execute(&mut *tx)
+    .await?;
+    let user = insert_user(&mut tx, npub, nym, ct_descriptor, None).await?;
+    tx.commit().await?;
+    Ok(user)
 }
 
 pub async fn update_user_descriptor(
@@ -340,6 +455,10 @@ pub async fn update_user_descriptor(
 
 pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(npub)
+        .execute(&mut *tx)
+        .await?;
     let user_opt = sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE \
          WHERE npub = $1 AND is_active = TRUE \
@@ -349,23 +468,6 @@ pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, 
     .bind(npub)
     .fetch_optional(&mut *tx)
     .await?;
-
-    // Auto-archive donation pages tied to this nym so the public URL stops
-    // accepting payments once the user deactivates. Without this the page keeps
-    // rendering fully live while every checkout fails at get_active_user_by_nym
-    // (a working-looking page whose Pay button always errors). Same shape as
-    // purge_user / DELETE /donation-page; re-saving the page (which sets
-    // archived_at = NULL) or purging restores/finalizes it, so reactivation via
-    // re-register + page re-save brings the page back cleanly.
-    if let Some(user) = &user_opt {
-        sqlx::query(
-            "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
-             WHERE nym = $1 AND archived_at IS NULL",
-        )
-        .bind(&user.nym)
-        .execute(&mut *tx)
-        .await?;
-    }
 
     tx.commit().await?;
     Ok(user_opt)
@@ -391,6 +493,10 @@ pub enum PurgeOutcome {
 /// `claim_key_hex` / `preimage_hex` needed to redeem a Boltz lockup.
 pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(npub)
+        .execute(&mut *tx)
+        .await?;
 
     let user_opt = sqlx::query_as::<_, User>(
         "SELECT id, nym, npub, verification_npub, \
@@ -448,19 +554,6 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
         .bind(&user.nym)
         .execute(&mut *tx)
         .await?;
-
-    // Auto-archive any donation page tied to this nym so the public URL
-    // stops accepting donations after the user purges. The page row stays
-    // (so old social-media links resolve cleanly to a "this donation
-    // page has been deleted" template) — same shape as user-initiated
-    // archive via DELETE /donation-page.
-    sqlx::query(
-        "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
-         WHERE nym = $1 AND archived_at IS NULL",
-    )
-    .bind(&user.nym)
-    .execute(&mut *tx)
-    .await?;
 
     // Purge deactivates the user rather than deleting it. Existing
     // invoices remain queryable by id and will expire through GC.

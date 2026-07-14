@@ -119,8 +119,9 @@ pub struct NewInvoice<'a> {
     /// Liquid mainnet CT address (NULL when both accept_ln=FALSE and
     /// accept_liquid=FALSE). Two supply paths feed this field:
     ///   - Wallet-origin (Get-paid): wallet supplies the address directly.
-    ///   - Checkout-origin (donation page): server eagerly allocates
-    ///     via `allocate_next_liquid_for_active_nym` BEFORE this insert.
+    ///   - Checkout-origin: server eagerly allocates from the surface
+    ///     descriptor, or from the permanent-nym compatibility allocator,
+    ///     BEFORE this insert.
     ///
     /// In both cases `liquid_address_index` on the invoice row stays
     /// NULL; the address is the chain watcher's lookup key, not the
@@ -198,10 +199,9 @@ pub async fn invoice_presentation_received_sat<'e, E: sqlx::PgExecutor<'e>>(
 /// `invoices_ln_or_liquid_addr_chk` constraint requires it at INSERT
 /// time. Two supply paths:
 ///   - Wallet-origin (Get-paid): the wallet supplies the address.
-///   - Checkout-origin (donation page): the caller invokes
-///     `allocate_next_liquid_for_active_nym` to bump the owner's
-///     descriptor index and derive the next address, then passes the
-///     result through `NewInvoice.liquid_address`.
+///   - Checkout-origin: the caller invokes a Page/POS descriptor allocator or
+///     `allocate_next_liquid_for_permanent_nym`, then passes the result through
+///     `NewInvoice.liquid_address`.
 ///
 /// Lightning offers attach via a separate `record_swap` call that sets
 /// `swap_records.invoice_id`; the claimer routes the LN claim to the
@@ -1933,8 +1933,8 @@ pub async fn terminalize_stale_checkout_partial_invoices(
 /// `accept_liquid = TRUE` and no wallet-supplied address — the
 /// `invoices_ln_or_liquid_addr_chk` constraint requires
 /// `liquid_address` to be set at INSERT time, so the allocator must
-/// run before insert. The donation-page checkout flow is the primary
-/// caller.
+/// run before insert. Use this variant only for a flow whose availability is
+/// deliberately coupled to the Lightning Address.
 ///
 /// Uses the `donation:{nym}` advisory lock so concurrent allocator calls for
 /// the same nym serialize on the `next_addr_idx` bump.
@@ -1948,6 +1948,33 @@ pub async fn allocate_next_liquid_for_active_nym<F>(
 where
     F: Fn(&str, u32) -> Result<String, sqlx::Error>,
 {
+    allocate_next_liquid_for_nym_availability(pool, nym, false, derive_address).await
+}
+
+/// Compatibility allocator for a Payment Page that predates page-specific
+/// descriptors. Permanent ownership, not Lightning Address availability,
+/// authorizes this cursor: taking the LA offline must not take Page checkout
+/// offline. New Page/POS rows should use their own donation_pages descriptor.
+pub async fn allocate_next_liquid_for_permanent_nym<F>(
+    pool: &PgPool,
+    nym: &str,
+    derive_address: F,
+) -> Result<Option<(String, i32)>, sqlx::Error>
+where
+    F: Fn(&str, u32) -> Result<String, sqlx::Error>,
+{
+    allocate_next_liquid_for_nym_availability(pool, nym, true, derive_address).await
+}
+
+async fn allocate_next_liquid_for_nym_availability<F>(
+    pool: &PgPool,
+    nym: &str,
+    allow_offline: bool,
+    derive_address: F,
+) -> Result<Option<(String, i32)>, sqlx::Error>
+where
+    F: Fn(&str, u32) -> Result<String, sqlx::Error>,
+{
     let mut tx = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
@@ -1956,9 +1983,12 @@ where
         .await?;
 
     let row: Option<(String, i32)> = sqlx::query_as(
-        "SELECT ct_descriptor, next_addr_idx FROM users WHERE nym = $1 AND is_active = TRUE",
+        "SELECT ct_descriptor, next_addr_idx \
+           FROM users \
+          WHERE nym = $1 AND (is_active = TRUE OR $2)",
     )
     .bind(nym)
+    .bind(allow_offline)
     .fetch_optional(&mut *tx)
     .await?;
 

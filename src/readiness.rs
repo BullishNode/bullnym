@@ -814,6 +814,275 @@ SELECT
     )
 "#;
 
+const PERMANENT_PUBLIC_NAME_INVARIANTS_SQL: &str = r#"
+SELECT COALESCE((
+    to_regclass('public.public_names') IS NOT NULL
+    AND COALESCE((
+        SELECT array_agg(
+                   format('%s:%s:%s', column_name, data_type, is_nullable)
+                   ORDER BY ordinal_position
+               ) = ARRAY[
+                   'id:uuid:NO',
+                   'name:text:NO',
+                   'owner_npub:text:NO',
+                   'kind:text:NO',
+                   'canonical:boolean:NO',
+                   'claimed_at:timestamp with time zone:NO',
+                   'grandfathered:boolean:NO'
+               ]::TEXT[]
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'public_names'
+    ), FALSE)
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('public_names_pkey', 'p'),
+              ('public_names_kind_check', 'c'),
+              ('public_names_claimed_at_check', 'c'),
+              ('public_names_new_name_shape_check', 'c'),
+              ('public_names_new_owner_shape_check', 'c'),
+              ('public_names_name_kind_key', 'u')
+          ) required(constraint_name, constraint_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                    to_regclass('public.public_names')
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype =
+                    required.constraint_type::"char"
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid = to_regclass('public.public_names')
+           AND index_relation.relname =
+               'public_names_one_canonical_kind_per_owner_idx'
+           AND index_info.indisunique
+           AND index_info.indisvalid
+           AND index_info.indisready
+           AND index_info.indnkeyatts = 2
+           AND index_info.indnatts = 2
+           AND ARRAY(
+               SELECT attribute.attname::TEXT
+                 FROM unnest(index_info.indkey) WITH ORDINALITY
+                      AS key_column(attnum, position)
+                 JOIN pg_attribute attribute
+                   ON attribute.attrelid = index_info.indrelid
+                  AND attribute.attnum = key_column.attnum
+                ORDER BY key_column.position
+           ) = ARRAY['owner_npub', 'kind']::TEXT[]
+           AND pg_get_expr(index_info.indpred, index_info.indrelid) = 'canonical'
+    )
+    -- Historical duplicate owners remain representable.  Only one active LA
+    -- row is permitted, and the active row must be the canonical tombstone-safe
+    -- identity selected during preflight.
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid = to_regclass('public.users')
+           AND index_relation.relname = 'users_npub_active_key'
+           AND index_info.indisunique
+           AND index_info.indisvalid
+           AND index_info.indisready
+           AND index_info.indnkeyatts = 1
+           AND index_info.indnatts = 1
+           AND ARRAY(
+               SELECT attribute.attname::TEXT
+                 FROM unnest(index_info.indkey) WITH ORDINALITY
+                      AS key_column(attnum, position)
+                 JOIN pg_attribute attribute
+                   ON attribute.attrelid = index_info.indrelid
+                  AND attribute.attnum = key_column.attnum
+                ORDER BY key_column.position
+           ) = ARRAY['npub']::TEXT[]
+           AND pg_get_expr(index_info.indpred, index_info.indrelid)
+               IN ('is_active', '(is_active = true)')
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM public_names
+         WHERE NOT canonical AND NOT grandfathered
+    )
+    AND NOT EXISTS (
+        SELECT owner_npub, kind
+          FROM public_names
+         GROUP BY owner_npub, kind
+        HAVING COUNT(*) FILTER (WHERE canonical) <> 1
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM public_names AS aliases
+         WHERE aliases.kind = 'alias'
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM public_names AS nyms
+                WHERE nyms.owner_npub = aliases.owner_npub
+                  AND nyms.kind = 'nym'
+                  AND nyms.canonical
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM users
+         WHERE users.is_active
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM public_names
+                WHERE public_names.name = users.nym
+                  AND public_names.owner_npub = users.npub
+                  AND public_names.kind = 'nym'
+                  AND public_names.canonical
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM users
+         WHERE NOT EXISTS (
+               SELECT 1
+                 FROM public_names
+                WHERE public_names.name = users.nym
+                  AND public_names.owner_npub = users.npub
+                  AND public_names.kind = 'nym'
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM donation_pages WHERE ct_descriptor IS NULL
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_attribute
+         WHERE attrelid = to_regclass('public.donation_pages')
+           AND attname = 'alias'
+           AND attnum > 0
+           AND NOT attisdropped
+    )
+    AND to_regclass('public.donation_pages_alias_uidx') IS NULL
+    AND to_regclass('public.public_name_migration_choices') IS NULL
+    AND to_regclass('public.public_name_migration_merchant_communications') IS NULL
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('public_names', 'public_names_validate_insert',
+                  'enforce_public_name_insert', 7),
+              ('public_names', 'public_names_reject_mutation',
+                  'reject_public_name_mutation', 27),
+              ('users', 'users_require_permanent_nym',
+                  'require_user_permanent_nym', 23)
+          ) required(table_name, trigger_name, function_name, trigger_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info
+                 ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
+              WHERE relation_namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
+                AND relation.relname = required.table_name
+                AND trigger_info.tgname = required.trigger_name
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled = 'O'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'public_names'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'name', 'INSERT'
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'owner_npub', 'INSERT'
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'kind', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'id', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'canonical', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'claimed_at', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'grandfathered', 'INSERT'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+              relation.relacl, acldefault('r', relation.relowner)
+          )) acl
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'public_names'
+           AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_public_name_insert'),
+              ('reject_public_name_mutation'),
+              ('require_user_permanent_nym')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND function_info.prorettype = 'trigger'::REGTYPE
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+         )
+    )
+), FALSE)
+"#;
+
 type DirectLifecyclePrivileges = (
     Option<bool>,
     Option<bool>,
@@ -939,6 +1208,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !merchant_settlement_privileges_present(pool).await?
         || !chain_swap_renegotiation_invariants_present(pool).await?
         || !chain_swap_cooperative_signing_invariants_present(pool).await?
+        || !permanent_public_name_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -1099,6 +1369,14 @@ async fn chain_swap_cooperative_signing_invariants_present(
     pool: &sqlx::PgPool,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(CHAIN_SWAP_COOPERATIVE_SIGNING_INVARIANTS_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn permanent_public_name_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(PERMANENT_PUBLIC_NAME_INVARIANTS_SQL)
         .fetch_one(pool)
         .await
 }
@@ -1597,12 +1875,6 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'swap_records' \
                   AND column_name = 'last_reconciled_at' \
-            ) \
-            AND EXISTS ( \
-                SELECT 1 FROM information_schema.columns \
-                WHERE table_schema = 'public' \
-                  AND table_name = 'donation_pages' \
-                  AND column_name = 'alias' \
             ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \

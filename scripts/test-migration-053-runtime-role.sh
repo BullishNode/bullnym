@@ -214,6 +214,75 @@ if scripts/check-migration-053-boundary.sh \
   exit 1
 fi
 
+# Advance the same empty disposable database through the later privileged-owner
+# migrations and prove the deploy wrapper's complete migration-059 boundary.
+# The non-empty candidate/resolution/drift rehearsal belongs to test-db's
+# upgrade lane; this lane verifies the empty bootstrap and runtime-role ACLs.
+for later_migration in \
+  migrations/054_fee_policy_authority.sql \
+  migrations/055_merchant_settlement_lifecycle.sql \
+  migrations/056_chain_swap_renegotiation_journal.sql \
+  migrations/057_chain_swap_cooperative_signing_operations.sql \
+  migrations/058_permanent_public_names.sql \
+  migrations/059_remove_surface_alias.sql; do
+  docker exec --interactive "$CONTAINER" \
+    psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --username "$PG_USER" --dbname success \
+      --command 'SET ROLE migration_owner' \
+      --set runtime_role=bullnym_app --file=- \
+    <"$later_migration" >/dev/null
+done
+
+migration_058_probe="$(
+  scripts/check-migration-058-boundary.sh \
+    "$ENV_FILE" bullnym_app success
+)"
+[[ "$migration_058_probe" == *"migration 058 boundary verified"* ]] || {
+  echo "migration-058 test: complete deploy boundary was not verified" >&2
+  exit 1
+}
+
+migration_059_probe="$(
+  scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success
+)"
+[[ "$migration_059_probe" == *"migration 059 boundary verified"* ]] || {
+  echo "migration-059 test: complete deploy boundary was not verified" >&2
+  exit 1
+}
+
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE public_names DISABLE TRIGGER public_names_reject_mutation;
+"
+if scripts/check-migration-058-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-058 test: probe accepted a disabled immutability guard" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE public_names ENABLE TRIGGER public_names_reject_mutation;
+"
+scripts/check-migration-058-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE donation_pages ADD COLUMN alias TEXT;
+"
+if scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-059 test: probe accepted restored mutable alias authority" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE donation_pages DROP COLUMN alias;
+"
+scripts/check-migration-059-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
 admin_sql success "
   SET ROLE migration_owner;
   DROP TRIGGER chain_swap_records_reject_recovery_commitment_update
@@ -228,4 +297,4 @@ if scripts/check-migration-053-boundary.sh \
   exit 1
 fi
 
-echo "migration-053 test: runtime-role refusals and read-only probe passed"
+echo "migration-053/059 test: runtime-role refusals and read-only probes passed"

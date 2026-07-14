@@ -32,7 +32,7 @@ use crate::AppState;
 /// scrubbed from HTML, config, image URLs, and manifest.
 enum PublicBase<'a> {
     Nym { nym: &'a str, base_path: &'a str },
-    Alias { slug: &'a str },
+    Alias { slug: &'a str, base_path: &'a str },
 }
 
 #[derive(Template)]
@@ -610,6 +610,27 @@ pub async fn manifest_alias(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    manifest_alias_for_kind(state, slug, db::KIND_PAYMENT_PAGE, peer_opt, headers).await
+}
+
+/// `GET /a/:slug/pos/manifest.webmanifest` — manifest for the POS surface
+/// selected through the same owner-level alias.
+pub async fn manifest_alias_pos(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    manifest_alias_for_kind(state, slug, db::KIND_POS, peer_opt, headers).await
+}
+
+async fn manifest_alias_for_kind(
+    state: AppState,
+    slug: String,
+    kind: &'static str,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     if !is_valid_slug(&slug) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -620,7 +641,7 @@ pub async fn manifest_alias(
         return resp;
     }
 
-    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
+    let page = match db::get_donation_page_by_alias(&state.db, &slug, kind).await {
         Ok(Some(p)) if p.enabled && !p.is_archived => p,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -629,7 +650,11 @@ pub async fn manifest_alias(
         }
     };
 
-    let start_path = format!("/a/{slug}");
+    let start_path = if kind == db::KIND_POS {
+        format!("/a/{slug}/pos")
+    } else {
+        format!("/a/{slug}")
+    };
     let manifest = web_manifest_for_page(&page, &start_path, &slug);
 
     let body = match serde_json::to_string(&manifest) {
@@ -682,8 +707,8 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
                 .as_ref()
                 .map(|hash| format!("https://{domain}/img/{nym}/og.jpg?v={hash}")),
         ),
-        PublicBase::Alias { slug } => (
-            format!("/a/{slug}"),
+        PublicBase::Alias { slug, base_path } => (
+            base_path.to_string(),
             slug.to_string(),
             None,
             page.avatar_sha256
@@ -912,6 +937,26 @@ pub async fn render_alias(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    render_alias_for_kind(state, slug, db::KIND_PAYMENT_PAGE, peer_opt, headers).await
+}
+
+/// `GET /a/:slug/pos` — POS selected by the same owner-level permanent alias.
+pub async fn render_alias_pos(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    render_alias_for_kind(state, slug, db::KIND_POS, peer_opt, headers).await
+}
+
+async fn render_alias_for_kind(
+    state: AppState,
+    slug: String,
+    kind: &'static str,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     if !is_valid_slug(&slug) {
         return render_404(&state, &slug);
     }
@@ -922,7 +967,7 @@ pub async fn render_alias(
         return resp;
     }
 
-    let page = match db::get_donation_page_by_alias(&state.db, &slug).await {
+    let page = match db::get_donation_page_by_alias(&state.db, &slug, kind).await {
         Ok(Some(p)) => p,
         Ok(None) => return render_404(&state, &slug),
         Err(e) => {
@@ -931,14 +976,27 @@ pub async fn render_alias(
         }
     };
 
+    let base_path = if kind == db::KIND_POS {
+        format!("/a/{slug}/pos")
+    } else {
+        format!("/a/{slug}")
+    };
     if page.is_archived {
-        return render_archived(&state, &slug, &format!("/a/{slug}"));
+        return render_archived(&state, &slug, &base_path);
     }
     if !page.enabled {
         return render_404(&state, &slug);
     }
 
-    render_live(&state, &page, PublicBase::Alias { slug: &slug }).await
+    render_live(
+        &state,
+        &page,
+        PublicBase::Alias {
+            slug: &slug,
+            base_path: &base_path,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

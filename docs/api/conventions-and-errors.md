@@ -49,7 +49,7 @@ response, including HTTP 2xx responses.
 | `201` | Successful nym registration. |
 | `400` | Framework query/path or malformed-JSON rejection; generally not a Bullnym error envelope. |
 | `401` | `AuthError`: malformed key/signature, bad signature, or timestamp outside the allowed window. |
-| `409` | A supplied Bitcoin/Liquid address is already assigned, or an alias is taken. Generate another value; blind retry is wrong. |
+| `409` | A supplied Bitcoin/Liquid address is already assigned, a public name is permanently reserved, or this npub already owns another permanent nym/alias. Blind retry is wrong. |
 | `410` | Deprecated Liquid-offer endpoint. |
 | `413` | Axum request-body limit exceeded before the handler. |
 | `404`, `405` | Route not found or method not allowed; may be HTML/plain text rather than JSON. |
@@ -65,7 +65,8 @@ status/content type, then parse a Bullnym envelope when the body is JSON.
 Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 `NymReserved`, `KeyAlreadyRegistered`, `NymQuotaExceeded`,
 `InvalidDescriptor`, `AuthError`, `DonationPageInvalid`,
-`DonationPageNotFound`, `AliasTaken`, `InvoiceNotFound`, `InvalidAmount`,
+`DonationPageNotFound`, `NameTaken`, `NymAlreadyAssigned`,
+`AliasAlreadyAssigned`, `InvoiceNotFound`, `InvalidAmount`,
 `BitcoinAddressAlreadyUsed`, `LiquidAddressAlreadyUsed`,
 `ProofOfFundsRequired`, `ProofOfFundsInvalid`, `UtxoNotFound`, `UtxoSpent`,
 `PubkeyUtxoMismatch`, `RateLimitedSender`, `RateLimitedRecipient`,

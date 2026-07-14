@@ -234,6 +234,16 @@ migration_057_boundary_ready() {
     "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
+migration_058_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-058-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
+migration_059_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-059-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
 automatic_binary_rollback_allowed() {
   local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
@@ -250,6 +260,14 @@ automatic_binary_rollback_allowed() {
       && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
            || ((10#$previous_version < 53)); }; then
     echo "automatic rollback refused: migration 053 is a stopped-writer, roll-forward-only recovery-commitment boundary" >&2
+    return 1
+  fi
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 59)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 59)); }; then
+    echo "automatic rollback refused: migration 059 removes mutable per-surface alias authority" >&2
     return 1
   fi
 
@@ -420,6 +438,33 @@ deployment refused before build: migration 057 is absent or its exact runtime bo
 Stop payservice and every database writer, apply migration 057 with
 --set runtime_role=bullnym_app as the distinct privileged schema owner, then
 rerun this script. Never fabricate cooperative signing operation evidence.
+EOF
+    exit 1
+  fi
+fi
+if [[ -f "$REPO/migrations/058_permanent_public_names.sql" ]]; then
+  if ! migration_058_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 058 is absent or its exact immutable public-name boundary could not be verified.
+Stop every database writer and apply migration 058 with
+--set runtime_role=bullnym_app as the distinct privileged schema owner. Review
+public_name_migration_choices, explicitly resolve every fully-offline multi-nym
+or multi-alias owner, and capture the A10 merchant-communication view. Keep
+writers stopped until migration 059 completes; never alter candidate arrays to
+force the boundary.
+EOF
+    exit 1
+  fi
+fi
+if [[ -f "$REPO/migrations/059_remove_surface_alias.sql" ]]; then
+  if ! migration_059_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 059 is absent or mutable per-surface alias authority remains.
+Keep payservice and every database writer stopped, take the documented backup,
+then apply migration 059 with --set runtime_role=bullnym_app as the privileged
+schema owner. It revalidates both candidate sets, snapshots fallback Page
+descriptors/cursors, preserves canonical names and tombstones, and only then
+removes the old alias column. Never bypass an unresolved or drift refusal.
 EOF
     exit 1
   fi

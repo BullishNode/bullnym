@@ -54,6 +54,27 @@ describe('parseConfig', () => {
     expect(config.page_key).toBe('alices-shop')
   })
 
+  it('keeps an explicit alias POS base nym-free and surface-specific', () => {
+    vi.stubGlobal('document', {
+      getElementById: () => ({
+        textContent: JSON.stringify({
+          invoice_base: '/a/alices-shop/pos',
+          page_key: 'alices-shop',
+          mode: 'pos',
+          currency: 'CRC',
+          header: "Alice's Register",
+        }),
+      }),
+    })
+
+    const config = parseConfig()
+
+    expect(config.nym).toBe('')
+    expect(config.invoice_base).toBe('/a/alices-shop/pos')
+    expect(config.page_key).toBe('alices-shop')
+    expect(config.mode).toBe('pos')
+  })
+
   it('prefers explicit invoice_base/page_key over the derived values', () => {
     vi.stubGlobal('document', {
       getElementById: () => ({

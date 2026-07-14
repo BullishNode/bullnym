@@ -9,8 +9,8 @@ export interface BullnymConfig {
   /// `page_key` for storage keys and `invoice_base` for URL construction.
   nym: string
   /// Public base path the client appends `/invoice` and `/i/<id>` to:
-  /// `/<nym>`, `/<nym>/pos`, or `/a/<slug>`. The client no longer composes
-  /// this from the nym, so alias pages stay nym-free.
+  /// `/<nym>`, `/<nym>/pos`, `/a/<slug>`, or `/a/<slug>/pos`. The client no
+  /// longer composes this from the nym, so alias pages stay nym-free.
   invoice_base: string
   /// Stable namespace key for client-side storage (settings, history, PIN).
   /// Equals the nym on nym pages (no key migration for installed PWAs) and

@@ -163,7 +163,8 @@ export function createInvoice(
   req: CreateInvoiceRequest,
 ): Promise<CreateInvoiceResponse> {
   // `invoiceBase` already encodes the surface: `/<nym>` (Payment Page),
-  // `/<nym>/pos` (POS), or `/a/<slug>` (alias). The server resolves the
+  // `/<nym>/pos` (POS), `/a/<slug>` (alias Page), or `/a/<slug>/pos` (alias
+  // POS). The server resolves the
   // settlement descriptor from it, so POS receipts settle to the POS
   // descriptor (idx 103) and never fall back to the Lightning Address wallet
   // (KR-1 / issue #7). Alias pages stay nym-free because the base carries the

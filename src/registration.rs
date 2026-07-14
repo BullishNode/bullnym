@@ -58,6 +58,8 @@ static NYM_REGEX: LazyLock<Regex> =
 static NOSTR_PUBKEY_HEX_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").unwrap());
 
+const PERMANENT_NYM_CAP: i64 = 1;
+
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub nym: String,
@@ -69,11 +71,9 @@ pub struct RegisterRequest {
     pub timestamp: u64,
 }
 
-/// Wire-shape view of a per-npub lifetime nym quota. Lives on every
-/// register/lookup/delete response and inside `NymQuotaExceeded.details`
-/// so the mobile decodes it from one shape regardless of which endpoint
-/// produced it. `remaining` is `(cap - used).max(0)` — included so clients
-/// don't have to recompute.
+/// Compatibility view retained on register/lookup/delete responses. Permanent
+/// names make the authoritative cap exactly one; current clients can continue
+/// decoding the existing fields without interpreting an offline nym as free.
 #[derive(Serialize, Clone, Copy)]
 pub struct QuotaView {
     pub used: i64,
@@ -204,46 +204,46 @@ pub async fn register(
         &req.signature,
     )?;
 
-    // Atomic register flow under an advisory lock keyed on `npub`.
-    // Past nyms stay reserved forever (the inactive row keeps its name);
-    // re-registering the original nym reactivates the same row so swap
-    // history follows the FK; a different nym becomes a fresh row.
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    // The first claim permanently binds this npub and nym. Exact online retries
+    // are stable no-ops; the same offline nym turns only Lightning Address back
+    // online; a different nym can never be claimed by this owner. The active
+    // ceiling is checked under the same transaction and global lock as the
+    // activation, so distinct first claims cannot race past it.
     let active_cap = if is_whitelisted {
         0
     } else {
         i64::from(state.config.rate_limit.max_active_users)
     };
-    match db::register_user_atomic(
+    let user = match db::register_user_atomic(
         &state.db,
         &req.npub,
         &req.nym,
         &req.ct_descriptor,
         verification_npub,
-        cap,
+        PERMANENT_NYM_CAP,
         active_cap,
     )
     .await?
     {
-        db::RegisterOutcome::Created(_) | db::RegisterOutcome::Reactivated(_) => {}
-        db::RegisterOutcome::KeyAlreadyRegistered { nym } => {
-            return Err(AppError::KeyAlreadyRegistered {
+        db::RegisterOutcome::Created(user)
+        | db::RegisterOutcome::Reactivated(user)
+        | db::RegisterOutcome::Idempotent(user) => user,
+        db::RegisterOutcome::NymAlreadyAssigned { nym } => {
+            return Err(AppError::NymAlreadyAssigned {
                 nym,
                 domain: state.config.domain.clone(),
             });
         }
-        db::RegisterOutcome::QuotaExceeded { used, cap } => {
-            return Err(AppError::NymQuotaExceeded { used, cap });
-        }
+        db::RegisterOutcome::NameTaken => return Err(AppError::NameTaken),
         db::RegisterOutcome::ActiveUserCapacityReached { active, cap } => {
             return Err(AppError::ServiceUnavailable(format!(
                 "active user ceiling reached ({active} >= {cap})"
             )));
         }
-    }
+    };
 
-    let lightning_address = format!("{}@{}", req.nym, state.config.domain);
-    let nip05 = if verification_npub.is_some() && state.config.features.nip05 {
+    let lightning_address = format!("{}@{}", user.nym, state.config.domain);
+    let nip05 = if user.verification_npub.is_some() && state.config.features.nip05 {
         Some(lightning_address.clone())
     } else {
         None
@@ -253,10 +253,10 @@ pub async fn register(
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
-            nym: req.nym,
+            nym: user.nym,
             lightning_address,
             nip05,
-            quota: QuotaView::new(used, cap),
+            quota: QuotaView::new(used, PERMANENT_NYM_CAP),
         }),
     ))
 }
@@ -379,10 +379,9 @@ pub async fn delete_registration(
         tracing::info!("deactivated registration for {}", user.nym);
     }
 
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
     Ok(Json(DeleteResponse {
-        quota: QuotaView::new(used, cap),
+        quota: QuotaView::new(used, PERMANENT_NYM_CAP),
     }))
 }
 
@@ -443,8 +442,7 @@ pub async fn lookup_by_npub(
 
     let (active_nym, previous_nyms, used) =
         db::lookup_status_by_npub(&state.db, &params.npub).await?;
-    let cap = state.config.limits.max_lifetime_nyms_per_npub;
-    let quota = QuotaView::new(used, cap);
+    let quota = QuotaView::new(used, PERMANENT_NYM_CAP);
     if let Some(nym) = active_nym {
         return Ok(Json(LookupResponse {
             nym,
@@ -452,7 +450,7 @@ pub async fn lookup_by_npub(
             quota,
             previous_nyms,
             lifetime_nyms_used: used,
-            lifetime_nyms_cap: cap,
+            lifetime_nyms_cap: PERMANENT_NYM_CAP,
         }));
     }
     if let Some(head) = previous_nyms.first() {
@@ -463,7 +461,7 @@ pub async fn lookup_by_npub(
             quota,
             previous_nyms,
             lifetime_nyms_used: used,
-            lifetime_nyms_cap: cap,
+            lifetime_nyms_cap: PERMANENT_NYM_CAP,
         }));
     }
     Err(AppError::NymNotFound(

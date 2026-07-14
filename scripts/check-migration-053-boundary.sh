@@ -15,6 +15,8 @@ expected_database="${3:-bullnym}"
 require_migration_055="${REQUIRE_MIGRATION_055:-0}"
 require_migration_056="${REQUIRE_MIGRATION_056:-0}"
 require_migration_057="${REQUIRE_MIGRATION_057:-0}"
+require_migration_058="${REQUIRE_MIGRATION_058:-0}"
+require_migration_059="${REQUIRE_MIGRATION_059:-0}"
 
 [[ "$require_migration_055" == "0" || "$require_migration_055" == "1" ]] || {
   echo "migration boundary: REQUIRE_MIGRATION_055 must be 0 or 1" >&2
@@ -28,12 +30,28 @@ require_migration_057="${REQUIRE_MIGRATION_057:-0}"
   echo "migration boundary: REQUIRE_MIGRATION_057 must be 0 or 1" >&2
   exit 2
 }
+[[ "$require_migration_058" == "0" || "$require_migration_058" == "1" ]] || {
+  echo "migration boundary: REQUIRE_MIGRATION_058 must be 0 or 1" >&2
+  exit 2
+}
+[[ "$require_migration_059" == "0" || "$require_migration_059" == "1" ]] || {
+  echo "migration boundary: REQUIRE_MIGRATION_059 must be 0 or 1" >&2
+  exit 2
+}
 if [[ "$require_migration_056" == "1" && "$require_migration_055" != "1" ]]; then
   echo "migration boundary: REQUIRE_MIGRATION_056 requires REQUIRE_MIGRATION_055=1" >&2
   exit 2
 fi
 if [[ "$require_migration_057" == "1" && "$require_migration_056" != "1" ]]; then
   echo "migration boundary: REQUIRE_MIGRATION_057 requires REQUIRE_MIGRATION_056=1" >&2
+  exit 2
+fi
+if [[ "$require_migration_058" == "1" && "$require_migration_057" != "1" ]]; then
+  echo "migration boundary: REQUIRE_MIGRATION_058 requires REQUIRE_MIGRATION_057=1" >&2
+  exit 2
+fi
+if [[ "$require_migration_059" == "1" && "$require_migration_058" != "1" ]]; then
+  echo "migration boundary: REQUIRE_MIGRATION_059 requires REQUIRE_MIGRATION_058=1" >&2
   exit 2
 fi
 
@@ -1532,6 +1550,297 @@ SQL
   }
 fi
 
+if [[ "$require_migration_058" == "1" ]]; then
+  migration_058_ready="$(
+    clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+      --quiet --tuples-only --no-align <<'SQL'
+SELECT (
+    COALESCE((
+        SELECT array_agg(
+                   format('%s:%s:%s', column_name, data_type, is_nullable)
+                   ORDER BY ordinal_position
+               ) = ARRAY[
+                   'id:uuid:NO',
+                   'name:text:NO',
+                   'owner_npub:text:NO',
+                   'kind:text:NO',
+                   'canonical:boolean:NO',
+                   'claimed_at:timestamp with time zone:NO',
+                   'grandfathered:boolean:NO'
+               ]::TEXT[]
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'public_names'
+    ), FALSE)
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('public_names_pkey', 'p'),
+              ('public_names_kind_check', 'c'),
+              ('public_names_claimed_at_check', 'c'),
+              ('public_names_new_name_shape_check', 'c'),
+              ('public_names_new_owner_shape_check', 'c'),
+              ('public_names_name_kind_key', 'u')
+          ) required(constraint_name, constraint_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                        'public.public_names'::REGCLASS
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype =
+                        required.constraint_type::"char"
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation
+            ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid = 'public.public_names'::REGCLASS
+           AND index_relation.relname =
+               'public_names_one_canonical_kind_per_owner_idx'
+           AND index_info.indisunique
+           AND index_info.indisvalid
+           AND index_info.indisready
+           AND index_info.indnkeyatts = 2
+           AND index_info.indnatts = 2
+           AND ARRAY(
+               SELECT attribute.attname::TEXT
+                 FROM unnest(index_info.indkey) WITH ORDINALITY
+                      AS key_column(attnum, position)
+                 JOIN pg_attribute attribute
+                   ON attribute.attrelid = index_info.indrelid
+                  AND attribute.attnum = key_column.attnum
+                ORDER BY key_column.position
+           ) = ARRAY['owner_npub', 'kind']::TEXT[]
+           AND pg_get_expr(index_info.indpred, index_info.indrelid) = 'canonical'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation
+            ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid = 'public.users'::REGCLASS
+           AND index_relation.relname = 'users_npub_active_key'
+           AND index_info.indisunique
+           AND index_info.indisvalid
+           AND index_info.indisready
+           AND index_info.indnkeyatts = 1
+           AND index_info.indnatts = 1
+           AND ARRAY(
+               SELECT attribute.attname::TEXT
+                 FROM unnest(index_info.indkey) WITH ORDINALITY
+                      AS key_column(attnum, position)
+                 JOIN pg_attribute attribute
+                   ON attribute.attrelid = index_info.indrelid
+                  AND attribute.attnum = key_column.attnum
+                ORDER BY key_column.position
+           ) = ARRAY['npub']::TEXT[]
+           AND pg_get_expr(index_info.indpred, index_info.indrelid)
+               IN ('is_active', '(is_active = true)')
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM public_names
+         WHERE NOT canonical AND NOT grandfathered
+    )
+    AND NOT EXISTS (
+        SELECT owner_npub, kind
+          FROM public_names
+         GROUP BY owner_npub, kind
+        HAVING COUNT(*) FILTER (WHERE canonical) <> 1
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM public_names AS aliases
+         WHERE aliases.kind = 'alias'
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM public_names AS nyms
+                WHERE nyms.owner_npub = aliases.owner_npub
+                  AND nyms.kind = 'nym'
+                  AND nyms.canonical
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('public_names', 'public_names_validate_insert',
+                  'enforce_public_name_insert', 7),
+              ('public_names', 'public_names_reject_mutation',
+                  'reject_public_name_mutation', 27),
+              ('users', 'users_require_permanent_nym',
+                  'require_user_permanent_nym', 23)
+          ) required(table_name, trigger_name, function_name, trigger_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info
+                 ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
+              WHERE relation_namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
+                AND relation.relname = required.table_name
+                AND trigger_info.tgname = required.trigger_name
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled = 'O'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'public_names'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'name', 'INSERT'
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'owner_npub', 'INSERT'
+    )
+    AND has_column_privilege(
+        current_user, 'public.public_names', 'kind', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'id', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'canonical', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'claimed_at', 'INSERT'
+    )
+    AND NOT has_column_privilege(
+        current_user, 'public.public_names', 'grandfathered', 'INSERT'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+              relation.relacl,
+              acldefault('r', relation.relowner)
+          )) acl
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'public_names'
+           AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_attribute attribute,
+               LATERAL aclexplode(COALESCE(
+                   attribute.attacl,
+                   acldefault('c', (
+                       SELECT relowner FROM pg_class
+                        WHERE oid = attribute.attrelid
+                   ))
+               )) acl
+         WHERE attribute.attrelid = 'public.public_names'::REGCLASS
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
+           AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_public_name_insert'),
+              ('reject_public_name_mutation'),
+              ('require_user_permanent_nym')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND function_info.prokind = 'f'
+                AND function_info.prorettype = 'trigger'::REGTYPE
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user,
+                    pg_get_userbyid(function_info.proowner),
+                    'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM aclexplode(COALESCE(
+                          function_info.proacl,
+                          acldefault('f', function_info.proowner)
+                      )) acl
+                     WHERE acl.grantee = 0
+                       AND acl.privilege_type = 'EXECUTE'
+                )
+         )
+    )
+    AND to_regclass('public.public_name_migration_choices') IS NULL
+    AND to_regclass('public.public_name_migration_merchant_communications') IS NULL
+)::INT;
+SQL
+  )"
+  [[ "$migration_058_ready" == "1" ]] || {
+    echo "migration-058 boundary: immutable registry, owner, or ACL invariant failed" >&2
+    exit 1
+  }
+fi
+
+if [[ "$require_migration_059" == "1" ]]; then
+  migration_059_ready="$(
+    clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+      --quiet --tuples-only --no-align <<'SQL'
+SELECT (
+    NOT EXISTS (
+        SELECT 1
+          FROM pg_attribute
+         WHERE attrelid = to_regclass('public.donation_pages')
+           AND attname = 'alias'
+           AND attnum > 0
+           AND NOT attisdropped
+    )
+    AND to_regclass('public.donation_pages_alias_uidx') IS NULL
+)::INT;
+SQL
+  )"
+  [[ "$migration_059_ready" == "1" ]] || {
+    echo "migration-059 boundary: mutable per-surface alias authority remains" >&2
+    exit 1
+  }
+fi
+
 echo "migration 053 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 if [[ "$require_migration_055" == "1" ]]; then
   echo "migration 055 boundary verified for runtime role $actual_runtime_role on database $actual_database"
@@ -1541,4 +1850,10 @@ if [[ "$require_migration_056" == "1" ]]; then
 fi
 if [[ "$require_migration_057" == "1" ]]; then
   echo "migration 057 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+fi
+if [[ "$require_migration_058" == "1" ]]; then
+  echo "migration 058 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+fi
+if [[ "$require_migration_059" == "1" ]]; then
+  echo "migration 059 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 fi
