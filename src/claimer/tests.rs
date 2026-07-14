@@ -871,6 +871,17 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
 }
 
 #[test]
+fn malformed_renegotiation_quote_amounts_remain_ambiguous() {
+    assert!(validate_chain_swap_quote_amount(0).is_err());
+    assert!(validate_chain_swap_quote_amount((i64::MAX as u64) + 1).is_err());
+    assert_eq!(validate_chain_swap_quote_amount(1).unwrap(), 1);
+    assert_eq!(
+        validate_chain_swap_quote_amount(i64::MAX as u64).unwrap(),
+        i64::MAX
+    );
+}
+
+#[test]
 fn electrum_host_port_strips_scheme_for_boltz_client() {
     // boltz-client re-adds ssl://; we must hand it a bare host:port.
     assert_eq!(
