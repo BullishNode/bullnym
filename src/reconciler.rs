@@ -492,7 +492,11 @@ const fn compose_merchant_settlement_rebroadcast(
         return None;
     }
     let expected = service_requested || matches!(action, AppliedMerchantSettlementAction::Demoted);
-    (repository_required == expected).then_some(expected)
+    if repository_required == expected {
+        Some(expected)
+    } else {
+        None
+    }
 }
 
 /// Execute one exact-output settlement observation from a single validated
