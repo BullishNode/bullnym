@@ -562,9 +562,11 @@ pub(crate) async fn execute_journaled_recovery_automatically(
         chain_swap_id,
         &builder,
         RecoveryConstructionFee::runtime(&state.fee_runtime),
-        evidence,
-        &broadcaster,
-        &NoRecoveryFaults,
+        RecoveryExecutionServices {
+            evidence,
+            broadcaster: &broadcaster,
+            faults: &NoRecoveryFaults,
+        },
         RecoveryExecutionMode::Automatic(state),
     )
     .await
@@ -614,9 +616,11 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
         chain_swap_id,
         builder,
         construction_fee,
-        evidence,
-        broadcaster,
-        faults,
+        RecoveryExecutionServices {
+            evidence,
+            broadcaster,
+            faults,
+        },
         RecoveryExecutionMode::InjectedHarness,
     )
     .await
@@ -656,6 +660,12 @@ impl<'a> RecoveryConstructionFee<'a> {
 enum RecoveryExecutionMode<'a> {
     InjectedHarness,
     Automatic(&'a AppState),
+}
+
+struct RecoveryExecutionServices<'a> {
+    evidence: &'a dyn BitcoinRecoveryEvidence,
+    broadcaster: &'a dyn BitcoinRecoveryBroadcaster,
+    faults: &'a dyn RecoveryFaultInjector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,11 +748,14 @@ async fn execute_journaled_recovery_with_builder_fee(
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
     construction_fee: RecoveryConstructionFee<'_>,
-    evidence: &dyn BitcoinRecoveryEvidence,
-    broadcaster: &dyn BitcoinRecoveryBroadcaster,
-    faults: &dyn RecoveryFaultInjector,
+    services: RecoveryExecutionServices<'_>,
     mode: RecoveryExecutionMode<'_>,
 ) -> Result<String, AppError> {
+    let RecoveryExecutionServices {
+        evidence,
+        broadcaster,
+        faults,
+    } = services;
     prepare_or_reload_attempt(
         pool,
         chain_swap_id,
