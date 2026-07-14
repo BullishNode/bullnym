@@ -266,7 +266,13 @@ BEGIN
 
     FOREACH function_name IN ARRAY ARRAY[
         'guard_chain_swap_tx_attempt_immutable',
-        'require_review25_bitcoin_attempt_fee_authority'
+        'require_review25_bitcoin_attempt_fee_authority',
+        'enforce_liquid_claim_replacement_lineage',
+        'guard_invoice_payment_event_evidence',
+        'reject_merchant_settlement_event_delete',
+        'enforce_merchant_settlement_checkpoint_write',
+        'enforce_merchant_settlement_retained_update',
+        'reject_merchant_settlement_delete'
     ] LOOP
         SELECT proowner INTO STRICT function_owner_oid
           FROM pg_proc procedure_info
