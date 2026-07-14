@@ -732,6 +732,34 @@ SELECT
     )
     AND EXISTS (
         SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_cooperative_signing_insert'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%FROM public.chain_swap_records%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.clock_timestamp()%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_cooperative_signing_update'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%FROM public.chain_swap_tx_attempts attempt%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.jsonb_array_length(attempt.source_prevouts)%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.clock_timestamp()%'
+    )
+    AND EXISTS (
+        SELECT 1
           FROM pg_class relation
           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
          WHERE namespace.nspname = 'public'

@@ -62,7 +62,7 @@ BEGIN
 END
 $$;
 
-CREATE TABLE chain_swap_cooperative_signing_operations (
+CREATE TABLE public.chain_swap_cooperative_signing_operations (
     chain_swap_id                         UUID PRIMARY KEY,
     state                                 TEXT NOT NULL DEFAULT 'prepared',
     boltz_swap_id                         TEXT NOT NULL,
@@ -134,7 +134,7 @@ CREATE TABLE chain_swap_cooperative_signing_operations (
     updated_at                            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chain_swap_cooperative_signing_chain_fkey
-        FOREIGN KEY (chain_swap_id) REFERENCES chain_swap_records(id)
+        FOREIGN KEY (chain_swap_id) REFERENCES public.chain_swap_records(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT chain_swap_cooperative_signing_state_check CHECK (
         state IN (
@@ -412,20 +412,20 @@ CREATE TABLE chain_swap_cooperative_signing_operations (
 );
 
 CREATE INDEX chain_swap_cooperative_signing_active_idx
-    ON chain_swap_cooperative_signing_operations(updated_at, chain_swap_id)
+    ON public.chain_swap_cooperative_signing_operations(updated_at, chain_swap_id)
     WHERE state NOT IN ('completed', 'integrity_hold', 'superseded');
 
-CREATE FUNCTION enforce_chain_swap_cooperative_signing_insert()
+CREATE FUNCTION public.enforce_chain_swap_cooperative_signing_insert()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    persisted_at TIMESTAMPTZ := clock_timestamp();
+    persisted_at TIMESTAMPTZ := pg_catalog.clock_timestamp();
     parent_boltz_swap_id TEXT;
 BEGIN
     SELECT boltz_swap_id
       INTO parent_boltz_swap_id
-      FROM chain_swap_records
+      FROM public.chain_swap_records
      WHERE id = NEW.chain_swap_id
      FOR KEY SHARE;
     IF NOT FOUND OR parent_boltz_swap_id <> NEW.boltz_swap_id THEN
@@ -462,12 +462,12 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION enforce_chain_swap_cooperative_signing_update()
+CREATE FUNCTION public.enforce_chain_swap_cooperative_signing_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    transitioned_at TIMESTAMPTZ := clock_timestamp();
+    transitioned_at TIMESTAMPTZ := pg_catalog.clock_timestamp();
     immutable_changed BOOLEAN := ROW(
         NEW.chain_swap_id, NEW.boltz_swap_id,
         NEW.source_txid, NEW.source_vout, NEW.source_amount_sat,
@@ -606,12 +606,12 @@ BEGIN
         END IF;
         IF NOT EXISTS (
             SELECT 1
-              FROM chain_swap_tx_attempts attempt
+              FROM public.chain_swap_tx_attempts attempt
              WHERE attempt.chain_swap_id = NEW.chain_swap_id
                AND attempt.purpose = 'btc_recovery'
                AND attempt.raw_tx_hex = NEW.final_transaction_hex
                AND attempt.txid = NEW.final_txid
-               AND jsonb_array_length(attempt.source_prevouts) = 1
+               AND pg_catalog.jsonb_array_length(attempt.source_prevouts) = 1
                AND attempt.source_prevouts -> 0 ->> 'txid' = NEW.source_txid
                AND (attempt.source_prevouts -> 0 ->> 'vout')::BIGINT = NEW.source_vout
                AND (attempt.source_prevouts -> 0 ->> 'amount_sat')::BIGINT = NEW.source_amount_sat
@@ -685,7 +685,7 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION reject_chain_swap_cooperative_signing_delete()
+CREATE FUNCTION public.reject_chain_swap_cooperative_signing_delete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
@@ -696,19 +696,19 @@ END
 $$;
 
 CREATE TRIGGER chain_swap_cooperative_signing_validate_insert
-    BEFORE INSERT ON chain_swap_cooperative_signing_operations
-    FOR EACH ROW EXECUTE FUNCTION enforce_chain_swap_cooperative_signing_insert();
+    BEFORE INSERT ON public.chain_swap_cooperative_signing_operations
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_chain_swap_cooperative_signing_insert();
 CREATE TRIGGER chain_swap_cooperative_signing_validate_update
-    BEFORE UPDATE ON chain_swap_cooperative_signing_operations
-    FOR EACH ROW EXECUTE FUNCTION enforce_chain_swap_cooperative_signing_update();
+    BEFORE UPDATE ON public.chain_swap_cooperative_signing_operations
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_chain_swap_cooperative_signing_update();
 CREATE TRIGGER chain_swap_cooperative_signing_reject_delete
-    BEFORE DELETE ON chain_swap_cooperative_signing_operations
-    FOR EACH ROW EXECUTE FUNCTION reject_chain_swap_cooperative_signing_delete();
+    BEFORE DELETE ON public.chain_swap_cooperative_signing_operations
+    FOR EACH ROW EXECUTE FUNCTION public.reject_chain_swap_cooperative_signing_delete();
 
-REVOKE ALL ON TABLE chain_swap_cooperative_signing_operations FROM PUBLIC;
-REVOKE ALL ON FUNCTION enforce_chain_swap_cooperative_signing_insert() FROM PUBLIC;
-REVOKE ALL ON FUNCTION enforce_chain_swap_cooperative_signing_update() FROM PUBLIC;
-REVOKE ALL ON FUNCTION reject_chain_swap_cooperative_signing_delete() FROM PUBLIC;
+REVOKE ALL ON TABLE public.chain_swap_cooperative_signing_operations FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.enforce_chain_swap_cooperative_signing_insert() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.enforce_chain_swap_cooperative_signing_update() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.reject_chain_swap_cooperative_signing_delete() FROM PUBLIC;
 
 DO $$
 DECLARE

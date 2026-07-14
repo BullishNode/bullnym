@@ -1906,13 +1906,17 @@ pub async fn record_chain_swap_cooperative_signing_response(
             .ok_or(CooperativeSigningDomainError::InvalidStoredLifecycle)?;
         if existing == response
             && (current.version == expected_version
-                || version_is_exact_retry(current.version, expected_version))
+                || version_is_exact_retry(current.version, expected_version)
+                || (current.ambiguous_at_unix.is_some()
+                    && current.version.checked_sub(2) == Some(expected_version)))
         {
             tx.commit().await?;
             return Ok(exact_retry(current));
         }
         if current.version == expected_version
             || version_is_exact_retry(current.version, expected_version)
+            || (current.ambiguous_at_unix.is_some()
+                && current.version.checked_sub(2) == Some(expected_version))
         {
             let reason_sha256 = provider_response_conflict_sha256(existing, response);
             let operation = transition_to_integrity_hold(
@@ -1932,7 +1936,9 @@ pub async fn record_chain_swap_cooperative_signing_response(
             if current.integrity_reason_sha256.as_deref() == Some(reason_sha256.as_str())
                 && (current.version == expected_version
                     || current.version.checked_sub(1) == Some(expected_version)
-                    || current.version.checked_sub(2) == Some(expected_version))
+                    || current.version.checked_sub(2) == Some(expected_version)
+                    || (current.ambiguous_at_unix.is_some()
+                        && current.version.checked_sub(3) == Some(expected_version)))
             {
                 tx.commit().await?;
                 return Ok(exact_retry(current));
@@ -1940,16 +1946,31 @@ pub async fn record_chain_swap_cooperative_signing_response(
         }
     }
 
-    require_version(&current, expected_version)?;
-    if !matches!(
-        current.state,
-        CooperativeSigningState::Requested | CooperativeSigningState::Ambiguous
-    ) {
-        return Err(ChainSwapCooperativeSigningStoreError::InvalidTransition {
-            chain_swap_id,
-            state: current.state,
-        });
-    }
+    let transition_version = match current.state {
+        CooperativeSigningState::Requested => {
+            require_version(&current, expected_version)?;
+            current.version
+        }
+        CooperativeSigningState::Ambiguous
+            if current.version.checked_sub(1) == Some(expected_version) =>
+        {
+            // The only late-response allowance: the POST caller still holds
+            // requested version N while a concurrent uncertainty recorder
+            // advanced that exact operation to ambiguous N+1. No other
+            // ambiguous version or state can consume the response.
+            current.version
+        }
+        CooperativeSigningState::Ambiguous => {
+            return Err(ChainSwapCooperativeSigningStoreError::CasMiss { chain_swap_id });
+        }
+        _ => {
+            require_version(&current, expected_version)?;
+            return Err(ChainSwapCooperativeSigningStoreError::InvalidTransition {
+                chain_swap_id,
+                state: current.state,
+            });
+        }
+    };
     let sql = format!(
         "UPDATE chain_swap_cooperative_signing_operations \
             SET state = 'response_received', provider_public_nonce_hex = $3, \
@@ -1960,7 +1981,7 @@ pub async fn record_chain_swap_cooperative_signing_response(
     );
     let updated = sqlx::query_as::<_, CooperativeSigningOperationDbRow>(&sql)
         .bind(chain_swap_id)
-        .bind(checked_version(expected_version)?)
+        .bind(checked_version(transition_version)?)
         .bind(&response.public_nonce_hex)
         .bind(&response.partial_signature_hex)
         .bind(&response.response_sha256)
@@ -2026,15 +2047,38 @@ pub async fn mark_chain_swap_cooperative_signing_integrity_hold(
     expected_version: u64,
     integrity_reason_sha256: &str,
 ) -> Result<CooperativeSigningTransitionOutcome, ChainSwapCooperativeSigningStoreError> {
-    validate_sha256(integrity_reason_sha256, "integrity_reason_sha256")?;
     let mut tx = pool.begin().await?;
-    let current = load_required_for_update(&mut tx, chain_swap_id).await?;
+    let outcome = mark_chain_swap_cooperative_signing_integrity_hold_in_transaction(
+        &mut tx,
+        chain_swap_id,
+        expected_version,
+        integrity_reason_sha256,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Persist an integrity observation without releasing the caller's shared
+/// `chain-claim:<id>` advisory lock or parent/operation row locks. Runtime
+/// evidence reducers must use this boundary so the observed conflict and its
+/// terminal disposition are one serializable decision.
+pub async fn mark_chain_swap_cooperative_signing_integrity_hold_in_transaction(
+    conn: &mut PgConnection,
+    chain_swap_id: Uuid,
+    expected_version: u64,
+    integrity_reason_sha256: &str,
+) -> Result<CooperativeSigningTransitionOutcome, ChainSwapCooperativeSigningStoreError> {
+    validate_sha256(integrity_reason_sha256, "integrity_reason_sha256")?;
+    acquire_chain_claim_boundary(conn, chain_swap_id, None).await?;
+    let current = load_operation_for_update(conn, chain_swap_id)
+        .await?
+        .ok_or(ChainSwapCooperativeSigningStoreError::NotFound { chain_swap_id })?;
     if current.state == CooperativeSigningState::IntegrityHold
         && current.integrity_reason_sha256.as_deref() == Some(integrity_reason_sha256)
         && (current.version == expected_version
             || version_is_exact_retry(current.version, expected_version))
     {
-        tx.commit().await?;
         return Ok(exact_retry(current));
     }
     require_version(&current, expected_version)?;
@@ -2044,15 +2088,23 @@ pub async fn mark_chain_swap_cooperative_signing_integrity_hold(
             state: current.state,
         });
     }
-    let operation = transition_to_integrity_hold(
-        &mut tx,
-        chain_swap_id,
-        expected_version,
-        integrity_reason_sha256,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(applied(operation))
+    let sql = format!(
+        "UPDATE chain_swap_cooperative_signing_operations \
+            SET state = 'integrity_hold', integrity_reason_sha256 = $3, \
+                integrity_hold_at = clock_timestamp(), version = version + 1 \
+          WHERE chain_swap_id = $1 \
+            AND state IN ('prepared', 'requested', 'ambiguous', 'response_received') \
+            AND version = $2 \
+          RETURNING {OPERATION_COLUMNS}"
+    );
+    let updated = sqlx::query_as::<_, CooperativeSigningOperationDbRow>(&sql)
+        .bind(chain_swap_id)
+        .bind(checked_version(expected_version)?)
+        .bind(integrity_reason_sha256)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(ChainSwapCooperativeSigningStoreError::CasMiss { chain_swap_id })?;
+    Ok(applied(decode_row(updated)?))
 }
 
 pub async fn supersede_chain_swap_cooperative_signing_at_unilateral_timeout(

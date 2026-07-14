@@ -212,6 +212,47 @@ pub(crate) fn prepare_exact_cooperative_refund(
     })
 }
 
+/// Construct the provider half of one exact test session. This remains
+/// crate-private so production cannot synthesize a remote response; the
+/// external integration harness reaches it only through the chain-recovery
+/// fixture constructor.
+pub(crate) fn provider_partial_signature_for_integration_test(
+    script: &BtcSwapScript,
+    details: &ChainSwapDetails,
+    provider_keypair: &Keypair,
+    request: &DurableCooperativeRequest,
+) -> Result<PartialSig, AppError> {
+    let message: [u8; 32] = hex::decode(&request.sighash_hex)
+        .map_err(|_| AppError::ClaimError("test provider sighash is invalid".into()))?
+        .try_into()
+        .map_err(|_| AppError::ClaimError("test provider sighash length is invalid".into()))?;
+    let cache = tweaked_key_agg_cache(script, details)?;
+    let mut provider_session_secret_bytes = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(provider_session_secret_bytes.as_mut());
+    let provider_session_secret =
+        musig::SessionSecretRand::assume_unique_per_nonce_gen(*provider_session_secret_bytes);
+    let (provider_secret_nonce, provider_public_nonce) = cache.nonce_gen(
+        provider_session_secret,
+        convert_public_key(provider_keypair.public_key()),
+        &message,
+        None,
+    );
+    let client_public_nonce = musig::PublicNonce::from_str(&request.public_nonce_hex)
+        .map_err(|_| AppError::ClaimError("test client public nonce is invalid".into()))?;
+    let aggregate_nonce =
+        musig::AggregatedNonce::new(&[&provider_public_nonce, &client_public_nonce]);
+    let session = musig::Session::new(&cache, aggregate_nonce, &message);
+    let provider_partial = session.partial_sign(
+        provider_secret_nonce,
+        &convert_keypair(provider_keypair),
+        &cache,
+    );
+    Ok(PartialSig {
+        pub_nonce: provider_public_nonce.to_string(),
+        partial_signature: provider_partial.to_string(),
+    })
+}
+
 /// Consume the protected nonce only after the exact provider response has
 /// been durably selected. Replaying the same selected response deterministically
 /// reconstructs the same final witness after a local transaction rollback.

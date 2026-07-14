@@ -3,13 +3,20 @@
 -- terminal evidence at the schema boundary.
 DO $$
 BEGIN
-    IF (SELECT COUNT(*) FROM chain_swap_cooperative_signing_operations) <> 0 THEN
+    IF (SELECT COUNT(*) FROM public.chain_swap_cooperative_signing_operations) <> 0 THEN
         RAISE EXCEPTION 'migration 057 fabricated historical signing intent';
     END IF;
 END
 $$;
 
-INSERT INTO chain_swap_cooperative_signing_operations (
+-- Trigger functions run as SECURITY INVOKER. An empty TEMP shadow must not
+-- redirect their parent lookup away from the authoritative public relation.
+CREATE TEMP TABLE chain_swap_records (
+    id UUID,
+    boltz_swap_id TEXT
+);
+
+INSERT INTO public.chain_swap_cooperative_signing_operations (
     chain_swap_id, boltz_swap_id,
     source_txid, source_vout, source_amount_sat, source_script_pubkey_hex,
     destination_address, destination_script_pubkey_hex, destination_amount_sat,
@@ -42,15 +49,17 @@ SELECT
     'secp256k1-musig-secnonce-132-v1', 'xchacha20poly1305-v1',
     'migration-057-fixture', decode(repeat('8', 48), 'hex'),
     decode(repeat('9', 296), 'hex'), repeat('a', 64)
-  FROM chain_swap_records parent
+  FROM public.chain_swap_records parent
  WHERE parent.id = '53000000-0000-0000-0000-000000000012';
 
-UPDATE chain_swap_cooperative_signing_operations
+DROP TABLE pg_temp.chain_swap_records;
+
+UPDATE public.chain_swap_cooperative_signing_operations
    SET state = 'requested', request_attempt_count = 1,
        requested_at = '2020-01-01 00:00:00+00', version = 2
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
-UPDATE chain_swap_cooperative_signing_operations
+UPDATE public.chain_swap_cooperative_signing_operations
    SET state = 'response_received',
        provider_public_nonce_hex = repeat('b', 132),
        provider_partial_signature_hex = repeat('c', 64),
@@ -66,16 +75,73 @@ UPDATE chain_swap_cooperative_signing_operations
        response_received_at = '2020-01-01 00:00:00+00', version = 3
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
+-- A TEMP attempt with a byte-for-byte matching shape must not satisfy the
+-- completion trigger. Only public.chain_swap_tx_attempts is authoritative.
+CREATE TEMP VIEW chain_swap_tx_attempts AS
+SELECT
+    operation.chain_swap_id,
+    'btc_recovery'::TEXT AS purpose,
+    operation.request_transaction_hex AS raw_tx_hex,
+    operation.request_transaction_txid AS txid,
+    jsonb_build_array(jsonb_build_object(
+        'txid', operation.source_txid,
+        'vout', operation.source_vout,
+        'amount_sat', operation.source_amount_sat,
+        'script_pubkey_hex', operation.source_script_pubkey_hex
+    )) AS source_prevouts,
+    operation.destination_address,
+    operation.destination_script_pubkey_hex AS destination_script_hex,
+    0::BIGINT AS destination_vout,
+    operation.destination_amount_sat,
+    operation.fee_amount_sat,
+    operation.fee_amount_sat::DOUBLE PRECISION
+        / operation.fee_vbytes::DOUBLE PRECISION AS fee_rate_sat_vb,
+    operation.fee_decision_purpose,
+    operation.fee_decision_rail,
+    operation.fee_decision_target,
+    operation.fee_decision_source,
+    operation.fee_decision_rate_sat_vb,
+    operation.fee_decision_quoted_at_unix,
+    operation.fee_decision_evaluated_at_unix,
+    operation.fee_decision_freshness_age_secs,
+    operation.fee_decision_freshness_max_age_secs,
+    operation.fee_decision_provenance,
+    operation.fee_decision_policy_floor_sat_vb,
+    operation.fee_decision_policy_cap_sat_vb,
+    operation.fee_decision_policy_version
+  FROM public.chain_swap_cooperative_signing_operations operation
+ WHERE operation.chain_swap_id = '53000000-0000-0000-0000-000000000012';
+
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.chain_swap_cooperative_signing_operations
+           SET state = 'completed',
+               final_transaction_hex = request_transaction_hex,
+               final_transaction_sha256 = request_transaction_sha256,
+               final_txid = request_transaction_txid,
+               local_partial_signature_sha256 = repeat('d', 64),
+               version = 4
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 057 accepted a TEMP-shadowed recovery attempt';
+    EXCEPTION WHEN foreign_key_violation THEN
+        NULL;
+    END;
+END
+$$;
+
+DROP VIEW pg_temp.chain_swap_tx_attempts;
+
 DO $$
 DECLARE
     original_response_sha256 TEXT;
 BEGIN
     SELECT provider_response_sha256 INTO STRICT original_response_sha256
-      FROM chain_swap_cooperative_signing_operations
+      FROM public.chain_swap_cooperative_signing_operations
      WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
     BEGIN
-        UPDATE chain_swap_cooperative_signing_operations
+        UPDATE public.chain_swap_cooperative_signing_operations
            SET provider_response_sha256 = repeat('d', 64),
                version = version + 1
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
@@ -84,7 +150,7 @@ BEGIN
         NULL;
     END;
 
-    UPDATE chain_swap_cooperative_signing_operations
+    UPDATE public.chain_swap_cooperative_signing_operations
        SET state = 'integrity_hold',
            integrity_reason_sha256 = repeat('e', 64),
            integrity_hold_at = '2020-01-01 00:00:00+00',
@@ -92,7 +158,7 @@ BEGIN
      WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
     BEGIN
-        UPDATE chain_swap_cooperative_signing_operations
+        UPDATE public.chain_swap_cooperative_signing_operations
            SET secret_nonce_ciphertext = decode(repeat('f', 296), 'hex')
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
         RAISE EXCEPTION 'migration 057 allowed encrypted nonce mutation';
@@ -101,7 +167,7 @@ BEGIN
     END;
 
     BEGIN
-        DELETE FROM chain_swap_cooperative_signing_operations
+        DELETE FROM public.chain_swap_cooperative_signing_operations
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
         RAISE EXCEPTION 'migration 057 allowed journal deletion';
     EXCEPTION WHEN object_not_in_prerequisite_state THEN
@@ -110,7 +176,7 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1
-          FROM chain_swap_cooperative_signing_operations
+          FROM public.chain_swap_cooperative_signing_operations
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012'
            AND state = 'integrity_hold'
            AND version = 4
