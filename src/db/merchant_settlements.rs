@@ -41,6 +41,29 @@ pub enum LiquidMerchantSettlementBroadcastStartDisposition {
     Superseded,
 }
 
+/// Result of reloading a reconstructed immutable Liquid journal packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactLiquidMerchantSettlementJournalDisposition {
+    /// The exact packet remains eligible for same-byte broadcast or redrive.
+    Broadcastable,
+    /// Independent observation already confirmed or finalized the exact packet.
+    AlreadySettled,
+}
+
+fn exact_liquid_journal_disposition(
+    status: &str,
+) -> Result<ExactLiquidMerchantSettlementJournalDisposition, MerchantSettlementRepositoryError> {
+    match status {
+        "constructed" | "broadcast_ambiguous" | "broadcast" => {
+            Ok(ExactLiquidMerchantSettlementJournalDisposition::Broadcastable)
+        }
+        "confirmed" | "finalized" => {
+            Ok(ExactLiquidMerchantSettlementJournalDisposition::AlreadySettled)
+        }
+        _ => Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiquidBroadcastStartAction {
     Start,
@@ -548,7 +571,10 @@ pub async fn insert_liquid_merchant_settlement_journal(
 pub async fn load_exact_liquid_merchant_settlement_journal(
     connection: &mut PgConnection,
     journal: &NewLiquidMerchantSettlementJournal<'_>,
-) -> Result<MerchantSettlementJournalRow, MerchantSettlementRepositoryError> {
+) -> Result<
+    ExactLiquidMerchantSettlementJournalDisposition,
+    MerchantSettlementRepositoryError,
+> {
     validate_new_liquid_journal(journal)?;
     let purpose = if journal.replaces_txid.is_some() {
         "liquid_claim_replacement"
@@ -566,13 +592,10 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     .ok_or(MerchantSettlementRepositoryError::MissingJournal)?
     .try_into()?;
     assert_liquid_journal_matches(&row, journal, purpose)?;
-    if !liquid_attempt_is_broadcastable(&row.status) {
-        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
-    }
     if row.fee_authority.is_none() {
         return Err(MerchantSettlementRepositoryError::MissingJournal);
     }
-    Ok(row)
+    exact_liquid_journal_disposition(&row.status)
 }
 
 /// Durably record that an exact Liquid claim broadcast is about to start. If
@@ -2286,6 +2309,28 @@ mod tests {
         }
         for status in ["confirmed", "finalized", "integrity_hold"] {
             assert!(!liquid_attempt_is_broadcastable(status));
+        }
+    }
+
+    #[test]
+    fn exact_liquid_journal_status_is_terminal_aware_and_fail_closed() {
+        for status in ["constructed", "broadcast_ambiguous", "broadcast"] {
+            assert_eq!(
+                exact_liquid_journal_disposition(status).unwrap(),
+                ExactLiquidMerchantSettlementJournalDisposition::Broadcastable
+            );
+        }
+        for status in ["confirmed", "finalized"] {
+            assert_eq!(
+                exact_liquid_journal_disposition(status).unwrap(),
+                ExactLiquidMerchantSettlementJournalDisposition::AlreadySettled
+            );
+        }
+        for status in ["integrity_hold", "failed", "unknown"] {
+            assert!(matches!(
+                exact_liquid_journal_disposition(status),
+                Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+            ));
         }
     }
 

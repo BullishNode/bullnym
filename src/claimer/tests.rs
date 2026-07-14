@@ -230,32 +230,21 @@ fn chain_claim_journal_mode_rejects_orphan_parent_state() {
     );
     assert!(persisted_chain_claim_journal_mode(Some("00"), None).is_err());
     assert!(persisted_chain_claim_journal_mode(None, Some("11")).is_err());
-}
-
-#[test]
-fn exact_confirmed_chain_claim_attempt_short_circuits_without_masking_mismatch() {
-    for status in ["confirmed", "finalized"] {
-        assert!(exact_terminal_chain_claim_attempt(
-            "00",
-            Some((status, "00"))
-        ));
-    }
-    for status in [
-        "constructed",
-        "broadcast_ambiguous",
-        "broadcast",
-        "integrity_hold",
-    ] {
-        assert!(!exact_terminal_chain_claim_attempt(
-            "00",
-            Some((status, "00"))
-        ));
-    }
-    assert!(!exact_terminal_chain_claim_attempt(
-        "00",
-        Some(("confirmed", "11"))
-    ));
-    assert!(!exact_terminal_chain_claim_attempt("00", None));
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claimed,
+        PersistedChainClaimJournalMode::ConstructAndInsert,
+    )
+    .is_err());
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claimed,
+        PersistedChainClaimJournalMode::DecodeAndLoadExact,
+    )
+    .is_ok());
+    assert!(require_terminal_chain_claim_journal(
+        ChainSwapStatus::Claiming,
+        PersistedChainClaimJournalMode::ConstructAndInsert,
+    )
+    .is_ok());
 }
 
 #[test]

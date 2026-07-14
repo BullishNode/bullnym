@@ -2170,16 +2170,19 @@ fn persisted_chain_claim_journal_mode(
     }
 }
 
-fn exact_terminal_chain_claim_attempt(
-    expected_raw_tx_hex: &str,
-    attempt: Option<(&str, &str)>,
-) -> bool {
-    matches!(
-        attempt,
-        Some((status, raw_tx_hex))
-            if matches!(status, "confirmed" | "finalized")
-                && raw_tx_hex == expected_raw_tx_hex
-    )
+fn require_terminal_chain_claim_journal(
+    status: ChainSwapStatus,
+    journal_mode: PersistedChainClaimJournalMode,
+) -> Result<(), AppError> {
+    if status == ChainSwapStatus::Claimed
+        && journal_mode != PersistedChainClaimJournalMode::DecodeAndLoadExact
+    {
+        return Err(AppError::ClaimError(
+            "claimed chain swap lacks committed claim bytes and txid; integrity review required"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_exact_persisted_chain_claim_journal<T>(
@@ -2420,7 +2423,10 @@ async fn claim_chain_swap_inner(
     let status = swap
         .parsed_status()
         .map_err(|e| AppError::ClaimError(format!("invalid persisted chain status: {e}")))?;
-    if status.is_terminal() {
+    // A `claimed` parent must still prove its complete independently
+    // reconstructed journal packet below. Other terminal branches do not own
+    // a successful Liquid merchant settlement and remain no-op outcomes.
+    if status.is_terminal() && status != ChainSwapStatus::Claimed {
         return Ok(ClaimOutcome::AlreadyTerminal);
     }
     if !matches!(
@@ -2428,6 +2434,7 @@ async fn claim_chain_swap_inner(
         ChainSwapStatus::ServerLockMempool
             | ChainSwapStatus::ServerLockConfirmed
             | ChainSwapStatus::Claiming
+            | ChainSwapStatus::Claimed
             | ChainSwapStatus::ClaimFailed
     ) {
         return Ok(ClaimOutcome::AlreadyTerminal);
@@ -2445,6 +2452,7 @@ async fn claim_chain_swap_inner(
     )?;
     let had_persisted_claim =
         journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact;
+    require_terminal_chain_claim_journal(status, journal_mode)?;
     if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert
         && (fee_decision.is_none()
             || !liquid_claim_journal_authorized(had_persisted_claim, fee_record))
@@ -2483,31 +2491,10 @@ async fn claim_chain_swap_inner(
         ) {
             return commit_claim_preparation_error(tx, error).await;
         }
-        let terminal_attempt: Option<(String, String)> = sqlx::query_as(
-            "SELECT status, raw_tx_hex FROM chain_swap_tx_attempts \
-              WHERE chain_swap_id = $1 AND txid = $2 AND purpose = 'liquid_claim' \
-                AND replaces_txid IS NULL FOR UPDATE",
-        )
-        .bind(swap.id)
-        .bind(&claim_txid)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| AppError::DbError(error.to_string()))?;
-        if exact_terminal_chain_claim_attempt(
-            claim_tx_hex,
-            terminal_attempt
-                .as_ref()
-                .map(|(status, raw_tx_hex)| (status.as_str(), raw_tx_hex.as_str())),
-        ) {
-            return Ok(ClaimOutcome::AlreadyTerminal);
-        }
         Some(claim_tx)
     } else {
         None
     };
-    let claim_clients = claim_clients.ok_or_else(|| {
-        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
-    })?;
     let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
         .map_err(|error| {
             AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
@@ -2566,6 +2553,9 @@ async fn claim_chain_swap_inner(
     let claim_tx = if let Some(claim_tx) = persisted_claim_tx {
         claim_tx
     } else {
+        let claim_clients = claim_clients.ok_or_else(|| {
+            AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+        })?;
         let fee_decision = LiquidBuilderFeeDecision::from(
             fee_decision.expect("unjournaled chain claims require a policy decision"),
         );
@@ -2630,7 +2620,7 @@ async fn claim_chain_swap_inner(
             PersistedChainClaimJournalMode::DecodeAndLoadExact => None,
         },
     };
-    if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert {
+    let journal_disposition = if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert {
         let fee_record = new_journal.fee_authority.ok_or_else(|| {
             AppError::ClaimError("unjournaled chain claim is missing fee authority".into())
         })?;
@@ -2721,6 +2711,7 @@ async fn claim_chain_swap_inner(
                     "insert Liquid merchant settlement journal: {error}"
                 ))
             })?;
+        db::ExactLiquidMerchantSettlementJournalDisposition::Broadcastable
     } else {
         if swap.claim_tx_hex.as_deref() != Some(prepared.journal.raw_transaction_hex.as_str())
             || swap.claim_txid.as_deref() != Some(prepared.journal.txid.as_str())
@@ -2731,8 +2722,29 @@ async fn claim_chain_swap_inner(
         }
         require_exact_persisted_chain_claim_journal(
             db::load_exact_liquid_merchant_settlement_journal(&mut tx, &new_journal).await,
-        )?;
+        )?
+    };
+
+    match journal_disposition {
+        db::ExactLiquidMerchantSettlementJournalDisposition::AlreadySettled => {
+            tx.commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return Ok(ClaimOutcome::AlreadyTerminal);
+        }
+        db::ExactLiquidMerchantSettlementJournalDisposition::Broadcastable
+            if status == ChainSwapStatus::Claimed =>
+        {
+            return Err(AppError::ClaimError(
+                "claimed chain swap has no confirmed or finalized exact journal".into(),
+            ));
+        }
+        db::ExactLiquidMerchantSettlementJournalDisposition::Broadcastable => {}
     }
+
+    let claim_clients = claim_clients.ok_or_else(|| {
+        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+    })?;
 
     let marked_claiming = sqlx::query(
         "UPDATE chain_swap_records \
