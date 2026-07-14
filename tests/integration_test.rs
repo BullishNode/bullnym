@@ -757,6 +757,12 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Renegotiation rows reject ordinary DELETE and hold a RESTRICT FK to the
+    // chain swap. Test-database ownership uses DDL solely for test isolation.
+    sqlx::query("TRUNCATE chain_swap_renegotiation_operations")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM watcher_lane_progress")
         .execute(pool)
         .await
@@ -1267,7 +1273,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "055_merchant_settlement_lifecycle"
+        "056_chain_swap_renegotiation_journal"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -15085,6 +15091,222 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
         stale.is_none(),
         "expired chain swaps must not be exposed as payable offers"
     );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() {
+    use pay_service::chain_swap_renegotiation::{
+        RenegotiationDomainError, RenegotiationErrorClass, RenegotiationIdentity,
+        RenegotiationState, TransitionDisposition,
+    };
+    use pay_service::db::ChainSwapRenegotiationStoreError;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "renegotiationjournal").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "renegotiationjournal",
+        &npub,
+        "lq1renegotiationjournal",
+        60,
+    )
+    .await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("renegotiationjournal"),
+            boltz_swap_id: "renegotiation-journal-swap",
+            lockup_address: "bc1qrenegotiationjournal",
+            lockup_bip21: None,
+            user_lock_amount_sat: 25_000,
+            server_lock_amount_sat: 24_750,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"renegotiation-journal-swap\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let identity = RenegotiationIdentity::new(
+        row.id,
+        24_750,
+        "aa".repeat(32),
+        now - 2,
+        "issue38-v1",
+        "bb".repeat(32),
+        now - 1,
+    )
+    .unwrap();
+
+    let quoted = pay_service::db::persist_quoted_chain_swap_renegotiation(&pool, &identity)
+        .await
+        .unwrap();
+    assert_eq!(quoted.state, RenegotiationState::Quoted);
+    assert_eq!(quoted.version, 1);
+
+    // Crash before intent commit: the transaction-local request vanishes and
+    // a new process still observes the exact retryable quote.
+    let mut before_intent = pool.begin().await.unwrap();
+    let staged_state: String = sqlx::query_scalar(
+        "UPDATE chain_swap_renegotiation_operations \
+            SET state = 'accept_requested', accept_attempt_count = 1, \
+                accept_requested_at = clock_timestamp(), version = 2 \
+          WHERE chain_swap_id = $1 RETURNING state",
+    )
+    .bind(row.id)
+    .fetch_one(&mut *before_intent)
+    .await
+    .unwrap();
+    assert_eq!(staged_state, "accept_requested");
+    before_intent.rollback().await.unwrap();
+    let after_before_intent_crash = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_before_intent_crash.state, RenegotiationState::Quoted);
+    assert_eq!(after_before_intent_crash.version, 1);
+
+    // The typed adapter commits the intent before any external accept is
+    // permitted. A restart and an exact retry retain that durable fact.
+    let requested = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
+        .await
+        .unwrap();
+    assert_eq!(requested.disposition, TransitionDisposition::Apply);
+    assert_eq!(
+        requested.operation.state,
+        RenegotiationState::AcceptRequested
+    );
+    assert_eq!(requested.operation.version, 2);
+    let restarted_requested = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted_requested.state,
+        RenegotiationState::AcceptRequested
+    );
+    let request_retry =
+        pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
+            .await
+            .unwrap();
+    assert_eq!(request_retry.disposition, TransitionDisposition::ExactRetry);
+    assert_eq!(request_retry.operation.version, 2);
+
+    let ambiguous = pay_service::db::mark_chain_swap_renegotiation_ambiguous(
+        &pool,
+        &identity,
+        2,
+        RenegotiationErrorClass::Transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ambiguous.operation.state, RenegotiationState::Ambiguous);
+    assert_eq!(ambiguous.operation.version, 3);
+    let false_decline = pay_service::db::mark_chain_swap_renegotiation_declined(
+        &pool,
+        &identity,
+        3,
+        "cc".repeat(32),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        false_decline,
+        ChainSwapRenegotiationStoreError::Domain(RenegotiationDomainError::IllegalTransition {
+            from: RenegotiationState::Ambiguous,
+            to: RenegotiationState::Declined,
+        })
+    ));
+
+    let redriven = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        redriven.operation.state,
+        RenegotiationState::AcceptRequested
+    );
+    assert_eq!(redriven.operation.accept_attempt_count, 2);
+    assert_eq!(redriven.operation.version, 4);
+    assert_eq!(
+        redriven.operation.last_error_class,
+        Some(RenegotiationErrorClass::Transport)
+    );
+
+    // Crash after provider response but before result commit: rollback leaves
+    // the durable request unresolved, so fallback/decline is still blocked.
+    let mut before_result = pool.begin().await.unwrap();
+    let staged_terminal: String = sqlx::query_scalar(
+        "UPDATE chain_swap_renegotiation_operations \
+            SET state = 'accepted', terminal_response_digest = $2, \
+                terminal_observed_at = clock_timestamp(), version = 5 \
+          WHERE chain_swap_id = $1 RETURNING state",
+    )
+    .bind(row.id)
+    .bind("dd".repeat(32))
+    .fetch_one(&mut *before_result)
+    .await
+    .unwrap();
+    assert_eq!(staged_terminal, "accepted");
+    before_result.rollback().await.unwrap();
+    let after_before_result_crash = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_before_result_crash.state,
+        RenegotiationState::AcceptRequested
+    );
+    assert_eq!(after_before_result_crash.version, 4);
+    assert!(after_before_result_crash
+        .terminal_response_digest()
+        .is_none());
+
+    let accepted = pay_service::db::mark_chain_swap_renegotiation_accepted(
+        &pool,
+        &identity,
+        4,
+        "dd".repeat(32),
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.operation.state, RenegotiationState::Accepted);
+    assert_eq!(accepted.operation.version, 5);
+    let accepted_retry = pay_service::db::mark_chain_swap_renegotiation_accepted(
+        &pool,
+        &identity,
+        4,
+        "dd".repeat(32),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted_retry.disposition,
+        TransitionDisposition::ExactRetry
+    );
+    assert_eq!(accepted_retry.operation.version, 5);
+
+    let stale = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        ChainSwapRenegotiationStoreError::Domain(RenegotiationDomainError::StaleVersion {
+            expected: 1,
+            actual: 5,
+        })
+    ));
 
     cleanup_db(&pool).await;
 }
