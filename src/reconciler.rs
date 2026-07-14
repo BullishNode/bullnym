@@ -1940,11 +1940,10 @@ pub enum ReconcilerAction {
     /// Boltz says the lockup was refunded. Terminal `lockup_refunded`.
     /// FUND LOSS. P0 alert.
     MarkLockupRefunded,
-    /// Boltz says invoice settled but our row is not Claimed. Either
-    /// our broadcast landed but we lost the response, or someone else
-    /// claimed. The reconciler logs loudly and leaves manual rescue to
-    /// disambiguate.
-    NeedsManualAttention(&'static str),
+    /// Boltz says the Lightning invoice settled but our row is not Claimed.
+    /// Preserve a structured operator alert while automatically re-driving
+    /// the claim path, which owns the lockup-outspend recovery probe.
+    RecoverSettledWithoutLocalClaim,
 }
 
 pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> ReconcilerAction {
@@ -1986,9 +1985,11 @@ pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> Reconc
         // Boltz says invoice settled. That means the claim API received
         // our preimage, but Boltz does not track whether our claim tx was
         // broadcast. If our row is not Claimed yet, nudge the claimer; it
-        // owns the advisory lock and the lockup-outspend recovery probe.
+        // owns the advisory lock and the lockup-outspend recovery probe. Keep
+        // this distinct from an ordinary retry: the provider/local mismatch
+        // is operationally alertable until the claim path resolves it.
         ("invoice.settled", "claimed") => Noop,
-        ("invoice.settled", _) => ScheduleImmediateClaim,
+        ("invoice.settled", _) => RecoverSettledWithoutLocalClaim,
 
         // `minerfee.paid` and any future Boltz-side states are
         // informational; debug-log and move on.
@@ -2101,15 +2102,32 @@ async fn apply_action(
             // is an incident, not merchant-side settlement.
             Ok(())
         }
-        NeedsManualAttention(reason) => {
-            tracing::error!(
-                event = "reconciler_needs_attention",
-                swap_id = %swap.boltz_swap_id,
-                nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
-                our_status = %swap.status,
-                reason,
-                "reconciler cannot progress this swap; manual intervention required"
-            );
+        RecoverSettledWithoutLocalClaim => {
+            // A missed lockup webhook can leave the local row `pending`, which
+            // the claim sweep does not select. Promote only that live state;
+            // every other live status is already claimable and terminal rows
+            // were rejected by `decide_action` above.
+            if swap.status == "pending" {
+                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+            }
+            let scheduled = db::schedule_immediate_claim(pool, swap.id).await?;
+            if scheduled == 1 {
+                tracing::error!(
+                    event = "reverse_swap_settled_without_local_claim",
+                    source = "reconciler",
+                    swap_id = %swap.boltz_swap_id,
+                    nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                    our_status = %swap.status,
+                    claim_txid = ?swap.claim_txid,
+                    amount_sat = swap.amount_sat,
+                    "provider reports a settled Lightning invoice without a local claimed state; scheduling automatic claim recovery"
+                );
+            } else {
+                tracing::debug!(
+                    swap_id = %swap.boltz_swap_id,
+                    "settled reverse swap reached a terminal state before reconciler recovery scheduling"
+                );
+            }
             Ok(())
         }
     }

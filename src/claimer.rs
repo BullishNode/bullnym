@@ -615,11 +615,38 @@ async fn dispatch_webhook(
             try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
         }
         "invoice.settled" => {
-            // Preimage was disclosed and Boltz settled the LN HTLC. This
-            // arrives downstream of our successful cooperative claim. We
-            // don't transition status here — the claim path itself sets
-            // `Claimed` with the on-chain txid.
-            tracing::info!("invoice settled for swap {}", data.id);
+            // Usually this arrives downstream of our successful cooperative
+            // claim. Reaching this arm means the local row is still live,
+            // however: a response or webhook may have been lost after the
+            // preimage was disclosed. Keep that discrepancy alertable and
+            // immediately re-drive the claim/outspend recovery path instead
+            // of waiting for the next provider reconciliation cycle.
+            if swap.status == "pending" {
+                db::update_swap_status(&state.db, swap.id, SwapStatus::LockupConfirmed, None)
+                    .await
+                    .map_err(|e| AppError::DbError(e.to_string()))?;
+            }
+            let scheduled = db::schedule_immediate_claim(&state.db, swap.id)
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+            if scheduled == 1 {
+                tracing::error!(
+                    event = "reverse_swap_settled_without_local_claim",
+                    source = "webhook",
+                    swap_id = %data.id,
+                    nym = %swap.nym.as_deref().unwrap_or("<invoice-only>"),
+                    our_status = %swap.status,
+                    claim_txid = ?swap.claim_txid,
+                    amount_sat = swap.amount_sat,
+                    "provider reports a settled Lightning invoice without a local claimed state; scheduling automatic claim recovery"
+                );
+                try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
+            } else {
+                tracing::debug!(
+                    swap_id = %data.id,
+                    "settled reverse swap reached a terminal state before webhook recovery scheduling"
+                );
+            }
         }
         "swap.expired" => {
             // `swap.expired` is the wall-clock hold-invoice timer (~50% of

@@ -5319,6 +5319,72 @@ async fn webhook_skips_terminal_swaps() {
 }
 
 #[tokio::test]
+async fn settled_webhook_schedules_unclaimed_reverse_recovery() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let app = test_app(state);
+
+    let (npub, _, _) = sign_registration("settledunclaimed", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "settledunclaimed", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("settledunclaimed"),
+            boltz_swap_id: "SETTLED_WITHOUT_LOCAL_CLAIM",
+            address: Some("lq1settledunclaimed"),
+            address_index: Some(0),
+            amount_sat: 1_000,
+            invoice: "lnbc-settled-unclaimed",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/webhook/boltz",
+        json!({
+            "event": "swap.update",
+            "data": {
+                "id": "SETTLED_WITHOUT_LOCAL_CLAIM",
+                "status": "invoice.settled"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let recovered = pay_service::db::get_swap_by_boltz_id(&pool, "SETTLED_WITHOUT_LOCAL_CLAIM")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, "lockup_confirmed");
+    assert_eq!(recovered.claim_attempts, 0);
+    let scheduled: bool = sqlx::query_scalar(
+        "SELECT next_claim_attempt_at IS NOT NULL FROM swap_records WHERE id = $1",
+    )
+    .bind(recovered.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        scheduled,
+        "settled provider evidence must leave a durable automatic recovery obligation"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     let pool = constrained_test_pool(1, None);
     cleanup_db(&pool).await;
