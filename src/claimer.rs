@@ -2170,6 +2170,18 @@ fn persisted_chain_claim_journal_mode(
     }
 }
 
+fn exact_terminal_chain_claim_attempt(
+    expected_raw_tx_hex: &str,
+    attempt: Option<(&str, &str)>,
+) -> bool {
+    matches!(
+        attempt,
+        Some((status, raw_tx_hex))
+            if matches!(status, "confirmed" | "finalized")
+                && raw_tx_hex == expected_raw_tx_hex
+    )
+}
+
 fn require_exact_persisted_chain_claim_journal<T>(
     loaded: Result<T, db::MerchantSettlementRepositoryError>,
 ) -> Result<T, AppError> {
@@ -2436,6 +2448,62 @@ async fn claim_chain_swap_inner(
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
         });
     }
+    let journal_mode = persisted_chain_claim_journal_mode(
+        swap.claim_tx_hex.as_deref(),
+        swap.claim_txid.as_deref(),
+    )?;
+    let persisted_claim_tx = if journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact {
+        let claim_tx_hex = swap
+            .claim_tx_hex
+            .as_deref()
+            .expect("validated persisted chain claim bytes");
+        let claim_tx =
+            match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), claim_tx_hex)
+                .map_err(|error| {
+                    AppError::ClaimError(format!("decode persisted chain claim_tx: {error}"))
+                }) {
+                Ok(transaction) => transaction,
+                Err(error) => return commit_claim_preparation_error(tx, error).await,
+            };
+        let claim_txid = btc_like_txid(&claim_tx);
+        if swap.claim_txid.as_deref() != Some(claim_txid.as_str()) {
+            return commit_claim_preparation_error(
+                tx,
+                AppError::ClaimError(
+                    "persisted chain claim bytes/txid do not match their decoded journal".into(),
+                ),
+            )
+            .await;
+        }
+        if let Err(error) = validate_replayed_liquid_claim_fee_authority(
+            &swap.claim_fee_authority,
+            FeeConstructionPurpose::ChainLiquidClaim,
+            &claim_tx,
+        ) {
+            return commit_claim_preparation_error(tx, error).await;
+        }
+        let terminal_attempt: Option<(String, String)> = sqlx::query_as(
+            "SELECT status, raw_tx_hex FROM chain_swap_tx_attempts \
+              WHERE chain_swap_id = $1 AND txid = $2 AND purpose = 'liquid_claim' \
+                AND replaces_txid IS NULL FOR UPDATE",
+        )
+        .bind(swap.id)
+        .bind(&claim_txid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+        if exact_terminal_chain_claim_attempt(
+            claim_tx_hex,
+            terminal_attempt
+                .as_ref()
+                .map(|(status, raw_tx_hex)| (status.as_str(), raw_tx_hex.as_str())),
+        ) {
+            return Ok(ClaimOutcome::AlreadyTerminal);
+        }
+        Some(claim_tx)
+    } else {
+        None
+    };
     let claim_clients = claim_clients.ok_or_else(|| {
         AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
     })?;
@@ -2494,26 +2562,8 @@ async fn claim_chain_swap_inner(
         .map(|terms| terms.liquid_asset_id.as_str())
         .unwrap_or(&default_liquid_asset_id);
 
-    let journal_mode = persisted_chain_claim_journal_mode(
-        swap.claim_tx_hex.as_deref(),
-        swap.claim_txid.as_deref(),
-    )?;
-    let claim_tx = if let Some(hex) = swap.claim_tx_hex.as_deref() {
-        match BtcLikeTransaction::from_hex(Chain::Liquid(LiquidChain::Liquid), hex)
-            .map_err(|e| AppError::ClaimError(format!("decode persisted chain claim_tx: {e}")))
-        {
-            Ok(claim_tx) => {
-                if let Err(error) = validate_replayed_liquid_claim_fee_authority(
-                    &swap.claim_fee_authority,
-                    FeeConstructionPurpose::ChainLiquidClaim,
-                    &claim_tx,
-                ) {
-                    return commit_claim_preparation_error(tx, error).await;
-                }
-                claim_tx
-            }
-            Err(error) => return commit_claim_preparation_error(tx, error).await,
-        }
+    let claim_tx = if let Some(claim_tx) = persisted_claim_tx {
+        claim_tx
     } else {
         let fee_decision = LiquidBuilderFeeDecision::from(
             fee_decision.expect("unjournaled chain claims require a policy decision"),

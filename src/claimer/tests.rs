@@ -233,6 +233,32 @@ fn chain_claim_journal_mode_rejects_orphan_parent_state() {
 }
 
 #[test]
+fn exact_confirmed_chain_claim_attempt_short_circuits_without_masking_mismatch() {
+    for status in ["confirmed", "finalized"] {
+        assert!(exact_terminal_chain_claim_attempt(
+            "00",
+            Some((status, "00"))
+        ));
+    }
+    for status in [
+        "constructed",
+        "broadcast_ambiguous",
+        "broadcast",
+        "integrity_hold",
+    ] {
+        assert!(!exact_terminal_chain_claim_attempt(
+            "00",
+            Some((status, "00"))
+        ));
+    }
+    assert!(!exact_terminal_chain_claim_attempt(
+        "00",
+        Some(("confirmed", "11"))
+    ));
+    assert!(!exact_terminal_chain_claim_attempt("00", None));
+}
+
+#[test]
 fn persisted_chain_claim_without_exact_journal_fails_before_broadcast() {
     let broadcast_calls = Cell::new(0usize);
     let result = (|| -> Result<(), AppError> {
