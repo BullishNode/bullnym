@@ -29,6 +29,7 @@ const ACCEPT_REQUESTED_AT: i64 = 1_721_000_003;
 const AMBIGUOUS_AT: i64 = 1_721_000_004;
 const TERMINAL_AT: i64 = 1_721_000_005;
 
+#[allow(clippy::too_many_arguments)]
 fn operation(
     identity: RenegotiationIdentity,
     state: RenegotiationState,
