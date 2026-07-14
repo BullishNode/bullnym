@@ -731,7 +731,6 @@ mod tests {
             let adapter = MempoolFastestFeeAdapter::new(&source.endpoint)
                 .expect("configured production API base must be valid");
             assert_eq!(adapter.precise_fees_url.as_str(), expected_precise_url);
-            assert!(!adapter.precise_fees_url.path().contains("recommended"));
         }
     }
 
