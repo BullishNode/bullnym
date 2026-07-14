@@ -202,6 +202,21 @@ pub struct AdmissionDenied {
     pub rail: Rail,
 }
 
+/// Result of applying one authenticated provider-recovery reconciliation to
+/// new-chain admission. This is deliberately finite and identity-free: source
+/// errors and recovery evidence remain at the reconciliation boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRecoveryConsistencyTransitionV1 {
+    Safe,
+    Unsafe,
+}
+
+impl ProviderRecoveryConsistencyTransitionV1 {
+    pub const fn safe(self) -> bool {
+        matches!(self, Self::Safe)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FoundationFacts {
     pub workers_enabled: bool,
@@ -439,6 +454,31 @@ impl MoneyAdmission {
 
     pub fn set_recovery_commitment_ready(&self, ready: bool) {
         self.mutate(|state, _| state.facts.recovery_commitment_ready = ready);
+    }
+
+    /// Apply one complete authenticated provider/local/witness reconciliation
+    /// to the provider-recovery admission fact.
+    ///
+    /// Callers cannot supply a bare boolean or a freely constructed report:
+    /// the accepted fact has private fields and is produced only after the
+    /// bounded startup reconciliation has validated all three recovery
+    /// sources and the Bitcoin lockup witness. Any source failure or any
+    /// classified disagreement closes the fact synchronously.
+    pub fn apply_provider_recovery_reconciliation_v1(
+        &self,
+        result: Result<
+            crate::startup_provider_reconciliation::StartupProviderReconciliationFactV1,
+            crate::startup_provider_reconciliation::StartupProviderReconciliationErrorV1,
+        >,
+    ) -> ProviderRecoveryConsistencyTransitionV1 {
+        let transition = match result {
+            Ok(fact) if fact.exact_agreement() => ProviderRecoveryConsistencyTransitionV1::Safe,
+            Ok(_) | Err(_) => ProviderRecoveryConsistencyTransitionV1::Unsafe,
+        };
+        self.mutate(|state, _| {
+            state.facts.provider_recovery_consistent = transition.safe();
+        });
+        transition
     }
 
     fn mutate(&self, f: impl FnOnce(&mut State, Instant)) {

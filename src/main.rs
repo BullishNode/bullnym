@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config.bitcoin_watcher,
         )
         .ok();
-    let provider_recovery_consistent = match (
+    let provider_recovery_reconciliation = match (
         recovery_manifest_runtime_v1.as_deref(),
         startup_chain_witness.as_ref(),
     ) {
@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "startup recovery sources differ; new Bitcoin chain-swap admission is closed"
                                 );
                             }
-                            exact_agreement
+                            Some(Ok(fact))
                         }
                         Err(error) => {
                             tracing::error!(
@@ -243,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 error = %error,
                                 "startup recovery evidence is unavailable or invalid; new Bitcoin chain-swap admission is closed"
                             );
-                            false
+                            Some(Err(error))
                         }
                     }
                 }
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         event = "startup_provider_recovery_configuration_invalid",
                         "startup recovery evidence configuration is invalid; new Bitcoin chain-swap admission is closed"
                     );
-                    false
+                    None
                 }
             }
         }
@@ -261,14 +261,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event = "startup_chain_witness_configuration_invalid",
                 "startup Bitcoin witness configuration is invalid; new Bitcoin chain-swap admission is closed"
             );
-            false
+            None
         }
         (None, _) => {
             tracing::error!(
                 event = "startup_provider_recovery_configuration_missing",
                 "startup recovery evidence configuration is unavailable; new Bitcoin chain-swap admission is closed"
             );
-            false
+            None
         }
     };
 
@@ -542,7 +542,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             boltz_client_ready: boltz.client_ready(),
             swap_key_lineage_safe,
             recovery_journal_ready: schema_and_journal_ready,
-            provider_recovery_consistent,
+            // Only the opaque reconciliation result below may open this
+            // process-local fact. Missing or invalid configuration therefore
+            // remains closed without inventing recovery evidence.
+            provider_recovery_consistent: false,
             fee_policy_ready: fee_startup.readiness().ready(),
             recovery_commitment_ready,
         },
@@ -555,6 +558,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(config.bitcoin_watcher.active_tick_secs),
         ),
     );
+    if let Some(result) = provider_recovery_reconciliation {
+        admission.apply_provider_recovery_reconciliation_v1(result);
+    }
 
     let state = AppState {
         db: pool.clone(),
