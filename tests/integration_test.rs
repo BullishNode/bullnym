@@ -17082,6 +17082,198 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
 }
 
 #[tokio::test]
+async fn merchant_settlement_replacement_persists_reason_after_child_confirmation() {
+    use pay_service::merchant_output_verifier::{
+        verify_merchant_output, ApprovedMerchantDestination, JournaledMerchantTransaction,
+        MerchantAsset, MerchantOutputEvidence, ObservedMerchantOutput,
+    };
+    use pay_service::merchant_settlement_adoption::{
+        MerchantSettlementContext, MerchantSettlementPath,
+    };
+    use pay_service::merchant_settlement_lifecycle::SettlementFinalityPolicy;
+    use pay_service::merchant_settlement_service::MerchantSettlementAdoptionService;
+
+    const ORIGINAL_BLOCK: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const REPLACEMENT_BLOCK: &str =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (swap_id, original_txid) =
+        seed_liquid_merchant_settlement_attempt(&pool, "replacement-reason").await;
+    let (
+        invoice_id,
+        boltz_swap_id,
+        destination_address,
+        destination_script_hex,
+        asset_id,
+        original_raw_tx_hex,
+    ): (Uuid, String, String, String, String, String) = sqlx::query_as(
+        "SELECT parent.invoice_id, parent.boltz_swap_id, attempt.destination_address, \
+                attempt.destination_script_hex, attempt.destination_asset_id, \
+                attempt.raw_tx_hex \
+           FROM chain_swap_records parent \
+           JOIN chain_swap_tx_attempts attempt ON attempt.chain_swap_id = parent.id \
+          WHERE parent.id = $1 AND attempt.txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&original_txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let context = MerchantSettlementContext::new(
+        invoice_id,
+        swap_id,
+        boltz_swap_id,
+        MerchantSettlementPath::LiquidClaim,
+    )
+    .unwrap();
+    let policy = SettlementFinalityPolicy::new(2, 3).unwrap();
+    let mut service =
+        MerchantSettlementAdoptionService::new(context, &original_txid, policy).unwrap();
+    let original = verified_liquid_merchant_output(
+        &original_txid,
+        &destination_address,
+        &destination_script_hex,
+        &asset_id,
+        1,
+        100,
+        ORIGINAL_BLOCK,
+    );
+    let original_outcome = service.apply_verified_confirmation(&original).unwrap();
+    pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        0,
+        &service.snapshot(),
+        &original_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    let mut replacement_transaction: lwk_wollet::elements::Transaction =
+        lwk_wollet::elements::encode::deserialize(&hex::decode(&original_raw_tx_hex).unwrap())
+            .unwrap();
+    replacement_transaction.input[0].sequence = lwk_wollet::elements::Sequence::ZERO;
+    let replacement_txid = replacement_transaction.txid().to_string();
+    let replacement_raw_tx_hex = hex::encode(lwk_wollet::elements::encode::serialize(
+        &replacement_transaction,
+    ));
+    let inserted = sqlx::query(
+        "INSERT INTO chain_swap_tx_attempts (\
+             chain_swap_id, purpose, replaces_txid, raw_tx_hex, txid, source_prevouts, \
+             destination_address, destination_script_hex, destination_asset_id, \
+             destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+             liquid_blinding_key_hex, fee_decision_purpose, fee_decision_rail, \
+             fee_decision_target, fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version\
+         ) SELECT \
+             chain_swap_id, 'liquid_claim_replacement', txid, $3, $4, source_prevouts, \
+             destination_address, destination_script_hex, destination_asset_id, \
+             destination_vout, destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+             liquid_blinding_key_hex, fee_decision_purpose, fee_decision_rail, \
+             fee_decision_target, fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version \
+           FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND txid = $2 AND purpose = 'liquid_claim'",
+    )
+    .bind(swap_id)
+    .bind(&original_txid)
+    .bind(&replacement_raw_tx_hex)
+    .bind(&replacement_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inserted.rows_affected(), 1);
+    let parent_updated = sqlx::query(
+        "UPDATE chain_swap_records SET claim_txid = $2, updated_at = NOW() \
+          WHERE id = $1 AND claim_txid = $3",
+    )
+    .bind(swap_id)
+    .bind(&replacement_txid)
+    .bind(&original_txid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(parent_updated.rows_affected(), 1);
+
+    let asset = MerchantAsset::Liquid(asset_id.clone());
+    let approved = ApprovedMerchantDestination::liquid(
+        &destination_address,
+        &destination_script_hex,
+        &asset_id,
+    );
+    let replacement_journal = JournaledMerchantTransaction::linked_replacement(
+        &replacement_txid,
+        &original_txid,
+        &destination_address,
+        &destination_script_hex,
+        asset.clone(),
+        1_000,
+        0,
+    );
+    let replacement = verify_merchant_output(
+        &original_txid,
+        &replacement_journal,
+        &approved,
+        &MerchantOutputEvidence::Authoritative(ObservedMerchantOutput::new(
+            &replacement_txid,
+            &destination_script_hex,
+            asset,
+            1_000,
+            0,
+            1,
+            Some(101),
+            Some(REPLACEMENT_BLOCK.to_owned()),
+        )),
+        1,
+    )
+    .unwrap();
+    let replacement_outcome = service.apply_verified_confirmation(&replacement).unwrap();
+    pay_service::db::persist_merchant_settlement_outcome(
+        &pool,
+        1,
+        &service.snapshot(),
+        &replacement_outcome,
+        policy,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT txid, accounting_state, deactivation_reason \
+           FROM invoice_payment_events WHERE merchant_chain_swap_id = $1 \
+          ORDER BY accounting_sequence",
+    )
+    .bind(swap_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            (
+                original_txid,
+                "inactive".to_owned(),
+                Some("replaced".to_owned()),
+            ),
+            (replacement_txid, "active".to_owned(), None),
+        ]
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn closed_admission_still_completes_existing_chain_recovery() {
     use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
