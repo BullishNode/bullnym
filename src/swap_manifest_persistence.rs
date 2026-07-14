@@ -270,11 +270,25 @@ pub async fn persist_created_chain_swap(
     runtime: &RecoveryManifestRuntimeV1,
     input: CreatedChainSwapPersistenceInput<'_>,
 ) -> Result<ChainSwapRecord, PersistCreatedChainSwapError> {
+    let faults = NoChainSwapPersistenceFaults;
+    persist_created_chain_swap_with_faults(pool, runtime, input, &faults).await
+}
+
+/// Execute the complete production post-provider path with deterministic
+/// process-loss checkpoints. The ordinary route always supplies the inert
+/// implementation through [`persist_created_chain_swap`].
+#[doc(hidden)]
+pub async fn persist_created_chain_swap_with_faults(
+    pool: &PgPool,
+    runtime: &RecoveryManifestRuntimeV1,
+    input: CreatedChainSwapPersistenceInput<'_>,
+    faults: &dyn ChainSwapPersistenceFaultInjector,
+) -> Result<ChainSwapRecord, PersistCreatedChainSwapError> {
     let prepared = prepare_created_chain_swap_persistence(input)
         .map_err(|_| PersistCreatedChainSwapError::InvalidPersistenceInput)?;
     let parts = prepared.coordinator_request_parts();
 
-    persist_and_deliver_chain_swap(
+    persist_and_deliver_chain_swap_with_faults(
         pool,
         runtime.store(),
         PersistAndDeliverChainSwapRequest {
@@ -285,6 +299,7 @@ pub async fn persist_created_chain_swap(
             merchant_policy: parts.merchant_policy,
             crypto: runtime.borrow_manifest_staging_crypto_v1(),
         },
+        faults,
     )
     .await
     .map_err(|_| PersistCreatedChainSwapError::PersistenceOrDeliveryFailed)
