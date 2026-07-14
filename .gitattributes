@@ -1,0 +1,4 @@
+# Vite bundles can contain significant trailing whitespace inside multiline
+# JavaScript template literals. These deterministic outputs are verified by
+# `cd pwa && npm run check:dist`.
+pwa/dist/assets/*.js whitespace=-blank-at-eol

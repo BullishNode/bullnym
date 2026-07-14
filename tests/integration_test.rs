@@ -18855,12 +18855,7 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
     pay_service::db::mark_chain_swap_refund_due(&pool, done_swap.id)
         .await
         .unwrap();
-    set_test_refund_destination(
-        &pool,
-        done_swap.id,
-        "bc1qdonedest0000000000000000000000000",
-    )
-    .await;
+    set_test_refund_destination(&pool, done_swap.id, "bc1qdonedest0000000000000000000000000").await;
     pay_service::db::mark_chain_swap_refunding(&pool, done_swap.id)
         .await
         .unwrap();
