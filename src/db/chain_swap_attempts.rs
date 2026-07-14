@@ -192,35 +192,104 @@ pub async fn mark_recovery_broadcast_started(
     pool: &PgPool,
     attempt_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
     let chain_swap_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT chain_swap_id FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND purpose = 'btc_recovery'",
+    )
+    .bind(attempt_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(chain_swap_id) = chain_swap_id else {
+        return Ok(0);
+    };
+    let mut tx = pool.begin().await?;
+    let parent_exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if parent_exists.is_none() {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM chain_swap_tx_attempts \
+          WHERE id = $1 AND chain_swap_id = $2 AND purpose = 'btc_recovery' FOR UPDATE",
+    )
+    .bind(attempt_id)
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(next_status) = status
+        .as_deref()
+        .and_then(recovery_broadcast_start_next_status)
+    else {
+        tx.rollback().await?;
+        return Ok(0);
+    };
+    let rows = sqlx::query(
         "UPDATE chain_swap_tx_attempts \
-            SET broadcast_attempts = broadcast_attempts + 1, \
+            SET status = $3, \
+                broadcast_attempts = broadcast_attempts + 1, \
                 first_broadcast_attempt_at = \
                     COALESCE(first_broadcast_attempt_at, NOW()), \
                 last_broadcast_attempt_at = NOW(), \
                 last_broadcast_result = 'attempt started', \
                 updated_at = NOW() \
-          WHERE id = $1 \
-            AND status IN ('constructed', 'broadcast_ambiguous') \
-          RETURNING chain_swap_id",
+          WHERE id = $1 AND chain_swap_id = $2 AND status = $4",
     )
     .bind(attempt_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(chain_swap_id) = chain_swap_id {
-        // The stale-recovery worker keys off the parent timestamp. Delay its
-        // next pass after every real broadcast call instead of hot-looping an
-        // old `refunding` row once it crosses the age threshold.
-        sqlx::query("UPDATE chain_swap_records SET updated_at = NOW() WHERE id = $1")
-            .bind(chain_swap_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(1)
-    } else {
+    .bind(chain_swap_id)
+    .bind(next_status)
+    .bind(status.as_deref().expect("status selected above"))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows != 1 {
         tx.rollback().await?;
-        Ok(0)
+        return Ok(0);
+    }
+    // The stale-recovery worker keys off the parent timestamp. Delay its next
+    // pass after every real broadcast call instead of hot-looping an old
+    // `refunding` row once it crosses the age threshold.
+    sqlx::query("UPDATE chain_swap_records SET updated_at = NOW() WHERE id = $1")
+        .bind(chain_swap_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(1)
+}
+
+fn recovery_broadcast_start_next_status(status: &str) -> Option<&'static str> {
+    match status {
+        "constructed" | "broadcast_ambiguous" => Some("broadcast_ambiguous"),
+        "broadcast" => Some("broadcast"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod recovery_broadcast_start_tests {
+    use super::recovery_broadcast_start_next_status;
+
+    #[test]
+    fn start_preserves_redrivable_wal_states_and_rejects_terminal_states() {
+        assert_eq!(
+            recovery_broadcast_start_next_status("constructed"),
+            Some("broadcast_ambiguous")
+        );
+        assert_eq!(
+            recovery_broadcast_start_next_status("broadcast_ambiguous"),
+            Some("broadcast_ambiguous")
+        );
+        assert_eq!(
+            recovery_broadcast_start_next_status("broadcast"),
+            Some("broadcast")
+        );
+        for status in ["confirmed", "finalized", "integrity_hold", "unknown"] {
+            assert_eq!(recovery_broadcast_start_next_status(status), None);
+        }
     }
 }
 

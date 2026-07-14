@@ -16885,6 +16885,26 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             .unwrap();
         assert_eq!(final_attempt.status, "broadcast");
         assert_eq!(final_attempt.raw_tx_hex, harness.expected_raw_hex);
+        assert_eq!(
+            pay_service::db::mark_recovery_broadcast_started(&pool, final_attempt.id)
+                .await
+                .unwrap(),
+            1,
+            "fault {point:?} left a broadcast attempt that could not redrive"
+        );
+        let restarted = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.status, "broadcast");
+        assert_eq!(
+            restarted.broadcast_attempts,
+            final_attempt.broadcast_attempts + 1
+        );
+        assert_eq!(
+            restarted.last_broadcast_result.as_deref(),
+            Some("attempt started")
+        );
         let final_swap = pay_service::db::get_chain_swap_by_id(&pool, harness.swap.id)
             .await
             .unwrap()
