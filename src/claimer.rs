@@ -1037,8 +1037,8 @@ pub enum ClaimOutcome {
     /// (or independently recovered the exact journaled txid). For chain swaps,
     /// this means in-flight `claiming`; observation owns accounting/finality.
     Broadcast,
-    /// Another process holds the per-swap advisory lock; the next sweep
-    /// tick (or webhook delivery) will try again.
+    /// Another process owns or just superseded this claim invocation; the
+    /// next scheduled sweep (or webhook delivery) will retry live state.
     SkippedLockHeld,
     /// Row reached a terminal state (`Claimed`, `Expired`, `ClaimStuck`,
     /// `LockupRefunded`) — nothing to do.
@@ -2805,7 +2805,7 @@ async fn claim_chain_swap_inner(
                 txid = %txid,
                 "another worker superseded the prepared Liquid claim; skipping network call"
             );
-            return Ok(ClaimOutcome::AlreadyTerminal);
+            return Ok(ClaimOutcome::SkippedLockHeld);
         }
     }
     let liquid_client = claim_clients.connect().await?;
