@@ -17611,7 +17611,7 @@ async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() 
     let master_key = startup_reconciliation_master_key();
     let chain_witness = startup_chain_witness_adapter(&server);
 
-    let fact = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+    let error = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
         &pool,
         &runtime,
         &fetcher,
@@ -17619,16 +17619,23 @@ async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() 
         &chain_witness,
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert!(!fact.exact_agreement());
-    assert_eq!(fact.repaired_obligation_count(), 0);
-    let report = fact.report();
-    assert_eq!(report.manifest_count, 0);
-    assert_eq!(report.local.local_record_count, 0);
-    assert_eq!(report.boltz.chain_record_count, 1);
-    assert_eq!(report.boltz.provider_only_chain_record_count, 1);
+    assert_eq!(
+        error,
+        pay_service::startup_provider_reconciliation::StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
+        "a provider-only chain identity without an exact local inventory must fail closed"
+    );
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let local_chain_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM chain_swap_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        local_chain_count, 0,
+        "the failed audit must not reconstruct"
+    );
     cleanup_db(&pool).await;
 }
 

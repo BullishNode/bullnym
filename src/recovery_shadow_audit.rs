@@ -6,19 +6,24 @@
 //! It deliberately performs no reconstruction, persistence, admission change,
 //! worker scheduling, chain lookup, or runtime/configuration wiring.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use async_trait::async_trait;
 use boltz_client::util::secrets::SwapMasterKey;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::boltz_restore::{BoltzRestoreKind, ValidatedBoltzRestoreSet};
+use crate::boltz_restore::{
+    BoltzRestoreKeyPurpose, BoltzRestoreKind, ValidatedBoltzRestoreRecord, ValidatedBoltzRestoreSet,
+};
 use crate::boltz_restore_fetch::{BoltzRestoreFetchError, BoltzRestoreFetcher};
 use crate::db::{load_local_chain_swap_recovery_snapshot_v1, LocalRecoverySnapshotReadErrorV1};
 use crate::local_chain_swap_recovery_audit::{
     audit_manifest_set_against_local_recovery_snapshot_v1, LocalChainSwapRecoveryAuditError,
     LocalChainSwapRecoveryAuditV1, LocalChainSwapRecoverySnapshotV1,
-    LocalRecoveryHighWaterRelationV1, MAX_RECOVERY_AUDIT_LOCAL_LINEAGES_V1,
+    LocalChainSwapRecoveryStructuralClassV1, LocalRecoveryHighWaterRelationV1,
+    MAX_RECOVERY_AUDIT_CHAIN_INVENTORY_RECORDS_V1, MAX_RECOVERY_AUDIT_LOCAL_LINEAGES_V1,
     MAX_RECOVERY_AUDIT_LOCAL_RECORDS_V1, MAX_RECOVERY_AUDIT_MANIFEST_RECORDS_V1,
 };
 use crate::swap_manifest::{
@@ -62,6 +67,7 @@ impl RecoveryShadowWitnessSourceV1 for RecoveryManifestWitnessLoaderV1 {
 pub trait RecoveryShadowLocalSnapshotSourceV1: Send + Sync {
     async fn load_validated_local_snapshot(
         &self,
+        active_root_fingerprint: &str,
     ) -> Result<LocalChainSwapRecoverySnapshotV1, LocalRecoverySnapshotReadErrorV1>;
 }
 
@@ -69,14 +75,18 @@ pub trait RecoveryShadowLocalSnapshotSourceV1: Send + Sync {
 impl RecoveryShadowLocalSnapshotSourceV1 for PgPool {
     async fn load_validated_local_snapshot(
         &self,
+        active_root_fingerprint: &str,
     ) -> Result<LocalChainSwapRecoverySnapshotV1, LocalRecoverySnapshotReadErrorV1> {
-        load_local_chain_swap_recovery_snapshot_v1(self).await
+        load_local_chain_swap_recovery_snapshot_v1(self, active_root_fingerprint).await
     }
 }
 
 /// Injectable boundary for one bounded, validated provider restore fetch.
 #[async_trait]
 pub trait RecoveryShadowBoltzSourceV1: Send + Sync {
+    /// Stable non-secret identifier for the configured xpub restore root.
+    fn active_root_fingerprint(&self) -> Option<String>;
+
     async fn fetch_validated_boltz_restore(
         &self,
     ) -> Result<ValidatedBoltzRestoreSet, BoltzRestoreFetchError>;
@@ -109,6 +119,12 @@ impl fmt::Debug for RecoveryShadowBoltzFetcherV1<'_> {
 
 #[async_trait]
 impl RecoveryShadowBoltzSourceV1 for RecoveryShadowBoltzFetcherV1<'_> {
+    fn active_root_fingerprint(&self) -> Option<String> {
+        let keypair = self.swap_master_key.derive_swapkey(0).ok()?;
+        let digest = Sha256::digest(keypair.public_key().serialize());
+        Some(hex::encode(&digest[..8]))
+    }
+
     async fn fetch_validated_boltz_restore(
         &self,
     ) -> Result<ValidatedBoltzRestoreSet, BoltzRestoreFetchError> {
@@ -116,8 +132,8 @@ impl RecoveryShadowBoltzSourceV1 for RecoveryShadowBoltzFetcherV1<'_> {
     }
 }
 
-/// Whether one cross-source comparison found only exact witnessed coverage or
-/// retained bounded candidates for a later policy boundary.
+/// Whether one cross-source comparison found exact accepted coverage (signed
+/// current-v1 or strictly fenced complete legacy) or retained candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryShadowCoverageV1 {
     Exact,
@@ -144,11 +160,12 @@ pub struct RecoveryShadowLineageClassificationsV1 {
 }
 
 impl RecoveryShadowLineageClassificationsV1 {
-    fn has_differences(self) -> bool {
-        self.local_ahead != 0
-            || self.local_behind != 0
-            || self.local_missing != 0
-            || self.manifest_missing != 0
+    fn has_unsafe_differences(self) -> bool {
+        // Reverse swaps and committed-before-provider orphan reservations can
+        // legitimately advance the shared allocator after the latest chain
+        // manifest. The exact provider/local high-water comparison below is
+        // the authoritative safety check for that reported local-ahead case.
+        self.local_behind != 0 || self.local_missing != 0 || self.manifest_missing != 0
     }
 }
 
@@ -196,6 +213,17 @@ pub struct RecoveryShadowLocalReportV1 {
     pub coverage: RecoveryShadowCoverageV1,
 }
 
+/// Sanitized exact-set accounting across provider and every local chain-swap
+/// generation. It intentionally contains counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryShadowChainInventoryReportV1 {
+    pub local_chain_record_count: usize,
+    pub current_v1_record_count: usize,
+    pub complete_legacy_record_count: usize,
+    pub exact_provider_local_id_count: usize,
+    pub legacy_provider_key_count: usize,
+}
+
 /// One bounded public report. It contains no provider ids, swap/database ids,
 /// root fingerprints, endpoints, envelopes, provider bodies, or key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +234,7 @@ pub struct RecoveryShadowReportV1 {
     pub provider_local_high_water_relation: RecoveryShadowProviderLocalHighWaterRelationV1,
     pub boltz: RecoveryShadowBoltzReportV1,
     pub local: RecoveryShadowLocalReportV1,
+    pub chain_inventory: RecoveryShadowChainInventoryReportV1,
     pub classification: RecoveryShadowClassificationV1,
 }
 
@@ -223,6 +252,7 @@ pub enum RecoveryShadowAuditErrorV1 {
     BoltzKeyLimitExceeded,
     ManifestBoltzAuditFailed,
     ManifestLocalAuditFailed,
+    ChainInventoryAuditFailed,
 }
 
 impl fmt::Display for RecoveryShadowAuditErrorV1 {
@@ -244,6 +274,9 @@ impl fmt::Display for RecoveryShadowAuditErrorV1 {
             Self::BoltzKeyLimitExceeded => "recovery shadow provider restore exceeds the key limit",
             Self::ManifestBoltzAuditFailed => "recovery shadow manifest/provider comparison failed",
             Self::ManifestLocalAuditFailed => "recovery shadow manifest/local comparison failed",
+            Self::ChainInventoryAuditFailed => {
+                "recovery shadow all-chain inventory comparison failed"
+            }
         })
     }
 }
@@ -341,12 +374,24 @@ where
             return Err(RecoveryShadowAuditErrorV1::WitnessRecordLimitExceeded);
         }
 
+        let active_root_fingerprint = self
+            .boltz
+            .active_root_fingerprint()
+            .ok_or(RecoveryShadowAuditErrorV1::BoltzRestoreFetchFailed)?;
         let local_snapshot = self
             .local
-            .load_validated_local_snapshot()
+            .load_validated_local_snapshot(&active_root_fingerprint)
             .await
             .map_err(|_| RecoveryShadowAuditErrorV1::LocalSnapshotLoadFailed)?;
+        if local_snapshot.summary.active_root_fingerprint != active_root_fingerprint {
+            return Err(RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed);
+        }
         if local_snapshot.records.len() > self.limits.local_records {
+            return Err(RecoveryShadowAuditErrorV1::LocalRecordLimitExceeded);
+        }
+        if local_snapshot.summary.chain_inventory.len()
+            > MAX_RECOVERY_AUDIT_CHAIN_INVENTORY_RECORDS_V1.min(self.limits.local_records)
+        {
             return Err(RecoveryShadowAuditErrorV1::LocalRecordLimitExceeded);
         }
         if local_snapshot.summary.lineage_high_waters.len() > self.limits.local_lineages {
@@ -376,8 +421,16 @@ where
         let local_audit =
             audit_manifest_set_against_local_recovery_snapshot_v1(&manifests, &local_snapshot)
                 .map_err(collapse_manifest_local_error)?;
+        let chain_inventory = audit_complete_chain_inventory_v1(
+            &manifests,
+            &local_snapshot,
+            &boltz_restore,
+            &local_audit,
+            &active_root_fingerprint,
+        )
+        .map_err(|_| RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed)?;
 
-        let report = build_report(&boltz_restore, &boltz_audit, &local_audit);
+        let report = build_report(&boltz_restore, &boltz_audit, &local_audit, chain_inventory);
         Ok((report, manifests))
     }
 }
@@ -392,10 +445,171 @@ fn collapse_manifest_local_error(
     RecoveryShadowAuditErrorV1::ManifestLocalAuditFailed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteChainInventoryAuditErrorV1 {
+    DuplicateProviderChainId,
+    DuplicateLocalChainId,
+    ProviderLocalSetMismatch,
+    CurrentEvidenceSetMismatch,
+    CurrentManifestSetMismatch,
+    CurrentManifestAuditMismatch,
+    CurrentActiveRootMismatch,
+    MissingActiveRootLegacyHighWater,
+    LegacyMigration044RootMismatch,
+    LegacyMigration044RoleMismatch,
+    LegacyProviderKeyShapeInvalid,
+    LegacyProviderKeyAboveHighWater,
+    CountOverflow,
+}
+
+fn audit_complete_chain_inventory_v1(
+    manifests: &[SwapManifestV1],
+    local: &LocalChainSwapRecoverySnapshotV1,
+    boltz_restore: &ValidatedBoltzRestoreSet,
+    local_audit: &LocalChainSwapRecoveryAuditV1,
+    active_root_fingerprint: &str,
+) -> Result<RecoveryShadowChainInventoryReportV1, CompleteChainInventoryAuditErrorV1> {
+    let mut provider_chain = BTreeMap::<&str, &ValidatedBoltzRestoreRecord>::new();
+    for record in boltz_restore
+        .records
+        .iter()
+        .filter(|record| record.kind == BoltzRestoreKind::Chain)
+    {
+        if provider_chain
+            .insert(record.provider_swap_id.as_str(), record)
+            .is_some()
+        {
+            return Err(CompleteChainInventoryAuditErrorV1::DuplicateProviderChainId);
+        }
+    }
+
+    let mut local_inventory = BTreeMap::new();
+    let mut current_ids = BTreeSet::new();
+    let mut complete_legacy_ids = BTreeSet::new();
+    for record in &local.summary.chain_inventory {
+        if local_inventory
+            .insert(record.boltz_swap_id.as_str(), record)
+            .is_some()
+        {
+            return Err(CompleteChainInventoryAuditErrorV1::DuplicateLocalChainId);
+        }
+        match record.structural_class {
+            LocalChainSwapRecoveryStructuralClassV1::CurrentV1 => {
+                current_ids.insert(record.boltz_swap_id.as_str());
+            }
+            LocalChainSwapRecoveryStructuralClassV1::CompleteLegacy => {
+                complete_legacy_ids.insert(record.boltz_swap_id.as_str());
+            }
+        }
+    }
+
+    let provider_ids = provider_chain.keys().copied().collect::<BTreeSet<_>>();
+    let local_ids = local_inventory.keys().copied().collect::<BTreeSet<_>>();
+    if provider_ids != local_ids {
+        return Err(CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch);
+    }
+    let current_evidence_ids = local
+        .records
+        .iter()
+        .map(|record| record.boltz_swap_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if current_ids != current_evidence_ids {
+        return Err(CompleteChainInventoryAuditErrorV1::CurrentEvidenceSetMismatch);
+    }
+    let manifested_ids = manifests
+        .iter()
+        .map(|manifest| manifest.restore_identity.boltz_swap_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if current_ids != manifested_ids {
+        return Err(CompleteChainInventoryAuditErrorV1::CurrentManifestSetMismatch);
+    }
+    if manifests
+        .iter()
+        .any(|manifest| manifest.derivation_lineage.root_fingerprint != active_root_fingerprint)
+        || local
+            .records
+            .iter()
+            .any(|record| record.root_fingerprint != active_root_fingerprint)
+    {
+        return Err(CompleteChainInventoryAuditErrorV1::CurrentActiveRootMismatch);
+    }
+    if local_audit.exact_match_count != current_ids.len()
+        || !local_audit.manifest_only_chain_swap_ids.is_empty()
+        || !local_audit.local_only_chain_swap_ids.is_empty()
+    {
+        return Err(CompleteChainInventoryAuditErrorV1::CurrentManifestAuditMismatch);
+    }
+
+    let mut legacy_provider_key_count = 0_usize;
+    if !complete_legacy_ids.is_empty() {
+        let legacy_high_water = local
+            .summary
+            .active_root_legacy_high_water
+            .ok_or(CompleteChainInventoryAuditErrorV1::MissingActiveRootLegacyHighWater)?;
+        for provider_id in &complete_legacy_ids {
+            let local_record = local_inventory
+                .get(provider_id)
+                .ok_or(CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch)?;
+            let provider_record = provider_chain
+                .get(provider_id)
+                .ok_or(CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch)?;
+            if provider_record.keys.len() != 2 {
+                return Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyShapeInvalid);
+            }
+            let mut claims = provider_record
+                .keys
+                .iter()
+                .filter(|key| key.purpose == BoltzRestoreKeyPurpose::ChainClaim);
+            let mut refunds = provider_record
+                .keys
+                .iter()
+                .filter(|key| key.purpose == BoltzRestoreKeyPurpose::ChainRefund);
+            let Some(claim) = claims.next() else {
+                return Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyShapeInvalid);
+            };
+            let Some(refund) = refunds.next() else {
+                return Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyShapeInvalid);
+            };
+            if claims.next().is_some() || refunds.next().is_some() {
+                return Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyShapeInvalid);
+            }
+            legacy_provider_key_count = legacy_provider_key_count
+                .checked_add(provider_record.keys.len())
+                .ok_or(CompleteChainInventoryAuditErrorV1::CountOverflow)?;
+            if provider_record
+                .keys
+                .iter()
+                .any(|key| i64::from(key.child_index) > legacy_high_water)
+            {
+                return Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyAboveHighWater);
+            }
+            if let Some(legacy) = &local_record.legacy_derivation {
+                if legacy.root_fingerprint != active_root_fingerprint {
+                    return Err(CompleteChainInventoryAuditErrorV1::LegacyMigration044RootMismatch);
+                }
+                if i64::from(claim.child_index) != legacy.claim_child_index
+                    || i64::from(refund.child_index) != legacy.refund_child_index
+                {
+                    return Err(CompleteChainInventoryAuditErrorV1::LegacyMigration044RoleMismatch);
+                }
+            }
+        }
+    }
+
+    Ok(RecoveryShadowChainInventoryReportV1 {
+        local_chain_record_count: local_ids.len(),
+        current_v1_record_count: current_ids.len(),
+        complete_legacy_record_count: complete_legacy_ids.len(),
+        exact_provider_local_id_count: provider_ids.len(),
+        legacy_provider_key_count,
+    })
+}
+
 fn build_report(
     boltz_restore: &ValidatedBoltzRestoreSet,
     boltz_audit: &SwapManifestBoltzAuditV1,
     local_audit: &LocalChainSwapRecoveryAuditV1,
+    chain_inventory: RecoveryShadowChainInventoryReportV1,
 ) -> RecoveryShadowReportV1 {
     let chain_record_count = boltz_restore
         .records
@@ -403,11 +617,9 @@ fn build_report(
         .filter(|record| record.kind == BoltzRestoreKind::Chain)
         .count();
     let reverse_record_count = boltz_restore.records.len() - chain_record_count;
-    let boltz_coverage = if boltz_audit.provider_only_chain_record_count == 0 {
-        RecoveryShadowCoverageV1::Exact
-    } else {
-        RecoveryShadowCoverageV1::CandidatesPresent
-    };
+    // The strict inventory audit above proves every provider-only chain record
+    // is an exact local complete-legacy identity under the active-root fence.
+    let boltz_coverage = RecoveryShadowCoverageV1::Exact;
 
     let mut lineage_classifications = RecoveryShadowLineageClassificationsV1::default();
     for comparison in &local_audit.lineage_high_waters {
@@ -459,7 +671,7 @@ fn build_report(
 
     let classification = if boltz_coverage == RecoveryShadowCoverageV1::Exact
         && local_coverage == RecoveryShadowCoverageV1::Exact
-        && !lineage_classifications.has_differences()
+        && !lineage_classifications.has_unsafe_differences()
         && !provider_local_high_water_relation.provider_is_ahead()
     {
         RecoveryShadowClassificationV1::Consistent
@@ -490,6 +702,7 @@ fn build_report(
             lineage_classifications,
             coverage: local_coverage,
         },
+        chain_inventory,
         classification,
     }
 }
@@ -530,6 +743,7 @@ mod tests {
     use crate::db::LocalRecoverySnapshotReadStageV1;
     use crate::local_chain_swap_recovery_audit::{
         LocalChainSwapRecoveryAllocationV1, LocalChainSwapRecoveryEvidenceV1,
+        LocalChainSwapRecoveryInventoryRecordV1, LocalChainSwapRecoveryLegacyDerivationV1,
         LocalChainSwapRecoverySnapshotSummaryV1, LocalRecoveryLineageComparisonV1,
         LocalRecoveryLineageHighWaterV1,
     };
@@ -570,6 +784,7 @@ mod tests {
     impl RecoveryShadowLocalSnapshotSourceV1 for FakeLocal {
         async fn load_validated_local_snapshot(
             &self,
+            _: &str,
         ) -> Result<LocalChainSwapRecoverySnapshotV1, LocalRecoverySnapshotReadErrorV1> {
             self.trace.lock().unwrap().push("local");
             self.result.clone()
@@ -583,6 +798,10 @@ mod tests {
 
     #[async_trait]
     impl RecoveryShadowBoltzSourceV1 for FakeBoltz {
+        fn active_root_fingerprint(&self) -> Option<String> {
+            Some(ROOT_SENTINEL.into())
+        }
+
         async fn fetch_validated_boltz_restore(
             &self,
         ) -> Result<ValidatedBoltzRestoreSet, BoltzRestoreFetchError> {
@@ -630,6 +849,10 @@ mod tests {
             records: Vec::new(),
             summary: LocalChainSwapRecoverySnapshotSummaryV1 {
                 record_count: 0,
+                chain_inventory_record_count: 0,
+                chain_inventory: Vec::new(),
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
                 lineage_high_waters: Vec::new(),
             },
         }
@@ -639,6 +862,50 @@ mod tests {
         ValidatedBoltzRestoreSet {
             records: Vec::new(),
             max_child_index: None,
+        }
+    }
+
+    fn empty_local_audit() -> LocalChainSwapRecoveryAuditV1 {
+        LocalChainSwapRecoveryAuditV1 {
+            manifest_set: SwapManifestSetAuditV1 {
+                manifest_count: 0,
+                last_manifest_sequence: None,
+                last_manifest_id: None,
+                lineage_high_waters: Vec::new(),
+            },
+            local_record_count: 0,
+            exact_match_count: 0,
+            manifest_only_chain_swap_ids: Vec::new(),
+            local_only_chain_swap_ids: Vec::new(),
+            lineage_high_waters: Vec::new(),
+        }
+    }
+
+    fn legacy_inventory(
+        boltz_swap_id: &str,
+        legacy_derivation: Option<LocalChainSwapRecoveryLegacyDerivationV1>,
+    ) -> LocalChainSwapRecoveryInventoryRecordV1 {
+        LocalChainSwapRecoveryInventoryRecordV1 {
+            boltz_swap_id: boltz_swap_id.into(),
+            structural_class: LocalChainSwapRecoveryStructuralClassV1::CompleteLegacy,
+            legacy_derivation,
+        }
+    }
+
+    fn legacy_snapshot(
+        chain_inventory: Vec<LocalChainSwapRecoveryInventoryRecordV1>,
+        active_root_legacy_high_water: Option<i64>,
+    ) -> LocalChainSwapRecoverySnapshotV1 {
+        LocalChainSwapRecoverySnapshotV1 {
+            records: Vec::new(),
+            summary: LocalChainSwapRecoverySnapshotSummaryV1 {
+                record_count: 0,
+                chain_inventory_record_count: chain_inventory.len(),
+                chain_inventory,
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water,
+                lineage_high_waters: Vec::new(),
+            },
         }
     }
 
@@ -717,6 +984,17 @@ mod tests {
         }
     }
 
+    fn provider_chain_record_at(
+        provider_swap_id: &str,
+        claim_child_index: u32,
+        refund_child_index: u32,
+    ) -> ValidatedBoltzRestoreRecord {
+        let mut record = provider_record(provider_swap_id, BoltzRestoreKind::Chain);
+        record.keys[0].child_index = claim_child_index;
+        record.keys[1].child_index = refund_child_index;
+        record
+    }
+
     fn invalid_manifest(provider_sentinel: &str) -> SwapManifestV1 {
         serde_json::from_value(json!({
             "format": SWAP_MANIFEST_FORMAT,
@@ -791,6 +1069,16 @@ mod tests {
         }
     }
 
+    fn empty_chain_inventory_report() -> RecoveryShadowChainInventoryReportV1 {
+        RecoveryShadowChainInventoryReportV1 {
+            local_chain_record_count: 0,
+            current_v1_record_count: 0,
+            complete_legacy_record_count: 0,
+            exact_provider_local_id_count: 0,
+            legacy_provider_key_count: 0,
+        }
+    }
+
     fn assert_trace(actual: &Trace, expected: &[&'static str]) {
         assert_eq!(&*actual.lock().unwrap(), expected);
     }
@@ -832,6 +1120,13 @@ mod tests {
                     lineage_classifications: RecoveryShadowLineageClassificationsV1::default(),
                     coverage: RecoveryShadowCoverageV1::Exact,
                 },
+                chain_inventory: RecoveryShadowChainInventoryReportV1 {
+                    local_chain_record_count: 0,
+                    current_v1_record_count: 0,
+                    complete_legacy_record_count: 0,
+                    exact_provider_local_id_count: 0,
+                    legacy_provider_key_count: 0,
+                },
                 classification: RecoveryShadowClassificationV1::Consistent,
             }
         );
@@ -848,6 +1143,14 @@ mod tests {
             records: vec![local_record],
             summary: LocalChainSwapRecoverySnapshotSummaryV1 {
                 record_count: 1,
+                chain_inventory_record_count: 1,
+                chain_inventory: vec![LocalChainSwapRecoveryInventoryRecordV1 {
+                    boltz_swap_id: "LocalOnlyProviderRecord".into(),
+                    structural_class: LocalChainSwapRecoveryStructuralClassV1::CurrentV1,
+                    legacy_derivation: None,
+                }],
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
                 lineage_high_waters: vec![LocalRecoveryLineageHighWaterV1 {
                     root_fingerprint: ROOT_SENTINEL.into(),
                     key_epoch: 1,
@@ -866,27 +1169,10 @@ mod tests {
             fake_boltz(&calls, Ok(provider)),
         );
 
-        let report = coordinator.run_once().await.unwrap();
+        let error = coordinator.run_once().await.unwrap_err();
 
-        assert_eq!(
-            report.classification,
-            RecoveryShadowClassificationV1::DifferencesClassified
-        );
-        assert_eq!(report.boltz.provider_only_chain_record_count, 1);
-        assert_eq!(
-            report.boltz.coverage,
-            RecoveryShadowCoverageV1::CandidatesPresent
-        );
-        assert_eq!(report.local.local_only_record_count, 1);
-        assert_eq!(report.local.manifest_only_record_count, 0);
-        assert_eq!(report.local.lineage_classifications.manifest_missing, 1);
-        assert_eq!(report.local.local_max_child_index, Some(11));
-        assert_eq!(
-            report.local.coverage,
-            RecoveryShadowCoverageV1::CandidatesPresent
-        );
-
-        let debug = format!("{report:?}");
+        assert_eq!(error, RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed);
+        let debug = format!("{error:?}");
         for forbidden in [
             PROVIDER_SENTINEL,
             ROOT_SENTINEL,
@@ -898,6 +1184,320 @@ mod tests {
             assert!(!debug.contains(forbidden), "report leaked {forbidden:?}");
         }
         assert_trace(&calls, &["witness", "local", "boltz"]);
+    }
+
+    #[test]
+    fn complete_legacy_inventory_requires_exact_ids_roles_and_active_root_fence() {
+        let migration_044 = LocalChainSwapRecoveryLegacyDerivationV1 {
+            root_fingerprint: ROOT_SENTINEL.into(),
+            claim_child_index: 22,
+            refund_child_index: 23,
+        };
+        let local = legacy_snapshot(
+            vec![
+                legacy_inventory("LegacyPre044", None),
+                legacy_inventory("LegacyMigration044", Some(migration_044.clone())),
+            ],
+            Some(23),
+        );
+        let provider = provider_set(vec![
+            provider_chain_record_at("LegacyPre044", 20, 21),
+            provider_chain_record_at("LegacyMigration044", 22, 23),
+        ]);
+        let report = audit_complete_chain_inventory_v1(
+            &[],
+            &local,
+            &provider,
+            &empty_local_audit(),
+            ROOT_SENTINEL,
+        )
+        .unwrap();
+        assert_eq!(
+            report,
+            RecoveryShadowChainInventoryReportV1 {
+                local_chain_record_count: 2,
+                current_v1_record_count: 0,
+                complete_legacy_record_count: 2,
+                exact_provider_local_id_count: 2,
+                legacy_provider_key_count: 4,
+            }
+        );
+
+        let missing = legacy_snapshot(
+            vec![
+                legacy_inventory("LegacyPre044", None),
+                legacy_inventory("MissingLocal", None),
+            ],
+            Some(23),
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &missing,
+                &provider,
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch)
+        );
+
+        let substituted = legacy_snapshot(
+            vec![
+                legacy_inventory("LegacyPre044", None),
+                legacy_inventory("SubstitutedLocal", None),
+            ],
+            Some(23),
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &substituted,
+                &provider,
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch)
+        );
+
+        let above_high_water =
+            legacy_snapshot(vec![legacy_inventory("LegacyPre044", None)], Some(20));
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &above_high_water,
+                &provider_set(vec![provider_chain_record_at("LegacyPre044", 20, 21,)]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyAboveHighWater)
+        );
+
+        let wrong_root = legacy_snapshot(
+            vec![legacy_inventory(
+                "LegacyMigration044",
+                Some(LocalChainSwapRecoveryLegacyDerivationV1 {
+                    root_fingerprint: "ffeeddccbbaa9988".into(),
+                    ..migration_044.clone()
+                }),
+            )],
+            Some(23),
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &wrong_root,
+                &provider_set(vec![
+                    provider_chain_record_at("LegacyMigration044", 22, 23,)
+                ]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::LegacyMigration044RootMismatch)
+        );
+
+        let wrong_role = legacy_snapshot(
+            vec![legacy_inventory(
+                "LegacyMigration044",
+                Some(LocalChainSwapRecoveryLegacyDerivationV1 {
+                    claim_child_index: 23,
+                    refund_child_index: 22,
+                    ..migration_044
+                }),
+            )],
+            Some(23),
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &wrong_role,
+                &provider_set(vec![
+                    provider_chain_record_at("LegacyMigration044", 22, 23,)
+                ]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::LegacyMigration044RoleMismatch)
+        );
+    }
+
+    #[test]
+    fn legacy_inventory_rejects_duplicates_partial_roles_and_current_without_witness() {
+        let provider_record = provider_chain_record_at("LegacyRecord", 20, 21);
+        let duplicate_provider =
+            provider_set(vec![provider_record.clone(), provider_record.clone()]);
+        let local = legacy_snapshot(vec![legacy_inventory("LegacyRecord", None)], Some(21));
+        let no_legacy_fence = legacy_snapshot(vec![legacy_inventory("LegacyRecord", None)], None);
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &no_legacy_fence,
+                &provider_set(vec![provider_record.clone()]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::MissingActiveRootLegacyHighWater)
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &local,
+                &duplicate_provider,
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::DuplicateProviderChainId)
+        );
+
+        let duplicate_local = legacy_snapshot(
+            vec![
+                legacy_inventory("LegacyRecord", None),
+                legacy_inventory("LegacyRecord", None),
+            ],
+            Some(21),
+        );
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &duplicate_local,
+                &provider_set(vec![provider_record.clone()]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::DuplicateLocalChainId)
+        );
+
+        let mut duplicate_role = provider_record.clone();
+        duplicate_role.keys[1].purpose = BoltzRestoreKeyPurpose::ChainClaim;
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &local,
+                &provider_set(vec![duplicate_role]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::LegacyProviderKeyShapeInvalid)
+        );
+
+        let mut current = local_only_record();
+        current.boltz_swap_id = "CurrentWithoutWitness".into();
+        let current_local = LocalChainSwapRecoverySnapshotV1 {
+            records: vec![current],
+            summary: LocalChainSwapRecoverySnapshotSummaryV1 {
+                record_count: 1,
+                chain_inventory_record_count: 1,
+                chain_inventory: vec![LocalChainSwapRecoveryInventoryRecordV1 {
+                    boltz_swap_id: "CurrentWithoutWitness".into(),
+                    structural_class: LocalChainSwapRecoveryStructuralClassV1::CurrentV1,
+                    legacy_derivation: None,
+                }],
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
+                lineage_high_waters: Vec::new(),
+            },
+        };
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[],
+                &current_local,
+                &provider_set(vec![provider_chain_record_at(
+                    "CurrentWithoutWitness",
+                    20,
+                    21,
+                )]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::CurrentManifestSetMismatch)
+        );
+
+        for error in [
+            CompleteChainInventoryAuditErrorV1::DuplicateProviderChainId,
+            CompleteChainInventoryAuditErrorV1::DuplicateLocalChainId,
+            CompleteChainInventoryAuditErrorV1::ProviderLocalSetMismatch,
+            CompleteChainInventoryAuditErrorV1::LegacyProviderKeyAboveHighWater,
+        ] {
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("LegacyRecord"));
+            assert!(!debug.contains(ROOT_SENTINEL));
+        }
+    }
+
+    #[test]
+    fn current_inventory_root_must_equal_the_authoritative_provider_root() {
+        const ALTERNATE_ROOT: &str = "ffeeddccbbaa9988";
+        let mut manifest = invalid_manifest("CurrentAlternateRoot");
+        manifest.derivation_lineage.root_fingerprint = ALTERNATE_ROOT.into();
+        let mut current = local_only_record();
+        current.boltz_swap_id = "CurrentAlternateRoot".into();
+        current.root_fingerprint = ALTERNATE_ROOT.into();
+        let local = LocalChainSwapRecoverySnapshotV1 {
+            records: vec![current],
+            summary: LocalChainSwapRecoverySnapshotSummaryV1 {
+                record_count: 1,
+                chain_inventory_record_count: 1,
+                chain_inventory: vec![LocalChainSwapRecoveryInventoryRecordV1 {
+                    boltz_swap_id: "CurrentAlternateRoot".into(),
+                    structural_class: LocalChainSwapRecoveryStructuralClassV1::CurrentV1,
+                    legacy_derivation: None,
+                }],
+                active_root_fingerprint: ALTERNATE_ROOT.into(),
+                active_root_legacy_high_water: None,
+                lineage_high_waters: Vec::new(),
+            },
+        };
+        assert_eq!(
+            audit_complete_chain_inventory_v1(
+                &[manifest],
+                &local,
+                &provider_set(vec![provider_chain_record_at(
+                    "CurrentAlternateRoot",
+                    20,
+                    21,
+                )]),
+                &empty_local_audit(),
+                ROOT_SENTINEL,
+            ),
+            Err(CompleteChainInventoryAuditErrorV1::CurrentActiveRootMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_a_canonical_but_non_authoritative_snapshot_root() {
+        const ALTERNATE_ROOT: &str = "ffeeddccbbaa9988";
+        let calls = trace();
+        let mut local = legacy_snapshot(
+            vec![legacy_inventory(
+                "LegacyAlternateRoot",
+                Some(LocalChainSwapRecoveryLegacyDerivationV1 {
+                    root_fingerprint: ALTERNATE_ROOT.into(),
+                    claim_child_index: 20,
+                    refund_child_index: 21,
+                }),
+            )],
+            Some(21),
+        );
+        local.summary.active_root_fingerprint = ALTERNATE_ROOT.into();
+        let error = RecoveryShadowAuditCoordinatorV1::new(
+            fake_witness(&calls, Ok(Vec::new())),
+            fake_local(&calls, Ok(local)),
+            fake_boltz(
+                &calls,
+                Ok(provider_set(vec![provider_chain_record_at(
+                    "LegacyAlternateRoot",
+                    20,
+                    21,
+                )])),
+            ),
+        )
+        .run_once()
+        .await
+        .unwrap_err();
+        assert_eq!(error, RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed);
+        assert_trace(&calls, &["witness", "local"]);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(ALTERNATE_ROOT));
+        assert!(!rendered.contains("LegacyAlternateRoot"));
     }
 
     #[test]
@@ -956,7 +1556,12 @@ mod tests {
             lineage_high_waters,
         };
 
-        let report = build_report(&boltz_restore, &boltz_audit, &local_audit);
+        let report = build_report(
+            &boltz_restore,
+            &boltz_audit,
+            &local_audit,
+            empty_chain_inventory_report(),
+        );
 
         assert_eq!(report.manifest_count, 2);
         assert_eq!(report.manifest_lineage_count, 1);
@@ -1010,10 +1615,20 @@ mod tests {
     }
 
     #[test]
-    fn local_ahead_and_manifest_missing_lineages_remain_differences() {
+    fn only_local_ahead_is_not_an_unsafe_lineage_difference() {
+        assert!(!RecoveryShadowLineageClassificationsV1 {
+            local_ahead: 1,
+            ..RecoveryShadowLineageClassificationsV1::default()
+        }
+        .has_unsafe_differences());
+
         for classifications in [
             RecoveryShadowLineageClassificationsV1 {
-                local_ahead: 1,
+                local_behind: 1,
+                ..RecoveryShadowLineageClassificationsV1::default()
+            },
+            RecoveryShadowLineageClassificationsV1 {
+                local_missing: 1,
                 ..RecoveryShadowLineageClassificationsV1::default()
             },
             RecoveryShadowLineageClassificationsV1 {
@@ -1021,7 +1636,70 @@ mod tests {
                 ..RecoveryShadowLineageClassificationsV1::default()
             },
         ] {
-            assert!(classifications.has_differences());
+            assert!(classifications.has_unsafe_differences());
+        }
+    }
+
+    #[test]
+    fn local_ahead_is_consistent_when_provider_is_equal_or_behind_local() {
+        let manifest_set = SwapManifestSetAuditV1 {
+            manifest_count: 1,
+            last_manifest_sequence: Some(1),
+            last_manifest_id: Some(Uuid::from_u128(0x901)),
+            lineage_high_waters: vec![ManifestLineageHighWaterV1 {
+                root_fingerprint: ROOT_SENTINEL.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                child_index: 29,
+            }],
+        };
+        let provider = provider_set(vec![
+            provider_chain_record_at("ExistingChainRecord", 28, 29),
+            provider_record("LaterReverseRecord", BoltzRestoreKind::Reverse),
+        ]);
+        let boltz_audit = SwapManifestBoltzAuditV1 {
+            manifest_set: manifest_set.clone(),
+            provider_only_chain_swap_ids: Vec::new(),
+            provider_only_chain_record_count: 0,
+            provider_max_child_index: Some(30),
+        };
+
+        for (local_child_index, expected_relation) in [
+            (30, RecoveryShadowProviderLocalHighWaterRelationV1::Equal),
+            (
+                31,
+                RecoveryShadowProviderLocalHighWaterRelationV1::LocalAhead,
+            ),
+        ] {
+            let local_audit = LocalChainSwapRecoveryAuditV1 {
+                manifest_set: manifest_set.clone(),
+                local_record_count: 1,
+                exact_match_count: 1,
+                manifest_only_chain_swap_ids: Vec::new(),
+                local_only_chain_swap_ids: Vec::new(),
+                lineage_high_waters: vec![LocalRecoveryLineageComparisonV1 {
+                    root_fingerprint: ROOT_SENTINEL.into(),
+                    key_epoch: 1,
+                    derivation_scheme_version: 1,
+                    signed_manifest_child_index: Some(29),
+                    local_child_index: Some(local_child_index),
+                    relation: LocalRecoveryHighWaterRelationV1::LocalAhead,
+                }],
+            };
+
+            let report = build_report(
+                &provider,
+                &boltz_audit,
+                &local_audit,
+                empty_chain_inventory_report(),
+            );
+
+            assert_eq!(report.local.lineage_classifications.local_ahead, 1);
+            assert_eq!(report.provider_local_high_water_relation, expected_relation);
+            assert_eq!(
+                report.classification,
+                RecoveryShadowClassificationV1::Consistent
+            );
         }
     }
 
@@ -1064,7 +1742,12 @@ mod tests {
             }],
         };
 
-        let report = build_report(&provider, &boltz_audit, &local_audit);
+        let report = build_report(
+            &provider,
+            &boltz_audit,
+            &local_audit,
+            empty_chain_inventory_report(),
+        );
 
         assert_eq!(report.boltz.coverage, RecoveryShadowCoverageV1::Exact);
         assert_eq!(report.local.coverage, RecoveryShadowCoverageV1::Exact);
@@ -1152,6 +1835,10 @@ mod tests {
             records: vec![record.clone(), record],
             summary: LocalChainSwapRecoverySnapshotSummaryV1 {
                 record_count: 2,
+                chain_inventory_record_count: 0,
+                chain_inventory: Vec::new(),
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
                 lineage_high_waters: Vec::new(),
             },
         };
@@ -1178,6 +1865,10 @@ mod tests {
             records: Vec::new(),
             summary: LocalChainSwapRecoverySnapshotSummaryV1 {
                 record_count: 0,
+                chain_inventory_record_count: 0,
+                chain_inventory: Vec::new(),
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
                 lineage_high_waters: vec![high_water.clone(), high_water],
             },
         };
@@ -1260,6 +1951,10 @@ mod tests {
             records: Vec::new(),
             summary: LocalChainSwapRecoverySnapshotSummaryV1 {
                 record_count: 1,
+                chain_inventory_record_count: 0,
+                chain_inventory: Vec::new(),
+                active_root_fingerprint: ROOT_SENTINEL.into(),
+                active_root_legacy_high_water: None,
                 lineage_high_waters: Vec::new(),
             },
         };
@@ -1287,6 +1982,7 @@ mod tests {
             RecoveryShadowAuditErrorV1::BoltzKeyLimitExceeded,
             RecoveryShadowAuditErrorV1::ManifestBoltzAuditFailed,
             RecoveryShadowAuditErrorV1::ManifestLocalAuditFailed,
+            RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed,
         ];
 
         for error in errors {
@@ -1330,10 +2026,16 @@ mod tests {
         let master_key =
             SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
         let adapter = RecoveryShadowBoltzFetcherV1::new(&fetcher, &master_key);
+        let active_root_fingerprint = adapter.active_root_fingerprint().unwrap();
+        assert_eq!(active_root_fingerprint.len(), 16);
+        assert!(active_root_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
         let debug = format!("{adapter:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(ENDPOINT_SENTINEL));
         assert!(!debug.contains(TEST_MNEMONIC));
         assert!(!debug.contains(&master_key.get_master_xpub().to_string()));
+        assert!(!debug.contains(&active_root_fingerprint));
     }
 }

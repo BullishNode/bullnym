@@ -21,6 +21,9 @@ use crate::swap_manifest::{
 pub const MAX_RECOVERY_AUDIT_MANIFEST_RECORDS_V1: usize = 10_000;
 /// Maximum local chain-swap evidence records accepted by one snapshot.
 pub const MAX_RECOVERY_AUDIT_LOCAL_RECORDS_V1: usize = 10_000;
+/// Maximum all-generation chain-swap identities accepted by one snapshot.
+pub const MAX_RECOVERY_AUDIT_CHAIN_INVENTORY_RECORDS_V1: usize =
+    MAX_RECOVERY_AUDIT_LOCAL_RECORDS_V1;
 /// Maximum derivation namespaces accepted in one local snapshot summary.
 pub const MAX_RECOVERY_AUDIT_LOCAL_LINEAGES_V1: usize = 4_096;
 
@@ -87,6 +90,60 @@ pub struct LocalRecoveryLineageHighWaterV1 {
     pub child_index: i64,
 }
 
+/// Structurally complete local generation represented by one chain-swap row.
+///
+/// Current-v1 rows carry complete #65 allocation lineage and #80 creation
+/// evidence. Complete legacy rows carry neither, and their migration-044
+/// root/index tuple is either wholly present or wholly absent. No partial
+/// generation is representable at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalChainSwapRecoveryStructuralClassV1 {
+    CurrentV1,
+    CompleteLegacy,
+}
+
+/// Optional complete migration-044 identity retained for an otherwise legacy
+/// row. Pre-044 rows have no such tuple. Values remain internal and redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalChainSwapRecoveryLegacyDerivationV1 {
+    pub root_fingerprint: String,
+    pub claim_child_index: i64,
+    pub refund_child_index: i64,
+}
+
+impl fmt::Debug for LocalChainSwapRecoveryLegacyDerivationV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalChainSwapRecoveryLegacyDerivationV1")
+            .field("root_fingerprint", &REDACTED)
+            .field("claim_child_index", &REDACTED)
+            .field("refund_child_index", &REDACTED)
+            .finish()
+    }
+}
+
+/// One bounded all-generation identity used only for exact provider/local set
+/// accounting. The provider id is necessary internally but always redacted by
+/// `Debug` and is never copied into the public recovery report.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalChainSwapRecoveryInventoryRecordV1 {
+    pub boltz_swap_id: String,
+    pub structural_class: LocalChainSwapRecoveryStructuralClassV1,
+    pub legacy_derivation: Option<LocalChainSwapRecoveryLegacyDerivationV1>,
+}
+
+impl fmt::Debug for LocalChainSwapRecoveryInventoryRecordV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalChainSwapRecoveryInventoryRecordV1")
+            .field("boltz_swap_id", &REDACTED)
+            .field("structural_class", &self.structural_class)
+            .field(
+                "legacy_derivation_present",
+                &self.legacy_derivation.is_some(),
+            )
+            .finish()
+    }
+}
+
 impl fmt::Debug for LocalRecoveryLineageHighWaterV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalRecoveryLineageHighWaterV1")
@@ -102,6 +159,11 @@ impl fmt::Debug for LocalRecoveryLineageHighWaterV1 {
 #[derive(Clone, PartialEq, Eq)]
 pub struct LocalChainSwapRecoverySnapshotSummaryV1 {
     pub record_count: usize,
+    pub chain_inventory_record_count: usize,
+    pub chain_inventory: Vec<LocalChainSwapRecoveryInventoryRecordV1>,
+    pub active_root_fingerprint: String,
+    /// Immutable migration-050 exclusion for the configured active root.
+    pub active_root_legacy_high_water: Option<i64>,
     pub lineage_high_waters: Vec<LocalRecoveryLineageHighWaterV1>,
 }
 
@@ -109,6 +171,16 @@ impl fmt::Debug for LocalChainSwapRecoverySnapshotSummaryV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalChainSwapRecoverySnapshotSummaryV1")
             .field("record_count", &self.record_count)
+            .field(
+                "chain_inventory_record_count",
+                &self.chain_inventory_record_count,
+            )
+            .field("chain_inventory", &self.chain_inventory.len())
+            .field("active_root_fingerprint", &REDACTED)
+            .field(
+                "active_root_legacy_high_water_present",
+                &self.active_root_legacy_high_water.is_some(),
+            )
             .field("lineage_high_waters", &self.lineage_high_waters)
             .finish()
     }
@@ -243,9 +315,13 @@ pub enum LocalChainSwapRecoveryAuditError {
     InvalidManifestSet,
     TooManyManifestRecords,
     TooManyLocalRecords,
+    TooManyChainInventoryRecords,
     TooManyLocalLineages,
     SnapshotRecordCountMismatch,
+    SnapshotChainInventoryRecordCountMismatch,
     InvalidLocalEvidence,
+    InvalidChainInventoryEvidence,
+    InvalidActiveRootLegacyHighWater,
     InvalidLocalLineageHighWater,
     DuplicateLocalChainSwapId,
     DuplicateLocalBoltzSwapId,
@@ -254,6 +330,8 @@ pub enum LocalChainSwapRecoveryAuditError {
     DuplicateLocalPublicKey,
     DuplicateLocalClaimPreimageHash,
     DuplicateLocalCreationResponseHash,
+    DuplicateChainInventoryBoltzSwapId,
+    CurrentChainInventoryMismatch,
     DuplicateLocalLineage,
     MissingLocalLineageHighWater,
     LocalLineageHighWaterTrailsEvidence,
@@ -268,9 +346,17 @@ impl fmt::Debug for LocalChainSwapRecoveryAuditError {
             Self::FieldConflict(field) => f.debug_tuple("FieldConflict").field(field).finish(),
             Self::TooManyManifestRecords => f.write_str("TooManyManifestRecords"),
             Self::TooManyLocalRecords => f.write_str("TooManyLocalRecords"),
+            Self::TooManyChainInventoryRecords => f.write_str("TooManyChainInventoryRecords"),
             Self::TooManyLocalLineages => f.write_str("TooManyLocalLineages"),
             Self::SnapshotRecordCountMismatch => f.write_str("SnapshotRecordCountMismatch"),
+            Self::SnapshotChainInventoryRecordCountMismatch => {
+                f.write_str("SnapshotChainInventoryRecordCountMismatch")
+            }
             Self::InvalidLocalEvidence => f.write_str("InvalidLocalEvidence"),
+            Self::InvalidChainInventoryEvidence => f.write_str("InvalidChainInventoryEvidence"),
+            Self::InvalidActiveRootLegacyHighWater => {
+                f.write_str("InvalidActiveRootLegacyHighWater")
+            }
             Self::InvalidLocalLineageHighWater => f.write_str("InvalidLocalLineageHighWater"),
             Self::DuplicateLocalChainSwapId => f.write_str("DuplicateLocalChainSwapId"),
             Self::DuplicateLocalBoltzSwapId => f.write_str("DuplicateLocalBoltzSwapId"),
@@ -283,6 +369,10 @@ impl fmt::Debug for LocalChainSwapRecoveryAuditError {
             Self::DuplicateLocalCreationResponseHash => {
                 f.write_str("DuplicateLocalCreationResponseHash")
             }
+            Self::DuplicateChainInventoryBoltzSwapId => {
+                f.write_str("DuplicateChainInventoryBoltzSwapId")
+            }
+            Self::CurrentChainInventoryMismatch => f.write_str("CurrentChainInventoryMismatch"),
             Self::DuplicateLocalLineage => f.write_str("DuplicateLocalLineage"),
             Self::MissingLocalLineageHighWater => f.write_str("MissingLocalLineageHighWater"),
             Self::LocalLineageHighWaterTrailsEvidence => {
@@ -305,14 +395,26 @@ impl fmt::Display for LocalChainSwapRecoveryAuditError {
             Self::TooManyLocalRecords => {
                 f.write_str("local recovery audit exceeds the snapshot record limit")
             }
+            Self::TooManyChainInventoryRecords => {
+                f.write_str("local recovery audit exceeds the chain inventory limit")
+            }
             Self::TooManyLocalLineages => {
                 f.write_str("local recovery audit exceeds the snapshot lineage limit")
             }
             Self::SnapshotRecordCountMismatch => {
                 f.write_str("local recovery snapshot summary count is inconsistent")
             }
+            Self::SnapshotChainInventoryRecordCountMismatch => {
+                f.write_str("local recovery chain inventory count is inconsistent")
+            }
             Self::InvalidLocalEvidence => {
                 f.write_str("local recovery snapshot contains invalid public evidence")
+            }
+            Self::InvalidChainInventoryEvidence => {
+                f.write_str("local recovery chain inventory contains invalid public evidence")
+            }
+            Self::InvalidActiveRootLegacyHighWater => {
+                f.write_str("local recovery snapshot contains an invalid legacy high-water")
             }
             Self::InvalidLocalLineageHighWater => {
                 f.write_str("local recovery snapshot contains an invalid allocator high-water")
@@ -337,6 +439,12 @@ impl fmt::Display for LocalChainSwapRecoveryAuditError {
             }
             Self::DuplicateLocalCreationResponseHash => {
                 f.write_str("local recovery snapshot reuses a creation response hash")
+            }
+            Self::DuplicateChainInventoryBoltzSwapId => {
+                f.write_str("local recovery chain inventory reuses a provider swap id")
+            }
+            Self::CurrentChainInventoryMismatch => {
+                f.write_str("local recovery current inventory disagrees with current evidence")
             }
             Self::DuplicateLocalLineage => {
                 f.write_str("local recovery snapshot repeats an allocator lineage")
@@ -384,11 +492,17 @@ pub fn audit_manifest_set_against_local_recovery_snapshot_v1(
     if local.records.len() > MAX_RECOVERY_AUDIT_LOCAL_RECORDS_V1 {
         return Err(LocalChainSwapRecoveryAuditError::TooManyLocalRecords);
     }
+    if local.summary.chain_inventory.len() > MAX_RECOVERY_AUDIT_CHAIN_INVENTORY_RECORDS_V1 {
+        return Err(LocalChainSwapRecoveryAuditError::TooManyChainInventoryRecords);
+    }
     if local.summary.lineage_high_waters.len() > MAX_RECOVERY_AUDIT_LOCAL_LINEAGES_V1 {
         return Err(LocalChainSwapRecoveryAuditError::TooManyLocalLineages);
     }
     if local.summary.record_count != local.records.len() {
         return Err(LocalChainSwapRecoveryAuditError::SnapshotRecordCountMismatch);
+    }
+    if local.summary.chain_inventory_record_count != local.summary.chain_inventory.len() {
+        return Err(LocalChainSwapRecoveryAuditError::SnapshotChainInventoryRecordCountMismatch);
     }
 
     let manifest_set = audit_append_only_manifest_set_v1(manifests)
@@ -497,6 +611,56 @@ fn validate_local_snapshot(
         if !creation_response_hashes.insert(record.canonical_creation_response_sha256.as_str()) {
             return Err(LocalChainSwapRecoveryAuditError::DuplicateLocalCreationResponseHash);
         }
+    }
+
+    let mut inventory_ids = BTreeSet::new();
+    let mut current_inventory_ids = BTreeSet::new();
+    if !is_valid_root_fingerprint(&local.summary.active_root_fingerprint) {
+        return Err(LocalChainSwapRecoveryAuditError::InvalidChainInventoryEvidence);
+    }
+    for record in &local.summary.chain_inventory {
+        if record.boltz_swap_id.is_empty()
+            || record.boltz_swap_id.len() > 128
+            || !record
+                .boltz_swap_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(LocalChainSwapRecoveryAuditError::InvalidChainInventoryEvidence);
+        }
+        if !inventory_ids.insert(record.boltz_swap_id.as_str()) {
+            return Err(LocalChainSwapRecoveryAuditError::DuplicateChainInventoryBoltzSwapId);
+        }
+        match record.structural_class {
+            LocalChainSwapRecoveryStructuralClassV1::CurrentV1 => {
+                if record.legacy_derivation.is_some() {
+                    return Err(LocalChainSwapRecoveryAuditError::InvalidChainInventoryEvidence);
+                }
+                current_inventory_ids.insert(record.boltz_swap_id.as_str());
+            }
+            LocalChainSwapRecoveryStructuralClassV1::CompleteLegacy => {
+                if record.legacy_derivation.as_ref().is_some_and(|derivation| {
+                    !is_valid_root_fingerprint(&derivation.root_fingerprint)
+                        || !(0..=MAX_UNHARDENED_SWAP_CHILD_INDEX)
+                            .contains(&derivation.claim_child_index)
+                        || !(0..=MAX_UNHARDENED_SWAP_CHILD_INDEX)
+                            .contains(&derivation.refund_child_index)
+                        || derivation.claim_child_index == derivation.refund_child_index
+                }) {
+                    return Err(LocalChainSwapRecoveryAuditError::InvalidChainInventoryEvidence);
+                }
+            }
+        }
+    }
+    if current_inventory_ids != boltz_swap_ids {
+        return Err(LocalChainSwapRecoveryAuditError::CurrentChainInventoryMismatch);
+    }
+    if local
+        .summary
+        .active_root_legacy_high_water
+        .is_some_and(|high_water| !(0..=MAX_UNHARDENED_SWAP_CHILD_INDEX).contains(&high_water))
+    {
+        return Err(LocalChainSwapRecoveryAuditError::InvalidActiveRootLegacyHighWater);
     }
 
     let mut lineage_high_waters = BTreeMap::new();
