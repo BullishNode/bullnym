@@ -487,6 +487,14 @@ mod provider_transition_tests {
             expiry_first,
             "duplicate pending expiry must remain a no-op"
         );
+        assert_eq!(
+            reduce_chain_swap_provider_status(ChainSwapStatus::Pending, true, expiry),
+            ChainSwapProviderDecision {
+                status: ChainSwapStatus::Pending,
+                cooperative_refused: true,
+            },
+            "pending expiry must not clear prior independent failure evidence"
+        );
 
         let user_after = reduce_chain_swap_provider_status(
             expiry_first.status,
