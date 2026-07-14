@@ -84,11 +84,40 @@
   // than merging it, because null withdraws a stale/amount-mismatched offer.
   // ---------------------------------------------------------------------
   let latest = $state<InvoiceStatus | null>(null)
-  let currentLightningPr = $state<string | null>(untrack(() => invoice.lightning_pr || null))
-  let currentLiquidAddress = $state<string | null>(untrack(() => invoice.liquid_address || null))
+  let currentLightningAmountSat = $state<number | null>(
+    untrack(() =>
+      Number.isSafeInteger(invoice.lightning_amount_sat) && (invoice.lightning_amount_sat ?? 0) > 0
+        ? invoice.lightning_amount_sat
+        : null,
+    ),
+  )
+  let currentLightningPr = $state<string | null>(
+    untrack(() => (currentLightningAmountSat !== null ? (invoice.lightning_pr || null) : null)),
+  )
+  let currentLiquidAmountSat = $state<number | null>(
+    untrack(() =>
+      Number.isSafeInteger(invoice.liquid_amount_sat) && (invoice.liquid_amount_sat ?? 0) > 0
+        ? invoice.liquid_amount_sat
+        : null,
+    ),
+  )
+  let currentLiquidAddress = $state<string | null>(
+    untrack(() => (currentLiquidAmountSat !== null ? (invoice.liquid_address || null) : null)),
+  )
   let currentBitcoinDirectAddress = $state<string | null>(null)
-  let currentBitcoinChainAddress = $state<string | null>(untrack(() => invoice.bitcoin_chain_address))
-  let currentBitcoinChainBip21 = $state<string | null>(untrack(() => invoice.bitcoin_chain_bip21))
+  let currentBitcoinChainAmountSat = $state<number | null>(
+    untrack(() =>
+      Number.isSafeInteger(invoice.bitcoin_chain_amount_sat) && (invoice.bitcoin_chain_amount_sat ?? 0) > 0
+        ? invoice.bitcoin_chain_amount_sat
+        : null,
+    ),
+  )
+  let currentBitcoinChainAddress = $state<string | null>(
+    untrack(() => (currentBitcoinChainAmountSat !== null ? invoice.bitcoin_chain_address : null)),
+  )
+  let currentBitcoinChainBip21 = $state<string | null>(
+    untrack(() => (currentBitcoinChainAddress ? invoice.bitcoin_chain_bip21 : null)),
+  )
   const currentBitcoinAddress = $derived(currentBitcoinChainAddress ?? currentBitcoinDirectAddress)
 
   const view = $derived<PayView>(latest ? derivePayView(latest) : payViewBeforeFirstStatus())
@@ -106,11 +135,14 @@
     availableRails({
       acceptLn: latest?.accept_ln,
       lightningPr: currentLightningPr,
+      lightningAmountSat: currentLightningAmountSat,
       acceptLiquid: latest?.accept_liquid,
       liquidAddress: currentLiquidAddress,
+      liquidAmountSat: currentLiquidAmountSat,
       acceptBtc: latest?.accept_btc,
       bitcoinAddress: currentBitcoinDirectAddress,
       bitcoinChainAddress: currentBitcoinChainAddress,
+      bitcoinChainAmountSat: currentBitcoinChainAmountSat,
     }),
   )
 
@@ -181,7 +213,11 @@
     lnRefreshing = true
     try {
       const res = await fetchLightningOffer(invoice.invoice_id)
-      currentLightningPr = res.pr
+      const amountSat = Number.isSafeInteger(res.lightning_amount_sat) && res.lightning_amount_sat > 0
+        ? res.lightning_amount_sat
+        : null
+      currentLightningPr = res.pr && amountSat !== null ? res.pr : null
+      currentLightningAmountSat = currentLightningPr ? amountSat : null
       lnFailedAt = null
     } catch {
       lnFailedAt = Date.now()
@@ -204,7 +240,7 @@
   // a null amount like the pre-rewrite version did) — show a waiting state
   // instead.
   const boltCardReady = $derived(
-    showsRails(view) && !!currentLightningPr && !lnRefreshing && remainingAmountSat !== null,
+    showsRails(view) && !!currentLightningPr && !lnRefreshing && currentLightningAmountSat !== null,
   )
 
   function stopCardScan() {
@@ -227,7 +263,7 @@
         if (controller.signal.aborted) return
         cardState = 'requesting'
         const pr = currentLightningPr
-        const amt = remainingAmountSat
+        const amt = currentLightningAmountSat
         if (!pr || amt === null) throw new Error('Lightning offer not ready — try again in a moment')
         await payViaBoltCard(lnurl, pr, amt)
         if (controller.signal.aborted) return
@@ -323,12 +359,24 @@
       // re-requested (review item 6 / finding #2 — a partial payment
       // invalidates the full-amount BOLT11 and the server returns
       // lightning_pr=null until POST /lightning issues a new one).
-      currentLightningPr = nextLightningPr(currentLightningPr, status)
-      currentLiquidAddress = status.liquid_address
+      const nextPr = nextLightningPr(currentLightningPr, status)
+      const nextLightningAmountSat = Number.isSafeInteger(status.lightning_amount_sat) && (status.lightning_amount_sat ?? 0) > 0
+        ? status.lightning_amount_sat
+        : null
+      currentLightningPr = nextPr && nextLightningAmountSat !== null ? nextPr : null
+      currentLightningAmountSat = currentLightningPr ? nextLightningAmountSat : null
+      const nextLiquidAmountSat = Number.isSafeInteger(status.liquid_amount_sat) && (status.liquid_amount_sat ?? 0) > 0
+        ? status.liquid_amount_sat
+        : null
+      currentLiquidAddress = status.liquid_address && nextLiquidAmountSat !== null
+        ? status.liquid_address
+        : null
+      currentLiquidAmountSat = currentLiquidAddress ? nextLiquidAmountSat : null
       const bitcoin = bitcoinPaymentPayloadFromStatus(status)
       currentBitcoinDirectAddress = bitcoin.directAddress
       currentBitcoinChainAddress = bitcoin.chainAddress
       currentBitcoinChainBip21 = bitcoin.chainBip21
+      currentBitcoinChainAmountSat = bitcoin.chainAmountSat
       // Publish the new view only after every payload has been replaced, so a
       // payable render cannot observe the prior snapshot for one frame.
       latest = status
@@ -427,15 +475,36 @@
   // ---------------------------------------------------------------------
   const qrValue = $derived.by(() => {
     if (activeTab === 'lightning') return currentLightningPr ?? ''
-    if (remainingAmountSat === null) return ''
     if (activeTab === 'liquid') {
-      return currentLiquidAddress ? liquidUri(currentLiquidAddress, remainingAmountSat, config.liquid_btc_asset_id) : ''
+      return currentLiquidAddress && currentLiquidAmountSat !== null
+        ? liquidUri(currentLiquidAddress, currentLiquidAmountSat, config.liquid_btc_asset_id)
+        : ''
     }
     if (activeTab === 'bitcoin') {
+      if (remainingAmountSat === null) return ''
       const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null
-      return currentBitcoinAddress ? bitcoinPayload(currentBitcoinAddress, bip21, remainingAmountSat) : ''
+      const amountSat = currentBitcoinChainAddress ? currentBitcoinChainAmountSat : remainingAmountSat
+      return currentBitcoinAddress && amountSat !== null
+        ? bitcoinPayload(currentBitcoinAddress, bip21, amountSat)
+        : ''
     }
     return ''
+  })
+
+  const bitcoinChainSwapCostSat = $derived.by(() => {
+    if (
+      !currentBitcoinChainAddress ||
+      currentBitcoinChainAmountSat === null ||
+      remainingAmountSat === null
+    ) return null
+    const cost = currentBitcoinChainAmountSat - remainingAmountSat
+    return Number.isSafeInteger(cost) && cost >= 0 ? cost : null
+  })
+
+  const lightningSwapCostSat = $derived.by(() => {
+    if (currentLightningAmountSat === null || remainingAmountSat === null) return null
+    const cost = currentLightningAmountSat - remainingAmountSat
+    return Number.isSafeInteger(cost) && cost >= 0 ? cost : null
   })
 
   const qrPlaceholder = $derived(activeTab === 'lightning' ? 'Loading Lightning offer…' : 'Preparing payment code…')
@@ -492,6 +561,44 @@
         </button>
       {/each}
     </div>
+
+    {#if activeTab === 'lightning' && currentLightningAmountSat !== null && lightningSwapCostSat !== null}
+      <div class="flex flex-col items-center gap-1 text-center">
+        <p class="font-display text-4xl tabular-nums tracking-display leading-none">
+          Send {new Intl.NumberFormat().format(currentLightningAmountSat)} sats
+        </p>
+        <p class="max-w-sm text-xs text-[#776b5a] dark:text-[#b9aa91]">
+          Includes {new Intl.NumberFormat().format(lightningSwapCostSat)} sats in swap costs; your wallet may add its own Lightning routing fee.
+        </p>
+      </div>
+    {:else if activeTab === 'liquid' && currentLiquidAmountSat !== null}
+      <div class="flex flex-col items-center gap-1 text-center">
+        <p class="font-display text-4xl tabular-nums tracking-display leading-none">
+          Send {new Intl.NumberFormat().format(currentLiquidAmountSat)} sats
+        </p>
+        <p class="max-w-sm text-xs text-[#776b5a] dark:text-[#b9aa91]">
+          Your wallet may add its own Liquid network fee.
+        </p>
+      </div>
+    {:else if activeTab === 'bitcoin' && currentBitcoinChainAddress && currentBitcoinChainAmountSat !== null && bitcoinChainSwapCostSat !== null}
+      <div class="flex flex-col items-center gap-1 text-center">
+        <p class="font-display text-4xl tabular-nums tracking-display leading-none">
+          Send {new Intl.NumberFormat().format(currentBitcoinChainAmountSat)} sats
+        </p>
+        <p class="max-w-sm text-xs text-[#776b5a] dark:text-[#b9aa91]">
+          Includes {new Intl.NumberFormat().format(bitcoinChainSwapCostSat)} sats in swap costs; your wallet may add its own Bitcoin network fee.
+        </p>
+      </div>
+    {:else if activeTab === 'bitcoin' && currentBitcoinDirectAddress && remainingAmountSat !== null}
+      <div class="flex flex-col items-center gap-1 text-center">
+        <p class="font-display text-4xl tabular-nums tracking-display leading-none">
+          Send {new Intl.NumberFormat().format(remainingAmountSat)} sats
+        </p>
+        <p class="max-w-sm text-xs text-[#776b5a] dark:text-[#b9aa91]">
+          Your wallet may add its own Bitcoin network fee.
+        </p>
+      </div>
+    {/if}
 
     {#if activeTab === 'boltcard'}
       <div class="flex w-full flex-col items-center gap-3 py-6">

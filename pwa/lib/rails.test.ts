@@ -11,11 +11,14 @@ describe('availableRails', () => {
       availableRails({
         acceptLn: true,
         lightningPr: 'lnbc1...',
+        lightningAmountSat: 1_050,
         acceptLiquid: true,
         liquidAddress: 'lq1...',
+        liquidAmountSat: 1_000,
         acceptBtc: true,
         bitcoinAddress: 'bc1...',
         bitcoinChainAddress: null,
+        bitcoinChainAmountSat: null,
       }),
     ).toEqual({ lightning: true, liquid: true, bitcoin: true })
   })
@@ -24,11 +27,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 1_050,
       acceptLiquid: false,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 1_000,
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     expect(result.liquid).toBe(false)
   })
@@ -37,11 +43,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 1_050,
       acceptLiquid: true,
       liquidAddress: null,
+      liquidAmountSat: 1_000,
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     expect(result.liquid).toBe(false)
   })
@@ -50,11 +59,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 1_050,
       acceptLiquid: true,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 1_000,
       acceptBtc: true,
       bitcoinAddress: null,
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     expect(result.bitcoin).toBe(false)
   })
@@ -63,11 +75,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: '',
+      lightningAmountSat: 1_050,
       acceptLiquid: true,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 1_000,
       acceptBtc: true,
       bitcoinAddress: 'bc1...',
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     expect(result.lightning).toBe(false)
   })
@@ -76,11 +91,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: undefined,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 1_050,
       acceptLiquid: undefined,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 1_000,
       acceptBtc: undefined,
       bitcoinAddress: null,
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     // lightning/liquid have both "accepted" (defaulted) and a payload ->
     // available; bitcoin has no payload -> not available even though its
@@ -96,11 +114,14 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 10_850,
       acceptLiquid: true,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 10_800,
       acceptBtc: false,
       bitcoinAddress: 'bc1qlockup...', // merged current address == chain address
       bitcoinChainAddress: 'bc1qlockup...',
+      bitcoinChainAmountSat: 10_800,
     })
     expect(result.bitcoin).toBe(true)
   })
@@ -109,12 +130,65 @@ describe('availableRails', () => {
     const result = availableRails({
       acceptLn: true,
       lightningPr: 'lnbc1...',
+      lightningAmountSat: 1_050,
       acceptLiquid: true,
       liquidAddress: 'lq1...',
+      liquidAmountSat: 1_000,
       acceptBtc: false,
       bitcoinAddress: 'bc1direct...',
       bitcoinChainAddress: null,
+      bitcoinChainAmountSat: null,
     })
     expect(result.bitcoin).toBe(false)
+  })
+
+  it('fails closed on a chain address without an exact safe positive amount', () => {
+    for (const bitcoinChainAmountSat of [null, 0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      const result = availableRails({
+        acceptLn: false,
+        lightningPr: null,
+        lightningAmountSat: null,
+        acceptLiquid: false,
+        liquidAddress: null,
+        liquidAmountSat: null,
+        acceptBtc: false,
+        bitcoinAddress: null,
+        bitcoinChainAddress: 'bc1qamountlesschain',
+        bitcoinChainAmountSat,
+      })
+      expect(result.bitcoin).toBe(false)
+    }
+  })
+
+  it('fails closed when Lightning or Liquid payload lacks its exact amount', () => {
+    for (const amount of [null, 0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      const lightning = availableRails({
+        acceptLn: true,
+        lightningPr: 'lnbc1...',
+        lightningAmountSat: amount,
+        acceptLiquid: false,
+        liquidAddress: null,
+        liquidAmountSat: null,
+        acceptBtc: false,
+        bitcoinAddress: null,
+        bitcoinChainAddress: null,
+        bitcoinChainAmountSat: null,
+      })
+      expect(lightning.lightning).toBe(false)
+
+      const liquid = availableRails({
+        acceptLn: false,
+        lightningPr: null,
+        lightningAmountSat: null,
+        acceptLiquid: true,
+        liquidAddress: 'lq1...',
+        liquidAmountSat: amount,
+        acceptBtc: false,
+        bitcoinAddress: null,
+        bitcoinChainAddress: null,
+        bitcoinChainAmountSat: null,
+      })
+      expect(liquid.liquid).toBe(false)
+    }
   })
 })

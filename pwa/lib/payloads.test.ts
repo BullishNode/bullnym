@@ -35,6 +35,15 @@ describe('bitcoinPayload', () => {
   it('falls back to btcUri when bip21 is an empty string', () => {
     expect(bitcoinPayload('bc1qxyz', '', 10_800)).toBe('bitcoin:bc1qxyz?amount=0.00010800')
   })
+
+  it('uses the typed grossed-up payer amount instead of the lower invoice amount', () => {
+    const merchantInvoiceSat = 10_000
+    const bitcoinChainAmountSat = 10_431
+    expect(bitcoinChainAmountSat).toBeGreaterThan(merchantInvoiceSat)
+    expect(bitcoinPayload('bc1qgrossup', null, bitcoinChainAmountSat)).toBe(
+      'bitcoin:bc1qgrossup?amount=0.00010431',
+    )
+  })
 })
 
 describe('liquidUri', () => {

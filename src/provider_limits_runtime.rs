@@ -12,10 +12,12 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider_limits::{
-    effective_lightning_address_range, revalidate_lightning_address_creation,
-    EffectiveLightningAddressRange, LightningAddressCreationError, LightningAddressUnavailable,
-    ProviderAsset, ProviderLimitMode, ProviderZeroConfLimit, ReversePairObservation,
-    ReversePairSnapshotState, ReversePairSource, ReversePairValidationError,
+    effective_lightning_address_range, fixed_checkout_reverse_quote,
+    revalidate_lightning_address_creation, EffectiveLightningAddressRange,
+    FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError, LightningAddressCreationError,
+    LightningAddressUnavailable, ProviderAsset, ProviderLimitMode, ProviderZeroConfLimit,
+    ReversePairObservation, ReversePairSnapshotState, ReversePairSource,
+    ReversePairValidationError,
 };
 
 pub const PROVIDER_LIMIT_REFRESH_CADENCE: Duration = Duration::from_secs(30);
@@ -101,6 +103,21 @@ impl ProviderLimitsRuntime {
             product_maximum_msat,
             amount_msat,
             Instant::now(),
+        )
+    }
+
+    /// Exact payer-pays quote for a fixed-price checkout. Unlike Lightning
+    /// Address range reads, this includes the validated reverse-pair fee packet
+    /// and fails closed when that packet is missing or stale.
+    pub fn fixed_checkout_reverse_quote(
+        &self,
+        merchant_amount_sat: u64,
+    ) -> Result<FixedCheckoutReverseQuote, FixedCheckoutReverseQuoteError> {
+        fixed_checkout_reverse_quote(
+            &self.snapshot(),
+            merchant_amount_sat,
+            Instant::now(),
+            PROVIDER_LIMIT_MAXIMUM_AGE,
         )
     }
 

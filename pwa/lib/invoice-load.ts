@@ -38,9 +38,12 @@ export async function reconstructInvoice(id: string): Promise<ReconstructResult>
     const invoice: CreateInvoiceResponse = {
       invoice_id: id,
       lightning_pr: status.lightning_pr ?? '',
+      lightning_amount_sat: status.lightning_amount_sat,
       liquid_address: status.liquid_address ?? '',
+      liquid_amount_sat: status.liquid_amount_sat,
       bitcoin_chain_address: status.bitcoin_chain_address,
       bitcoin_chain_bip21: status.bitcoin_chain_bip21,
+      bitcoin_chain_amount_sat: status.bitcoin_chain_amount_sat,
       expires_at_unix: status.expires_at_unix,
     }
 

@@ -27,9 +27,15 @@ export interface CreateInvoiceRequest {
 export interface CreateInvoiceResponse {
   invoice_id: string
   lightning_pr: string
+  /** Exact BOLT11 principal paired with lightning_pr. */
+  lightning_amount_sat: number | null
   liquid_address: string
+  /** Exact direct-Liquid amount paired with liquid_address. */
+  liquid_amount_sat: number | null
   bitcoin_chain_address: string | null
   bitcoin_chain_bip21: string | null
+  /** Exact payer-side Bitcoin lock amount for the chain-swap offer. */
+  bitcoin_chain_amount_sat: number | null
   expires_at_unix: number
 }
 
@@ -74,10 +80,16 @@ export interface InvoiceStatus {
   paid_at_unix: number | null
   paid_amount_sat: number | null
   lightning_pr: string | null
+  /** Exact BOLT11 principal paired with lightning_pr. */
+  lightning_amount_sat: number | null
   liquid_address: string | null
+  /** Exact direct-Liquid amount paired with liquid_address. */
+  liquid_amount_sat: number | null
   bitcoin_address: string | null
   bitcoin_chain_address: string | null
   bitcoin_chain_bip21: string | null
+  /** Exact payer-side Bitcoin lock amount; null with no usable chain offer. */
+  bitcoin_chain_amount_sat: number | null
   accept_btc: boolean
   accept_ln: boolean
   accept_liquid: boolean
@@ -180,6 +192,6 @@ export function getSupportedCurrencies(): Promise<SupportedCurrenciesResponse> {
  * ApiError — callers catch it (see PaymentScreen.svelte's throttled
  * maybeRefreshLightning()).
  */
-export function fetchLightningOffer(id: string): Promise<{ pr: string }> {
+export function fetchLightningOffer(id: string): Promise<{ pr: string; lightning_amount_sat: number }> {
   return request(`/api/v1/invoices/${id}/lightning`, { method: 'POST' })
 }

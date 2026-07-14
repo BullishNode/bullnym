@@ -64,4 +64,9 @@ server can create the payloads:
 
 The Bitcoin tab may use `bitcoin_chain_address` even when `accept_btc` is
 false, because chain-swap Bitcoin is distinct from wallet-origin direct
-Bitcoin invoices.
+Bitcoin invoices. Tabs are ordered Lightning, Liquid, then Bitcoin, and each
+tab exposes a typed payer amount. Lightning/Bolt Card use the exact grossed-up
+BOLT11 principal, Liquid uses the merchant remainder, and a
+chain-swap Bitcoin tab displays and pays `bitcoin_chain_amount_sat`, including
+the disclosed swap-cost delta above the merchant invoice amount; it never
+synthesizes a fallback URI from the lower invoice remainder.

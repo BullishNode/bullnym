@@ -16,6 +16,7 @@ use boltz_client::swaps::boltz::{
 };
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::{BtcSwapScript, LBtcSwapScript, PublicKey};
+use lightning_invoice::Bolt11Invoice;
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
@@ -27,6 +28,13 @@ pub struct SwapResult {
     pub claim_public_key: PublicKey,
     pub claim_keypair: Keypair,
     pub boltz_response: CreateReverseResponse,
+}
+
+pub struct FixedCheckoutReverseSwapResult {
+    pub swap: SwapResult,
+    pub payer_amount_sat: u64,
+    pub onchain_amount_sat: u64,
+    pub claim_fee_budget_sat: u64,
 }
 
 pub struct ChainSwapResult {
@@ -178,6 +186,20 @@ const LOCK_TIME_TIMESTAMP_THRESHOLD: u32 = 500_000_000;
 
 fn invalid_chain_response(reason: impl Into<String>) -> AppError {
     AppError::BoltzError(format!("invalid chain swap response: {}", reason.into()))
+}
+
+fn exact_bolt11_amount_sat(invoice: &str) -> Result<u64, AppError> {
+    let invoice = Bolt11Invoice::from_str(invoice)
+        .map_err(|error| AppError::BoltzError(format!("invalid BOLT11 invoice: {error}")))?;
+    let amount_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
+        AppError::BoltzError("fixed checkout BOLT11 has no exact amount".to_string())
+    })?;
+    if amount_msat % 1_000 != 0 {
+        return Err(AppError::BoltzError(
+            "fixed checkout BOLT11 amount is not whole satoshis".to_string(),
+        ));
+    }
+    Ok(amount_msat / 1_000)
 }
 
 fn is_lower_hex_32(value: &str) -> bool {
@@ -774,6 +796,144 @@ impl BoltzService {
             claim_public_key,
             claim_keypair: keypair,
             boltz_response: response,
+        })
+    }
+
+    /// Create a payer-pays reverse swap for one fixed-price checkout.
+    ///
+    /// The fresh validated pair snapshot supplies the claim budget and pins
+    /// the provider fee packet. Supplying `onchainAmount` asks Boltz to compute
+    /// the BOLT11 principal around that exact lockup value, so a fee change can
+    /// never silently reduce the merchant side of the swap.
+    pub async fn create_fixed_checkout_reverse_swap(
+        &self,
+        derived_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        description: Option<&str>,
+        description_hash: Option<&str>,
+    ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
+        if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
+            return Err(AppError::BoltzError(
+                "boltz temporarily unavailable (circuit breaker open)".to_string(),
+            ));
+        }
+        let quote = self
+            .provider_limits
+            .fixed_checkout_reverse_quote(merchant_amount_sat)
+            .map_err(|error| AppError::BoltzError(error.to_string()))?;
+        let DerivedSwapKey { keypair, preimage } = derived_key;
+        let claim_public_key = PublicKey::new(keypair.public_key());
+        let base_request = CreateReverseRequest {
+            from: "BTC".to_string(),
+            to: "L-BTC".to_string(),
+            claim_public_key,
+            invoice: None,
+            invoice_amount: None,
+            preimage_hash: Some(preimage.sha256),
+            description: description.map(str::to_owned),
+            description_hash: description_hash.map(str::to_owned),
+            address: None,
+            address_signature: None,
+            referral_id: None,
+            webhook: self.webhook_url.as_ref().map(|url| Webhook {
+                url: url.clone(),
+                hash_swap_id: None,
+                status: Some(vec![
+                    RevSwapStates::TransactionMempool,
+                    RevSwapStates::TransactionConfirmed,
+                    RevSwapStates::InvoiceSettled,
+                    RevSwapStates::SwapExpired,
+                    RevSwapStates::TransactionFailed,
+                ]),
+            }),
+            claim_covenant: None,
+        };
+        let mut request = serde_json::to_value(base_request).map_err(|error| {
+            AppError::BoltzError(format!("failed to encode reverse swap request: {error}"))
+        })?;
+        let request_object = request.as_object_mut().ok_or_else(|| {
+            AppError::BoltzError("reverse swap request did not encode as an object".into())
+        })?;
+        request_object.insert(
+            "onchainAmount".into(),
+            serde_json::Value::from(quote.onchain_amount_sat()),
+        );
+        request_object.insert(
+            "pairHash".into(),
+            serde_json::Value::String(quote.pair_hash().to_owned()),
+        );
+
+        let client = self
+            .quote_http_client
+            .as_ref()
+            .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))?;
+        let base_url = self
+            .quote_api_url
+            .as_deref()
+            .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))?;
+        let response = client
+            .post(format!("{}/swap/reverse", base_url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&request)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.breaker.record(true);
+                return Err(AppError::BoltzError(format!(
+                    "fixed checkout reverse swap request failed: {error}"
+                )));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            self.breaker.record(status.is_server_error());
+            return Err(AppError::BoltzError(format!(
+                "fixed checkout reverse swap request failed with HTTP {}",
+                status.as_u16()
+            )));
+        }
+        self.breaker.record(false);
+        let response: CreateReverseResponse = response.json().await.map_err(|error| {
+            AppError::BoltzError(format!(
+                "fixed checkout reverse swap response was invalid: {error}"
+            ))
+        })?;
+        let invoice = response
+            .invoice
+            .clone()
+            .ok_or_else(|| AppError::BoltzError("no invoice returned".to_string()))?;
+        let payer_amount_sat = exact_bolt11_amount_sat(&invoice)?;
+        if payer_amount_sat != quote.payer_amount_sat() {
+            return Err(AppError::BoltzError(format!(
+                "fixed checkout reverse invoice amount mismatch: expected {}, got {payer_amount_sat}",
+                quote.payer_amount_sat()
+            )));
+        }
+        if response.onchain_amount != quote.onchain_amount_sat() {
+            return Err(AppError::BoltzError(format!(
+                "fixed checkout reverse onchain amount mismatch: expected {}, got {}",
+                quote.onchain_amount_sat(),
+                response.onchain_amount
+            )));
+        }
+
+        Ok(FixedCheckoutReverseSwapResult {
+            swap: SwapResult {
+                swap_id: response.id.clone(),
+                invoice,
+                preimage: preimage
+                    .bytes
+                    .map(|bytes| bytes.to_vec())
+                    .unwrap_or_default(),
+                claim_public_key,
+                claim_keypair: keypair,
+                boltz_response: response,
+            },
+            payer_amount_sat,
+            onchain_amount_sat: quote.onchain_amount_sat(),
+            claim_fee_budget_sat: quote.claim_fee_budget_sat(),
         })
     }
 

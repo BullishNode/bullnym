@@ -386,6 +386,7 @@ export interface BitcoinPaymentPayloadState {
   directAddress: string | null
   chainAddress: string | null
   chainBip21: string | null
+  chainAmountSat: number | null
 }
 
 /** Replace Bitcoin payment payloads from one authoritative status snapshot.
@@ -393,13 +394,20 @@ export interface BitcoinPaymentPayloadState {
  * left `pending`, or no longer match the exact remaining amount. Never merge
  * that null with a cached chain address. */
 export function bitcoinPaymentPayloadFromStatus(
-  status: Pick<InvoiceStatus, 'bitcoin_address' | 'bitcoin_chain_address' | 'bitcoin_chain_bip21'>,
+  status: Pick<
+    InvoiceStatus,
+    'bitcoin_address' | 'bitcoin_chain_address' | 'bitcoin_chain_bip21' | 'bitcoin_chain_amount_sat'
+  >,
 ): BitcoinPaymentPayloadState {
   const chainAddress = status.bitcoin_chain_address ?? null
+  const chainAmountSat = status.bitcoin_chain_amount_sat
+  const completeChainOffer =
+    !!chainAddress && Number.isSafeInteger(chainAmountSat) && (chainAmountSat ?? 0) > 0
   return {
     directAddress: status.bitcoin_address ?? null,
-    chainAddress,
-    chainBip21: chainAddress ? (status.bitcoin_chain_bip21 ?? null) : null,
+    chainAddress: completeChainOffer ? chainAddress : null,
+    chainBip21: completeChainOffer ? (status.bitcoin_chain_bip21 ?? null) : null,
+    chainAmountSat: completeChainOffer ? chainAmountSat : null,
   }
 }
 

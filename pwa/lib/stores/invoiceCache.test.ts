@@ -10,9 +10,12 @@ function makeInvoice(id: string): CreateInvoiceResponse {
   return {
     invoice_id: id,
     lightning_pr: 'lnbc1...',
+    lightning_amount_sat: 1_050,
     liquid_address: 'lq1...',
+    liquid_amount_sat: 1_000,
     bitcoin_chain_address: null,
     bitcoin_chain_bip21: null,
+    bitcoin_chain_amount_sat: null,
     expires_at_unix: 1_700_000_000,
   }
 }

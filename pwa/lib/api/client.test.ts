@@ -73,9 +73,12 @@ describe('request() error-envelope detection', () => {
     mockFetchOnce(200, {
       invoice_id: 'real-id',
       lightning_pr: 'lnbc1...',
+      lightning_amount_sat: 1_050,
       liquid_address: 'lq1...',
+      liquid_amount_sat: 1_000,
       bitcoin_chain_address: null,
       bitcoin_chain_bip21: null,
+      bitcoin_chain_amount_sat: null,
       expires_at_unix: 1234567890,
     })
     const res = await createInvoice('/alice', { amount_sat: 1000 })
@@ -91,9 +94,12 @@ describe('request() error-envelope detection', () => {
     mockFetchOnce(200, {
       invoice_id: 'id',
       lightning_pr: '',
+      lightning_amount_sat: null,
       liquid_address: '',
+      liquid_amount_sat: null,
       bitcoin_chain_address: null,
       bitcoin_chain_bip21: null,
+      bitcoin_chain_amount_sat: null,
       expires_at_unix: 0,
     })
     await createInvoice('/a/alices-shop', { amount_sat: 1000 })
