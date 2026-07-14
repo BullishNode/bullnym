@@ -27,6 +27,7 @@ use crate::{
 };
 
 const CHECKPOINT_FORMAT_VERSION: i16 = 1;
+const LIQUID_BROADCAST_START_PARENT_STATUS: &str = "claiming";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointWriteKind {
@@ -551,11 +552,13 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
           FROM chain_swap_records parent \
          WHERE attempt.chain_swap_id = $1 AND attempt.txid = $2 AND attempt.purpose = $3 \
            AND attempt.status IN ('constructed','broadcast_ambiguous','broadcast') \
-           AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid",
+           AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid \
+           AND parent.status = $4",
     )
     .bind(chain_swap_id)
     .bind(txid)
     .bind(purpose)
+    .bind(LIQUID_BROADCAST_START_PARENT_STATUS)
     .execute(pool)
     .await?
     .rows_affected();
@@ -2197,6 +2200,14 @@ mod tests {
         }
         for status in ["confirmed", "finalized", "integrity_hold"] {
             assert!(!liquid_attempt_is_broadcastable(status));
+        }
+    }
+
+    #[test]
+    fn liquid_broadcast_start_requires_claiming_parent() {
+        assert_eq!(LIQUID_BROADCAST_START_PARENT_STATUS, "claiming");
+        for status in ["claim_failed", "claim_stuck", "claimed", "expired"] {
+            assert_ne!(status, LIQUID_BROADCAST_START_PARENT_STATUS);
         }
     }
 
