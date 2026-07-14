@@ -422,6 +422,7 @@ fn test_app(state: AppState) -> Router {
             "/register",
             axum::routing::delete(registration::delete_registration),
         )
+        .route("/register/lookup", get(registration::lookup_by_npub))
         .route("/api/v1/:nym/invoices", post(invoice::create_signed_linked))
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
         .route("/api/v1/invoices", get(invoice::list_signed))
@@ -18091,6 +18092,94 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
     .await
     .unwrap();
     assert_eq!(after_reactivation_surfaces, initial_surfaces);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availability() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let npub = create_test_user(&pool, "lookup-contract").await;
+    let lookup_uri = format!("/register/lookup?npub={npub}");
+
+    let (online_status, online_without_alias) = get_path(&app, &lookup_uri).await;
+    assert_eq!(online_status, StatusCode::OK);
+    assert_eq!(online_without_alias["nym"], "lookup-contract");
+    assert_eq!(online_without_alias["active"], true);
+    assert_eq!(online_without_alias["lightning_address_online"], true);
+    assert_eq!(
+        online_without_alias["active"],
+        online_without_alias["lightning_address_online"]
+    );
+    assert_eq!(online_without_alias["alias"], Value::Null);
+    assert_eq!(
+        online_without_alias["public_name_policy"],
+        "permanent_names_v1"
+    );
+    assert_eq!(
+        online_without_alias["quota"],
+        json!({"used": 1, "cap": 1, "remaining": 0})
+    );
+    assert_eq!(online_without_alias["previous_nyms"], json!([]));
+    assert_eq!(online_without_alias["lifetime_nyms_used"], 1);
+    assert_eq!(online_without_alias["lifetime_nyms_cap"], 1);
+
+    sqlx::query(
+        "INSERT INTO public_names (name, owner_npub, kind) \
+         VALUES ('lookup-shop', $1, 'alias')",
+    )
+    .bind(&npub)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (aliased_status, online_with_alias) = get_path(&app, &lookup_uri).await;
+    assert_eq!(aliased_status, StatusCode::OK);
+    assert_eq!(online_with_alias["nym"], "lookup-contract");
+    assert_eq!(online_with_alias["alias"], "lookup-shop");
+    assert_eq!(online_with_alias["active"], true);
+    assert_eq!(online_with_alias["lightning_address_online"], true);
+    assert_eq!(
+        online_with_alias["public_name_policy"],
+        "permanent_names_v1"
+    );
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("active canonical nym");
+
+    let (offline_status, offline_with_alias) = get_path(&app, &lookup_uri).await;
+    assert_eq!(offline_status, StatusCode::OK);
+    assert_eq!(offline_with_alias["nym"], "lookup-contract");
+    assert_eq!(offline_with_alias["alias"], "lookup-shop");
+    assert_eq!(offline_with_alias["active"], false);
+    assert_eq!(offline_with_alias["lightning_address_online"], false);
+    assert_eq!(
+        offline_with_alias["active"],
+        offline_with_alias["lightning_address_online"]
+    );
+    assert_eq!(
+        offline_with_alias["public_name_policy"],
+        "permanent_names_v1"
+    );
+    assert_eq!(
+        offline_with_alias["previous_nyms"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        offline_with_alias["previous_nyms"][0]["nym"],
+        "lookup-contract"
+    );
+    assert_eq!(
+        offline_with_alias["quota"],
+        json!({"used": 1, "cap": 1, "remaining": 0})
+    );
 
     cleanup_db(&pool).await;
 }

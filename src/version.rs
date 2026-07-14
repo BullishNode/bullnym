@@ -2,6 +2,7 @@ use axum::Json;
 use serde::Serialize;
 
 pub const EXPECTED_SCHEMA_MARKER: &str = env!("BULLNYM_SCHEMA_MARKER");
+pub const PUBLIC_NAME_POLICY: &str = "permanent_names_v1";
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct BuildProvenance {
@@ -50,6 +51,7 @@ pub struct VersionResponse {
     pub build_dirty: &'static str,
     pub runtime_mode: String,
     pub expected_schema_marker: &'static str,
+    pub public_name_policy: &'static str,
 }
 
 impl VersionResponse {
@@ -69,6 +71,7 @@ impl VersionResponse {
             runtime_mode: std::env::var("BULLNYM_RUNTIME_MODE")
                 .unwrap_or_else(|_| "unknown".into()),
             expected_schema_marker: build.expected_schema_marker,
+            public_name_policy: PUBLIC_NAME_POLICY,
         }
     }
 }
@@ -117,6 +120,7 @@ mod tests {
             super::EXPECTED_SCHEMA_MARKER
         );
         assert_eq!(json["runtime_mode"], "test");
+        assert_eq!(json["public_name_policy"], super::PUBLIC_NAME_POLICY);
         assert_eq!(json["build_commit"], env!("BULLNYM_BUILD_COMMIT"));
         assert!(json.get("build_branch").is_some());
         assert!(json.get("build_time").is_some());

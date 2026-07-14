@@ -143,53 +143,66 @@ pub struct PreviousNym {
     pub created_at: String,
 }
 
-/// One round trip: `(online_nym, compatibility_offline_nyms, used_count)`.
-/// `previous_nyms` remains populated for an offline permanent nym so current
-/// clients can still discover and reactivate it; it no longer implies release
-/// or eligibility to choose another name.
+/// Permanent ownership plus the independent Lightning Address availability
+/// projected by `GET /register/lookup` in one database snapshot.
+pub struct RegistrationLookupStatus {
+    pub canonical_nym: String,
+    pub lightning_address_online: bool,
+    pub canonical_alias: Option<String>,
+    pub previous_nyms: Vec<PreviousNym>,
+    pub used: i64,
+}
+
+/// Resolve only the canonical permanent nym and alias for this owner. An
+/// offline canonical nym remains the returned identity and is additionally
+/// retained in `previous_nyms` for compatibility; historical tombstones never
+/// become the current lookup identity.
 pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
-) -> Result<(Option<String>, Vec<PreviousNym>, i64), sqlx::Error> {
-    let row: (
+) -> Result<Option<RegistrationLookupStatus>, sqlx::Error> {
+    let row: Option<(
+        String,
+        bool,
         Option<String>,
-        Option<sqlx::types::Json<Vec<PreviousNym>>>,
-        Option<i64>,
-    ) = sqlx::query_as(
+        sqlx::types::Json<Vec<PreviousNym>>,
+        i64,
+    )> = sqlx::query_as(
         "SELECT \
-                (SELECT public_names.name \
-                   FROM public_names \
-                   JOIN users \
-                     ON users.npub = public_names.owner_npub \
-                    AND users.nym = public_names.name \
-                  WHERE public_names.owner_npub = $1 \
-                    AND public_names.kind = 'nym' \
-                    AND public_names.canonical \
-                    AND users.is_active = TRUE) \
-                    AS active_nym, \
-                (SELECT json_agg(json_build_object( \
-                                     'nym', public_names.name, \
-                                     'created_at', public_names.claimed_at \
-                                 ) ORDER BY public_names.claimed_at DESC) \
-                   FROM public_names \
-                   LEFT JOIN users \
-                     ON users.npub = public_names.owner_npub \
-                    AND users.nym = public_names.name \
-                  WHERE public_names.owner_npub = $1 \
-                    AND public_names.kind = 'nym' \
-                    AND public_names.canonical \
-                    AND COALESCE(users.is_active, FALSE) = FALSE) \
-                    AS previous_nyms, \
-                (SELECT COUNT(*) FROM public_names \
-                  WHERE owner_npub = $1 AND kind = 'nym' AND canonical) AS used",
+                canonical_nym.name, \
+                users.is_active, \
+                canonical_alias.name, \
+                CASE WHEN users.is_active THEN '[]'::JSON \
+                     ELSE json_build_array(json_build_object( \
+                              'nym', canonical_nym.name, \
+                              'created_at', canonical_nym.claimed_at)) END, \
+                (SELECT COUNT(*) FROM public_names counted_nym \
+                  WHERE counted_nym.owner_npub = canonical_nym.owner_npub \
+                    AND counted_nym.kind = 'nym' \
+                    AND counted_nym.canonical) \
+           FROM public_names canonical_nym \
+           JOIN users \
+             ON users.npub = canonical_nym.owner_npub \
+            AND users.nym = canonical_nym.name \
+      LEFT JOIN public_names canonical_alias \
+             ON canonical_alias.owner_npub = canonical_nym.owner_npub \
+            AND canonical_alias.kind = 'alias' \
+            AND canonical_alias.canonical \
+          WHERE canonical_nym.owner_npub = $1 \
+            AND canonical_nym.kind = 'nym' \
+            AND canonical_nym.canonical",
     )
     .bind(npub)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok((
-        row.0,
-        row.1.map(|j| j.0).unwrap_or_default(),
-        row.2.unwrap_or(0),
+    Ok(row.map(
+        |(canonical_nym, online, canonical_alias, previous_nyms, used)| RegistrationLookupStatus {
+            canonical_nym,
+            lightning_address_online: online,
+            canonical_alias,
+            previous_nyms: previous_nyms.0,
+            used,
+        },
     ))
 }
 

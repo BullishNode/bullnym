@@ -177,20 +177,28 @@ Public and rate-limited. A successful response is:
 {
   "nym": "alice",
   "active": false,
-  "quota": { "used": 2, "cap": 3, "remaining": 1 },
+  "lightning_address_online": false,
+  "alias": "coffee",
+  "public_name_policy": "permanent_names_v1",
+  "quota": { "used": 1, "cap": 1, "remaining": 0 },
   "previous_nyms": [
     { "nym": "alice", "created_at": "2026-07-09T12:00:00Z" }
   ],
-  "lifetime_nyms_used": 2,
-  "lifetime_nyms_cap": 3
+  "lifetime_nyms_used": 1,
+  "lifetime_nyms_cap": 1
 }
 ```
 
-`nym` is the active nym, or the most recently deactivated nym when none is
-active. `previous_nyms` is newest first. The two `lifetime_*` fields are legacy;
-new clients use `quota`. Because lookup is public, an authentication key is
-linkable to its Bullnym names; clients needing identity separation should use
-a dedicated auth key.
+`nym` is always the canonical permanent nym. `lightning_address_online`
+reports only Lightning Address availability and exactly matches the legacy
+`active` field. `alias` is the canonical permanent owner alias, or `null` when
+none has ever been claimed. Clients must require
+`public_name_policy == "permanent_names_v1"` before enabling permanent-name or
+alias UX. While the Lightning Address is offline, `previous_nyms` retains the
+canonical nym for older clients; it is empty while online. The two
+`lifetime_*` fields are legacy; new clients use `quota`. Because lookup is
+public, an authentication key is linkable to its Bullnym names; clients needing
+identity separation should use a dedicated auth key.
 
 ## `GET /api/reservations/:nym`
 

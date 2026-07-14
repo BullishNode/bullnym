@@ -13,6 +13,7 @@ use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
 use crate::reserved_nyms;
+use crate::version::PUBLIC_NAME_POLICY;
 use crate::AppState;
 
 /// Resolve the caller IP using the same logic as `/lnurlp/callback`:
@@ -394,13 +395,18 @@ pub struct LookupParams {
 
 #[derive(Serialize)]
 pub struct LookupResponse {
-    /// Active nym, or the most-recent inactive nym when `active == false`
-    /// (i.e. `previous_nyms[0].nym`). Kept for older clients that don't
-    /// read `previous_nyms`.
+    /// The owner's canonical permanent nym, independent of Lightning Address
+    /// availability.
     pub nym: String,
+    /// Compatibility view of `lightning_address_online`.
     pub active: bool,
+    pub lightning_address_online: bool,
+    /// The one canonical permanent owner alias, when it has been claimed.
+    pub alias: Option<String>,
+    pub public_name_policy: &'static str,
     pub quota: QuotaView,
-    /// All inactive nyms for this npub, most-recent first.
+    /// Compatibility list. The canonical nym is present while its Lightning
+    /// Address is offline and absent while online.
     pub previous_nyms: Vec<db::PreviousNym>,
     /// Compatibility field. New clients MUST read `quota.used`; see
     /// docs/compatibility-ledger.md for removal policy.
@@ -440,33 +446,21 @@ pub async fn lookup_by_npub(
         }
     }
 
-    let (active_nym, previous_nyms, used) =
-        db::lookup_status_by_npub(&state.db, &params.npub).await?;
-    let quota = QuotaView::new(used, PERMANENT_NYM_CAP);
-    if let Some(nym) = active_nym {
-        return Ok(Json(LookupResponse {
-            nym,
-            active: true,
-            quota,
-            previous_nyms,
-            lifetime_nyms_used: used,
-            lifetime_nyms_cap: PERMANENT_NYM_CAP,
-        }));
-    }
-    if let Some(head) = previous_nyms.first() {
-        let nym = head.nym.clone();
-        return Ok(Json(LookupResponse {
-            nym,
-            active: false,
-            quota,
-            previous_nyms,
-            lifetime_nyms_used: used,
-            lifetime_nyms_cap: PERMANENT_NYM_CAP,
-        }));
-    }
-    Err(AppError::NymNotFound(
-        "no registration for this key".to_string(),
-    ))
+    let status = db::lookup_status_by_npub(&state.db, &params.npub)
+        .await?
+        .ok_or_else(|| AppError::NymNotFound("no registration for this key".to_string()))?;
+    let online = status.lightning_address_online;
+    Ok(Json(LookupResponse {
+        nym: status.canonical_nym,
+        active: online,
+        lightning_address_online: online,
+        alias: status.canonical_alias,
+        public_name_policy: PUBLIC_NAME_POLICY,
+        quota: QuotaView::new(status.used, PERMANENT_NYM_CAP),
+        previous_nyms: status.previous_nyms,
+        lifetime_nyms_used: status.used,
+        lifetime_nyms_cap: PERMANENT_NYM_CAP,
+    }))
 }
 
 // --- Reservation sync ---
