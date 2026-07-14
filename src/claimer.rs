@@ -703,6 +703,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             // commit and this side effect remains safe and convergent.
             invoice::flip_invoice_on_bitcoin_boltz_in_progress(
                 &state.db,
+                swap.id,
                 Some(swap.invoice_id),
                 &swap.boltz_swap_id,
             )
@@ -910,6 +911,7 @@ pub(crate) async fn handle_chain_swap_webhook(
     ) {
         invoice::flip_invoice_on_bitcoin_boltz_in_progress(
             &state.db,
+            swap.id,
             Some(swap.invoice_id),
             &swap.boltz_swap_id,
         )

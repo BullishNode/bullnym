@@ -1463,9 +1463,19 @@ pub async fn mark_invoice_in_progress_for_component(
     id: Uuid,
     component: InvoiceInProgressComponent,
 ) -> Result<bool, sqlx::Error> {
-    let is_direct = component == InvoiceInProgressComponent::Direct;
     let mut tx = pool.begin().await?;
     lock_invoice_lightning_projection(&mut tx, id).await?;
+    let flipped = mark_invoice_in_progress_for_component_locked(&mut tx, id, component).await?;
+    tx.commit().await?;
+    Ok(flipped)
+}
+
+async fn mark_invoice_in_progress_for_component_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    component: InvoiceInProgressComponent,
+) -> Result<bool, sqlx::Error> {
+    let is_direct = component == InvoiceInProgressComponent::Direct;
     let flipped: Option<bool> = sqlx::query_scalar(
         "WITH locked AS MATERIALIZED ( \
              SELECT status, direct_settlement_status, swap_settlement_status \
@@ -1509,10 +1519,105 @@ pub async fn mark_invoice_in_progress_for_component(
     )
     .bind(id)
     .bind(is_direct)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(flipped.unwrap_or(false))
+}
+
+fn chain_swap_in_progress_projection_allowed(parent_status: &str) -> bool {
+    matches!(
+        parent_status,
+        "user_lock_mempool"
+            | "user_lock_confirmed"
+            | "server_lock_mempool"
+            | "server_lock_confirmed"
+            | "claiming"
+            | "claim_failed"
+            | "refund_due"
+            | "refunding"
+    )
+}
+
+/// Re-drive payer-side chain-swap progress only while the current parent is a
+/// funded pre-final branch. The shared invoice projection lock is acquired
+/// before the parent row, matching exact settlement CAS; a late provider
+/// delivery therefore cannot regress `claimed`, `claim_stuck`, `refunded`, or
+/// any other terminal/unsupported branch back to settlement-pending.
+pub async fn mark_chain_swap_invoice_in_progress_if_current(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    invoice_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, invoice_id).await?;
+    let invoice_exists: Option<bool> =
+        sqlx::query_scalar("SELECT TRUE FROM invoices WHERE id = $1 FOR UPDATE")
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if invoice_exists.is_none() {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let parent: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT invoice_id, status FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let Some((locked_invoice_id, parent_status)) = parent else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    if locked_invoice_id != invoice_id {
+        return Err(sqlx::Error::Protocol(
+            "chain swap invoice changed while publishing in-progress state".into(),
+        ));
+    }
+    if !chain_swap_in_progress_projection_allowed(&parent_status) {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let flipped = mark_invoice_in_progress_for_component_locked(
+        &mut tx,
+        invoice_id,
+        InvoiceInProgressComponent::Swap,
+    )
+    .await?;
     tx.commit().await?;
-    Ok(flipped.unwrap_or(false))
+    Ok(flipped)
+}
+
+#[cfg(test)]
+mod chain_swap_in_progress_projection_tests {
+    use super::chain_swap_in_progress_projection_allowed;
+
+    #[test]
+    fn projection_accepts_only_funded_pre_final_chain_states() {
+        for status in [
+            "user_lock_mempool",
+            "user_lock_confirmed",
+            "server_lock_mempool",
+            "server_lock_confirmed",
+            "claiming",
+            "claim_failed",
+            "refund_due",
+            "refunding",
+        ] {
+            assert!(chain_swap_in_progress_projection_allowed(status), "{status}");
+        }
+        for status in [
+            "pending",
+            "claimed",
+            "claim_stuck",
+            "expired",
+            "lockup_failed",
+            "refunded",
+            "unknown",
+        ] {
+            assert!(!chain_swap_in_progress_projection_allowed(status), "{status}");
+        }
+    }
 }
 
 pub async fn mark_invoice_settlement_status(

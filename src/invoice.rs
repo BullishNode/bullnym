@@ -266,15 +266,14 @@ pub async fn flip_invoice_on_lightning_in_progress(
 /// is still recorded only after the server claims the LBTC output.
 pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
     pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
     invoice_id: Option<Uuid>,
     boltz_swap_id: &str,
 ) {
     let Some(id) = invoice_id else {
         return;
     };
-    match db::mark_invoice_in_progress_for_component(pool, id, db::InvoiceInProgressComponent::Swap)
-        .await
-    {
+    match db::mark_chain_swap_invoice_in_progress_if_current(pool, chain_swap_id, id).await {
         Ok(true) => {
             tracing::info!(
                 event = "invoice_in_progress_via_bitcoin_boltz_chain",
