@@ -962,6 +962,13 @@ fn classify_automatic_bitcoin_source(
             _ => false,
         });
         if expected {
+            result.exact_sources = primary
+                .iter()
+                .map(|observation| AutomaticFallbackSource {
+                    txid: observation.txid.clone(),
+                    vout: observation.vout,
+                })
+                .collect();
             result.bitcoin_source = BitcoinSourceEvidence::SpentByRecoveryTransaction;
             result.transaction = match attempt.status.as_str() {
                 "finalized" => MerchantTransactionEvidence::Finalized,
