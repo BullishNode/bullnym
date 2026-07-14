@@ -595,9 +595,11 @@ The reducer authorizes recovery only when:
 - recovery is cooperative-safe now or script-path spendable at the current
   Bitcoin height.
 
-The worker journals, broadcasts, fee-bumps, watches, and confirms without the
-merchant wallet being online. Manual action is an override for legacy or
-integrity-hold cases, not the normal executor.
+The worker journals, broadcasts, watches, and confirms without the merchant
+wallet being online. It replays only the exact committed bytes after ambiguity;
+explicit RBF replacement remains deferred to issue #86. There is no public
+manual execution action. Legacy or integrity-hold cases remain read-only
+operator incidents until a separate reviewed repair is implemented.
 
 Build one BTC recovery attempt per source outpoint. Bullnym must not aggregate
 unrelated payer fundings merely because they share the single emergency
@@ -770,13 +772,15 @@ The plan is complete only when all of the following are demonstrated:
   exposed;
 - a stale derivation state blocks new swaps and has a tested reconstruction
   procedure;
-- every source outpoint, including late and repeated funding, is tracked, and
-  unconfirmed funding is never credited;
+- the one independently verified primary Bitcoin funding transaction is bound
+  exactly to the swap; conflicting, late, repeated, or unconfirmed funding
+  never authorizes credit or recovery;
 - webhooks can be lost without losing progress;
 - exact claim and recovery bytes survive every crash boundary;
 - no broadcast alone creates a paid invoice or terminal swap;
 - reorged or evicted transactions return to active watching;
-- Bitcoin recovery automatically fee-bumps without changing its destination;
+- Bitcoin recovery uses fresh priority fee authority and exact-byte replay;
+  linked RBF replacement remains the explicitly deferred #86 hardening;
 - renegotiation cannot credit a stale amount;
 - a new swap always contains the merchant's single precommitted emergency
   address;
