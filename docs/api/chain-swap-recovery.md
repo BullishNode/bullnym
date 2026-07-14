@@ -51,10 +51,10 @@ A successful response contains acceptance metadata only:
 }
 ```
 
-The response never returns the address, npub, signature, commitment ID, or
-commitment version. There is deliberately no read or list operation; `GET` on
-this path is not allowed. Missing and inactive identities produce the same
-generic authentication response, so the endpoint is not an identity oracle.
+The write response never returns the address, npub, signature, commitment ID,
+or commitment version. Missing and inactive identities produce the same
+generic authentication response, so the write endpoint is not an identity
+oracle.
 
 An exact signed-request retry (the same five logical values and signature)
 within the 300-second authentication window is idempotent: it resolves to the
@@ -63,7 +63,49 @@ valid signed request, including one with a new timestamp for the same address,
 appends a new commitment version and becomes the policy for future swaps.
 Address rotation never rewrites a swap that was already bound to an earlier
 commitment. If a response is lost, retry the exact request while it is fresh;
-do not re-sign merely to poll, because there is no read API.
+otherwise use the signed lookup below before deciding whether registration is
+needed. Do not re-sign a write merely to poll, because that would create a new
+immutable version.
+
+## Looking up the current recovery address
+
+Setup and seed-restore flows read the current private policy with:
+
+```text
+GET /api/v1/recovery-address?npub=<64 lowercase hex>&timestamp=<unix>&signature=<128 hex>
+```
+
+Sign LA-v2 action `recovery-address-get` in the identity-wide empty-nym domain
+with zero payload fields:
+
+```text
+bullpay-la-v2 NUL recovery-address-get NUL npub NUL NUL timestamp
+```
+
+When a commitment exists, the authenticated response is:
+
+```json
+{
+  "version": 1,
+  "recovery_address_registered": true,
+  "btc_address": "bc1...",
+  "commitment_version": 1,
+  "signed_at_unix": 1760000000
+}
+```
+
+When none exists, the three commitment-specific fields are `null` and
+`recovery_address_registered` is `false`. The lookup does not require an
+active nym: a restored wallet must still adopt the immutable address governing
+existing swaps after registration expiry. The caller must verify that its
+default Bitcoin wallet recognizes the returned mainnet address and reapply its
+local recovery label; it must not register a replacement merely because local
+label state was lost.
+
+The address is available only after a fresh signature from its owning npub.
+Anonymous Page, POS, invoice-status, registration-write, and error responses
+never expose it. The lookup also withholds the npub, commitment UUID, original
+authorization signature, and server registration time.
 
 ## Detecting recoverable swaps
 

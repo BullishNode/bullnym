@@ -43,6 +43,7 @@ unlinked invoice operations it is the empty string.
 | recover chain swap | `invoice-recover` | `invoice_id`, `btc_address` |
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 | register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
+| look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |
 
 Invoice optionals always occupy their fixed signing position as `""`. Amounts
 and timestamps use decimal strings. This distinction from the surface API's
