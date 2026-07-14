@@ -202,6 +202,11 @@ pub enum LiquidScriptHistory {
 pub struct LiquidHistorySnapshot {
     pub authority: String,
     pub tip_height: i32,
+    /// Canonical block hash at `tip_height`, sampled and rechecked by the same
+    /// authority as the script history. Automatic fallback must bind an empty
+    /// history to an identical chain tip at both independent authorities;
+    /// height agreement alone is not fork agreement.
+    pub tip_hash: String,
     pub entries: Vec<LiquidHistoryEntry>,
     /// Current canonical hashes for every history height and every stored
     /// prior-positive height requested by the caller that was still available
@@ -1024,6 +1029,7 @@ fn fetch_liquid_history_snapshot(
         LiquidHistorySnapshot {
             authority: String::new(),
             tip_height,
+            tip_hash,
             entries,
             anchored_block_hashes: block_hashes,
         },
@@ -1058,6 +1064,8 @@ fn agree_liquid_history_snapshots(
     right: &LiquidHistorySnapshot,
 ) -> Option<LiquidHistorySnapshot> {
     if left.authority == right.authority
+        || left.tip_height != right.tip_height
+        || left.tip_hash != right.tip_hash
         || left.entries != right.entries
         || left.anchored_block_hashes != right.anchored_block_hashes
     {
@@ -1071,9 +1079,8 @@ fn agree_liquid_history_snapshots(
     );
     Some(LiquidHistorySnapshot {
         authority,
-        // Authorities can be sampled a few seconds apart. The lower tip is
-        // the strongest height both snapshots independently reached.
-        tip_height: left.tip_height.min(right.tip_height),
+        tip_height: left.tip_height,
+        tip_hash: left.tip_hash.clone(),
         entries: left.entries.clone(),
         anchored_block_hashes: left.anchored_block_hashes.clone(),
     })

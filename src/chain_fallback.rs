@@ -206,13 +206,16 @@ async fn probe_automatic_fallback_dependencies(state: &AppState) -> Result<(), A
     }
 }
 
-/// A deterministic, unspendable script used only to prove that two distinct
+/// An ephemeral, unspendable script used only to prove that two distinct
 /// Liquid authorities can agree on a stable history/tip boundary. It carries no
-/// payment identity and cannot authorize a per-swap decision.
+/// payment identity and cannot authorize a per-swap decision. Fresh randomness
+/// prevents the readiness probe itself from becoming a public history-flooding
+/// target that can remotely close new-money admission.
 fn automatic_fallback_readiness_script() -> lwk_wollet::elements::Script {
     let mut bytes = Vec::with_capacity(34);
     bytes.extend_from_slice(&[0x6a, 0x20]); // OP_RETURN PUSH32
-    bytes.extend_from_slice(&[0x85; 32]);
+    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+    bytes.extend_from_slice(Uuid::new_v4().as_bytes());
     lwk_wollet::elements::Script::from(bytes)
 }
 
@@ -360,11 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn readiness_probe_uses_a_fixed_unspendable_non_payment_script() {
-        let script = automatic_fallback_readiness_script();
-        assert_eq!(script.as_bytes().len(), 34);
-        assert_eq!(&script.as_bytes()[..2], &[0x6a, 0x20]);
-        assert!(script.as_bytes()[2..].iter().all(|byte| *byte == 0x85));
+    fn readiness_probe_uses_an_ephemeral_unspendable_non_payment_script() {
+        let first = automatic_fallback_readiness_script();
+        let second = automatic_fallback_readiness_script();
+        assert_eq!(first.as_bytes().len(), 34);
+        assert_eq!(&first.as_bytes()[..2], &[0x6a, 0x20]);
+        assert_ne!(first, second);
     }
 
     #[test]
