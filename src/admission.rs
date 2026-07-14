@@ -47,18 +47,20 @@ pub enum Worker {
     ChainClaimer,
     ReverseReconciler,
     ChainReconciler,
+    AutomaticFallback,
     SettlementRepair,
     SlowRecovery,
 }
 
 impl Worker {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::LiquidWatcher,
         Self::BitcoinWatcher,
         Self::ReverseClaimer,
         Self::ChainClaimer,
         Self::ReverseReconciler,
         Self::ChainReconciler,
+        Self::AutomaticFallback,
         Self::SettlementRepair,
         Self::SlowRecovery,
     ];
@@ -71,6 +73,7 @@ impl Worker {
             Self::ChainClaimer => "chain_claimer",
             Self::ReverseReconciler => "reverse_reconciler",
             Self::ChainReconciler => "chain_reconciler",
+            Self::AutomaticFallback => "automatic_fallback",
             Self::SettlementRepair => "settlement_repair",
             Self::SlowRecovery => "slow_recovery",
         }
@@ -257,6 +260,7 @@ impl WorkerCadences {
         values.insert(Worker::ChainClaimer, Duration::from_secs(10));
         values.insert(Worker::ReverseReconciler, reconciler);
         values.insert(Worker::ChainReconciler, reconciler);
+        values.insert(Worker::AutomaticFallback, reconciler);
         values.insert(Worker::SettlementRepair, reconciler);
         values.insert(Worker::SlowRecovery, slow_recovery);
         Self { values }
@@ -619,6 +623,7 @@ fn required_workers(rail: Rail) -> &'static [Worker] {
         Rail::BitcoinChain => &[
             Worker::ChainClaimer,
             Worker::ChainReconciler,
+            Worker::AutomaticFallback,
             Worker::SettlementRepair,
             Worker::SlowRecovery,
         ],

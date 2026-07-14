@@ -5,6 +5,7 @@
 //! transaction ids remain outside the source facts assembled here.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::str::FromStr;
 
 use boltz_client::elements;
@@ -15,22 +16,31 @@ use boltz_client::Keypair;
 use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 
+use crate::chain_lockup_witness_audit::{ChainLockupInclusionV1, ChainLockupSpendV1};
 use crate::chain_swap_action::{
-    BitcoinSourceEvidence, BitcoinTimeoutEvidence, ChainSwapEvidence, CooperativeRecoveryEvidence,
-    EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence, MerchantTransactionEvidence,
-    ProviderStatusEvidence, RecoveryDestinationEvidence, RenegotiationEvidence,
+    recheck_recovery_under_lock, BitcoinSourceEvidence, BitcoinTimeoutEvidence, ChainSwapEvidence,
+    CooperativeRecoveryEvidence, EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence,
+    MerchantTransactionEvidence, ProviderStatusEvidence, RecoveryDestinationEvidence,
+    RecoveryExecutionGate, RenegotiationEvidence,
 };
 use crate::chain_swap_primary_source::{
-    project_primary_bitcoin_source_snapshot_v1, PrimaryBitcoinSourceAuthorityV1,
-    PrimaryBitcoinSourceProjectionV1, PrimaryBitcoinSourceTargetV1,
+    project_primary_bitcoin_source_snapshot_v1, PrimaryBitcoinAmountRelationV1,
+    PrimaryBitcoinSourceAuthorityV1, PrimaryBitcoinSourceProjectionV1,
+    PrimaryBitcoinSourceTargetV1,
 };
 use crate::db::{self, ChainSwapRecord, ChainSwapTxAttempt};
 use crate::error::AppError;
 use crate::merchant_settlement_lifecycle::SettlementFinalityPolicy;
 use crate::utxo::{
-    LiquidHistorySnapshotLimits, LiquidHistorySnapshotOutcome, LiquidScriptHistory, UtxoBackend,
+    LiquidHistorySnapshot, LiquidHistorySnapshotLimits, LiquidHistorySnapshotOutcome,
+    LiquidScriptHistory, UtxoBackend,
 };
 use crate::AppState;
+
+const AUTOMATIC_FALLBACK_LIQUID_HISTORY_LIMIT: usize = 64;
+const LIQUID_MAINNET_GENESIS_HASH: &str =
+    "1466275836220db2944ca059a3a10ef6fd2ea684b0688d2c379296888a206003";
+const REDACTED: &str = "<redacted>";
 
 /// Owned snapshot handoff for the runtime reducer.
 pub struct CollectedPendingExpiryEvidence {
@@ -539,6 +549,865 @@ const fn merge_evidence_quality(left: EvidenceQuality, right: EvidenceQuality) -
     }
 }
 
+/// One exact Bitcoin source outpoint selected by the independently audited
+/// primary transaction. It remains an in-memory construction constraint; #85
+/// does not introduce an allocation ledger or aggregate unrelated swaps.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutomaticFallbackSource {
+    txid: String,
+    vout: u32,
+}
+
+impl AutomaticFallbackSource {
+    pub fn txid(&self) -> &str {
+        &self.txid
+    }
+
+    pub fn vout(&self) -> u32 {
+        self.vout
+    }
+}
+
+impl fmt::Debug for AutomaticFallbackSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AutomaticFallbackSource")
+            .field("txid", &REDACTED)
+            .field("vout", &self.vout)
+            .finish()
+    }
+}
+
+/// Complete automatic-fallback packet assembled inside the shared per-swap
+/// lock. Secret/address material has explicit accessors and redacted Debug.
+#[derive(Clone)]
+pub struct CollectedAutomaticFallbackEvidence {
+    pub evidence: ChainSwapEvidence,
+    committed_destination: Option<String>,
+    exact_sources: Vec<AutomaticFallbackSource>,
+    bitcoin_timeout_height: Option<u32>,
+    dependencies_available: bool,
+}
+
+impl CollectedAutomaticFallbackEvidence {
+    pub fn committed_destination(&self) -> Option<&str> {
+        self.committed_destination.as_deref()
+    }
+
+    pub fn exact_sources(&self) -> &[AutomaticFallbackSource] {
+        &self.exact_sources
+    }
+
+    pub fn bitcoin_timeout_height(&self) -> Option<u32> {
+        self.bitcoin_timeout_height
+    }
+
+    pub fn dependencies_available(&self) -> bool {
+        self.dependencies_available
+    }
+
+    /// Mechanical shape check in addition to the shared #82 reducer gate.
+    /// The reducer chooses the rail; this check proves the executor also has
+    /// one concrete immutable destination, timeout, and exact primary input
+    /// set before construction can be called.
+    pub fn authorizes_automatic_recovery(&self) -> bool {
+        matches!(
+            recheck_recovery_under_lock(&self.evidence),
+            RecoveryExecutionGate::Authorized
+        ) && self.dependencies_available
+            && self.evidence.bitcoin_timeout == BitcoinTimeoutEvidence::Reached
+            && self.committed_destination.is_some()
+            && self.bitcoin_timeout_height.is_some()
+            && !self.exact_sources.is_empty()
+    }
+}
+
+impl fmt::Debug for CollectedAutomaticFallbackEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectedAutomaticFallbackEvidence")
+            .field("evidence", &self.evidence)
+            .field(
+                "committed_destination",
+                &self.committed_destination.as_ref().map(|_| REDACTED),
+            )
+            .field("exact_source_count", &self.exact_sources.len())
+            .field("bitcoin_timeout_height", &self.bitcoin_timeout_height)
+            .field("dependencies_available", &self.dependencies_available)
+            .finish()
+    }
+}
+
+/// Assemble the independent #82 packet used by #85 scheduling and execution.
+///
+/// Provider lifecycle/status is deliberately absent. Before the immutable
+/// Bitcoin timeout, a missing Liquid lock is still a viable/unknown normal
+/// path. At and after the timeout, one self-hosted primary Bitcoin snapshot,
+/// one stable exact Liquid snapshot, the historical #84 commitment, and all
+/// transaction intents must agree before the reducer can authorize unilateral
+/// recovery.
+pub async fn collect_automatic_fallback_evidence_under_lock(
+    state: &AppState,
+    conn: &mut PgConnection,
+    swap: &ChainSwapRecord,
+    recovery_attempt: Option<&ChainSwapTxAttempt>,
+) -> Result<CollectedAutomaticFallbackEvidence, AppError> {
+    let delivery = db::get_delivered_manifest_for_chain_swap(&mut *conn, swap.id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let liquid_intent_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM chain_swap_tx_attempts \
+              WHERE chain_swap_id = $1 \
+                AND purpose IN ('liquid_claim', 'liquid_claim_replacement') \
+             UNION ALL \
+             SELECT 1 FROM merchant_settlement_checkpoints \
+              WHERE chain_swap_id = $1 AND settlement_path = 'liquid_claim' \
+         )",
+    )
+    .bind(swap.id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+
+    let mut evidence = ChainSwapEvidence {
+        quality: EvidenceQuality::CompleteAndAgreed,
+        provider_status: ProviderStatusEvidence::Unknown,
+        bitcoin_source: BitcoinSourceEvidence::Unknown,
+        liquid_lock: LiquidLockEvidence::Unknown,
+        liquid_path: LiquidPathEvidence::Unknown,
+        renegotiation: RenegotiationEvidence::Ambiguous,
+        recovery_destination: RecoveryDestinationEvidence::Missing,
+        cooperative_recovery: CooperativeRecoveryEvidence::Unknown,
+        bitcoin_timeout: BitcoinTimeoutEvidence::Unknown,
+        liquid_claim_transaction: automatic_fallback_liquid_claim_transaction_evidence(
+            swap,
+            liquid_intent_exists,
+        ),
+        bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
+    };
+
+    let committed_destination =
+        collect_exact_recovery_destination(conn, swap, recovery_attempt, &mut evidence).await?;
+
+    let primary_target = delivery.and_then(|delivery| {
+        let expected_amount_sat = u64::try_from(swap.user_lock_amount_sat).ok()?;
+        PrimaryBitcoinSourceTargetV1::try_new(
+            delivery.manifest_sequence,
+            delivery.manifest_id,
+            delivery.chain_swap_id,
+            swap.lockup_address.clone(),
+            expected_amount_sat,
+        )
+        .ok()
+    });
+    let liquid_target = exact_liquid_server_lock_target(swap).ok();
+
+    let bitcoin_read = async {
+        let adapter = state.bitcoin_lockup_witness_adapter.as_deref().ok_or(())?;
+        let target = primary_target.as_ref().ok_or(())?;
+        let snapshot = adapter
+            .load_chain_swap_snapshot(
+                target.manifest_id(),
+                target.chain_swap_id(),
+                target.lockup_address(),
+            )
+            .await
+            .map_err(|_| ())?;
+        let authority = if adapter.is_primary_authority(&snapshot) {
+            PrimaryBitcoinSourceAuthorityV1::SelfHostedNode
+        } else {
+            PrimaryBitcoinSourceAuthorityV1::UntrustedSingleBackend
+        };
+        Ok::<_, ()>((snapshot, authority))
+    };
+    let liquid_read = async {
+        let backend = state.utxo_backend.as_deref().ok_or(())?;
+        let target = liquid_target.as_ref().ok_or(())?;
+        let outcome = backend
+            .automatic_fallback_liquid_history_snapshot(
+                &target.script,
+                &[],
+                LiquidHistorySnapshotLimits {
+                    max_history_entries: AUTOMATIC_FALLBACK_LIQUID_HISTORY_LIMIT,
+                    max_block_heights: AUTOMATIC_FALLBACK_LIQUID_HISTORY_LIMIT,
+                },
+            )
+            .await
+            .map_err(|_| ())?;
+        match outcome {
+            LiquidHistorySnapshotOutcome::Complete(snapshot) => Ok(snapshot),
+            LiquidHistorySnapshotOutcome::Incomplete(_) => Err(()),
+        }
+    };
+    let (bitcoin_snapshot, liquid_snapshot) = tokio::join!(bitcoin_read, liquid_read);
+    let primary_bitcoin_available = matches!(
+        bitcoin_snapshot.as_ref(),
+        Ok((_, PrimaryBitcoinSourceAuthorityV1::SelfHostedNode))
+    );
+    let dependencies_available =
+        committed_destination.is_some() && primary_bitcoin_available && liquid_snapshot.is_ok();
+
+    let mut exact_sources = Vec::new();
+    let mut bitcoin_timeout_height = None;
+    let mut amount_relation = PrimaryBitcoinAmountRelationV1::Unknown;
+    match (primary_target.as_ref(), bitcoin_snapshot.as_ref().ok()) {
+        (Some(target), Some((snapshot, authority))) => {
+            let projection =
+                project_primary_bitcoin_source_snapshot_v1(target, snapshot, None, *authority)
+                    .map_err(|_| {
+                        AppError::ClaimError(
+                            "automatic fallback rejected the primary Bitcoin evidence".into(),
+                        )
+                    })?;
+            projection.apply_to_reducer_evidence(&mut evidence);
+            amount_relation = projection.amount_relation();
+            let projected =
+                classify_automatic_bitcoin_source(&projection, snapshot, recovery_attempt);
+            evidence.bitcoin_source = projected.bitcoin_source;
+            evidence.bitcoin_recovery_transaction = projected.transaction;
+            evidence.quality = merge_quality(evidence.quality, projected.quality);
+            exact_sources = projected.exact_sources;
+
+            let timeout = swap
+                .creation_terms
+                .as_ref()
+                .and_then(|terms| u32::try_from(terms.btc_timeout_height).ok());
+            match timeout {
+                Some(timeout) if timeout > 0 => {
+                    bitcoin_timeout_height = Some(timeout);
+                    evidence.bitcoin_timeout = if snapshot.tip_height >= timeout {
+                        BitcoinTimeoutEvidence::Reached
+                    } else {
+                        BitcoinTimeoutEvidence::BeforeTimeout
+                    };
+                }
+                _ => evidence.quality = EvidenceQuality::Incomplete,
+            }
+        }
+        _ => evidence.quality = EvidenceQuality::Incomplete,
+    }
+
+    match (
+        state.utxo_backend.as_deref(),
+        liquid_target.as_ref(),
+        liquid_snapshot.as_ref().ok(),
+    ) {
+        (Some(backend), Some(target), Some(snapshot)) => {
+            let projected = classify_liquid_server_lock(
+                backend,
+                target,
+                snapshot,
+                swap,
+                liquid_intent_exists,
+                state.config.liquid_watcher.finality_confirmations,
+            )
+            .await?;
+            evidence.quality = merge_quality(evidence.quality, projected.quality);
+            evidence.liquid_lock = projected.lock;
+            evidence.liquid_claim_transaction = projected.transaction;
+            if projected.path_unavailable
+                && evidence.bitcoin_timeout == BitcoinTimeoutEvidence::Reached
+            {
+                evidence.liquid_path = LiquidPathEvidence::Unavailable;
+            }
+        }
+        _ => evidence.quality = EvidenceQuality::Incomplete,
+    }
+
+    if evidence.liquid_path != LiquidPathEvidence::Unavailable {
+        evidence.liquid_path = match evidence.liquid_lock {
+            LiquidLockEvidence::NotObserved
+            | LiquidLockEvidence::MempoolUnspent
+            | LiquidLockEvidence::ConfirmedUnspent => LiquidPathEvidence::Viable,
+            LiquidLockEvidence::SpentByProviderRefund => LiquidPathEvidence::Unavailable,
+            LiquidLockEvidence::Unknown
+            | LiquidLockEvidence::SpentByMerchantClaim
+            | LiquidLockEvidence::UnknownOutspend => LiquidPathEvidence::Unknown,
+        };
+    }
+    evidence.renegotiation = classify_renegotiation(swap, amount_relation);
+
+    Ok(CollectedAutomaticFallbackEvidence {
+        evidence,
+        committed_destination,
+        exact_sources,
+        bitcoin_timeout_height,
+        dependencies_available,
+    })
+}
+
+async fn collect_exact_recovery_destination(
+    conn: &mut PgConnection,
+    swap: &ChainSwapRecord,
+    recovery_attempt: Option<&ChainSwapTxAttempt>,
+    evidence: &mut ChainSwapEvidence,
+) -> Result<Option<String>, AppError> {
+    let Some(terms) = swap.creation_terms.as_ref() else {
+        return Ok(None);
+    };
+    let (Some(commitment_id), Some(destination)) = (
+        terms.recovery_address_commitment_id,
+        terms.merchant_emergency_btc_address.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let commitment = db::select_recovery_address_commitment_by_id(&mut *conn, commitment_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let invoice_owner = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT npub_owner, nym_owner FROM invoices WHERE id = $1",
+    )
+    .bind(swap.invoice_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|error| AppError::DbError(error.to_string()))?;
+    let exact = commitment.as_ref().is_some_and(|commitment| {
+        commitment.commitment_id == commitment_id
+            && commitment.canonical_btc_address() == destination
+            && recovery_owner_matches_invoice(
+                &commitment.npub,
+                swap.nym.as_deref(),
+                invoice_owner.as_ref(),
+            )
+    });
+    if !exact {
+        evidence.recovery_destination = RecoveryDestinationEvidence::Disputed;
+        return Ok(None);
+    }
+    if swap
+        .refund_address
+        .as_deref()
+        .is_some_and(|address| address != destination)
+        || recovery_attempt
+            .is_some_and(|attempt| attempt.destination_address.as_str() != destination)
+    {
+        evidence.recovery_destination = RecoveryDestinationEvidence::Disputed;
+        return Ok(None);
+    }
+    evidence.recovery_destination = RecoveryDestinationEvidence::Committed;
+    Ok(Some(destination.clone()))
+}
+
+fn recovery_owner_matches_invoice(
+    commitment_npub: &str,
+    swap_nym: Option<&str>,
+    invoice_owner: Option<&(String, Option<String>)>,
+) -> bool {
+    invoice_owner.is_some_and(|(npub, nym)| npub == commitment_npub && nym.as_deref() == swap_nym)
+}
+
+struct AutomaticBitcoinProjection {
+    quality: EvidenceQuality,
+    bitcoin_source: BitcoinSourceEvidence,
+    transaction: MerchantTransactionEvidence,
+    exact_sources: Vec<AutomaticFallbackSource>,
+}
+
+fn classify_automatic_bitcoin_source(
+    projection: &PrimaryBitcoinSourceProjectionV1,
+    snapshot: &crate::chain_lockup_witness_adapter::BitcoinMainnetLockupWitnessSnapshotV1,
+    attempt: Option<&ChainSwapTxAttempt>,
+) -> AutomaticBitcoinProjection {
+    let mut result = AutomaticBitcoinProjection {
+        quality: projection.quality(),
+        bitcoin_source: projection.bitcoin_source(),
+        transaction: recovery_transaction_evidence(attempt),
+        exact_sources: Vec::new(),
+    };
+    let Some(primary_txid) = projection.primary_txid() else {
+        return result;
+    };
+    let primary = snapshot
+        .observations
+        .iter()
+        .filter(|observation| observation.txid == primary_txid)
+        .collect::<Vec<_>>();
+    if primary.is_empty() {
+        result.quality = EvidenceQuality::Incomplete;
+        result.bitcoin_source = BitcoinSourceEvidence::Unknown;
+        return result;
+    }
+
+    if projection.bitcoin_source() == BitcoinSourceEvidence::ConfirmedUnspent {
+        if primary.iter().all(|observation| {
+            matches!(
+                observation.inclusion,
+                ChainLockupInclusionV1::Confirmed { .. }
+            ) && observation.spend == ChainLockupSpendV1::Unspent
+        }) {
+            result.exact_sources = primary
+                .iter()
+                .map(|observation| AutomaticFallbackSource {
+                    txid: observation.txid.clone(),
+                    vout: observation.vout,
+                })
+                .collect();
+            if let Some(attempt) = attempt {
+                result.transaction = match attempt.status.as_str() {
+                    "integrity_hold" => MerchantTransactionEvidence::Disputed,
+                    "confirmed" | "finalized" => MerchantTransactionEvidence::Disputed,
+                    _ => MerchantTransactionEvidence::Prepared,
+                };
+            }
+        } else {
+            result.quality = EvidenceQuality::BackendDisagreement;
+            result.bitcoin_source = BitcoinSourceEvidence::Unknown;
+        }
+        return result;
+    }
+
+    if projection.bitcoin_source() == BitcoinSourceEvidence::UnknownOutspend {
+        let Some(attempt) = attempt else {
+            return result;
+        };
+        let mut inclusion = None;
+        let expected = primary.iter().all(|observation| match &observation.spend {
+            ChainLockupSpendV1::Spent {
+                spending_txid,
+                inclusion: candidate,
+            } if spending_txid.eq_ignore_ascii_case(&attempt.txid) => {
+                inclusion = Some(candidate);
+                true
+            }
+            _ => false,
+        });
+        if expected {
+            result.exact_sources = primary
+                .iter()
+                .map(|observation| AutomaticFallbackSource {
+                    txid: observation.txid.clone(),
+                    vout: observation.vout,
+                })
+                .collect();
+            result.bitcoin_source = BitcoinSourceEvidence::SpentByRecoveryTransaction;
+            result.transaction = match attempt.status.as_str() {
+                "finalized" => MerchantTransactionEvidence::Finalized,
+                "integrity_hold" => MerchantTransactionEvidence::Disputed,
+                _ => match inclusion {
+                    Some(ChainLockupInclusionV1::Mempool) => MerchantTransactionEvidence::Mempool,
+                    Some(ChainLockupInclusionV1::Confirmed { .. }) => {
+                        MerchantTransactionEvidence::Confirmed
+                    }
+                    None => MerchantTransactionEvidence::Disputed,
+                },
+            };
+        }
+    }
+    result
+}
+
+struct AutomaticFallbackLiquidServerLockTarget {
+    script: elements::Script,
+    blinding_key: elements::secp256k1_zkp::SecretKey,
+    asset_id: elements::AssetId,
+    amount_sat: u64,
+    timeout_height: i32,
+    refund_leaf: elements::Script,
+    provider_refund_key: elements::secp256k1_zkp::XOnlyPublicKey,
+}
+
+fn exact_liquid_server_lock_target(
+    swap: &ChainSwapRecord,
+) -> Result<AutomaticFallbackLiquidServerLockTarget, AppError> {
+    let script = exact_liquid_server_lock_script(swap)?;
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
+            AppError::ClaimError(format!("invalid chain creation response: {error}"))
+        })?;
+    let terms = swap
+        .creation_terms
+        .as_ref()
+        .ok_or_else(|| AppError::ClaimError("chain swap lacks immutable creation terms".into()))?;
+    let refund_leaf_bytes = hex::decode(&response.claim_details.swap_tree.refund_leaf.output)
+        .map_err(|_| AppError::ClaimError("Liquid refund leaf is invalid".into()))?;
+    if hex::encode(Sha256::digest(&refund_leaf_bytes)) != terms.liquid_refund_script_sha256 {
+        return Err(AppError::ClaimError(
+            "Liquid refund leaf differs from immutable creation terms".into(),
+        ));
+    }
+    let refund_leaf = elements::Script::from(refund_leaf_bytes);
+    let provider_refund_key = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(
+        &response
+            .claim_details
+            .server_public_key
+            .inner
+            .x_only_public_key()
+            .0
+            .serialize(),
+    )
+    .map_err(|_| AppError::ClaimError("Liquid provider refund key is invalid".into()))?;
+    let blinding_key = response
+        .claim_details
+        .blinding_key
+        .as_deref()
+        .ok_or_else(|| AppError::ClaimError("Liquid server lock lacks its blinding key".into()))?
+        .parse()
+        .map_err(|_| {
+            AppError::ClaimError("Liquid server lock has an invalid blinding key".into())
+        })?;
+    let asset_id = terms
+        .liquid_asset_id
+        .parse()
+        .map_err(|_| AppError::ClaimError("chain swap has an invalid Liquid asset".into()))?;
+    let amount_sat = u64::try_from(swap.effective_server_lock_amount_sat())
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| AppError::ClaimError("chain swap has an invalid Liquid amount".into()))?;
+    let timeout_height = i32::try_from(terms.liquid_timeout_height)
+        .ok()
+        .filter(|height| *height > 0)
+        .ok_or_else(|| AppError::ClaimError("chain swap has an invalid Liquid timeout".into()))?;
+    let expected_refund_leaf = elements::script::Builder::new()
+        .push_slice(&provider_refund_key.serialize())
+        .push_opcode(elements::opcodes::all::OP_CHECKSIGVERIFY)
+        .push_int(i64::from(timeout_height))
+        .push_opcode(elements::opcodes::all::OP_CLTV)
+        .into_script();
+    if refund_leaf != expected_refund_leaf {
+        return Err(AppError::ClaimError(
+            "Liquid refund leaf does not bind the pinned provider key and timeout".into(),
+        ));
+    }
+    Ok(AutomaticFallbackLiquidServerLockTarget {
+        script,
+        blinding_key,
+        asset_id,
+        amount_sat,
+        timeout_height,
+        refund_leaf,
+        provider_refund_key,
+    })
+}
+
+struct AutomaticFallbackLiquidLockProjection {
+    quality: EvidenceQuality,
+    lock: LiquidLockEvidence,
+    transaction: MerchantTransactionEvidence,
+    path_unavailable: bool,
+}
+
+async fn classify_liquid_server_lock(
+    backend: &dyn UtxoBackend,
+    target: &AutomaticFallbackLiquidServerLockTarget,
+    snapshot: &LiquidHistorySnapshot,
+    swap: &ChainSwapRecord,
+    liquid_intent_exists: bool,
+    finality_confirmations: u32,
+) -> Result<AutomaticFallbackLiquidLockProjection, AppError> {
+    let claim_intent =
+        automatic_fallback_liquid_claim_transaction_evidence(swap, liquid_intent_exists);
+    if snapshot.entries.is_empty() {
+        return Ok(AutomaticFallbackLiquidLockProjection {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            lock: LiquidLockEvidence::NotObserved,
+            transaction: claim_intent,
+            path_unavailable: liquid_height_is_finalized(
+                snapshot.tip_height,
+                target.timeout_height,
+                finality_confirmations,
+            ),
+        });
+    }
+
+    let secp = elements::secp256k1_zkp::Secp256k1::new();
+    let mut candidates = Vec::new();
+    let mut invalid_candidate = false;
+    for entry in &snapshot.entries {
+        let raw = backend.get_raw_tx(&entry.txid).await?;
+        let transaction: elements::Transaction = elements::encode::deserialize(&raw)
+            .map_err(|_| AppError::ElectrumError("decode Liquid server-lock evidence".into()))?;
+        if !transaction
+            .txid()
+            .to_string()
+            .eq_ignore_ascii_case(&entry.txid)
+        {
+            return Ok(AutomaticFallbackLiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+                transaction: claim_intent,
+                path_unavailable: false,
+            });
+        }
+        for (vout, output) in transaction.output.iter().enumerate() {
+            if output.script_pubkey != target.script {
+                continue;
+            }
+            let opened = match output.unblind(&secp, target.blinding_key) {
+                Ok(opened) => opened,
+                Err(_) => {
+                    invalid_candidate = true;
+                    continue;
+                }
+            };
+            if opened.asset != target.asset_id || opened.value != target.amount_sat {
+                invalid_candidate = true;
+                continue;
+            }
+            let Ok(vout) = u32::try_from(vout) else {
+                invalid_candidate = true;
+                continue;
+            };
+            candidates.push((entry, vout, output.clone()));
+        }
+    }
+    if invalid_candidate || candidates.len() != 1 {
+        return Ok(AutomaticFallbackLiquidLockProjection {
+            quality: if invalid_candidate {
+                EvidenceQuality::BackendDisagreement
+            } else {
+                EvidenceQuality::Incomplete
+            },
+            lock: LiquidLockEvidence::Unknown,
+            transaction: claim_intent,
+            path_unavailable: false,
+        });
+    }
+
+    let (funding, vout, funding_output) = &candidates[0];
+    let mut spenders = Vec::new();
+    for entry in &snapshot.entries {
+        let raw = backend.get_raw_tx(&entry.txid).await?;
+        let transaction: elements::Transaction = elements::encode::deserialize(&raw)
+            .map_err(|_| AppError::ElectrumError("decode Liquid outspend evidence".into()))?;
+        if !transaction
+            .txid()
+            .to_string()
+            .eq_ignore_ascii_case(&entry.txid)
+        {
+            return Ok(AutomaticFallbackLiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+                transaction: claim_intent,
+                path_unavailable: false,
+            });
+        }
+        if transaction.input.iter().any(|input| {
+            input
+                .previous_output
+                .txid
+                .to_string()
+                .eq_ignore_ascii_case(&funding.txid)
+                && input.previous_output.vout == *vout
+        }) {
+            spenders.push((entry, transaction));
+        }
+    }
+    if spenders.is_empty() {
+        return Ok(AutomaticFallbackLiquidLockProjection {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            lock: if funding.height > 0 {
+                LiquidLockEvidence::ConfirmedUnspent
+            } else {
+                LiquidLockEvidence::MempoolUnspent
+            },
+            transaction: claim_intent,
+            path_unavailable: false,
+        });
+    }
+    if spenders.len() != 1 {
+        return Ok(AutomaticFallbackLiquidLockProjection {
+            quality: EvidenceQuality::BackendDisagreement,
+            lock: LiquidLockEvidence::UnknownOutspend,
+            transaction: claim_intent,
+            path_unavailable: false,
+        });
+    }
+    let (spender_entry, spender_transaction) = &spenders[0];
+    if liquid_history_entry_is_finalized(snapshot, funding, finality_confirmations)
+        && liquid_history_entry_is_finalized(snapshot, spender_entry, finality_confirmations)
+        && validates_exact_liquid_provider_refund(
+            target,
+            &funding.txid,
+            *vout,
+            funding_output,
+            spender_transaction,
+        )
+    {
+        return Ok(AutomaticFallbackLiquidLockProjection {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            lock: LiquidLockEvidence::SpentByProviderRefund,
+            transaction: claim_intent,
+            path_unavailable: true,
+        });
+    }
+
+    // A txid alone is not #83-compatible raw-transaction authority. A
+    // non-final, cooperative, malformed, wrong-leaf, or wrong-key outspend is
+    // an integrity stop rather than guessed provider-refund evidence.
+    Ok(AutomaticFallbackLiquidLockProjection {
+        quality: EvidenceQuality::CompleteAndAgreed,
+        lock: LiquidLockEvidence::UnknownOutspend,
+        transaction: claim_intent,
+        path_unavailable: false,
+    })
+}
+
+fn liquid_height_is_finalized(
+    tip_height: i32,
+    fact_height: i32,
+    finality_confirmations: u32,
+) -> bool {
+    if fact_height <= 0 || finality_confirmations == 0 {
+        return false;
+    }
+    tip_height
+        .checked_sub(fact_height)
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|confirmations| u32::try_from(confirmations).ok())
+        .is_some_and(|confirmations| confirmations >= finality_confirmations)
+}
+
+fn liquid_history_entry_is_finalized(
+    snapshot: &LiquidHistorySnapshot,
+    entry: &crate::utxo::LiquidHistoryEntry,
+    finality_confirmations: u32,
+) -> bool {
+    liquid_height_is_finalized(snapshot.tip_height, entry.height, finality_confirmations)
+        && entry.block_hash.as_ref().is_some_and(|block_hash| {
+            snapshot.anchored_block_hashes.get(&entry.height) == Some(block_hash)
+        })
+}
+
+/// Prove the exact unilateral server-refund script path emitted by the pinned
+/// Boltz protocol implementation. A Liquid txid does not commit witness bytes,
+/// so classification requires the raw witness's taproot commitment and
+/// provider signature, not merely a matching funding outpoint.
+fn validates_exact_liquid_provider_refund(
+    target: &AutomaticFallbackLiquidServerLockTarget,
+    funding_txid: &str,
+    funding_vout: u32,
+    funding_output: &elements::TxOut,
+    spender: &elements::Transaction,
+) -> bool {
+    use elements::hashes::Hash as _;
+    use elements::schnorr::TapTweak as _;
+
+    let Ok(timeout_height) = u32::try_from(target.timeout_height) else {
+        return false;
+    };
+    let [input] = spender.input.as_slice() else {
+        return false;
+    };
+    if spender.version != 2
+        || funding_output.script_pubkey != target.script
+        || !input
+            .previous_output
+            .txid
+            .to_string()
+            .eq_ignore_ascii_case(funding_txid)
+        || input.previous_output.vout != funding_vout
+        || input.sequence != elements::Sequence::ZERO
+        || input.is_pegin
+        || input.asset_issuance != elements::AssetIssuance::default()
+        || !input.script_sig.is_empty()
+        || input.witness.amount_rangeproof.is_some()
+        || input.witness.inflation_keys_rangeproof.is_some()
+        || !input.witness.pegin_witness.is_empty()
+        || spender.lock_time.to_consensus_u32() != timeout_height
+    {
+        return false;
+    }
+    let [signature_bytes, refund_leaf_bytes, control_block_bytes] =
+        input.witness.script_witness.as_slice()
+    else {
+        return false;
+    };
+    if signature_bytes.len() != 64 || refund_leaf_bytes.as_slice() != target.refund_leaf.as_bytes()
+    {
+        return false;
+    }
+    let Ok(signature) = elements::SchnorrSig::from_slice(signature_bytes) else {
+        return false;
+    };
+    if signature.hash_ty != elements::SchnorrSighashType::Default {
+        return false;
+    }
+    let Ok(control_block) = elements::taproot::ControlBlock::from_slice(control_block_bytes) else {
+        return false;
+    };
+    if control_block.leaf_version != elements::taproot::LeafVersion::default() {
+        return false;
+    }
+    let script_bytes = funding_output.script_pubkey.as_bytes();
+    if script_bytes.len() != 34 || script_bytes[0] != 0x51 || script_bytes[1] != 0x20 {
+        return false;
+    }
+    let Ok(output_key) = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&script_bytes[2..])
+    else {
+        return false;
+    };
+    let output_key = output_key.dangerous_assume_tweaked();
+    let secp = elements::secp256k1_zkp::Secp256k1::verification_only();
+    if !control_block.verify_taproot_commitment(&secp, &output_key, &target.refund_leaf) {
+        return false;
+    }
+
+    let Ok(genesis_hash) = elements::BlockHash::from_str(LIQUID_MAINNET_GENESIS_HASH) else {
+        return false;
+    };
+    let refund_leaf_hash = elements::taproot::TapLeafHash::from_script(
+        &target.refund_leaf,
+        elements::taproot::LeafVersion::default(),
+    );
+    let Ok(sighash) = elements::sighash::SighashCache::new(spender)
+        .taproot_script_spend_signature_hash(
+            0,
+            &elements::sighash::Prevouts::All(&[funding_output]),
+            refund_leaf_hash,
+            elements::SchnorrSighashType::Default,
+            genesis_hash,
+        )
+    else {
+        return false;
+    };
+    let Ok(message) = elements::secp256k1_zkp::Message::from_digest_slice(sighash.as_byte_array())
+    else {
+        return false;
+    };
+    secp.verify_schnorr(&signature.sig, &message, &target.provider_refund_key)
+        .is_ok()
+}
+
+fn classify_renegotiation(
+    swap: &ChainSwapRecord,
+    amount_relation: PrimaryBitcoinAmountRelationV1,
+) -> RenegotiationEvidence {
+    if swap.renegotiated_server_lock_amount_sat.is_some() {
+        return RenegotiationEvidence::AcceptedAwaitingLock;
+    }
+    match amount_relation {
+        PrimaryBitcoinAmountRelationV1::NotFunded | PrimaryBitcoinAmountRelationV1::Exact => {
+            RenegotiationEvidence::NotRequired
+        }
+        PrimaryBitcoinAmountRelationV1::Unknown
+        | PrimaryBitcoinAmountRelationV1::Underfunded
+        | PrimaryBitcoinAmountRelationV1::Overfunded => RenegotiationEvidence::Ambiguous,
+    }
+}
+
+fn automatic_fallback_liquid_claim_transaction_evidence(
+    swap: &ChainSwapRecord,
+    persisted_intent_exists: bool,
+) -> MerchantTransactionEvidence {
+    match (swap.claim_txid.as_deref(), swap.claim_tx_hex.as_deref()) {
+        (None, None) if !persisted_intent_exists => MerchantTransactionEvidence::None,
+        _ => MerchantTransactionEvidence::Disputed,
+    }
+}
+
+fn merge_quality(left: EvidenceQuality, right: EvidenceQuality) -> EvidenceQuality {
+    use EvidenceQuality::{
+        BackendDisagreement, CompleteAndAgreed, Incomplete, ProviderDisagreement,
+    };
+    match (left, right) {
+        (BackendDisagreement, _) | (_, BackendDisagreement) => BackendDisagreement,
+        (ProviderDisagreement, _) | (_, ProviderDisagreement) => ProviderDisagreement,
+        (Incomplete, _) | (_, Incomplete) => Incomplete,
+        (CompleteAndAgreed, CompleteAndAgreed) => CompleteAndAgreed,
+    }
+}
+
 /// Assemble fresh evidence while the caller holds the existing per-swap
 /// advisory transaction lock and has reloaded `swap` with `FOR UPDATE`.
 ///
@@ -810,6 +1679,135 @@ mod tests {
         (second_gate, mutations)
     }
 
+    fn signed_provider_refund_fixture() -> (
+        AutomaticFallbackLiquidServerLockTarget,
+        String,
+        u32,
+        elements::TxOut,
+        elements::Transaction,
+    ) {
+        use elements::hashes::Hash as _;
+
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let provider_secret = elements::secp256k1_zkp::SecretKey::from_slice(&[3_u8; 32]).unwrap();
+        let provider_keypair =
+            elements::secp256k1_zkp::Keypair::from_secret_key(&secp, &provider_secret);
+        let (provider_refund_key, _) = provider_keypair.x_only_public_key();
+        let internal_secret = elements::secp256k1_zkp::SecretKey::from_slice(&[4_u8; 32]).unwrap();
+        let internal_keypair =
+            elements::secp256k1_zkp::Keypair::from_secret_key(&secp, &internal_secret);
+        let (internal_key, _) = internal_keypair.x_only_public_key();
+        let timeout_height = 1_000;
+        let refund_leaf = elements::script::Builder::new()
+            .push_slice(&provider_refund_key.serialize())
+            .push_opcode(elements::opcodes::all::OP_CHECKSIGVERIFY)
+            .push_int(i64::from(timeout_height))
+            .push_opcode(elements::opcodes::all::OP_CLTV)
+            .into_script();
+        let claim_leaf = elements::script::Builder::new()
+            .push_opcode(elements::opcodes::all::OP_PUSHNUM_1)
+            .into_script();
+        let spend_info = elements::taproot::TaprootBuilder::new()
+            .add_leaf_with_ver(1, claim_leaf, elements::taproot::LeafVersion::default())
+            .unwrap()
+            .add_leaf_with_ver(
+                1,
+                refund_leaf.clone(),
+                elements::taproot::LeafVersion::default(),
+            )
+            .unwrap()
+            .finalize(&secp, internal_key)
+            .unwrap();
+        let script = elements::Script::new_v1_p2tr_tweaked(spend_info.output_key());
+        let asset_id = elements::AssetId::LIQUID_BTC;
+        let funding_output = elements::TxOut {
+            asset: elements::confidential::Asset::Explicit(asset_id),
+            value: elements::confidential::Value::Explicit(50_000),
+            nonce: elements::confidential::Nonce::Null,
+            script_pubkey: script.clone(),
+            witness: elements::TxOutWitness::default(),
+        };
+        let funding_txid: elements::Txid = "11".repeat(32).parse().unwrap();
+        let funding_vout = 2;
+        let mut spender = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::from_consensus(timeout_height as u32),
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(funding_txid, funding_vout),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::ZERO,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![elements::TxOut::new_fee(250, asset_id)],
+        };
+        let genesis_hash = elements::BlockHash::from_str(LIQUID_MAINNET_GENESIS_HASH).unwrap();
+        let leaf_hash = elements::taproot::TapLeafHash::from_script(
+            &refund_leaf,
+            elements::taproot::LeafVersion::default(),
+        );
+        let sighash = elements::sighash::SighashCache::new(&spender)
+            .taproot_script_spend_signature_hash(
+                0,
+                &elements::sighash::Prevouts::All(&[&funding_output]),
+                leaf_hash,
+                elements::SchnorrSighashType::Default,
+                genesis_hash,
+            )
+            .unwrap();
+        let message =
+            elements::secp256k1_zkp::Message::from_digest_slice(sighash.as_byte_array()).unwrap();
+        let signature = elements::SchnorrSig {
+            sig: secp.sign_schnorr(&message, &provider_keypair),
+            hash_ty: elements::SchnorrSighashType::Default,
+        };
+        let control_block = spend_info
+            .control_block(&(
+                refund_leaf.clone(),
+                elements::taproot::LeafVersion::default(),
+            ))
+            .unwrap();
+        spender.input[0].witness.script_witness = vec![
+            signature.to_vec(),
+            refund_leaf.as_bytes().to_vec(),
+            control_block.serialize(),
+        ];
+
+        let target = AutomaticFallbackLiquidServerLockTarget {
+            script,
+            blinding_key: elements::secp256k1_zkp::SecretKey::from_slice(&[5_u8; 32]).unwrap(),
+            asset_id,
+            amount_sat: 50_000,
+            timeout_height,
+            refund_leaf,
+            provider_refund_key,
+        };
+        (
+            target,
+            funding_txid.to_string(),
+            funding_vout,
+            funding_output,
+            spender,
+        )
+    }
+
+    fn automatic_candidate() -> ChainSwapEvidence {
+        ChainSwapEvidence {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            provider_status: ProviderStatusEvidence::Unknown,
+            bitcoin_source: BitcoinSourceEvidence::ConfirmedUnspent,
+            liquid_lock: LiquidLockEvidence::NotObserved,
+            liquid_path: LiquidPathEvidence::Unavailable,
+            renegotiation: RenegotiationEvidence::NotRequired,
+            recovery_destination: RecoveryDestinationEvidence::Committed,
+            cooperative_recovery: CooperativeRecoveryEvidence::Unknown,
+            bitcoin_timeout: BitcoinTimeoutEvidence::Reached,
+            liquid_claim_transaction: MerchantTransactionEvidence::None,
+            bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
+        }
+    }
+
     #[test]
     fn recovery_attempt_ambiguity_never_looks_absent_or_final() {
         assert_eq!(
@@ -892,5 +1890,114 @@ mod tests {
             assert_eq!(mutations.journaled, 0);
             assert_eq!(mutations.broadcast, 1);
         }
+    }
+
+    #[test]
+    fn provider_refund_requires_exact_signed_script_path() {
+        let (target, funding_txid, funding_vout, funding_output, spender) =
+            signed_provider_refund_fixture();
+        assert!(validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &spender,
+        ));
+
+        let mut wrong_signature = spender.clone();
+        wrong_signature.input[0].witness.script_witness[0][0] ^= 1;
+        assert!(!validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &wrong_signature,
+        ));
+
+        let mut cooperative_key_path = spender;
+        cooperative_key_path.input[0]
+            .witness
+            .script_witness
+            .truncate(1);
+        assert!(!validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &cooperative_key_path,
+        ));
+    }
+
+    #[test]
+    fn liquid_refund_and_timeout_require_configured_finality_and_anchor() {
+        assert!(!liquid_height_is_finalized(100, 100, 2));
+        assert!(liquid_height_is_finalized(101, 100, 2));
+        assert!(!liquid_height_is_finalized(101, 100, 0));
+        assert!(!liquid_height_is_finalized(99, 100, 1));
+
+        let entry = crate::utxo::LiquidHistoryEntry {
+            txid: "22".repeat(32),
+            height: 100,
+            block_hash: Some("33".repeat(32)),
+        };
+        let mut snapshot = LiquidHistorySnapshot {
+            authority: "liquid-electrum-agreement:test".into(),
+            tip_height: 101,
+            tip_hash: "44".repeat(32),
+            entries: vec![entry.clone()],
+            anchored_block_hashes: std::collections::BTreeMap::from([(100, "33".repeat(32))]),
+        };
+        assert!(liquid_history_entry_is_finalized(&snapshot, &entry, 2));
+        snapshot.anchored_block_hashes.insert(100, "55".repeat(32));
+        assert!(!liquid_history_entry_is_finalized(&snapshot, &entry, 2));
+    }
+
+    #[test]
+    fn commitment_npub_is_bound_to_invoice_owner_not_the_nym_alias() {
+        let owner = ("02merchant".to_owned(), Some("merchant-name".to_owned()));
+        assert!(recovery_owner_matches_invoice(
+            "02merchant",
+            Some("merchant-name"),
+            Some(&owner),
+        ));
+        assert!(!recovery_owner_matches_invoice(
+            "merchant-name",
+            Some("merchant-name"),
+            Some(&owner),
+        ));
+        assert!(!recovery_owner_matches_invoice(
+            "02merchant",
+            Some("other-name"),
+            Some(&owner),
+        ));
+    }
+
+    #[test]
+    fn automatic_packet_requires_the_complete_execution_shape() {
+        let mut packet = CollectedAutomaticFallbackEvidence {
+            evidence: automatic_candidate(),
+            committed_destination: Some(
+                "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0".into(),
+            ),
+            exact_sources: vec![AutomaticFallbackSource {
+                txid: "11".repeat(32),
+                vout: 0,
+            }],
+            bitcoin_timeout_height: Some(840_000),
+            dependencies_available: true,
+        };
+        assert!(packet.authorizes_automatic_recovery());
+
+        packet.exact_sources.clear();
+        assert!(!packet.authorizes_automatic_recovery());
+        packet.exact_sources.push(AutomaticFallbackSource {
+            txid: "11".repeat(32),
+            vout: 0,
+        });
+        packet.evidence.renegotiation = RenegotiationEvidence::Ambiguous;
+        assert!(!packet.authorizes_automatic_recovery());
+        packet.evidence.renegotiation = RenegotiationEvidence::NotRequired;
+        packet.dependencies_available = false;
+        assert!(!packet.authorizes_automatic_recovery());
     }
 }

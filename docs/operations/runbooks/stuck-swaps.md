@@ -117,10 +117,12 @@ appear settled.
 
 This means the payer's BTC lockup is recoverable but merchant settlement did not
 complete. Recovery requires the single merchant-configured emergency Bitcoin
-address already committed to the swap. Use the authenticated recovery endpoint
-documented in [Chain-swap recovery](../../api/chain-swap-recovery.md); it applies
-first-write-wins destination persistence, provider preflight, confirmation, and
-claim/refund exclusion gates.
+address already committed to the swap. Bullnym's automatic worker reloads that
+commitment, the exact primary Bitcoin source, and independently agreed Liquid
+evidence under the shared swap lock before it can journal or broadcast. The
+signed endpoint documented in
+[Chain-swap recovery](../../api/chain-swap-recovery.md) is read-only lifecycle
+status; it cannot select a destination or trigger execution.
 
 Do not issue a refund if a claim transaction was constructed or broadcast. An
 ambiguous provider response is a reason to defer, not a reason to risk paying
@@ -132,7 +134,8 @@ Check `refund_txid` and chain state before retrying anything. A process crash ca
 occur after broadcast but before the database records success. Prove whether the
 persisted transaction or lockup output was spent, then reconcile the database
 to chain evidence. Never move the row back to `refund_due` merely because the
-HTTP request timed out.
+worker or a chain backend timed out. The automatic worker replays only the exact
+journaled bytes after a fresh authoritative recheck.
 
 ## Verify resolution
 

@@ -191,6 +191,52 @@ impl BitcoinLockupWitnessAdapterV1 {
             .is_some_and(|primary| primary == snapshot.authority())
     }
 
+    /// Prove that the configured primary Bitcoin witness authority can supply
+    /// one internally stable chain view right now.
+    ///
+    /// This deliberately does not fail over: automatic-fallback admission uses
+    /// the configured primary as its self-hosted authority contract, while
+    /// public failovers remain useful only for observing/draining existing
+    /// obligations. An ephemeral unspendable P2WSH target exercises the
+    /// address-history API as well as the bounded tip/canonical-block recheck;
+    /// a tip-only probe could falsely open admission when payment-specific
+    /// source evidence is unavailable. Fresh randomness prevents a public
+    /// fixed probe address from becoming an admission-denial target.
+    pub async fn primary_authority_health_check(
+        &self,
+    ) -> Result<(), BitcoinLockupWitnessAdapterError> {
+        let primary = self
+            .endpoints
+            .first()
+            .ok_or(BitcoinLockupWitnessAdapterError::InvalidConfiguration)?;
+        let manifest_id = Uuid::new_v4();
+        let chain_swap_id = Uuid::new_v4();
+        let witness_script = ScriptBuf::from_bytes({
+            let mut bytes = Vec::with_capacity(34);
+            bytes.extend_from_slice(&[0x6a, 0x20]); // OP_RETURN PUSH32
+            bytes.extend_from_slice(manifest_id.as_bytes());
+            bytes.extend_from_slice(chain_swap_id.as_bytes());
+            bytes
+        });
+        let address = Address::p2wsh(&witness_script, Network::Bitcoin);
+        let targets = [ManifestTarget {
+            manifest_id,
+            chain_swap_id,
+            address: address.to_string(),
+            script_pubkey: address.script_pubkey(),
+        }];
+        let mut authority = AuthorityScan::new(self, primary);
+        let snapshot = authority
+            .scan_targets(&targets)
+            .await
+            .map_err(|_| BitcoinLockupWitnessAdapterError::NoCompleteAuthority)?;
+        if self.is_primary_authority(&snapshot) {
+            Ok(())
+        } else {
+            Err(BitcoinLockupWitnessAdapterError::NoCompleteAuthority)
+        }
+    }
+
     /// Load a complete audit input. Every failed endpoint's partial vectors and
     /// caches are dropped before the next endpoint begins.
     pub async fn load_snapshot(

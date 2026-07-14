@@ -2122,6 +2122,7 @@ mod tests {
         LiquidHistorySnapshot {
             authority: "liquid-electrum:test".to_string(),
             tip_height: 200,
+            tip_hash: "00".repeat(32),
             entries,
             anchored_block_hashes: anchors
                 .iter()

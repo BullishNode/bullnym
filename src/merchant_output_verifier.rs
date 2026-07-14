@@ -2415,6 +2415,7 @@ mod tests {
         LiquidHistorySnapshot {
             authority: "mock-liquid-authority".into(),
             tip_height,
+            tip_hash: "00".repeat(32),
             entries,
             anchored_block_hashes: anchors
                 .iter()

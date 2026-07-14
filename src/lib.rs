@@ -9,6 +9,7 @@ pub mod boltz_restore_fetch;
 pub mod builder_fee;
 pub(crate) mod canonical_json;
 pub mod certification;
+pub mod chain_fallback;
 pub mod chain_lockup_witness_adapter;
 pub mod chain_lockup_witness_audit;
 pub mod chain_recovery;

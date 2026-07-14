@@ -20,7 +20,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
     donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl, nostr, og_image,
     pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration, registration,
@@ -711,6 +711,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tracing::info!("chain reconciler started (shares reconciler config)");
 
+        // Automatic Bitcoin fallback is a distinct existing-obligation
+        // executor. It consumes only #82-authorized due markers and remains
+        // active when admission closes; provider polling never decides or
+        // broadcasts from this task.
+        let _automatic_fallback_task = chain_fallback::spawn_automatic_fallback_executor(
+            state.clone(),
+            Arc::new(config.reconciler.clone()),
+            cancel.clone(),
+            state
+                .admission
+                .reporter(admission::Worker::AutomaticFallback),
+        );
+        tracing::info!("automatic Bitcoin fallback executor started");
+
         // Settlement-repair: re-records invoice payment events for reverse
         // (Lightning) swaps that reached `claimed` but whose invoice flip never
         // completed (crash / transient failure between the claimed commit and
@@ -1022,34 +1036,11 @@ fn build_router(state: AppState) -> Router {
             .route("/invoice/:id", get(invoice::render_unlinked_payment));
     }
 
-    // Merchant-authenticated chain-swap recovery (#44). Schnorr-signed by the
-    // invoice-owning nym; linked-only (only nym invoices ever create a chain
-    // swap). Gated SOLELY behind its own default-off flag — it signs and
-    // broadcasts real BTC and stays off until the staged broadcast test. Kept
-    // out of the `features.invoices` block: chain swaps are born under
-    // `payment_pages` (checkout), so tying the recover route to `invoices`
-    // could leave swaps in `refund_due` with the route silently absent.
-    if features.chain_swap_merchant_recovery {
-        if !features.payment_pages {
-            tracing::warn!(
-                "chain_swap_merchant_recovery is ON but payment_pages is OFF — no chain swaps are created, so nothing will ever be recoverable"
-            );
-        }
-        router = router.route(
-            "/api/v1/:nym/invoices/:id/recover",
-            post(invoice::recover_chain_swap).layer(DefaultBodyLimit::max(1024)),
-        );
-    }
-
-    // Signed, npub-keyed detection of stuck (recoverable) chain swaps. Read-only
-    // and ALWAYS-ON — deliberately NOT gated by `chain_swap_merchant_recovery`
-    // (that flag guards the dangerous broadcast path only): merchants must be
-    // able to SEE stranded funds before the recover action is enabled. The
-    // response carries `recovery_enabled` so the server drives the "Recover now"
-    // vs "Contact support" UI. Guarded by `invoices || payment_pages` for the
-    // same reason as the recover route: chain swaps are born under checkout
-    // (`payment_pages`), so a merchant could have a `refund_due` swap even on a
-    // deployment with `invoices` off — the detection route must not be absent.
+    // Signed, npub-keyed read-only status for chain swaps in the recovery
+    // lifecycle. Recovery execution is internal and automatic: this route
+    // never accepts a destination or triggers a broadcast. Guarded by
+    // `invoices || payment_pages` because chain swaps are born under checkout
+    // (`payment_pages`), so status must remain available when `invoices` is off.
     if features.invoices || features.payment_pages {
         router = router.route(
             "/api/v1/invoices/recoverable",

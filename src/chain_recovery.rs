@@ -11,7 +11,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::{Address, Network, Transaction};
+use bitcoin::hashes::Hash as _;
+use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
+use bitcoin::{
+    Address, Amount, Network, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
+    XOnlyPublicKey,
+};
 use boltz_client::network::esplora::EsploraBitcoinClient;
 use boltz_client::network::{BitcoinChain, Chain};
 use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateChainResponse, Side};
@@ -21,9 +27,16 @@ use boltz_client::swaps::{
 use boltz_client::util::fees::Fee;
 use boltz_client::{Keypair, PublicKey, Secp256k1};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::builder_fee::BitcoinBuilderFeeDecision;
+use crate::chain_swap_action::{
+    reduce_chain_swap_evidence, BitcoinSourceEvidence, ChainSwapAction, MerchantTransactionEvidence,
+};
+use crate::chain_swap_runtime_evidence::{
+    collect_automatic_fallback_evidence_under_lock, CollectedAutomaticFallbackEvidence,
+};
 use crate::db::{
     self, ChainSwapRecord, ChainSwapStatus, ChainSwapTxAttempt, NewBitcoinRecoveryAttempt,
     RecoverySourcePrevout,
@@ -31,6 +44,7 @@ use crate::db::{
 use crate::error::AppError;
 use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
 use crate::fee_policy::{BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness};
+use crate::fee_runtime::FeeRuntime;
 use crate::AppState;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -527,11 +541,10 @@ impl BitcoinRecoveryBroadcaster for EsploraRecoveryBroadcaster {
     }
 }
 
-/// Production entry after the caller's Boltz-status and lockup-confirmation
-/// gates.  The public dependency-taking variant below is intentionally narrow
-/// so DB integration tests can deterministically model crash and response-loss
-/// boundaries without a live Boltz or Bitcoin node.
-pub(crate) async fn execute_journaled_recovery(
+/// Existing-obligation #85 entry. This never selects an address from a request.
+/// The complete independent #82 packet is rebuilt under the shared lock before
+/// construction and again immediately before broadcast.
+pub(crate) async fn execute_journaled_recovery_automatically(
     state: &AppState,
     chain_swap_id: Uuid,
 ) -> Result<String, AppError> {
@@ -539,35 +552,30 @@ pub(crate) async fn execute_journaled_recovery(
         AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
     })?;
     let endpoints = evidence.endpoints().to_vec();
+    // This first production slice is positively authorized only after the
+    // immutable timeout. Its only live builder is unilateral; no provider
+    // response can select or downgrade the transaction path.
     let builder = LiveRecoveryBuilder { state };
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
-    // A missing current decision is passed through deliberately: an existing
-    // journal replays without it, while a new attempt remains pending.
-    let fee_decision = state
-        .fee_runtime
-        .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
-        .ok();
-    let construction_fee = match fee_decision.as_ref() {
-        Some((decision, record)) => RecoveryConstructionFee::new(decision, record),
-        None => RecoveryConstructionFee::unavailable(),
-    };
     execute_journaled_recovery_with_builder_fee(
         &state.db,
         chain_swap_id,
         &builder,
-        construction_fee,
-        evidence,
-        &broadcaster,
-        &NoRecoveryFaults,
+        RecoveryConstructionFee::runtime(&state.fee_runtime),
+        RecoveryExecutionServices {
+            evidence,
+            broadcaster: &broadcaster,
+            faults: &NoRecoveryFaults,
+        },
+        RecoveryExecutionMode::Automatic(state),
     )
     .await
 }
 
 /// Testable write-ahead executor.  This is public only to let the external DB
-/// integration target supply deterministic boundary fakes; normal application
-/// code calls [`execute_journaled_recovery`]. `fee_decision` applies only when
-/// no journaled attempt exists; retries always reuse the committed bytes and
-/// their immutable actual-fee evidence.
+/// integration target supply deterministic boundary fakes. `fee_decision`
+/// applies only when no journaled attempt exists; retries always reuse the
+/// committed bytes and their immutable actual-fee evidence.
 #[doc(hidden)]
 pub async fn execute_journaled_recovery_with_services(
     pool: &sqlx::PgPool,
@@ -608,9 +616,12 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
         chain_swap_id,
         builder,
         construction_fee,
-        evidence,
-        broadcaster,
-        faults,
+        RecoveryExecutionServices {
+            evidence,
+            broadcaster,
+            faults,
+        },
+        RecoveryExecutionMode::InjectedHarness,
     )
     .await
 }
@@ -619,17 +630,10 @@ struct RecoveryConstructionFee<'a> {
     builder_decision: Option<BitcoinBuilderFeeDecision>,
     record: Option<&'a FeeDecisionRecord>,
     compatibility_record: Option<Result<FeeDecisionRecord, AppError>>,
+    runtime: Option<&'a FeeRuntime>,
 }
 
 impl<'a> RecoveryConstructionFee<'a> {
-    fn new(decision: &BitcoinFeeDecision, record: &'a FeeDecisionRecord) -> Self {
-        Self {
-            builder_decision: Some(BitcoinBuilderFeeDecision::from(decision)),
-            record: Some(record),
-            compatibility_record: None,
-        }
-    }
-
     fn compatibility(decision: Option<&BitcoinFeeDecision>) -> Self {
         Self {
             builder_decision: decision.map(BitcoinBuilderFeeDecision::from),
@@ -638,16 +642,105 @@ impl<'a> RecoveryConstructionFee<'a> {
             // defer an unusable-record error until the core proves that no
             // committed bytes exist to replay.
             compatibility_record: decision.map(bitcoin_fee_record_for_compatibility_seam),
+            runtime: None,
         }
     }
 
-    const fn unavailable() -> Self {
+    const fn runtime(runtime: &'a FeeRuntime) -> Self {
         Self {
             builder_decision: None,
             record: None,
             compatibility_record: None,
+            runtime: Some(runtime),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryExecutionMode<'a> {
+    InjectedHarness,
+    Automatic(&'a AppState),
+}
+
+struct RecoveryExecutionServices<'a> {
+    evidence: &'a dyn BitcoinRecoveryEvidence,
+    broadcaster: &'a dyn BitcoinRecoveryBroadcaster,
+    faults: &'a dyn RecoveryFaultInjector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritativeAutomaticAttemptDecision {
+    Broadcast,
+    ExpectedObserved,
+    IntegrityHold,
+    Deferred,
+}
+
+/// Classify only the final primary-authority packet. The generic recovery
+/// backend has ordered public failovers and therefore cannot authorize an
+/// automatic state transition before this boundary.
+fn classify_authoritative_automatic_attempt(
+    action: ChainSwapAction,
+    bitcoin_source: BitcoinSourceEvidence,
+    recovery_transaction: MerchantTransactionEvidence,
+) -> AuthoritativeAutomaticAttemptDecision {
+    if action == ChainSwapAction::IntegrityHold {
+        return AuthoritativeAutomaticAttemptDecision::IntegrityHold;
+    }
+    if bitcoin_source == BitcoinSourceEvidence::SpentByRecoveryTransaction
+        && matches!(
+            recovery_transaction,
+            MerchantTransactionEvidence::Mempool
+                | MerchantTransactionEvidence::Confirmed
+                | MerchantTransactionEvidence::Finalized
+        )
+        && matches!(
+            action,
+            ChainSwapAction::WatchTransaction | ChainSwapAction::Finalize
+        )
+    {
+        return AuthoritativeAutomaticAttemptDecision::ExpectedObserved;
+    }
+    if action == ChainSwapAction::RecoverBitcoin {
+        AuthoritativeAutomaticAttemptDecision::Broadcast
+    } else {
+        AuthoritativeAutomaticAttemptDecision::Deferred
+    }
+}
+
+fn automatic_existing_attempt_may_reconcile(
+    decision: AuthoritativeAutomaticAttemptDecision,
+) -> bool {
+    matches!(
+        decision,
+        AuthoritativeAutomaticAttemptDecision::Broadcast
+            | AuthoritativeAutomaticAttemptDecision::ExpectedObserved
+            | AuthoritativeAutomaticAttemptDecision::IntegrityHold
+    )
+}
+
+enum RecoveryBroadcastDispatch {
+    Network {
+        attempt: ChainSwapTxAttempt,
+        result: Result<String, AppError>,
+        generic_error_reconciliation: bool,
+    },
+    ExpectedObserved {
+        attempt: ChainSwapTxAttempt,
+    },
+    IntegrityHold {
+        attempt: ChainSwapTxAttempt,
+        reason: String,
+    },
+}
+
+enum AutomaticAttemptPreflight {
+    BroadcastReady,
+    ExpectedObserved(ChainSwapTxAttempt),
+    IntegrityHold {
+        attempt: ChainSwapTxAttempt,
+        reason: String,
+    },
 }
 
 async fn execute_journaled_recovery_with_builder_fee(
@@ -655,10 +748,14 @@ async fn execute_journaled_recovery_with_builder_fee(
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
     construction_fee: RecoveryConstructionFee<'_>,
-    evidence: &dyn BitcoinRecoveryEvidence,
-    broadcaster: &dyn BitcoinRecoveryBroadcaster,
-    faults: &dyn RecoveryFaultInjector,
+    services: RecoveryExecutionServices<'_>,
+    mode: RecoveryExecutionMode<'_>,
 ) -> Result<String, AppError> {
+    let RecoveryExecutionServices {
+        evidence,
+        broadcaster,
+        faults,
+    } = services;
     prepare_or_reload_attempt(
         pool,
         chain_swap_id,
@@ -666,12 +763,15 @@ async fn execute_journaled_recovery_with_builder_fee(
         construction_fee,
         evidence,
         faults,
+        mode,
     )
     .await?;
 
     faults.check(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast)?;
 
     // Broadcast only bytes reloaded after the journal transaction committed.
+    // Automatic execution takes the shared execution lock again around its
+    // final independent evidence snapshot and the irreversible call below.
     let attempt = db::get_bitcoin_recovery_attempt(pool, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?
@@ -696,44 +796,81 @@ async fn execute_journaled_recovery_with_builder_fee(
         return Ok(attempt.txid);
     }
 
-    let observed_token = attempt.observed_state_token();
-    match reconcile_attempt_evidence(&attempt, evidence).await? {
-        EvidenceDecision::ExpectedObserved(reason) => {
-            complete_expected_attempt(pool, &attempt, &reason).await?;
-            return Ok(attempt.txid);
-        }
-        EvidenceDecision::Unspent => {}
-        EvidenceDecision::UnknownOutspend { source, spender } => {
-            let reason = format!(
-                "source {}:{} spent by unexpected transaction {}",
-                source.txid, source.vout, spender
-            );
-            let held = db::mark_recovery_integrity_hold(
-                pool,
-                attempt.chain_swap_id,
-                attempt.id,
-                &attempt.purpose,
-                &attempt.txid,
-                &observed_token,
-                &reason,
-            )
-            .await
-            .map_err(|e| AppError::DbError(e.to_string()))?;
-            if held != 1 {
-                return Err(AppError::DbError(
-                    "could not persist Bitcoin recovery integrity hold".into(),
-                ));
+    if matches!(mode, RecoveryExecutionMode::InjectedHarness) {
+        let observed_token = attempt.observed_state_token();
+        match reconcile_attempt_evidence(&attempt, evidence).await? {
+            EvidenceDecision::ExpectedObserved(reason) => {
+                complete_expected_attempt(pool, &attempt, &reason).await?;
+                return Ok(attempt.txid);
             }
-            tracing::error!(
-                event = "chain_swap_recovery_integrity_hold",
-                chain_swap_id = %attempt.chain_swap_id,
-                expected_txid = %attempt.txid,
-                source_txid = %source.txid,
-                source_vout = source.vout,
-                unexpected_spender = %spender,
-                "Bitcoin recovery source has an unknown outspend; automation stopped"
-            );
-            return Err(AppError::ClaimError(reason));
+            EvidenceDecision::Unspent => {}
+            EvidenceDecision::UnknownOutspend { source, spender } => {
+                let reason = format!(
+                    "source {}:{} spent by unexpected transaction {}",
+                    source.txid, source.vout, spender
+                );
+                let held = db::mark_recovery_integrity_hold(
+                    pool,
+                    attempt.chain_swap_id,
+                    attempt.id,
+                    &attempt.purpose,
+                    &attempt.txid,
+                    &observed_token,
+                    &reason,
+                )
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
+                if held != 1 {
+                    return Err(AppError::DbError(
+                        "could not persist Bitcoin recovery integrity hold".into(),
+                    ));
+                }
+                tracing::error!(
+                    event = "chain_swap_recovery_integrity_hold",
+                    chain_swap_id = %attempt.chain_swap_id,
+                    expected_txid = %attempt.txid,
+                    source_txid = %source.txid,
+                    source_vout = source.vout,
+                    unexpected_spender = %spender,
+                    "Bitcoin recovery source has an unknown outspend; injected harness stopped"
+                );
+                return Err(AppError::ClaimError(reason));
+            }
+        }
+    }
+
+    if let RecoveryExecutionMode::Automatic(state) = mode {
+        match preflight_automatic_attempt_under_lock(state, chain_swap_id).await? {
+            AutomaticAttemptPreflight::BroadcastReady => {}
+            AutomaticAttemptPreflight::ExpectedObserved(attempt) => {
+                complete_expected_attempt(
+                    pool,
+                    &attempt,
+                    "expected transaction observed by the authoritative primary snapshot",
+                )
+                .await?;
+                return Ok(attempt.txid);
+            }
+            AutomaticAttemptPreflight::IntegrityHold { attempt, reason } => {
+                let observed_token = attempt.observed_state_token();
+                let held = db::mark_recovery_integrity_hold(
+                    pool,
+                    attempt.chain_swap_id,
+                    attempt.id,
+                    &attempt.purpose,
+                    &attempt.txid,
+                    &observed_token,
+                    &reason,
+                )
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+                if held != 1 {
+                    return Err(AppError::DbError(
+                        "could not persist authoritative Bitcoin recovery integrity hold".into(),
+                    ));
+                }
+                return Err(AppError::ClaimError(reason));
+            }
         }
     }
 
@@ -748,9 +885,60 @@ async fn execute_journaled_recovery_with_builder_fee(
         })?;
     faults.check(RecoveryFaultPoint::AfterBroadcastAttemptCommit)?;
 
-    let broadcast_result = broadcaster
-        .broadcast(&attempt.raw_tx_hex, &attempt.txid)
-        .await;
+    let dispatch = match mode {
+        RecoveryExecutionMode::InjectedHarness => RecoveryBroadcastDispatch::Network {
+            result: broadcaster
+                .broadcast(&attempt.raw_tx_hex, &attempt.txid)
+                .await,
+            attempt,
+            generic_error_reconciliation: true,
+        },
+        RecoveryExecutionMode::Automatic(state) => {
+            broadcast_automatic_attempt_under_lock(state, chain_swap_id, broadcaster).await?
+        }
+    };
+
+    let (attempt, broadcast_result, generic_error_reconciliation) = match dispatch {
+        RecoveryBroadcastDispatch::ExpectedObserved { attempt } => {
+            complete_expected_attempt(
+                pool,
+                &attempt,
+                "expected transaction observed by the authoritative primary snapshot",
+            )
+            .await?;
+            return Ok(attempt.txid);
+        }
+        RecoveryBroadcastDispatch::IntegrityHold { attempt, reason } => {
+            let held = db::mark_recovery_integrity_hold(
+                pool,
+                attempt.chain_swap_id,
+                attempt.id,
+                &attempt.purpose,
+                &attempt.txid,
+                &started_token,
+                &reason,
+            )
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+            if held != 1 {
+                return Err(AppError::DbError(
+                    "could not persist authoritative Bitcoin recovery integrity hold".into(),
+                ));
+            }
+            tracing::error!(
+                event = "chain_swap_recovery_integrity_hold",
+                chain_swap_id = %attempt.chain_swap_id,
+                expected_txid = %attempt.txid,
+                "authoritative automatic-recovery evidence entered an integrity hold"
+            );
+            return Err(AppError::ClaimError(reason));
+        }
+        RecoveryBroadcastDispatch::Network {
+            attempt,
+            result,
+            generic_error_reconciliation,
+        } => (attempt, result, generic_error_reconciliation),
+    };
     faults.check(RecoveryFaultPoint::AfterBroadcastCallBeforeOutcomeCommit)?;
 
     match broadcast_result {
@@ -763,17 +951,23 @@ async fn execute_journaled_recovery_with_builder_fee(
                 "broadcaster returned txid {returned_txid}, expected {}",
                 attempt.txid
             );
-            reconcile_after_broadcast_error(
-                pool,
-                &attempt,
-                &started_token,
-                evidence,
-                AppError::ClaimError(error),
-            )
-            .await
+            let error = AppError::ClaimError(error);
+            if generic_error_reconciliation {
+                reconcile_after_broadcast_error(pool, &attempt, &started_token, evidence, error)
+                    .await
+            } else {
+                preserve_authoritative_broadcast_ambiguity(pool, &attempt, &started_token, error)
+                    .await
+            }
         }
         Err(error) => {
-            reconcile_after_broadcast_error(pool, &attempt, &started_token, evidence, error).await
+            if generic_error_reconciliation {
+                reconcile_after_broadcast_error(pool, &attempt, &started_token, evidence, error)
+                    .await
+            } else {
+                preserve_authoritative_broadcast_ambiguity(pool, &attempt, &started_token, error)
+                    .await
+            }
         }
     }
 }
@@ -785,6 +979,7 @@ async fn prepare_or_reload_attempt(
     construction_fee: RecoveryConstructionFee<'_>,
     evidence: &dyn BitcoinRecoveryEvidence,
     faults: &dyn RecoveryFaultInjector,
+    mode: RecoveryExecutionMode<'_>,
 ) -> Result<ChainSwapTxAttempt, AppError> {
     let mut tx = pool
         .begin()
@@ -811,11 +1006,69 @@ async fn prepare_or_reload_attempt(
     let existing = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    let automatic_authority = match mode {
+        RecoveryExecutionMode::InjectedHarness => None,
+        RecoveryExecutionMode::Automatic(state) => {
+            let collected = collect_automatic_fallback_evidence_under_lock(
+                state,
+                &mut tx,
+                &swap,
+                existing.as_ref(),
+            )
+            .await?;
+            if !collected.dependencies_available() {
+                return Err(AppError::ElectrumError(
+                    "automatic fallback evidence dependencies are unavailable".into(),
+                ));
+            }
+            let action = reduce_chain_swap_evidence(&collected.evidence);
+            let decision = classify_authoritative_automatic_attempt(
+                action,
+                collected.evidence.bitcoin_source,
+                collected.evidence.bitcoin_recovery_transaction,
+            );
+            if existing.is_some() {
+                if !automatic_existing_attempt_may_reconcile(decision) {
+                    return Err(AppError::RecoveryNotAvailable(
+                        "automatic fallback evidence no longer permits attempt reconciliation"
+                            .into(),
+                    ));
+                }
+                if decision == AuthoritativeAutomaticAttemptDecision::Broadcast
+                    && !collected.authorizes_automatic_recovery()
+                {
+                    return Err(AppError::ClaimError(
+                        "automatic fallback authorization packet is incomplete".into(),
+                    ));
+                }
+            } else if !collected.authorizes_automatic_recovery() {
+                if decision == AuthoritativeAutomaticAttemptDecision::IntegrityHold {
+                    return Err(AppError::ClaimError(
+                        "automatic fallback evidence requires an integrity hold".into(),
+                    ));
+                }
+                return Err(AppError::RecoveryNotAvailable(
+                    "automatic fallback evidence no longer authorizes recovery".into(),
+                ));
+            }
+            Some(collected)
+        }
+    };
 
     if let Some(attempt) = existing {
         // Validate the immutable bytes and their construction-time authority
         // before repairing any parent lifecycle state.
         validate_reloaded_attempt(&attempt)?;
+        if let Some(authority) = automatic_authority.as_ref() {
+            let decision = classify_authoritative_automatic_attempt(
+                reduce_chain_swap_evidence(&authority.evidence),
+                authority.evidence.bitcoin_source,
+                authority.evidence.bitcoin_recovery_transaction,
+            );
+            if decision != AuthoritativeAutomaticAttemptDecision::IntegrityHold {
+                validate_automatic_attempt_authority(&attempt, authority, &swap)?;
+            }
+        }
         if attempt.status == "integrity_hold" {
             return Err(AppError::ClaimError(format!(
                 "recovery attempt is on integrity hold: {}",
@@ -878,18 +1131,41 @@ async fn prepare_or_reload_attempt(
             "recovery blocked: a Liquid claim is already in progress for this payment".into(),
         ));
     }
-    let destination = swap.refund_address.clone().ok_or_else(|| {
-        AppError::ClaimError("chain swap recovery has no committed destination".into())
-    })?;
+    let destination = match automatic_authority.as_ref() {
+        Some(authority) => authority
+            .committed_destination()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                AppError::ClaimError("automatic fallback has no committed destination".into())
+            })?,
+        None => swap.refund_address.clone().ok_or_else(|| {
+            AppError::ClaimError("chain swap recovery has no committed destination".into())
+        })?,
+    };
     // Compatibility authority was captured before the pool/lock wait, but its
     // result is deliberately inspected only after the existing-journal branch:
     // replay never consults new-construction authority.
+    let runtime_fee = construction_fee
+        .runtime
+        .map(|runtime| {
+            runtime
+                .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+                .map_err(|_| {
+                    AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
+                })
+        })
+        .transpose()?;
     let compatibility_record = construction_fee.compatibility_record.transpose()?;
-    let fee_decision = construction_fee.builder_decision.ok_or_else(|| {
-        AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
-    })?;
+    let fee_decision = runtime_fee
+        .as_ref()
+        .map(|(decision, _)| BitcoinBuilderFeeDecision::from(decision))
+        .or(construction_fee.builder_decision)
+        .ok_or_else(|| {
+            AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
+        })?;
     let fee_record = construction_fee
         .record
+        .or_else(|| runtime_fee.as_ref().map(|(_, record)| record))
         .or(compatibility_record.as_ref())
         .ok_or_else(|| {
             AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
@@ -902,9 +1178,15 @@ async fn prepare_or_reload_attempt(
 
     faults.check(RecoveryFaultPoint::BeforeConstruction)?;
     let transaction = builder.construct(&swap, &destination, fee_decision).await?;
-    let prepared =
-        validate_constructed_attempt(&swap, &destination, &transaction, fee_record, evidence)
-            .await?;
+    let prepared = validate_constructed_attempt(
+        &swap,
+        &destination,
+        &transaction,
+        fee_record,
+        evidence,
+        automatic_authority.as_ref(),
+    )
+    .await?;
     faults.check(RecoveryFaultPoint::AfterConstructionBeforeJournal)?;
     if !fee_record.authorizes_construction_now() {
         return Err(AppError::RecoveryNotAvailable(
@@ -919,6 +1201,9 @@ async fn prepare_or_reload_attempt(
     // A faulty builder or inconsistent decision must roll back with the
     // journal instead of committing an unreplayable immutable attempt.
     validate_reloaded_attempt(&attempt)?;
+    if let Some(authority) = automatic_authority.as_ref() {
+        validate_automatic_attempt_authority(&attempt, authority, &swap)?;
+    }
     let rows = db::mark_chain_swap_refunding(&mut *tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -944,12 +1229,464 @@ async fn prepare_or_reload_attempt(
     Ok(attempt)
 }
 
+/// Reconcile a restarted attempt before incrementing its durable broadcast
+/// counter. This replaces the legacy first-success backend read with a fresh,
+/// coherent primary packet and lets an already-observed transaction complete
+/// without recording a broadcast call that never happened.
+async fn preflight_automatic_attempt_under_lock(
+    state: &AppState,
+    chain_swap_id: Uuid,
+) -> Result<AutomaticAttemptPreflight, AppError> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+    if !got_lock {
+        return Err(AppError::RecoveryNotAvailable(
+            "automatic fallback preflight lock is busy".into(),
+        ));
+    }
+    let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
+    if swap.parsed_status().map_err(AppError::DbError)? != ChainSwapStatus::Refunding {
+        return Err(AppError::RecoveryNotAvailable(
+            "automatic fallback is no longer the owned preflight branch".into(),
+        ));
+    }
+    let attempt = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::ClaimError(
+                "committed Bitcoin recovery attempt disappeared before preflight".into(),
+            )
+        })?;
+    validate_reloaded_attempt(&attempt)?;
+    let collected =
+        collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, Some(&attempt))
+            .await?;
+    if !collected.dependencies_available() {
+        return Err(AppError::ElectrumError(
+            "automatic fallback evidence dependencies changed during preflight".into(),
+        ));
+    }
+    let decision = classify_authoritative_automatic_attempt(
+        reduce_chain_swap_evidence(&collected.evidence),
+        collected.evidence.bitcoin_source,
+        collected.evidence.bitcoin_recovery_transaction,
+    );
+    let result = match decision {
+        AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
+            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            AutomaticAttemptPreflight::ExpectedObserved(attempt)
+        }
+        AuthoritativeAutomaticAttemptDecision::IntegrityHold => {
+            AutomaticAttemptPreflight::IntegrityHold {
+                attempt,
+                reason: "authoritative automatic fallback preflight requires integrity review"
+                    .into(),
+            }
+        }
+        AuthoritativeAutomaticAttemptDecision::Broadcast => {
+            if !collected.authorizes_automatic_recovery() {
+                return Err(AppError::ClaimError(
+                    "automatic fallback preflight authorization packet is incomplete".into(),
+                ));
+            }
+            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            AutomaticAttemptPreflight::BroadcastReady
+        }
+        AuthoritativeAutomaticAttemptDecision::Deferred => {
+            return Err(AppError::RecoveryNotAvailable(
+                "automatic fallback evidence changed during preflight".into(),
+            ));
+        }
+    };
+    tx.commit()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    Ok(result)
+}
+
+async fn broadcast_automatic_attempt_under_lock(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    broadcaster: &dyn BitcoinRecoveryBroadcaster,
+) -> Result<RecoveryBroadcastDispatch, AppError> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+    if !got_lock {
+        return Err(AppError::RecoveryNotAvailable(
+            "automatic fallback execution lock is busy".into(),
+        ));
+    }
+    let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| AppError::ClaimError(format!("chain swap not found: {chain_swap_id}")))?;
+    if swap.parsed_status().map_err(AppError::DbError)? != ChainSwapStatus::Refunding {
+        return Err(AppError::RecoveryNotAvailable(
+            "automatic fallback is no longer the owned execution branch".into(),
+        ));
+    }
+    let attempt = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::ClaimError(
+                "committed Bitcoin recovery attempt disappeared before broadcast".into(),
+            )
+        })?;
+    validate_reloaded_attempt(&attempt)?;
+    let collected =
+        collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, Some(&attempt))
+            .await?;
+    if !collected.dependencies_available() {
+        return Err(AppError::ElectrumError(
+            "automatic fallback evidence dependencies changed before broadcast".into(),
+        ));
+    }
+    let action = reduce_chain_swap_evidence(&collected.evidence);
+    match classify_authoritative_automatic_attempt(
+        action,
+        collected.evidence.bitcoin_source,
+        collected.evidence.bitcoin_recovery_transaction,
+    ) {
+        AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
+            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            tx.commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return Ok(RecoveryBroadcastDispatch::ExpectedObserved { attempt });
+        }
+        AuthoritativeAutomaticAttemptDecision::IntegrityHold => {
+            tx.commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return Ok(RecoveryBroadcastDispatch::IntegrityHold {
+                attempt,
+                reason: "authoritative automatic fallback evidence requires integrity review"
+                    .into(),
+            });
+        }
+        AuthoritativeAutomaticAttemptDecision::Deferred => {
+            return Err(AppError::RecoveryNotAvailable(
+                "automatic fallback evidence changed before broadcast".into(),
+            ));
+        }
+        AuthoritativeAutomaticAttemptDecision::Broadcast => {
+            if !collected.authorizes_automatic_recovery() {
+                return Err(AppError::ClaimError(
+                    "automatic fallback authorization packet is incomplete before broadcast".into(),
+                ));
+            }
+            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+        }
+    }
+    // Keep the transaction-scoped `chain-claim` lock through the exact-byte
+    // broadcast. External chain reads above may take time, but no claim,
+    // scheduler, or competing recovery can change the owned execution branch
+    // between the final #82 decision and the irreversible call.
+    let broadcast_result = broadcaster
+        .broadcast(&attempt.raw_tx_hex, &attempt.txid)
+        .await;
+    if !matches!(
+        &broadcast_result,
+        Ok(returned_txid) if returned_txid.eq_ignore_ascii_case(&attempt.txid)
+    ) {
+        // A broadcaster error or mismatched response is ambiguous. Automatic
+        // execution must reconcile it from another coherent primary packet,
+        // never from the generic first-success public-failover backend.
+        let reconciled =
+            collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, Some(&attempt))
+                .await?;
+        if reconciled.dependencies_available() {
+            let reconciled_action = reduce_chain_swap_evidence(&reconciled.evidence);
+            match classify_authoritative_automatic_attempt(
+                reconciled_action,
+                reconciled.evidence.bitcoin_source,
+                reconciled.evidence.bitcoin_recovery_transaction,
+            ) {
+                AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
+                    validate_automatic_attempt_authority(&attempt, &reconciled, &swap)?;
+                    tx.commit()
+                        .await
+                        .map_err(|error| AppError::DbError(error.to_string()))?;
+                    return Ok(RecoveryBroadcastDispatch::ExpectedObserved { attempt });
+                }
+                AuthoritativeAutomaticAttemptDecision::IntegrityHold => {
+                    tx.commit()
+                        .await
+                        .map_err(|error| AppError::DbError(error.to_string()))?;
+                    return Ok(RecoveryBroadcastDispatch::IntegrityHold {
+                        attempt,
+                        reason: "authoritative post-broadcast evidence requires integrity review"
+                            .into(),
+                    });
+                }
+                AuthoritativeAutomaticAttemptDecision::Broadcast => {
+                    // Revalidate all immutable attempt authority even though
+                    // this call remains ambiguous and will not rebroadcast in
+                    // the current invocation.
+                    if !reconciled.authorizes_automatic_recovery() {
+                        return Err(AppError::ClaimError(
+                            "automatic post-broadcast authorization packet is incomplete".into(),
+                        ));
+                    }
+                    validate_automatic_attempt_authority(&attempt, &reconciled, &swap)?;
+                }
+                AuthoritativeAutomaticAttemptDecision::Deferred => {}
+            }
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    Ok(RecoveryBroadcastDispatch::Network {
+        attempt,
+        result: broadcast_result,
+        generic_error_reconciliation: false,
+    })
+}
+
+fn validate_automatic_attempt_authority(
+    attempt: &ChainSwapTxAttempt,
+    authority: &CollectedAutomaticFallbackEvidence,
+    swap: &ChainSwapRecord,
+) -> Result<(), AppError> {
+    let destination = authority.committed_destination().ok_or_else(|| {
+        AppError::ClaimError("automatic fallback lacks its immutable destination".into())
+    })?;
+    if attempt.destination_address != destination
+        || swap.refund_address.as_deref() != Some(destination)
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal destination differs from the immutable commitment".into(),
+        ));
+    }
+    let address = Address::from_str(destination)
+        .map_err(|_| AppError::ClaimError("automatic recovery destination is invalid".into()))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| {
+            AppError::ClaimError("automatic recovery destination is not mainnet".into())
+        })?;
+    if hex::encode(address.script_pubkey().as_bytes()) != attempt.destination_script_hex {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal script differs from the immutable commitment".into(),
+        ));
+    }
+
+    let expected = authority
+        .exact_sources()
+        .iter()
+        .map(|source| (source.txid(), source.vout()))
+        .collect::<HashSet<_>>();
+    let actual = attempt
+        .source_prevouts
+        .0
+        .iter()
+        .map(|source| (source.txid.as_str(), source.vout))
+        .collect::<HashSet<_>>();
+    if actual != expected {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal sources differ from the fresh primary source set".into(),
+        ));
+    }
+    let raw = hex::decode(&attempt.raw_tx_hex)
+        .map_err(|_| AppError::ClaimError("automatic recovery journal hex is invalid".into()))?;
+    let transaction: Transaction = deserialize(&raw)
+        .map_err(|_| AppError::ClaimError("automatic recovery journal is invalid".into()))?;
+    let timeout_height = authority.bitcoin_timeout_height().ok_or_else(|| {
+        AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
+    })?;
+    if transaction.lock_time.to_consensus_u32() != timeout_height
+        || transaction
+            .input
+            .iter()
+            .any(|input| input.sequence != bitcoin::Sequence::ZERO)
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal does not enforce the immutable script timeout".into(),
+        ));
+    }
+    let source_txouts = journaled_source_txouts(&attempt.source_prevouts.0)?;
+    validate_automatic_unilateral_refund_witness(swap, &transaction, &source_txouts)?;
+    Ok(())
+}
+
+fn journaled_source_txouts(sources: &[RecoverySourcePrevout]) -> Result<Vec<TxOut>, AppError> {
+    sources
+        .iter()
+        .map(|source| {
+            let script_bytes = hex::decode(&source.script_pubkey_hex).map_err(|_| {
+                AppError::ClaimError(
+                    "automatic recovery journal source script is invalid hex".into(),
+                )
+            })?;
+            if hex::encode(&script_bytes) != source.script_pubkey_hex {
+                return Err(AppError::ClaimError(
+                    "automatic recovery journal source script is not canonical".into(),
+                ));
+            }
+            Ok(TxOut {
+                value: Amount::from_sat(source.amount_sat),
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            })
+        })
+        .collect()
+}
+
+/// Prove that every automatic input is the exact unilateral Boltz refund
+/// script path. Source/destination/fee validation alone is insufficient: a
+/// cooperative key-path transaction or a different tapleaf could otherwise be
+/// journaled and replayed after the immutable timeout.
+fn validate_automatic_unilateral_refund_witness(
+    swap: &ChainSwapRecord,
+    transaction: &Transaction,
+    source_txouts: &[TxOut],
+) -> Result<(), AppError> {
+    if transaction.input.len() != source_txouts.len() || transaction.input.is_empty() {
+        return Err(AppError::ClaimError(
+            "automatic recovery witness source set is incomplete".into(),
+        ));
+    }
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let terms = swap.creation_terms.as_ref().ok_or_else(|| {
+        AppError::ClaimError("automatic recovery lacks immutable creation terms".into())
+    })?;
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|_| {
+            AppError::ClaimError("automatic recovery creation response is invalid".into())
+        })?;
+    let refund_leaf_bytes = hex::decode(&response.lockup_details.swap_tree.refund_leaf.output)
+        .map_err(|_| AppError::ClaimError("automatic recovery refund leaf is invalid".into()))?;
+    if hex::encode(Sha256::digest(&refund_leaf_bytes)) != terms.btc_refund_script_sha256 {
+        return Err(AppError::ClaimError(
+            "automatic recovery refund leaf differs from immutable creation terms".into(),
+        ));
+    }
+    let refund_leaf = ScriptBuf::from_bytes(refund_leaf_bytes);
+    let leaf_hash = TapLeafHash::from_script(&refund_leaf, LeafVersion::TapScript);
+
+    let key_bytes = hex::decode(&swap.refund_key_hex)
+        .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
+    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
+        .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let refund_keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret_key);
+    let (refund_xonly, _) = refund_keypair.x_only_public_key();
+
+    let lockup_script = Address::from_str(&swap.lockup_address)
+        .map_err(|_| AppError::ClaimError("automatic recovery lockup address is invalid".into()))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| AppError::ClaimError("automatic recovery lockup is not mainnet".into()))?
+        .script_pubkey();
+    if source_txouts
+        .iter()
+        .any(|source| source.script_pubkey != lockup_script)
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery source script differs from the immutable lockup".into(),
+        ));
+    }
+
+    for (input_index, input) in transaction.input.iter().enumerate() {
+        if input.sequence != bitcoin::Sequence::ZERO
+            || input.witness.len() != 3
+            || input.witness[0].len() != 64
+        {
+            return Err(AppError::ClaimError(
+                "automatic recovery input is not an exact unilateral refund witness".into(),
+            ));
+        }
+        if &input.witness[1] != refund_leaf.as_bytes() {
+            return Err(AppError::ClaimError(
+                "automatic recovery witness uses a different refund leaf".into(),
+            ));
+        }
+        let signature = TaprootSignature::from_slice(&input.witness[0]).map_err(|_| {
+            AppError::ClaimError("automatic recovery witness signature is invalid".into())
+        })?;
+        if signature.sighash_type != TapSighashType::Default {
+            return Err(AppError::ClaimError(
+                "automatic recovery witness does not use the pinned sighash mode".into(),
+            ));
+        }
+        let control_block = ControlBlock::decode(&input.witness[2]).map_err(|_| {
+            AppError::ClaimError("automatic recovery witness control block is invalid".into())
+        })?;
+        if control_block.leaf_version != LeafVersion::TapScript {
+            return Err(AppError::ClaimError(
+                "automatic recovery witness control block uses a different leaf version".into(),
+            ));
+        }
+        let output_key = p2tr_output_key(&source_txouts[input_index].script_pubkey)?;
+        if !control_block.verify_taproot_commitment(&secp, output_key, &refund_leaf) {
+            return Err(AppError::ClaimError(
+                "automatic recovery witness does not commit to the source taproot output".into(),
+            ));
+        }
+        let sighash = SighashCache::new(transaction.clone())
+            .taproot_script_spend_signature_hash(
+                input_index,
+                &Prevouts::All(source_txouts),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .map_err(|_| {
+                AppError::ClaimError("automatic recovery witness sighash is invalid".into())
+            })?;
+        let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        secp.verify_schnorr(&signature.signature, &message, &refund_xonly)
+            .map_err(|_| {
+                AppError::ClaimError(
+                    "automatic recovery witness is not signed by the immutable refund key".into(),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn p2tr_output_key(script: &ScriptBuf) -> Result<XOnlyPublicKey, AppError> {
+    let bytes = script.as_bytes();
+    if bytes.len() != 34 || bytes[0] != 0x51 || bytes[1] != 0x20 {
+        return Err(AppError::ClaimError(
+            "automatic recovery source is not a canonical taproot output".into(),
+        ));
+    }
+    XOnlyPublicKey::from_slice(&bytes[2..]).map_err(|_| {
+        AppError::ClaimError("automatic recovery source taproot key is invalid".into())
+    })
+}
+
 async fn validate_constructed_attempt(
     swap: &ChainSwapRecord,
     destination: &str,
     transaction: &BtcLikeTransaction,
     fee_record: &FeeDecisionRecord,
     evidence: &dyn BitcoinRecoveryEvidence,
+    automatic_authority: Option<&CollectedAutomaticFallbackEvidence>,
 ) -> Result<PreparedAttempt, AppError> {
     let BtcLikeTransaction::Bitcoin(tx) = transaction else {
         return Err(AppError::ClaimError(
@@ -987,6 +1724,7 @@ async fn validate_constructed_attempt(
 
     let mut seen = HashSet::new();
     let mut source_prevouts = Vec::with_capacity(tx.input.len());
+    let mut source_txouts = Vec::with_capacity(tx.input.len());
     let mut total_input_sat = 0u64;
     for input in &tx.input {
         let source_txid = input.previous_output.txid.to_string();
@@ -1032,6 +1770,35 @@ async fn validate_constructed_attempt(
             amount_sat,
             script_pubkey_hex: hex::encode(prevout.script_pubkey.as_bytes()),
         });
+        source_txouts.push(prevout.clone());
+    }
+
+    if let Some(authority) = automatic_authority {
+        let expected = authority
+            .exact_sources()
+            .iter()
+            .map(|source| (source.txid().to_owned(), source.vout()))
+            .collect::<HashSet<_>>();
+        if seen != expected {
+            return Err(AppError::ClaimError(
+                "automatic recovery inputs do not match the exact primary source set".into(),
+            ));
+        }
+        let timeout_height = authority.bitcoin_timeout_height().ok_or_else(|| {
+            AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
+        })?;
+        if tx.lock_time.to_consensus_u32() != timeout_height
+            || tx
+                .input
+                .iter()
+                .any(|input| input.sequence != bitcoin::Sequence::ZERO)
+        {
+            return Err(AppError::ClaimError(
+                "automatic recovery transaction does not enforce the immutable script timeout"
+                    .into(),
+            ));
+        }
+        validate_automatic_unilateral_refund_witness(swap, tx, &source_txouts)?;
     }
 
     let total_output_sat = tx.output.iter().try_fold(0u64, |sum, output| {
@@ -1369,6 +2136,29 @@ async fn reconcile_after_broadcast_error(
     }
 }
 
+/// Automatic execution already performed its authoritative post-call recheck
+/// while holding the shared swap lock. If that packet did not positively
+/// explain the outcome, preserve the write-ahead ambiguity and propagate the
+/// original typed error without consulting a public failover backend.
+async fn preserve_authoritative_broadcast_ambiguity(
+    pool: &sqlx::PgPool,
+    attempt: &ChainSwapTxAttempt,
+    started_token: &db::RecoveryAttemptStateToken,
+    error: AppError,
+) -> Result<String, AppError> {
+    let result =
+        format!("broadcast outcome ambiguous after authoritative primary recheck: {error}");
+    let updated = db::mark_recovery_broadcast_ambiguous(pool, attempt.id, started_token, &result)
+        .await
+        .map_err(|database_error| AppError::DbError(database_error.to_string()))?;
+    if updated != 1 {
+        return Err(AppError::DbError(
+            "could not preserve authoritative Bitcoin recovery ambiguity".into(),
+        ));
+    }
+    Err(error)
+}
+
 async fn complete_expected_attempt(
     pool: &sqlx::PgPool,
     attempt: &ChainSwapTxAttempt,
@@ -1428,45 +2218,27 @@ async fn construct_live_refund(
     for (index, endpoint) in endpoints.iter().enumerate() {
         let bitcoin_client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
         let chain_client = ChainClient::new().with_bitcoin(bitcoin_client);
-        let build = |cooperative: bool| {
-            let params = SwapTransactionParams {
-                keys: refund_keypair,
-                output_address: refund_address.to_string(),
-                fee: bitcoin_recovery_fee(fee_decision),
-                swap_id: swap.boltz_swap_id.clone(),
-                chain_client: &chain_client,
-                boltz_client: &boltz_api,
-                options: Some(TransactionOptions::default().with_cooperative(cooperative)),
-            };
-            lockup_script.construct_refund(params)
+        let params = SwapTransactionParams {
+            keys: refund_keypair,
+            output_address: refund_address.to_string(),
+            fee: bitcoin_recovery_fee(fee_decision),
+            swap_id: swap.boltz_swap_id.clone(),
+            chain_client: &chain_client,
+            boltz_client: &boltz_api,
+            options: Some(TransactionOptions::default().with_cooperative(false)),
         };
-
-        match build(true).await {
+        match lockup_script.construct_refund(params).await {
             Ok(tx) => return Ok(tx),
-            Err(cooperative_error) => {
-                tracing::warn!(
-                    event = "chain_swap_refund_cooperative_failed",
-                    swap_id = %swap.boltz_swap_id,
-                    endpoint = %endpoint,
-                    error = %cooperative_error,
-                    "cooperative recovery construction failed; trying script path"
-                );
-                match build(false).await {
-                    Ok(tx) => return Ok(tx),
-                    Err(script_error) => {
-                        if index + 1 < endpoints.len() {
-                            tracing::warn!(
-                                event = "chain_swap_refund_construct_failover",
-                                swap_id = %swap.boltz_swap_id,
-                                endpoint = %endpoint,
-                                "recovery construction failed; rotating Bitcoin backend"
-                            );
-                        }
-                        errors.push(format!(
-                            "{endpoint}: cooperative={cooperative_error}; script={script_error}"
-                        ));
-                    }
+            Err(script_error) => {
+                if index + 1 < endpoints.len() {
+                    tracing::warn!(
+                        event = "chain_swap_refund_construct_failover",
+                        swap_id = %swap.boltz_swap_id,
+                        endpoint = %endpoint,
+                        "unilateral recovery construction failed; rotating Bitcoin backend"
+                    );
                 }
+                errors.push(format!("{endpoint}: script={script_error}"));
             }
         }
     }
@@ -1485,10 +2257,15 @@ mod tests {
     use boltz_client::util::fees::Fee;
 
     use super::{
-        bitcoin_recovery_fee, validate_reloaded_fee_intent, BitcoinRecoveryBackend,
-        BitcoinRecoveryEvidence, BitcoinRecoveryTransactionStatus,
+        automatic_existing_attempt_may_reconcile, bitcoin_recovery_fee,
+        classify_authoritative_automatic_attempt, validate_reloaded_fee_intent,
+        AuthoritativeAutomaticAttemptDecision, BitcoinRecoveryBackend, BitcoinRecoveryEvidence,
+        BitcoinRecoveryTransactionStatus,
     };
     use crate::builder_fee::BitcoinBuilderFeeDecision;
+    use crate::chain_swap_action::{
+        BitcoinSourceEvidence, ChainSwapAction, MerchantTransactionEvidence,
+    };
     use crate::db::{BitcoinRecoveryFeeAuthority, RecoverySourcePrevout};
     use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
     use axum::{
@@ -1555,6 +2332,74 @@ mod tests {
             let decision = bitcoin_builder_fee(rate);
             assert_eq!(relative_fee_rate(bitcoin_recovery_fee(decision)), rate);
         }
+    }
+
+    #[test]
+    fn automatic_restart_reconciles_only_an_exact_primary_observation() {
+        assert!(automatic_existing_attempt_may_reconcile(
+            AuthoritativeAutomaticAttemptDecision::ExpectedObserved
+        ));
+        assert!(automatic_existing_attempt_may_reconcile(
+            AuthoritativeAutomaticAttemptDecision::IntegrityHold
+        ));
+        assert!(!automatic_existing_attempt_may_reconcile(
+            AuthoritativeAutomaticAttemptDecision::Deferred
+        ));
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::WatchTransaction,
+                BitcoinSourceEvidence::SpentByRecoveryTransaction,
+                MerchantTransactionEvidence::Mempool,
+            ),
+            AuthoritativeAutomaticAttemptDecision::ExpectedObserved
+        );
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::Finalize,
+                BitcoinSourceEvidence::SpentByRecoveryTransaction,
+                MerchantTransactionEvidence::Finalized,
+            ),
+            AuthoritativeAutomaticAttemptDecision::ExpectedObserved
+        );
+
+        // A transaction status without the exact primary-source spend cannot
+        // complete a restarted attempt, even if a public backend reported it.
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::WatchTransaction,
+                BitcoinSourceEvidence::ConfirmedUnspent,
+                MerchantTransactionEvidence::Mempool,
+            ),
+            AuthoritativeAutomaticAttemptDecision::Deferred
+        );
+    }
+
+    #[test]
+    fn automatic_primary_decision_separates_broadcast_hold_and_defer() {
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::RecoverBitcoin,
+                BitcoinSourceEvidence::ConfirmedUnspent,
+                MerchantTransactionEvidence::Prepared,
+            ),
+            AuthoritativeAutomaticAttemptDecision::Broadcast
+        );
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::IntegrityHold,
+                BitcoinSourceEvidence::UnknownOutspend,
+                MerchantTransactionEvidence::Disputed,
+            ),
+            AuthoritativeAutomaticAttemptDecision::IntegrityHold
+        );
+        assert_eq!(
+            classify_authoritative_automatic_attempt(
+                ChainSwapAction::Observe,
+                BitcoinSourceEvidence::Unknown,
+                MerchantTransactionEvidence::Prepared,
+            ),
+            AuthoritativeAutomaticAttemptDecision::Deferred
+        );
     }
 
     #[derive(Clone)]

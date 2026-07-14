@@ -504,14 +504,18 @@ fn reduce_confirmed_unspent(evidence: &ChainSwapEvidence) -> ChainSwapAction {
         return Action::IntegrityHold;
     }
 
-    let recovery_action = match evidence.cooperative_recovery {
-        CooperativeRecoveryEvidence::Available => Action::RecoverBitcoin,
-        CooperativeRecoveryEvidence::Unknown => Action::Observe,
-        CooperativeRecoveryEvidence::Unavailable => match evidence.bitcoin_timeout {
-            BitcoinTimeoutEvidence::BeforeTimeout => Action::WaitForBitcoinTimeout,
-            BitcoinTimeoutEvidence::Reached => Action::RecoverBitcoin,
-            BitcoinTimeoutEvidence::Unknown => Action::Observe,
+    // Once the immutable Bitcoin timeout is independently proven reached, the
+    // unilateral refund path no longer depends on a provider response. Before
+    // that boundary, only positively available cooperative recovery may run;
+    // an unknown/transient cooperative result remains observational.
+    let recovery_action = match evidence.bitcoin_timeout {
+        BitcoinTimeoutEvidence::Reached => Action::RecoverBitcoin,
+        BitcoinTimeoutEvidence::BeforeTimeout => match evidence.cooperative_recovery {
+            CooperativeRecoveryEvidence::Available => Action::RecoverBitcoin,
+            CooperativeRecoveryEvidence::Unavailable => Action::WaitForBitcoinTimeout,
+            CooperativeRecoveryEvidence::Unknown => Action::Observe,
         },
+        BitcoinTimeoutEvidence::Unknown => Action::Observe,
     };
 
     if matches!(evidence.bitcoin_recovery_transaction, Transaction::Prepared)
