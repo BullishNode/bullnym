@@ -16,12 +16,17 @@ bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 boltz-client = { git = "https://github.com/BullishNode/boltz-rust.git", rev = "c20511854bbd996a74f914fa0327d4601b5d4f62", features = ["electrum"] }
 lightning-invoice = "0.32"
 secp256k1 = { version = "0.29", features = ["global-context"] }
+# MuSig2 is the same pinned implementation used by boltz-client. Bullnym uses
+# it directly so the exact cooperative request can be journaled before the
+# provider signature endpoint is called.
+secp256k1_musig = { package = "secp256k1", version = "=0.32.0-beta.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
+zeroize = "1"
 chacha20poly1305 = "0.10"
 hex = "0.4"
 tracing = "0.1"

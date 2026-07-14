@@ -11,7 +11,14 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bitcoin::key::rand::{rngs::OsRng, RngCore};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hmac::{Hmac, Mac};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::swap_manifest::{SwapManifestError, SwapManifestV1};
 use crate::swap_manifest_staging::ManifestStagingCrypto;
@@ -63,6 +70,99 @@ pub enum RecoveryManifestRuntimeConfigError {
     StoreConfigurationRejected,
     SigningKeyDoesNotMatchPinnedSigner,
 }
+
+/// Bounded failures from the opaque cooperative-signing nonce capability.
+///
+/// The variants retain no key material, nonce plaintext, ciphertext, AAD, or
+/// cryptographic source. Callers may therefore report the class without
+/// expanding protected runtime material into logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CooperativeSigningNonceError {
+    InvalidContext,
+    SealFailed,
+    OpenFailed,
+}
+
+impl fmt::Display for CooperativeSigningNonceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidContext => "cooperative signing nonce context is invalid",
+            Self::SealFailed => "cooperative signing nonce seal failed",
+            Self::OpenFailed => "cooperative signing nonce open failed",
+        })
+    }
+}
+
+impl std::error::Error for CooperativeSigningNonceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+/// Persistable output of the protected cooperative nonce capability.
+///
+/// This deliberately has no `Debug` implementation. It contains no plaintext
+/// key material, but keeping the envelope non-formattable prevents future
+/// field additions from silently broadening operational logs.
+pub(crate) struct CooperativeSigningNonceEnvelopeV1 {
+    pub format: &'static str,
+    pub algorithm: &'static str,
+    pub key_id: String,
+    pub encryption_nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub plaintext_sha256: String,
+}
+
+impl CooperativeSigningNonceEnvelopeV1 {
+    /// Reconstitute only the encrypted fields admitted by migration 057. The
+    /// protected runtime still authenticates every value, including the
+    /// derived key identity, before returning plaintext.
+    pub(crate) fn from_persisted(
+        key_id: impl Into<String>,
+        encryption_nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+        plaintext_sha256: impl Into<String>,
+    ) -> Result<Self, CooperativeSigningNonceError> {
+        let envelope = Self {
+            format: COOPERATIVE_SIGNING_NONCE_FORMAT,
+            algorithm: COOPERATIVE_SIGNING_NONCE_ALGORITHM,
+            key_id: key_id.into(),
+            encryption_nonce,
+            ciphertext,
+            plaintext_sha256: plaintext_sha256.into(),
+        };
+        if envelope.key_id.is_empty()
+            || envelope.key_id.len() > 64
+            || !envelope
+                .key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+            || envelope.encryption_nonce.len() != 24
+            || envelope.ciphertext.len() != COOPERATIVE_SIGNING_NONCE_CIPHERTEXT_LEN
+            || parse_canonical_sha256(&envelope.plaintext_sha256).is_err()
+        {
+            return Err(CooperativeSigningNonceError::InvalidContext);
+        }
+        Ok(envelope)
+    }
+}
+
+/// Opened key-grade material. The bytes are overwritten on drop and cannot be
+/// cloned or formatted.
+pub(crate) struct ProtectedCooperativeSigningNonce(Zeroizing<Vec<u8>>);
+
+impl ProtectedCooperativeSigningNonce {
+    pub(crate) fn expose(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+const COOPERATIVE_SIGNING_NONCE_FORMAT: &str = "secp256k1-musig-secnonce-132-v1";
+const COOPERATIVE_SIGNING_NONCE_ALGORITHM: &str = "xchacha20poly1305-v1";
+const COOPERATIVE_SIGNING_NONCE_LEN: usize = 132;
+const COOPERATIVE_SIGNING_NONCE_CIPHERTEXT_LEN: usize = COOPERATIVE_SIGNING_NONCE_LEN + 16;
+const COOPERATIVE_SIGNING_NONCE_DOMAIN: &[u8] =
+    b"bullnym/recovery-manifest-runtime/cooperative-signing-secnonce/v1\0";
 
 impl fmt::Display for RecoveryManifestRuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -195,6 +295,131 @@ impl RecoveryManifestRuntimeV1 {
         .map_err(|_| RecoveryManifestRuntimeConfigError::InvalidValue)
     }
 
+    /// Seal one MuSig secret nonce through the protected runtime key.
+    ///
+    /// The derived subkey is domain-separated from manifest encryption and is
+    /// bound to both the immutable swap identity and the exact persisted
+    /// signing-session digest. The configured key and derived subkey never
+    /// leave this capability.
+    pub(crate) fn seal_cooperative_signing_nonce_v1(
+        &self,
+        chain_swap_id: uuid::Uuid,
+        session_sha256: &str,
+        secret_nonce: &[u8],
+    ) -> Result<CooperativeSigningNonceEnvelopeV1, CooperativeSigningNonceError> {
+        if secret_nonce.len() != COOPERATIVE_SIGNING_NONCE_LEN {
+            return Err(CooperativeSigningNonceError::InvalidContext);
+        }
+        let session_digest = parse_canonical_sha256(session_sha256)?;
+        let (subkey, key_id) =
+            self.cooperative_signing_nonce_subkey(chain_swap_id, &session_digest)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(subkey.as_ref())
+            .map_err(|_| CooperativeSigningNonceError::SealFailed)?;
+        let mut encryption_nonce = [0_u8; 24];
+        OsRng.fill_bytes(&mut encryption_nonce);
+        let aad = cooperative_signing_nonce_aad(chain_swap_id, &session_digest, &key_id);
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&encryption_nonce),
+                Payload {
+                    msg: secret_nonce,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CooperativeSigningNonceError::SealFailed)?;
+        if ciphertext.len() != COOPERATIVE_SIGNING_NONCE_CIPHERTEXT_LEN {
+            return Err(CooperativeSigningNonceError::SealFailed);
+        }
+
+        Ok(CooperativeSigningNonceEnvelopeV1 {
+            format: COOPERATIVE_SIGNING_NONCE_FORMAT,
+            algorithm: COOPERATIVE_SIGNING_NONCE_ALGORITHM,
+            key_id,
+            encryption_nonce: encryption_nonce.to_vec(),
+            ciphertext,
+            plaintext_sha256: hex::encode(Sha256::digest(secret_nonce)),
+        })
+    }
+
+    /// Open a persisted MuSig secret nonce without exposing the runtime key.
+    ///
+    /// Every envelope field is checked exactly before decryption. A swap,
+    /// session, key identity, nonce, ciphertext, or plaintext commitment
+    /// mismatch collapses to one source-free failure class.
+    pub(crate) fn open_cooperative_signing_nonce_v1(
+        &self,
+        chain_swap_id: uuid::Uuid,
+        session_sha256: &str,
+        envelope: &CooperativeSigningNonceEnvelopeV1,
+    ) -> Result<ProtectedCooperativeSigningNonce, CooperativeSigningNonceError> {
+        if envelope.format != COOPERATIVE_SIGNING_NONCE_FORMAT
+            || envelope.algorithm != COOPERATIVE_SIGNING_NONCE_ALGORITHM
+            || envelope.encryption_nonce.len() != 24
+            || envelope.ciphertext.len() != COOPERATIVE_SIGNING_NONCE_CIPHERTEXT_LEN
+        {
+            return Err(CooperativeSigningNonceError::OpenFailed);
+        }
+        let session_digest = parse_canonical_sha256(session_sha256)
+            .map_err(|_| CooperativeSigningNonceError::OpenFailed)?;
+        let expected_plaintext_digest = parse_canonical_sha256(&envelope.plaintext_sha256)
+            .map_err(|_| CooperativeSigningNonceError::OpenFailed)?;
+        let (subkey, expected_key_id) = self
+            .cooperative_signing_nonce_subkey(chain_swap_id, &session_digest)
+            .map_err(|_| CooperativeSigningNonceError::OpenFailed)?;
+        if envelope.key_id != expected_key_id {
+            return Err(CooperativeSigningNonceError::OpenFailed);
+        }
+        let cipher = XChaCha20Poly1305::new_from_slice(subkey.as_ref())
+            .map_err(|_| CooperativeSigningNonceError::OpenFailed)?;
+        let aad = cooperative_signing_nonce_aad(chain_swap_id, &session_digest, &expected_key_id);
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope.encryption_nonce),
+                Payload {
+                    msg: &envelope.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CooperativeSigningNonceError::OpenFailed)?;
+        if plaintext.len() != COOPERATIVE_SIGNING_NONCE_LEN {
+            return Err(CooperativeSigningNonceError::OpenFailed);
+        }
+        let actual_plaintext_digest: [u8; 32] = Sha256::digest(&plaintext).into();
+        if !bool::from(actual_plaintext_digest.ct_eq(&expected_plaintext_digest)) {
+            return Err(CooperativeSigningNonceError::OpenFailed);
+        }
+        Ok(ProtectedCooperativeSigningNonce(Zeroizing::new(plaintext)))
+    }
+
+    fn cooperative_signing_nonce_subkey(
+        &self,
+        chain_swap_id: uuid::Uuid,
+        session_digest: &[u8; 32],
+    ) -> Result<(Zeroizing<[u8; 32]>, String), CooperativeSigningNonceError> {
+        let mut derivation = <Hmac<Sha256> as Mac>::new_from_slice(&self.encryption_key)
+            .map_err(|_| CooperativeSigningNonceError::InvalidContext)?;
+        derivation.update(COOPERATIVE_SIGNING_NONCE_DOMAIN);
+        derivation.update(chain_swap_id.as_bytes());
+        derivation.update(session_digest);
+        derivation.update(
+            &u32::try_from(self.encryption_key_id.len())
+                .map_err(|_| CooperativeSigningNonceError::InvalidContext)?
+                .to_be_bytes(),
+        );
+        derivation.update(self.encryption_key_id.as_bytes());
+        let subkey: [u8; 32] = derivation.finalize().into_bytes().into();
+
+        let mut key_identity = <Hmac<Sha256> as Mac>::new_from_slice(&self.encryption_key)
+            .map_err(|_| CooperativeSigningNonceError::InvalidContext)?;
+        key_identity.update(b"bullnym/recovery-manifest-runtime/cooperative-signing-key-id/v1\0");
+        key_identity.update(self.encryption_key_id.as_bytes());
+        let key_identity = key_identity.finalize().into_bytes();
+        Ok((
+            Zeroizing::new(subkey),
+            format!("recovery-cap-v1:{}", hex::encode(&key_identity[..16])),
+        ))
+    }
+
     fn from_fallible_lookup<F>(mut lookup: F) -> Result<Self, RecoveryManifestRuntimeConfigError>
     where
         F: FnMut(&str) -> Result<Option<String>, RecoveryManifestRuntimeConfigError>,
@@ -279,6 +504,35 @@ impl RecoveryManifestRuntimeV1 {
             }
         }
     }
+}
+
+fn parse_canonical_sha256(value: &str) -> Result<[u8; 32], CooperativeSigningNonceError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(CooperativeSigningNonceError::InvalidContext);
+    }
+    let mut digest = [0_u8; 32];
+    hex::decode_to_slice(value, &mut digest)
+        .map_err(|_| CooperativeSigningNonceError::InvalidContext)?;
+    Ok(digest)
+}
+
+fn cooperative_signing_nonce_aad(
+    chain_swap_id: uuid::Uuid,
+    session_digest: &[u8; 32],
+    key_id: &str,
+) -> Vec<u8> {
+    let mut aad =
+        Vec::with_capacity(COOPERATIVE_SIGNING_NONCE_DOMAIN.len() + 16 + 32 + 4 + key_id.len());
+    aad.extend_from_slice(COOPERATIVE_SIGNING_NONCE_DOMAIN);
+    aad.extend_from_slice(chain_swap_id.as_bytes());
+    aad.extend_from_slice(session_digest);
+    aad.extend_from_slice(&(key_id.len() as u32).to_be_bytes());
+    aad.extend_from_slice(key_id.as_bytes());
+    aad
 }
 
 impl fmt::Debug for RecoveryManifestRuntimeV1 {
@@ -496,6 +750,45 @@ mod tests {
         for value in values.values() {
             assert!(!opening_debug.contains(value));
         }
+    }
+
+    #[test]
+    fn cooperative_nonce_capability_is_external_bound_and_tamper_evident() {
+        let values = valid_values();
+        let runtime = load(&values).expect("valid protected configuration");
+        let swap_id = Uuid::from_u128(0x85);
+        let session_sha256 = "11".repeat(32);
+        let secret_nonce = Zeroizing::new(vec![0x37_u8; COOPERATIVE_SIGNING_NONCE_LEN]);
+
+        let mut envelope = runtime
+            .seal_cooperative_signing_nonce_v1(swap_id, &session_sha256, &secret_nonce)
+            .expect("protected nonce seal");
+        assert_eq!(envelope.format, COOPERATIVE_SIGNING_NONCE_FORMAT);
+        assert_eq!(envelope.algorithm, COOPERATIVE_SIGNING_NONCE_ALGORITHM);
+        assert_eq!(envelope.encryption_nonce.len(), 24);
+        assert_eq!(
+            envelope.ciphertext.len(),
+            COOPERATIVE_SIGNING_NONCE_CIPHERTEXT_LEN
+        );
+        assert_ne!(envelope.ciphertext, secret_nonce.as_slice());
+        assert!(envelope.key_id.starts_with("recovery-cap-v1:"));
+        assert!(!envelope.key_id.contains(&values[ENCRYPTION_KEY_ID_ENV]));
+
+        let opened = runtime
+            .open_cooperative_signing_nonce_v1(swap_id, &session_sha256, &envelope)
+            .expect("protected nonce open");
+        assert_eq!(opened.expose(), secret_nonce.as_slice());
+        assert!(runtime
+            .open_cooperative_signing_nonce_v1(Uuid::from_u128(0x86), &session_sha256, &envelope,)
+            .is_err());
+        assert!(runtime
+            .open_cooperative_signing_nonce_v1(swap_id, &"12".repeat(32), &envelope)
+            .is_err());
+
+        envelope.ciphertext[0] ^= 1;
+        assert!(runtime
+            .open_cooperative_signing_nonce_v1(swap_id, &session_sha256, &envelope)
+            .is_err());
     }
 
     #[test]

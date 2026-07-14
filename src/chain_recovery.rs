@@ -15,17 +15,19 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
 use bitcoin::{
-    Address, Amount, Network, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
+    Address, Amount, Network, OutPoint, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
     XOnlyPublicKey,
 };
 use boltz_client::network::esplora::EsploraBitcoinClient;
 use boltz_client::network::{BitcoinChain, Chain};
-use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateChainResponse, Side};
+use boltz_client::swaps::bitcoin::BtcSwapScript;
+use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateChainResponse, PartialSig, Side};
 use boltz_client::swaps::{
     BtcLikeTransaction, ChainClient, SwapScript, SwapTransactionParams, TransactionOptions,
 };
 use boltz_client::util::fees::Fee;
 use boltz_client::{Keypair, PublicKey, Secp256k1};
+use secp256k1_musig::musig;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -38,6 +40,10 @@ use crate::chain_swap_action::{
 use crate::chain_swap_runtime_evidence::{
     collect_automatic_fallback_evidence_under_lock, AutomaticFallbackConstructionPath,
     CollectedAutomaticFallbackEvidence,
+};
+use crate::cooperative_bitcoin_refund::{
+    exact_chain_lockup_script, prepare_exact_cooperative_refund, select_exact_source,
+    PreparedCooperativeRefund,
 };
 use crate::db::{
     self, ChainSwapRecord, ChainSwapStatus, ChainSwapTxAttempt, NewBitcoinRecoveryAttempt,
@@ -71,6 +77,11 @@ pub enum RecoveryFaultPoint {
     AfterJournalCommitBeforeBroadcast,
     AfterBroadcastAttemptCommit,
     AfterBroadcastCallBeforeOutcomeCommit,
+    AfterCooperativePreparedCommit,
+    AfterCooperativeRequestedCommitBeforeProvider,
+    AfterCooperativeProviderBeforeResponseCommit,
+    AfterCooperativeResponseCommit,
+    AfterCooperativeAttemptWriteBeforeCommit,
 }
 
 pub trait RecoveryFaultInjector: Send + Sync {
@@ -566,6 +577,269 @@ async fn fetch_esplora_block_hash(
 
 struct EsploraRecoveryBroadcaster {
     endpoints: Vec<String>,
+}
+
+/// Narrow boundary around the single provider-mutating cooperative request.
+/// The executor calls this only after the exact request transition commits;
+/// tests inject a counter so source drift and CAS retries can prove zero POSTs.
+#[async_trait]
+trait CooperativeSigningProvider: Send + Sync {
+    async fn request_partial_signature(
+        &self,
+        boltz_swap_id: &str,
+        input_index: u32,
+        client_public_nonce_hex: &str,
+        transaction_hex: &str,
+    ) -> Result<PartialSig, AppError>;
+}
+
+struct LiveCooperativeSigningProvider {
+    api_url: String,
+}
+
+#[async_trait]
+impl CooperativeSigningProvider for LiveCooperativeSigningProvider {
+    async fn request_partial_signature(
+        &self,
+        boltz_swap_id: &str,
+        input_index: u32,
+        client_public_nonce_hex: &str,
+        transaction_hex: &str,
+    ) -> Result<PartialSig, AppError> {
+        if input_index != 0 {
+            return Err(AppError::ClaimError(
+                "cooperative provider request input index is not canonical".into(),
+            ));
+        }
+        let public_nonce = musig::PublicNonce::from_str(client_public_nonce_hex).map_err(|_| {
+            AppError::ClaimError("cooperative provider request public nonce is invalid".into())
+        })?;
+        let provider = BoltzApiClientV2::new(self.api_url.clone(), Some(Duration::from_secs(15)));
+        provider
+            .get_chain_partial_sig(
+                &boltz_swap_id.to_owned(),
+                input_index as usize,
+                &public_nonce,
+                &transaction_hex.to_owned(),
+            )
+            .await
+            .map_err(|_| {
+                AppError::RecoveryNotAvailable(
+                    "cooperative provider request outcome is unknown".into(),
+                )
+            })
+    }
+}
+
+/// Every configured construction backend must expose exactly the one source
+/// selected by the primary authority. This check happens before the durable
+/// signing request is prepared, and the exact returned prevout is injected
+/// directly into Bullnym's transaction template; no address-wide SDK fetch is
+/// performed after this boundary.
+async fn exact_cooperative_source_across_backends(
+    script: &BtcSwapScript,
+    expected: OutPoint,
+    expected_txout: &TxOut,
+    endpoints: &[String],
+) -> Result<TxOut, AppError> {
+    if endpoints.is_empty() {
+        return Err(AppError::ElectrumError(
+            "cooperative recovery has no construction backend".into(),
+        ));
+    }
+    let mut agreed = None;
+    for endpoint in endpoints {
+        let client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
+        let sources = script.fetch_utxos(&client).await.map_err(|error| {
+            AppError::ElectrumError(format!(
+                "cooperative recovery source read failed on {endpoint}: {error}"
+            ))
+        })?;
+        let candidate = select_exact_source(&expected, expected_txout, sources)?;
+        if agreed.as_ref().is_some_and(|prior| prior != &candidate) {
+            return Err(AppError::ElectrumError(
+                "cooperative recovery construction backends disagree on the exact source".into(),
+            ));
+        }
+        agreed.get_or_insert(candidate);
+    }
+    agreed.ok_or_else(|| {
+        AppError::ElectrumError("cooperative recovery exact source disappeared".into())
+    })
+}
+
+struct LiveCooperativePreparation {
+    prepared: PreparedCooperativeRefund,
+    source_outpoint: OutPoint,
+    source_txout: TxOut,
+    fee_record: FeeDecisionRecord,
+}
+
+struct CooperativeOperationDigests {
+    request_transaction_sha256: String,
+    provider_request_sha256: String,
+    session_sha256: String,
+}
+
+fn framed_sha256(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn cooperative_operation_digests(
+    swap: &ChainSwapRecord,
+    preparation: &LiveCooperativePreparation,
+) -> Result<CooperativeOperationDigests, AppError> {
+    let request = preparation.prepared.durable_request();
+    let raw = hex::decode(&request.unsigned_tx_hex).map_err(|_| {
+        AppError::ClaimError("cooperative request transaction hex is invalid".into())
+    })?;
+    let request_transaction_sha256 = hex::encode(Sha256::digest(&raw));
+    let input_index = request.input_index.to_string();
+    let provider_request_sha256 = framed_sha256(
+        b"bullnym/boltz-chain-refund-signature-request/v1",
+        &[
+            swap.boltz_swap_id.as_bytes(),
+            request.public_nonce_hex.as_bytes(),
+            request.unsigned_tx_hex.as_bytes(),
+            input_index.as_bytes(),
+        ],
+    );
+    let source_txid = preparation.source_outpoint.txid.to_string();
+    let source_vout = preparation.source_outpoint.vout.to_string();
+    let source_amount = preparation.source_txout.value.to_sat().to_string();
+    let fee = &preparation.fee_record;
+    let fee_rate = fee.rate().as_f64().to_bits().to_string();
+    let fee_quoted = fee.quoted_at_unix().to_string();
+    let fee_evaluated = fee.evaluated_at_unix().to_string();
+    let fee_age = fee.freshness_age_secs().to_string();
+    let fee_max_age = fee.freshness_max_age_secs().to_string();
+    let fee_floor = fee.policy_floor().as_f64().to_bits().to_string();
+    let fee_cap = fee.policy_cap().as_f64().to_bits().to_string();
+    let secret_commitment =
+        hex::encode(Sha256::digest(preparation.prepared.secret_nonce().expose()));
+    let session_sha256 = framed_sha256(
+        b"bullnym/cooperative-signing-session/v1",
+        &[
+            swap.id.as_bytes(),
+            swap.boltz_swap_id.as_bytes(),
+            source_txid.as_bytes(),
+            source_vout.as_bytes(),
+            source_amount.as_bytes(),
+            preparation.source_txout.script_pubkey.as_bytes(),
+            request.unsigned_tx_hex.as_bytes(),
+            request.sighash_hex.as_bytes(),
+            request.tweaked_aggregate_key_hex.as_bytes(),
+            request.public_nonce_hex.as_bytes(),
+            fee.purpose().as_str().as_bytes(),
+            fee.rail().as_str().as_bytes(),
+            fee.target().as_str().as_bytes(),
+            fee.source().as_str().as_bytes(),
+            fee_rate.as_bytes(),
+            fee_quoted.as_bytes(),
+            fee_evaluated.as_bytes(),
+            fee_age.as_bytes(),
+            fee_max_age.as_bytes(),
+            fee.provenance_for_persistence().as_bytes(),
+            fee_floor.as_bytes(),
+            fee_cap.as_bytes(),
+            fee.policy_version().as_bytes(),
+            provider_request_sha256.as_bytes(),
+            secret_commitment.as_bytes(),
+        ],
+    );
+    Ok(CooperativeOperationDigests {
+        request_transaction_sha256,
+        provider_request_sha256,
+        session_sha256,
+    })
+}
+
+async fn prepare_live_cooperative_operation(
+    state: &AppState,
+    swap: &ChainSwapRecord,
+    authority: &CollectedAutomaticFallbackEvidence,
+) -> Result<LiveCooperativePreparation, AppError> {
+    if authority.automatic_construction_path()
+        != Some(AutomaticFallbackConstructionPath::Cooperative)
+        || authority.exact_sources().len() != 1
+    {
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative recovery lacks one exact current source".into(),
+        ));
+    }
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let destination = authority.committed_destination().ok_or_else(|| {
+        AppError::ClaimError("cooperative recovery lacks its committed destination".into())
+    })?;
+    let source = &authority.exact_sources()[0];
+    let source_outpoint = OutPoint {
+        txid: source
+            .txid()
+            .parse()
+            .map_err(|_| AppError::ClaimError("cooperative source txid is invalid".into()))?,
+        vout: source.vout(),
+    };
+    let authoritative_script = hex::decode(source.script_pubkey_hex()).map_err(|_| {
+        AppError::ClaimError("cooperative authoritative source script is invalid".into())
+    })?;
+    let authoritative_txout = TxOut {
+        value: Amount::from_sat(source.amount_sat()),
+        script_pubkey: ScriptBuf::from_bytes(authoritative_script),
+    };
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
+            AppError::ClaimError(format!("invalid chain Boltz response JSON: {error}"))
+        })?;
+    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
+        .map_err(|_| AppError::ClaimError("invalid chain refund key hex".into()))?;
+    let secp = Secp256k1::new();
+    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
+        .map_err(|_| AppError::ClaimError("invalid chain refund secret key".into()))?;
+    let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
+    let refund_public_key = PublicKey::new(refund_keypair.public_key());
+    let script = exact_chain_lockup_script(&response.lockup_details, refund_public_key)?;
+    let evidence_backend = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+    })?;
+    let source_txout = exact_cooperative_source_across_backends(
+        &script,
+        source_outpoint,
+        &authoritative_txout,
+        evidence_backend.endpoints(),
+    )
+    .await?;
+    let (decision, fee_record) = state
+        .fee_runtime
+        .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+        .map_err(|_| AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into()))?;
+    let prepared = prepare_exact_cooperative_refund(
+        &script,
+        &response.lockup_details,
+        &refund_keypair,
+        source_outpoint,
+        source_txout.clone(),
+        destination,
+        BitcoinBuilderFeeDecision::from(&decision),
+    )?;
+    if !fee_record.authorizes_construction_now() {
+        return Err(AppError::RecoveryNotAvailable(
+            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+        ));
+    }
+    Ok(LiveCooperativePreparation {
+        prepared,
+        source_outpoint,
+        source_txout,
+        fee_record,
+    })
 }
 
 #[async_trait]
@@ -2411,6 +2685,14 @@ async fn construct_live_refund(
     fee_decision: BitcoinBuilderFeeDecision,
     path: AutomaticFallbackConstructionPath,
 ) -> Result<BtcLikeTransaction, AppError> {
+    if path == AutomaticFallbackConstructionPath::Cooperative {
+        // Cooperative construction is a provider-mutating operation. It must
+        // use the dedicated exact-source prepare/request/response journal and
+        // may never enter boltz-client's address-wide one-shot helper.
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative recovery requires its durable signing operation".into(),
+        ));
+    }
     swap.verify_creation_response_integrity()
         .map_err(AppError::ClaimError)?;
     let refund_key_bytes = hex::decode(&swap.refund_key_hex)
@@ -2453,21 +2735,14 @@ async fn construct_live_refund(
             swap_id: swap.boltz_swap_id.clone(),
             chain_client: &chain_client,
             boltz_client: &boltz_api,
-            options: Some(
-                TransactionOptions::default()
-                    .with_cooperative(path == AutomaticFallbackConstructionPath::Cooperative),
-            ),
+            options: Some(TransactionOptions::default().with_cooperative(false)),
         };
         match lockup_script.construct_refund(params).await {
             Ok(tx) => return Ok(tx),
             Err(script_error) => {
                 if index + 1 < endpoints.len() {
                     tracing::warn!(
-                        event = if path == AutomaticFallbackConstructionPath::Cooperative {
-                            "chain_swap_cooperative_refund_construct_retry"
-                        } else {
-                            "chain_swap_refund_construct_failover"
-                        },
+                        event = "chain_swap_refund_construct_failover",
                         swap_id = %swap.boltz_swap_id,
                         endpoint = %endpoint,
                         "recovery construction failed; rotating Bitcoin backend without changing spend path"
@@ -2477,29 +2752,11 @@ async fn construct_live_refund(
             }
         }
     }
-    if path == AutomaticFallbackConstructionPath::Cooperative {
-        // The pinned Boltz endpoint only returns a partial signature and does
-        // not broadcast. Its backend accepts a retry with a fresh nonce after
-        // response loss. Preserve every refusal/timeout as observational here:
-        // before timeout this must never fall through to script-path signing.
-        tracing::warn!(
-            event = "chain_swap_cooperative_refund_deferred",
-            swap_id = %swap.boltz_swap_id,
-            attempts = endpoints.len(),
-            errors = %errors.join(" | "),
-            "cooperative refund signing was unavailable or ambiguous; retaining refund_due for retry"
-        );
-        Err(AppError::RecoveryNotAvailable(
-            "cooperative Bitcoin recovery signing unavailable or ambiguous; retry before unilateral timeout"
-                .into(),
-        ))
-    } else {
-        Err(AppError::ElectrumError(format!(
-            "construct chain recovery failed on all {} Bitcoin backend(s): {}",
-            endpoints.len(),
-            errors.join(" | ")
-        )))
-    }
+    Err(AppError::ElectrumError(format!(
+        "construct chain recovery failed on all {} Bitcoin backend(s): {}",
+        endpoints.len(),
+        errors.join(" | ")
+    )))
 }
 
 #[cfg(test)]

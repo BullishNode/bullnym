@@ -2848,6 +2848,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "secp256k1 0.29.1",
+ "secp256k1 0.32.0-beta.2",
  "serde",
  "serde_json",
  "sha2",
@@ -2862,6 +2863,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

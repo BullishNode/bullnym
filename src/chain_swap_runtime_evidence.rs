@@ -557,6 +557,8 @@ const fn merge_evidence_quality(left: EvidenceQuality, right: EvidenceQuality) -
 pub struct AutomaticFallbackSource {
     txid: String,
     vout: u32,
+    amount_sat: u64,
+    script_pubkey_hex: String,
 }
 
 impl AutomaticFallbackSource {
@@ -567,6 +569,14 @@ impl AutomaticFallbackSource {
     pub fn vout(&self) -> u32 {
         self.vout
     }
+
+    pub fn amount_sat(&self) -> u64 {
+        self.amount_sat
+    }
+
+    pub fn script_pubkey_hex(&self) -> &str {
+        &self.script_pubkey_hex
+    }
 }
 
 impl fmt::Debug for AutomaticFallbackSource {
@@ -575,6 +585,8 @@ impl fmt::Debug for AutomaticFallbackSource {
             .debug_struct("AutomaticFallbackSource")
             .field("txid", &REDACTED)
             .field("vout", &self.vout)
+            .field("amount_sat", &REDACTED)
+            .field("script_pubkey_hex", &REDACTED)
             .finish()
     }
 }
@@ -994,6 +1006,8 @@ fn classify_automatic_bitcoin_source(
                 .map(|observation| AutomaticFallbackSource {
                     txid: observation.txid.clone(),
                     vout: observation.vout,
+                    amount_sat: observation.amount_sat,
+                    script_pubkey_hex: observation.lockup_script_pubkey_hex.clone(),
                 })
                 .collect();
             if let Some(attempt) = attempt {
@@ -1031,6 +1045,8 @@ fn classify_automatic_bitcoin_source(
                 .map(|observation| AutomaticFallbackSource {
                     txid: observation.txid.clone(),
                     vout: observation.vout,
+                    amount_sat: observation.amount_sat,
+                    script_pubkey_hex: observation.lockup_script_pubkey_hex.clone(),
                 })
                 .collect();
             result.bitcoin_source = BitcoinSourceEvidence::SpentByRecoveryTransaction;
@@ -2188,6 +2204,8 @@ mod tests {
             exact_sources: vec![AutomaticFallbackSource {
                 txid: "11".repeat(32),
                 vout: 0,
+                amount_sat: 100_000,
+                script_pubkey_hex: "5120".to_owned() + &"22".repeat(32),
             }],
             bitcoin_timeout_height: Some(840_000),
             dependencies_available: true,
@@ -2215,10 +2233,14 @@ mod tests {
         packet.exact_sources.push(AutomaticFallbackSource {
             txid: "11".repeat(32),
             vout: 0,
+            amount_sat: 100_000,
+            script_pubkey_hex: "5120".to_owned() + &"22".repeat(32),
         });
         packet.exact_sources.push(AutomaticFallbackSource {
             txid: "22".repeat(32),
             vout: 1,
+            amount_sat: 100_000,
+            script_pubkey_hex: "5120".to_owned() + &"22".repeat(32),
         });
         assert_eq!(
             packet.automatic_construction_path(),

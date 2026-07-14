@@ -26,6 +26,7 @@ pub mod chain_swap_stale_restore;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
+pub(crate) mod cooperative_bitcoin_refund;
 pub mod current_fee_snapshot;
 pub mod db;
 pub mod derivation_guard;
