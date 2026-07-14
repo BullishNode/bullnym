@@ -4364,10 +4364,12 @@ async fn construct_chain_claim_tx(
 
     let claim_public_key = boltz_client::PublicKey::new(claim_keypair.public_key());
     let refund_public_key = boltz_client::PublicKey::new(refund_keypair.public_key());
+    let mut claim_details = boltz_response.claim_details.clone();
+    claim_details.amount = effective_chain_claim_amount_sat(swap)?;
     let claim_script = SwapScript::chain_from_swap_resp(
         Chain::Liquid(LiquidChain::Liquid),
         Side::Claim,
-        boltz_response.claim_details.clone(),
+        claim_details,
         claim_public_key,
     )
     .map_err(|e| AppError::ClaimError(format!("chain claim script build failed: {e}")))?;
@@ -4406,6 +4408,19 @@ async fn construct_chain_claim_tx(
         .construct_claim(&preimage, params)
         .await
         .map_err(|e| AppError::ClaimError(format!("construct_chain_claim failed: {e}")))
+}
+
+/// Amount boltz-client must bind to its source-output lookup for a chain claim.
+///
+/// The immutable creation response owns the script and keys, but its amount is
+/// superseded after a durable #38 acceptance. Passing the original amount to
+/// `SwapScript::chain_from_swap_resp` makes a legitimate renegotiated lockup
+/// fail boltz-client's exact source-value check before construction.
+fn effective_chain_claim_amount_sat(swap: &db::ChainSwapRecord) -> Result<u64, AppError> {
+    u64::try_from(swap.effective_server_lock_amount_sat())
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| AppError::ClaimError("invalid effective Liquid server-lock amount".into()))
 }
 
 /// Phase 4 merchant-recovery executor (#44). Drains a `refund_due` chain swap

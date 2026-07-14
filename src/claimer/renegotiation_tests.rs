@@ -762,6 +762,19 @@ async fn exact_primary_amount_is_ineligible_while_under_and_over_are_verified_mi
 }
 
 #[test]
+fn chain_claim_construction_uses_the_durable_renegotiated_amount() {
+    let mut swap = chain_swap(1_000);
+    assert_eq!(swap.server_lock_amount_sat, 990);
+    assert_eq!(effective_chain_claim_amount_sat(&swap).unwrap(), 990);
+
+    swap.renegotiated_server_lock_amount_sat = Some(890);
+    assert_eq!(effective_chain_claim_amount_sat(&swap).unwrap(), 890);
+
+    swap.renegotiated_server_lock_amount_sat = Some(0);
+    assert!(effective_chain_claim_amount_sat(&swap).is_err());
+}
+
+#[test]
 fn runtime_projection_constructs_renegotiation_capability_only_after_confirmed_exact_identity() {
     let swap = chain_swap(1_000);
     let confirmed = collected_primary_mismatch(
