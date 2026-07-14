@@ -82,22 +82,17 @@ fn liquid_broadcast_start_action(
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
     match (attempt_status, parent_status) {
-        ("integrity_hold", _) => {
-            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
-        }
+        ("integrity_hold", _) => Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict),
         ("confirmed", "claiming") | ("finalized", "claimed") => {
             Ok(LiquidBroadcastStartAction::AlreadySettled)
         }
         (
             "constructed" | "broadcast_ambiguous" | "broadcast",
             LIQUID_BROADCAST_START_PARENT_STATUS,
-        ) => {
-            Ok(LiquidBroadcastStartAction::Start)
+        ) => Ok(LiquidBroadcastStartAction::Start),
+        ("constructed" | "broadcast_ambiguous" | "broadcast", "claim_failed" | "claim_stuck") => {
+            Ok(LiquidBroadcastStartAction::Superseded)
         }
-        (
-            "constructed" | "broadcast_ambiguous" | "broadcast",
-            "claim_failed" | "claim_stuck",
-        ) => Ok(LiquidBroadcastStartAction::Superseded),
         _ => Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict),
     }
 }
@@ -571,10 +566,7 @@ pub async fn insert_liquid_merchant_settlement_journal(
 pub async fn load_exact_liquid_merchant_settlement_journal(
     connection: &mut PgConnection,
     journal: &NewLiquidMerchantSettlementJournal<'_>,
-) -> Result<
-    ExactLiquidMerchantSettlementJournalDisposition,
-    MerchantSettlementRepositoryError,
-> {
+) -> Result<ExactLiquidMerchantSettlementJournalDisposition, MerchantSettlementRepositoryError> {
     validate_new_liquid_journal(journal)?;
     let purpose = if journal.replaces_txid.is_some() {
         "liquid_claim_replacement"
@@ -606,10 +598,7 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
     chain_swap_id: Uuid,
     txid: &str,
     purpose: &str,
-) -> Result<
-    LiquidMerchantSettlementBroadcastStartDisposition,
-    MerchantSettlementRepositoryError,
-> {
+) -> Result<LiquidMerchantSettlementBroadcastStartDisposition, MerchantSettlementRepositoryError> {
     if chain_swap_id.is_nil()
         || !matches!(purpose, "liquid_claim" | "liquid_claim_replacement")
         || !canonical_hash(txid)
@@ -2460,12 +2449,7 @@ mod tests {
         );
         for previous in ["pending", "refunding", "refunded", "expired"] {
             assert_eq!(
-                parent_transition_target(
-                    MerchantSettlementPath::LiquidClaim,
-                    previous,
-                    true,
-                    true,
-                ),
+                parent_transition_target(MerchantSettlementPath::LiquidClaim, previous, true, true,),
                 None,
                 "{previous}"
             );
@@ -2507,20 +2491,13 @@ mod tests {
 
     #[test]
     fn liquid_broadcast_start_requires_claiming_parent() {
-        const CHILD: &str =
-            "2222222222222222222222222222222222222222222222222222222222222222";
+        const CHILD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
         assert_eq!(LIQUID_BROADCAST_START_PARENT_STATUS, "claiming");
         for attempt_status in ["constructed", "broadcast_ambiguous", "broadcast"] {
             assert_eq!(
-                liquid_broadcast_start_action(
-                    TXID,
-                    TXID,
-                    attempt_status,
-                    Some(TXID),
-                    "claiming",
-                )
-                .unwrap(),
+                liquid_broadcast_start_action(TXID, TXID, attempt_status, Some(TXID), "claiming",)
+                    .unwrap(),
                 LiquidBroadcastStartAction::Start
             );
             for parent_status in ["claim_failed", "claim_stuck"] {
@@ -2538,13 +2515,11 @@ mod tests {
             }
         }
         assert_eq!(
-            liquid_broadcast_start_action(TXID, TXID, "confirmed", Some(TXID), "claiming")
-                .unwrap(),
+            liquid_broadcast_start_action(TXID, TXID, "confirmed", Some(TXID), "claiming").unwrap(),
             LiquidBroadcastStartAction::AlreadySettled
         );
         assert_eq!(
-            liquid_broadcast_start_action(TXID, TXID, "finalized", Some(TXID), "claimed")
-                .unwrap(),
+            liquid_broadcast_start_action(TXID, TXID, "finalized", Some(TXID), "claimed").unwrap(),
             LiquidBroadcastStartAction::AlreadySettled
         );
         for (attempt_txid, attempt_status, parent_txid, parent_status) in [

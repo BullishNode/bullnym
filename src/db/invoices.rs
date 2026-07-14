@@ -1604,7 +1604,10 @@ mod chain_swap_in_progress_projection_tests {
             "refund_due",
             "refunding",
         ] {
-            assert!(chain_swap_in_progress_projection_allowed(status), "{status}");
+            assert!(
+                chain_swap_in_progress_projection_allowed(status),
+                "{status}"
+            );
         }
         for status in [
             "pending",
@@ -1615,7 +1618,10 @@ mod chain_swap_in_progress_projection_tests {
             "refunded",
             "unknown",
         ] {
-            assert!(!chain_swap_in_progress_projection_allowed(status), "{status}");
+            assert!(
+                !chain_swap_in_progress_projection_allowed(status),
+                "{status}"
+            );
         }
     }
 }
@@ -1724,12 +1730,8 @@ pub async fn mark_chain_swap_invoice_claim_stuck_if_current(
     Ok(rows)
 }
 
-fn chain_claim_stuck_projection_allowed(
-    parent_status: &str,
-    attempt_status: Option<&str>,
-) -> bool {
-    parent_status == "claim_stuck"
-        && !matches!(attempt_status, Some("confirmed" | "finalized"))
+fn chain_claim_stuck_projection_allowed(parent_status: &str, attempt_status: Option<&str>) -> bool {
+    parent_status == "claim_stuck" && !matches!(attempt_status, Some("confirmed" | "finalized"))
 }
 
 #[cfg(test)]
@@ -1739,10 +1741,7 @@ mod chain_claim_stuck_projection_tests {
     #[test]
     fn projection_requires_current_stuck_unsettled_obligation() {
         for attempt in [None, Some("constructed"), Some("broadcast_ambiguous")] {
-            assert!(chain_claim_stuck_projection_allowed(
-                "claim_stuck",
-                attempt
-            ));
+            assert!(chain_claim_stuck_projection_allowed("claim_stuck", attempt));
         }
         for attempt in [Some("confirmed"), Some("finalized")] {
             assert!(!chain_claim_stuck_projection_allowed(

@@ -849,13 +849,7 @@ pub async fn record_chain_swap_with_lineage_and_creation_evidence_in_tx(
     lineage: &ChainSwapLineage<'_>,
     creation_evidence: &NewChainSwapCreationEvidence<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(
-        &mut **tx,
-        swap,
-        Some(lineage),
-        Some(creation_evidence),
-    )
-    .await
+    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(creation_evidence)).await
 }
 
 pub async fn record_chain_swap_in_tx(
@@ -1774,10 +1768,7 @@ mod claim_failure_tests {
             "claim_failed",
         ] {
             assert!(chain_claim_failure_may_advance(parent, None), "{parent}");
-            assert!(chain_claim_failure_may_advance(
-                parent,
-                Some("broadcast")
-            ));
+            assert!(chain_claim_failure_may_advance(parent, Some("broadcast")));
             for attempt in ["confirmed", "finalized"] {
                 assert!(!chain_claim_failure_may_advance(parent, Some(attempt)));
             }

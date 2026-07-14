@@ -17093,8 +17093,7 @@ async fn merchant_settlement_replacement_persists_reason_after_child_confirmatio
     use pay_service::merchant_settlement_lifecycle::SettlementFinalityPolicy;
     use pay_service::merchant_settlement_service::MerchantSettlementAdoptionService;
 
-    const ORIGINAL_BLOCK: &str =
-        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const ORIGINAL_BLOCK: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const REPLACEMENT_BLOCK: &str =
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
