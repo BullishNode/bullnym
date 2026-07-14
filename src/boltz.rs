@@ -1067,7 +1067,11 @@ fn exact_u64_bound_message(message: &str, separator: &str) -> bool {
     message
         .split_once(separator)
         .is_some_and(|(actual, bound)| {
-            actual.parse::<u64>().is_ok() && bound.parse::<u64>().is_ok()
+            [actual, bound].into_iter().all(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u64>().is_ok()
+            })
         })
 }
 

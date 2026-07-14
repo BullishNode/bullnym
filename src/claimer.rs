@@ -1338,7 +1338,6 @@ where
             }
         }
         debug_assert!(accept_prepared_in_process);
-        accept_prepared_in_process = false;
         observer.reached(RenegotiationCheckpoint::AcceptRequested)?;
 
         match provider
@@ -1598,24 +1597,6 @@ pub(crate) async fn reconcile_renegotiation_from_verified_server_lock(
     reconcile_renegotiation_from_verified_server_lock_using(&store, swap, evidence).await
 }
 
-pub(crate) async fn try_renegotiate_chain_swap_with_verified_mismatch(
-    state: &AppState,
-    swap: &db::ChainSwapRecord,
-    boltz_status: &str,
-    evidence: &VerifiedPrimaryFundingAmountMismatch,
-) -> Result<bool, AppError> {
-    let store = PostgresChainSwapRenegotiationStore { pool: &state.db };
-    try_renegotiate_chain_swap_with_verified_mismatch_using(
-        &store,
-        state.boltz.as_ref(),
-        &NoopRenegotiationCheckpointObserver,
-        swap,
-        boltz_status,
-        evidence,
-    )
-    .await
-}
-
 pub(crate) async fn handle_chain_swap_webhook(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -1710,6 +1691,14 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
         return Ok(());
     }
 
+    // #139 will map its complete/agreed primary and Liquid projections into
+    // these narrow seams in a stacked integration commit. Keep the function
+    // items linked from the live claimer without executing either path from a
+    // bare webhook, which has no independently verified value evidence.
+    let _stacked_renegotiation_adoption_seams = (
+        adopt_verified_primary_funding_for_renegotiation,
+        reconcile_renegotiation_from_verified_server_lock,
+    );
     let Some(input) = chain_swap_provider_input(boltz_status) else {
         tracing::debug!(
             "ignoring chain-swap webhook status: {} for {}",
@@ -4763,6 +4752,9 @@ impl ClaimClientStartup {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod renegotiation_tests;
 
 /// Owned runtime dependencies for the long-lived reverse and chain claim
 /// sweeps. Worker health reporters are grouped separately because they are
