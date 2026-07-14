@@ -57,6 +57,17 @@ fn liquid_claim_fee(decision: &LiquidBuilderFeeDecision, _cooperative_or_script_
     Fee::Relative(decision.rate().as_f64())
 }
 
+/// A persisted claim owns its original construction authority and must remain
+/// replayable without a current quote. Fresh bytes, however, may be committed
+/// only while the process-local monotonic deadline captured in the decision
+/// record is still live.
+fn liquid_claim_journal_authorized(
+    had_persisted_claim: bool,
+    fee_record: Option<&FeeDecisionRecord>,
+) -> bool {
+    had_persisted_claim || fee_record.is_some_and(FeeDecisionRecord::authorizes_construction_now)
+}
+
 fn validated_chain_creation_destination(
     terms: &db::ChainSwapCreationTerms,
 ) -> Result<String, AppError> {
@@ -1575,9 +1586,10 @@ async fn claim_swap_inner(
         ));
     }
 
-    if swap.claim_tx_hex.is_none()
+    let had_persisted_claim = swap.claim_tx_hex.is_some();
+    if !had_persisted_claim
         && (fee_decision.is_none()
-            || fee_record.is_none_or(|record| !record.authorizes_construction_now()))
+            || !liquid_claim_journal_authorized(had_persisted_claim, fee_record))
     {
         return Ok(ClaimOutcome::PendingFeeUnavailable {
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
@@ -1765,6 +1777,17 @@ async fn claim_swap_inner(
             "reverse claim preparation could not publish claiming state: {}",
             swap.id
         )));
+    }
+
+    // Construction and the two journal writes can outlive the authority that
+    // was valid at entry. Recheck at the last synchronous boundary before
+    // COMMIT so an expired fresh decision rolls back bytes, metadata, status,
+    // and destination allocation atomically. Existing bytes deliberately do
+    // not consult current fee state during replay.
+    if !liquid_claim_journal_authorized(had_persisted_claim, fee_record) {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
     }
 
     tx.commit()
@@ -2127,9 +2150,10 @@ async fn claim_chain_swap_inner(
         return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
     }
 
-    if swap.claim_tx_hex.is_none()
+    let had_persisted_claim = swap.claim_tx_hex.is_some();
+    if !had_persisted_claim
         && (fee_decision.is_none()
-            || fee_record.is_none_or(|record| !record.authorizes_construction_now()))
+            || !liquid_claim_journal_authorized(had_persisted_claim, fee_record))
     {
         return Ok(ClaimOutcome::PendingFeeUnavailable {
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
@@ -2311,6 +2335,16 @@ async fn claim_chain_swap_inner(
             "chain claim preparation could not publish claiming state: {}",
             swap.id
         )));
+    }
+
+    // Mirror the reverse path's last-moment construction-authority check. A
+    // slow journal/status write must not turn an expired observation into new
+    // durable claim bytes; replay of an existing journal remains independent
+    // of a fresh quote.
+    if !liquid_claim_journal_authorized(had_persisted_claim, fee_record) {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
     }
 
     tx.commit()

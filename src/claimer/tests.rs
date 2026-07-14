@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use elements::encode::serialize;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
@@ -17,6 +18,31 @@ fn liquid_builder_fee(rate: f64) -> LiquidBuilderFeeDecision {
         .decide_typed(Some(&observation), None, 1_000)
         .unwrap();
     LiquidBuilderFeeDecision::from(&decision)
+}
+
+fn short_lived_liquid_fee_record() -> FeeDecisionRecord {
+    let policy = LiquidFeePolicy::with_freshness(
+        SatPerVbyte::try_from(0.1).unwrap(),
+        SatPerVbyte::try_from(10.0).unwrap(),
+        1,
+        1,
+    )
+    .unwrap();
+    let observation = LiveLiquid::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        1_000,
+        FeeProvenance::new("claimer-final-commit-gate").unwrap(),
+    );
+    let decision = policy
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap();
+    FeeDecisionRecord::from_liquid(
+        FeeConstructionPurpose::ReverseLiquidClaim,
+        &decision,
+        &policy,
+        1_000,
+    )
+    .unwrap()
 }
 
 fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
@@ -77,6 +103,24 @@ fn changed_liquid_decision_changes_each_next_claim_construction_path() {
             5.0
         );
     }
+}
+
+#[test]
+fn final_liquid_journal_gate_rechecks_fresh_bytes_but_not_replay() {
+    let record = short_lived_liquid_fee_record();
+    assert!(liquid_claim_journal_authorized(false, Some(&record)));
+
+    // Model construction plus journal writes crossing the one-second
+    // monotonic authority window. The same gate is called immediately before
+    // COMMIT on both reverse- and chain-claim paths.
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert!(!liquid_claim_journal_authorized(false, Some(&record)));
+    assert!(!liquid_claim_journal_authorized(false, None));
+
+    // Existing bytes retain their construction-time packet and are replayed
+    // without requiring a new quote or process-local deadline.
+    assert!(liquid_claim_journal_authorized(true, None));
+    assert!(liquid_claim_journal_authorized(true, Some(&record)));
 }
 
 #[test]
