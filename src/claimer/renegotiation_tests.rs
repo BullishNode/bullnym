@@ -457,7 +457,7 @@ impl ChainSwapRenegotiationStore for MemoryStore {
         )
         .map_err(|error| AppError::DbError(error.to_string()))?;
         Self::apply_transition(&mut self.state.lock().unwrap(), transition)
-            .map(|(operation, _)| DefiniteDeclineFinalization::Declined(operation))
+            .map(|(operation, _)| DefiniteDeclineFinalization::Declined(Box::new(operation)))
     }
 
     async fn record_accepted(
@@ -482,7 +482,9 @@ impl ChainSwapRenegotiationStore for MemoryStore {
         .map_err(|error| AppError::DbError(error.to_string()))?;
         let (operation, _) = Self::apply_transition(&mut state, transition)?;
         state.accepted_parent_amount_sat = Some(evidence.accepted_actual_amount_sat());
-        Ok(AcceptedRenegotiationFinalization::Committed(operation))
+        Ok(AcceptedRenegotiationFinalization::Committed(Box::new(
+            operation,
+        )))
     }
 }
 

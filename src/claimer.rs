@@ -758,13 +758,13 @@ impl ChainSwapRenegotiationProvider for crate::boltz::BoltzService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcceptedRenegotiationFinalization {
-    Committed(ChainSwapRenegotiationOperation),
+    Committed(Box<ChainSwapRenegotiationOperation>),
     Busy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DefiniteDeclineFinalization {
-    Declined(ChainSwapRenegotiationOperation),
+    Declined(Box<ChainSwapRenegotiationOperation>),
     Busy,
     LiquidPathActive,
 }
@@ -953,7 +953,7 @@ impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
         .await
         .map(|outcome| match outcome {
             DbOutcome::Applied(operation) | DbOutcome::ExactRetry(operation) => {
-                DefiniteDeclineFinalization::Declined(operation)
+                DefiniteDeclineFinalization::Declined(Box::new(operation))
             }
             DbOutcome::Busy => DefiniteDeclineFinalization::Busy,
             DbOutcome::LiquidPathActive => DefiniteDeclineFinalization::LiquidPathActive,
@@ -974,7 +974,7 @@ impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
                 DbOutcome::Applied(operation)
                 | DbOutcome::ExactRetry(operation)
                 | DbOutcome::RepairedParent(operation) => {
-                    AcceptedRenegotiationFinalization::Committed(operation)
+                    AcceptedRenegotiationFinalization::Committed(Box::new(operation))
                 }
                 DbOutcome::Busy => AcceptedRenegotiationFinalization::Busy,
             })

@@ -346,25 +346,22 @@ impl ChainSwapRenegotiationOperation {
             return Err(RenegotiationDomainError::AttemptCountExhausted);
         }
 
-        let legal = match (&transition.kind, self.state) {
+        let legal = matches!(
+            (&transition.kind, self.state),
             (
                 RenegotiationTransitionKind::RequestAccept,
                 RenegotiationState::Quoted | RenegotiationState::Ambiguous,
-            ) => true,
-            (
+            ) | (
                 RenegotiationTransitionKind::MarkAmbiguous { .. },
                 RenegotiationState::AcceptRequested,
-            ) => true,
-            (
+            ) | (
                 RenegotiationTransitionKind::MarkAccepted { .. },
                 RenegotiationState::AcceptRequested | RenegotiationState::Ambiguous,
-            ) => true,
-            (
+            ) | (
                 RenegotiationTransitionKind::MarkDeclined { .. },
                 RenegotiationState::Quoted | RenegotiationState::AcceptRequested,
-            ) => true,
-            _ => false,
-        };
+            )
+        );
         if !legal {
             return Err(RenegotiationDomainError::IllegalTransition {
                 from: self.state,
