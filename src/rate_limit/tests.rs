@@ -122,3 +122,30 @@ fn inmem_sweep_drops_idle_entries() {
     assert!(s.map.contains_key("fresh"));
     assert!(!s.map.contains_key("stale"));
 }
+
+#[tokio::test]
+async fn public_rate_limit_is_per_source_and_uses_a_dedicated_bucket() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+        .unwrap();
+    let limiter = RateLimiter::new(
+        pool,
+        RateLimitConfig {
+            public_rate_per_source_per_min: 2,
+            ..RateLimitConfig::default()
+        },
+    );
+    let first = "192.0.2.10".parse().unwrap();
+    let second = "192.0.2.11".parse().unwrap();
+
+    assert!(limiter.check_public_rate_per_source(first).await.is_ok());
+    assert!(limiter.check_public_rate_per_source(first).await.is_ok());
+    assert!(matches!(
+        limiter.check_public_rate_per_source(first).await,
+        Err(AppError::RateLimitedSender)
+    ));
+    assert!(limiter.check_public_rate_per_source(second).await.is_ok());
+
+    // A pricing burst must not consume the unrelated general API bucket.
+    assert!(limiter.check_api_per_ip(first).await.is_ok());
+}

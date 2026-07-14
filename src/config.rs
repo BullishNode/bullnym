@@ -605,6 +605,7 @@ fn default_slow_recovery_backoff_cap_secs() -> u64 {
 
 const DEFAULT_PRICER_URL: &str = "https://api.bullbitcoin.com/public/price";
 const DEFAULT_PRICER_CACHE_TTL_SECS: u64 = 60;
+const DEFAULT_PRICER_MAX_FRESHNESS_SECS: u64 = 300;
 const DEFAULT_PRICER_REQUEST_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -619,6 +620,10 @@ pub struct PricerConfig {
     /// donation-page views all share one upstream call within the TTL.
     #[serde(default = "default_pricer_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
+    /// Maximum accepted age of the upstream observation. Cached fallback is
+    /// never returned at or beyond this bound, even when the provider is down.
+    #[serde(default = "default_pricer_max_freshness_secs")]
+    pub max_freshness_secs: u64,
     /// HTTP request timeout (milliseconds) for the upstream call. On
     /// timeout / error, the donation render falls back to the last-good
     /// cached rate (if any).
@@ -637,6 +642,7 @@ impl Default for PricerConfig {
         Self {
             url: DEFAULT_PRICER_URL.to_string(),
             cache_ttl_secs: DEFAULT_PRICER_CACHE_TTL_SECS,
+            max_freshness_secs: DEFAULT_PRICER_MAX_FRESHNESS_SECS,
             request_timeout_ms: DEFAULT_PRICER_REQUEST_TIMEOUT_MS,
             supported_currencies: default_pricer_supported_currencies(),
         }
@@ -648,6 +654,9 @@ fn default_pricer_url() -> String {
 }
 fn default_pricer_cache_ttl_secs() -> u64 {
     DEFAULT_PRICER_CACHE_TTL_SECS
+}
+fn default_pricer_max_freshness_secs() -> u64 {
+    DEFAULT_PRICER_MAX_FRESHNESS_SECS
 }
 fn default_pricer_request_timeout_ms() -> u64 {
     DEFAULT_PRICER_REQUEST_TIMEOUT_MS
@@ -1098,6 +1107,11 @@ pub struct RateLimitConfig {
     )]
     pub api_rate_window_secs: u32,
 
+    /// Per-source cap for the public supported-currency and rate endpoints.
+    /// This bucket is intentionally separate from payment/status routes.
+    #[serde(default = "default_public_rate_per_source_per_min")]
+    pub public_rate_per_source_per_min: u32,
+
     /// Distinct nyms a single IP can probe across the metadata endpoints
     /// per window. Bounds enumeration even when the per-IP rate is unhit
     /// (slow-drip nym discovery). 0 disables.
@@ -1230,6 +1244,7 @@ impl Default for RateLimitConfig {
             max_active_users: default_max_active_users(),
             api_rate_limit: default_api_rate_limit(),
             api_rate_window_secs: default_api_rate_window_secs(),
+            public_rate_per_source_per_min: default_public_rate_per_source_per_min(),
             metadata_distinct_nyms_per_ip_limit: default_metadata_distinct_nyms_per_ip(),
             metadata_distinct_nyms_per_ip_window_secs:
                 default_metadata_distinct_nyms_per_ip_window_secs(),
@@ -1350,6 +1365,11 @@ fn default_api_rate_limit() -> u32 {
 }
 fn default_api_rate_window_secs() -> u32 {
     60
+}
+/// 120/min per source accommodates shared NATs and active browser refreshes.
+/// The short cache and keyed coalescing independently bound upstream calls.
+fn default_public_rate_per_source_per_min() -> u32 {
+    120
 }
 // LUD-06 requires a metadata fetch per payment, so a small office paying
 // multiple Lightning Addresses can exceed 5/h. Enumeration is still bounded
@@ -1743,6 +1763,14 @@ impl Config {
             return Err("reconciler slow-recovery backoff base must be <= cap".into());
         }
         validate_http_endpoint("pricer.url", &self.pricer.url)?;
+        require_positive("pricer.cache_ttl_secs", self.pricer.cache_ttl_secs)?;
+        require_positive("pricer.max_freshness_secs", self.pricer.max_freshness_secs)?;
+        if self.pricer.max_freshness_secs > DEFAULT_PRICER_MAX_FRESHNESS_SECS {
+            return Err("pricer.max_freshness_secs must be <= 300".into());
+        }
+        if self.pricer.cache_ttl_secs > self.pricer.max_freshness_secs {
+            return Err("pricer.cache_ttl_secs must be <= pricer.max_freshness_secs".into());
+        }
         require_positive("pricer.request_timeout_ms", self.pricer.request_timeout_ms)?;
         if self.pwa.dist_dir.trim().is_empty() {
             return Err("pwa.dist_dir must be non-empty".into());

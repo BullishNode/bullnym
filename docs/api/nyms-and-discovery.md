@@ -85,16 +85,35 @@ when NIP-05 is enabled and the nym opted in with a separate
 `GET /api/v1/rate?currency=USD` returns:
 
 ```json
-{ "minor_per_btc": 6500000, "last_known_rate": false }
+{
+  "base_currency": "BTC",
+  "currency": "USD",
+  "minor_per_btc": 6500000,
+  "precision": 2,
+  "source": "bullbitcoin-pricer:indexPrice",
+  "observed_at_unix": 1760000000,
+  "fetched_at_unix": 1760000001,
+  "expires_at_unix": 1760000300,
+  "last_known_rate": false
+}
 ```
 
 `minor_per_btc` uses the currency's minor unit. Convert sats with
-`sats * minor_per_btc / 100000000`. A value of `0` means no rate is available.
-`last_known_rate: true` means the upstream is unavailable and the response is
-stale. Display it cautiously. Invoice creation locks the selected rate, but it
-may accept a last-known cached rate for up to 300 seconds after an upstream
-failure; older stale rates cause `ServiceUnavailable`. Merchants therefore
-retain bounded short-term exchange-rate exposure during a pricer outage.
+`sats * minor_per_btc / 100000000`. Currency input is normalized to an
+uppercase code from the explicit supported-currency response. An optional
+`base=BTC` is accepted; every other base is rejected. Upstream base, quote, and
+price-currency fields must exactly match the requested `BTC` pair.
+
+`observed_at_unix` is the upstream observation, `fetched_at_unix` is when
+Bullnym completed the fetch, and `expires_at_unix` is the exclusive freshness
+boundary capped from both timestamps. `last_known_rate: true` means a failed
+refresh reused a cached but still-unexpired observation. Bullnym never emits
+zero, malformed, mismatched,
+future-dated, or expired rates: unsupported inputs return `InvalidAmount`, and
+absence of a valid current observation returns HTTP 503 `ServiceUnavailable`.
+The public endpoints have a dedicated per-source throttle, while a short cache
+and per-currency request coalescing bound upstream work without consuming
+payment, status, settlement, or recovery limits.
 
 ## Nym lifecycle
 

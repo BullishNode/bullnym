@@ -2,25 +2,37 @@
 //!
 //! Donation pages embed a fiat conversion rate at HTML render time so the
 //! browser can show "5,432 sats" next to "$5". The rate is fetched per
-//! `display_currency` and cached in-memory with a short TTL. On upstream
-//! failure, the last-good rate is served (with `last_known_rate=true`)
-//! rather than failing the page render.
+//! `display_currency`, strictly validated, cached briefly, and coalesced per
+//! currency. Upstream failure may use only a still-bounded last-good rate;
+//! stale or malformed observations fail closed for new fiat pricing.
 //!
 //! Wire shape mirrors the existing Dart consumer
 //! (`bb-exchange/bb_flutter_core/lib/data/data_source/pricer_data_source.dart`):
 //! JSON-RPC 2.0 POST with method `getRate`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
+use chrono::DateTime;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::config::PricerConfig;
+use crate::error::AppError;
+use crate::ip_whitelist;
 use crate::AppState;
+
+const BASE_CURRENCY: &str = "BTC";
+const RATE_SOURCE: &str = "bullbitcoin-pricer:indexPrice";
+const MAX_UPSTREAM_FUTURE_SKEW_SECS: u64 = 30;
+const MAX_CONFIGURED_FRESHNESS_SECS: u64 = 300;
+const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Currency rate result. `minor_per_btc` is in this server's minor units of
 /// `currency` (e.g. cents for USD/CAD/EUR, whole units for CRC/COP). To
@@ -31,28 +43,31 @@ pub struct RateView {
     pub currency: String,
     pub minor_per_btc: i64,
     pub precision: u8,
-    /// Unix epoch seconds when this rate was fetched from upstream. The
-    /// donation-page template renders this as a small "rate updated …"
-    /// line so users can sanity-check freshness.
+    /// Stable logical provenance. Never contains the configured URL or
+    /// credentials.
+    pub source: String,
+    /// Unix epoch seconds carried by the upstream observation.
+    pub observed_at_unix: u64,
+    /// Unix epoch seconds when Bullnym completed the upstream response.
     pub fetched_at_unix: u64,
-    /// True when upstream is unreachable and we're returning a stale-but-
-    /// known rate instead of failing. The page can show a "rate may be
-    /// stale" badge.
+    /// Exclusive freshness boundary, capped from both observation and fetch.
+    pub expires_at_unix: u64,
+    /// True only when a failed refresh reused a still-unexpired observation.
     pub last_known_rate: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CachedRate {
-    minor_per_btc: i64,
-    precision: u8,
-    fetched_at: Instant,
-    fetched_at_unix: u64,
+    rate: RateView,
+    cached_at: Instant,
 }
 
 pub struct PricerClient {
     cfg: PricerConfig,
     http: reqwest::Client,
     cache: Arc<DashMap<String, CachedRate>>,
+    refresh_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    failed_refreshes: Arc<DashMap<String, Instant>>,
     supported_currencies: Arc<Vec<CurrencyView>>,
 }
 
@@ -71,9 +86,20 @@ impl PricerClient {
         // but we'd rather fail at startup than at first request.
         let lower = cfg.url.to_lowercase();
         if !lower.starts_with("http://") && !lower.starts_with("https://") {
-            return Err(PricerInitError::BadScheme(cfg.url.clone()));
+            return Err(PricerInitError::BadScheme);
+        }
+        if cfg.cache_ttl_secs == 0
+            || cfg.max_freshness_secs == 0
+            || cfg.max_freshness_secs > MAX_CONFIGURED_FRESHNESS_SECS
+            || cfg.cache_ttl_secs > cfg.max_freshness_secs
+            || cfg.request_timeout_ms == 0
+        {
+            return Err(PricerInitError::InvalidFreshnessPolicy);
         }
         let supported_currencies = normalize_supported_currencies(&cfg.supported_currencies);
+        if supported_currencies.is_empty() {
+            return Err(PricerInitError::EmptySupportedCurrencies);
+        }
         if let Some(currency) = supported_currencies
             .iter()
             .find(|currency| max_minor_per_btc(&currency.code).is_none())
@@ -88,6 +114,8 @@ impl PricerClient {
             cfg,
             http,
             cache: Arc::new(DashMap::new()),
+            refresh_locks: Arc::new(DashMap::new()),
+            failed_refreshes: Arc::new(DashMap::new()),
             supported_currencies: Arc::new(supported_currencies),
         })
     }
@@ -109,65 +137,99 @@ impl PricerClient {
     /// `GET /api/v1/rate` after the HTML has loaded.
     pub fn cached_rate(&self, currency: &str) -> Option<RateView> {
         let currency = normalize_currency_code(currency);
-        self.cache.get(&currency).map(|entry| RateView {
-            currency,
-            minor_per_btc: entry.minor_per_btc,
-            precision: entry.precision,
-            fetched_at_unix: entry.fetched_at_unix,
-            last_known_rate: entry.fetched_at.elapsed()
-                >= Duration::from_secs(self.cfg.cache_ttl_secs),
-        })
+        if !self.is_supported_currency(&currency) {
+            return None;
+        }
+        let entry = self.cache.get(&currency)?;
+        if cache_entry_expired(&entry) {
+            return None;
+        }
+        let mut rate = entry.rate.clone();
+        rate.last_known_rate =
+            entry.cached_at.elapsed() >= Duration::from_secs(self.cfg.cache_ttl_secs);
+        Some(rate)
     }
 
     /// Fetch a fresh rate for `currency` (e.g. "USD"), or return the cached
-    /// rate if it's within the configured TTL. On upstream error and a
-    /// non-empty cache, returns the stale rate with `last_known_rate=true`.
-    /// On upstream error and empty cache, returns `None`.
-    pub async fn get_rate(&self, currency: &str) -> Option<RateView> {
+    /// rate if it's within the configured TTL. Identical refreshes serialize
+    /// behind one keyed lock. On upstream error, only a still-unexpired cached
+    /// observation is returned with `last_known_rate=true`.
+    pub async fn get_rate(&self, currency: &str) -> Result<RateView, PricerError> {
         let currency = normalize_currency_code(currency);
-
-        // Fast path: cached and within TTL.
-        if let Some(entry) = self.cache.get(&currency) {
-            if entry.fetched_at.elapsed() < Duration::from_secs(self.cfg.cache_ttl_secs) {
-                return Some(RateView {
-                    currency: currency.clone(),
-                    minor_per_btc: entry.minor_per_btc,
-                    precision: entry.precision,
-                    fetched_at_unix: entry.fetched_at_unix,
-                    last_known_rate: false,
-                });
-            }
+        if !self.is_supported_currency(&currency) {
+            return Err(PricerError::UnsupportedCurrency);
         }
 
-        // Slow path: refresh from upstream.
+        // Fast path: cached and within TTL.
+        if let Some(rate) = self.current_cached_rate(&currency) {
+            return Ok(rate);
+        }
+
+        let refresh_lock = self
+            .refresh_locks
+            .entry(currency.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _refresh_guard = refresh_lock.lock().await;
+
+        // Another request may have populated the cache while this request
+        // waited. Recheck under the per-currency refresh lock.
+        if let Some(rate) = self.current_cached_rate(&currency) {
+            return Ok(rate);
+        }
+        if self
+            .failed_refreshes
+            .get(&currency)
+            .is_some_and(|failed_at| failed_at.elapsed() < FAILED_REFRESH_COOLDOWN)
+        {
+            return self
+                .bounded_last_known_rate(&currency)
+                .ok_or(PricerError::RecentRefreshFailure);
+        }
+
         match self.fetch_from_upstream(&currency).await {
             Ok(view) => {
+                self.failed_refreshes.remove(&currency);
                 self.cache.insert(
                     currency.clone(),
                     CachedRate {
-                        minor_per_btc: view.minor_per_btc,
-                        precision: view.precision,
-                        fetched_at: Instant::now(),
-                        fetched_at_unix: view.fetched_at_unix,
+                        rate: view.clone(),
+                        cached_at: Instant::now(),
                     },
                 );
-                Some(view)
+                Ok(view)
             }
-            Err(e) => {
+            Err(error) => {
+                self.failed_refreshes
+                    .insert(currency.clone(), Instant::now());
                 tracing::warn!(
                     currency = %currency,
-                    error = %e,
-                    "pricer fetch failed; serving last-known rate if cached"
+                    failure = error.code(),
+                    "pricer refresh failed; considering only bounded cached data"
                 );
-                self.cache.get(&currency).map(|entry| RateView {
-                    currency: currency.clone(),
-                    minor_per_btc: entry.minor_per_btc,
-                    precision: entry.precision,
-                    fetched_at_unix: entry.fetched_at_unix,
-                    last_known_rate: true,
-                })
+                self.bounded_last_known_rate(&currency).ok_or(error)
             }
         }
+    }
+
+    fn current_cached_rate(&self, currency: &str) -> Option<RateView> {
+        let entry = self.cache.get(currency)?;
+        if entry.cached_at.elapsed() >= Duration::from_secs(self.cfg.cache_ttl_secs)
+            || cache_entry_expired(&entry)
+        {
+            return None;
+        }
+        Some(entry.rate.clone())
+    }
+
+    fn bounded_last_known_rate(&self, currency: &str) -> Option<RateView> {
+        let entry = self.cache.get(currency)?;
+        if cache_entry_expired(&entry) {
+            return None;
+        }
+        let mut rate = entry.rate.clone();
+        rate.last_known_rate = true;
+        Some(rate)
     }
 
     async fn fetch_from_upstream(&self, currency: &str) -> Result<RateView, PricerError> {
@@ -189,54 +251,106 @@ impl PricerClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| PricerError::Transport(e.to_string()))?
+            .map_err(|_| PricerError::Transport)?
             .error_for_status()
-            .map_err(|e| PricerError::Transport(e.to_string()))?
+            .map_err(|_| PricerError::Transport)?
             .json()
             .await
-            .map_err(|e| PricerError::Decode(e.to_string()))?;
+            .map_err(|_| PricerError::Decode)?;
 
-        if let Some(err) = resp.error {
-            return Err(PricerError::Rpc(err.message));
+        if resp.error.is_some() {
+            return Err(PricerError::Rpc);
         }
 
-        let element = resp
-            .result
-            .ok_or_else(|| PricerError::Decode("missing result".into()))?
-            .element;
+        let element = resp.result.ok_or(PricerError::Decode)?.element;
+
+        validate_upstream_pair(&element, currency)?;
 
         let minor_per_btc = minor_per_btc_from_element(&element)?;
+        validate_rate(currency, minor_per_btc).map_err(|_| PricerError::InvalidRate)?;
 
-        if let Err(reason) = validate_rate(&element.to_currency, minor_per_btc) {
-            return Err(PricerError::Decode(format!(
-                "indexPrice {} for {} rejected: {}",
-                element.index_price, element.to_currency, reason
-            )));
-        }
-
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let fetched_at_unix = unix_now();
+        let (observed_at_unix, expires_at_unix) = validate_observation_time(
+            &element.created_at,
+            fetched_at_unix,
+            self.cfg.max_freshness_secs,
+        )?;
 
         Ok(RateView {
             precision: currency_precision(&element.to_currency),
-            currency: normalize_currency_code(&element.to_currency),
+            currency: element.to_currency,
             minor_per_btc,
-            fetched_at_unix: now_unix,
+            source: RATE_SOURCE.to_string(),
+            observed_at_unix,
+            fetched_at_unix,
+            expires_at_unix,
             last_known_rate: false,
         })
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn cache_entry_expired(entry: &CachedRate) -> bool {
+    let remaining_at_fetch = entry
+        .rate
+        .expires_at_unix
+        .saturating_sub(entry.rate.fetched_at_unix);
+    unix_now() >= entry.rate.expires_at_unix
+        || entry.cached_at.elapsed() >= Duration::from_secs(remaining_at_fetch)
+}
+
+fn parse_observed_at(value: &str) -> Result<u64, PricerError> {
+    let timestamp = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| PricerError::InvalidObservationTime)?
+        .timestamp();
+    u64::try_from(timestamp).map_err(|_| PricerError::InvalidObservationTime)
+}
+
+fn validate_upstream_pair(
+    element: &RateElement,
+    requested_currency: &str,
+) -> Result<(), PricerError> {
+    if element.from_currency != BASE_CURRENCY
+        || element.to_currency != requested_currency
+        || element.price_currency != requested_currency
+    {
+        return Err(PricerError::PairMismatch);
+    }
+    Ok(())
+}
+
+fn validate_observation_time(
+    value: &str,
+    fetched_at_unix: u64,
+    max_freshness_secs: u64,
+) -> Result<(u64, u64), PricerError> {
+    let observed_at_unix = parse_observed_at(value)?;
+    let observation_expiry = observed_at_unix
+        .checked_add(max_freshness_secs)
+        .ok_or(PricerError::InvalidObservationTime)?;
+    let fetch_expiry = fetched_at_unix
+        .checked_add(max_freshness_secs)
+        .ok_or(PricerError::InvalidObservationTime)?;
+    let expires_at_unix = observation_expiry.min(fetch_expiry);
+    if observed_at_unix > fetched_at_unix.saturating_add(MAX_UPSTREAM_FUTURE_SKEW_SECS) {
+        return Err(PricerError::FutureObservation);
+    }
+    if fetched_at_unix >= expires_at_unix {
+        return Err(PricerError::StaleObservation);
+    }
+    Ok((observed_at_unix, expires_at_unix))
+}
+
 fn minor_per_btc_from_element(element: &RateElement) -> Result<i64, PricerError> {
     let server_precision = currency_precision(&element.to_currency);
-    rescale_minor_units(element.index_price, element.precision, server_precision).ok_or_else(|| {
-        PricerError::Decode(format!(
-            "indexPrice {} for {} cannot be rescaled from precision {} to {}",
-            element.index_price, element.to_currency, element.precision, server_precision
-        ))
-    })
+    rescale_minor_units(element.index_price, element.precision, server_precision)
+        .ok_or(PricerError::InvalidRate)
 }
 
 fn rescale_minor_units(value: i64, from_precision: u8, to_precision: u8) -> Option<i64> {
@@ -285,7 +399,7 @@ fn max_minor_per_btc(currency: &str) -> Option<i64> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CurrencyView {
     pub code: String,
     pub precision: u8,
@@ -298,41 +412,102 @@ pub struct SupportedCurrenciesResponse {
 
 pub async fn supported_currencies(
     State(state): State<AppState>,
-) -> Json<SupportedCurrenciesResponse> {
-    Json(SupportedCurrenciesResponse {
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Result<Json<SupportedCurrenciesResponse>, AppError> {
+    check_public_rate_limit(&state, peer_opt, &headers).await?;
+    Ok(Json(SupportedCurrenciesResponse {
         currencies: state.pricer.supported_currencies().to_vec(),
-    })
+    }))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateQuery {
     currency: String,
+    #[serde(default)]
+    base: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RateResponse {
+    pub base_currency: String,
+    pub currency: String,
     pub minor_per_btc: i64,
+    pub precision: u8,
+    pub source: String,
+    pub observed_at_unix: u64,
+    pub fetched_at_unix: u64,
+    pub expires_at_unix: u64,
     pub last_known_rate: bool,
 }
 
 pub async fn rate(
     State(state): State<AppState>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(query): Query<RateQuery>,
-) -> Json<RateResponse> {
+) -> Result<Json<RateResponse>, AppError> {
+    check_public_rate_limit(&state, peer_opt, &headers).await?;
+
+    if query
+        .base
+        .as_deref()
+        .map(normalize_currency_code)
+        .is_some_and(|base| base != BASE_CURRENCY)
+    {
+        return Err(AppError::InvalidAmount(
+            "base currency must be BTC".to_string(),
+        ));
+    }
     let currency = normalize_currency_code(&query.currency);
-    let rate = state.pricer.get_rate(&currency).await;
-    let (minor_per_btc, last_known_rate) = match rate {
-        Some(rate) => (rate.minor_per_btc, rate.last_known_rate),
-        None => (0, false),
-    };
-    Json(RateResponse {
-        minor_per_btc,
-        last_known_rate,
-    })
+    if !state.pricer.is_supported_currency(&currency) {
+        return Err(AppError::InvalidAmount(format!(
+            "unsupported currency {currency}; fetch /api/v1/supported-currencies"
+        )));
+    }
+    let rate = state
+        .pricer
+        .get_rate(&currency)
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("fresh fiat rate unavailable".to_string()))?;
+
+    Ok(Json(RateResponse {
+        base_currency: BASE_CURRENCY.to_string(),
+        currency: rate.currency,
+        minor_per_btc: rate.minor_per_btc,
+        precision: rate.precision,
+        source: rate.source,
+        observed_at_unix: rate.observed_at_unix,
+        fetched_at_unix: rate.fetched_at_unix,
+        expires_at_unix: rate.expires_at_unix,
+        last_known_rate: rate.last_known_rate,
+    }))
+}
+
+async fn check_public_rate_limit(
+    state: &AppState,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let peer = peer_opt.map(|ConnectInfo(address)| address);
+    let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
+    let is_whitelisted = ip
+        .map(|address| state.ip_whitelist.contains(address))
+        .unwrap_or(false);
+    if !is_whitelisted {
+        if let Some(address) = ip {
+            state
+                .rate_limiter
+                .check_public_rate_per_source(address)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 pub fn normalize_currency_code(currency: &str) -> String {
-    currency.trim().to_uppercase()
+    currency.trim().to_ascii_uppercase()
 }
 
 pub fn currency_precision(currency: &str) -> u8 {
@@ -361,7 +536,9 @@ fn normalize_supported_currencies(currencies: &[String]) -> Vec<CurrencyView> {
 
 #[derive(Debug)]
 pub enum PricerInitError {
-    BadScheme(String),
+    BadScheme,
+    EmptySupportedCurrencies,
+    InvalidFreshnessPolicy,
     MissingRateCeiling(String),
     Build(reqwest::Error),
 }
@@ -369,9 +546,14 @@ pub enum PricerInitError {
 impl std::fmt::Display for PricerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadScheme(url) => {
-                write!(f, "pricer URL must be http:// or https://; got {url:?}")
+            Self::BadScheme => write!(f, "pricer URL must be http:// or https://"),
+            Self::EmptySupportedCurrencies => {
+                write!(f, "pricer supported currency list must not be empty")
             }
+            Self::InvalidFreshnessPolicy => write!(
+                f,
+                "pricer cache/request durations must be positive and cache TTL must not exceed freshness"
+            ),
             Self::MissingRateCeiling(currency) => {
                 write!(f, "pricer currency {currency} has no rate ceiling")
             }
@@ -400,10 +582,11 @@ struct JsonRpcResult {
 #[derive(Debug, Deserialize)]
 struct RateElement {
     #[serde(rename = "fromCurrency")]
-    #[allow(dead_code)]
     from_currency: String,
     #[serde(rename = "toCurrency")]
     to_currency: String,
+    #[serde(rename = "priceCurrency")]
+    price_currency: String,
     /// Index (reference) rate in upstream minor units of `toCurrency` per 1 BTC.
     /// Distinct from `price`: `price` carries Bull's sell-side markup
     /// while `indexPrice` is the neutral reference rate. The donation
@@ -412,29 +595,50 @@ struct RateElement {
     #[serde(rename = "indexPrice")]
     index_price: i64,
     precision: u8,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcError {
     #[allow(dead_code)]
     code: i64,
-    message: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PricerError {
-    Transport(String),
-    Decode(String),
-    Rpc(String),
+    UnsupportedCurrency,
+    Transport,
+    Decode,
+    Rpc,
+    PairMismatch,
+    InvalidRate,
+    InvalidObservationTime,
+    FutureObservation,
+    StaleObservation,
+    RecentRefreshFailure,
+}
+
+impl PricerError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedCurrency => "unsupported_currency",
+            Self::Transport => "transport",
+            Self::Decode => "decode",
+            Self::Rpc => "rpc",
+            Self::PairMismatch => "pair_mismatch",
+            Self::InvalidRate => "invalid_rate",
+            Self::InvalidObservationTime => "invalid_observation_time",
+            Self::FutureObservation => "future_observation",
+            Self::StaleObservation => "stale_observation",
+            Self::RecentRefreshFailure => "recent_refresh_failure",
+        }
+    }
 }
 
 impl std::fmt::Display for PricerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(m) => write!(f, "pricer transport: {m}"),
-            Self::Decode(m) => write!(f, "pricer decode: {m}"),
-            Self::Rpc(m) => write!(f, "pricer rpc: {m}"),
-        }
+        write!(f, "pricer {}", self.code())
     }
 }
 

@@ -490,9 +490,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("pricer client init: {e}"))?,
     );
     tracing::info!(
-        "pricer client configured (url={}, ttl={}s, timeout={}ms)",
-        config.pricer.url,
+        "pricer client configured (ttl={}s, max_freshness={}s, timeout={}ms)",
         config.pricer.cache_ttl_secs,
+        config.pricer.max_freshness_secs,
         config.pricer.request_timeout_ms,
     );
     let pwa_shells = Arc::new(donation_render::PwaShells::load(&config.pwa.dist_dir));

@@ -169,6 +169,39 @@ fn api_rate_limit_accepts_current_and_legacy_keys() {
 }
 
 #[test]
+fn public_rate_limit_has_a_separate_reasonable_default() {
+    let defaults = RateLimitConfig::default();
+    assert_eq!(defaults.public_rate_per_source_per_min, 120);
+
+    let configured: RateLimitConfig =
+        toml::from_str("public_rate_per_source_per_min = 75").unwrap();
+    assert_eq!(configured.public_rate_per_source_per_min, 75);
+    assert_eq!(configured.api_rate_limit, default_api_rate_limit());
+}
+
+#[test]
+fn pricer_cache_must_be_positive_and_within_freshness_bound() {
+    for (cache_ttl_secs, max_freshness_secs, expected) in [
+        (0, 300, "pricer.cache_ttl_secs must be > 0"),
+        (60, 0, "pricer.max_freshness_secs must be > 0"),
+        (60, 301, "pricer.max_freshness_secs must be <= 300"),
+        (
+            301,
+            300,
+            "pricer.cache_ttl_secs must be <= pricer.max_freshness_secs",
+        ),
+    ] {
+        let mut config = production_base_config();
+        config.pricer.cache_ttl_secs = cache_ttl_secs;
+        config.pricer.max_freshness_secs = max_freshness_secs;
+        let error = config
+            .validate_for_runtime("development", false)
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn donation_image_default_dimension_bounds_decode_memory() {
     let cfg = DonationConfig::default();
 
@@ -242,9 +275,7 @@ fn checked_in_config_keeps_legacy_alias_compatibility() {
 
     assert_eq!(parsed.rate_limit.api_rate_limit, 30);
     assert_eq!(parsed.rate_limit.api_rate_window_secs, 60);
-    parsed
-        .validate_for_runtime("development", false)
-        .unwrap();
+    parsed.validate_for_runtime("development", false).unwrap();
 }
 
 #[test]

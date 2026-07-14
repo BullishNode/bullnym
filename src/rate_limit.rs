@@ -194,6 +194,20 @@ impl RateLimiter {
         )
     }
 
+    /// Dedicated public-pricing source gate. Keeping this bucket separate
+    /// prevents a pricing poll storm from consuming registration, status, or
+    /// settlement API capacity. Valid responses are still cache/coalesced in
+    /// `pricer`, so clearing this gate never multiplies upstream calls.
+    pub async fn check_public_rate_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("public_rate:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.public_rate_per_source_per_min,
+            60,
+            AppError::RateLimitedSender,
+        )
+    }
+
     /// Distinct nyms-queried per IP across the metadata endpoints. Bounds
     /// slow-drip enumeration (one nym every couple of seconds, just under
     /// the per-IP rate). Reuses `nym_access_events` with the `meta:ip:`

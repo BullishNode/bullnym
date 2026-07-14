@@ -930,17 +930,15 @@ async fn parse_create_request(
         )));
     }
 
-    let rate = state.pricer.get_rate(&currency).await.ok_or_else(|| {
+    let rate = state.pricer.get_rate(&currency).await.map_err(|_| {
         AppError::ServiceUnavailable("pricer unavailable for invoice creation".into())
     })?;
     if rate.last_known_rate {
-        // Tolerate a last-known (stale) rate for a bounded grace window so a
-        // brief pricer/upstream blip does not 503 ALL fiat POS and payment-page
-        // checkout creation globally (POS terminals are fiat-first). Beyond the
-        // grace, refuse rather than price a new invoice on an ancient rate.
-        const STALE_RATE_GRACE_SECS: u64 = 300;
-        let age_secs = (unix_now() as u64).saturating_sub(rate.fetched_at_unix);
-        if age_secs > STALE_RATE_GRACE_SECS {
+        // The pricer enforces this bound before returning cached data. Recheck
+        // the observation timestamp at the money boundary so future quote-
+        // version integration cannot accidentally rely on fetch time instead.
+        let age_secs = (unix_now() as u64).saturating_sub(rate.observed_at_unix);
+        if age_secs >= state.config.pricer.max_freshness_secs {
             return Err(AppError::ServiceUnavailable(
                 "pricer rate is too stale; cannot create new invoice".into(),
             ));
