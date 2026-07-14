@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::fee_decision_record::FeeDecisionRecord;
+
 /// Complete previous-output evidence for one Bitcoin recovery input.  Keeping
 /// the amount and script with the outpoint makes the journal independently
 /// auditable and supplies the exact material a later explicit replacement
@@ -26,6 +28,7 @@ pub struct NewBitcoinRecoveryAttempt<'a> {
     pub destination_amount_sat: i64,
     pub fee_amount_sat: i64,
     pub fee_rate_sat_vb: f64,
+    pub fee_decision: &'a FeeDecisionRecord,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -42,6 +45,21 @@ pub struct ChainSwapTxAttempt {
     pub destination_amount_sat: i64,
     pub fee_amount_sat: i64,
     pub fee_rate_sat_vb: f64,
+    /// Nullable only for immutable attempts journaled before migration 054.
+    /// The database requires the complete metadata shape on every new insert.
+    pub fee_decision_purpose: Option<String>,
+    pub fee_decision_rail: Option<String>,
+    pub fee_decision_target: Option<String>,
+    pub fee_decision_source: Option<String>,
+    pub fee_decision_rate_sat_vb: Option<f64>,
+    pub fee_decision_quoted_at_unix: Option<i64>,
+    pub fee_decision_evaluated_at_unix: Option<i64>,
+    pub fee_decision_freshness_age_secs: Option<i64>,
+    pub fee_decision_freshness_max_age_secs: Option<i64>,
+    pub fee_decision_provenance: Option<String>,
+    pub fee_decision_policy_floor_sat_vb: Option<f64>,
+    pub fee_decision_policy_cap_sat_vb: Option<f64>,
+    pub fee_decision_policy_version: Option<String>,
     pub status: String,
     pub broadcast_attempts: i32,
     pub last_broadcast_result: Option<String>,
@@ -58,7 +76,13 @@ pub struct ChainSwapTxAttempt {
 
 const ATTEMPT_COLUMNS: &str = "id, chain_swap_id, purpose, raw_tx_hex, txid, source_prevouts, \
      destination_address, destination_script_hex, destination_vout, \
-     destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, status, \
+     destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+     fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+     fee_decision_source, fee_decision_rate_sat_vb, \
+     fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+     fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+     fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+     fee_decision_policy_cap_sat_vb, fee_decision_policy_version, status, \
      broadcast_attempts, last_broadcast_result, integrity_reason, \
      EXTRACT(EPOCH FROM constructed_at)::BIGINT AS constructed_at_unix, \
      EXTRACT(EPOCH FROM first_broadcast_attempt_at)::BIGINT \
@@ -79,12 +103,33 @@ pub async fn insert_bitcoin_recovery_attempt(
     attempt: &NewBitcoinRecoveryAttempt<'_>,
 ) -> Result<ChainSwapTxAttempt, sqlx::Error> {
     let source_prevouts = sqlx::types::Json(attempt.source_prevouts);
+    let decision = attempt.fee_decision;
+    let quoted_at = checked_fee_unix("fee_decision_quoted_at_unix", decision.quoted_at_unix())?;
+    let evaluated_at = checked_fee_unix(
+        "fee_decision_evaluated_at_unix",
+        decision.evaluated_at_unix(),
+    )?;
+    let freshness_age = checked_fee_unix(
+        "fee_decision_freshness_age_secs",
+        decision.freshness_age_secs(),
+    )?;
+    let freshness_max_age = checked_fee_unix(
+        "fee_decision_freshness_max_age_secs",
+        decision.freshness_max_age_secs(),
+    )?;
     sqlx::query_as::<_, ChainSwapTxAttempt>(&format!(
         "INSERT INTO chain_swap_tx_attempts \
              (chain_swap_id, purpose, raw_tx_hex, txid, source_prevouts, \
               destination_address, destination_script_hex, destination_vout, \
-              destination_amount_sat, fee_amount_sat, fee_rate_sat_vb) \
-         VALUES ($1, 'btc_recovery', $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+              destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+              fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+              fee_decision_source, fee_decision_rate_sat_vb, \
+              fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+              fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+              fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+              fee_decision_policy_cap_sat_vb, fee_decision_policy_version) \
+         VALUES ($1, 'btc_recovery', $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
          RETURNING {ATTEMPT_COLUMNS}"
     ))
     .bind(attempt.chain_swap_id)
@@ -97,8 +142,26 @@ pub async fn insert_bitcoin_recovery_attempt(
     .bind(attempt.destination_amount_sat)
     .bind(attempt.fee_amount_sat)
     .bind(attempt.fee_rate_sat_vb)
+    .bind(decision.purpose().as_str())
+    .bind(decision.rail().as_str())
+    .bind(decision.target().as_str())
+    .bind(decision.source().as_str())
+    .bind(decision.rate().as_f64())
+    .bind(quoted_at)
+    .bind(evaluated_at)
+    .bind(freshness_age)
+    .bind(freshness_max_age)
+    .bind(decision.provenance_for_persistence())
+    .bind(decision.policy_floor().as_f64())
+    .bind(decision.policy_cap().as_f64())
+    .bind(decision.policy_version())
     .fetch_one(conn)
     .await
+}
+
+fn checked_fee_unix(field: &'static str, value: u64) -> Result<i64, sqlx::Error> {
+    i64::try_from(value)
+        .map_err(|_| sqlx::Error::Protocol(format!("{field} exceeds BIGINT storage")))
 }
 
 pub async fn get_bitcoin_recovery_attempt(

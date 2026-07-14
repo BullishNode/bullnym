@@ -26,10 +26,14 @@ use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
 use crate::admission::WorkerReporter;
+use crate::builder_fee::LiquidBuilderFeeDecision;
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
 use crate::error::AppError;
+use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
+use crate::fee_policy::{FeeFreshness, LiquidFeeDecision, LiquidFeePolicy};
+use crate::fee_runtime::FeeRuntime;
 use crate::invoice;
 use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
@@ -41,6 +45,17 @@ const REVERSE_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed reverse response without persisted claim bytes";
 const CHAIN_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed chain response without persisted claim bytes";
+/// Stable, non-secret explanation for a claim that remains pending until fee
+/// policy supplies accepted live or recent same-rail evidence.
+#[doc(hidden)]
+pub const LIQUID_FEE_DECISION_PENDING_REASON: &str =
+    "Liquid fee decision unavailable; retry after accepted live or recent same-rail evidence";
+
+fn liquid_claim_fee(decision: &LiquidBuilderFeeDecision, _cooperative_or_script_path: bool) -> Fee {
+    // Both paths use the same sat/vByte decision. `boltz-client` applies it
+    // to each path's actual virtual size, so their absolute fees may differ.
+    Fee::Relative(decision.rate().as_f64())
+}
 
 fn validated_chain_creation_destination(
     terms: &db::ChainSwapCreationTerms,
@@ -329,16 +344,7 @@ async fn dispatch_webhook(
             )
             .await;
 
-            try_claim_with_retry(
-                &state.db,
-                &swap,
-                state.liquid_claim_client_factory.as_deref(),
-                &state.config.boltz.api_url,
-                state.config.claim.max_claim_attempts,
-                state.utxo_backend.as_ref(),
-                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-            )
-            .await;
+            try_claim_with_retry(&swap, ClaimAttemptContext::from_state(&state)).await;
         }
         "invoice.settled" => {
             // Preimage was disclosed and Boltz settled the LN HTLC. This
@@ -724,16 +730,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             local_status = %status,
             "boltz reports chain swap claimed; local claim path remains authoritative for invoice accounting"
         );
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         return Ok(());
     }
 
@@ -751,16 +748,7 @@ pub(crate) async fn handle_chain_swap_webhook(
         // Nudge the claimer: if the server lockup is already confirmed/claiming
         // the script-path claim runs now; otherwise the sweep / reconciler
         // picks it up once the lockup appears.
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         return Ok(());
     }
 
@@ -855,16 +843,7 @@ pub(crate) async fn handle_chain_swap_webhook(
                 boltz_status,
                 "provider failure disagrees with the local Liquid branch; preserving and redriving claim"
             );
-            try_claim_chain_swap_with_retry(
-                &state.db,
-                swap,
-                state.liquid_claim_client_factory.as_deref(),
-                &state.config.boltz.api_url,
-                state.config.claim.max_claim_attempts,
-                state.utxo_backend.as_ref(),
-                db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-            )
-            .await;
+            try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         } else {
             tracing::debug!(
                 swap_id = %swap.boltz_swap_id,
@@ -928,16 +907,7 @@ pub(crate) async fn handle_chain_swap_webhook(
             | ChainSwapStatus::Claiming
             | ChainSwapStatus::ClaimFailed
     ) {
-        try_claim_chain_swap_with_retry(
-            &state.db,
-            swap,
-            state.liquid_claim_client_factory.as_deref(),
-            &state.config.boltz.api_url,
-            state.config.claim.max_claim_attempts,
-            state.utxo_backend.as_ref(),
-            db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-        )
-        .await;
+        try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
     }
     Ok(())
 }
@@ -975,23 +945,48 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
     }
 }
 
-async fn try_claim_chain_swap_with_retry(
-    pool: &sqlx::PgPool,
-    swap: &db::ChainSwapRecord,
-    claim_clients: Option<&LiquidClaimClientFactory>,
-    boltz_url: &str,
+struct ClaimAttemptContext<'a> {
+    pool: &'a sqlx::PgPool,
+    claim_clients: Option<&'a LiquidClaimClientFactory>,
+    boltz_url: &'a str,
     max_claim_attempts: i32,
-    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
+    utxo_backend: Option<&'a Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_runtime: &'a FeeRuntime,
+}
+
+impl<'a> ClaimAttemptContext<'a> {
+    fn from_state(state: &'a AppState) -> Self {
+        Self {
+            pool: &state.db,
+            claim_clients: state.liquid_claim_client_factory.as_deref(),
+            boltz_url: &state.config.boltz.api_url,
+            max_claim_attempts: state.config.claim.max_claim_attempts,
+            utxo_backend: state.utxo_backend.as_ref(),
+            tolerances: db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
+            fee_runtime: state.fee_runtime.as_ref(),
+        }
+    }
+}
+
+async fn try_claim_chain_swap_with_retry(
+    swap: &db::ChainSwapRecord,
+    context: ClaimAttemptContext<'_>,
 ) {
+    let fee_decision = context
+        .fee_runtime
+        .liquid_construction_decision_now(FeeConstructionPurpose::ChainLiquidClaim)
+        .ok();
     match claim_chain_swap(
-        pool,
+        context.pool,
         swap.id,
-        claim_clients,
-        boltz_url,
-        max_claim_attempts,
-        utxo_backend,
-        tolerances,
+        context.claim_clients,
+        context.boltz_url,
+        context.max_claim_attempts,
+        context.utxo_backend,
+        context.tolerances,
+        fee_decision.as_ref().map(|(decision, _)| decision),
+        fee_decision.as_ref().map(|(_, record)| record),
     )
     .await
     {
@@ -1001,6 +996,13 @@ async fn try_claim_chain_swap_with_retry(
             tracing::debug!(
                 "webhook chain-swap claim skipped (lock held) for swap {}",
                 swap.boltz_swap_id
+            );
+        }
+        Ok(ClaimOutcome::PendingFeeUnavailable { reason }) => {
+            tracing::info!(
+                swap_id = %swap.boltz_swap_id,
+                reason,
+                "webhook chain-swap claim remains pending"
             );
         }
         Err(e) => {
@@ -1025,6 +1027,9 @@ pub enum ClaimOutcome {
     /// Row reached a terminal state (`Claimed`, `Expired`, `ClaimStuck`,
     /// `LockupRefunded`) — nothing to do.
     AlreadyTerminal,
+    /// No accepted live or recent same-rail Liquid fee decision exists. No
+    /// bytes or retry-failure state were written; a later sweep may retry.
+    PendingFeeUnavailable { reason: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1110,23 +1115,21 @@ fn is_local_claim_error(message: &str) -> bool {
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
 /// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
-async fn try_claim_with_retry(
-    pool: &sqlx::PgPool,
-    swap: &db::SwapRecord,
-    claim_clients: Option<&LiquidClaimClientFactory>,
-    boltz_url: &str,
-    max_claim_attempts: i32,
-    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
-    tolerances: db::InvoiceAccountingTolerances,
-) {
+async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContext<'_>) {
+    let fee_decision = context
+        .fee_runtime
+        .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
+        .ok();
     match claim_swap(
-        pool,
+        context.pool,
         swap.id,
-        claim_clients,
-        boltz_url,
-        max_claim_attempts,
-        utxo_backend,
-        tolerances,
+        context.claim_clients,
+        context.boltz_url,
+        context.max_claim_attempts,
+        context.utxo_backend,
+        context.tolerances,
+        fee_decision.as_ref().map(|(decision, _)| decision),
+        fee_decision.as_ref().map(|(_, record)| record),
     )
     .await
     {
@@ -1136,6 +1139,13 @@ async fn try_claim_with_retry(
             tracing::debug!(
                 "webhook claim skipped (lock held) for swap {}",
                 swap.boltz_swap_id
+            );
+        }
+        Ok(ClaimOutcome::PendingFeeUnavailable { reason }) => {
+            tracing::info!(
+                swap_id = %swap.boltz_swap_id,
+                reason,
+                "webhook reverse-swap claim remains pending"
             );
         }
         Err(e) => {
@@ -1303,17 +1313,21 @@ async fn resolve_claim_address(
 ///      `SkippedLockHeld` and try on the next tick.
 ///   2. Reload the row inside the lock. If terminal, return
 ///      `AlreadyTerminal`.
-///   3. Resolve the claim destination address (allocates a fresh
+///   3. If no transaction is journaled and no accepted fee decision is
+///      available, return `PendingFeeUnavailable` without allocating a
+///      destination or consuming an attempt.
+///   4. Resolve the claim destination address (allocates a fresh
 ///      descriptor index if none was set at swap creation).
-///   4. If `claim_tx_hex` is set, deserialize it. Otherwise
+///   5. If `claim_tx_hex` is set, deserialize it. Otherwise
 ///      `construct_claim` and persist `(claim_tx_hex, claim_txid,
 ///      claim_path)` in the same transaction. Mark status `claiming`.
 ///      Set a short in-flight lease in `next_claim_attempt_at`.
-///   5. Commit (releases the advisory lock).
-///   6. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
+///   6. Commit (releases the advisory lock).
+///   7. Broadcast the tx OUTSIDE the lock — broadcast is the slow,
 ///      I/O-bound step and we don't want to hold a DB connection.
 ///      Idempotent on Electrum.
-///   7. Mark status `claimed` with the on-chain txid.
+///   8. Mark status `claimed` with the on-chain txid.
+#[allow(clippy::too_many_arguments)]
 async fn claim_swap(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
@@ -1322,6 +1336,8 @@ async fn claim_swap(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
 ) -> Result<ClaimOutcome, AppError> {
     claim_swap_with_guard(
         pool,
@@ -1331,6 +1347,8 @@ async fn claim_swap(
         max_claim_attempts,
         utxo_backend,
         tolerances,
+        fee_decision,
+        fee_record,
         false,
     )
     .await
@@ -1345,8 +1363,13 @@ async fn claim_swap(
 pub async fn exercise_reverse_claim_with_malformed_response(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
+    fee_decision: &LiquidFeeDecision,
 ) -> Result<ClaimOutcome, AppError> {
     let factory = LiquidClaimClientFactory::try_new(vec!["tcp://127.0.0.1:1".to_string()])?;
+    let fee_record = liquid_fee_record_for_compatibility_seam(
+        FeeConstructionPurpose::ReverseLiquidClaim,
+        fee_decision,
+    )?;
     claim_swap_with_guard(
         pool,
         swap_id,
@@ -1355,7 +1378,32 @@ pub async fn exercise_reverse_claim_with_malformed_response(
         20,
         None,
         db::InvoiceAccountingTolerances::default(),
+        Some(fee_decision),
+        Some(&fee_record),
         true,
+    )
+    .await
+}
+
+/// Exercise production claim preparation without a usable fee quote. This
+/// seam performs no network I/O: unjournaled bytes remain pending before any
+/// claim client is required.
+#[doc(hidden)]
+pub async fn exercise_reverse_claim_without_fee(
+    pool: &sqlx::PgPool,
+    swap_id: Uuid,
+) -> Result<ClaimOutcome, AppError> {
+    claim_swap_with_guard(
+        pool,
+        swap_id,
+        None,
+        "http://127.0.0.1:1",
+        20,
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        None,
+        None,
+        false,
     )
     .await
 }
@@ -1369,12 +1417,13 @@ async fn claim_swap_with_guard(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     // Outer wrapper: records every Err uniformly via
-    // `db::record_claim_failure`. SkippedLockHeld and AlreadyTerminal
-    // are Ok variants and do NOT count as failures (no attempt was
-    // really made).
+    // `db::record_claim_failure`. Pending/skip outcomes are Ok variants and do
+    // not count as failures because no construction attempt was made.
     let result = claim_swap_inner(
         pool,
         swap_id,
@@ -1382,6 +1431,8 @@ async fn claim_swap_with_guard(
         boltz_url,
         utxo_backend,
         tolerances,
+        fee_decision,
+        fee_record,
         require_malformed_response,
     )
     .await;
@@ -1467,6 +1518,7 @@ async fn commit_claim_preparation_error<T>(
     Err(error)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
     swap_id: Uuid,
@@ -1474,11 +1526,10 @@ async fn claim_swap_inner(
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
-    let claim_clients = claim_clients.ok_or_else(|| {
-        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
-    })?;
     // Acquire single-flight and prepare the claim tx.
     let mut tx = pool
         .begin()
@@ -1524,6 +1575,15 @@ async fn claim_swap_inner(
         ));
     }
 
+    if swap.claim_tx_hex.is_none() && (fee_decision.is_none() || fee_record.is_none()) {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
+    }
+    let claim_clients = claim_clients.ok_or_else(|| {
+        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+    })?;
+
     // Destination resolution uses this same transaction/connection. Returning
     // to the pool here would self-starve at max_connections=1 and can deadlock
     // a saturated pool when multiple claim preparations each hold one slot.
@@ -1541,6 +1601,10 @@ async fn claim_swap_inner(
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
+        let fee_record = fee_record.expect("unjournaled claims require fee decision metadata");
+        let fee_decision = LiquidBuilderFeeDecision::from(
+            fee_decision.expect("unjournaled claims require a policy decision"),
+        );
         // Choose the claim path. `cooperative_refused` is set by either:
         //   - the webhook handler on `swap.expired`, OR
         //   - this function on a previous attempt where Boltz returned
@@ -1553,6 +1617,7 @@ async fn claim_swap_inner(
             &output_address,
             claim_clients,
             boltz_url,
+            &fee_decision,
             use_cooperative,
         )
         .await
@@ -1577,6 +1642,23 @@ async fn claim_swap_inner(
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
+        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&constructed)?;
+        let quoted_at = checked_fee_i64(
+            "claim_fee_decision_quoted_at_unix",
+            fee_record.quoted_at_unix(),
+        )?;
+        let evaluated_at = checked_fee_i64(
+            "claim_fee_decision_evaluated_at_unix",
+            fee_record.evaluated_at_unix(),
+        )?;
+        let freshness_age = checked_fee_i64(
+            "claim_fee_decision_freshness_age_secs",
+            fee_record.freshness_age_secs(),
+        )?;
+        let freshness_max_age = checked_fee_i64(
+            "claim_fee_decision_freshness_max_age_secs",
+            fee_record.freshness_max_age_secs(),
+        )?;
         let hex = match serialize_claim_tx_hex(&constructed) {
             Ok(hex) => hex,
             Err(error) => return commit_claim_preparation_error(tx, error).await,
@@ -1592,13 +1674,40 @@ async fn claim_swap_inner(
         // have prevented this; the guard is there to fail closed).
         let persisted = sqlx::query(
             "UPDATE swap_records \
-             SET claim_tx_hex = $2, claim_txid = $3, claim_path = $4 \
+             SET claim_tx_hex = $2, claim_txid = $3, claim_path = $4, \
+                 claim_actual_fee_sat = $5, claim_actual_fee_rate_sat_vb = $6, \
+                 claim_fee_decision_purpose = $7, claim_fee_decision_rail = $8, \
+                 claim_fee_decision_target = $9, claim_fee_decision_source = $10, \
+                 claim_fee_decision_rate_sat_vb = $11, \
+                 claim_fee_decision_quoted_at_unix = $12, \
+                 claim_fee_decision_evaluated_at_unix = $13, \
+                 claim_fee_decision_freshness_age_secs = $14, \
+                 claim_fee_decision_freshness_max_age_secs = $15, \
+                 claim_fee_decision_provenance = $16, \
+                 claim_fee_decision_policy_floor_sat_vb = $17, \
+                 claim_fee_decision_policy_cap_sat_vb = $18, \
+                 claim_fee_decision_policy_version = $19 \
              WHERE id = $1 AND claim_tx_hex IS NULL",
         )
         .bind(swap.id)
         .bind(&hex)
         .bind(&txid)
         .bind(claim_path)
+        .bind(actual_fee_sat)
+        .bind(actual_fee_rate_sat_vb)
+        .bind(fee_record.purpose().as_str())
+        .bind(fee_record.rail().as_str())
+        .bind(fee_record.target().as_str())
+        .bind(fee_record.source().as_str())
+        .bind(fee_record.rate().as_f64())
+        .bind(quoted_at)
+        .bind(evaluated_at)
+        .bind(freshness_age)
+        .bind(freshness_max_age)
+        .bind(fee_record.provenance_for_persistence())
+        .bind(fee_record.policy_floor().as_f64())
+        .bind(fee_record.policy_cap().as_f64())
+        .bind(fee_record.policy_version())
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1761,6 +1870,7 @@ async fn claim_swap_inner(
     Ok(ClaimOutcome::Broadcast)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn claim_chain_swap(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
@@ -1769,6 +1879,8 @@ async fn claim_chain_swap(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
 ) -> Result<ClaimOutcome, AppError> {
     claim_chain_swap_with_guard(
         pool,
@@ -1778,6 +1890,8 @@ async fn claim_chain_swap(
         max_claim_attempts,
         utxo_backend,
         tolerances,
+        fee_decision,
+        fee_record,
         false,
     )
     .await
@@ -1791,8 +1905,13 @@ async fn claim_chain_swap(
 pub async fn exercise_chain_claim_with_malformed_response(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
+    fee_decision: &LiquidFeeDecision,
 ) -> Result<ClaimOutcome, AppError> {
     let factory = LiquidClaimClientFactory::try_new(vec!["tcp://127.0.0.1:1".to_string()])?;
+    let fee_record = liquid_fee_record_for_compatibility_seam(
+        FeeConstructionPurpose::ChainLiquidClaim,
+        fee_decision,
+    )?;
     claim_chain_swap_with_guard(
         pool,
         chain_swap_id,
@@ -1801,7 +1920,31 @@ pub async fn exercise_chain_claim_with_malformed_response(
         20,
         None,
         db::InvoiceAccountingTolerances::default(),
+        Some(fee_decision),
+        Some(&fee_record),
         true,
+    )
+    .await
+}
+
+/// Exercise production chain-claim preparation without a usable fee quote.
+/// Unjournaled bytes remain pending before any network client is required.
+#[doc(hidden)]
+pub async fn exercise_chain_claim_without_fee(
+    pool: &sqlx::PgPool,
+    chain_swap_id: Uuid,
+) -> Result<ClaimOutcome, AppError> {
+    claim_chain_swap_with_guard(
+        pool,
+        chain_swap_id,
+        None,
+        "http://127.0.0.1:1",
+        20,
+        None,
+        db::InvoiceAccountingTolerances::default(),
+        None,
+        None,
+        false,
     )
     .await
 }
@@ -1815,6 +1958,8 @@ async fn claim_chain_swap_with_guard(
     max_claim_attempts: i32,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     let result = claim_chain_swap_inner(
@@ -1824,6 +1969,8 @@ async fn claim_chain_swap_with_guard(
         boltz_url,
         utxo_backend,
         tolerances,
+        fee_decision,
+        fee_record,
         require_malformed_response,
     )
     .await;
@@ -1890,6 +2037,7 @@ async fn claim_chain_swap_with_guard(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn claim_chain_swap_inner(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
@@ -1897,11 +2045,10 @@ async fn claim_chain_swap_inner(
     boltz_url: &str,
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
+    fee_decision: Option<&LiquidFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
-    let claim_clients = claim_clients.ok_or_else(|| {
-        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
-    })?;
     let mut tx = pool
         .begin()
         .await
@@ -1947,6 +2094,15 @@ async fn claim_chain_swap_inner(
         return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
     }
 
+    if swap.claim_tx_hex.is_none() && (fee_decision.is_none() || fee_record.is_none()) {
+        return Ok(ClaimOutcome::PendingFeeUnavailable {
+            reason: LIQUID_FEE_DECISION_PENDING_REASON,
+        });
+    }
+    let claim_clients = claim_clients.ok_or_else(|| {
+        AppError::ClaimError("Liquid claim client factory is unavailable".to_string())
+    })?;
+
     // Post-051 swaps claim only to the immutable destination committed before
     // the payer saw the Bitcoin address. Never re-resolve it through the
     // mutable invoice relationship. Historical rows have no creation packet,
@@ -1976,6 +2132,11 @@ async fn claim_chain_swap_inner(
             Err(error) => return commit_claim_preparation_error(tx, error).await,
         }
     } else {
+        let fee_record =
+            fee_record.expect("unjournaled chain claims require fee decision metadata");
+        let fee_decision = LiquidBuilderFeeDecision::from(
+            fee_decision.expect("unjournaled chain claims require a policy decision"),
+        );
         // Cooperative MuSig2 claim by default; script-path (preimage) claim once
         // `cooperative_refused` is set — by the `swap.expired` webhook or a prior
         // runtime refusal below. One-way flag, so no cooperative/script ping-pong.
@@ -1986,6 +2147,7 @@ async fn claim_chain_swap_inner(
             &output_address,
             claim_clients,
             boltz_url,
+            &fee_decision,
             use_cooperative,
         )
         .await
@@ -2005,6 +2167,23 @@ async fn claim_chain_swap_inner(
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
+        let (actual_fee_sat, actual_fee_rate_sat_vb) = liquid_actual_fee(&constructed)?;
+        let quoted_at = checked_fee_i64(
+            "claim_fee_decision_quoted_at_unix",
+            fee_record.quoted_at_unix(),
+        )?;
+        let evaluated_at = checked_fee_i64(
+            "claim_fee_decision_evaluated_at_unix",
+            fee_record.evaluated_at_unix(),
+        )?;
+        let freshness_age = checked_fee_i64(
+            "claim_fee_decision_freshness_age_secs",
+            fee_record.freshness_age_secs(),
+        )?;
+        let freshness_max_age = checked_fee_i64(
+            "claim_fee_decision_freshness_max_age_secs",
+            fee_record.freshness_max_age_secs(),
+        )?;
         let hex = match serialize_claim_tx_hex(&constructed) {
             Ok(hex) => hex,
             Err(error) => return commit_claim_preparation_error(tx, error).await,
@@ -2012,12 +2191,39 @@ async fn claim_chain_swap_inner(
         let txid = btc_like_txid(&constructed);
         let persisted = sqlx::query(
             "UPDATE chain_swap_records \
-             SET claim_tx_hex = $2, claim_txid = $3 \
+             SET claim_tx_hex = $2, claim_txid = $3, \
+                 claim_actual_fee_sat = $4, claim_actual_fee_rate_sat_vb = $5, \
+                 claim_fee_decision_purpose = $6, claim_fee_decision_rail = $7, \
+                 claim_fee_decision_target = $8, claim_fee_decision_source = $9, \
+                 claim_fee_decision_rate_sat_vb = $10, \
+                 claim_fee_decision_quoted_at_unix = $11, \
+                 claim_fee_decision_evaluated_at_unix = $12, \
+                 claim_fee_decision_freshness_age_secs = $13, \
+                 claim_fee_decision_freshness_max_age_secs = $14, \
+                 claim_fee_decision_provenance = $15, \
+                 claim_fee_decision_policy_floor_sat_vb = $16, \
+                 claim_fee_decision_policy_cap_sat_vb = $17, \
+                 claim_fee_decision_policy_version = $18 \
              WHERE id = $1 AND claim_tx_hex IS NULL",
         )
         .bind(swap.id)
         .bind(&hex)
         .bind(&txid)
+        .bind(actual_fee_sat)
+        .bind(actual_fee_rate_sat_vb)
+        .bind(fee_record.purpose().as_str())
+        .bind(fee_record.rail().as_str())
+        .bind(fee_record.target().as_str())
+        .bind(fee_record.source().as_str())
+        .bind(fee_record.rate().as_f64())
+        .bind(quoted_at)
+        .bind(evaluated_at)
+        .bind(freshness_age)
+        .bind(freshness_max_age)
+        .bind(fee_record.provenance_for_persistence())
+        .bind(fee_record.policy_floor().as_f64())
+        .bind(fee_record.policy_cap().as_f64())
+        .bind(fee_record.policy_version())
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -2170,6 +2376,7 @@ async fn construct_claim_tx(
     output_address: &str,
     claim_clients: &LiquidClaimClientFactory,
     boltz_url: &str,
+    fee_decision: &LiquidBuilderFeeDecision,
     cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_hex = swap
@@ -2219,7 +2426,7 @@ async fn construct_claim_tx(
     let params = SwapTransactionParams {
         keys: keypair,
         output_address: output_address.to_string(),
-        fee: Fee::Relative(0.1),
+        fee: liquid_claim_fee(fee_decision, cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
@@ -2237,6 +2444,7 @@ async fn construct_chain_claim_tx(
     output_address: &str,
     claim_clients: &LiquidClaimClientFactory,
     boltz_url: &str,
+    fee_decision: &LiquidBuilderFeeDecision,
     use_cooperative: bool,
 ) -> Result<BtcLikeTransaction, AppError> {
     let preimage_bytes = hex::decode(&swap.preimage_hex)
@@ -2290,7 +2498,7 @@ async fn construct_chain_claim_tx(
     let params = SwapTransactionParams {
         keys: claim_keypair,
         output_address: output_address.to_string(),
-        fee: Fee::Relative(0.1),
+        fee: liquid_claim_fee(fee_decision, use_cooperative),
         swap_id: swap.boltz_swap_id.clone(),
         chain_client: &chain_client,
         boltz_client: &boltz_api,
@@ -2644,6 +2852,83 @@ fn btc_like_txid(tx: &BtcLikeTransaction) -> String {
     }
 }
 
+fn liquid_actual_fee(tx: &BtcLikeTransaction) -> Result<(i64, f64), AppError> {
+    let BtcLikeTransaction::Liquid(transaction) = tx else {
+        return Err(AppError::ClaimError(
+            "Liquid claim builder returned a non-Liquid transaction".into(),
+        ));
+    };
+    let mut fee_outputs = transaction.output.iter().filter(|output| output.is_fee());
+    let fee_output = fee_outputs.next().ok_or_else(|| {
+        AppError::ClaimError("constructed Liquid claim has no explicit fee output".into())
+    })?;
+    if fee_outputs.next().is_some() {
+        return Err(AppError::ClaimError(
+            "constructed Liquid claim has multiple fee outputs".into(),
+        ));
+    }
+    match fee_output.asset {
+        boltz_elements::confidential::Asset::Explicit(asset)
+            if asset == boltz_elements::AssetId::LIQUID_BTC => {}
+        _ => {
+            return Err(AppError::ClaimError(
+                "constructed Liquid claim fee is not explicit L-BTC".into(),
+            ))
+        }
+    }
+    let fee_sat = match fee_output.value {
+        boltz_elements::confidential::Value::Explicit(value) if value > 0 => value,
+        _ => {
+            return Err(AppError::ClaimError(
+                "constructed Liquid claim fee is not a positive explicit value".into(),
+            ))
+        }
+    };
+    // Liquid claims are constructed through boltz-client with
+    // `is_discount_ct = true`, so the relative fee is applied to Elements'
+    // discounted confidential-transaction virtual size. Record the actual
+    // effective rate on that same basis.
+    let vsize = transaction.discount_vsize();
+    if vsize == 0 {
+        return Err(AppError::ClaimError(
+            "constructed Liquid claim has zero discounted virtual size".into(),
+        ));
+    }
+    let fee_sat_i64 = i64::try_from(fee_sat)
+        .map_err(|_| AppError::ClaimError("Liquid claim fee exceeds BIGINT storage".into()))?;
+    Ok((fee_sat_i64, fee_sat as f64 / vsize as f64))
+}
+
+fn checked_fee_i64(field: &'static str, value: u64) -> Result<i64, AppError> {
+    i64::try_from(value)
+        .map_err(|_| AppError::ClaimError(format!("{field} exceeds BIGINT storage")))
+}
+
+fn liquid_fee_record_for_compatibility_seam(
+    purpose: FeeConstructionPurpose,
+    decision: &LiquidFeeDecision,
+) -> Result<FeeDecisionRecord, AppError> {
+    let evaluated_at_unix =
+        match decision.freshness() {
+            FeeFreshness::Fresh { age_secs, .. } => decision
+                .observed_at_unix()
+                .checked_add(age_secs)
+                .ok_or_else(|| AppError::ClaimError("fee decision clock overflow".into()))?,
+            _ => {
+                return Err(AppError::ClaimError(
+                    LIQUID_FEE_DECISION_PENDING_REASON.into(),
+                ))
+            }
+        };
+    FeeDecisionRecord::from_liquid(
+        purpose,
+        decision,
+        &LiquidFeePolicy::default(),
+        evaluated_at_unix,
+    )
+    .map_err(|error| AppError::ClaimError(format!("invalid Liquid fee decision record: {error}")))
+}
+
 async fn recover_claim_from_lockup_spend(
     claim_tx: &BtcLikeTransaction,
     backend: &Arc<dyn UtxoBackend>,
@@ -2726,15 +3011,66 @@ impl ClaimClientStartup {
 #[cfg(test)]
 mod tests;
 
-pub fn spawn_background_claimer(
+/// Owned runtime dependencies for the long-lived reverse and chain claim
+/// sweeps. Worker health reporters are grouped separately because they are
+/// mutable rail-local state, not claim-construction capabilities.
+pub struct BackgroundClaimerDependencies {
     pool: sqlx::PgPool,
     config: Arc<Config>,
     claim_clients: Option<Arc<LiquidClaimClientFactory>>,
     utxo_backend: Option<Arc<dyn UtxoBackend>>,
+    fee_runtime: Arc<FeeRuntime>,
     cancel: CancellationToken,
-    mut reverse_reporter: WorkerReporter,
-    mut chain_reporter: WorkerReporter,
+}
+
+impl BackgroundClaimerDependencies {
+    pub fn new(
+        pool: sqlx::PgPool,
+        config: Arc<Config>,
+        claim_clients: Option<Arc<LiquidClaimClientFactory>>,
+        utxo_backend: Option<Arc<dyn UtxoBackend>>,
+        fee_runtime: Arc<FeeRuntime>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            pool,
+            config,
+            claim_clients,
+            utxo_backend,
+            fee_runtime,
+            cancel,
+        }
+    }
+}
+
+/// Rail-local admission reporters consumed by the background claimer task.
+pub struct BackgroundClaimerReporters {
+    reverse: WorkerReporter,
+    chain: WorkerReporter,
+}
+
+impl BackgroundClaimerReporters {
+    pub fn new(reverse: WorkerReporter, chain: WorkerReporter) -> Self {
+        Self { reverse, chain }
+    }
+}
+
+pub fn spawn_background_claimer(
+    dependencies: BackgroundClaimerDependencies,
+    reporters: BackgroundClaimerReporters,
 ) -> tokio::task::JoinHandle<()> {
+    let BackgroundClaimerDependencies {
+        pool,
+        config,
+        claim_clients,
+        utxo_backend,
+        fee_runtime,
+        cancel,
+    } = dependencies;
+    let BackgroundClaimerReporters {
+        reverse: mut reverse_reporter,
+        chain: mut chain_reporter,
+    } = reporters;
     tokio::spawn(async move {
         let mut first_reverse_run = true;
         let mut claim_client_startup = ClaimClientStartup::default();
@@ -2804,6 +3140,11 @@ pub fn spawn_background_claimer(
                         }
                         for swap in &ready {
                             reverse_reporter.progress();
+                            let fee_decision = fee_runtime
+                                .liquid_construction_decision_now(
+                                    FeeConstructionPurpose::ReverseLiquidClaim,
+                                )
+                                .ok();
                             match claim_swap(
                                 &pool,
                                 swap.id,
@@ -2812,6 +3153,8 @@ pub fn spawn_background_claimer(
                                 config.claim.max_claim_attempts,
                                 utxo_backend.as_ref(),
                                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+                                fee_decision.as_ref().map(|(decision, _)| decision),
+                                fee_decision.as_ref().map(|(_, record)| record),
                             )
                             .await
                             {
@@ -2831,6 +3174,13 @@ pub fn spawn_background_claimer(
                                     tracing::debug!(
                                         "background claimer: skipped {} (already terminal)",
                                         swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::PendingFeeUnavailable { reason }) => {
+                                    tracing::info!(
+                                        swap_id = %swap.boltz_swap_id,
+                                        reason,
+                                        "background claimer: reverse swap remains pending"
                                     );
                                 }
                                 Err(e) => {
@@ -2866,6 +3216,11 @@ pub fn spawn_background_claimer(
                         );
                         for swap in &ready_chain {
                             chain_reporter.progress();
+                            let fee_decision = fee_runtime
+                                .liquid_construction_decision_now(
+                                    FeeConstructionPurpose::ChainLiquidClaim,
+                                )
+                                .ok();
                             match claim_chain_swap(
                                 &pool,
                                 swap.id,
@@ -2874,6 +3229,8 @@ pub fn spawn_background_claimer(
                                 config.claim.max_claim_attempts,
                                 utxo_backend.as_ref(),
                                 db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
+                                fee_decision.as_ref().map(|(decision, _)| decision),
+                                fee_decision.as_ref().map(|(_, record)| record),
                             )
                             .await
                             {
@@ -2893,6 +3250,13 @@ pub fn spawn_background_claimer(
                                     tracing::debug!(
                                         "background claimer: skipped chain swap {} (already terminal)",
                                         swap.boltz_swap_id
+                                    );
+                                }
+                                Ok(ClaimOutcome::PendingFeeUnavailable { reason }) => {
+                                    tracing::info!(
+                                        swap_id = %swap.boltz_swap_id,
+                                        reason,
+                                        "background claimer: chain swap remains pending"
                                     );
                                 }
                                 Err(e) => {

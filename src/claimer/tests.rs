@@ -5,6 +5,20 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
+use crate::fee_policy::{FeeProvenance, LiquidFeePolicy, LiveLiquid, SatPerVbyte};
+
+fn liquid_builder_fee(rate: f64) -> LiquidBuilderFeeDecision {
+    let observation = LiveLiquid::new(
+        SatPerVbyte::try_from(rate).unwrap(),
+        1_000,
+        FeeProvenance::new("claimer-test").unwrap(),
+    );
+    let decision = LiquidFeePolicy::default()
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap();
+    LiquidBuilderFeeDecision::from(&decision)
+}
+
 fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
     db::ChainSwapCreationTerms {
         pinned_pair_hash: "11".repeat(32),
@@ -23,6 +37,90 @@ fn valid_chain_creation_terms() -> db::ChainSwapCreationTerms {
         merchant_emergency_btc_address: None,
         recovery_address_commitment_id: None,
     }
+}
+
+fn relative_fee_rate(fee: Fee) -> f64 {
+    match fee {
+        Fee::Relative(rate) => rate,
+        Fee::Absolute(_) => panic!("claim builder must use a sat/vByte decision"),
+    }
+}
+
+#[test]
+fn reverse_and_chain_claim_paths_preserve_upstream_min_midrange_and_max_rates() {
+    // Representative policy boundary values. The policy package owns their
+    // actual configuration; this builder test proves all four construction
+    // paths receive the exact selected sat/vByte rate without reclamping it.
+    for rate in [0.1, 2.0, 10.0] {
+        let decision = liquid_builder_fee(rate);
+        for cooperative in [true, false] {
+            assert_eq!(
+                relative_fee_rate(liquid_claim_fee(&decision, cooperative)),
+                rate
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_liquid_decision_changes_each_next_claim_construction_path() {
+    let previous = liquid_builder_fee(0.1);
+    let changed = liquid_builder_fee(5.0);
+
+    for cooperative in [true, false] {
+        assert_eq!(
+            relative_fee_rate(liquid_claim_fee(&previous, cooperative)),
+            0.1
+        );
+        assert_eq!(
+            relative_fee_rate(liquid_claim_fee(&changed, cooperative)),
+            5.0
+        );
+    }
+}
+
+#[test]
+fn liquid_actual_fee_uses_discounted_virtual_size_basis() {
+    let secp = boltz_elements::secp256k1_zkp::Secp256k1::new();
+    let confidential_value = boltz_elements::confidential::Value::new_confidential_from_assetid(
+        &secp,
+        50_000,
+        boltz_elements::AssetId::LIQUID_BTC,
+        boltz_elements::confidential::ValueBlindingFactor::zero(),
+        boltz_elements::confidential::AssetBlindingFactor::zero(),
+    );
+    let transaction = boltz_elements::Transaction {
+        version: 2,
+        lock_time: boltz_elements::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![
+            boltz_elements::TxOut {
+                asset: boltz_elements::confidential::Asset::Explicit(
+                    boltz_elements::AssetId::LIQUID_BTC,
+                ),
+                value: confidential_value,
+                nonce: boltz_elements::confidential::Nonce::Null,
+                script_pubkey: boltz_elements::Script::from(vec![0x51]),
+                witness: boltz_elements::TxOutWitness::default(),
+            },
+            boltz_elements::TxOut {
+                asset: boltz_elements::confidential::Asset::Explicit(
+                    boltz_elements::AssetId::LIQUID_BTC,
+                ),
+                value: boltz_elements::confidential::Value::Explicit(1_000),
+                nonce: boltz_elements::confidential::Nonce::Null,
+                script_pubkey: boltz_elements::Script::new(),
+                witness: boltz_elements::TxOutWitness::default(),
+            },
+        ],
+    };
+    assert_ne!(transaction.vsize(), transaction.discount_vsize());
+
+    let (fee_sat, rate_sat_vb) =
+        liquid_actual_fee(&BtcLikeTransaction::Liquid(transaction.clone())).unwrap();
+
+    assert_eq!(fee_sat, 1_000);
+    assert_eq!(rate_sat_vb, 1_000.0 / transaction.discount_vsize() as f64);
 }
 
 #[test]

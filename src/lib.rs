@@ -1,10 +1,12 @@
 pub mod admission;
 pub mod auth;
+pub mod bitcoin_fee_adapter;
 pub mod bitcoin_watcher;
 pub mod boltz;
 pub mod boltz_breaker;
 pub mod boltz_restore;
 pub mod boltz_restore_fetch;
+pub mod builder_fee;
 pub(crate) mod canonical_json;
 pub mod certification;
 pub mod chain_lockup_witness_audit;
@@ -15,6 +17,7 @@ pub mod chain_swap_creation_permit;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
+pub mod current_fee_snapshot;
 pub mod db;
 pub mod derivation_guard;
 pub mod descriptor;
@@ -22,10 +25,16 @@ pub mod donation_page;
 pub mod donation_render;
 pub mod error;
 pub mod esplora;
+pub mod fee_policy;
+pub mod fee_decision_record;
+pub mod fee_refresh_cycle;
+pub mod fee_runtime;
 pub mod gc;
 pub mod image_pipeline;
 pub mod invoice;
 pub mod ip_whitelist;
+pub mod liquid_fee_adapter;
+pub mod liquid_fee_sources;
 pub mod lnurl;
 pub mod local_chain_swap_recovery_audit;
 pub mod nostr;
@@ -41,6 +50,7 @@ pub mod recovery_address_registration;
 pub mod recovery_shadow_audit;
 pub mod registration;
 pub mod reserved_nyms;
+pub mod runtime_fee_sources;
 pub mod startup_provider_reconciliation;
 pub mod swap_manifest;
 pub mod swap_manifest_delivery;
@@ -68,6 +78,7 @@ pub struct AppState {
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub liquid_claim_client_factory: Option<Arc<claimer::LiquidClaimClientFactory>>,
     pub bitcoin_recovery_backend: Option<Arc<chain_recovery::BitcoinRecoveryBackend>>,
+    pub fee_runtime: Arc<fee_runtime::FeeRuntime>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
     /// Protected off-host manifest capability. Absence is fail-closed for new
