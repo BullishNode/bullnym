@@ -315,6 +315,7 @@ impl ChainSwapRenegotiationOperation {
             RenegotiationState::AcceptRequested => {
                 accept_attempt_count > 0
                     && accept_requested_at_unix.is_some()
+                    && (ambiguous_at_unix.is_some() == last_error_class.is_some())
                     && terminal_response_digest.is_none()
                     && terminal_observed_at_unix.is_none()
             }
@@ -329,11 +330,20 @@ impl ChainSwapRenegotiationOperation {
             RenegotiationState::Accepted => {
                 accept_attempt_count > 0
                     && accept_requested_at_unix.is_some()
+                    && (ambiguous_at_unix.is_some() == last_error_class.is_some())
                     && terminal_response_digest.is_some()
                     && terminal_observed_at_unix.is_some()
             }
             RenegotiationState::Declined => {
-                terminal_response_digest.is_some() && terminal_observed_at_unix.is_some()
+                ((accept_attempt_count == 0
+                    && accept_requested_at_unix.is_none()
+                    && ambiguous_at_unix.is_none()
+                    && last_error_class.is_none())
+                    || (accept_attempt_count > 0
+                        && accept_requested_at_unix.is_some()
+                        && (ambiguous_at_unix.is_some() == last_error_class.is_some())))
+                    && terminal_response_digest.is_some()
+                    && terminal_observed_at_unix.is_some()
             }
         };
         if !shape_is_valid {
