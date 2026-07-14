@@ -54,6 +54,7 @@ pub mod runtime_fee_sources;
 pub mod startup_provider_reconciliation;
 pub mod swap_manifest;
 pub mod swap_manifest_delivery;
+pub mod swap_manifest_delivery_rebuild;
 pub mod swap_manifest_persistence;
 pub mod swap_manifest_runtime;
 pub mod swap_manifest_staging;
