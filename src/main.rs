@@ -664,6 +664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state.liquid_claim_client_factory.clone(),
                 state.utxo_backend.clone(),
                 state.fee_runtime.clone(),
+                state.clone(),
                 cancel.clone(),
             ),
             claimer::BackgroundClaimerReporters::new(

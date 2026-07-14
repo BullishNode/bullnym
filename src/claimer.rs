@@ -32,7 +32,8 @@ use crate::admission::WorkerReporter;
 use crate::boltz::{ChainSwapQuote, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
 use crate::builder_fee::LiquidBuilderFeeDecision;
 use crate::chain_swap_action::{
-    reduce_chain_swap_evidence, BitcoinSourceEvidence, ChainSwapAction, EvidenceQuality,
+    recheck_chain_swap_execution_under_lock, reduce_chain_swap_evidence, BitcoinSourceEvidence,
+    ChainSwapAction, ChainSwapExecutionAction, ChainSwapExecutionGate, EvidenceQuality,
     LiquidLockEvidence, LiquidPathEvidence, MerchantTransactionEvidence, ProviderStatusEvidence,
     RenegotiationEvidence,
 };
@@ -47,7 +48,8 @@ use crate::chain_swap_runtime::{
     ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
 };
 use crate::chain_swap_runtime_evidence::{
-    collect_pending_expiry_evidence_under_lock, CollectedPendingExpiryEvidence,
+    collect_chain_claim_execution_evidence_under_lock, collect_pending_expiry_evidence_under_lock,
+    CollectedPendingExpiryEvidence,
 };
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
@@ -2167,6 +2169,7 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
 }
 
 struct ClaimAttemptContext<'a> {
+    state: &'a AppState,
     pool: &'a sqlx::PgPool,
     claim_clients: Option<&'a LiquidClaimClientFactory>,
     boltz_url: &'a str,
@@ -2179,6 +2182,7 @@ struct ClaimAttemptContext<'a> {
 impl<'a> ClaimAttemptContext<'a> {
     fn from_state(state: &'a AppState) -> Self {
         Self {
+            state,
             pool: &state.db,
             claim_clients: state.liquid_claim_client_factory.as_deref(),
             boltz_url: &state.config.boltz.api_url,
@@ -2199,13 +2203,8 @@ async fn try_claim_chain_swap_with_retry(
         .liquid_construction_decision_now(FeeConstructionPurpose::ChainLiquidClaim)
         .ok();
     match claim_chain_swap(
-        context.pool,
+        context.state,
         swap.id,
-        context.claim_clients,
-        context.boltz_url,
-        context.max_claim_attempts,
-        context.utxo_backend,
-        context.tolerances,
         fee_decision.as_ref().map(|(decision, _)| decision),
         fee_decision.as_ref().map(|(_, record)| record),
     )
@@ -2224,6 +2223,14 @@ async fn try_claim_chain_swap_with_retry(
                 swap_id = %swap.boltz_swap_id,
                 reason,
                 "webhook chain-swap claim remains pending"
+            );
+        }
+        Ok(ClaimOutcome::EvidenceBlocked { action }) => {
+            tracing::info!(
+                event = "chain_swap_claim_evidence_deferred",
+                swap_id = %swap.boltz_swap_id,
+                ?action,
+                "fresh evidence returned the claim to shared observation/dispatch"
             );
         }
         Err(e) => {
@@ -2251,6 +2258,10 @@ pub enum ClaimOutcome {
     /// No accepted live or recent same-rail Liquid fee decision exists. No
     /// bytes or retry-failure state were written; a later sweep may retry.
     PendingFeeUnavailable { reason: &'static str },
+    /// Fresh under-lock chain/journal facts no longer authorize ClaimLiquid.
+    /// This is an observation/dispatcher outcome, not a failed claim attempt;
+    /// no construction, journal, broadcast-start, or network mutation ran.
+    EvidenceBlocked { action: ChainSwapAction },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2367,6 +2378,12 @@ async fn try_claim_with_retry(swap: &db::SwapRecord, context: ClaimAttemptContex
                 swap_id = %swap.boltz_swap_id,
                 reason,
                 "webhook reverse-swap claim remains pending"
+            );
+        }
+        Ok(ClaimOutcome::EvidenceBlocked { action }) => {
+            tracing::warn!(
+                ?action,
+                "reverse claim unexpectedly received a chain-swap evidence outcome"
             );
         }
         Err(e) => {
@@ -3165,26 +3182,22 @@ async fn claim_swap_inner(
 
 #[allow(clippy::too_many_arguments)]
 async fn claim_chain_swap(
-    pool: &sqlx::PgPool,
+    state: &AppState,
     chain_swap_id: Uuid,
-    claim_clients: Option<&LiquidClaimClientFactory>,
-    boltz_url: &str,
-    max_claim_attempts: i32,
-    utxo_backend: Option<&Arc<dyn UtxoBackend>>,
-    tolerances: db::InvoiceAccountingTolerances,
     fee_decision: Option<&LiquidFeeDecision>,
     fee_record: Option<&FeeDecisionRecord>,
 ) -> Result<ClaimOutcome, AppError> {
     claim_chain_swap_with_guard(
-        pool,
+        &state.db,
         chain_swap_id,
-        claim_clients,
-        boltz_url,
-        max_claim_attempts,
-        utxo_backend,
-        tolerances,
+        state.liquid_claim_client_factory.as_deref(),
+        &state.config.boltz.api_url,
+        state.config.claim.max_claim_attempts,
+        state.utxo_backend.as_ref(),
+        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
         fee_decision,
         fee_record,
+        Some(state),
         false,
     )
     .await
@@ -3197,18 +3210,7 @@ pub(crate) async fn redrive_journaled_chain_claim(
     state: &AppState,
     chain_swap_id: Uuid,
 ) -> Result<ClaimOutcome, AppError> {
-    claim_chain_swap(
-        &state.db,
-        chain_swap_id,
-        state.liquid_claim_client_factory.as_deref(),
-        &state.config.boltz.api_url,
-        state.config.claim.max_claim_attempts,
-        state.utxo_backend.as_ref(),
-        db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting),
-        None,
-        None,
-    )
-    .await
+    claim_chain_swap(state, chain_swap_id, None, None).await
 }
 
 /// Constrained-pool integration seam for chain claims. The persisted provider
@@ -3236,6 +3238,7 @@ pub async fn exercise_chain_claim_with_malformed_response(
         db::InvoiceAccountingTolerances::default(),
         Some(fee_decision),
         Some(&fee_record),
+        None,
         true,
     )
     .await
@@ -3256,6 +3259,7 @@ pub async fn exercise_chain_claim_without_fee(
         20,
         None,
         db::InvoiceAccountingTolerances::default(),
+        None,
         None,
         None,
         false,
@@ -3283,6 +3287,7 @@ pub async fn exercise_journaled_chain_claim_retry(
         db::InvoiceAccountingTolerances::default(),
         None,
         None,
+        None,
         false,
     )
     .await
@@ -3299,6 +3304,7 @@ async fn claim_chain_swap_with_guard(
     tolerances: db::InvoiceAccountingTolerances,
     fee_decision: Option<&LiquidFeeDecision>,
     fee_record: Option<&FeeDecisionRecord>,
+    evidence_state: Option<&AppState>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     let result = claim_chain_swap_inner(
@@ -3310,6 +3316,7 @@ async fn claim_chain_swap_with_guard(
         tolerances,
         fee_decision,
         fee_record,
+        evidence_state,
         require_malformed_response,
     )
     .await;
@@ -3641,6 +3648,7 @@ async fn claim_chain_swap_inner(
     _tolerances: db::InvoiceAccountingTolerances,
     fee_decision: Option<&LiquidFeeDecision>,
     fee_record: Option<&FeeDecisionRecord>,
+    evidence_state: Option<&AppState>,
     require_malformed_response: bool,
 ) -> Result<ClaimOutcome, AppError> {
     let mut tx = pool
@@ -3705,6 +3713,21 @@ async fn claim_chain_swap_inner(
         return Ok(ClaimOutcome::PendingFeeUnavailable {
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
         });
+    }
+    if status != ChainSwapStatus::Claimed {
+        if let Some(state) = evidence_state {
+            let collected =
+                collect_chain_claim_execution_evidence_under_lock(state, &mut tx, &swap).await?;
+            if let ChainSwapExecutionGate::Blocked(action) = recheck_chain_swap_execution_under_lock(
+                ChainSwapExecutionAction::ClaimLiquid,
+                &collected.evidence,
+            ) {
+                tx.commit()
+                    .await
+                    .map_err(|error| AppError::DbError(error.to_string()))?;
+                return Ok(ClaimOutcome::EvidenceBlocked { action });
+            }
+        }
     }
     let persisted_claim_tx = if journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact {
         let claim_tx_hex = swap
@@ -4030,46 +4053,115 @@ async fn claim_chain_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    // As on the reverse path, only bytes reloaded from the committed journal
-    // may reach the broadcaster. The expected serialization detects any
-    // disagreement between the locked preparation and the post-commit row,
-    // including witness-only changes that do not alter the txid.
+    // Only bytes reloaded from the committed journal may reach the broadcaster.
+    // Production then reacquires the same advisory lock, reloads the row, and
+    // recollects every reducer fact. The durable broadcast-start transition is
+    // committed in that transaction, leaving no unlocked database interval
+    // between the second authorization and the network call.
     let expected_hex = serialize_claim_tx_hex(&claim_tx)?;
-    let claim_tx = reload_chain_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
-
+    let claim_tx = if let Some(state) = evidence_state {
+        let mut broadcast_tx = pool
+            .begin()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .execute(&mut *broadcast_tx)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        let current = db::get_chain_swap_by_id_for_update(&mut *broadcast_tx, swap.id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?
+            .ok_or_else(|| {
+                AppError::ClaimError(format!(
+                    "chain swap {} disappeared before claim broadcast",
+                    swap.id
+                ))
+            })?;
+        let committed = validate_reloaded_liquid_claim(
+            "chain",
+            &expected_hex,
+            current.claim_txid.as_deref(),
+            current.claim_tx_hex.as_deref(),
+        )?;
+        let collected =
+            collect_chain_claim_execution_evidence_under_lock(state, &mut broadcast_tx, &current)
+                .await?;
+        if let ChainSwapExecutionGate::Blocked(action) = recheck_chain_swap_execution_under_lock(
+            ChainSwapExecutionAction::ClaimLiquid,
+            &collected.evidence,
+        ) {
+            broadcast_tx
+                .commit()
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            return Ok(ClaimOutcome::EvidenceBlocked { action });
+        }
+        let txid = btc_like_txid(&committed);
+        let disposition = db::mark_liquid_merchant_settlement_broadcast_started_locked(
+            &mut broadcast_tx,
+            swap.id,
+            &txid,
+            "liquid_claim",
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!(
+                "start Liquid merchant settlement broadcast: {error}"
+            ))
+        })?;
+        broadcast_tx
+            .commit()
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+        match disposition {
+            db::LiquidMerchantSettlementBroadcastStartDisposition::Started => {}
+            db::LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled => {
+                tracing::info!(
+                    event = "chain_claim_broadcast_start_already_settled",
+                    swap_id = %swap.boltz_swap_id,
+                    txid = %txid,
+                    "exact Liquid claim settled before broadcast start; skipping network call"
+                );
+                return Ok(ClaimOutcome::AlreadyTerminal);
+            }
+            db::LiquidMerchantSettlementBroadcastStartDisposition::Superseded => {
+                tracing::info!(
+                    event = "chain_claim_broadcast_start_superseded",
+                    swap_id = %swap.boltz_swap_id,
+                    txid = %txid,
+                    "another worker superseded the prepared Liquid claim; skipping network call"
+                );
+                return Ok(ClaimOutcome::SkippedLockHeld);
+            }
+        }
+        committed
+    } else {
+        let committed = reload_chain_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
+        let txid = btc_like_txid(&committed);
+        match db::mark_liquid_merchant_settlement_broadcast_started(
+            pool,
+            swap.id,
+            &txid,
+            "liquid_claim",
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!(
+                "start Liquid merchant settlement broadcast: {error}"
+            ))
+        })? {
+            db::LiquidMerchantSettlementBroadcastStartDisposition::Started => {}
+            db::LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled => {
+                return Ok(ClaimOutcome::AlreadyTerminal)
+            }
+            db::LiquidMerchantSettlementBroadcastStartDisposition::Superseded => {
+                return Ok(ClaimOutcome::SkippedLockHeld)
+            }
+        }
+        committed
+    };
     let txid = btc_like_txid(&claim_tx);
-    match db::mark_liquid_merchant_settlement_broadcast_started(
-        pool,
-        swap.id,
-        &txid,
-        "liquid_claim",
-    )
-    .await
-    .map_err(|error| {
-        AppError::DbError(format!(
-            "start Liquid merchant settlement broadcast: {error}"
-        ))
-    })? {
-        db::LiquidMerchantSettlementBroadcastStartDisposition::Started => {}
-        db::LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled => {
-            tracing::info!(
-                event = "chain_claim_broadcast_start_already_settled",
-                swap_id = %swap.boltz_swap_id,
-                txid = %txid,
-                "exact Liquid claim settled before broadcast start; skipping network call"
-            );
-            return Ok(ClaimOutcome::AlreadyTerminal);
-        }
-        db::LiquidMerchantSettlementBroadcastStartDisposition::Superseded => {
-            tracing::info!(
-                event = "chain_claim_broadcast_start_superseded",
-                swap_id = %swap.boltz_swap_id,
-                txid = %txid,
-                "another worker superseded the prepared Liquid claim; skipping network call"
-            );
-            return Ok(ClaimOutcome::SkippedLockHeld);
-        }
-    }
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let broadcast_result = match chain_client.try_broadcast_tx(&claim_tx).await {
@@ -4974,6 +5066,7 @@ pub struct BackgroundClaimerDependencies {
     claim_clients: Option<Arc<LiquidClaimClientFactory>>,
     utxo_backend: Option<Arc<dyn UtxoBackend>>,
     fee_runtime: Arc<FeeRuntime>,
+    chain_evidence_state: AppState,
     cancel: CancellationToken,
 }
 
@@ -4984,6 +5077,7 @@ impl BackgroundClaimerDependencies {
         claim_clients: Option<Arc<LiquidClaimClientFactory>>,
         utxo_backend: Option<Arc<dyn UtxoBackend>>,
         fee_runtime: Arc<FeeRuntime>,
+        chain_evidence_state: AppState,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -4992,6 +5086,7 @@ impl BackgroundClaimerDependencies {
             claim_clients,
             utxo_backend,
             fee_runtime,
+            chain_evidence_state,
             cancel,
         }
     }
@@ -5019,6 +5114,7 @@ pub fn spawn_background_claimer(
         claim_clients,
         utxo_backend,
         fee_runtime,
+        chain_evidence_state,
         cancel,
     } = dependencies;
     let BackgroundClaimerReporters {
@@ -5137,6 +5233,12 @@ pub fn spawn_background_claimer(
                                         "background claimer: reverse swap remains pending"
                                     );
                                 }
+                                Ok(ClaimOutcome::EvidenceBlocked { action }) => {
+                                    tracing::warn!(
+                                        ?action,
+                                        "reverse claimer unexpectedly received chain evidence"
+                                    );
+                                }
                                 Err(e) => {
                                     health.observe_error(&e);
                                     tracing::warn!(
@@ -5176,13 +5278,8 @@ pub fn spawn_background_claimer(
                                 )
                                 .ok();
                             match claim_chain_swap(
-                                &pool,
+                                &chain_evidence_state,
                                 swap.id,
-                                claim_clients.as_deref(),
-                                &config.boltz.api_url,
-                                config.claim.max_claim_attempts,
-                                utxo_backend.as_ref(),
-                                db::InvoiceAccountingTolerances::from(&config.invoice_accounting),
                                 fee_decision.as_ref().map(|(decision, _)| decision),
                                 fee_decision.as_ref().map(|(_, record)| record),
                             )
@@ -5211,6 +5308,14 @@ pub fn spawn_background_claimer(
                                         swap_id = %swap.boltz_swap_id,
                                         reason,
                                         "background claimer: chain swap remains pending"
+                                    );
+                                }
+                                Ok(ClaimOutcome::EvidenceBlocked { action }) => {
+                                    tracing::info!(
+                                        event = "chain_swap_claim_evidence_deferred",
+                                        swap_id = %swap.boltz_swap_id,
+                                        ?action,
+                                        "background claim returned to shared observation/dispatch"
                                     );
                                 }
                                 Err(e) => {
