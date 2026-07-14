@@ -1536,6 +1536,33 @@ async fn commit_claim_preparation_error<T>(
     Err(error)
 }
 
+/// Persist the one-way chain cooperative-refusal fact in the same locked
+/// preparation transaction, then return the original provider/local error.
+/// Both the live construction arm and its guarded no-network test seam use
+/// this boundary so retry bookkeeping can never run before the flag commits.
+async fn commit_chain_cooperative_refusal<T>(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_swap_id: Uuid,
+    boltz_swap_id: &str,
+    error: AppError,
+) -> Result<T, AppError> {
+    tracing::warn!(
+        event = "chain_swap_cooperative_refused_runtime",
+        swap_id = %boltz_swap_id,
+        error = %error,
+        "boltz refused cooperative chain claim; flipping cooperative_refused for next sweep"
+    );
+    let updated = db::mark_chain_swap_cooperative_refused(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
+    if updated != 1 {
+        return Err(AppError::DbError(
+            "chain cooperative-refusal transition did not update one active swap".into(),
+        ));
+    }
+    commit_claim_preparation_error(tx, error).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_swap_inner(
     pool: &sqlx::PgPool,
@@ -2492,10 +2519,24 @@ async fn claim_chain_swap_inner(
     } else {
         None
     };
-    let boltz_response: CreateChainResponse = serde_json::from_str(&swap.boltz_response_json)
-        .map_err(|error| {
-            AppError::ClaimError(format!("invalid chain boltz response json: {error}"))
-        })?;
+    let boltz_response: CreateChainResponse = match serde_json::from_str(&swap.boltz_response_json)
+    {
+        Ok(response) => response,
+        Err(parse_error) => {
+            let error =
+                AppError::ClaimError(format!("invalid chain boltz response json: {parse_error}"));
+            // The guarded seam accepts only malformed persisted evidence
+            // and performs no provider or chain I/O. A known refusal phrase
+            // lets it exercise the exact durable transition used by the
+            // live construction arm. Production never classifies corrupt
+            // persisted JSON as provider authority.
+            if require_malformed_response && is_cooperative_refusal(&error) {
+                return commit_chain_cooperative_refusal(tx, swap.id, &swap.boltz_swap_id, error)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     // Malformed persisted provider evidence remains diagnosable without a
     // chain backend, but every valid claim path must have authoritative source
     // evidence before invoice loading, transaction construction, or a provider
@@ -2573,16 +2614,7 @@ async fn claim_chain_swap_inner(
         {
             Ok(t) => t,
             Err(e) if use_cooperative && is_cooperative_refusal(&e) => {
-                tracing::warn!(
-                    event = "chain_swap_cooperative_refused_runtime",
-                    swap_id = %swap.boltz_swap_id,
-                    error = %e,
-                    "boltz refused cooperative chain claim; flipping cooperative_refused for next sweep"
-                );
-                db::mark_chain_swap_cooperative_refused(&mut *tx, swap.id)
-                    .await
-                    .map_err(|db_error| AppError::DbError(db_error.to_string()))?;
-                return commit_claim_preparation_error(tx, e).await;
+                return commit_chain_cooperative_refusal(tx, swap.id, &swap.boltz_swap_id, e).await;
             }
             Err(e) => return commit_claim_preparation_error(tx, e).await,
         };
@@ -2617,7 +2649,8 @@ async fn claim_chain_swap_inner(
             PersistedChainClaimJournalMode::DecodeAndLoadExact => None,
         },
     };
-    let journal_disposition = if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert {
+    let journal_disposition = if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert
+    {
         let fee_record = new_journal.fee_authority.ok_or_else(|| {
             AppError::ClaimError("unjournaled chain claim is missing fee authority".into())
         })?;

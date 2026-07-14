@@ -5611,7 +5611,9 @@ async fn chain_cooperative_refusal_commits_with_one_connection() {
         3_600,
     )
     .await;
-    // Same deterministic local classifier trigger as the reverse refusal test.
+    // Same deterministic classifier phrase as the reverse test. The guarded
+    // chain seam refuses valid provider evidence and network I/O; its malformed
+    // packet reaches the shared durable-refusal boundary only in test mode.
     let swap_id = seed_claimable_chain_pool_swap(
         &admin,
         invoice.id,
@@ -16354,9 +16356,27 @@ async fn persisted_liquid_claim_without_journal_fails_real_retry_before_broadcas
     let merchant_blinding_key = invoice.liquid_blinding_key_hex.as_deref().unwrap();
     let (claim_tx_hex, claim_txid, backend) =
         persisted_liquid_claim_fixture(&response, merchant_address, merchant_blinding_key);
+    // This fixture deliberately omits only the immutable transaction journal.
+    // The parent bytes still carry a complete, valid Review-25 authority
+    // packet; otherwise migration 054 correctly rejects the setup before the
+    // missing-journal retry boundary can be exercised.
     sqlx::query(
-        "UPDATE chain_swap_records SET status = 'claiming', claim_tx_hex = $2, \
-             claim_txid = $3 WHERE id = $1",
+        "UPDATE chain_swap_records \
+         SET status = 'claiming', claim_tx_hex = $2, claim_txid = $3, \
+             claim_actual_fee_sat = 100, claim_actual_fee_rate_sat_vb = 1.5, \
+             claim_fee_decision_purpose = 'chain_liquid_claim', \
+             claim_fee_decision_rail = 'liquid', claim_fee_decision_target = '1', \
+             claim_fee_decision_source = 'liquid_live', \
+             claim_fee_decision_rate_sat_vb = 1.5, \
+             claim_fee_decision_quoted_at_unix = 1700000100, \
+             claim_fee_decision_evaluated_at_unix = 1700000105, \
+             claim_fee_decision_freshness_age_secs = 5, \
+             claim_fee_decision_freshness_max_age_secs = 60, \
+             claim_fee_decision_provenance = 'integration-test-liquid-live', \
+             claim_fee_decision_policy_floor_sat_vb = 0.1, \
+             claim_fee_decision_policy_cap_sat_vb = 10.0, \
+             claim_fee_decision_policy_version = 'review25-v1' \
+         WHERE id = $1",
     )
     .bind(swap.id)
     .bind(&claim_tx_hex)
@@ -20089,9 +20109,7 @@ impl AtomicManifestPersistenceFixture {
                     liquid_network: &terms.liquid_network,
                     liquid_asset_id: &terms.liquid_asset_id,
                     merchant_liquid_destination: &terms.merchant_liquid_destination,
-                    merchant_emergency_btc_address: terms
-                        .merchant_emergency_btc_address
-                        .as_deref(),
+                    merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
                 },
                 recovery_address_commitment_id: terms.recovery_address_commitment_id,
             },
@@ -21447,6 +21465,8 @@ async fn issue84_chain_invoice(
 ) -> pay_service::db::Invoice {
     let liquid_address =
         pay_service::descriptor::derive_address(TEST_DESCRIPTOR, liquid_address_index).unwrap();
+    let liquid_blinding_key_hex =
+        pay_service::descriptor::derive_blinding_key_hex(TEST_DESCRIPTOR, &liquid_address).unwrap();
     pay_service::db::insert_invoice(
         pool,
         &pay_service::db::NewInvoice {
@@ -21468,7 +21488,7 @@ async fn issue84_chain_invoice(
             accept_liquid: true,
             bitcoin_address: None,
             liquid_address: Some(&liquid_address),
-            liquid_blinding_key_hex: Some("11".repeat(32).as_str()),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
             expires_in_secs: 3_600,
         },
     )
@@ -21524,8 +21544,7 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
     .unwrap();
     assert!(mismatched.is_none());
 
-    invoice.npub_owner =
-        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
+    invoice.npub_owner = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into();
     let recipient_mismatched = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
         Some(nym),
@@ -22950,14 +22969,9 @@ fn invoice_route_manifest_runtime(
 
 async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
     let npub = create_test_user(pool, nym).await;
-    let recovery_address_commitment_id = insert_test_recovery_commitment(
-        pool,
-        &npub,
-        ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
-        1,
-        0x88,
-    )
-    .await;
+    let recovery_address_commitment_id =
+        insert_test_recovery_commitment(pool, &npub, ATOMIC_MANIFEST_EMERGENCY_ADDRESS, 1, 0x88)
+            .await;
     pay_service::db::upsert_donation_page(
         pool,
         &pay_service::db::UpsertDonationPage {
