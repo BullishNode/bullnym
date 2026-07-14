@@ -737,22 +737,15 @@ async fn execute_journaled_recovery_with_builder_fee(
         }
     }
 
-    let started_token = attempt
-        .state_token_after_broadcast_started()
-        .ok_or_else(|| {
-            AppError::DbError(
-                "recovery attempt cannot produce a durable broadcast-start token".into(),
-            )
-        })?;
-    let started = db::mark_recovery_broadcast_started(pool, attempt.id)
+    let started_token = db::mark_recovery_broadcast_started(pool, attempt.id)
         .await
-        .map_err(|e| AppError::DbError(e.to_string()))?;
-    if started != 1 {
-        return Err(AppError::ClaimError(format!(
-            "recovery attempt {} is not broadcastable (status {})",
-            attempt.id, attempt.status
-        )));
-    }
+        .map_err(|e| AppError::DbError(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::ClaimError(format!(
+                "recovery attempt {} is not broadcastable (status {})",
+                attempt.id, attempt.status
+            ))
+        })?;
     faults.check(RecoveryFaultPoint::AfterBroadcastAttemptCommit)?;
 
     let broadcast_result = broadcaster
@@ -1354,7 +1347,7 @@ async fn reconcile_after_broadcast_error(
         }
         Ok(EvidenceDecision::Unspent) => {
             let result = format!("broadcast outcome ambiguous: {error_text}");
-            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
+            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, started_token, &result)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             // Preserve the broadcaster's typed failure scope after the
@@ -1366,7 +1359,7 @@ async fn reconcile_after_broadcast_error(
             let result = format!(
                 "broadcast outcome ambiguous: {error_text}; evidence unavailable: {evidence_error}"
             );
-            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, &result)
+            db::mark_recovery_broadcast_ambiguous(pool, attempt.id, started_token, &result)
                 .await
                 .map_err(|e| AppError::DbError(e.to_string()))?;
             // Evidence is now the strongest reason the outcome cannot be

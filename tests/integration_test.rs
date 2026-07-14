@@ -17120,11 +17120,11 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             .unwrap();
         assert_eq!(final_attempt.status, "broadcast");
         assert_eq!(final_attempt.raw_tx_hex, harness.expected_raw_hex);
-        assert_eq!(
+        assert!(
             pay_service::db::mark_recovery_broadcast_started(&pool, final_attempt.id)
                 .await
-                .unwrap(),
-            1,
+                .unwrap()
+                .is_some(),
             "fault {point:?} left a broadcast attempt that could not redrive"
         );
         let restarted = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
@@ -17568,6 +17568,75 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
     assert_eq!(calls[0], harness.expected_raw_hex);
     assert_eq!(calls[1], harness.expected_raw_hex);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn recovery_ambiguity_result_rejects_a_stale_broadcast_start_token() {
+    use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "stalebroadcast", [FakeBroadcastResult::Reject]).await;
+
+    assert!(execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &harness.fee_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .is_err());
+    let attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stale_token = pay_service::db::mark_recovery_broadcast_started(&pool, attempt.id)
+        .await
+        .unwrap()
+        .expect("ambiguous attempt must remain exactly redrivable");
+    let current_token = pay_service::db::mark_recovery_broadcast_started(&pool, attempt.id)
+        .await
+        .unwrap()
+        .expect("a concurrent exact-byte redrive must receive its own token");
+
+    assert_eq!(
+        pay_service::db::mark_recovery_broadcast_ambiguous(
+            &pool,
+            attempt.id,
+            &stale_token,
+            "stale broadcaster result",
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        pay_service::db::mark_recovery_broadcast_ambiguous(
+            &pool,
+            attempt.id,
+            &current_token,
+            "current broadcaster result",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let current = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.broadcast_attempts, attempt.broadcast_attempts + 2);
+    assert_eq!(
+        current.last_broadcast_result.as_deref(),
+        Some("current broadcaster result")
+    );
+
     cleanup_db(&pool).await;
 }
 

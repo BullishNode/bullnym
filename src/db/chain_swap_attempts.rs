@@ -80,26 +80,6 @@ impl ChainSwapTxAttempt {
             last_broadcast_result: self.last_broadcast_result.clone(),
         }
     }
-
-    pub fn state_token_after_broadcast_started(&self) -> Option<RecoveryAttemptStateToken> {
-        recovery_attempt_state_token_after_broadcast_started(&self.status, self.broadcast_attempts)
-    }
-}
-
-fn recovery_attempt_state_token_after_broadcast_started(
-    status: &str,
-    broadcast_attempts: i32,
-) -> Option<RecoveryAttemptStateToken> {
-    let status = match status {
-        "constructed" | "broadcast_ambiguous" => "broadcast_ambiguous",
-        "broadcast" => "broadcast",
-        _ => return None,
-    };
-    Some(RecoveryAttemptStateToken {
-        status: status.to_owned(),
-        broadcast_attempts: broadcast_attempts.checked_add(1)?,
-        last_broadcast_result: Some("attempt started".to_owned()),
-    })
 }
 
 const ATTEMPT_COLUMNS: &str = "id, chain_swap_id, purpose, raw_tx_hex, txid, source_prevouts, \
@@ -224,11 +204,12 @@ pub async fn get_bitcoin_recovery_attempt_for_update(
 /// Durably record that a broadcast call is about to happen.  A process death
 /// after this commit is deliberately ambiguous, and restart reconciliation
 /// must inspect the expected txid/source outpoints before replaying the same
-/// bytes.
+/// bytes. The returned token is read from the locked, updated row so a worker
+/// cannot predict it from a stale pre-lock snapshot.
 pub async fn mark_recovery_broadcast_started(
     pool: &PgPool,
     attempt_id: Uuid,
-) -> Result<u64, sqlx::Error> {
+) -> Result<Option<RecoveryAttemptStateToken>, sqlx::Error> {
     let chain_swap_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT chain_swap_id FROM chain_swap_tx_attempts \
           WHERE id = $1 AND purpose = 'btc_recovery'",
@@ -237,7 +218,7 @@ pub async fn mark_recovery_broadcast_started(
     .fetch_optional(pool)
     .await?;
     let Some(chain_swap_id) = chain_swap_id else {
-        return Ok(0);
+        return Ok(None);
     };
     let mut tx = pool.begin().await?;
     let parent: Option<(String, Option<String>)> = sqlx::query_as(
@@ -248,7 +229,7 @@ pub async fn mark_recovery_broadcast_started(
     .await?;
     let Some((parent_status, parent_refund_txid)) = parent else {
         tx.rollback().await?;
-        return Ok(0);
+        return Ok(None);
     };
     let attempt: Option<(String, String)> = sqlx::query_as(
         "SELECT status, txid FROM chain_swap_tx_attempts \
@@ -260,7 +241,7 @@ pub async fn mark_recovery_broadcast_started(
     .await?;
     let Some((status, txid)) = attempt else {
         tx.rollback().await?;
-        return Ok(0);
+        return Ok(None);
     };
     let Some(next_status) = recovery_broadcast_start_next_status(
         &parent_status,
@@ -269,9 +250,9 @@ pub async fn mark_recovery_broadcast_started(
         &status,
     ) else {
         tx.rollback().await?;
-        return Ok(0);
+        return Ok(None);
     };
-    let rows = sqlx::query(
+    let updated: Option<(String, i32, Option<String>)> = sqlx::query_as(
         "UPDATE chain_swap_tx_attempts \
             SET status = $3, \
                 broadcast_attempts = broadcast_attempts + 1, \
@@ -280,19 +261,19 @@ pub async fn mark_recovery_broadcast_started(
                 last_broadcast_attempt_at = NOW(), \
                 last_broadcast_result = 'attempt started', \
                 updated_at = NOW() \
-          WHERE id = $1 AND chain_swap_id = $2 AND status = $4",
+          WHERE id = $1 AND chain_swap_id = $2 AND status = $4 \
+          RETURNING status, broadcast_attempts, last_broadcast_result",
     )
     .bind(attempt_id)
     .bind(chain_swap_id)
     .bind(next_status)
     .bind(&status)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if rows != 1 {
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, broadcast_attempts, last_broadcast_result)) = updated else {
         tx.rollback().await?;
-        return Ok(0);
-    }
+        return Ok(None);
+    };
     // The stale-recovery worker keys off the parent timestamp. Delay its next
     // pass after every real broadcast call instead of hot-looping an old
     // `refunding` row once it crosses the age threshold.
@@ -301,7 +282,11 @@ pub async fn mark_recovery_broadcast_started(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(1)
+    Ok(Some(RecoveryAttemptStateToken {
+        status,
+        broadcast_attempts,
+        last_broadcast_result,
+    }))
 }
 
 fn recovery_broadcast_start_next_status(
@@ -327,7 +312,6 @@ fn recovery_broadcast_start_next_status(
 #[cfg(test)]
 mod recovery_broadcast_start_tests {
     use super::{
-        recovery_attempt_state_token_after_broadcast_started,
         recovery_broadcast_completion_disposition, recovery_broadcast_start_next_status,
         recovery_integrity_hold_allowed, RecoveryAttemptStateToken,
         RecoveryBroadcastCompletionDisposition,
@@ -477,27 +461,6 @@ mod recovery_broadcast_start_tests {
 
     #[test]
     fn integrity_hold_requires_the_exact_observed_attempt_token() {
-        for status in ["constructed", "broadcast_ambiguous", "broadcast"] {
-            let token = recovery_attempt_state_token_after_broadcast_started(status, 4).unwrap();
-            let expected_status = if status == "broadcast" {
-                "broadcast"
-            } else {
-                "broadcast_ambiguous"
-            };
-            assert_eq!(token.status, expected_status);
-            assert_eq!(token.broadcast_attempts, 5);
-            assert_eq!(
-                token.last_broadcast_result.as_deref(),
-                Some("attempt started")
-            );
-        }
-        for status in ["confirmed", "finalized", "integrity_hold", "unknown"] {
-            assert!(recovery_attempt_state_token_after_broadcast_started(status, 4).is_none());
-        }
-        assert!(
-            recovery_attempt_state_token_after_broadcast_started("constructed", i32::MAX).is_none()
-        );
-
         let token = RecoveryAttemptStateToken {
             status: "broadcast_ambiguous".to_owned(),
             broadcast_attempts: 5,
@@ -570,21 +533,32 @@ mod recovery_broadcast_start_tests {
     }
 }
 
+/// Record one failed broadcast outcome only while that worker's durable start
+/// token is still current. A later redrive, completion, or integrity hold owns
+/// the row and makes this stale result a no-op.
 pub async fn mark_recovery_broadcast_ambiguous(
     pool: &PgPool,
     attempt_id: Uuid,
+    token: &RecoveryAttemptStateToken,
     result: &str,
 ) -> Result<u64, sqlx::Error> {
+    if token.status != "broadcast_ambiguous" {
+        return Ok(0);
+    }
     let result = sqlx::query(
         "UPDATE chain_swap_tx_attempts \
             SET status = 'broadcast_ambiguous', \
                 last_broadcast_result = $2, \
                 updated_at = NOW() \
           WHERE id = $1 \
-            AND status IN ('constructed', 'broadcast_ambiguous')",
+            AND status = $3 AND broadcast_attempts = $4 \
+            AND last_broadcast_result IS NOT DISTINCT FROM $5",
     )
     .bind(attempt_id)
     .bind(result)
+    .bind(&token.status)
+    .bind(token.broadcast_attempts)
+    .bind(token.last_broadcast_result.as_deref())
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
