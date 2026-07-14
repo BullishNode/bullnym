@@ -686,7 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // gives up after ~5 min) by querying state directly.
         let _reverse_reconciler_task = reconciler::spawn(
             pool.clone(),
-            config.boltz.api_url.clone(),
+            state.boltz.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
             state

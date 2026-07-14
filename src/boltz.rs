@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::{hash160, Hash};
@@ -10,15 +11,16 @@ use bitcoin::{Address, AddressType, Network, ScriptBuf};
 use boltz_client::bitcoin::secp256k1::Keypair;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
 use boltz_client::swaps::boltz::{
-    BoltzApiClientV2, ChainPair, ChainSwapStates, CreateChainRequest, CreateChainResponse,
-    CreateReverseRequest, CreateReverseResponse, GetQuoteResponse, HeightResponse, Leaf,
-    RevSwapStates, Side, Webhook,
+    ChainPair, ChainSwapStates, CreateChainRequest, CreateChainResponse, CreateReverseRequest,
+    CreateReverseResponse, GetQuoteResponse, GetSwapResponse, HeightResponse, Leaf, RevSwapStates,
+    Side, Webhook,
 };
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::{BtcSwapScript, LBtcSwapScript, PublicKey};
 use lightning_invoice::Bolt11Invoice;
 use sha2::{Digest, Sha256};
 
+use crate::boltz_transport::{BoltzQuoteMethod, BoltzTransport, HttpBoltzTransport};
 use crate::error::AppError;
 
 pub struct SwapResult {
@@ -576,9 +578,7 @@ impl DerivedSwapKey {
 }
 
 pub struct BoltzService {
-    api: Option<BoltzApiClientV2>,
-    quote_api_url: Option<String>,
-    quote_http_client: Option<reqwest::Client>,
+    transport: Option<Arc<dyn BoltzTransport>>,
     swap_master_key: SwapMasterKey,
     webhook_url: Option<String>,
     provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime,
@@ -593,23 +593,10 @@ impl BoltzService {
         swap_master_key: SwapMasterKey,
         webhook_url: Option<String>,
     ) -> Self {
-        let quote_http_client = crate::config::valid_http_endpoint(boltz_url)
-            .then(|| reqwest::Client::builder().build().ok())
-            .flatten();
-        let api = quote_http_client.clone().map(|client| {
-            // Bound request-path Boltz calls: Boltz normally answers in
-            // <2s, so a 10s ceiling fails fast with a clean error when
-            // Boltz hangs instead of blocking past nginx's timeout.
-            BoltzApiClientV2::with_client(
-                boltz_url.to_string(),
-                client,
-                Some(std::time::Duration::from_secs(10)),
-            )
-        });
+        let transport = HttpBoltzTransport::try_new(boltz_url)
+            .map(|transport| Arc::new(transport) as Arc<dyn BoltzTransport>);
         Self {
-            api,
-            quote_api_url: quote_http_client.as_ref().map(|_| boltz_url.to_string()),
-            quote_http_client,
+            transport,
             swap_master_key,
             webhook_url,
             provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime::new(),
@@ -618,7 +605,24 @@ impl BoltzService {
     }
 
     pub fn client_ready(&self) -> bool {
-        self.api.is_some()
+        self.transport.is_some()
+    }
+
+    /// Construct the production service with a deterministic transport while
+    /// retaining the same key derivation, breaker, and provider-limit logic.
+    #[doc(hidden)]
+    pub fn with_transport_for_integration_tests(
+        swap_master_key: SwapMasterKey,
+        webhook_url: Option<String>,
+        transport: Arc<dyn BoltzTransport>,
+    ) -> Self {
+        Self {
+            transport: Some(transport),
+            swap_master_key,
+            webhook_url,
+            provider_limits: crate::provider_limits_runtime::ProviderLimitsRuntime::new(),
+            breaker: crate::boltz_breaker::BoltzBreaker::default(),
+        }
     }
 
     /// Shared provider-limit reader. Calls on this value are in-memory only.
@@ -633,10 +637,7 @@ impl BoltzService {
         &self,
         swap_id: &str,
     ) -> Result<FreshChainSwapProviderHint, AppError> {
-        let api = self.api.as_ref().ok_or_else(|| {
-            AppError::BoltzError("Boltz client unavailable for chain-swap evidence".to_string())
-        })?;
-        let swap = api.get_swap(swap_id).await.map_err(|error| {
+        let swap = self.get_swap(swap_id).await.map_err(|error| {
             AppError::BoltzError(format!("fetch fresh chain-swap status: {error}"))
         })?;
         Ok(FreshChainSwapProviderHint {
@@ -648,10 +649,11 @@ impl BoltzService {
     async fn fetch_btc_to_lbtc_reverse_pair(
         &self,
     ) -> Result<Option<boltz_client::swaps::boltz::ReversePair>, ()> {
-        let Some(api) = self.api.as_ref() else {
+        let Some(transport) = self.transport.as_deref() else {
             return Err(());
         };
-        api.get_reverse_pairs()
+        transport
+            .get_reverse_pairs()
             .await
             .map(|pairs| pairs.get_btc_to_lbtc_pair())
             .map_err(|_| ())
@@ -696,10 +698,23 @@ impl BoltzService {
         self.breaker.snapshot()
     }
 
-    fn api(&self) -> Result<&BoltzApiClientV2, AppError> {
-        self.api
-            .as_ref()
+    fn transport(&self) -> Result<&dyn BoltzTransport, AppError> {
+        self.transport
+            .as_deref()
             .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))
+    }
+
+    /// Read one provider swap through the same boundary used for creation.
+    pub async fn get_swap(
+        &self,
+        swap_id: &str,
+    ) -> Result<GetSwapResponse, boltz_client::error::Error> {
+        let Some(transport) = self.transport.as_deref() else {
+            return Err(boltz_client::error::Error::Generic(
+                "Boltz client is unavailable".to_string(),
+            ));
+        };
+        transport.get_swap(swap_id).await
     }
 
     /// Stable, non-secret identifier of the master seed behind this service's
@@ -774,7 +789,7 @@ impl BoltzService {
         };
 
         let response: CreateReverseResponse = {
-            let provider_result = self.api()?.post_reverse_req(request).await;
+            let provider_result = self.transport()?.create_reverse(request).await;
             self.breaker.record(
                 provider_result
                     .as_ref()
@@ -963,7 +978,7 @@ impl BoltzService {
         // Pin the exact fee/limit quote before creation. Boltz rejects the
         // request if that quote changes between these calls, so no payer can
         // receive an address priced against stale terms.
-        let pairs_result = self.api()?.get_chain_pairs().await;
+        let pairs_result = self.transport()?.get_chain_pairs().await;
         self.breaker.record(
             pairs_result
                 .as_ref()
@@ -978,7 +993,7 @@ impl BoltzService {
         // Heights are captured before the mutating request and bound the
         // timeout-order validation. A block arriving during the request only
         // makes the resulting windows more conservative by one block.
-        let heights_result = self.api()?.get_height().await;
+        let heights_result = self.transport()?.get_height().await;
         self.breaker.record(
             heights_result
                 .as_ref()
@@ -1027,7 +1042,7 @@ impl BoltzService {
         };
 
         let response: CreateChainResponse = {
-            let provider_result = self.api()?.post_chain_req(request).await;
+            let provider_result = self.transport()?.create_chain(request).await;
             self.breaker.record(
                 provider_result
                     .as_ref()
@@ -1073,7 +1088,7 @@ impl BoltzService {
         swap_id: &str,
     ) -> Result<ChainSwapQuote, ChainSwapQuoteProviderError> {
         let body = self
-            .chain_swap_quote_request(reqwest::Method::GET, swap_id, None)
+            .chain_swap_quote_request(swap_id, BoltzQuoteMethod::Get)
             .await?;
         let response: serde_json::Value =
             serde_json::from_str(&body).map_err(|_| ChainSwapQuoteProviderError {
@@ -1111,67 +1126,32 @@ impl BoltzService {
         amount_sat: u64,
     ) -> Result<String, ChainSwapQuoteProviderError> {
         let body = self
-            .chain_swap_quote_request(
-                reqwest::Method::POST,
-                swap_id,
-                Some(serde_json::json!({ "amount": amount_sat })),
-            )
+            .chain_swap_quote_request(swap_id, BoltzQuoteMethod::Accept { amount_sat })
             .await?;
         parse_chain_swap_quote_acceptance_response(&body)
     }
 
     async fn chain_swap_quote_request(
         &self,
-        method: reqwest::Method,
         swap_id: &str,
-        body: Option<serde_json::Value>,
+        method: BoltzQuoteMethod,
     ) -> Result<String, ChainSwapQuoteProviderError> {
-        let client = self
-            .quote_http_client
-            .as_ref()
-            .ok_or(ChainSwapQuoteProviderError {
-                kind: ChainSwapQuoteProviderErrorKind::Transport,
-                terminal_evidence_sha256: None,
-            })?;
-        let base_url = self
-            .quote_api_url
+        let transport = self
+            .transport
             .as_deref()
             .ok_or(ChainSwapQuoteProviderError {
                 kind: ChainSwapQuoteProviderErrorKind::Transport,
                 terminal_evidence_sha256: None,
             })?;
-        let url = format!(
-            "{}/swap/chain/{}/quote",
-            base_url.trim_end_matches('/'),
-            swap_id
-        );
-        let mut request = client
-            .request(method, url)
-            .timeout(std::time::Duration::from_secs(10));
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ChainSwapQuoteProviderError {
-                kind: if error.is_timeout() {
-                    ChainSwapQuoteProviderErrorKind::Timeout
-                } else {
-                    ChainSwapQuoteProviderErrorKind::Transport
-                },
+        let response = transport.quote_request(swap_id, method).await?;
+        let status = reqwest::StatusCode::from_u16(response.status).map_err(|_| {
+            ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::MalformedResponse,
                 terminal_evidence_sha256: None,
-            })?;
-        let status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .map_err(|_| ChainSwapQuoteProviderError {
-                kind: ChainSwapQuoteProviderErrorKind::Transport,
-                terminal_evidence_sha256: None,
-            })?;
+            }
+        })?;
         if status.is_success() {
-            return Ok(response_body);
+            return Ok(response.body);
         }
         let error = if status.is_server_error() {
             ChainSwapQuoteProviderError {
@@ -1179,7 +1159,7 @@ impl BoltzService {
                 terminal_evidence_sha256: None,
             }
         } else {
-            classify_chain_swap_quote_protocol_error(&response_body).unwrap_or(
+            classify_chain_swap_quote_protocol_error(&response.body).unwrap_or(
                 ChainSwapQuoteProviderError {
                     kind: ChainSwapQuoteProviderErrorKind::UnknownProviderOutcome,
                     terminal_evidence_sha256: None,
@@ -1833,7 +1813,7 @@ mod tests {
             let key = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
             let invalid = BoltzService::new(url, key, None);
             assert!(!invalid.client_ready(), "accepted {url}");
-            assert!(invalid.api().is_err());
+            assert!(invalid.transport().is_err());
             assert!(invalid.derivation_root_fingerprint().is_ok());
         }
     }

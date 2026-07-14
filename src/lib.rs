@@ -4,6 +4,7 @@ pub mod bitcoin_fee_adapter;
 pub mod bitcoin_watcher;
 pub mod boltz;
 pub mod boltz_breaker;
+pub mod boltz_transport;
 pub mod boltz_restore;
 pub mod boltz_restore_fetch;
 pub mod builder_fee;
