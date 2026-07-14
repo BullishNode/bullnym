@@ -214,7 +214,57 @@ where
 mod tests {
     use std::error::Error as _;
 
+    use crate::admission::{
+        Dependency, MoneyAdmission, ProviderRecoveryConsistencyTransitionV1, Rail, ReasonCode,
+    };
+    use crate::recovery_shadow_audit::{
+        RecoveryShadowBoltzReportV1, RecoveryShadowCoverageV1,
+        RecoveryShadowLineageClassificationsV1, RecoveryShadowLocalReportV1,
+        RecoveryShadowProviderLocalHighWaterRelationV1,
+    };
+
     use super::*;
+
+    fn exact_empty_fact() -> StartupProviderReconciliationFactV1 {
+        StartupProviderReconciliationFactV1 {
+            report: RecoveryShadowReportV1 {
+                manifest_count: 0,
+                manifest_lineage_count: 0,
+                manifest_max_child_index: None,
+                provider_local_high_water_relation:
+                    RecoveryShadowProviderLocalHighWaterRelationV1::BothEmpty,
+                boltz: RecoveryShadowBoltzReportV1 {
+                    validated_record_count: 0,
+                    chain_record_count: 0,
+                    reverse_record_count: 0,
+                    provider_only_chain_record_count: 0,
+                    provider_max_child_index: None,
+                    coverage: RecoveryShadowCoverageV1::Exact,
+                },
+                local: RecoveryShadowLocalReportV1 {
+                    local_record_count: 0,
+                    exact_match_count: 0,
+                    manifest_only_record_count: 0,
+                    local_only_record_count: 0,
+                    local_lineage_count: 0,
+                    local_max_child_index: None,
+                    lineage_classifications: RecoveryShadowLineageClassificationsV1::default(),
+                    coverage: RecoveryShadowCoverageV1::Exact,
+                },
+                classification: RecoveryShadowClassificationV1::Consistent,
+            },
+            chain_witness: StartupChainLockupWitnessReportV1 {
+                manifest_count: 0,
+                observation_count: 0,
+                missing_manifest_count: 0,
+                unconfirmed_manifest_count: 0,
+                confirmed_manifest_count: 0,
+                spent_manifest_count: 0,
+                conflicting_manifest_count: 0,
+            },
+            repaired_obligation_count: 0,
+        }
+    }
 
     #[test]
     fn public_errors_are_fixed_bounded_and_source_free() {
@@ -304,5 +354,46 @@ mod tests {
             RecoveryShadowClassificationV1::DifferencesClassified,
             complete_non_conflicting,
         ));
+    }
+
+    #[test]
+    fn authenticated_reconciliation_is_the_only_transition_that_opens_provider_recovery() {
+        let admission = MoneyAdmission::healthy_test_fixture();
+
+        let failed = admission.apply_provider_recovery_reconciliation_v1(Err(
+            StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
+        ));
+        assert_eq!(failed, ProviderRecoveryConsistencyTransitionV1::Unsafe);
+        let closed = admission.decision(Rail::BitcoinChain);
+        assert!(!closed.allowed());
+        assert!(closed.reasons.iter().any(|reason| {
+            reason.dependency == Dependency::ProviderRecoveryConsistency
+                && reason.code == ReasonCode::Unsafe
+        }));
+
+        let exact = admission.apply_provider_recovery_reconciliation_v1(Ok(exact_empty_fact()));
+        assert_eq!(exact, ProviderRecoveryConsistencyTransitionV1::Safe);
+        assert!(admission.decision(Rail::BitcoinChain).allowed());
+    }
+
+    #[test]
+    fn classified_or_chain_disagreement_can_only_transition_to_unsafe() {
+        let admission = MoneyAdmission::healthy_test_fixture();
+
+        let mut classified = exact_empty_fact();
+        classified.report.classification = RecoveryShadowClassificationV1::DifferencesClassified;
+        assert_eq!(
+            admission.apply_provider_recovery_reconciliation_v1(Ok(classified)),
+            ProviderRecoveryConsistencyTransitionV1::Unsafe
+        );
+        assert!(!admission.decision(Rail::BitcoinChain).allowed());
+
+        let mut chain_conflict = exact_empty_fact();
+        chain_conflict.chain_witness.conflicting_manifest_count = 1;
+        assert_eq!(
+            admission.apply_provider_recovery_reconciliation_v1(Ok(chain_conflict)),
+            ProviderRecoveryConsistencyTransitionV1::Unsafe
+        );
+        assert!(!admission.decision(Rail::BitcoinChain).allowed());
     }
 }
