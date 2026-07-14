@@ -15103,11 +15103,11 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     };
     use pay_service::db::ChainSwapRenegotiationStoreError;
 
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-    let npub = create_test_user(&pool, "renegotiationjournal").await;
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "renegotiationjournal").await;
     let invoice = insert_test_invoice(
-        &pool,
+        &admin,
         "renegotiationjournal",
         &npub,
         "lq1renegotiationjournal",
@@ -15115,7 +15115,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     )
     .await;
     let row = record_pre_050_chain_fixture(
-        &pool,
+        &admin,
         &pay_service::db::NewChainSwapRecord {
             claim_key_index: None,
             refund_key_index: None,
@@ -15150,7 +15150,22 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     )
     .unwrap();
 
-    let quoted = pay_service::db::persist_quoted_chain_swap_renegotiation(&pool, &identity)
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
+
+    let quoted = pay_service::db::persist_quoted_chain_swap_renegotiation(&runtime, &identity)
         .await
         .unwrap();
     assert_eq!(quoted.state, RenegotiationState::Quoted);
@@ -15158,7 +15173,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
 
     // Crash before intent commit: the transaction-local request vanishes and
     // a new process still observes the exact retryable quote.
-    let mut before_intent = pool.begin().await.unwrap();
+    let mut before_intent = runtime.begin().await.unwrap();
     let staged_state: String = sqlx::query_scalar(
         "UPDATE chain_swap_renegotiation_operations \
             SET state = 'accept_requested', accept_attempt_count = 1, \
@@ -15171,7 +15186,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     .unwrap();
     assert_eq!(staged_state, "accept_requested");
     before_intent.rollback().await.unwrap();
-    let after_before_intent_crash = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+    let after_before_intent_crash = pay_service::db::get_chain_swap_renegotiation(&runtime, row.id)
         .await
         .unwrap()
         .unwrap();
@@ -15180,16 +15195,17 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
 
     // The typed adapter commits the intent before any external accept is
     // permitted. A restart and an exact retry retain that durable fact.
-    let requested = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
-        .await
-        .unwrap();
+    let requested =
+        pay_service::db::request_chain_swap_renegotiation_accept(&runtime, &identity, 1)
+            .await
+            .unwrap();
     assert_eq!(requested.disposition, TransitionDisposition::Apply);
     assert_eq!(
         requested.operation.state,
         RenegotiationState::AcceptRequested
     );
     assert_eq!(requested.operation.version, 2);
-    let restarted_requested = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+    let restarted_requested = pay_service::db::get_chain_swap_renegotiation(&runtime, row.id)
         .await
         .unwrap()
         .unwrap();
@@ -15198,14 +15214,14 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
         RenegotiationState::AcceptRequested
     );
     let request_retry =
-        pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
+        pay_service::db::request_chain_swap_renegotiation_accept(&runtime, &identity, 1)
             .await
             .unwrap();
     assert_eq!(request_retry.disposition, TransitionDisposition::ExactRetry);
     assert_eq!(request_retry.operation.version, 2);
 
     let ambiguous = pay_service::db::mark_chain_swap_renegotiation_ambiguous(
-        &pool,
+        &runtime,
         &identity,
         2,
         RenegotiationErrorClass::Transport,
@@ -15215,7 +15231,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     assert_eq!(ambiguous.operation.state, RenegotiationState::Ambiguous);
     assert_eq!(ambiguous.operation.version, 3);
     let false_decline = pay_service::db::mark_chain_swap_renegotiation_declined(
-        &pool,
+        &runtime,
         &identity,
         3,
         "cc".repeat(32),
@@ -15230,7 +15246,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
         })
     ));
 
-    let redriven = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 3)
+    let redriven = pay_service::db::request_chain_swap_renegotiation_accept(&runtime, &identity, 3)
         .await
         .unwrap();
     assert_eq!(
@@ -15246,7 +15262,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
 
     // Crash after provider response but before result commit: rollback leaves
     // the durable request unresolved, so fallback/decline is still blocked.
-    let mut before_result = pool.begin().await.unwrap();
+    let mut before_result = runtime.begin().await.unwrap();
     let staged_terminal: String = sqlx::query_scalar(
         "UPDATE chain_swap_renegotiation_operations \
             SET state = 'accepted', terminal_response_digest = $2, \
@@ -15260,7 +15276,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     .unwrap();
     assert_eq!(staged_terminal, "accepted");
     before_result.rollback().await.unwrap();
-    let after_before_result_crash = pay_service::db::get_chain_swap_renegotiation(&pool, row.id)
+    let after_before_result_crash = pay_service::db::get_chain_swap_renegotiation(&runtime, row.id)
         .await
         .unwrap()
         .unwrap();
@@ -15274,7 +15290,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
         .is_none());
 
     let accepted = pay_service::db::mark_chain_swap_renegotiation_accepted(
-        &pool,
+        &runtime,
         &identity,
         4,
         "dd".repeat(32),
@@ -15284,7 +15300,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     assert_eq!(accepted.operation.state, RenegotiationState::Accepted);
     assert_eq!(accepted.operation.version, 5);
     let accepted_retry = pay_service::db::mark_chain_swap_renegotiation_accepted(
-        &pool,
+        &runtime,
         &identity,
         4,
         "dd".repeat(32),
@@ -15297,7 +15313,7 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
     );
     assert_eq!(accepted_retry.operation.version, 5);
 
-    let stale = pay_service::db::request_chain_swap_renegotiation_accept(&pool, &identity, 1)
+    let stale = pay_service::db::request_chain_swap_renegotiation_accept(&runtime, &identity, 1)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -15308,7 +15324,8 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
         })
     ));
 
-    cleanup_db(&pool).await;
+    runtime.close().await;
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]
