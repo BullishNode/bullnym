@@ -4,7 +4,9 @@
 //! reconciler may ask the scheduler to evaluate one obligation, but both the
 //! scheduling write and the executor rebuild the complete independent #82
 //! packet while holding `chain-claim:<id>`. `refund_due` is therefore only a
-//! queue marker after a positive decision, never evidence by itself.
+//! queue marker after positive path eligibility, never evidence by itself; a
+//! cooperative path becomes spend authority only after its returned signature
+//! is validated and its exact bytes are journaled.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,8 +43,8 @@ pub enum AutomaticFallbackScheduleOutcome {
     LegacyWithoutRecoveryContract,
 }
 
-/// Rebuild #82 evidence and publish a queue marker only after an exact positive
-/// automatic-recovery decision. No provider status or retry counter enters the
+/// Rebuild #82 evidence and publish a queue marker only after an exact path is
+/// eligible for construction. No provider status or retry counter enters the
 /// decision, and no transaction construction happens in this function.
 pub async fn schedule_automatic_fallback(
     state: &AppState,
@@ -135,7 +137,7 @@ pub async fn schedule_automatic_fallback(
             .map_err(|error| AppError::DbError(error.to_string()))?;
         return Ok(AutomaticFallbackScheduleOutcome::IntegrityHold);
     }
-    if !collected.authorizes_automatic_recovery() {
+    if collected.automatic_construction_path().is_none() {
         tx.commit()
             .await
             .map_err(|error| AppError::DbError(error.to_string()))?;

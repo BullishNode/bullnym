@@ -581,6 +581,16 @@ impl fmt::Debug for AutomaticFallbackSource {
 
 /// Complete automatic-fallback packet assembled inside the shared per-swap
 /// lock. Secret/address material has explicit accessors and redacted Debug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticFallbackConstructionPath {
+    /// A provider-assisted Taproot key-path refund. The returned signature is
+    /// still validated locally and the exact final bytes must be journaled
+    /// before broadcast.
+    Cooperative,
+    /// The immutable refund-leaf path, available only at/after timeout.
+    Unilateral,
+}
+
 #[derive(Clone)]
 pub struct CollectedAutomaticFallbackEvidence {
     pub evidence: ChainSwapEvidence,
@@ -607,19 +617,54 @@ impl CollectedAutomaticFallbackEvidence {
         self.dependencies_available
     }
 
+    /// Select the only construction path that may be attempted from this
+    /// complete packet. Before timeout, provider availability cannot be known
+    /// without requesting a partial signature, so we mechanically ask whether
+    /// a *successfully validated* cooperative signature would make the shared
+    /// reducer authorize recovery. A failed or ambiguous request never changes
+    /// this evidence and therefore remains Observe. At timeout the provider is
+    /// removed from the decision and only the unilateral path is selected.
+    pub fn automatic_construction_path(&self) -> Option<AutomaticFallbackConstructionPath> {
+        if !self.dependencies_available
+            || self.committed_destination.is_none()
+            || self.bitcoin_timeout_height.is_none()
+            // Phase 5C requires one journaled attempt per source outpoint.
+            // The current live executor has one parent-level attempt slot, so
+            // fail closed instead of letting boltz-client aggregate multiple
+            // payer fundings that happen to share the same swap script.
+            || self.exact_sources.len() != 1
+        {
+            return None;
+        }
+
+        match self.evidence.bitcoin_timeout {
+            BitcoinTimeoutEvidence::Reached => matches!(
+                recheck_recovery_under_lock(&self.evidence),
+                RecoveryExecutionGate::Authorized
+            )
+            .then_some(AutomaticFallbackConstructionPath::Unilateral),
+            BitcoinTimeoutEvidence::BeforeTimeout => {
+                if self.evidence.cooperative_recovery == CooperativeRecoveryEvidence::Unavailable {
+                    return None;
+                }
+                let mut signed_cooperatively = self.evidence;
+                signed_cooperatively.cooperative_recovery = CooperativeRecoveryEvidence::Available;
+                matches!(
+                    recheck_recovery_under_lock(&signed_cooperatively),
+                    RecoveryExecutionGate::Authorized
+                )
+                .then_some(AutomaticFallbackConstructionPath::Cooperative)
+            }
+            BitcoinTimeoutEvidence::Unknown => None,
+        }
+    }
+
     /// Mechanical shape check in addition to the shared #82 reducer gate.
     /// The reducer chooses the rail; this check proves the executor also has
     /// one concrete immutable destination, timeout, and exact primary input
     /// set before construction can be called.
     pub fn authorizes_automatic_recovery(&self) -> bool {
-        matches!(
-            recheck_recovery_under_lock(&self.evidence),
-            RecoveryExecutionGate::Authorized
-        ) && self.dependencies_available
-            && self.evidence.bitcoin_timeout == BitcoinTimeoutEvidence::Reached
-            && self.committed_destination.is_some()
-            && self.bitcoin_timeout_height.is_some()
-            && !self.exact_sources.is_empty()
+        self.automatic_construction_path() == Some(AutomaticFallbackConstructionPath::Unilateral)
     }
 }
 
@@ -2148,6 +2193,22 @@ mod tests {
             dependencies_available: true,
         };
         assert!(packet.authorizes_automatic_recovery());
+        assert_eq!(
+            packet.automatic_construction_path(),
+            Some(AutomaticFallbackConstructionPath::Unilateral)
+        );
+
+        packet.evidence.bitcoin_timeout = BitcoinTimeoutEvidence::BeforeTimeout;
+        assert!(!packet.authorizes_automatic_recovery());
+        assert_eq!(
+            packet.automatic_construction_path(),
+            Some(AutomaticFallbackConstructionPath::Cooperative),
+            "a validated provider signature is the remaining positive fact before timeout"
+        );
+        packet.evidence.cooperative_recovery = CooperativeRecoveryEvidence::Unavailable;
+        assert_eq!(packet.automatic_construction_path(), None);
+        packet.evidence.bitcoin_timeout = BitcoinTimeoutEvidence::Reached;
+        packet.evidence.cooperative_recovery = CooperativeRecoveryEvidence::Unknown;
 
         packet.exact_sources.clear();
         assert!(!packet.authorizes_automatic_recovery());
@@ -2155,6 +2216,16 @@ mod tests {
             txid: "11".repeat(32),
             vout: 0,
         });
+        packet.exact_sources.push(AutomaticFallbackSource {
+            txid: "22".repeat(32),
+            vout: 1,
+        });
+        assert_eq!(
+            packet.automatic_construction_path(),
+            None,
+            "multiple source outpoints must fail before construction can reach a provider"
+        );
+        packet.exact_sources.pop();
         packet.evidence.renegotiation = RenegotiationEvidence::Ambiguous;
         assert!(!packet.authorizes_automatic_recovery());
         packet.evidence.renegotiation = RenegotiationEvidence::NotRequired;
