@@ -1031,15 +1031,15 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
             Some(db::ChainSwapProviderStatusInput::ServerLockConfirmed)
         }
         // Locally pending `swap.expired` observations are intercepted before
-        // this mapper and reduced from independently assembled evidence. The
-        // remaining funded branches retain the existing script-claim hint in
-        // this narrow integration slice.
+        // this mapper and reduced from independently assembled evidence. Raw
+        // expiry/failure/refund statuses remain hints for every other branch;
+        // they cannot authorize `refund_due` without the shared evidence gate.
         // 0-conf rejection is NOT a failure: Boltz just wants a confirmation
         // before proceeding, then the swap continues normally. Treat it as a
         // (re)sighting of the user lockup in the mempool — previously this was
         // terminalized as `lockup_failed`, killing a payment that would settle.
         "transaction.zeroconf.rejected" => Some(db::ChainSwapProviderStatusInput::UserLockMempool),
-        "swap.expired" => Some(db::ChainSwapProviderStatusInput::SwapExpired),
+        "swap.expired" => Some(db::ChainSwapProviderStatusInput::Observe),
         // Renegotiation runs before a lockup-failure observation can authorize
         // recovery, so the first atomic fold is read-only. An explicit decline
         // is folded as FundingFailed afterward.
@@ -1047,7 +1047,7 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
             Some(db::ChainSwapProviderStatusInput::Observe)
         }
         "transaction.failed" | "transaction.refunded" => {
-            Some(db::ChainSwapProviderStatusInput::FundingFailed)
+            Some(db::ChainSwapProviderStatusInput::Observe)
         }
         _ => None,
     }

@@ -837,11 +837,10 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
 #[test]
 fn chain_swap_expired_is_not_terminal() {
     // Locally pending expiry is intercepted by the shared evidence reducer.
-    // Funded branches retain this non-terminal script-claim hint in the narrow
-    // runtime slice so an observed server lock remains claim-eligible.
+    // Every other branch treats the raw status as a non-authoritative hint.
     assert_eq!(
         chain_swap_provider_input("swap.expired"),
-        Some(db::ChainSwapProviderStatusInput::SwapExpired)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
 }
 
@@ -859,7 +858,7 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
     );
     assert_eq!(
         chain_swap_provider_input("transaction.refunded"),
-        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
     assert_eq!(
         chain_swap_provider_input("transaction.lockupFailed"),
@@ -867,7 +866,7 @@ fn chain_swap_status_mapping_feeds_the_shared_transition() {
     );
     assert_eq!(
         chain_swap_provider_input("transaction.failed"),
-        Some(db::ChainSwapProviderStatusInput::FundingFailed)
+        Some(db::ChainSwapProviderStatusInput::Observe)
     );
 }
 

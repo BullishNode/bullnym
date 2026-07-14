@@ -62,12 +62,13 @@ pub enum ChainSwapProviderStatusInput {
     UserLockConfirmed,
     ServerLockMempool,
     ServerLockConfirmed,
-    /// Boltz's wall-clock expiry hint. A funded user lock becomes recoverable;
-    /// a still-viable Liquid path only switches permanently to script claim.
+    /// Boltz's wall-clock expiry hint. This is never recovery authority and
+    /// cannot change a persisted branch without independently assembled chain
+    /// evidence passing the shared action gate.
     SwapExpired,
-    /// Provider evidence that the normal server-lock creation failed. Combined
-    /// with a locally observed user lock this can make the row recoverable, but
-    /// it must never overwrite a server lock or in-flight/finished settlement.
+    /// Legacy failure hint retained for compatibility with focused callers.
+    /// It is non-authoritative and cannot mutate the branch; complete runtime
+    /// evidence must pass through the shared action reducer instead.
     FundingFailed,
 }
 
@@ -128,27 +129,6 @@ fn reduce_chain_swap_provider_status(
     input: ChainSwapProviderStatusInput,
 ) -> ChainSwapProviderDecision {
     if let Some(observed) = provider_progress_status(input) {
-        if cooperative_refused
-            && matches!(
-                current,
-                ChainSwapStatus::Pending
-                    | ChainSwapStatus::UserLockMempool
-                    | ChainSwapStatus::UserLockConfirmed
-            )
-            && matches!(
-                observed,
-                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed
-            )
-        {
-            // A concrete funding failure can arrive before local payer-lock
-            // evidence. The one-way failure fact is not recovery authority by
-            // itself, but it combines with a later user lock exactly as the
-            // opposite delivery order does.
-            return ChainSwapProviderDecision {
-                status: ChainSwapStatus::RefundDue,
-                cooperative_refused,
-            };
-        }
         let status = match (
             provider_progress_rank(current),
             provider_progress_rank(observed),
@@ -175,69 +155,13 @@ fn reduce_chain_swap_provider_status(
     }
 
     match input {
-        ChainSwapProviderStatusInput::SwapExpired => match current {
-            ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
-                ChainSwapProviderDecision {
-                    status: ChainSwapStatus::RefundDue,
-                    // Preserve the expiry fact even if a late server lock
-                    // subsequently revokes recovery eligibility.
-                    cooperative_refused: true,
-                }
-            }
-            // Pending provider expiry is not independent chain evidence and
-            // must remain a true no-op even if this fold is called directly.
-            ChainSwapStatus::Pending => ChainSwapProviderDecision {
-                status: current,
-                cooperative_refused,
-            },
-            ChainSwapStatus::ServerLockMempool
-            | ChainSwapStatus::ServerLockConfirmed
-            | ChainSwapStatus::Claiming
-            | ChainSwapStatus::ClaimFailed => ChainSwapProviderDecision {
-                status: current,
-                cooperative_refused: true,
-            },
-            ChainSwapStatus::Claimed
-            | ChainSwapStatus::ClaimStuck
-            | ChainSwapStatus::Expired
-            | ChainSwapStatus::LockupFailed
-            | ChainSwapStatus::Refunded
-            | ChainSwapStatus::RefundDue
-            | ChainSwapStatus::Refunding => ChainSwapProviderDecision {
-                status: current,
-                cooperative_refused,
-            },
-        },
-        ChainSwapProviderStatusInput::FundingFailed => match current {
-            ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
-                ChainSwapProviderDecision {
-                    status: ChainSwapStatus::RefundDue,
-                    cooperative_refused: true,
-                }
-            }
-            // Provider failure alone is not proof that the payer funded the
-            // Bitcoin lock. Pending remains pending, while the one-way fact is
-            // retained so later local user-lock evidence can combine with it.
-            ChainSwapStatus::Pending => ChainSwapProviderDecision {
-                status: current,
-                cooperative_refused: true,
-            },
-            ChainSwapStatus::ServerLockMempool
-            | ChainSwapStatus::ServerLockConfirmed
-            | ChainSwapStatus::Claiming
-            | ChainSwapStatus::Claimed
-            | ChainSwapStatus::ClaimFailed
-            | ChainSwapStatus::ClaimStuck
-            | ChainSwapStatus::Expired
-            | ChainSwapStatus::LockupFailed
-            | ChainSwapStatus::Refunded
-            | ChainSwapStatus::RefundDue
-            | ChainSwapStatus::Refunding => ChainSwapProviderDecision {
-                status: current,
-                cooperative_refused,
-            },
-        },
-        ChainSwapProviderStatusInput::Observe => ChainSwapProviderDecision {
+        ChainSwapProviderStatusInput::SwapExpired
+        | ChainSwapProviderStatusInput::FundingFailed
+        | ChainSwapProviderStatusInput::Observe => ChainSwapProviderDecision {
+            // Provider lifecycle and failure observations are never recovery
+            // authority. They cannot prove that the Liquid route is dead,
+            // authorize Bitcoin recovery, or set a durable refusal fact. The
+            // shared complete-evidence reducer owns those decisions.
             status: current,
             cooperative_refused,
         },
@@ -342,56 +266,32 @@ mod provider_transition_tests {
     }
 
     #[test]
-    fn expiry_preserves_liquid_progress_and_only_recovers_user_lock_states() {
+    fn expiry_hint_never_changes_a_persisted_branch_or_refusal_fact() {
         for &current in ALL_STATUSES {
             let decision = reduce_chain_swap_provider_status(
                 current,
                 false,
                 ChainSwapProviderStatusInput::SwapExpired,
             );
-            let (expected_status, expected_refused) = match current {
-                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
-                    (ChainSwapStatus::RefundDue, true)
-                }
-                ChainSwapStatus::Pending => (current, false),
-                ChainSwapStatus::ServerLockMempool
-                | ChainSwapStatus::ServerLockConfirmed
-                | ChainSwapStatus::Claiming
-                | ChainSwapStatus::ClaimFailed => (current, true),
-                ChainSwapStatus::Claimed
-                | ChainSwapStatus::ClaimStuck
-                | ChainSwapStatus::Expired
-                | ChainSwapStatus::LockupFailed
-                | ChainSwapStatus::Refunded
-                | ChainSwapStatus::RefundDue
-                | ChainSwapStatus::Refunding => (current, false),
-            };
             assert_eq!(
                 (decision.status, decision.cooperative_refused),
-                (expected_status, expected_refused),
+                (current, false),
                 "current={current:?}"
             );
         }
     }
 
     #[test]
-    fn failure_evidence_cannot_overwrite_server_or_resolution_branches() {
+    fn provider_failure_hint_never_changes_a_persisted_branch_or_refusal_fact() {
         for &current in ALL_STATUSES {
             let decision = reduce_chain_swap_provider_status(
                 current,
                 false,
                 ChainSwapProviderStatusInput::FundingFailed,
             );
-            let (expected_status, expected_refused) = match current {
-                ChainSwapStatus::UserLockMempool | ChainSwapStatus::UserLockConfirmed => {
-                    (ChainSwapStatus::RefundDue, true)
-                }
-                ChainSwapStatus::Pending => (current, true),
-                _ => (current, false),
-            };
             assert_eq!(
                 (decision.status, decision.cooperative_refused),
-                (expected_status, expected_refused),
+                (current, false),
                 "current={current:?}"
             );
         }
@@ -399,16 +299,9 @@ mod provider_transition_tests {
 
     #[test]
     fn late_server_lock_revokes_unstarted_recovery_and_reenters_claim_path() {
-        let failed = reduce_chain_swap_provider_status(
-            ChainSwapStatus::UserLockConfirmed,
-            false,
-            ChainSwapProviderStatusInput::FundingFailed,
-        );
-        assert_eq!(failed.status, ChainSwapStatus::RefundDue);
-
         let late_server_lock = reduce_chain_swap_provider_status(
-            failed.status,
-            failed.cooperative_refused,
+            ChainSwapStatus::RefundDue,
+            false,
             ChainSwapProviderStatusInput::ServerLockConfirmed,
         );
         assert_eq!(
@@ -429,12 +322,12 @@ mod provider_transition_tests {
     }
 
     #[test]
-    fn early_funding_failure_combines_with_later_user_lock_in_either_order() {
+    fn provider_failure_hint_never_combines_with_later_user_lock() {
         let failure = ChainSwapProviderStatusInput::FundingFailed;
         let failure_first =
             reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, failure);
         assert_eq!(failure_first.status, ChainSwapStatus::Pending);
-        assert!(failure_first.cooperative_refused);
+        assert!(!failure_first.cooperative_refused);
         assert_eq!(
             reduce_chain_swap_provider_status(
                 failure_first.status,
@@ -462,12 +355,12 @@ mod provider_transition_tests {
         );
 
         assert_eq!(user_after, failure_after);
-        assert_eq!(user_after.status, ChainSwapStatus::RefundDue);
-        assert!(user_after.cooperative_refused);
+        assert_eq!(user_after.status, ChainSwapStatus::UserLockConfirmed);
+        assert!(!user_after.cooperative_refused);
     }
 
     #[test]
-    fn pending_expiry_is_not_recovery_authority() {
+    fn expiry_is_not_recovery_authority_before_or_after_funding() {
         let expiry = ChainSwapProviderStatusInput::SwapExpired;
         let expiry_first =
             reduce_chain_swap_provider_status(ChainSwapStatus::Pending, false, expiry);
@@ -504,10 +397,11 @@ mod provider_transition_tests {
         assert_eq!(user_after.status, ChainSwapStatus::UserLockConfirmed);
         assert!(!user_after.cooperative_refused);
 
-        // Keep the funded branch unchanged in this narrow integration slice.
+        // A later funded observation still does not turn the old provider hint
+        // into recovery authority.
         let expiry_after_user = reduce_chain_swap_provider_status(user_after.status, false, expiry);
-        assert_eq!(expiry_after_user.status, ChainSwapStatus::RefundDue);
-        assert!(expiry_after_user.cooperative_refused);
+        assert_eq!(expiry_after_user.status, ChainSwapStatus::UserLockConfirmed);
+        assert!(!expiry_after_user.cooperative_refused);
     }
 }
 

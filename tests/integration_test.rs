@@ -6012,10 +6012,9 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .await
     .unwrap();
 
-    // A provider failure while still pending is not local proof of payer
-    // funding and cannot make Bitcoin recovery eligible. Keep the one-way
-    // failure fact so a later user-lock observation converges with the
-    // opposite delivery order.
+    // A provider failure while still pending is only a hint. It cannot make
+    // Bitcoin recovery eligible or leave a refusal fact that later combines
+    // with a user-lock observation.
     let pending_failure = pay_service::db::apply_chain_swap_provider_status(
         &pool,
         row.id,
@@ -6028,8 +6027,8 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
         pending_failure.current_status,
         pay_service::db::ChainSwapStatus::Pending
     );
-    assert!(pending_failure.changed);
-    assert!(pending_failure.cooperative_refused);
+    assert!(!pending_failure.changed);
+    assert!(!pending_failure.cooperative_refused);
     let failure_updated_at: i64 = sqlx::query_scalar(
         "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
          FROM chain_swap_records WHERE id = $1",
@@ -6038,7 +6037,7 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_ne!(failure_updated_at, initial_updated_at);
+    assert_eq!(failure_updated_at, initial_updated_at);
 
     let duplicate_failure = pay_service::db::apply_chain_swap_provider_status(
         &pool,
@@ -6069,7 +6068,7 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .unwrap();
     assert_eq!(
         user_after_failure.current_status,
-        pay_service::db::ChainSwapStatus::RefundDue
+        pay_service::db::ChainSwapStatus::UserLockConfirmed
     );
 
     sqlx::query(
@@ -6098,8 +6097,10 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .unwrap();
     assert_eq!(
         failed_after_user.current_status,
-        pay_service::db::ChainSwapStatus::RefundDue
+        pay_service::db::ChainSwapStatus::UserLockConfirmed
     );
+    assert!(!failed_after_user.changed);
+    assert!(!failed_after_user.cooperative_refused);
 
     sqlx::query(
         "UPDATE chain_swap_records \
@@ -6172,11 +6173,13 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
     .unwrap();
     assert_eq!(
         expiry_after_user.current_status,
-        pay_service::db::ChainSwapStatus::RefundDue
+        pay_service::db::ChainSwapStatus::UserLockMempool
     );
+    assert!(!expiry_after_user.changed);
+    assert!(!expiry_after_user.cooperative_refused);
 
-    // A late valid server lock revokes an unstarted recovery branch and
-    // returns the swap to the normal Liquid claim path.
+    // A later valid server lock advances the still-live normal Liquid path;
+    // the earlier provider expiry hint created no recovery branch to revoke.
     let late_server = pay_service::db::apply_chain_swap_provider_status(
         &pool,
         row.id,
@@ -6253,7 +6256,7 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
 }
 
 #[tokio::test]
-async fn issue30_user_lock_projection_converges_after_failure_in_either_order() {
+async fn issue82_provider_failure_hint_never_authorizes_recovery_in_either_order() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -6326,7 +6329,7 @@ async fn issue30_user_lock_projection_converges_after_failure_in_either_order() 
             .unwrap()
             .unwrap();
         assert_eq!(pending_failure.status, "pending", "{failure_status}");
-        assert!(pending_failure.cooperative_refused, "{failure_status}");
+        assert!(!pending_failure.cooperative_refused, "{failure_status}");
         let not_yet_funded = pay_service::db::get_invoice_by_id(&pool, invoice.id)
             .await
             .unwrap()
@@ -6358,7 +6361,10 @@ async fn issue30_user_lock_projection_converges_after_failure_in_either_order() 
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(failure_first_final.status, "refund_due", "{failure_status}");
+        assert_eq!(
+            failure_first_final.status, "user_lock_confirmed",
+            "{failure_status}"
+        );
         let failure_first_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
             .await
             .unwrap()
@@ -6472,7 +6478,10 @@ async fn issue30_user_lock_projection_converges_after_failure_in_either_order() 
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(user_first_final.status, "refund_due", "{failure_status}");
+        assert_eq!(
+            user_first_final.status, "user_lock_confirmed",
+            "{failure_status}"
+        );
         let user_first_invoice = pay_service::db::get_invoice_by_id(&pool, invoice.id)
             .await
             .unwrap()
@@ -6538,14 +6547,16 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
     )
     .await;
     assert_eq!(failed_status, StatusCode::OK);
-    let refund_due = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+    let after_failure_hint = pay_service::db::get_chain_swap_by_id(&pool, row.id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(refund_due.status, "refund_due");
+    assert_eq!(after_failure_hint.status, "user_lock_confirmed");
+    assert!(!after_failure_hint.cooperative_refused);
 
     // Seed the legacy permanent status key: chain correctness must not consult
-    // it, and the late server lock must still revoke recovery + redrive claim.
+    // it, and the late server lock must still advance and redrive the normal
+    // Liquid claim path after a non-authoritative failure hint.
     sqlx::query("INSERT INTO processed_webhook_events (event_id) VALUES ($1)")
         .bind("CHAIN_REDRIVE_1:transaction.server.confirmed")
         .execute(&pool)
