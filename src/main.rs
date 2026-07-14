@@ -837,9 +837,11 @@ fn build_router(state: AppState) -> Router {
     let mut router: Router<AppState> = Router::new()
         .route(
             "/api/v1/recovery-address",
-            put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
-                recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
-            )),
+            get(recovery_address_registration::lookup)
+                .put(recovery_address_registration::register)
+                .layer(DefaultBodyLimit::max(
+                    recovery_address_registration::RECOVERY_ADDRESS_REGISTRATION_BODY_LIMIT_BYTES,
+                )),
         )
         .route(
             "/api/v1/supported-currencies",
