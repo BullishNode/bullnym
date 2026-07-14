@@ -1315,7 +1315,7 @@ mod tests {
     #[test]
     fn readiness_rejects_durable_evidence_from_unconfigured_or_incompatible_sources() {
         let runtime = runtime();
-        let now = 10_000;
+        let now = unix_now().unwrap();
         runtime
             .snapshot
             .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
@@ -1337,6 +1337,14 @@ mod tests {
             .store(true, Ordering::Release);
         runtime.liquid_lkg_authorized.store(true, Ordering::Release);
         assert!(runtime.readiness_at(now).ready());
+        assert!(runtime.bitcoin_decision_now().is_ok());
+        assert!(runtime.liquid_decision_now().is_ok());
+        assert!(runtime
+            .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+            .is_ok());
+        assert!(runtime
+            .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
+            .is_ok());
 
         runtime
             .snapshot
@@ -1348,6 +1356,20 @@ mod tests {
             .unwrap();
         assert!(!runtime.readiness_at(now).bitcoin_ready());
         assert!(runtime.readiness_at(now).liquid_ready());
+        assert_eq!(
+            runtime.bitcoin_decision_now(),
+            Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Bitcoin))
+        );
+        assert_eq!(
+            runtime
+                .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+                .unwrap_err(),
+            FeeRuntimeUnavailable::NotDurable(FeeRail::Bitcoin)
+        );
+        assert!(runtime.liquid_decision_now().is_ok());
+        assert!(runtime
+            .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
+            .is_ok());
 
         runtime
             .snapshot
@@ -1368,6 +1390,20 @@ mod tests {
         assert!(runtime.readiness_at(now).bitcoin_ready());
         assert!(!runtime.readiness_at(now).liquid_ready());
         assert!(!runtime.readiness_at(now).ready());
+        assert!(runtime.bitcoin_decision_now().is_ok());
+        assert!(runtime
+            .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+            .is_ok());
+        assert_eq!(
+            runtime.liquid_decision_now(),
+            Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid))
+        );
+        assert_eq!(
+            runtime
+                .liquid_construction_decision_now(FeeConstructionPurpose::ReverseLiquidClaim)
+                .unwrap_err(),
+            FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid)
+        );
     }
 
     #[tokio::test(start_paused = true)]
