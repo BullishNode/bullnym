@@ -396,7 +396,19 @@ fn runtime_worker_selects_journal_owned_active_and_finalized_paths() {
         MerchantSettlementPath::BitcoinRecovery
     );
 
-    for status in ["pending", "server_lock_confirmed", "claim_stuck"] {
+    for status in ["claim_failed", "claim_stuck"] {
+        let record = settlement_record(SettlementChain::Liquid, status);
+        assert_eq!(
+            merchant_settlement_context_for_record(&record)
+                .unwrap()
+                .unwrap()
+                .path(),
+            MerchantSettlementPath::LiquidClaim,
+            "{status}"
+        );
+    }
+
+    for status in ["pending", "server_lock_confirmed"] {
         let record = settlement_record(SettlementChain::Liquid, status);
         assert!(
             merchant_settlement_context_for_record(&record)
@@ -670,9 +682,15 @@ fn scan_sql_eligibility_ignores_shared_reconciliation_markers() {
 }
 
 #[test]
-fn chain_settlement_scans_revisit_only_checkpoint_owned_terminal_rows() {
+fn chain_settlement_scans_revisit_only_exactly_owned_terminal_rows() {
     assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("c.status = 'claimed'"));
     assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("m.settlement_path = 'liquid_claim'"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("c.status = 'claim_stuck'"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("a.purpose = 'liquid_claim'"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("a.replaces_txid IS NULL"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("a.txid = c.claim_txid"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("a.raw_tx_hex = c.claim_tx_hex"));
+    assert!(db::CHAIN_RECONCILER_ELIGIBILITY_SQL.contains("a.status <> 'integrity_hold'"));
     assert!(db::STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL.contains("c.status = 'refunded'"));
     assert!(db::STALE_REFUNDING_CHAIN_SCAN_ELIGIBILITY_SQL
         .contains("m.settlement_path = 'bitcoin_recovery'"));

@@ -703,7 +703,10 @@ fn merchant_settlement_context_for_record(
         ))
     })?;
     let path = match status {
-        ChainSwapStatus::Claiming | ChainSwapStatus::Claimed => MerchantSettlementPath::LiquidClaim,
+        ChainSwapStatus::Claiming
+        | ChainSwapStatus::Claimed
+        | ChainSwapStatus::ClaimFailed
+        | ChainSwapStatus::ClaimStuck => MerchantSettlementPath::LiquidClaim,
         ChainSwapStatus::Refunding | ChainSwapStatus::Refunded => {
             MerchantSettlementPath::BitcoinRecovery
         }

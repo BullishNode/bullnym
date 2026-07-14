@@ -1619,11 +1619,24 @@ pub async fn list_stale_refunding_chain_swaps(
 /// (`get_ready_to_claim_chain_swaps`, which only covers server-lock/claiming
 /// states), this covers EVERY non-terminal state — including `pending` and
 /// `user_lock_*` — so a chain swap stranded by a dropped Boltz webhook is
-/// re-driven by polling Boltz `get_swap`. Mirrors
-/// `swaps::list_non_terminal_swaps_oldest_first`.
+/// re-driven by polling Boltz `get_swap`. A `claim_stuck` row is revisited only
+/// when its exact parent bytes/txid are backed by the original non-held Liquid
+/// journal, allowing authoritative merchant-output observation without opening
+/// a broad terminal scan. Mirrors `swaps::list_non_terminal_swaps_oldest_first`.
 pub(crate) const CHAIN_RECONCILER_ELIGIBILITY_SQL: &str =
     "WHERE ((c.status NOT IN ('claimed', 'expired', 'lockup_failed', 'refunded', 'claim_stuck') \
              AND c.status <> 'refunding') \
+          OR (c.status = 'claim_stuck' \
+              AND c.claim_txid IS NOT NULL AND c.claim_tx_hex IS NOT NULL \
+              AND EXISTS ( \
+                SELECT 1 FROM chain_swap_tx_attempts a \
+                 WHERE a.chain_swap_id = c.id \
+                   AND a.purpose = 'liquid_claim' \
+                   AND a.replaces_txid IS NULL \
+                   AND a.txid = c.claim_txid \
+                   AND a.raw_tx_hex = c.claim_tx_hex \
+                   AND a.status <> 'integrity_hold' \
+              )) \
           OR (c.status = 'claimed' AND EXISTS ( \
                 SELECT 1 FROM merchant_settlement_checkpoints m \
                  WHERE m.chain_swap_id = c.id \
