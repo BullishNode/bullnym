@@ -43,6 +43,64 @@ const MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL: &str =
                  AND NOT trigger_info.tgisinternal \
                  AND trigger_info.tgenabled IN ('O', 'A') \
           ) \
+    ) \
+    AND EXISTS ( \
+        SELECT 1 \
+          FROM pg_trigger trigger_info \
+          JOIN pg_class relation ON relation.oid = trigger_info.tgrelid \
+          JOIN pg_namespace relation_namespace \
+            ON relation_namespace.oid = relation.relnamespace \
+          JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+          JOIN pg_namespace function_namespace \
+            ON function_namespace.oid = function_info.pronamespace \
+         WHERE relation_namespace.nspname = 'public' \
+           AND function_namespace.nspname = 'public' \
+           AND relation.relname = 'chain_swap_tx_attempts' \
+           AND trigger_info.tgname = 'chain_swap_tx_attempts_require_review25_fee_authority' \
+           AND trigger_info.tgtype = 7 \
+           AND NOT trigger_info.tgisinternal \
+           AND trigger_info.tgenabled IN ('O', 'A') \
+           AND function_info.proname = 'require_review25_bitcoin_attempt_fee_authority' \
+           AND function_info.pronargs = 0 \
+           AND pg_get_functiondef(function_info.oid) LIKE \
+               '%IF NEW.fee_decision_purpose IS NULL THEN%' \
+           AND pg_get_functiondef(function_info.oid) LIKE \
+               '%IF NEW.purpose = ''liquid_claim'' THEN%' \
+           AND pg_get_functiondef(function_info.oid) LIKE \
+               '%parent.claim_fee_decision_policy_version%' \
+    ) \
+    AND NOT EXISTS ( \
+        SELECT 1 \
+          FROM (VALUES \
+              ('fee_decision_purpose'), \
+              ('fee_decision_rail'), \
+              ('fee_decision_target'), \
+              ('fee_decision_source'), \
+              ('fee_decision_rate_sat_vb'), \
+              ('fee_decision_quoted_at_unix'), \
+              ('fee_decision_evaluated_at_unix'), \
+              ('fee_decision_freshness_age_secs'), \
+              ('fee_decision_freshness_max_age_secs'), \
+              ('fee_decision_provenance'), \
+              ('fee_decision_policy_floor_sat_vb'), \
+              ('fee_decision_policy_cap_sat_vb'), \
+              ('fee_decision_policy_version') \
+          ) required(column_name) \
+         WHERE NOT EXISTS ( \
+             SELECT 1 \
+               FROM pg_proc function_info \
+               JOIN pg_namespace function_namespace \
+                 ON function_namespace.oid = function_info.pronamespace \
+              WHERE function_namespace.nspname = 'public' \
+                AND function_info.proname = 'guard_chain_swap_tx_attempt_immutable' \
+                AND function_info.pronargs = 0 \
+                AND position( \
+                    format( \
+                        'NEW.%s IS DISTINCT FROM OLD.%s', \
+                        required.column_name, required.column_name \
+                    ) IN pg_get_functiondef(function_info.oid) \
+                ) > 0 \
+         ) \
     )";
 
 const MERCHANT_SETTLEMENT_PRIVILEGES_SQL: &str =
@@ -1306,6 +1364,47 @@ mod tests {
             assert!(
                 MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(exact_catalog_guard),
                 "missing trigger catalog guard: {exact_catalog_guard}"
+            );
+        }
+        for authority_body_marker in [
+            "IF NEW.fee_decision_purpose IS NULL THEN",
+            "IF NEW.purpose = ''liquid_claim'' THEN",
+            "parent.claim_fee_decision_policy_version",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(authority_body_marker),
+                "missing fee-authority body marker: {authority_body_marker}"
+            );
+        }
+        for immutable_column in [
+            "fee_decision_purpose",
+            "fee_decision_rail",
+            "fee_decision_target",
+            "fee_decision_source",
+            "fee_decision_rate_sat_vb",
+            "fee_decision_quoted_at_unix",
+            "fee_decision_evaluated_at_unix",
+            "fee_decision_freshness_age_secs",
+            "fee_decision_freshness_max_age_secs",
+            "fee_decision_provenance",
+            "fee_decision_policy_floor_sat_vb",
+            "fee_decision_policy_cap_sat_vb",
+            "fee_decision_policy_version",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL
+                    .contains(&format!("('{immutable_column}')")),
+                "missing immutable fee-decision guard: {immutable_column}"
+            );
+        }
+        for immutable_body_guard in [
+            "guard_chain_swap_tx_attempt_immutable",
+            "NEW.%s IS DISTINCT FROM OLD.%s",
+            "pg_get_functiondef(function_info.oid)",
+        ] {
+            assert!(
+                MERCHANT_SETTLEMENT_TRIGGER_INVARIANTS_SQL.contains(immutable_body_guard),
+                "missing immutable function-body guard: {immutable_body_guard}"
             );
         }
 
