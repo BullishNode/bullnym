@@ -356,6 +356,19 @@ the exact late response or become `superseded` at unilateral timeout. The
 generic deploy preflight verifies this boundary and refuses automatic rollback
 across schema 057.
 
+Every generic deployment of a schema-057-or-later artifact also stops the
+current writer before inspecting the cooperative-signing journal. It refuses
+the switch when that protected runtime-role query is unreadable or any row is
+still nonterminal. If candidate verification later fails, automatic rollback
+first stops the candidate writer and repeats the same zero-row check; a
+nonzero or unreadable result leaves the candidate files installed and the
+writer stopped for fix-forward recovery. This ordering closes the race in
+which a candidate could otherwise create a nonce-bound operation after a
+successful count and before its replacement. Deployments ending before schema
+057 retain their existing rollback rules. The specialized hosted-artifact
+schema-057 helper owns the initial production boundary; this generic drain gate
+applies to subsequent schema-057-or-later replacements.
+
 Do not rotate `BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_ID` or
 `BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_HEX`, change the build target
 platform/architecture, or change the pinned `secp256k1` MuSig package while
@@ -365,6 +378,13 @@ with the same protected key, libsecp version, and platform. Drain each row to
 `completed`, `integrity_hold`, or timeout `superseded` using the original
 artifact first; never re-POST an ambiguous request or reuse its nonce with a
 different provider nonce/session.
+
+The zero-nonterminal gate deliberately freezes the entire runtime tuple rather
+than attempting to compare or print individual capabilities: artifact,
+key ID and key material, MuSig/libsecp implementation, and target platform.
+Neither the protected key nor any derived key/artifact fingerprint is emitted
+by the check. Drain with the original artifact before changing any member of
+that tuple.
 
 ## Reproducing a prior artifact
 

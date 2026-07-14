@@ -9,16 +9,27 @@ fail() {
   exit 1
 }
 
-function_source="$(
+guard_source="$(
+  awk '
+    /^require_no_nonterminal_cooperative_operations\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^}$/ { exit }
+  ' "$DEPLOY"
+)"
+[[ "$guard_source" == require_no_nonterminal_cooperative_operations* ]] \
+  || fail "could not extract require_no_nonterminal_cooperative_operations"
+eval "$guard_source"
+
+rollback_source="$(
   awk '
     /^automatic_binary_rollback_allowed\(\) \{/ { capture = 1 }
     capture { print }
     capture && /^}$/ { exit }
   ' "$DEPLOY"
 )"
-[[ "$function_source" == automatic_binary_rollback_allowed* ]] \
+[[ "$rollback_source" == automatic_binary_rollback_allowed* ]] \
   || fail "could not extract automatic_binary_rollback_allowed"
-eval "$function_source"
+eval "$rollback_source"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -39,6 +50,15 @@ build_info_schema_marker() {
 
 direct_transition_history_count() {
   echo 0
+}
+
+cooperative_count=0
+cooperative_query_fails=0
+rollback_writer_stopped=1
+
+cooperative_nonterminal_count() {
+  ((cooperative_query_fails == 0)) || return 1
+  echo "$cooperative_count"
 }
 
 expect_refusal() {
@@ -71,7 +91,59 @@ expect_refusal 055_merchant_settlement_lifecycle 057_chain_swap_cooperative_sign
   'migration 056 is a roll-forward-only renegotiation-intent boundary'
 expect_refusal 056_chain_swap_renegotiation_journal 057_chain_swap_cooperative_signing_operations \
   'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
+rollback_writer_stopped=0
+cooperative_query_fails=1
 expect_allowed 056_chain_swap_renegotiation_journal 056_chain_swap_renegotiation_journal
+rollback_writer_stopped=1
+cooperative_query_fails=0
+cooperative_count=0
 expect_allowed 057_chain_swap_cooperative_signing_operations 057_chain_swap_cooperative_signing_operations
+cooperative_count=1
+expect_refusal 057_chain_swap_cooperative_signing_operations \
+  057_chain_swap_cooperative_signing_operations \
+  'a nonterminal cooperative-signing operation still binds the current runtime'
+cooperative_count=not-a-count
+expect_refusal 057_chain_swap_cooperative_signing_operations \
+  057_chain_swap_cooperative_signing_operations \
+  'cooperative-signing state could not be inspected'
+cooperative_count=0
+cooperative_query_fails=1
+expect_refusal 057_chain_swap_cooperative_signing_operations \
+  057_chain_swap_cooperative_signing_operations \
+  'cooperative-signing state could not be inspected'
+cooperative_query_fails=0
+rollback_writer_stopped=0
+expect_refusal 057_chain_swap_cooperative_signing_operations \
+  057_chain_swap_cooperative_signing_operations \
+  'candidate writer is not proven stopped'
+
+rollback_failure_source="$(
+  awk '
+    /^rollback_on_failure\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^}$/ { exit }
+  ' "$DEPLOY"
+)"
+stop_line="$(grep -n -m1 'systemctl stop payservice' <<<"$rollback_failure_source" | cut -d: -f1)"
+check_line="$(grep -n -m1 'automatic_binary_rollback_allowed' <<<"$rollback_failure_source" | cut -d: -f1)"
+[[ "$stop_line" =~ ^[0-9]+$ && "$check_line" =~ ^[0-9]+$ \
+    && "$stop_line" -lt "$check_line" ]] \
+  || fail "rollback must stop the candidate writer before its compatibility check"
+
+forward_switch_source="$(
+  awk '
+    /^candidate_schema="\$\(build_info_schema_marker / { capture = 1 }
+    capture { print }
+    capture && /^sudo rm -f "\$APP\/pay-service\.prev"$/ { exit }
+  ' "$DEPLOY"
+)"
+[[ "$forward_switch_source" == candidate_schema=* ]] \
+  || fail "could not extract the forward schema-057 switch guard"
+stop_line="$(grep -n -m1 'systemctl stop payservice' <<<"$forward_switch_source" | cut -d: -f1)"
+check_line="$(grep -n -m1 'require_no_nonterminal_cooperative_operations "deployment"' \
+  <<<"$forward_switch_source" | cut -d: -f1)"
+[[ "$stop_line" =~ ^[0-9]+$ && "$check_line" =~ ^[0-9]+$ \
+    && "$stop_line" -lt "$check_line" ]] \
+  || fail "forward deploy must stop the current writer before its compatibility check"
 
 echo "renegotiation rollback checks passed"
