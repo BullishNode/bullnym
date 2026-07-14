@@ -2,8 +2,10 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use regex::Regex;
+use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 use crate::auth;
@@ -56,8 +58,22 @@ pub(crate) async fn gate_registration_setup_per_ip(
 
 static NYM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap());
-static NOSTR_PUBKEY_HEX_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").unwrap());
+
+fn validate_verification_npub(verification_npub: &str) -> Result<(), AppError> {
+    let parsed = XOnlyPublicKey::from_str(verification_npub).map_err(|_| {
+        AppError::AuthError(
+            "verification_npub must be a canonical lowercase 64-character hex public key"
+                .to_string(),
+        )
+    })?;
+    if parsed.to_string() != verification_npub {
+        return Err(AppError::AuthError(
+            "verification_npub must be a canonical lowercase 64-character hex public key"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 const PERMANENT_NYM_CAP: i64 = 1;
 
@@ -171,11 +187,9 @@ pub async fn register(
     // the ADR-004 role separation (see ISS-S-01). Omission => no NIP-05 record.
     let verification_npub = req.verification_npub.as_deref();
     if let Some(vn) = verification_npub {
-        if !NOSTR_PUBKEY_HEX_REGEX.is_match(vn) {
-            return Err(AppError::AuthError(
-                "verification_npub must be a 64-character hex public key".to_string(),
-            ));
-        }
+        // This is an exact signed payload field. Reject alternate encodings
+        // instead of silently normalizing bytes that the owner authenticated.
+        validate_verification_npub(vn)?;
     }
 
     // Distinct-npubs-per-IP cap, applied after the cheap input

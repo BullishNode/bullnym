@@ -5018,6 +5018,53 @@ async fn register_nip05_resolves_verification_npub() {
 }
 
 #[tokio::test]
+async fn register_rejects_uppercase_verification_npub_before_persistence() {
+    const UPPERCASE_VERIFICATION_NPUB: &str =
+        "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state_with_nip05(pool.clone()));
+
+    let secp = Secp256k1::new();
+    let auth_keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (auth_xonly, _) = auth_keypair.x_only_public_key();
+    let auth_npub = auth_xonly.to_string();
+    let (signature, timestamp) = sign_register_with_verification_keypair(
+        &auth_keypair,
+        &auth_npub,
+        "uppercaseverify",
+        TEST_DESCRIPTOR,
+        UPPERCASE_VERIFICATION_NPUB,
+    );
+
+    let (status, body) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "uppercaseverify",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": auth_npub,
+            "verification_npub": UPPERCASE_VERIFICATION_NPUB,
+            "signature": signature,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "AuthError");
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nym = 'uppercaseverify'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn register_duplicate_nym_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

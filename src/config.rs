@@ -716,14 +716,16 @@ pub struct DonationConfig {
     #[serde(default = "default_donation_image_max_bytes")]
     pub image_max_bytes: usize,
     /// Reject images whose decoded dimensions exceed this in either
-    /// axis. Image-bomb defense: read the header dimensions first
-    /// (cheap), reject before allocating the full pixel buffer. The
-    /// default is intentionally below large-camera panoramas because decode
-    /// memory grows with pixels, not upload bytes.
+    /// axis. Configured output dimensions must also fit this bound.
+    /// Image-bomb defense: read the header dimensions first (cheap), reject
+    /// before allocating the full pixel buffer. The default is intentionally
+    /// below large-camera panoramas because decode memory grows with pixels,
+    /// not upload bytes.
     #[serde(default = "default_donation_image_max_dimension")]
     pub image_max_dimension: u32,
     /// Reject images whose decoded pixel area exceeds this value before
-    /// allocating the full pixel buffer.
+    /// allocating the full pixel buffer. Configured output pixel areas must
+    /// also fit this bound.
     #[serde(default = "default_donation_image_max_pixels")]
     pub image_max_pixels: u64,
     /// Output size for resized avatar (square).
@@ -1775,12 +1777,7 @@ impl Config {
         if self.pwa.dist_dir.trim().is_empty() {
             return Err("pwa.dist_dir must be non-empty".into());
         }
-        if self.donation.image_max_dimension == 0 {
-            return Err("donation.image_max_dimension must be > 0".into());
-        }
-        if self.donation.image_max_pixels == 0 {
-            return Err("donation.image_max_pixels must be > 0".into());
-        }
+        validate_donation_image_dimensions(&self.donation)?;
         require_positive(
             "bitcoin_watcher.active_tick_secs",
             self.bitcoin_watcher.active_tick_secs,
@@ -1873,6 +1870,38 @@ fn require_positive(name: &str, value: u64) -> Result<(), Box<dyn std::error::Er
 
 fn require_positive_u32(name: &str, value: u32) -> Result<(), Box<dyn std::error::Error>> {
     require_positive(name, u64::from(value))
+}
+
+fn validate_donation_image_dimensions(
+    config: &DonationConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_positive_u32("donation.image_max_dimension", config.image_max_dimension)?;
+    require_positive("donation.image_max_pixels", config.image_max_pixels)?;
+
+    for (name, dimension) in [
+        ("donation.avatar_size", config.avatar_size),
+        ("donation.og_width", config.og_width),
+        ("donation.og_height", config.og_height),
+    ] {
+        require_positive_u32(name, dimension)?;
+        if dimension > config.image_max_dimension {
+            return Err(format!("{name} must be <= donation.image_max_dimension").into());
+        }
+    }
+
+    let avatar_pixels = u64::from(config.avatar_size) * u64::from(config.avatar_size);
+    if avatar_pixels > config.image_max_pixels {
+        return Err("donation.avatar_size squared must be <= donation.image_max_pixels".into());
+    }
+
+    let og_pixels = u64::from(config.og_width) * u64::from(config.og_height);
+    if og_pixels > config.image_max_pixels {
+        return Err(
+            "donation.og_width * donation.og_height must be <= donation.image_max_pixels".into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_http_endpoint(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
