@@ -1,12 +1,14 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -17,7 +19,7 @@ use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain, LiquidClient};
 use boltz_client::swaps::boltz::{
-    BoltzApiClientV2, CreateChainResponse, CreateReverseResponse, Side,
+    BoltzApiClientV2, ChainPair, CreateChainResponse, CreateReverseResponse, Side,
 };
 use boltz_client::swaps::{
     BtcLikeTransaction, ChainClient, SwapScript, SwapTransactionParams, TransactionOptions,
@@ -27,10 +29,16 @@ use boltz_client::util::secrets::Preimage;
 use boltz_client::Keypair;
 
 use crate::admission::WorkerReporter;
+use crate::boltz::{ChainSwapQuote, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
 use crate::builder_fee::LiquidBuilderFeeDecision;
 use crate::chain_swap_runtime::{
     apply_chain_swap_provider_effect, apply_chain_swap_provider_effect_with_evidence,
     ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
+};
+use crate::chain_swap_renegotiation::{
+    ChainSwapRenegotiationOperation, ChangedQuoteRedrive, RenegotiationErrorClass,
+    RenegotiationIdentity, RenegotiationState, TransitionDisposition,
+    VerifiedRenegotiationAcceptance,
 };
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
@@ -54,6 +62,14 @@ const REVERSE_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed reverse response without persisted claim bytes";
 const CHAIN_TEST_GUARD_REJECTED: &str =
     "claim integration seam requires a malformed chain response without persisted claim bytes";
+const RENEGOTIATION_POLICY_VERSION: &str = "issue38-primary-mismatch-v1";
+// Boltz requires more than 60 minutes before the Bitcoin timeout. Bitcoin's
+// target interval is ten minutes, so a strict `remaining > 6` check is the
+// conservative block-height form of that provider boundary.
+const RENEGOTIATION_MIN_REMAINING_BTC_BLOCKS: i64 = 6;
+const RENEGOTIATION_MAX_PRIMARY_OBSERVATION_AGE_SECS: i64 = 120;
+const RENEGOTIATION_MAX_SERVER_LOCK_OBSERVATION_AGE_SECS: i64 = 120;
+const RENEGOTIATION_ACCEPT_REQUEST_STALE_AFTER_SECS: i64 = 30;
 /// Stable, non-secret explanation for a claim that remains pending until fee
 /// policy supplies accepted live or recent same-rail evidence.
 #[doc(hidden)]
@@ -107,6 +123,225 @@ fn validated_chain_creation_destination(
         ));
     }
     Ok(canonical)
+}
+
+/// Source quality required before a wrong-amount provider mutation is even
+/// considered. There is deliberately no incomplete or single-backend variant:
+/// those observations remain read-only and must be reconciled by #82/#139.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimaryFundingEvidenceQuality {
+    CompleteAndAgreed,
+}
+
+/// Independently verified value of the primary Bitcoin funding transaction.
+///
+/// The webhook's `transaction.lockupFailed` string and the swap's expected
+/// amount are not evidence of what was actually funded. The later #139
+/// projection integration must construct this value only from a complete,
+/// agreeing primary-source observation with stable identity and digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedPrimaryFundingAmountMismatch {
+    quality: PrimaryFundingEvidenceQuality,
+    chain_swap_id: Uuid,
+    observed_amount_sat: u64,
+    expected_amount_sat: u64,
+    authoritative_bitcoin_tip: u32,
+    observed_at_unix: i64,
+    primary_identity: String,
+    primary_evidence_sha256: String,
+}
+
+impl VerifiedPrimaryFundingAmountMismatch {
+    pub(crate) fn new_complete_and_agreed(
+        chain_swap_id: Uuid,
+        observed_amount_sat: u64,
+        expected_amount_sat: u64,
+        authoritative_bitcoin_tip: u32,
+        observed_at_unix: i64,
+        primary_identity: impl Into<String>,
+        primary_evidence_sha256: impl Into<String>,
+    ) -> Result<Self, AppError> {
+        let evidence = Self {
+            quality: PrimaryFundingEvidenceQuality::CompleteAndAgreed,
+            chain_swap_id,
+            observed_amount_sat,
+            expected_amount_sat,
+            authoritative_bitcoin_tip,
+            observed_at_unix,
+            primary_identity: primary_identity.into(),
+            primary_evidence_sha256: primary_evidence_sha256.into(),
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        self.validate_common()?;
+        if self.observed_amount_sat == self.expected_amount_sat {
+            return Err(AppError::ClaimError(
+                "renegotiation is forbidden for a correctly funded primary transaction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_common(&self) -> Result<(), AppError> {
+        if self.quality != PrimaryFundingEvidenceQuality::CompleteAndAgreed {
+            return Err(AppError::ClaimError(
+                "renegotiation requires complete, agreeing primary funding evidence".into(),
+            ));
+        }
+        if self.chain_swap_id.is_nil() {
+            return Err(AppError::ClaimError(
+                "renegotiation primary funding observation has no swap identity".into(),
+            ));
+        }
+        if self.observed_amount_sat == 0 || self.expected_amount_sat == 0 {
+            return Err(AppError::ClaimError(
+                "renegotiation requires positive primary funding amounts".into(),
+            ));
+        }
+        let now = current_unix_time()?;
+        if self.authoritative_bitcoin_tip == 0
+            || self.observed_at_unix <= 0
+            || self.observed_at_unix > now
+            || now.saturating_sub(self.observed_at_unix)
+                > RENEGOTIATION_MAX_PRIMARY_OBSERVATION_AGE_SECS
+        {
+            return Err(AppError::ClaimError(
+                "renegotiation primary funding observation height or time is invalid".into(),
+            ));
+        }
+        if self.primary_identity.is_empty()
+            || self.primary_identity.len() > 256
+            || self.primary_identity.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::ClaimError(
+                "renegotiation primary funding identity is invalid".into(),
+            ));
+        }
+        if !is_lower_sha256(&self.primary_evidence_sha256) {
+            return Err(AppError::ClaimError(
+                "renegotiation primary funding evidence digest is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedPrimaryFundingObservation(VerifiedPrimaryFundingAmountMismatch);
+
+impl VerifiedPrimaryFundingObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_complete_and_agreed(
+        chain_swap_id: Uuid,
+        observed_amount_sat: u64,
+        expected_amount_sat: u64,
+        authoritative_bitcoin_tip: u32,
+        observed_at_unix: i64,
+        primary_identity: impl Into<String>,
+        primary_evidence_sha256: impl Into<String>,
+    ) -> Result<Self, AppError> {
+        let observation = VerifiedPrimaryFundingAmountMismatch {
+            quality: PrimaryFundingEvidenceQuality::CompleteAndAgreed,
+            chain_swap_id,
+            observed_amount_sat,
+            expected_amount_sat,
+            authoritative_bitcoin_tip,
+            observed_at_unix,
+            primary_identity: primary_identity.into(),
+            primary_evidence_sha256: primary_evidence_sha256.into(),
+        };
+        observation.validate_common()?;
+        Ok(Self(observation))
+    }
+
+    fn mismatch(&self) -> Option<&VerifiedPrimaryFundingAmountMismatch> {
+        (self.0.observed_amount_sat != self.0.expected_amount_sat).then_some(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedLiquidServerLockProgression {
+    chain_swap_id: Uuid,
+    observed_amount_sat: u64,
+    output_identity: String,
+    output_evidence_sha256: String,
+    observed_at_unix: i64,
+}
+
+impl VerifiedLiquidServerLockProgression {
+    pub(crate) fn new(
+        chain_swap_id: Uuid,
+        observed_amount_sat: u64,
+        output_identity: impl Into<String>,
+        output_evidence_sha256: impl Into<String>,
+        observed_at_unix: i64,
+    ) -> Result<Self, AppError> {
+        let evidence = Self {
+            chain_swap_id,
+            observed_amount_sat,
+            output_identity: output_identity.into(),
+            output_evidence_sha256: output_evidence_sha256.into(),
+            observed_at_unix,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        let now = current_unix_time()?;
+        if self.chain_swap_id.is_nil()
+            || self.observed_amount_sat == 0
+            || self.observed_at_unix <= 0
+            || self.observed_at_unix > now
+            || now.saturating_sub(self.observed_at_unix)
+                > RENEGOTIATION_MAX_SERVER_LOCK_OBSERVATION_AGE_SECS
+            || self.output_identity.is_empty()
+            || self.output_identity.len() > 256
+            || self.output_identity.chars().any(char::is_whitespace)
+            || !is_lower_sha256(&self.output_evidence_sha256)
+        {
+            return Err(AppError::ClaimError(
+                "verified Liquid server-lock progression is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn terminal_digest(&self) -> Result<String, AppError> {
+        let value = serde_json::json!({
+            "chainSwapId": self.chain_swap_id,
+            "observedAmountSat": self.observed_amount_sat,
+            "outputIdentitySha256": hex::encode(Sha256::digest(self.output_identity.as_bytes())),
+            "outputEvidenceSha256": self.output_evidence_sha256,
+            "observedAtUnix": self.observed_at_unix,
+        });
+        crate::canonical_json::canonical_json_and_sha256(&value)
+            .map(|(_, digest)| digest)
+            .map_err(|error| {
+                AppError::ClaimError(format!(
+                    "Liquid server-lock evidence is not canonical: {error}"
+                ))
+            })
+    }
+}
+
+fn current_unix_time() -> Result<i64, AppError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::ClaimError("system clock is before the Unix epoch".into()))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| AppError::ClaimError("system clock exceeds supported range".into()))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Deserialize)]
@@ -456,6 +691,931 @@ async fn dispatch_webhook(
     Ok("ok")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenegotiationCheckpoint {
+    QuoteObservedBeforePersistence,
+    QuotePersisted,
+    AcceptRequested,
+    ProviderAcceptedResponse,
+    BeforeAcceptanceCommit,
+    AcceptanceCommitted,
+}
+
+pub(crate) trait RenegotiationCheckpointObserver: Send + Sync {
+    fn reached(&self, checkpoint: RenegotiationCheckpoint) -> Result<(), AppError>;
+}
+
+struct NoopRenegotiationCheckpointObserver;
+
+impl RenegotiationCheckpointObserver for NoopRenegotiationCheckpointObserver {
+    fn reached(&self, _checkpoint: RenegotiationCheckpoint) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub(crate) trait ChainSwapRenegotiationProvider: Send + Sync {
+    async fn get_quote(&self, swap_id: &str)
+        -> Result<ChainSwapQuote, ChainSwapQuoteProviderError>;
+
+    async fn accept_quote(
+        &self,
+        swap_id: &str,
+        amount_sat: u64,
+    ) -> Result<String, ChainSwapQuoteProviderError>;
+}
+
+#[async_trait]
+impl ChainSwapRenegotiationProvider for crate::boltz::BoltzService {
+    async fn get_quote(
+        &self,
+        swap_id: &str,
+    ) -> Result<ChainSwapQuote, ChainSwapQuoteProviderError> {
+        self.get_chain_swap_quote(swap_id).await
+    }
+
+    async fn accept_quote(
+        &self,
+        swap_id: &str,
+        amount_sat: u64,
+    ) -> Result<String, ChainSwapQuoteProviderError> {
+        self.accept_chain_swap_quote(swap_id, amount_sat).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcceptedRenegotiationFinalization {
+    Committed(ChainSwapRenegotiationOperation),
+    Busy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefiniteDeclineFinalization {
+    Declined(ChainSwapRenegotiationOperation),
+    Busy,
+    LiquidPathActive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenegotiationStoreTransition {
+    Applied(ChainSwapRenegotiationOperation),
+    ExactRetry(ChainSwapRenegotiationOperation),
+}
+
+impl RenegotiationStoreTransition {
+    fn into_parts(self) -> (ChainSwapRenegotiationOperation, bool) {
+        match self {
+            Self::Applied(operation) => (operation, true),
+            Self::ExactRetry(operation) => (operation, false),
+        }
+    }
+}
+
+/// Narrow store seam for the one #38 operation. The production implementation
+/// delegates to the typed PostgreSQL adapter; deterministic tests use an
+/// in-memory CAS fake to prove crash/restart ordering without a database.
+#[async_trait]
+pub(crate) trait ChainSwapRenegotiationStore: Send + Sync {
+    async fn get(
+        &self,
+        chain_swap_id: Uuid,
+    ) -> Result<Option<ChainSwapRenegotiationOperation>, AppError>;
+
+    async fn persist_quoted(
+        &self,
+        identity: &RenegotiationIdentity,
+    ) -> Result<ChainSwapRenegotiationOperation, AppError>;
+
+    async fn request_accept(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+    ) -> Result<RenegotiationStoreTransition, AppError>;
+
+    async fn request_changed_accept(
+        &self,
+        current: &ChainSwapRenegotiationOperation,
+        replacement: &RenegotiationIdentity,
+    ) -> Result<RenegotiationStoreTransition, AppError>;
+
+    async fn mark_ambiguous(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+        error_class: RenegotiationErrorClass,
+    ) -> Result<RenegotiationStoreTransition, AppError>;
+
+    async fn mark_declined(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+        terminal_response_digest: &str,
+    ) -> Result<DefiniteDeclineFinalization, AppError>;
+
+    /// Reacquire the shared per-swap serialization and atomically commit both
+    /// the Accepted journal transition and the legacy operational amount.
+    async fn record_accepted(
+        &self,
+        evidence: &VerifiedRenegotiationAcceptance,
+        expected_version: u64,
+    ) -> Result<AcceptedRenegotiationFinalization, AppError>;
+}
+
+struct PostgresChainSwapRenegotiationStore<'a> {
+    pool: &'a sqlx::PgPool,
+}
+
+#[async_trait]
+impl ChainSwapRenegotiationStore for PostgresChainSwapRenegotiationStore<'_> {
+    async fn get(
+        &self,
+        chain_swap_id: Uuid,
+    ) -> Result<Option<ChainSwapRenegotiationOperation>, AppError> {
+        db::get_chain_swap_renegotiation(self.pool, chain_swap_id)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn persist_quoted(
+        &self,
+        identity: &RenegotiationIdentity,
+    ) -> Result<ChainSwapRenegotiationOperation, AppError> {
+        db::persist_quoted_chain_swap_renegotiation(self.pool, identity)
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn request_accept(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+    ) -> Result<RenegotiationStoreTransition, AppError> {
+        db::request_chain_swap_renegotiation_accept(self.pool, identity, expected_version)
+            .await
+            .map(|outcome| match outcome.disposition {
+                TransitionDisposition::Apply => {
+                    RenegotiationStoreTransition::Applied(outcome.operation)
+                }
+                TransitionDisposition::ExactRetry => {
+                    RenegotiationStoreTransition::ExactRetry(outcome.operation)
+                }
+            })
+            .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn request_changed_accept(
+        &self,
+        current: &ChainSwapRenegotiationOperation,
+        replacement: &RenegotiationIdentity,
+    ) -> Result<RenegotiationStoreTransition, AppError> {
+        let redrive = ChangedQuoteRedrive::new(
+            current.identity.clone(),
+            replacement.clone(),
+            current.version,
+        )
+        .map_err(|error| AppError::ClaimError(error.to_string()))?;
+        db::request_changed_chain_swap_renegotiation_accept(self.pool, &redrive)
+            .await
+            .map(|outcome| match outcome.disposition {
+                TransitionDisposition::Apply => {
+                    RenegotiationStoreTransition::Applied(outcome.operation)
+                }
+                TransitionDisposition::ExactRetry => {
+                    RenegotiationStoreTransition::ExactRetry(outcome.operation)
+                }
+            })
+            .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn mark_ambiguous(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+        error_class: RenegotiationErrorClass,
+    ) -> Result<RenegotiationStoreTransition, AppError> {
+        db::mark_chain_swap_renegotiation_ambiguous(
+            self.pool,
+            identity,
+            expected_version,
+            error_class,
+        )
+        .await
+        .map(|outcome| match outcome.disposition {
+            TransitionDisposition::Apply => {
+                RenegotiationStoreTransition::Applied(outcome.operation)
+            }
+            TransitionDisposition::ExactRetry => {
+                RenegotiationStoreTransition::ExactRetry(outcome.operation)
+            }
+        })
+        .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn mark_declined(
+        &self,
+        identity: &RenegotiationIdentity,
+        expected_version: u64,
+        terminal_response_digest: &str,
+    ) -> Result<DefiniteDeclineFinalization, AppError> {
+        use db::RecordDeclinedRenegotiationOutcome as DbOutcome;
+
+        db::record_definite_declined_chain_swap_renegotiation(
+            self.pool,
+            identity,
+            expected_version,
+            terminal_response_digest,
+        )
+        .await
+        .map(|outcome| match outcome {
+            DbOutcome::Applied(operation) | DbOutcome::ExactRetry(operation) => {
+                DefiniteDeclineFinalization::Declined(operation)
+            }
+            DbOutcome::Busy => DefiniteDeclineFinalization::Busy,
+            DbOutcome::LiquidPathActive => DefiniteDeclineFinalization::LiquidPathActive,
+        })
+        .map_err(|error| AppError::DbError(error.to_string()))
+    }
+
+    async fn record_accepted(
+        &self,
+        evidence: &VerifiedRenegotiationAcceptance,
+        expected_version: u64,
+    ) -> Result<AcceptedRenegotiationFinalization, AppError> {
+        use db::RecordAcceptedRenegotiationOutcome as DbOutcome;
+
+        db::record_accepted_chain_swap_renegotiation(self.pool, evidence, expected_version)
+            .await
+            .map(|outcome| match outcome {
+                DbOutcome::Applied(operation)
+                | DbOutcome::ExactRetry(operation)
+                | DbOutcome::RepairedParent(operation) => {
+                    AcceptedRenegotiationFinalization::Committed(operation)
+                }
+                DbOutcome::Busy => AcceptedRenegotiationFinalization::Busy,
+            })
+            .map_err(|error| AppError::DbError(error.to_string()))
+    }
+}
+
+fn renegotiation_error_class(error: ChainSwapQuoteProviderErrorKind) -> RenegotiationErrorClass {
+    match error {
+        ChainSwapQuoteProviderErrorKind::Timeout => RenegotiationErrorClass::Timeout,
+        ChainSwapQuoteProviderErrorKind::Transport => RenegotiationErrorClass::Transport,
+        ChainSwapQuoteProviderErrorKind::ProviderServerError => {
+            RenegotiationErrorClass::ProviderServerError
+        }
+        ChainSwapQuoteProviderErrorKind::MalformedResponse => {
+            RenegotiationErrorClass::MalformedResponse
+        }
+        ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote => {
+            RenegotiationErrorClass::BackendDisagreement
+        }
+        ChainSwapQuoteProviderErrorKind::RefundAlreadySigned
+        | ChainSwapQuoteProviderErrorKind::FundingNotAmountRejected
+        | ChainSwapQuoteProviderErrorKind::ExpiryMarginTooShort
+        | ChainSwapQuoteProviderErrorKind::AboveMaximum
+        | ChainSwapQuoteProviderErrorKind::BelowMinimum
+        | ChainSwapQuoteProviderErrorKind::UnknownProviderOutcome => {
+            RenegotiationErrorClass::UnknownProviderOutcome
+        }
+    }
+}
+
+fn policy_evidence_digest(
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+    quote_amount_sat: u64,
+    quote_response_sha256: &str,
+    pair: &ChainPair,
+    canonical_pair_sha256: &str,
+) -> Result<String, AppError> {
+    let primary_identity_sha256 = hex::encode(Sha256::digest(evidence.primary_identity.as_bytes()));
+    let value = serde_json::json!({
+        "policyVersion": RENEGOTIATION_POLICY_VERSION,
+        "chainSwapId": swap.id,
+        "boltzSwapIdSha256": hex::encode(Sha256::digest(swap.boltz_swap_id.as_bytes())),
+        "primaryFunding": {
+            "quality": "complete_and_agreed",
+            "chainSwapId": evidence.chain_swap_id,
+            "identitySha256": primary_identity_sha256,
+            "evidenceSha256": evidence.primary_evidence_sha256,
+            "observedAmountSat": evidence.observed_amount_sat,
+            "expectedAmountSat": evidence.expected_amount_sat,
+            "authoritativeBitcoinTip": evidence.authoritative_bitcoin_tip,
+            "observedAtUnix": evidence.observed_at_unix,
+        },
+        "quote": {
+            "amountSat": quote_amount_sat,
+            "responseSha256": quote_response_sha256,
+        },
+        "pinnedPair": {
+            "hash": pair.hash,
+            "canonicalSha256": canonical_pair_sha256,
+            "minimal": pair.limits.minimal,
+            "maximal": pair.limits.maximal,
+            "maximalZeroConf": pair.limits.maximal_zero_conf,
+            "percentageFee": pair.fees.percentage,
+            "serverMinerFee": pair.fees.miner_fees.server,
+            "userClaimMinerFee": pair.fees.miner_fees.user.claim,
+            "userLockupMinerFee": pair.fees.miner_fees.user.lockup,
+        },
+        "bitcoinTimeoutHeight": swap.creation_terms.as_ref().map(|terms| terms.btc_timeout_height),
+        "minimumRemainingBitcoinBlocks": RENEGOTIATION_MIN_REMAINING_BTC_BLOCKS,
+        "maximumPrimaryObservationAgeSeconds": RENEGOTIATION_MAX_PRIMARY_OBSERVATION_AGE_SECS,
+    });
+    crate::canonical_json::canonical_json_and_sha256(&value)
+        .map(|(_, digest)| digest)
+        .map_err(|error| {
+            AppError::ClaimError(format!(
+                "renegotiation policy evidence is not canonical: {error}"
+            ))
+        })
+}
+
+fn validate_renegotiation_preconditions(
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+) -> Result<(ChainPair, String), AppError> {
+    evidence.validate()?;
+    if evidence.chain_swap_id != swap.id {
+        return Err(AppError::ClaimError(
+            "primary funding evidence belongs to a different chain swap".into(),
+        ));
+    }
+    let expected_amount_sat = u64::try_from(swap.user_lock_amount_sat).map_err(|_| {
+        AppError::ClaimError("chain swap expected primary funding amount is invalid".into())
+    })?;
+    if evidence.expected_amount_sat != expected_amount_sat {
+        return Err(AppError::ClaimError(
+            "primary funding evidence disagrees with immutable swap terms".into(),
+        ));
+    }
+    let creation = swap.creation_terms.as_ref().ok_or_else(|| {
+        AppError::ClaimError("renegotiation requires immutable chain-swap creation terms".into())
+    })?;
+    let pair: ChainPair = serde_json::from_str(&creation.canonical_pair_quote_json)
+        .map_err(|_| AppError::ClaimError("immutable chain-swap pair quote is malformed".into()))?;
+    let (canonical_pair_json, canonical_pair_sha256) =
+        crate::canonical_json::canonical_json_and_sha256(&pair).map_err(|error| {
+            AppError::ClaimError(format!(
+                "immutable chain-swap pair quote is invalid: {error}"
+            ))
+        })?;
+    if canonical_pair_json != creation.canonical_pair_quote_json
+        || pair.hash != creation.pinned_pair_hash
+        || pair.limits.minimal == 0
+        || pair.limits.maximal < pair.limits.minimal
+        || evidence.observed_amount_sat < pair.limits.minimal
+        || evidence.observed_amount_sat > pair.limits.maximal
+    {
+        return Err(AppError::ClaimError(
+            "renegotiation evidence violates immutable provider pair limits".into(),
+        ));
+    }
+    let remaining_blocks = creation
+        .btc_timeout_height
+        .checked_sub(i64::from(evidence.authoritative_bitcoin_tip))
+        .ok_or_else(|| {
+            AppError::ClaimError("renegotiation Bitcoin timeout has already passed".into())
+        })?;
+    if remaining_blocks <= RENEGOTIATION_MIN_REMAINING_BTC_BLOCKS {
+        return Err(AppError::ClaimError(
+            "renegotiation is inside the conservative Bitcoin timeout margin".into(),
+        ));
+    }
+    Ok((pair, canonical_pair_sha256))
+}
+
+fn validate_renegotiation_policy(
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+    quote: &ChainSwapQuote,
+) -> Result<RenegotiationIdentity, AppError> {
+    let (pair, canonical_pair_sha256) = validate_renegotiation_preconditions(swap, evidence)?;
+    if quote.amount_sat == 0
+        || quote.amount_sat > i64::MAX as u64
+        || quote.amount_sat > evidence.observed_amount_sat
+        || !is_lower_sha256(&quote.response_sha256)
+    {
+        return Err(AppError::ClaimError(
+            "renegotiation quote violates the verified funding value boundary".into(),
+        ));
+    }
+
+    let policy_digest = policy_evidence_digest(
+        swap,
+        evidence,
+        quote.amount_sat,
+        &quote.response_sha256,
+        &pair,
+        &canonical_pair_sha256,
+    )?;
+    let observed_at_unix = current_unix_time()?;
+    RenegotiationIdentity::new(
+        swap.id,
+        quote.amount_sat,
+        quote.response_sha256.clone(),
+        observed_at_unix,
+        RENEGOTIATION_POLICY_VERSION,
+        policy_digest,
+        observed_at_unix,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))
+}
+
+fn same_validated_quote(
+    current: &RenegotiationIdentity,
+    candidate: &RenegotiationIdentity,
+) -> bool {
+    current.chain_swap_id == candidate.chain_swap_id
+        && current.quoted_actual_amount_sat == candidate.quoted_actual_amount_sat
+        && current.quote_response_digest() == candidate.quote_response_digest()
+        && current.policy_version() == candidate.policy_version()
+}
+
+fn provider_error(error: &ChainSwapQuoteProviderError) -> AppError {
+    AppError::BoltzError(error.to_string())
+}
+
+async fn load_or_observe_renegotiation<S, P, O>(
+    store: &S,
+    provider: &P,
+    observer: &O,
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+) -> Result<Option<ChainSwapRenegotiationOperation>, AppError>
+where
+    S: ChainSwapRenegotiationStore,
+    P: ChainSwapRenegotiationProvider,
+    O: RenegotiationCheckpointObserver,
+{
+    if let Some(current) = store.get(swap.id).await? {
+        if current.state.is_terminal() {
+            return Ok(Some(current));
+        }
+        let persisted_quote = ChainSwapQuote {
+            amount_sat: current.identity.quoted_actual_amount_sat,
+            response_sha256: current.identity.quote_response_digest().to_owned(),
+        };
+        let current_policy = validate_renegotiation_policy(swap, evidence, &persisted_quote)?;
+        if current.identity.quoted_actual_amount_sat != current_policy.quoted_actual_amount_sat
+            || current.identity.quote_response_digest() != current_policy.quote_response_digest()
+            || current.identity.policy_version() != current_policy.policy_version()
+        {
+            return Err(AppError::ClaimError(
+                "persisted renegotiation quote disagrees with current verified policy evidence"
+                    .into(),
+            ));
+        }
+        return Ok(Some(current));
+    }
+
+    let quote = match provider.get_quote(&swap.boltz_swap_id).await {
+        Ok(quote) => quote,
+        Err(error) if error.kind.is_explicit_non_eligibility() => {
+            tracing::info!(
+                event = "chain_swap_renegotiation_explicitly_unavailable",
+                swap_id = %swap.boltz_swap_id,
+                reason = %error,
+                "verified wrong-amount swap is not eligible for provider renegotiation"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(provider_error(&error)),
+    };
+    let identity = validate_renegotiation_policy(swap, evidence, &quote)?;
+    observer.reached(RenegotiationCheckpoint::QuoteObservedBeforePersistence)?;
+    let operation = store.persist_quoted(&identity).await?;
+    observer.reached(RenegotiationCheckpoint::QuotePersisted)?;
+    Ok(Some(operation))
+}
+
+async fn repair_or_confirm_accepted<S: ChainSwapRenegotiationStore>(
+    store: &S,
+    operation: &ChainSwapRenegotiationOperation,
+) -> Result<AcceptedRenegotiationFinalization, AppError> {
+    let terminal_response_digest = operation.terminal_response_digest().ok_or_else(|| {
+        AppError::ClaimError("accepted renegotiation is missing terminal evidence".into())
+    })?;
+    let evidence = VerifiedRenegotiationAcceptance::new(
+        operation.identity.clone(),
+        operation.identity.quoted_actual_amount_sat,
+        operation.identity.quote_response_digest(),
+        terminal_response_digest,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let expected_version = operation.version.checked_sub(1).ok_or_else(|| {
+        AppError::ClaimError("accepted renegotiation has an invalid persisted version".into())
+    })?;
+    store.record_accepted(&evidence, expected_version).await
+}
+
+/// Execute the one #38 quote mutation from independently verified primary
+/// funding evidence. Every store call completes before provider I/O begins;
+/// accepted finalization reacquires `chain-claim:<id>` inside the production
+/// store and atomically writes both journal and parent operational amount.
+async fn try_renegotiate_chain_swap_with_verified_mismatch_using<S, P, O>(
+    store: &S,
+    provider: &P,
+    observer: &O,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+) -> Result<bool, AppError>
+where
+    S: ChainSwapRenegotiationStore,
+    P: ChainSwapRenegotiationProvider,
+    O: RenegotiationCheckpointObserver,
+{
+    if boltz_status != "transaction.lockupFailed" {
+        // Unrelated provider failures never reach a quote API and cannot be
+        // transformed into recovery eligibility by this executor.
+        return Ok(true);
+    }
+    if let Some(persisted) = store.get(swap.id).await? {
+        if persisted.state == RenegotiationState::Accepted {
+            return match repair_or_confirm_accepted(store, &persisted).await? {
+                AcceptedRenegotiationFinalization::Committed(_)
+                | AcceptedRenegotiationFinalization::Busy => Ok(true),
+            };
+        }
+        if persisted.state == RenegotiationState::Declined {
+            return Ok(false);
+        }
+    }
+    evidence.validate()?;
+    if evidence.chain_swap_id != swap.id {
+        return Err(AppError::ClaimError(
+            "primary funding evidence belongs to a different chain swap".into(),
+        ));
+    }
+    // Reject stale tips, unsafe expiry margin, replayed evidence, and pinned
+    // pair/limit disagreement before the first provider request.
+    validate_renegotiation_preconditions(swap, evidence)?;
+
+    let Some(mut operation) =
+        load_or_observe_renegotiation(store, provider, observer, swap, evidence).await?
+    else {
+        return Ok(false);
+    };
+    let mut changed_quote_redriven = false;
+    let mut accept_prepared_in_process = false;
+
+    loop {
+        match operation.state {
+            RenegotiationState::Accepted => {
+                return match repair_or_confirm_accepted(store, &operation).await? {
+                    AcceptedRenegotiationFinalization::Committed(_) => Ok(true),
+                    AcceptedRenegotiationFinalization::Busy => Ok(true),
+                };
+            }
+            RenegotiationState::Declined => return Ok(false),
+            RenegotiationState::Quoted => {
+                let (requested, applied) = store
+                    .request_accept(&operation.identity, operation.version)
+                    .await?
+                    .into_parts();
+                if !applied {
+                    return Ok(true);
+                }
+                operation = requested;
+                accept_prepared_in_process = true;
+            }
+            RenegotiationState::Ambiguous => {
+                let quote = match provider.get_quote(&swap.boltz_swap_id).await {
+                    Ok(quote) => quote,
+                    Err(error) if error.kind.is_explicit_non_eligibility() => {
+                        return Err(provider_error(&error));
+                    }
+                    Err(error) => return Err(provider_error(&error)),
+                };
+                let replacement = validate_renegotiation_policy(swap, evidence, &quote)?;
+                let requested = if same_validated_quote(&operation.identity, &replacement) {
+                    store
+                        .request_accept(&operation.identity, operation.version)
+                        .await?
+                } else {
+                    store
+                        .request_changed_accept(&operation, &replacement)
+                        .await?
+                };
+                let (requested, applied) = requested.into_parts();
+                if !applied {
+                    return Ok(true);
+                }
+                operation = requested;
+                accept_prepared_in_process = true;
+            }
+            RenegotiationState::AcceptRequested => {
+                if !accept_prepared_in_process {
+                    let requested_at = operation.accept_requested_at_unix.ok_or_else(|| {
+                        AppError::ClaimError(
+                            "accept-requested renegotiation has no request timestamp".into(),
+                        )
+                    })?;
+                    if current_unix_time()?.saturating_sub(requested_at)
+                        <= RENEGOTIATION_ACCEPT_REQUEST_STALE_AFTER_SECS
+                    {
+                        // Another worker may still be inside the bounded 10s
+                        // POST. Fresh intent owns progress and must not be
+                        // redriven concurrently.
+                        return Ok(true);
+                    }
+                    let (ambiguous, applied) = store
+                        .mark_ambiguous(
+                            &operation.identity,
+                            operation.version,
+                            RenegotiationErrorClass::UnknownProviderOutcome,
+                        )
+                        .await?
+                        .into_parts();
+                    if !applied {
+                        return Ok(true);
+                    }
+                    operation = ambiguous;
+                    continue;
+                }
+            }
+        }
+        debug_assert!(accept_prepared_in_process);
+        accept_prepared_in_process = false;
+        observer.reached(RenegotiationCheckpoint::AcceptRequested)?;
+
+        match provider
+            .accept_quote(
+                &swap.boltz_swap_id,
+                operation.identity.quoted_actual_amount_sat,
+            )
+            .await
+        {
+            Ok(terminal_response_digest) => {
+                observer.reached(RenegotiationCheckpoint::ProviderAcceptedResponse)?;
+                let accepted = VerifiedRenegotiationAcceptance::new(
+                    operation.identity.clone(),
+                    operation.identity.quoted_actual_amount_sat,
+                    operation.identity.quote_response_digest(),
+                    terminal_response_digest,
+                )
+                .map_err(|error| AppError::ClaimError(error.to_string()))?;
+                observer.reached(RenegotiationCheckpoint::BeforeAcceptanceCommit)?;
+                return match store.record_accepted(&accepted, operation.version).await {
+                    Ok(AcceptedRenegotiationFinalization::Committed(_)) => {
+                        observer.reached(RenegotiationCheckpoint::AcceptanceCommitted)?;
+                        Ok(true)
+                    }
+                    Ok(AcceptedRenegotiationFinalization::Busy) => Ok(true),
+                    Err(commit_error) => {
+                        // The provider response is definite but the local
+                        // transaction result is not. Re-read before deciding;
+                        // never repeat accept directly from this branch.
+                        match store.get(swap.id).await {
+                            Ok(Some(current)) if current.state == RenegotiationState::Accepted => {
+                                observer.reached(RenegotiationCheckpoint::AcceptanceCommitted)?;
+                                Ok(true)
+                            }
+                            Ok(Some(current))
+                                if current.state == RenegotiationState::AcceptRequested =>
+                            {
+                                let _ = store
+                                    .mark_ambiguous(
+                                        &current.identity,
+                                        current.version,
+                                        RenegotiationErrorClass::LocalCommitUncertainty,
+                                    )
+                                    .await;
+                                Err(commit_error)
+                            }
+                            Ok(Some(_)) | Ok(None) | Err(_) => Err(commit_error),
+                        }
+                    }
+                };
+            }
+            Err(error) if error.kind.is_explicit_non_eligibility() => {
+                let terminal_digest =
+                    error.terminal_evidence_sha256.as_deref().ok_or_else(|| {
+                        AppError::ClaimError(
+                            "explicit provider decline is missing canonical evidence".into(),
+                        )
+                    })?;
+                return match store
+                    .mark_declined(&operation.identity, operation.version, terminal_digest)
+                    .await?
+                {
+                    DefiniteDeclineFinalization::Declined(operation) => {
+                        debug_assert_eq!(operation.state, RenegotiationState::Declined);
+                        Ok(false)
+                    }
+                    DefiniteDeclineFinalization::Busy
+                    | DefiniteDeclineFinalization::LiquidPathActive => Ok(true),
+                };
+            }
+            Err(error) => {
+                let invalid_or_stale =
+                    error.kind == ChainSwapQuoteProviderErrorKind::InvalidOrStaleQuote;
+                let (ambiguous, applied) = store
+                    .mark_ambiguous(
+                        &operation.identity,
+                        operation.version,
+                        renegotiation_error_class(error.kind),
+                    )
+                    .await?
+                    .into_parts();
+                if !applied {
+                    return Ok(true);
+                }
+                operation = ambiguous;
+                if !invalid_or_stale || changed_quote_redriven {
+                    return Err(provider_error(&error));
+                }
+                changed_quote_redriven = true;
+                let replacement_quote = provider
+                    .get_quote(&swap.boltz_swap_id)
+                    .await
+                    .map_err(|replacement_error| provider_error(&replacement_error))?;
+                let replacement =
+                    validate_renegotiation_policy(swap, evidence, &replacement_quote)?;
+                let requested = if same_validated_quote(&operation.identity, &replacement) {
+                    store
+                        .request_accept(&operation.identity, operation.version)
+                        .await?
+                } else {
+                    store
+                        .request_changed_accept(&operation, &replacement)
+                        .await?
+                };
+                let (requested, applied) = requested.into_parts();
+                if !applied {
+                    return Ok(true);
+                }
+                operation = requested;
+                accept_prepared_in_process = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenegotiationAdoptionOutcome {
+    NotApplicable,
+    OwnsProgress,
+    ExplicitlyUnavailable,
+}
+
+async fn adopt_verified_primary_funding_for_renegotiation_using<S, P, O>(
+    store: &S,
+    provider: &P,
+    observer: &O,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+    observation: &VerifiedPrimaryFundingObservation,
+) -> Result<RenegotiationAdoptionOutcome, AppError>
+where
+    S: ChainSwapRenegotiationStore,
+    P: ChainSwapRenegotiationProvider,
+    O: RenegotiationCheckpointObserver,
+{
+    if boltz_status != "transaction.lockupFailed" {
+        return Ok(RenegotiationAdoptionOutcome::NotApplicable);
+    }
+    let Some(mismatch) = observation.mismatch() else {
+        // Executable correct-amount boundary: complete/agreed evidence is
+        // accepted, but neither GET nor POST is reachable.
+        return Ok(RenegotiationAdoptionOutcome::NotApplicable);
+    };
+    if try_renegotiate_chain_swap_with_verified_mismatch_using(
+        store,
+        provider,
+        observer,
+        swap,
+        boltz_status,
+        mismatch,
+    )
+    .await?
+    {
+        Ok(RenegotiationAdoptionOutcome::OwnsProgress)
+    } else {
+        Ok(RenegotiationAdoptionOutcome::ExplicitlyUnavailable)
+    }
+}
+
+/// Narrow #139 adoption seam. It accepts only a verified primary observation;
+/// exact funding is NotApplicable without provider I/O, while a mismatch is
+/// routed through the crash-safe journal executor.
+pub(crate) async fn adopt_verified_primary_funding_for_renegotiation(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+    observation: &VerifiedPrimaryFundingObservation,
+) -> Result<RenegotiationAdoptionOutcome, AppError> {
+    let store = PostgresChainSwapRenegotiationStore { pool: &state.db };
+    adopt_verified_primary_funding_for_renegotiation_using(
+        &store,
+        state.boltz.as_ref(),
+        &NoopRenegotiationCheckpointObserver,
+        swap,
+        boltz_status,
+        observation,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerLockRenegotiationOutcome {
+    LiquidPathWon,
+    Observe,
+}
+
+async fn reconcile_renegotiation_from_verified_server_lock_using<S: ChainSwapRenegotiationStore>(
+    store: &S,
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedLiquidServerLockProgression,
+) -> Result<ServerLockRenegotiationOutcome, AppError> {
+    evidence.validate()?;
+    if evidence.chain_swap_id != swap.id {
+        return Err(AppError::ClaimError(
+            "Liquid server-lock evidence belongs to a different chain swap".into(),
+        ));
+    }
+    let Some(operation) = store.get(swap.id).await? else {
+        return Ok(ServerLockRenegotiationOutcome::Observe);
+    };
+    if evidence.observed_amount_sat != operation.identity.quoted_actual_amount_sat {
+        return Err(AppError::ClaimError(
+            "Liquid server-lock amount disagrees with the active renegotiation quote".into(),
+        ));
+    }
+    if operation.state == RenegotiationState::Declined
+        || operation.state == RenegotiationState::Quoted
+    {
+        tracing::error!(
+            event = "chain_swap_server_lock_contradicts_renegotiation_journal",
+            swap_id = %swap.boltz_swap_id,
+            journal_state = %operation.state,
+            "verified Liquid server-lock progression wins; retaining immutable journal contradiction for operator evidence"
+        );
+        return Ok(ServerLockRenegotiationOutcome::LiquidPathWon);
+    }
+    let terminal_digest = if operation.state == RenegotiationState::Accepted {
+        operation
+            .terminal_response_digest()
+            .ok_or_else(|| {
+                AppError::ClaimError("accepted renegotiation lacks terminal evidence".into())
+            })?
+            .to_owned()
+    } else {
+        evidence.terminal_digest()?
+    };
+    let acceptance = VerifiedRenegotiationAcceptance::new(
+        operation.identity.clone(),
+        evidence.observed_amount_sat,
+        operation.identity.quote_response_digest(),
+        terminal_digest,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let expected_version = if operation.state == RenegotiationState::Accepted {
+        operation.version.checked_sub(1).ok_or_else(|| {
+            AppError::ClaimError("accepted renegotiation has an invalid version".into())
+        })?
+    } else {
+        operation.version
+    };
+    match store.record_accepted(&acceptance, expected_version).await? {
+        AcceptedRenegotiationFinalization::Committed(_) => {
+            Ok(ServerLockRenegotiationOutcome::LiquidPathWon)
+        }
+        AcceptedRenegotiationFinalization::Busy => Ok(ServerLockRenegotiationOutcome::Observe),
+    }
+}
+
+/// Reconcile a requested/ambiguous accept from independently verified Liquid
+/// chain progression. This performs no quote or accept provider call.
+pub(crate) async fn reconcile_renegotiation_from_verified_server_lock(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    evidence: &VerifiedLiquidServerLockProgression,
+) -> Result<ServerLockRenegotiationOutcome, AppError> {
+    let store = PostgresChainSwapRenegotiationStore { pool: &state.db };
+    reconcile_renegotiation_from_verified_server_lock_using(&store, swap, evidence).await
+}
+
+pub(crate) async fn try_renegotiate_chain_swap_with_verified_mismatch(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+    evidence: &VerifiedPrimaryFundingAmountMismatch,
+) -> Result<bool, AppError> {
+    let store = PostgresChainSwapRenegotiationStore { pool: &state.db };
+    try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &store,
+        state.boltz.as_ref(),
+        &NoopRenegotiationCheckpointObserver,
+        swap,
+        boltz_status,
+        evidence,
+    )
+    .await
+}
+
 pub(crate) async fn handle_chain_swap_webhook(
     state: &AppState,
     swap: &db::ChainSwapRecord,
@@ -663,6 +1823,27 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
             "chain swap.expired received; retaining the forward-most funded branch"
         );
         try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
+        return Ok(());
+    }
+
+    if boltz_status == "transaction.lockupFailed"
+        && matches!(
+            status,
+            ChainSwapStatus::Pending
+                | ChainSwapStatus::UserLockMempool
+                | ChainSwapStatus::UserLockConfirmed
+        )
+    {
+        // This webhook is only a provider hint. Exact base 72d76ea has no
+        // independently verified primary-funding value, so it must make zero
+        // quote calls and cannot authorize FundingFailed/refund_due. #139 will
+        // map its complete/agreed projection into the guarded entrypoint above.
+        tracing::warn!(
+            event = "chain_swap_renegotiation_waiting_for_verified_funding",
+            swap_id = %swap.boltz_swap_id,
+            invoice_id = %swap.invoice_id,
+            "lockupFailed observed without complete/agreed primary funding evidence; retaining Observe and blocking fallback"
+        );
         return Ok(());
     }
 
