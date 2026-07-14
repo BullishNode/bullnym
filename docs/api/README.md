@@ -6,7 +6,7 @@ This directory is the maintained external API contract. It describes the
 choices exposed by Bullnym and their consequences. The Rust route table, serde
 types, and contract tests remain the implementation authority:
 `src/main.rs`, `src/auth.rs`, `src/registration.rs`, `src/lnurl.rs`,
-`src/donation_page.rs`, and `src/invoice.rs`.
+`src/lnurl_comment_history.rs`, `src/donation_page.rs`, and `src/invoice.rs`.
 
 ## Contents
 
@@ -15,6 +15,7 @@ types, and contract tests remain the implementation authority:
 - [Discovery, pricing, and nym lifecycle](nyms-and-discovery.md)
 - [Payment Page and POS APIs](payment-pages-and-pos.md)
 - [Invoices and payment state](invoices-and-payment-state.md)
+- [Private LNURL payer-comment history](private-lnurl-comments.md)
 - [Chain-swap recovery](chain-swap-recovery.md)
 - [Utility and operations APIs](operations.md)
 - [Integration choices and production checklist](integration-guide.md)

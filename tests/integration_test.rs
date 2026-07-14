@@ -65,8 +65,8 @@ use pay_service::swap_manifest_store::{
     S3ManifestStoreConfig,
 };
 use pay_service::{
-    certification, claimer, donation_page, donation_render, invoice, lnurl, nostr, readiness,
-    recovery_address_registration, registration, AppState,
+    certification, claimer, donation_page, donation_render, invoice, lnurl, lnurl_comment_history,
+    nostr, readiness, recovery_address_registration, registration, AppState,
 };
 
 use bitcoin::absolute::LockTime;
@@ -376,6 +376,10 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 fn test_app(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/api/v1/lnurl/comments",
+            get(lnurl_comment_history::list_signed),
+        )
         .route(
             "/api/v1/recovery-address",
             put(recovery_address_registration::register).layer(DefaultBodyLimit::max(
@@ -10384,6 +10388,331 @@ async fn create_test_user(pool: &PgPool, nym: &str) -> String {
         .await
         .unwrap();
     npub
+}
+
+fn lnurl_comment_history_uri(
+    keypair: &Keypair,
+    npub: &str,
+    page: i64,
+    page_size: i64,
+    timestamp: u64,
+) -> String {
+    let message = lnurl_comment_history::build_lnurl_comment_history_message(
+        npub, page, page_size, timestamp,
+    )
+    .unwrap();
+    let signature = sign_with_keypair(keypair, &message);
+    format!(
+        "/api/v1/lnurl/comments?npub={npub}&timestamp={timestamp}&signature={signature}&page={page}&pageSize={page_size}"
+    )
+}
+
+async fn persist_evidenced_lnurl_comment(
+    pool: &PgPool,
+    owner_npub: &str,
+    nym: &str,
+    digest_byte: u8,
+    amount_msat: u64,
+    exact_comment: &str,
+) -> Uuid {
+    use pay_service::db::{
+        bind_lnurl_comment_instruction, bind_lnurl_comment_payment_evidence,
+        persist_lnurl_comment_intent, NewLnurlCommentIntent,
+    };
+    use pay_service::lnurl_comment::{LnurlCommentIntentKey, LnurlCommentRail, LnurlPayerComment};
+
+    let key = LnurlCommentIntentKey::from_digest([digest_byte; 32]);
+    let comment = LnurlPayerComment::try_from(exact_comment.to_owned()).unwrap();
+    let persisted = persist_lnurl_comment_intent(
+        pool,
+        &NewLnurlCommentIntent {
+            owner_npub,
+            nym,
+            idempotency_key: &key,
+            amount_msat,
+            comment: &comment,
+        },
+    )
+    .await
+    .unwrap();
+    let instruction_reference = format!("history-instruction-{digest_byte:02x}");
+    let evidence_reference = format!("history-evidence-{digest_byte:02x}");
+    bind_lnurl_comment_instruction(
+        pool,
+        owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        &instruction_reference,
+    )
+    .await
+    .unwrap();
+    bind_lnurl_comment_payment_evidence(
+        pool,
+        owner_npub,
+        &key,
+        LnurlCommentRail::Lightning,
+        &instruction_reference,
+        &evidence_reference,
+    )
+    .await
+    .unwrap();
+    persisted.intent_id
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn signed_lnurl_comment_history_is_private_evidence_gated_paginated_and_restart_safe() {
+    use pay_service::db::{persist_lnurl_comment_intent, NewLnurlCommentIntent};
+    use pay_service::lnurl_comment::{LnurlCommentIntentKey, LnurlPayerComment};
+
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+
+    let secp = Secp256k1::new();
+    let merchant_keypair =
+        Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x31; 32]).unwrap());
+    let other_keypair =
+        Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x32; 32]).unwrap());
+    let merchant_npub = merchant_keypair.x_only_public_key().0.to_string();
+    let other_npub = other_keypair.x_only_public_key().0.to_string();
+    let merchant_nym = "historymerchant";
+    let other_nym = "historyother";
+    pay_service::db::create_user(&admin, merchant_nym, &merchant_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&admin, other_nym, &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let merchant_comments = [
+        "Café e\u{301}\nありがとう ☕",
+        "<b>plain text only</b> & שלום",
+        "👨‍👩‍👧‍👦 merci",
+        "line one\r\nline two — exact",
+    ];
+    for (index, comment) in merchant_comments.iter().enumerate() {
+        persist_evidenced_lnurl_comment(
+            &runtime,
+            &merchant_npub,
+            merchant_nym,
+            0x10 + u8::try_from(index).unwrap(),
+            21_000 + u64::try_from(index).unwrap() * 1_000,
+            comment,
+        )
+        .await;
+    }
+
+    let abandoned_text = "abandoned intent must stay invisible";
+    let abandoned_key = LnurlCommentIntentKey::from_digest([0x20; 32]);
+    let abandoned_comment = LnurlPayerComment::try_from(abandoned_text.to_owned()).unwrap();
+    persist_lnurl_comment_intent(
+        &runtime,
+        &NewLnurlCommentIntent {
+            owner_npub: &merchant_npub,
+            nym: merchant_nym,
+            idempotency_key: &abandoned_key,
+            amount_msat: 30_000,
+            comment: &abandoned_comment,
+        },
+    )
+    .await
+    .unwrap();
+
+    let other_comment = "other merchant private comment";
+    persist_evidenced_lnurl_comment(
+        &runtime,
+        &other_npub,
+        other_nym,
+        0x30,
+        31_000,
+        other_comment,
+    )
+    .await;
+
+    let expected_order = sqlx::query_scalar::<_, String>(
+        "SELECT comment FROM lnurl_comment_intents \
+          WHERE owner_npub = $1 \
+            AND payment_evidence_reference IS NOT NULL \
+            AND payment_evidenced_at IS NOT NULL \
+          ORDER BY payment_evidenced_at DESC, intent_id DESC",
+    )
+    .bind(&merchant_npub)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(expected_order.len(), merchant_comments.len());
+
+    // Simulate process loss at the persistence boundary: discard every
+    // runtime connection, reconnect with the restricted role, and serve only
+    // from durable migration-060 state.
+    runtime.close().await;
+    let restarted_runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(restarted_runtime.clone()));
+    let timestamp = auth_timestamp();
+
+    let log_writer = CapturedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(log_writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let page_one_uri =
+        lnurl_comment_history_uri(&merchant_keypair, &merchant_npub, 1, 2, timestamp);
+    let (page_one_status, page_one_headers, page_one) =
+        get_json_with_headers(&app, &page_one_uri).await;
+    assert_eq!(page_one_status, StatusCode::OK, "{page_one:?}");
+    assert_eq!(
+        page_one_headers.get("cache-control").unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(page_one_headers.get("pragma").unwrap(), "no-cache");
+    assert_eq!(page_one["page"], 1);
+    assert_eq!(page_one["pageSize"], 2);
+    assert_eq!(page_one["has_more"], true);
+    assert_eq!(page_one["comments"].as_array().unwrap().len(), 2);
+
+    // Stable ordering means an exact retry returns byte-for-byte equivalent
+    // JSON, including the UUID tie-break used by PostgreSQL.
+    let (retry_status, page_one_retry) = get_path(&app, &page_one_uri).await;
+    assert_eq!(retry_status, StatusCode::OK);
+    assert_eq!(page_one_retry, page_one);
+
+    let page_two_uri =
+        lnurl_comment_history_uri(&merchant_keypair, &merchant_npub, 2, 2, timestamp);
+    let (page_two_status, page_two) = get_path(&app, &page_two_uri).await;
+    assert_eq!(page_two_status, StatusCode::OK, "{page_two:?}");
+    assert_eq!(page_two["has_more"], false);
+    assert_eq!(page_two["comments"].as_array().unwrap().len(), 2);
+
+    let observed_order = page_one["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(page_two["comments"].as_array().unwrap())
+        .map(|item| item["comment"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(observed_order, expected_order);
+    for (actual, expected) in observed_order.iter().zip(expected_order.iter()) {
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+    for item in page_one["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(page_two["comments"].as_array().unwrap())
+    {
+        let object = item.as_object().unwrap();
+        assert_eq!(object.len(), 5);
+        for expected_key in [
+            "intent_id",
+            "nym",
+            "amount_msat",
+            "comment",
+            "received_at_unix",
+        ] {
+            assert!(object.contains_key(expected_key));
+        }
+        for forbidden_key in [
+            "owner_npub",
+            "idempotency_key",
+            "instruction",
+            "instruction_reference",
+            "payment_evidence",
+            "payment_evidence_reference",
+            "created_at_unix",
+        ] {
+            assert!(!object.contains_key(forbidden_key));
+        }
+    }
+
+    let page_three_uri =
+        lnurl_comment_history_uri(&merchant_keypair, &merchant_npub, 3, 2, timestamp);
+    let (page_three_status, page_three) = get_path(&app, &page_three_uri).await;
+    assert_eq!(page_three_status, StatusCode::OK);
+    assert_eq!(page_three["comments"], json!([]));
+    assert_eq!(page_three["has_more"], false);
+
+    // A second valid identity sees only its own evidence-bound row.
+    let other_uri = lnurl_comment_history_uri(&other_keypair, &other_npub, 1, 10, timestamp);
+    let (other_status, other_body) = get_path(&app, &other_uri).await;
+    assert_eq!(other_status, StatusCode::OK);
+    assert_eq!(other_body["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(other_body["comments"][0]["comment"], other_comment);
+
+    // Signing merchant A's query with merchant B's key cannot cross the
+    // structural npub filter.
+    let forged_message =
+        lnurl_comment_history::build_lnurl_comment_history_message(&merchant_npub, 1, 2, timestamp)
+            .unwrap();
+    let forged_signature = sign_with_keypair(&other_keypair, &forged_message);
+    let forged_uri = format!(
+        "/api/v1/lnurl/comments?npub={merchant_npub}&timestamp={timestamp}&signature={forged_signature}&page=1&pageSize=2"
+    );
+    let (forged_status, forged_body) = get_path(&app, &forged_uri).await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED);
+    assert!(forged_body.get("comments").is_none());
+
+    // Page and pageSize are signed; replaying page-one authorization against
+    // another page cannot reveal a different portion of history.
+    let page_one_signature = page_one_uri
+        .split("signature=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let tampered_uri = format!(
+        "/api/v1/lnurl/comments?npub={merchant_npub}&timestamp={timestamp}&signature={page_one_signature}&page=2&pageSize=2"
+    );
+    let (tampered_status, tampered_body) = get_path(&app, &tampered_uri).await;
+    assert_eq!(tampered_status, StatusCode::UNAUTHORIZED);
+    assert!(tampered_body.get("comments").is_none());
+
+    // Even a valid key cannot use a non-canonical textual npub alias.
+    let uppercase_npub = merchant_npub.to_uppercase();
+    let uppercase_message = pay_service::auth::build_la_v2_message(
+        lnurl_comment_history::ACTION_LNURL_COMMENT_HISTORY,
+        &uppercase_npub,
+        "",
+        &["1", "2"],
+        timestamp,
+    );
+    let uppercase_signature = sign_with_keypair(&merchant_keypair, &uppercase_message);
+    let uppercase_uri = format!(
+        "/api/v1/lnurl/comments?npub={uppercase_npub}&timestamp={timestamp}&signature={uppercase_signature}&page=1&pageSize=2"
+    );
+    let (uppercase_status, uppercase_body) = get_path(&app, &uppercase_uri).await;
+    assert_eq!(uppercase_status, StatusCode::UNAUTHORIZED);
+    assert!(uppercase_body.get("comments").is_none());
+
+    let (anonymous_status, anonymous_body) = get_path(&app, "/api/v1/lnurl/comments").await;
+    assert_eq!(anonymous_status, StatusCode::BAD_REQUEST);
+    assert!(anonymous_body.get("comments").is_none());
+
+    let all_wire = format!(
+        "{page_one} {page_two} {page_three} {other_body} {forged_body} {tampered_body} {uppercase_body} {anonymous_body}"
+    );
+    assert!(!all_wire.contains(abandoned_text));
+    assert!(!format!("{page_one} {page_two} {page_three}").contains(other_comment));
+    let logs = log_writer.contents();
+    for private_value in merchant_comments
+        .iter()
+        .copied()
+        .chain([abandoned_text, other_comment])
+        .chain([
+            "history-instruction-10",
+            "history-evidence-10",
+            abandoned_key.as_str(),
+        ])
+    {
+        assert!(!logs.contains(private_value), "private value reached logs");
+    }
+
+    drop(app);
+    restarted_runtime.close().await;
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]

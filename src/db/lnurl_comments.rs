@@ -19,7 +19,8 @@ use crate::lnurl_comment::{
 /// PostgreSQL advisory-lock class (ASCII `LCMT`) for one merchant/intent key.
 const LNURL_COMMENT_LOCK_CLASS: i32 = 1_280_474_196;
 const REFERENCE_MAX_BYTES: usize = 255;
-const MAX_AUTHENTICATED_HISTORY_PAGE: u16 = 100;
+pub const MAX_AUTHENTICATED_HISTORY_PAGE_SIZE: u16 = 100;
+pub const MAX_AUTHENTICATED_HISTORY_PAGE_NUMBER: u16 = 1_000;
 
 const INTENT_COLUMNS: &str = "intent_id, owner_npub, nym, idempotency_key, \
     amount_msat, comment, comment_grapheme_count, instruction_rail, \
@@ -101,6 +102,16 @@ pub struct LnurlCommentIntent {
     pub instruction: Option<LnurlCommentInstruction>,
     pub payment_evidence: Option<LnurlCommentPaymentEvidence>,
     pub created_at_unix: i64,
+}
+
+/// One bounded, evidence-gated merchant history page.
+///
+/// This remains an internal persistence type: the HTTP boundary must project
+/// each intent into a narrower DTO that omits owner keys, idempotency keys,
+/// provider references, and payment-evidence references.
+pub struct AuthenticatedLnurlCommentHistoryPage {
+    pub intents: Vec<LnurlCommentIntent>,
+    pub has_more: bool,
 }
 
 impl LnurlCommentIntent {
@@ -541,12 +552,42 @@ pub async fn list_received_lnurl_comments_for_authenticated_merchant(
     authenticated_owner_npub: &str,
     limit: u16,
 ) -> Result<Vec<LnurlCommentIntent>, LnurlCommentPersistenceError> {
+    Ok(
+        list_received_lnurl_comments_page_for_authenticated_merchant(
+            pool,
+            authenticated_owner_npub,
+            1,
+            limit,
+        )
+        .await?
+        .intents,
+    )
+}
+
+/// Evidence-gated, stably ordered page for an already-authenticated merchant.
+///
+/// Page bounds are enforced again here rather than trusting the HTTP layer.
+/// `LIMIT page_size + 1` proves `has_more` without exposing an unbounded query,
+/// and the UUID tie-break makes equal evidence timestamps deterministic.
+pub async fn list_received_lnurl_comments_page_for_authenticated_merchant(
+    pool: &PgPool,
+    authenticated_owner_npub: &str,
+    page: u16,
+    page_size: u16,
+) -> Result<AuthenticatedLnurlCommentHistoryPage, LnurlCommentPersistenceError> {
     validate_npub(authenticated_owner_npub)?;
-    if limit == 0 || limit > MAX_AUTHENTICATED_HISTORY_PAGE {
+    if page == 0 || page > MAX_AUTHENTICATED_HISTORY_PAGE_NUMBER {
         return Err(LnurlCommentPersistenceError::InvalidInput {
-            field: "history_limit",
+            field: "history_page",
         });
     }
+    if page_size == 0 || page_size > MAX_AUTHENTICATED_HISTORY_PAGE_SIZE {
+        return Err(LnurlCommentPersistenceError::InvalidInput {
+            field: "history_page_size",
+        });
+    }
+    let offset = i64::from(page - 1) * i64::from(page_size);
+    let fetch_limit = i64::from(page_size) + 1;
     let rows = sqlx::query_as::<_, LnurlCommentIntentDbRow>(&format!(
         "SELECT {INTENT_COLUMNS} \
            FROM lnurl_comment_intents \
@@ -554,13 +595,20 @@ pub async fn list_received_lnurl_comments_for_authenticated_merchant(
             AND payment_evidence_reference IS NOT NULL \
             AND payment_evidenced_at IS NOT NULL \
           ORDER BY payment_evidenced_at DESC, intent_id DESC \
-          LIMIT $2"
+          LIMIT $2 OFFSET $3"
     ))
     .bind(authenticated_owner_npub)
-    .bind(i64::from(limit))
+    .bind(fetch_limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(TryInto::try_into).collect()
+    let has_more = rows.len() > usize::from(page_size);
+    let intents = rows
+        .into_iter()
+        .take(usize::from(page_size))
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AuthenticatedLnurlCommentHistoryPage { intents, has_more })
 }
 
 async fn lock_intent(
