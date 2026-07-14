@@ -1,5 +1,6 @@
 mod bitcoin_recovery_fee_authority;
 mod chain_swap_attempts;
+mod chain_swap_cooperative_signing;
 mod chain_swap_renegotiations;
 mod chain_swaps;
 mod direct_payments;
@@ -22,6 +23,7 @@ mod watcher;
 
 pub use bitcoin_recovery_fee_authority::*;
 pub use chain_swap_attempts::*;
+pub use chain_swap_cooperative_signing::*;
 pub use chain_swap_renegotiations::*;
 pub use chain_swaps::*;
 pub use direct_payments::*;

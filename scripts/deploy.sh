@@ -182,6 +182,11 @@ migration_056_boundary_ready() {
     "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
+migration_057_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-057-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
 automatic_binary_rollback_allowed() {
   local previous_schema candidate_schema previous_version candidate_version transition_count
   [[ -s "$previous_build_info" && -s "$candidate_build_info" ]] || {
@@ -214,6 +219,14 @@ automatic_binary_rollback_allowed() {
       && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
            || ((10#$previous_version < 56)); }; then
     echo "automatic rollback refused: migration 056 is a roll-forward-only renegotiation-intent boundary" >&2
+    return 1
+  fi
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 57)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 57)); }; then
+    echo "automatic rollback refused: migration 057 is a roll-forward-only cooperative-signing-intent boundary" >&2
     return 1
   fi
 
@@ -318,6 +331,17 @@ deployment refused before build: migration 056 is absent or its exact runtime bo
 Stop payservice and every database writer, apply migration 056 with
 --set runtime_role=bullnym_app as the distinct privileged schema owner, then
 rerun this script. Never fabricate operation rows for historical renegotiations.
+EOF
+    exit 1
+  fi
+fi
+if [[ -f "$REPO/migrations/057_chain_swap_cooperative_signing_operations.sql" ]]; then
+  if ! migration_057_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 057 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, apply migration 057 with
+--set runtime_role=bullnym_app as the distinct privileged schema owner, then
+rerun this script. Never fabricate cooperative signing operation evidence.
 EOF
     exit 1
   fi

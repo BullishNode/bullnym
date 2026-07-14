@@ -44,13 +44,14 @@ direct_transition_history_count() {
 expect_refusal() {
   local previous="$1"
   local candidate="$2"
+  local boundary="$3"
   printf '%s\n' "$previous" > "$previous_build_info"
   printf '%s\n' "$candidate" > "$candidate_build_info"
   if automatic_binary_rollback_allowed >"$tmp/stdout" 2>"$tmp/stderr"; then
     fail "rollback unexpectedly allowed from $candidate to $previous"
   fi
   grep -Fq \
-    'migration 056 is a roll-forward-only renegotiation-intent boundary' \
+    "$boundary" \
     "$tmp/stderr" \
     || fail "rollback refusal for $candidate to $previous named the wrong boundary"
 }
@@ -64,9 +65,13 @@ expect_allowed() {
     || fail "rollback unexpectedly refused from $candidate to $previous"
 }
 
-expect_refusal 055_merchant_settlement_lifecycle 056_chain_swap_renegotiation_journal
-expect_refusal 055_merchant_settlement_lifecycle 057_later_schema
+expect_refusal 055_merchant_settlement_lifecycle 056_chain_swap_renegotiation_journal \
+  'migration 056 is a roll-forward-only renegotiation-intent boundary'
+expect_refusal 055_merchant_settlement_lifecycle 057_chain_swap_cooperative_signing_operations \
+  'migration 056 is a roll-forward-only renegotiation-intent boundary'
+expect_refusal 056_chain_swap_renegotiation_journal 057_chain_swap_cooperative_signing_operations \
+  'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
 expect_allowed 056_chain_swap_renegotiation_journal 056_chain_swap_renegotiation_journal
-expect_allowed 056_chain_swap_renegotiation_journal 057_later_schema
+expect_allowed 057_chain_swap_cooperative_signing_operations 057_chain_swap_cooperative_signing_operations
 
 echo "renegotiation rollback checks passed"

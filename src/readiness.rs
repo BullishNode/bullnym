@@ -622,6 +622,170 @@ SELECT
     )
 "#;
 
+const CHAIN_SWAP_COOPERATIVE_SIGNING_INVARIANTS_SQL: &str = r#"
+SELECT
+    to_regclass('public.chain_swap_cooperative_signing_operations') IS NOT NULL
+    AND (SELECT COUNT(*) = 60
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'chain_swap_cooperative_signing_operations')
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('request_transaction_txid', 'text', 'NO'),
+              ('secret_nonce_encryption_nonce', 'bytea', 'NO'),
+              ('secret_nonce_ciphertext', 'bytea', 'NO'),
+              ('provider_response_sha256', 'text', 'YES'),
+              ('final_transaction_hex', 'text', 'YES'),
+              ('local_partial_signature_sha256', 'text', 'YES'),
+              ('superseded_reason', 'text', 'YES')
+          ) required(column_name, data_type, is_nullable)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns column_info
+              WHERE column_info.table_schema = 'public'
+                AND column_info.table_name =
+                    'chain_swap_cooperative_signing_operations'
+                AND column_info.column_name = required.column_name
+                AND column_info.data_type = required.data_type
+                AND column_info.is_nullable = required.is_nullable
+         )
+    )
+    AND (SELECT COUNT(*) = 14
+           FROM pg_constraint
+          WHERE conrelid =
+                to_regclass('public.chain_swap_cooperative_signing_operations')
+            AND contype = 'c')
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_cooperative_signing_state_check'),
+              ('chain_swap_cooperative_signing_exact_fee_check'),
+              ('chain_swap_cooperative_signing_fee_authority_check'),
+              ('chain_swap_cooperative_signing_request_check'),
+              ('chain_swap_cooperative_signing_secret_nonce_check'),
+              ('chain_swap_cooperative_signing_response_check'),
+              ('chain_swap_cooperative_signing_completion_check'),
+              ('chain_swap_cooperative_signing_lifecycle_shape_check')
+          ) required(constraint_name)
+         WHERE NOT EXISTS (
+             SELECT 1 FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                    to_regclass('public.chain_swap_cooperative_signing_operations')
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype = 'c'
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid =
+               to_regclass('public.chain_swap_cooperative_signing_operations')
+           AND confrelid = to_regclass('public.chain_swap_records')
+           AND conname = 'chain_swap_cooperative_signing_chain_fkey'
+           AND contype = 'f' AND convalidated
+           AND confupdtype = 'r' AND confdeltype = 'r'
+           AND NOT condeferrable AND NOT condeferred
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid =
+               to_regclass('public.chain_swap_cooperative_signing_operations')
+           AND conname = 'chain_swap_cooperative_signing_response_check'
+           AND pg_get_constraintdef(oid) LIKE
+               '%bullnym:cooperative-signing-provider-response:v1:%'
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid =
+               to_regclass('public.chain_swap_cooperative_signing_operations')
+           AND conname = 'chain_swap_cooperative_signing_completion_check'
+           AND pg_get_constraintdef(oid) LIKE
+               '%final_txid = request_transaction_txid%'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_cooperative_signing_validate_insert',
+                  'enforce_chain_swap_cooperative_signing_insert'),
+              ('chain_swap_cooperative_signing_validate_update',
+                  'enforce_chain_swap_cooperative_signing_update'),
+              ('chain_swap_cooperative_signing_reject_delete',
+                  'reject_chain_swap_cooperative_signing_delete')
+          ) required(trigger_name, function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+              WHERE relation_namespace.nspname = 'public'
+                AND relation.relname =
+                    'chain_swap_cooperative_signing_operations'
+                AND trigger_info.tgname = required.trigger_name
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled = 'O'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'chain_swap_cooperative_signing_operations'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+           AND NOT EXISTS (
+               SELECT 1 FROM aclexplode(COALESCE(
+                   relation.relacl, acldefault('r', relation.relowner)
+               )) acl WHERE acl.grantee = 0
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_chain_swap_cooperative_signing_insert'),
+              ('enforce_chain_swap_cooperative_signing_update'),
+              ('reject_chain_swap_cooperative_signing_delete')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user, pg_get_userbyid(function_info.proowner), 'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user, pg_get_userbyid(function_info.proowner), 'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+         )
+    )
+"#;
+
 type DirectLifecyclePrivileges = (
     Option<bool>,
     Option<bool>,
@@ -746,6 +910,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !merchant_settlement_trigger_invariants_present(pool).await?
         || !merchant_settlement_privileges_present(pool).await?
         || !chain_swap_renegotiation_invariants_present(pool).await?
+        || !chain_swap_cooperative_signing_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -898,6 +1063,14 @@ async fn chain_swap_renegotiation_invariants_present(
     pool: &sqlx::PgPool,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(CHAIN_SWAP_RENEGOTIATION_INVARIANTS_SQL)
+        .fetch_one(pool)
+        .await
+}
+
+async fn chain_swap_cooperative_signing_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(CHAIN_SWAP_COOPERATIVE_SIGNING_INVARIANTS_SQL)
         .fetch_one(pool)
         .await
 }

@@ -326,6 +326,36 @@ curl --fail --silent --show-error http://127.0.0.1:8080/ready
 curl --fail --silent --show-error http://127.0.0.1:8080/version
 ```
 
+## Migration 057 cooperative-signing boundary
+
+Migration 057 is a stopped-writer, roll-forward-only boundary. Stop
+`bullnym.service` and every database writer, then apply
+`migrations/057_chain_swap_cooperative_signing_operations.sql` as the same
+distinct protected schema owner used for migrations 053–056. Pass
+`--set runtime_role=bullnym_app`; never apply it as `bullnym_app`, never
+backfill historical provider calls, and never start a pre-057 writer after it
+commits.
+
+Before restarting, verify the runtime view through the protected runtime
+environment. This proves the exact 60-column journal, state/fee/digest
+constraints, RESTRICT parent identity, active index, trigger bindings,
+non-assumable owner, runtime `SELECT/INSERT/UPDATE` ACL, absent PUBLIC/function
+authority, and absence of generated sequence authority.
+
+```bash
+sudo /opt/bullnym/bullnym/scripts/check-migration-057-boundary.sh \
+  /etc/bullnym/bullnym.env bullnym_app bullnym
+```
+
+The signing executor may issue its single provider request only after the
+outer transaction containing exact preparation and `prepared -> requested`
+commits under `chain-claim:<id>`. Completion must insert the exact immutable
+`btc_recovery` attempt and advance `response_received -> completed` in one
+transaction. An ambiguous request is never posted again; it can only receive
+the exact late response or become `superseded` at unilateral timeout. The
+generic deploy preflight verifies this boundary and refuses automatic rollback
+across schema 057.
+
 ## Reproducing a prior artifact
 
 1. Check out the Bullnym `build_commit` from its preserved release record.
