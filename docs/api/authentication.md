@@ -40,7 +40,6 @@ unlinked invoice operations it is the empty string.
 | create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, `public_description`, `recipient_name`, `invoice_number`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
-| recover chain swap | `invoice-recover` | `invoice_id`, `btc_address` |
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 | register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
 | look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |
@@ -56,9 +55,9 @@ SHA-256 digest of UTF-8 `reservations:<nym>:<ts>` and send it as `sig`.
 
 Sign immediately before sending. A retry within the 300-second window may
 reuse the request; after that, rebuild the timestamp and signature. Registration
-reactivation, cancellation, same-address completed recovery, and most reads are
-safe to retry. Invoice creation can create another receivable if the first
-response was lost; clients should reconcile through the signed list endpoint
-before creating a replacement. Recovery-address registration is idempotent only
+reactivation, cancellation, and most reads are safe to retry. A lost invoice
+creation response may hide a newly created receivable; clients should reconcile
+through the signed list endpoint before creating a replacement.
+Recovery-address registration is idempotent only
 for the exact signed request: rebuilding its timestamp or signature appends a
 new immutable policy version, even when the address is unchanged.

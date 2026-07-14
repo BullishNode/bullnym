@@ -37,7 +37,6 @@ or linked/unlinked invoice scopes.
 | `invoice-create` | `npub` | Amount, accepted rails, recipient-supplied addresses, metadata, expiry. |
 | `invoice-cancel` | `npub` | Invoice id. |
 | `invoice-list` | `npub` | List filters and pagination. |
-| `invoice-recover` | `npub` | Invoice id and Bitcoin recovery address for chain-swap recovery. |
 
 ## Descriptor Ownership
 
