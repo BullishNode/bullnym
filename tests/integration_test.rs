@@ -9678,7 +9678,7 @@ async fn registration_lifecycle_keeps_address_index_monotonic() {
         .unwrap()
         .unwrap();
     let reactivated =
-        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5)
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5, 0)
             .await
             .unwrap();
     match reactivated {
@@ -16143,16 +16143,32 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, None, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-0",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        0,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
         .execute(&pool)
         .await
         .unwrap();
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, None, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-1",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        0,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
         .execute(&pool)
         .await
@@ -16227,6 +16243,56 @@ async fn register_concurrent_does_not_exceed_cap() {
         .await
         .unwrap();
     assert_eq!(count, 3, "lifetime cap must hold under contention");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn concurrent_registrations_respect_global_active_user_ceiling() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let npub_a = "41".repeat(32);
+    let npub_b = "42".repeat(32);
+    let register_a = pay_service::db::register_user_atomic(
+        &pool,
+        &npub_a,
+        "active-cap-a",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        1,
+    );
+    let register_b = pay_service::db::register_user_atomic(
+        &pool,
+        &npub_b,
+        "active-cap-b",
+        TEST_DESCRIPTOR,
+        None,
+        3,
+        1,
+    );
+    let (outcome_a, outcome_b) = tokio::join!(register_a, register_b);
+    let outcomes = [outcome_a.unwrap(), outcome_b.unwrap()];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, pay_service::db::RegisterOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                pay_service::db::RegisterOutcome::ActiveUserCapacityReached { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(pay_service::db::count_active_users(&pool).await.unwrap(), 1);
 
     cleanup_db(&pool).await;
 }

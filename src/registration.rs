@@ -152,12 +152,6 @@ pub async fn register(
         Some(&req.npub),
     );
 
-    // Hard ceiling on active users. New registrations are blocked once
-    // the cap is reached; updates / lookups / deletes still work.
-    if !is_whitelisted {
-        state.rate_limiter.check_max_active_users().await?;
-    }
-
     if !NYM_REGEX.is_match(&req.nym) {
         return Err(AppError::NymInvalid(
             "must be 1-32 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen"
@@ -215,6 +209,11 @@ pub async fn register(
     // re-registering the original nym reactivates the same row so swap
     // history follows the FK; a different nym becomes a fresh row.
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
+    let active_cap = if is_whitelisted {
+        0
+    } else {
+        i64::from(state.config.rate_limit.max_active_users)
+    };
     match db::register_user_atomic(
         &state.db,
         &req.npub,
@@ -222,6 +221,7 @@ pub async fn register(
         &req.ct_descriptor,
         verification_npub,
         cap,
+        active_cap,
     )
     .await?
     {
@@ -234,6 +234,11 @@ pub async fn register(
         }
         db::RegisterOutcome::QuotaExceeded { used, cap } => {
             return Err(AppError::NymQuotaExceeded { used, cap });
+        }
+        db::RegisterOutcome::ActiveUserCapacityReached { active, cap } => {
+            return Err(AppError::ServiceUnavailable(format!(
+                "active user ceiling reached ({active} >= {cap})"
+            )));
         }
     }
 

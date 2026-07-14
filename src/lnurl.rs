@@ -168,7 +168,7 @@ pub(crate) async fn gate_metadata_per_ip(
     ) {
         return Ok(());
     }
-    state.rate_limiter.check_metadata_per_ip(ip).await?;
+    state.rate_limiter.check_api_per_ip(ip).await?;
     if let Some(n) = nym {
         state
             .rate_limiter

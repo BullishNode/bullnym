@@ -156,6 +156,19 @@ fn rate_limit_invoice_status_accepts_legacy_key() {
 }
 
 #[test]
+fn api_rate_limit_accepts_current_and_legacy_keys() {
+    let current: RateLimitConfig =
+        toml::from_str("api_rate_limit = 41\napi_rate_window_secs = 71").unwrap();
+    assert_eq!(current.api_rate_limit, 41);
+    assert_eq!(current.api_rate_window_secs, 71);
+
+    let legacy: RateLimitConfig =
+        toml::from_str("metadata_rate_limit = 42\nmetadata_rate_window_secs = 72").unwrap();
+    assert_eq!(legacy.api_rate_limit, 42);
+    assert_eq!(legacy.api_rate_window_secs, 72);
+}
+
+#[test]
 fn donation_image_default_dimension_bounds_decode_memory() {
     let cfg = DonationConfig::default();
 
@@ -194,6 +207,99 @@ fn production_base_config() -> Config {
         boltz_webhook_url_secret: "webhook-secret".to_string(),
         boltz_webhook_url_secret_previous: String::new(),
     }
+}
+
+#[test]
+fn config_rejects_unknown_root_and_nested_fields() {
+    let unknown_root = r#"
+domain = "pay.example.com"
+listen = "127.0.0.1:8080"
+pool_sze = 10
+
+[boltz]
+api_url = "https://api.boltz.exchange/v2"
+electrum_url = "ssl://liquid-electrum.example.com:50002"
+"#;
+    assert!(toml::from_str::<Config>(unknown_root).is_err());
+
+    let unknown_nested = r#"
+domain = "pay.example.com"
+listen = "127.0.0.1:8080"
+
+[boltz]
+api_url = "https://api.boltz.exchange/v2"
+electrum_url = "ssl://liquid-electrum.example.com:50002"
+
+[workers]
+enable = true
+"#;
+    assert!(toml::from_str::<Config>(unknown_nested).is_err());
+}
+
+#[test]
+fn checked_in_config_keeps_legacy_alias_compatibility() {
+    let parsed: Config = toml::from_str(include_str!("../../config.toml")).unwrap();
+
+    assert_eq!(parsed.rate_limit.api_rate_limit, 30);
+    assert_eq!(parsed.rate_limit.api_rate_window_secs, 60);
+    parsed
+        .validate_for_runtime("development", false)
+        .unwrap();
+}
+
+#[test]
+fn common_validation_rejects_hot_loops_and_unsafe_values() {
+    let mut config = production_base_config();
+    config.reconciler.interval_secs = 0;
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("reconciler.interval_secs"));
+
+    let mut config = production_base_config();
+    config.invoice_accounting.liquid_shortfall_tolerance_sat = -1;
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("shortfall tolerances"));
+
+    let mut config = production_base_config();
+    config.rate_limit.global_electrum_rate_per_sec = 0;
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("global_electrum_rate_per_sec"));
+
+    let mut config = production_base_config();
+    config.rate_limit.api_rate_limit = 1;
+    config.rate_limit.api_rate_window_secs = 0;
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("api_rate_window_secs"));
+}
+
+#[test]
+fn common_validation_rejects_malformed_shared_endpoints_and_secrets() {
+    let mut config = production_base_config();
+    config.boltz.api_url = "https://user@example.com/v2".to_string();
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("boltz.api_url"));
+
+    let mut config = production_base_config();
+    config.boltz_webhook_url_secret = "not/a/path-segment".to_string();
+    assert!(config
+        .validate_for_runtime("development", false)
+        .unwrap_err()
+        .to_string()
+        .contains("BOLTZ_WEBHOOK_URL_SECRET"));
 }
 
 fn fee_source(id: &str, endpoint: &str) -> FeeSourceConfig {
@@ -651,6 +757,26 @@ fn production_rejects_localhost_domain() {
     let err = cfg.validate_for_runtime("production", false).unwrap_err();
 
     assert!(err.to_string().contains("domain must not be localhost"));
+}
+
+#[test]
+fn production_rejects_loopback_ip_domain() {
+    let mut cfg = production_base_config();
+    cfg.domain = "127.0.0.1:8080".to_string();
+
+    let err = cfg.validate_for_runtime("production", false).unwrap_err();
+
+    assert!(err.to_string().contains("loopback IP"));
+}
+
+#[test]
+fn production_rejects_ipv6_loopback_domain() {
+    let mut cfg = production_base_config();
+    cfg.domain = "[::1]:8080".to_string();
+
+    let err = cfg.validate_for_runtime("production", false).unwrap_err();
+
+    assert!(err.to_string().contains("loopback IP"));
 }
 
 #[test]
