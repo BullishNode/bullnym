@@ -1210,32 +1210,76 @@ fn unrecorded_rebroadcast_update_required(
     }
 }
 
+fn parent_transition_target(
+    path: MerchantSettlementPath,
+    previous_status: &str,
+    finalized: bool,
+    exact_stuck_liquid_journal: bool,
+) -> Option<&'static str> {
+    match path {
+        MerchantSettlementPath::LiquidClaim
+            if matches!(previous_status, "claiming" | "claimed" | "claim_failed")
+                || (previous_status == "claim_stuck" && exact_stuck_liquid_journal) =>
+        {
+            Some(if finalized { "claimed" } else { "claiming" })
+        }
+        MerchantSettlementPath::BitcoinRecovery
+            if matches!(previous_status, "refunding" | "refunded") =>
+        {
+            Some(if finalized { "refunded" } else { "refunding" })
+        }
+        _ => None,
+    }
+}
+
 async fn transition_parent_locked(
     tx: &mut Transaction<'_, Postgres>,
     snapshot: &MerchantSettlementAdoptionSnapshot,
 ) -> Result<MerchantSettlementParentTransition, MerchantSettlementRepositoryError> {
-    let (previous_status, claim_txid, refund_txid): (String, Option<String>, Option<String>) =
-        sqlx::query_as(
-            "SELECT status, claim_txid, refund_txid FROM chain_swap_records WHERE id = $1 FOR UPDATE",
-        )
-        .bind(snapshot.context.chain_swap_id())
-        .fetch_one(&mut **tx)
-        .await?;
+    let (previous_status, claim_txid, claim_tx_hex, refund_txid): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, claim_txid, claim_tx_hex, refund_txid \
+           FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(snapshot.context.chain_swap_id())
+    .fetch_one(&mut **tx)
+    .await?;
     let finalized = snapshot.lifecycle.accounting == SettlementAccountingState::Finalized;
     let active_txid = snapshot.lifecycle.active_txid.as_str();
-    let (current_status, allowed) = match snapshot.context.path() {
-        MerchantSettlementPath::LiquidClaim => (
-            if finalized { "claimed" } else { "claiming" },
-            matches!(previous_status.as_str(), "claiming" | "claimed"),
-        ),
-        MerchantSettlementPath::BitcoinRecovery => (
-            if finalized { "refunded" } else { "refunding" },
-            matches!(previous_status.as_str(), "refunding" | "refunded"),
-        ),
+    let exact_stuck_liquid_journal = if snapshot.context.path()
+        == MerchantSettlementPath::LiquidClaim
+        && previous_status == "claim_stuck"
+    {
+        let Some(claim_tx_hex) = claim_tx_hex.as_deref() else {
+            return Err(MerchantSettlementRepositoryError::MissingJournal);
+        };
+        sqlx::query_scalar::<_, bool>(
+            "SELECT TRUE FROM chain_swap_tx_attempts \
+              WHERE chain_swap_id = $1 AND txid = $2 \
+                AND purpose IN ('liquid_claim','liquid_claim_replacement') \
+                AND raw_tx_hex = $3 AND status <> 'integrity_hold' \
+              FOR UPDATE",
+        )
+        .bind(snapshot.context.chain_swap_id())
+        .bind(active_txid)
+        .bind(claim_tx_hex)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(false)
+    } else {
+        false
     };
-    if !allowed {
-        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
-    }
+    let current_status = parent_transition_target(
+        snapshot.context.path(),
+        &previous_status,
+        finalized,
+        exact_stuck_liquid_journal,
+    )
+    .ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?;
     let prior_txid = match snapshot.context.path() {
         MerchantSettlementPath::LiquidClaim => claim_txid.as_deref(),
         MerchantSettlementPath::BitcoinRecovery => refund_txid.as_deref(),
@@ -1250,6 +1294,8 @@ async fn transition_parent_locked(
                 sqlx::query(
                     "UPDATE chain_swap_records SET status = $2, \
                          claim_txid = CASE WHEN $2 = 'claimed' THEN $3 ELSE claim_txid END, \
+                         last_claim_error = NULL, last_claim_error_at = NULL, \
+                         next_claim_attempt_at = NULL, \
                          updated_at = NOW() WHERE id = $1",
                 )
                 .bind(snapshot.context.chain_swap_id())
@@ -2331,6 +2377,102 @@ mod tests {
                 exact_liquid_journal_disposition(status),
                 Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
             ));
+        }
+    }
+
+    #[test]
+    fn parent_transition_accepts_only_exact_liquid_failure_recovery() {
+        for previous in ["claiming", "claimed", "claim_failed"] {
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::LiquidClaim,
+                    previous,
+                    false,
+                    false,
+                ),
+                Some("claiming")
+            );
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::LiquidClaim,
+                    previous,
+                    true,
+                    false,
+                ),
+                Some("claimed")
+            );
+        }
+        assert_eq!(
+            parent_transition_target(
+                MerchantSettlementPath::LiquidClaim,
+                "claim_stuck",
+                false,
+                true,
+            ),
+            Some("claiming")
+        );
+        assert_eq!(
+            parent_transition_target(
+                MerchantSettlementPath::LiquidClaim,
+                "claim_stuck",
+                true,
+                true,
+            ),
+            Some("claimed")
+        );
+        assert_eq!(
+            parent_transition_target(
+                MerchantSettlementPath::LiquidClaim,
+                "claim_stuck",
+                true,
+                false,
+            ),
+            None
+        );
+        for previous in ["pending", "refunding", "refunded", "expired"] {
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::LiquidClaim,
+                    previous,
+                    true,
+                    true,
+                ),
+                None,
+                "{previous}"
+            );
+        }
+
+        for previous in ["refunding", "refunded"] {
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::BitcoinRecovery,
+                    previous,
+                    false,
+                    true,
+                ),
+                Some("refunding")
+            );
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::BitcoinRecovery,
+                    previous,
+                    true,
+                    true,
+                ),
+                Some("refunded")
+            );
+        }
+        for previous in ["claim_failed", "claim_stuck", "claiming", "claimed"] {
+            assert_eq!(
+                parent_transition_target(
+                    MerchantSettlementPath::BitcoinRecovery,
+                    previous,
+                    true,
+                    true,
+                ),
+                None,
+                "{previous}"
+            );
         }
     }
 

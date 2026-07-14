@@ -16507,6 +16507,15 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
         .apply_verified_confirmation(&one_confirmation)
         .unwrap();
     let confirmed_snapshot = service.snapshot();
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'claim_failed', \
+             last_claim_error = 'ambiguous broadcast', last_claim_error_at = NOW(), \
+             next_claim_attempt_at = NOW() WHERE id = $1",
+    )
+    .bind(swap_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     let confirmed = pay_service::db::persist_merchant_settlement_outcome(
         &pool,
         0,
@@ -16519,9 +16528,18 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     .unwrap();
     assert_eq!(confirmed.checkpoint_version, 1);
     assert!(!confirmed.journal_rebroadcast_required);
-    assert_eq!(confirmed.parent_transition.previous_status, "claiming");
+    assert_eq!(confirmed.parent_transition.previous_status, "claim_failed");
     assert_eq!(confirmed.parent_transition.current_status, "claiming");
-    assert!(!confirmed.parent_transition.changed);
+    assert!(confirmed.parent_transition.changed);
+    let cleared_confirmed_failure: (Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT last_claim_error, last_claim_error_at IS NULL, next_claim_attempt_at IS NULL \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared_confirmed_failure, (None, true, true));
     let confirmed_event: (i64, String, bool, String, String) = sqlx::query_as(
         "SELECT amount_sat, accounting_state, merchant_settlement_finalized, source, rail \
            FROM invoice_payment_events WHERE merchant_chain_swap_id = $1",
@@ -16570,6 +16588,15 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
         .apply_verified_confirmation(&final_confirmation)
         .unwrap();
     let finalized_snapshot = service.snapshot();
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'claim_stuck', \
+             last_claim_error = 'retry budget exhausted', last_claim_error_at = NOW(), \
+             next_claim_attempt_at = NOW() WHERE id = $1",
+    )
+    .bind(swap_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     let finalized = pay_service::db::persist_merchant_settlement_outcome(
         &pool,
         1,
@@ -16581,7 +16608,7 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     .await
     .unwrap();
     assert_eq!(finalized.checkpoint_version, 2);
-    assert_eq!(finalized.parent_transition.previous_status, "claiming");
+    assert_eq!(finalized.parent_transition.previous_status, "claim_stuck");
     assert_eq!(finalized.parent_transition.current_status, "claimed");
     assert!(finalized.parent_transition.changed);
     let finalized_state: (String, bool, String, String) = sqlx::query_as(
@@ -16601,6 +16628,15 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     assert!(finalized_state.1);
     assert_eq!(finalized_state.2, "finalized");
     assert_eq!(finalized_state.3, "claimed");
+    let cleared_finalized_failure: (Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT last_claim_error, last_claim_error_at IS NULL, next_claim_attempt_at IS NULL \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared_finalized_failure, (None, true, true));
     assert_eq!(
         pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
             &pool,
