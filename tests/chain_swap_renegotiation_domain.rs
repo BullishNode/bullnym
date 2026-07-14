@@ -197,6 +197,10 @@ fn persisted_state_and_sanitized_error_vocabulary_is_exact() {
             RenegotiationErrorClass::BackendDisagreement,
         ),
         (
+            "local_commit_uncertainty",
+            RenegotiationErrorClass::LocalCommitUncertainty,
+        ),
+        (
             "unknown_provider_outcome",
             RenegotiationErrorClass::UnknownProviderOutcome,
         ),
@@ -327,6 +331,44 @@ fn old_or_repeated_ambiguity_never_becomes_decline_without_new_evidence() {
             )
             .unwrap(),
         RenegotiationReconciliationDecision::Observe
+    );
+}
+
+#[test]
+fn uncertain_local_commit_is_a_durable_blocking_ambiguity() {
+    let requested = accept_requested_operation();
+    let transition = RenegotiationTransition::new(
+        requested.identity.clone(),
+        requested.version,
+        RenegotiationTransitionKind::MarkAmbiguous {
+            error_class: RenegotiationErrorClass::LocalCommitUncertainty,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        requested.plan_transition(&transition).unwrap(),
+        TransitionDisposition::Apply
+    );
+
+    let uncertain = operation(
+        exact_identity(),
+        RenegotiationState::Ambiguous,
+        1,
+        Some(RenegotiationErrorClass::LocalCommitUncertainty),
+        3,
+        Some(ACCEPT_REQUESTED_AT),
+        Some(AMBIGUOUS_AT),
+        None,
+        None,
+        AMBIGUOUS_AT,
+    );
+    assert_eq!(
+        uncertain.fallback_gate(),
+        RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::Ambiguous)
+    );
+    assert_eq!(
+        uncertain.restart_action(),
+        RenegotiationRestartAction::ReobserveAndRevalidateQuote
     );
 }
 

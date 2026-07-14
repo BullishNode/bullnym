@@ -65,6 +65,7 @@ pub enum RenegotiationErrorClass {
     ProviderServerError,
     MalformedResponse,
     BackendDisagreement,
+    LocalCommitUncertainty,
     UnknownProviderOutcome,
 }
 
@@ -76,6 +77,7 @@ impl RenegotiationErrorClass {
             Self::ProviderServerError => "provider_server_error",
             Self::MalformedResponse => "malformed_response",
             Self::BackendDisagreement => "backend_disagreement",
+            Self::LocalCommitUncertainty => "local_commit_uncertainty",
             Self::UnknownProviderOutcome => "unknown_provider_outcome",
         }
     }
@@ -91,6 +93,7 @@ impl FromStr for RenegotiationErrorClass {
             "provider_server_error" => Ok(Self::ProviderServerError),
             "malformed_response" => Ok(Self::MalformedResponse),
             "backend_disagreement" => Ok(Self::BackendDisagreement),
+            "local_commit_uncertainty" => Ok(Self::LocalCommitUncertainty),
             "unknown_provider_outcome" => Ok(Self::UnknownProviderOutcome),
             _ => Err(RenegotiationDomainError::InvalidStoredErrorClass),
         }

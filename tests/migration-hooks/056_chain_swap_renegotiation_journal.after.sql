@@ -278,10 +278,11 @@ BEGIN
 END
 $$;
 
--- Uncertain provider outcome is durable and cannot be downgraded to declined.
+-- A definite provider response followed by uncertain local commit is durable
+-- ambiguity and cannot be downgraded to declined.
 UPDATE chain_swap_renegotiation_operations
    SET state = 'ambiguous',
-       last_error_class = 'transport',
+       last_error_class = 'local_commit_uncertainty',
        ambiguous_at = clock_timestamp(),
        version = 3
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
@@ -291,7 +292,7 @@ BEGIN
     BEGIN
         UPDATE chain_swap_renegotiation_operations
            SET state = 'declined',
-               last_error_class = 'transport',
+               last_error_class = 'local_commit_uncertainty',
                terminal_response_digest = repeat('d', 64),
                terminal_observed_at = clock_timestamp(),
                version = 4
@@ -306,7 +307,7 @@ BEGIN
           FROM chain_swap_renegotiation_operations
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012'
            AND state = 'ambiguous'
-           AND last_error_class = 'transport'
+           AND last_error_class = 'local_commit_uncertainty'
            AND version = 3
            AND terminal_response_digest IS NULL
     ) THEN
@@ -393,7 +394,7 @@ BEGIN
            AND policy_version = 'issue38-v1'
            AND policy_evidence_digest = repeat('b', 64)
            AND accept_attempt_count = 1
-           AND last_error_class = 'transport'
+           AND last_error_class = 'local_commit_uncertainty'
            AND version = 3
     ) THEN
         RAISE EXCEPTION 'migration 056 changed ambiguity after invalid quote redrive';
@@ -428,7 +429,7 @@ BEGIN
            AND policy_evidence_digest = repeat('7', 64)
            AND policy_validated_at = '2020-07-13 12:02:01+00'::TIMESTAMPTZ
            AND accept_attempt_count = 2
-           AND last_error_class = 'transport'
+           AND last_error_class = 'local_commit_uncertainty'
            AND ambiguous_at IS NOT NULL
            AND accept_requested_at >= ambiguous_at
            AND version = 4
@@ -440,7 +441,7 @@ $$;
 
 UPDATE chain_swap_renegotiation_operations
    SET state = 'accepted',
-       last_error_class = 'transport',
+       last_error_class = 'local_commit_uncertainty',
        terminal_response_digest = repeat('c', 64),
        terminal_observed_at = clock_timestamp(),
        version = 5

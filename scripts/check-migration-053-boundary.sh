@@ -842,6 +842,8 @@ SELECT (
            AND pg_get_constraintdef(constraint_info.oid) LIKE
                '%backend_disagreement%'
            AND pg_get_constraintdef(constraint_info.oid) LIKE
+               '%local_commit_uncertainty%'
+           AND pg_get_constraintdef(constraint_info.oid) LIKE
                '%unknown_provider_outcome%'
     )
     AND EXISTS (

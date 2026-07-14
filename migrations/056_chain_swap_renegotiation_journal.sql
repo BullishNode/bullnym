@@ -5,7 +5,7 @@
 -- Persist the exact provider quote and local policy evidence before an
 -- accept_quote side effect. One row owns the only renegotiation operation for
 -- a chain swap. Versioned state transitions make retries compare-and-swap;
--- ambiguous transport outcomes remain retryable and can never be rewritten as
+-- ambiguous remote/local outcomes remain retryable and can never be rewritten as
 -- a refusal without first issuing a new durable accept request.
 
 BEGIN;
@@ -109,7 +109,7 @@ CREATE TABLE chain_swap_renegotiation_operations (
         last_error_class IS NULL OR last_error_class IN (
             'timeout', 'transport', 'provider_server_error',
             'malformed_response', 'backend_disagreement',
-            'unknown_provider_outcome'
+            'local_commit_uncertainty', 'unknown_provider_outcome'
         )
     ),
     CONSTRAINT chain_swap_renegotiation_version_check CHECK (
