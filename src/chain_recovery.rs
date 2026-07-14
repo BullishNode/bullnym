@@ -696,6 +696,7 @@ async fn execute_journaled_recovery_with_builder_fee(
         return Ok(attempt.txid);
     }
 
+    let observed_token = attempt.observed_state_token();
     match reconcile_attempt_evidence(&attempt, evidence).await? {
         EvidenceDecision::ExpectedObserved(reason) => {
             complete_expected_attempt(pool, &attempt, &reason).await?;
@@ -707,9 +708,17 @@ async fn execute_journaled_recovery_with_builder_fee(
                 "source {}:{} spent by unexpected transaction {}",
                 source.txid, source.vout, spender
             );
-            let held = db::mark_recovery_integrity_hold(pool, attempt.id, &reason)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let held = db::mark_recovery_integrity_hold(
+                pool,
+                attempt.chain_swap_id,
+                attempt.id,
+                &attempt.purpose,
+                &attempt.txid,
+                &observed_token,
+                &reason,
+            )
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
             if held != 1 {
                 return Err(AppError::DbError(
                     "could not persist Bitcoin recovery integrity hold".into(),
@@ -728,6 +737,13 @@ async fn execute_journaled_recovery_with_builder_fee(
         }
     }
 
+    let started_token = attempt
+        .state_token_after_broadcast_started()
+        .ok_or_else(|| {
+            AppError::DbError(
+                "recovery attempt cannot produce a durable broadcast-start token".into(),
+            )
+        })?;
     let started = db::mark_recovery_broadcast_started(pool, attempt.id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -754,10 +770,18 @@ async fn execute_journaled_recovery_with_builder_fee(
                 "broadcaster returned txid {returned_txid}, expected {}",
                 attempt.txid
             );
-            reconcile_after_broadcast_error(pool, &attempt, evidence, AppError::ClaimError(error))
-                .await
+            reconcile_after_broadcast_error(
+                pool,
+                &attempt,
+                &started_token,
+                evidence,
+                AppError::ClaimError(error),
+            )
+            .await
         }
-        Err(error) => reconcile_after_broadcast_error(pool, &attempt, evidence, error).await,
+        Err(error) => {
+            reconcile_after_broadcast_error(pool, &attempt, &started_token, evidence, error).await
+        }
     }
 }
 
@@ -1281,6 +1305,7 @@ async fn reconcile_attempt_evidence(
 async fn reconcile_after_broadcast_error(
     pool: &sqlx::PgPool,
     attempt: &ChainSwapTxAttempt,
+    started_token: &db::RecoveryAttemptStateToken,
     evidence: &dyn BitcoinRecoveryEvidence,
     error: AppError,
 ) -> Result<String, AppError> {
@@ -1300,9 +1325,17 @@ async fn reconcile_after_broadcast_error(
                 "source {}:{} spent by unexpected transaction {} after broadcast ambiguity",
                 source.txid, source.vout, spender
             );
-            let held = db::mark_recovery_integrity_hold(pool, attempt.id, &reason)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let held = db::mark_recovery_integrity_hold(
+                pool,
+                attempt.chain_swap_id,
+                attempt.id,
+                &attempt.purpose,
+                &attempt.txid,
+                started_token,
+                &reason,
+            )
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
             if held != 1 {
                 return Err(AppError::DbError(
                     "could not persist Bitcoin recovery integrity hold".into(),
