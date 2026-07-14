@@ -6726,6 +6726,221 @@ async fn issue30_cancelled_chain_transition_can_retry_the_identical_evidence() {
 }
 
 #[tokio::test]
+async fn issue82_unfunded_finalize_is_exact_once_across_retry_restart_and_reordering() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "chain82finalize").await;
+    let invoice =
+        insert_test_invoice(&pool, "chain82finalize", &npub, "lq1chain82finalize", 60).await;
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("chain82finalize"),
+            boltz_swap_id: "CHAIN_82_FINALIZE_1",
+            lockup_address: "bc1qchain82finalize",
+            lockup_bip21: None,
+            user_lock_amount_sat: 42_000,
+            server_lock_amount_sat: 41_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+
+    let empty_primary_audit =
+        pay_service::chain_lockup_witness_audit::ChainLockupManifestWitnessAuditV1 {
+            manifest_sequence: 1,
+            manifest_id: Uuid::from_u128(1),
+            chain_swap_id: row.id,
+            expected_amount_sat: 42_000,
+            classification:
+                pay_service::chain_lockup_witness_audit::ChainLockupManifestClassificationV1::Missing,
+            findings: vec![],
+        };
+    let project_primary = || {
+        pay_service::chain_swap_primary_source::project_primary_bitcoin_source_v1(
+            &empty_primary_audit,
+            None,
+            pay_service::chain_swap_primary_source::PrimaryBitcoinSourceAuthorityV1::SelfHostedNode,
+        )
+        .unwrap()
+    };
+    let runtime_evidence = pay_service::chain_swap_action::ChainSwapEvidence {
+        quality: pay_service::chain_swap_action::EvidenceQuality::CompleteAndAgreed,
+        provider_status: pay_service::chain_swap_action::ProviderStatusEvidence::Unknown,
+        bitcoin_source: pay_service::chain_swap_action::BitcoinSourceEvidence::Unknown,
+        liquid_lock: pay_service::chain_swap_action::LiquidLockEvidence::NotObserved,
+        liquid_path: pay_service::chain_swap_action::LiquidPathEvidence::Unavailable,
+        renegotiation: pay_service::chain_swap_action::RenegotiationEvidence::ExplicitlyUnavailable,
+        recovery_destination:
+            pay_service::chain_swap_action::RecoveryDestinationEvidence::Committed,
+        cooperative_recovery:
+            pay_service::chain_swap_action::CooperativeRecoveryEvidence::Unavailable,
+        bitcoin_timeout: pay_service::chain_swap_action::BitcoinTimeoutEvidence::BeforeTimeout,
+        liquid_claim_transaction: pay_service::chain_swap_action::MerchantTransactionEvidence::None,
+        bitcoin_recovery_transaction:
+            pay_service::chain_swap_action::MerchantTransactionEvidence::None,
+    };
+
+    let inconclusive_primary =
+        pay_service::chain_swap_primary_source::project_primary_bitcoin_source_v1(
+            &empty_primary_audit,
+            None,
+            pay_service::chain_swap_primary_source::PrimaryBitcoinSourceAuthorityV1::UntrustedSingleBackend,
+        )
+        .unwrap();
+    let inconclusive_input = pay_service::chain_swap_runtime::ChainSwapProviderEvidence {
+        evidence: runtime_evidence,
+        primary_bitcoin: Some(&inconclusive_primary),
+    };
+    assert_eq!(
+        pay_service::chain_swap_runtime::apply_chain_swap_provider_effect_with_evidence(
+            &pool,
+            row.id,
+            "swap.expired",
+            inconclusive_input,
+        )
+        .await
+        .unwrap(),
+        pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::Observed
+    );
+    assert_eq!(
+        pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
+    );
+
+    let first_primary = project_primary();
+    let first_input = pay_service::chain_swap_runtime::ChainSwapProviderEvidence {
+        evidence: runtime_evidence,
+        primary_bitcoin: Some(&first_primary),
+    };
+    assert_eq!(
+        pay_service::chain_swap_runtime::decide_chain_swap_provider_effect(
+            "swap.expired",
+            first_input,
+        ),
+        pay_service::chain_swap_runtime::ChainSwapProviderEffect::FinalizeUnfunded
+    );
+    assert_eq!(
+        pay_service::chain_swap_runtime::apply_chain_swap_provider_effect_with_evidence(
+            &pool,
+            row.id,
+            "swap.expired",
+            first_input,
+        )
+        .await
+        .unwrap(),
+        pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::Finalized
+    );
+
+    let first_updated_at: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Rebuild the projection/input as a restarted process would, replay the
+    // exact delivery, then reorder active and unknown provider observations.
+    let restarted_primary = project_primary();
+    let restarted_input = pay_service::chain_swap_runtime::ChainSwapProviderEvidence {
+        evidence: runtime_evidence,
+        primary_bitcoin: Some(&restarted_primary),
+    };
+    let exact_retry =
+        pay_service::chain_swap_runtime::apply_chain_swap_provider_effect_with_evidence(
+            &pool,
+            row.id,
+            "swap.expired",
+            restarted_input,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_retry,
+        pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::AlreadyFinalized
+    );
+
+    for reordered_status in ["transaction.confirmed", "provider.unknown"] {
+        assert_eq!(
+            pay_service::chain_swap_runtime::apply_chain_swap_provider_effect_with_evidence(
+                &pool,
+                row.id,
+                reordered_status,
+                restarted_input,
+            )
+            .await
+            .unwrap(),
+            pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::Observed,
+            "reordered_status={reordered_status}"
+        );
+    }
+    assert_eq!(
+        pay_service::chain_swap_runtime::apply_chain_swap_provider_effect_with_evidence(
+            &pool,
+            row.id,
+            "swap.expired",
+            restarted_input,
+        )
+        .await
+        .unwrap(),
+        pay_service::chain_swap_runtime::ChainSwapProviderApplyOutcome::AlreadyFinalized
+    );
+
+    let persisted = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, "expired");
+    let after_replays_updated_at: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+         FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_replays_updated_at, first_updated_at);
+
+    let scan_epoch_micros: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM NOW()) * 1000000)::BIGINT")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(pay_service::db::list_non_terminal_chain_swaps_oldest_first(
+        &pool,
+        0,
+        scan_epoch_micros,
+        None,
+        100,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .all(|candidate| candidate.id != row.id));
+    assert!(pay_service::db::get_ready_to_claim_chain_swaps(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .all(|candidate| candidate.id != row.id));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn webhook_skips_terminal_chain_swap_records() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
