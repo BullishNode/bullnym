@@ -736,8 +736,12 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
         }
     };
     let (bitcoin_snapshot, liquid_snapshot) = tokio::join!(bitcoin_read, liquid_read);
+    let primary_bitcoin_available = matches!(
+        bitcoin_snapshot.as_ref(),
+        Ok((_, PrimaryBitcoinSourceAuthorityV1::SelfHostedNode))
+    );
     let dependencies_available =
-        committed_destination.is_some() && bitcoin_snapshot.is_ok() && liquid_snapshot.is_ok();
+        committed_destination.is_some() && primary_bitcoin_available && liquid_snapshot.is_ok();
 
     let mut exact_sources = Vec::new();
     let mut bitcoin_timeout_height = None;

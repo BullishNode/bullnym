@@ -197,9 +197,10 @@ impl BitcoinLockupWitnessAdapterV1 {
     /// This deliberately does not fail over: automatic-fallback admission uses
     /// the configured primary as its self-hosted authority contract, while
     /// public failovers remain useful only for observing/draining existing
-    /// obligations. An empty target set still exercises the primary's bounded
-    /// tip and canonical-block recheck without inventing a payment address or
-    /// treating another endpoint as equivalent authority.
+    /// obligations. A deterministic unspendable P2WSH target exercises the
+    /// address-history API as well as the bounded tip/canonical-block recheck;
+    /// a tip-only probe could falsely open admission when payment-specific
+    /// source evidence is unavailable.
     pub async fn primary_authority_health_check(
         &self,
     ) -> Result<(), BitcoinLockupWitnessAdapterError> {
@@ -207,9 +208,22 @@ impl BitcoinLockupWitnessAdapterV1 {
             .endpoints
             .first()
             .ok_or(BitcoinLockupWitnessAdapterError::InvalidConfiguration)?;
+        let witness_script = ScriptBuf::from_bytes({
+            let mut bytes = Vec::with_capacity(34);
+            bytes.extend_from_slice(&[0x6a, 0x20]); // OP_RETURN PUSH32
+            bytes.extend_from_slice(&[0x85; 32]);
+            bytes
+        });
+        let address = Address::p2wsh(&witness_script, Network::Bitcoin);
+        let targets = [ManifestTarget {
+            manifest_id: Uuid::nil(),
+            chain_swap_id: Uuid::nil(),
+            address: address.to_string(),
+            script_pubkey: address.script_pubkey(),
+        }];
         let mut authority = AuthorityScan::new(self, primary);
         let snapshot = authority
-            .scan_targets(&[])
+            .scan_targets(&targets)
             .await
             .map_err(|_| BitcoinLockupWitnessAdapterError::NoCompleteAuthority)?;
         if self.is_primary_authority(&snapshot) {
