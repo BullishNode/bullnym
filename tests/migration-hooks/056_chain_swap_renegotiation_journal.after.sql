@@ -315,12 +315,135 @@ BEGIN
 END
 $$;
 
+-- A changed quote is a single narrow exception to quote/policy identity
+-- immutability: it may only atomically redrive Ambiguous -> AcceptRequested,
+-- with a new version and accept-attempt count. No other edge may replace it.
+DO $$
+BEGIN
+    BEGIN
+        UPDATE chain_swap_renegotiation_operations
+           SET quote_response_digest = repeat('6', 64)
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 056 allowed ambiguous identity mutation without redrive';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        NULL;
+    END;
+
+    BEGIN
+        UPDATE chain_swap_renegotiation_operations
+           SET state = 'accepted',
+               quoted_actual_amount_sat = 25250,
+               quote_response_digest = repeat('6', 64),
+               quote_observed_at = '2020-07-13 12:02:00+00',
+               policy_version = 'issue38-v2',
+               policy_evidence_digest = repeat('7', 64),
+               policy_validated_at = '2020-07-13 12:02:01+00',
+               terminal_response_digest = repeat('c', 64),
+               terminal_observed_at = clock_timestamp(),
+               version = 4
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 056 allowed changed quote on ambiguous acceptance';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        NULL;
+    END;
+
+    BEGIN
+        UPDATE chain_swap_renegotiation_operations
+           SET state = 'accept_requested',
+               quoted_actual_amount_sat = 25250,
+               quote_response_digest = repeat('6', 64),
+               quote_observed_at = '2020-07-13 12:02:00+00',
+               policy_version = 'issue38-v2',
+               policy_evidence_digest = repeat('7', 64),
+               policy_validated_at = '2020-07-13 12:02:01+00',
+               accept_attempt_count = 1,
+               accept_requested_at = clock_timestamp(),
+               version = 4
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 056 allowed changed quote without a new attempt';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
+    BEGIN
+        UPDATE chain_swap_renegotiation_operations
+           SET state = 'accept_requested',
+               quoted_actual_amount_sat = 25250,
+               quote_response_digest = repeat('6', 64),
+               quote_observed_at = '2020-07-13 12:02:00+00',
+               policy_version = 'issue38-v2',
+               policy_evidence_digest = repeat('7', 64),
+               policy_validated_at = '2020-07-13 12:02:01+00',
+               accept_attempt_count = 2,
+               accept_requested_at = clock_timestamp(),
+               version = 3
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 056 allowed changed quote without a new version';
+    EXCEPTION WHEN serialization_failure THEN
+        NULL;
+    END;
+
+    IF NOT EXISTS (
+        SELECT 1
+          FROM chain_swap_renegotiation_operations
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012'
+           AND state = 'ambiguous'
+           AND quoted_actual_amount_sat = 24750
+           AND quote_response_digest = repeat('a', 64)
+           AND policy_version = 'issue38-v1'
+           AND policy_evidence_digest = repeat('b', 64)
+           AND accept_attempt_count = 1
+           AND last_error_class = 'transport'
+           AND version = 3
+    ) THEN
+        RAISE EXCEPTION 'migration 056 changed ambiguity after invalid quote redrive';
+    END IF;
+END
+$$;
+
+UPDATE chain_swap_renegotiation_operations
+   SET state = 'accept_requested',
+       quoted_actual_amount_sat = 25250,
+       quote_response_digest = repeat('6', 64),
+       quote_observed_at = '2020-07-13 12:02:00+00',
+       policy_version = 'issue38-v2',
+       policy_evidence_digest = repeat('7', 64),
+       policy_validated_at = '2020-07-13 12:02:01+00',
+       accept_attempt_count = 2,
+       accept_requested_at = clock_timestamp(),
+       version = 4
+ WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM chain_swap_renegotiation_operations
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012'
+           AND state = 'accept_requested'
+           AND quoted_actual_amount_sat = 25250
+           AND quote_response_digest = repeat('6', 64)
+           AND quote_observed_at = '2020-07-13 12:02:00+00'::TIMESTAMPTZ
+           AND policy_version = 'issue38-v2'
+           AND policy_evidence_digest = repeat('7', 64)
+           AND policy_validated_at = '2020-07-13 12:02:01+00'::TIMESTAMPTZ
+           AND accept_attempt_count = 2
+           AND last_error_class = 'transport'
+           AND ambiguous_at IS NOT NULL
+           AND accept_requested_at >= ambiguous_at
+           AND version = 4
+    ) THEN
+        RAISE EXCEPTION 'migration 056 failed exact changed-quote redrive';
+    END IF;
+END
+$$;
+
 UPDATE chain_swap_renegotiation_operations
    SET state = 'accepted',
        last_error_class = 'transport',
        terminal_response_digest = repeat('c', 64),
        terminal_observed_at = clock_timestamp(),
-       version = 4
+       version = 5
  WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
 
 -- Policy decline is a terminal, pre-attempt outcome. Identity and terminal
@@ -364,6 +487,15 @@ BEGIN
     END;
 
     BEGIN
+        UPDATE chain_swap_renegotiation_operations
+           SET chain_swap_id = '53000000-0000-0000-0000-000000000013'
+         WHERE chain_swap_id = '53000000-0000-0000-0000-000000000012';
+        RAISE EXCEPTION 'migration 056 allowed operation identity mutation';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        NULL;
+    END;
+
+    BEGIN
         DELETE FROM chain_swap_renegotiation_operations
          WHERE chain_swap_id = '53000000-0000-0000-0000-000000000013';
         RAISE EXCEPTION 'migration 056 allowed journal deletion';
@@ -373,9 +505,12 @@ BEGIN
 
     IF (
         SELECT COUNT(*)
-          FROM chain_swap_renegotiation_operations
+         FROM chain_swap_renegotiation_operations
          WHERE (chain_swap_id = '53000000-0000-0000-0000-000000000012'
-                AND state = 'accepted' AND version = 4)
+                AND state = 'accepted' AND version = 5
+                AND quoted_actual_amount_sat = 25250
+                AND quote_response_digest = repeat('6', 64)
+                AND terminal_response_digest = repeat('c', 64))
             OR (chain_swap_id = '53000000-0000-0000-0000-000000000013'
                 AND state = 'declined' AND version = 2
                 AND last_error_class IS NULL)
