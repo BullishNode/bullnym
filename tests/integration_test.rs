@@ -19631,6 +19631,10 @@ impl StartupRestoreProviderServer {
             )
             .route("/blocks/tip/height", get(startup_chain_tip_height))
             .route("/block-height/:height", get(startup_chain_block_hash))
+            .route(
+                "/address/:address/txs",
+                get(startup_chain_empty_address_history),
+            )
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -19652,6 +19656,10 @@ async fn startup_chain_tip_height() -> &'static str {
 
 async fn startup_chain_block_hash() -> String {
     "11".repeat(32)
+}
+
+async fn startup_chain_empty_address_history() -> axum::Json<Value> {
+    axum::Json(json!([]))
 }
 
 fn startup_chain_witness_adapter(
@@ -19733,6 +19741,8 @@ async fn startup_provider_reconciliation_opens_only_on_exact_empty_source_agreem
     assert_eq!(report.manifest_count, 0);
     assert_eq!(report.local.local_record_count, 0);
     assert_eq!(report.boltz.validated_record_count, 0);
+    assert_eq!(fact.reconstructed_chain_swap_count(), 0);
+    assert_eq!(fact.reconstructed_delivery_count(), 0);
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
     cleanup_db(&pool).await;
 }
@@ -19786,7 +19796,7 @@ async fn startup_provider_reconciliation_closes_on_provider_only_chain_orphan() 
 }
 
 #[tokio::test]
-async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart() {
+async fn startup_provider_reconciliation_repairs_then_requires_provider_match_without_restart() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let fixture =
@@ -19815,8 +19825,8 @@ async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart()
 
     assert_eq!(
         error,
-        pay_service::startup_provider_reconciliation::StartupProviderReconciliationErrorV1::ThreeSourceAuditFailed,
-        "the deliberately empty provider snapshot must fail only after repair and audit"
+        pay_service::startup_provider_reconciliation::StartupProviderReconciliationErrorV1::ChainSwapReconstructionFailed,
+        "the repaired manifest must fail before audit when no matching validated provider identity exists"
     );
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
     let deliveries = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
@@ -19825,6 +19835,99 @@ async fn startup_provider_reconciliation_repairs_then_audits_without_a_restart()
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].chain_swap_id, row.id);
     assert_eq!(deliveries[0].delivery_state, "delivered");
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn stale_restore_startup_reconstructs_authenticated_row_before_ledger_and_audit() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture =
+        StaleRestoreReconstructionFixture::seed(&pool, "startupstalereconstruction").await;
+    let backend = InstrumentedManifestObjectStore::new();
+    let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(
+        coordinator_manifest_store(backend),
+    );
+    let envelope =
+        EncryptedSwapManifestV1::parse(runtime.seal_manifest_v1(&fixture.manifest).unwrap())
+            .unwrap();
+    let object_id = ManifestObjectId::new(
+        fixture.manifest.restore_identity.chain_swap_id,
+        fixture.manifest.restore_identity.manifest_id,
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.store().put_v1(object_id, &envelope).await.unwrap(),
+        ManifestWriteOutcome::Created
+    );
+
+    let all_records: Value =
+        serde_json::from_str(include_str!("fixtures/boltz-xpub-restore-v1.json")).unwrap();
+    let chain_only = Value::Array(vec![all_records.as_array().unwrap()[1].clone()]);
+    let records: &'static str =
+        Box::leak(serde_json::to_string(&chain_only).unwrap().into_boxed_str());
+    let server = StartupRestoreProviderServer::spawn(
+        records,
+        include_str!("fixtures/boltz-xpub-restore-index-v1.json"),
+    )
+    .await;
+    let fetcher =
+        pay_service::boltz_restore_fetch::BoltzRestoreFetcher::from_loopback_for_integration_tests(
+            &server.base_url,
+        )
+        .unwrap();
+    let chain_witness = startup_chain_witness_adapter(&server);
+
+    let first = pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+        &pool,
+        &runtime,
+        &fetcher,
+        &fixture.master,
+        &chain_witness,
+    )
+    .await
+    .unwrap();
+    assert!(first.exact_agreement());
+    assert_eq!(first.reconstructed_chain_swap_count(), 1);
+    assert_eq!(first.reconstructed_delivery_count(), 1);
+    assert_eq!(first.repaired_obligation_count(), 0);
+    assert_eq!(first.chain_witness().missing_manifest_count, 1);
+    let restored = pay_service::db::get_chain_swap_by_boltz_id(
+        &pool,
+        &fixture.manifest.restore_identity.boltz_swap_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(restored.id, fixture.manifest.restore_identity.chain_swap_id);
+    assert_eq!(restored.claim_key_hex, fixture.expected_claim_key_hex);
+    let deliveries = pay_service::db::list_manifest_delivery_audit(&pool, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0].manifest_id,
+        fixture.manifest.restore_identity.manifest_id
+    );
+    assert_eq!(deliveries[0].chain_swap_id, restored.id);
+    assert_eq!(deliveries[0].delivery_state, "delivered");
+    assert_eq!(server.calls.load(Ordering::SeqCst), 4);
+
+    let restarted =
+        pay_service::startup_provider_reconciliation::reconcile_startup_provider_state_v1(
+            &pool,
+            &runtime,
+            &fetcher,
+            &fixture.master,
+            &chain_witness,
+        )
+        .await
+        .unwrap();
+    assert!(restarted.exact_agreement());
+    assert_eq!(restarted.reconstructed_chain_swap_count(), 0);
+    assert_eq!(restarted.reconstructed_delivery_count(), 0);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 8);
+
     cleanup_db(&pool).await;
 }
 
@@ -20745,6 +20848,400 @@ fn atomic_manifest_canonical_json<T: serde::Serialize>(value: &T) -> String {
 
 fn atomic_manifest_leaf_sha256(leaf: &boltz_client::swaps::boltz::Leaf) -> String {
     hex::encode(Sha256::digest(hex::decode(&leaf.output).unwrap()))
+}
+
+struct StaleRestoreReconstructionFixture {
+    master: SwapMasterKey,
+    manifest: pay_service::swap_manifest::SwapManifestV1,
+    provider: pay_service::boltz_restore::ValidatedBoltzRestoreSet,
+    expected_preimage_hex: String,
+    expected_claim_key_hex: String,
+    expected_refund_key_hex: String,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct StaleRestoreLineageRow {
+    claim_key_index: Option<i64>,
+    refund_key_index: Option<i64>,
+    root_fingerprint: Option<String>,
+    claim_key_allocation_id: Option<Uuid>,
+    refund_key_allocation_id: Option<Uuid>,
+}
+
+impl StaleRestoreReconstructionFixture {
+    async fn seed(pool: &PgPool, nym: &str) -> Self {
+        use pay_service::boltz_restore::{
+            BoltzRestoreKeyPurpose, BoltzRestoreKind, ValidatedBoltzRestoreKey,
+            ValidatedBoltzRestoreRecord, ValidatedBoltzRestoreSet,
+        };
+        use pay_service::swap_manifest::{
+            ImmutableChainSwapCreationV1, ManifestKeyAllocationV1, ManifestKeyPurposeV1,
+            MerchantPolicyReferencesV1, SwapDerivationLineageV1, SwapManifestV1,
+            SwapRestoreIdentityV1,
+        };
+
+        let npub = create_test_user(pool, nym).await;
+        let recovery_address_commitment_id = insert_test_recovery_commitment(
+            pool,
+            &npub,
+            ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
+            1,
+            0x87,
+        )
+        .await;
+        let invoice =
+            insert_test_invoice(pool, nym, &npub, ATOMIC_MANIFEST_LIQUID_DESTINATION, 3_600).await;
+
+        let master = startup_reconciliation_master_key();
+        let claim_child_index = 101_u32;
+        let refund_child_index = 102_u32;
+        let claim_keypair = master.derive_swapkey(u64::from(claim_child_index)).unwrap();
+        let refund_keypair = master
+            .derive_swapkey(u64::from(refund_child_index))
+            .unwrap();
+        let claim_public_key = boltz_client::PublicKey::new(claim_keypair.public_key());
+        let refund_public_key = boltz_client::PublicKey::new(refund_keypair.public_key());
+        let preimage = Preimage::from_swap_key(&claim_keypair);
+        let response = atomic_manifest_provider_fixture(
+            "RstrChn00001",
+            &preimage,
+            claim_public_key,
+            refund_public_key,
+        );
+        let canonical_provider_response = atomic_manifest_canonical_json(&response);
+        let response_sha256 = hex::encode(Sha256::digest(canonical_provider_response.as_bytes()));
+        let root_seed = master.derive_swapkey(0).unwrap();
+        let root_digest = Sha256::digest(root_seed.public_key().serialize());
+        let root_fingerprint = hex::encode(&root_digest[..8]);
+        let claim_allocation_id = Uuid::new_v4();
+        let refund_allocation_id = Uuid::new_v4();
+        let chain_swap_id = Uuid::new_v4();
+        let preimage_hash = preimage.sha256.to_string();
+        let lockup_address = response.lockup_details.lockup_address.clone();
+        let manifest = SwapManifestV1::new(
+            SwapRestoreIdentityV1 {
+                manifest_id: Uuid::new_v4(),
+                manifest_sequence: 1,
+                previous_manifest_id: None,
+                chain_swap_id,
+                boltz_swap_id: response.id.clone(),
+                created_at_unix: 1_784_000_000,
+            },
+            SwapDerivationLineageV1 {
+                root_fingerprint,
+                key_epoch: 1,
+                derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+                allocation_high_water_child_index: i64::from(refund_child_index),
+                claim: ManifestKeyAllocationV1 {
+                    allocation_id: claim_allocation_id,
+                    child_index: i64::from(claim_child_index),
+                    purpose: ManifestKeyPurposeV1::ChainClaim,
+                    public_key_hex: claim_public_key.to_string(),
+                    preimage_hash_hex: Some(preimage_hash.clone()),
+                },
+                refund: ManifestKeyAllocationV1 {
+                    allocation_id: refund_allocation_id,
+                    child_index: i64::from(refund_child_index),
+                    purpose: ManifestKeyPurposeV1::ChainRefund,
+                    public_key_hex: refund_public_key.to_string(),
+                    preimage_hash_hex: None,
+                },
+            },
+            ImmutableChainSwapCreationV1 {
+                lockup_address: lockup_address.clone(),
+                lockup_bip21: format!(
+                    "bitcoin:{lockup_address}?amount=0.00025431&label=Restore%20payment"
+                ),
+                user_lock_amount_sat: 25_431,
+                server_lock_amount_sat: 25_000,
+                canonical_provider_response_json: canonical_provider_response,
+                pinned_pair_hash: "22".repeat(32),
+                canonical_pair_quote_json: format!(r#"{{"hash":"{}","rate":1}}"#, "22".repeat(32)),
+                creation_response_sha256: response_sha256,
+                btc_claim_script_sha256: atomic_manifest_leaf_sha256(
+                    &response.lockup_details.swap_tree.claim_leaf,
+                ),
+                btc_refund_script_sha256: atomic_manifest_leaf_sha256(
+                    &response.lockup_details.swap_tree.refund_leaf,
+                ),
+                liquid_claim_script_sha256: atomic_manifest_leaf_sha256(
+                    &response.claim_details.swap_tree.claim_leaf,
+                ),
+                liquid_refund_script_sha256: atomic_manifest_leaf_sha256(
+                    &response.claim_details.swap_tree.refund_leaf,
+                ),
+                btc_timeout_height: i64::from(response.lockup_details.timeout_block_height),
+                liquid_timeout_height: i64::from(response.claim_details.timeout_block_height),
+                btc_network: "bitcoin".into(),
+                liquid_network: "liquid".into(),
+                liquid_asset_id: boltz_client::elements::AssetId::LIQUID_BTC.to_string(),
+                merchant_liquid_destination: ATOMIC_MANIFEST_LIQUID_DESTINATION.into(),
+                merchant_emergency_btc_address: Some(ATOMIC_MANIFEST_EMERGENCY_ADDRESS.into()),
+            },
+            MerchantPolicyReferencesV1::new(
+                invoice.id,
+                nym,
+                ATOMIC_MANIFEST_LIQUID_DESTINATION,
+                Some((
+                    recovery_address_commitment_id,
+                    ATOMIC_MANIFEST_EMERGENCY_ADDRESS,
+                )),
+            ),
+        )
+        .unwrap();
+        let provider = ValidatedBoltzRestoreSet {
+            records: vec![ValidatedBoltzRestoreRecord {
+                provider_swap_id: response.id,
+                kind: BoltzRestoreKind::Chain,
+                status: "transaction.server.mempool".into(),
+                created_at: 1_784_000_000,
+                keys: vec![
+                    ValidatedBoltzRestoreKey {
+                        purpose: BoltzRestoreKeyPurpose::ChainClaim,
+                        child_index: claim_child_index,
+                        public_key_hex: claim_public_key.to_string(),
+                        preimage_sha256_hex: Some(preimage_hash),
+                    },
+                    ValidatedBoltzRestoreKey {
+                        purpose: BoltzRestoreKeyPurpose::ChainRefund,
+                        child_index: refund_child_index,
+                        public_key_hex: refund_public_key.to_string(),
+                        preimage_sha256_hex: None,
+                    },
+                ],
+            }],
+            max_child_index: Some(refund_child_index),
+        };
+
+        Self {
+            master,
+            manifest,
+            provider,
+            expected_preimage_hex: hex::encode(preimage.bytes.unwrap()),
+            expected_claim_key_hex: hex::encode(claim_keypair.secret_bytes()),
+            expected_refund_key_hex: hex::encode(refund_keypair.secret_bytes()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_restore_reconstructs_exact_row_and_is_restart_idempotent() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = StaleRestoreReconstructionFixture::seed(&pool, "stalerestoreexact").await;
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    let first =
+        pay_service::chain_swap_stale_restore::reconstruct_validated_manifested_chain_swaps_v1(
+            &pool,
+            std::slice::from_ref(&fixture.manifest),
+            &fixture.provider,
+            &fixture.master,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.witnessed_records, 1);
+    assert_eq!(first.reconstructed_records, 1);
+    assert_eq!(first.verified_existing_records, 0);
+
+    let row = pay_service::db::get_chain_swap_by_boltz_id(
+        &pool,
+        &fixture.manifest.restore_identity.boltz_swap_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(row.id, fixture.manifest.restore_identity.chain_swap_id);
+    assert_eq!(row.invoice_id, fixture.manifest.merchant_policy.invoice_id);
+    assert_eq!(row.nym.as_deref(), Some("stalerestoreexact"));
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.preimage_hex, fixture.expected_preimage_hex);
+    assert_eq!(row.claim_key_hex, fixture.expected_claim_key_hex);
+    assert_eq!(row.refund_key_hex, fixture.expected_refund_key_hex);
+    assert_eq!(
+        row.created_at_unix,
+        fixture.manifest.restore_identity.created_at_unix
+    );
+    assert_eq!(row.updated_at_unix, row.created_at_unix);
+    let terms = row.creation_terms.unwrap();
+    assert_eq!(
+        terms.recovery_address_commitment_id,
+        fixture
+            .manifest
+            .merchant_policy
+            .emergency_bitcoin_commitment_id
+    );
+    assert_eq!(
+        terms.merchant_liquid_destination,
+        ATOMIC_MANIFEST_LIQUID_DESTINATION
+    );
+
+    let lineage: StaleRestoreLineageRow = sqlx::query_as(
+        "SELECT claim_key_index, refund_key_index, root_fingerprint, \
+                    claim_key_allocation_id, refund_key_allocation_id \
+               FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lineage,
+        StaleRestoreLineageRow {
+            claim_key_index: Some(fixture.manifest.derivation_lineage.claim.child_index),
+            refund_key_index: Some(fixture.manifest.derivation_lineage.refund.child_index),
+            root_fingerprint: Some(fixture.manifest.derivation_lineage.root_fingerprint.clone()),
+            claim_key_allocation_id: Some(fixture.manifest.derivation_lineage.claim.allocation_id,),
+            refund_key_allocation_id: Some(
+                fixture.manifest.derivation_lineage.refund.allocation_id,
+            ),
+        }
+    );
+    let exact_allocation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations WHERE id = $1 OR id = $2")
+            .bind(fixture.manifest.derivation_lineage.claim.allocation_id)
+            .bind(fixture.manifest.derivation_lineage.refund.allocation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(exact_allocation_count, 2);
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before,
+        "reconstruction must not consume or advance the allocator sequence"
+    );
+
+    sqlx::query("UPDATE chain_swap_records SET status = 'user_lock_mempool' WHERE id = $1")
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let restart =
+        pay_service::chain_swap_stale_restore::reconstruct_validated_manifested_chain_swaps_v1(
+            &pool,
+            std::slice::from_ref(&fixture.manifest),
+            &fixture.provider,
+            &fixture.master,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restart.witnessed_records, 1);
+    assert_eq!(restart.reconstructed_records, 0);
+    assert_eq!(restart.verified_existing_records, 1);
+    let restarted = pay_service::db::get_chain_swap_by_boltz_id(
+        &pool,
+        &fixture.manifest.restore_identity.boltz_swap_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(restarted.status, "user_lock_mempool");
+
+    let corrupt_claim_key = "fe".repeat(32);
+    let mut corrupt = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corrupt)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chain_swap_records SET claim_key_hex = $2 WHERE id = $1")
+        .bind(row.id)
+        .bind(&corrupt_claim_key)
+        .execute(&mut *corrupt)
+        .await
+        .unwrap();
+    corrupt.commit().await.unwrap();
+    let conflict =
+        pay_service::chain_swap_stale_restore::reconstruct_validated_manifested_chain_swaps_v1(
+            &pool,
+            std::slice::from_ref(&fixture.manifest),
+            &fixture.provider,
+            &fixture.master,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict,
+        pay_service::chain_swap_stale_restore::ChainSwapStaleRestoreErrorV1::ChainSwapConflict
+    );
+    let still_corrupt: String =
+        sqlx::query_scalar("SELECT claim_key_hex FROM chain_swap_records WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_corrupt, corrupt_claim_key,
+        "restore never overwrites a conflict"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn stale_restore_allocation_conflict_rolls_back_every_new_identity() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = StaleRestoreReconstructionFixture::seed(&pool, "stalerestoreconflict").await;
+    let conflicting_key = fixture.master.derive_swapkey(173).unwrap();
+    let conflicting_public_key = boltz_client::PublicKey::new(conflicting_key.public_key());
+    let conflicting_preimage = Preimage::from_swap_key(&conflicting_key);
+    sqlx::query(
+        "INSERT INTO swap_key_allocations (\
+             id, root_fingerprint, key_epoch, derivation_scheme_version, child_index, \
+             purpose, public_key_hex, preimage_hash_hex\
+         ) VALUES ($1,$2,1,$3,173,'chain_claim',$4,$5)",
+    )
+    .bind(fixture.manifest.derivation_lineage.claim.allocation_id)
+    .bind(&fixture.manifest.derivation_lineage.root_fingerprint)
+    .bind(pay_service::db::DERIVATION_SCHEME_VERSION)
+    .bind(conflicting_public_key.to_string())
+    .bind(conflicting_preimage.sha256.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sequence_before = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+
+    let error =
+        pay_service::chain_swap_stale_restore::reconstruct_validated_manifested_chain_swaps_v1(
+            &pool,
+            std::slice::from_ref(&fixture.manifest),
+            &fixture.provider,
+            &fixture.master,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        pay_service::chain_swap_stale_restore::ChainSwapStaleRestoreErrorV1::AllocationConflict
+    );
+    assert!(pay_service::db::get_chain_swap_by_boltz_id(
+        &pool,
+        &fixture.manifest.restore_identity.boltz_swap_id,
+    )
+    .await
+    .unwrap()
+    .is_none());
+    let refund_allocation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM swap_key_allocations WHERE id = $1")
+            .bind(fixture.manifest.derivation_lineage.refund.allocation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(refund_allocation_count, 0);
+    assert_eq!(
+        pay_service::db::swap_key_seq_next_value(&pool)
+            .await
+            .unwrap(),
+        sequence_before
+    );
+
+    cleanup_db(&pool).await;
 }
 
 struct AtomicManifestPersistenceFixture {

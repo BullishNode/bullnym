@@ -201,11 +201,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let report = fact.report();
                             let exact_agreement = fact.exact_agreement();
                             let repaired_obligation_count = fact.repaired_obligation_count();
+                            let reconstructed_chain_swap_count =
+                                fact.reconstructed_chain_swap_count();
+                            let reconstructed_delivery_count = fact.reconstructed_delivery_count();
                             let chain = fact.chain_witness();
                             if exact_agreement {
                                 tracing::info!(
                                     event = "startup_provider_recovery_consistent",
                                     repaired_obligation_count,
+                                    reconstructed_chain_swap_count,
+                                    reconstructed_delivery_count,
                                     manifest_count = report.manifest_count,
                                     provider_record_count = report.boltz.validated_record_count,
                                     provider_chain_record_count = report.boltz.chain_record_count,
@@ -228,6 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::error!(
                                     event = "startup_provider_recovery_inconsistent",
                                     repaired_obligation_count,
+                                    reconstructed_chain_swap_count,
+                                    reconstructed_delivery_count,
                                     manifest_count = report.manifest_count,
                                     provider_chain_record_count = report.boltz.chain_record_count,
                                     provider_only_chain_record_count =
