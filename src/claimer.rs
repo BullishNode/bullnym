@@ -2724,9 +2724,16 @@ async fn claim_chain_swap_inner(
     let expected_hex = serialize_claim_tx_hex(&claim_tx)?;
     let claim_tx = reload_chain_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
 
+    let txid = btc_like_txid(&claim_tx);
+    db::mark_liquid_merchant_settlement_broadcast_started(pool, swap.id, &txid, "liquid_claim")
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!(
+                "start Liquid merchant settlement broadcast: {error}"
+             ))
+         })?;
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
-    let txid = btc_like_txid(&claim_tx);
     let broadcast_result = match chain_client.try_broadcast_tx(&claim_tx).await {
         Ok(_) => "broadcast accepted or exact transaction already known",
         Err(broadcast_err) => match backend.tx_exists(&txid).await {

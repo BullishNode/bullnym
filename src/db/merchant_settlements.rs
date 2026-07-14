@@ -28,6 +28,30 @@ use crate::{
 
 const CHECKPOINT_FORMAT_VERSION: i16 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointWriteKind {
+    InsertInitial,
+    UpdateExisting,
+}
+
+fn checkpoint_write_kind(
+    expected_checkpoint_version: i64,
+) -> Result<CheckpointWriteKind, MerchantSettlementRepositoryError> {
+    match expected_checkpoint_version {
+        value if value < 0 => Err(MerchantSettlementRepositoryError::InvalidCommand),
+        0 => Ok(CheckpointWriteKind::InsertInitial),
+        _ => Ok(CheckpointWriteKind::UpdateExisting),
+    }
+}
+
+fn next_checkpoint_version(
+    expected_checkpoint_version: i64,
+) -> Result<i64, MerchantSettlementRepositoryError> {
+    expected_checkpoint_version
+        .checked_add(1)
+        .ok_or(MerchantSettlementRepositoryError::InvalidCheckpoint)
+}
+
 #[derive(Debug)]
 pub enum MerchantSettlementRepositoryError {
     Database(sqlx::Error),
@@ -500,9 +524,49 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     Ok(row)
 }
 
-/// Record a successful or already-known Liquid broadcast only when the
-/// journal and parent still identify the same exact claim. This is deliberately
-/// provider-free: the caller performs chain I/O, then commits its result here.
+/// Durably record that an exact Liquid claim broadcast is about to start. If
+/// the process dies after this commit, restart sees an ambiguous immutable
+/// attempt and can only replay the same bytes.
+pub async fn mark_liquid_merchant_settlement_broadcast_started(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    txid: &str,
+    purpose: &str,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    if chain_swap_id.is_nil()
+        || !matches!(purpose, "liquid_claim" | "liquid_claim_replacement")
+        || !canonical_hash(txid)
+    {
+        return Err(MerchantSettlementRepositoryError::InvalidCommand);
+    }
+    let rows = sqlx::query(
+        "UPDATE chain_swap_tx_attempts attempt SET \
+             status = CASE WHEN attempt.status IN ('constructed','broadcast_ambiguous') \
+                           THEN 'broadcast_ambiguous' ELSE attempt.status END, \
+             broadcast_attempts = attempt.broadcast_attempts + 1, \
+             first_broadcast_attempt_at = COALESCE(attempt.first_broadcast_attempt_at, NOW()), \
+             last_broadcast_attempt_at = NOW(), \
+             last_broadcast_result = 'broadcast attempt started; outcome unknown', \
+             updated_at = NOW() \
+          FROM chain_swap_records parent \
+         WHERE attempt.chain_swap_id = $1 AND attempt.txid = $2 AND attempt.purpose = $3 \
+           AND attempt.status IN ('constructed','broadcast_ambiguous','broadcast') \
+           AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid",
+    )
+    .bind(chain_swap_id)
+    .bind(txid)
+    .bind(purpose)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
+}
+
+/// Finalize a successful or already-known Liquid broadcast only when the
+/// journal and parent still identify the same exact, durably-started attempt.
 pub async fn mark_liquid_merchant_settlement_broadcast(
     pool: &PgPool,
     chain_swap_id: Uuid,
@@ -521,14 +585,12 @@ pub async fn mark_liquid_merchant_settlement_broadcast(
         "UPDATE chain_swap_tx_attempts attempt SET \
              status = CASE WHEN attempt.status IN ('confirmed','finalized') \
                            THEN attempt.status ELSE 'broadcast' END, \
-             broadcast_attempts = attempt.broadcast_attempts + 1, \
-             first_broadcast_attempt_at = COALESCE(attempt.first_broadcast_attempt_at, NOW()), \
-             last_broadcast_attempt_at = NOW(), \
              broadcast_at = COALESCE(attempt.broadcast_at, NOW()), \
              last_broadcast_result = $4, updated_at = NOW() \
           FROM chain_swap_records parent \
          WHERE attempt.chain_swap_id = $1 AND attempt.txid = $2 AND attempt.purpose = $3 \
-           AND attempt.status <> 'integrity_hold' \
+           AND attempt.status IN ('broadcast_ambiguous','broadcast','confirmed','finalized') \
+           AND attempt.broadcast_attempts > 0 \
            AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid",
     )
     .bind(chain_swap_id)
@@ -779,9 +841,7 @@ pub async fn persist_merchant_settlement_outcome(
     policy: SettlementFinalityPolicy,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<MerchantSettlementPersistenceResult, MerchantSettlementRepositoryError> {
-    if expected_checkpoint_version < 0 {
-        return Err(MerchantSettlementRepositoryError::InvalidCommand);
-    }
+    let checkpoint_write = checkpoint_write_kind(expected_checkpoint_version)?;
     MerchantSettlementAdoptionService::restore(snapshot.clone(), policy)?;
     validate_commands(snapshot, outcome)?;
     let snapshot_json = encode_snapshot(snapshot)?;
@@ -803,35 +863,47 @@ pub async fn persist_merchant_settlement_outcome(
             actual,
         });
     }
+    let checkpoint_version = next_checkpoint_version(expected_checkpoint_version)?;
     apply_commands(&mut tx, snapshot, outcome).await?;
     persist_retained(&mut tx, snapshot).await?;
-    let checkpoint_version = expected_checkpoint_version + 1;
-    let rows = sqlx::query(
-        "INSERT INTO merchant_settlement_checkpoints (\
-             chain_swap_id, settlement_path, invoice_id, boltz_swap_id, format_version, \
-             checkpoint_version, journal_txid, snapshot_json\
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
-         ON CONFLICT (chain_swap_id, settlement_path) DO UPDATE SET \
-             checkpoint_version = EXCLUDED.checkpoint_version, snapshot_json = EXCLUDED.snapshot_json, \
-             updated_at = NOW() \
-         WHERE merchant_settlement_checkpoints.invoice_id = EXCLUDED.invoice_id \
-           AND merchant_settlement_checkpoints.boltz_swap_id = EXCLUDED.boltz_swap_id \
-           AND merchant_settlement_checkpoints.journal_txid = EXCLUDED.journal_txid \
-           AND merchant_settlement_checkpoints.format_version = EXCLUDED.format_version \
-           AND merchant_settlement_checkpoints.checkpoint_version = $9",
-    )
-    .bind(context.chain_swap_id())
-    .bind(path_text(context.path()))
-    .bind(context.invoice_id())
-    .bind(context.boltz_swap_id())
-    .bind(CHECKPOINT_FORMAT_VERSION)
-    .bind(checkpoint_version)
-    .bind(snapshot.lifecycle.journal_txid.as_str())
-    .bind(snapshot_json)
-    .bind(expected_checkpoint_version)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let rows = match checkpoint_write {
+        CheckpointWriteKind::InsertInitial => sqlx::query(
+            "INSERT INTO merchant_settlement_checkpoints (\
+                 chain_swap_id, settlement_path, invoice_id, boltz_swap_id, format_version, \
+                 checkpoint_version, journal_txid, snapshot_json\
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(context.chain_swap_id())
+        .bind(path_text(context.path()))
+        .bind(context.invoice_id())
+        .bind(context.boltz_swap_id())
+        .bind(CHECKPOINT_FORMAT_VERSION)
+        .bind(checkpoint_version)
+        .bind(snapshot.lifecycle.journal_txid.as_str())
+        .bind(&snapshot_json)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+        CheckpointWriteKind::UpdateExisting => sqlx::query(
+            "UPDATE merchant_settlement_checkpoints \
+                SET checkpoint_version = $6, snapshot_json = $8, updated_at = NOW() \
+              WHERE chain_swap_id = $1 AND settlement_path = $2 \
+                AND invoice_id = $3 AND boltz_swap_id = $4 AND format_version = $5 \
+                AND journal_txid = $7 AND checkpoint_version = $9",
+        )
+        .bind(context.chain_swap_id())
+        .bind(path_text(context.path()))
+        .bind(context.invoice_id())
+        .bind(context.boltz_swap_id())
+        .bind(CHECKPOINT_FORMAT_VERSION)
+        .bind(checkpoint_version)
+        .bind(snapshot.lifecycle.journal_txid.as_str())
+        .bind(&snapshot_json)
+        .bind(expected_checkpoint_version)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+    };
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
@@ -2014,6 +2086,30 @@ mod tests {
         for status in ["confirmed", "finalized", "integrity_hold"] {
             assert!(!liquid_attempt_is_broadcastable(status));
         }
+    }
+
+    #[test]
+    fn checkpoint_write_splits_initial_insert_from_existing_cas_update() {
+        assert!(matches!(
+            checkpoint_write_kind(0),
+            Ok(CheckpointWriteKind::InsertInitial)
+        ));
+        for version in [1, 2, i64::MAX] {
+            assert!(matches!(
+                checkpoint_write_kind(version),
+                Ok(CheckpointWriteKind::UpdateExisting)
+            ));
+        }
+        assert!(matches!(
+            checkpoint_write_kind(-1),
+            Err(MerchantSettlementRepositoryError::InvalidCommand)
+        ));
+        assert!(matches!(next_checkpoint_version(0), Ok(1)));
+        assert!(matches!(next_checkpoint_version(1), Ok(2)));
+        assert!(matches!(
+            next_checkpoint_version(i64::MAX),
+            Err(MerchantSettlementRepositoryError::InvalidCheckpoint)
+        ));
     }
 
     #[test]
