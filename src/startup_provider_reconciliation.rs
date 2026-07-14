@@ -16,7 +16,11 @@ use sqlx::PgPool;
 
 use crate::boltz_restore_fetch::BoltzRestoreFetcher;
 use crate::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1;
-use crate::chain_lockup_witness_audit::audit_manifest_set_against_chain_lockup_witness_v1;
+use crate::chain_lockup_witness_audit::{
+    audit_manifest_set_against_chain_lockup_witness_v1, ChainLockupConflictFieldV1,
+    ChainLockupFindingClassificationV1, ChainLockupManifestClassificationV1,
+    ChainLockupManifestWitnessAuditV1, ChainLockupWitnessAuditV1,
+};
 use crate::chain_swap_creation_permit::{ChainSwapCreationPermit, ChainSwapCreationPermitError};
 use crate::chain_swap_stale_restore::reconstruct_missing_manifested_chain_swaps_v1;
 use crate::recovery_shadow_audit::{
@@ -56,16 +60,26 @@ pub struct StartupChainLockupWitnessReportV1 {
     pub confirmed_manifest_count: usize,
     pub spent_manifest_count: usize,
     pub conflicting_manifest_count: usize,
+    pub amount_mismatch_manifest_count: usize,
+    pub structural_conflicting_manifest_count: usize,
 }
 
 impl StartupChainLockupWitnessReportV1 {
     fn exact_agreement(self) -> bool {
-        self.conflicting_manifest_count == 0
+        // A validated amount mismatch is evidence about one already-persisted
+        // obligation, not a disagreement between recovery authorities. Keep
+        // that obligation in its runtime reducer without permanently closing
+        // creation for unrelated swaps. Unknown or structural conflict shapes
+        // and any count-accounting drift remain fail closed.
+        self.structural_conflicting_manifest_count == 0
+            && self.conflicting_manifest_count == self.amount_mismatch_manifest_count
     }
 }
 
 impl StartupProviderReconciliationFactV1 {
-    /// Only complete, exact agreement opens the new Bitcoin chain-swap rail.
+    /// Only complete source agreement and structurally valid chain evidence
+    /// open the new Bitcoin chain-swap rail. A validated amount mismatch stays
+    /// isolated to the already-persisted obligation's runtime reducer.
     pub fn exact_agreement(&self) -> bool {
         startup_sources_exact(self.report.classification, self.chain_witness)
     }
@@ -100,6 +114,66 @@ fn startup_sources_exact(
     chain: StartupChainLockupWitnessReportV1,
 ) -> bool {
     recovery == RecoveryShadowClassificationV1::Consistent && chain.exact_agreement()
+}
+
+fn startup_chain_witness_report(
+    chain: &ChainLockupWitnessAuditV1,
+) -> StartupChainLockupWitnessReportV1 {
+    let (amount_mismatch_manifest_count, structural_conflicting_manifest_count) =
+        classify_startup_chain_conflicts(&chain.manifests);
+    StartupChainLockupWitnessReportV1 {
+        manifest_count: chain.manifests.len(),
+        observation_count: chain.observation_count,
+        missing_manifest_count: chain.missing_manifest_count,
+        unconfirmed_manifest_count: chain.unconfirmed_manifest_count,
+        confirmed_manifest_count: chain.confirmed_manifest_count,
+        spent_manifest_count: chain.spent_manifest_count,
+        conflicting_manifest_count: chain.conflicting_manifest_count,
+        amount_mismatch_manifest_count,
+        structural_conflicting_manifest_count,
+    }
+}
+
+fn classify_startup_chain_conflicts(
+    manifests: &[ChainLockupManifestWitnessAuditV1],
+) -> (usize, usize) {
+    let mut amount_mismatch_manifest_count = 0;
+    let mut structural_conflicting_manifest_count = 0;
+
+    for manifest in manifests {
+        let mut saw_conflicting_finding = false;
+        let amount_mismatch_only = manifest.findings.iter().all(|finding| {
+            let ChainLockupFindingClassificationV1::Conflicting { fields } =
+                &finding.classification
+            else {
+                return true;
+            };
+            saw_conflicting_finding = true;
+            fields.as_slice() == [ChainLockupConflictFieldV1::ExpectedAmount]
+        });
+
+        match (
+            manifest.classification,
+            saw_conflicting_finding,
+            amount_mismatch_only,
+        ) {
+            (ChainLockupManifestClassificationV1::Conflicting, true, true) => {
+                amount_mismatch_manifest_count += 1;
+            }
+            (ChainLockupManifestClassificationV1::Conflicting, _, _) | (_, true, _) => {
+                // A structurally impossible summary, an empty conflict field
+                // set, or any chain/address/script disagreement cannot be
+                // downgraded to an obligation-local amount mismatch.
+                structural_conflicting_manifest_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    (
+        amount_mismatch_manifest_count,
+        structural_conflicting_manifest_count,
+    )
 }
 
 /// Fixed startup failures. Lower-layer SQL, object-store, provider, URL,
@@ -193,15 +267,7 @@ pub async fn reconcile_startup_provider_state_v1(
                 .map_err(|_| StartupProviderReconciliationErrorV1::ChainWitnessAuditFailed)?;
         Ok::<_, StartupProviderReconciliationErrorV1>((
             report,
-            StartupChainLockupWitnessReportV1 {
-                manifest_count: chain.manifests.len(),
-                observation_count: chain.observation_count,
-                missing_manifest_count: chain.missing_manifest_count,
-                unconfirmed_manifest_count: chain.unconfirmed_manifest_count,
-                confirmed_manifest_count: chain.confirmed_manifest_count,
-                spent_manifest_count: chain.spent_manifest_count,
-                conflicting_manifest_count: chain.conflicting_manifest_count,
-            },
+            startup_chain_witness_report(&chain),
             reconstruction.reconstructed_records,
             delivery_rebuild.reconstructed_records,
         ))
@@ -254,6 +320,9 @@ mod tests {
     use crate::admission::{
         Dependency, MoneyAdmission, ProviderRecoveryConsistencyTransitionV1, Rail, ReasonCode,
     };
+    use crate::chain_lockup_witness_audit::{
+        ChainLockupInclusionV1, ChainLockupSpendV1, ChainLockupWitnessFindingV1,
+    };
     use crate::recovery_shadow_audit::{
         RecoveryShadowBoltzReportV1, RecoveryShadowChainInventoryReportV1,
         RecoveryShadowCoverageV1, RecoveryShadowLineageClassificationsV1,
@@ -261,6 +330,27 @@ mod tests {
     };
 
     use super::*;
+
+    fn conflicting_manifest(
+        classification: ChainLockupManifestClassificationV1,
+        finding_classification: ChainLockupFindingClassificationV1,
+    ) -> ChainLockupManifestWitnessAuditV1 {
+        ChainLockupManifestWitnessAuditV1 {
+            manifest_sequence: 1,
+            manifest_id: uuid::Uuid::new_v4(),
+            chain_swap_id: uuid::Uuid::new_v4(),
+            expected_amount_sat: 25_355,
+            classification,
+            findings: vec![ChainLockupWitnessFindingV1 {
+                txid: "11".repeat(32),
+                vout: 0,
+                observed_amount_sat: 10_142,
+                inclusion: ChainLockupInclusionV1::Mempool,
+                spend: ChainLockupSpendV1::Unspent,
+                classification: finding_classification,
+            }],
+        }
+    }
 
     fn exact_empty_fact() -> StartupProviderReconciliationFactV1 {
         StartupProviderReconciliationFactV1 {
@@ -305,6 +395,8 @@ mod tests {
                 confirmed_manifest_count: 0,
                 spent_manifest_count: 0,
                 conflicting_manifest_count: 0,
+                amount_mismatch_manifest_count: 0,
+                structural_conflicting_manifest_count: 0,
             },
             repaired_obligation_count: 0,
             reconstructed_chain_swap_count: 0,
@@ -375,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_chain_witness_success_opens_and_conflict_fails_closed() {
+    fn startup_chain_witness_keeps_amount_mismatch_local_and_structural_conflict_closed() {
         let complete_non_conflicting = StartupChainLockupWitnessReportV1 {
             manifest_count: 3,
             observation_count: 2,
@@ -384,24 +476,87 @@ mod tests {
             confirmed_manifest_count: 1,
             spent_manifest_count: 1,
             conflicting_manifest_count: 0,
+            amount_mismatch_manifest_count: 0,
+            structural_conflicting_manifest_count: 0,
         };
         assert!(startup_sources_exact(
             RecoveryShadowClassificationV1::Consistent,
             complete_non_conflicting,
         ));
 
-        let conflicting = StartupChainLockupWitnessReportV1 {
+        let amount_mismatch = StartupChainLockupWitnessReportV1 {
+            conflicting_manifest_count: 1,
+            amount_mismatch_manifest_count: 1,
+            ..complete_non_conflicting
+        };
+        assert!(startup_sources_exact(
+            RecoveryShadowClassificationV1::Consistent,
+            amount_mismatch,
+        ));
+
+        let structural_conflict = StartupChainLockupWitnessReportV1 {
+            conflicting_manifest_count: 1,
+            structural_conflicting_manifest_count: 1,
+            ..complete_non_conflicting
+        };
+        assert!(!startup_sources_exact(
+            RecoveryShadowClassificationV1::Consistent,
+            structural_conflict,
+        ));
+        let unaccounted_conflict = StartupChainLockupWitnessReportV1 {
             conflicting_manifest_count: 1,
             ..complete_non_conflicting
         };
         assert!(!startup_sources_exact(
             RecoveryShadowClassificationV1::Consistent,
-            conflicting,
+            unaccounted_conflict,
         ));
         assert!(!startup_sources_exact(
             RecoveryShadowClassificationV1::DifferencesClassified,
-            complete_non_conflicting,
+            amount_mismatch,
         ));
+    }
+
+    #[test]
+    fn startup_conflict_accounting_accepts_only_expected_amount_findings() {
+        let amount_only = conflicting_manifest(
+            ChainLockupManifestClassificationV1::Conflicting,
+            ChainLockupFindingClassificationV1::Conflicting {
+                fields: vec![ChainLockupConflictFieldV1::ExpectedAmount],
+            },
+        );
+        assert_eq!(classify_startup_chain_conflicts(&[amount_only]), (1, 0));
+
+        let structural = conflicting_manifest(
+            ChainLockupManifestClassificationV1::Conflicting,
+            ChainLockupFindingClassificationV1::Conflicting {
+                fields: vec![
+                    ChainLockupConflictFieldV1::LockupAddress,
+                    ChainLockupConflictFieldV1::ExpectedAmount,
+                ],
+            },
+        );
+        assert_eq!(classify_startup_chain_conflicts(&[structural]), (0, 1));
+
+        let missing_conflict_finding = conflicting_manifest(
+            ChainLockupManifestClassificationV1::Conflicting,
+            ChainLockupFindingClassificationV1::Confirmed,
+        );
+        assert_eq!(
+            classify_startup_chain_conflicts(&[missing_conflict_finding]),
+            (0, 1)
+        );
+
+        let inconsistent_summary = conflicting_manifest(
+            ChainLockupManifestClassificationV1::Confirmed,
+            ChainLockupFindingClassificationV1::Conflicting {
+                fields: vec![ChainLockupConflictFieldV1::ExpectedAmount],
+            },
+        );
+        assert_eq!(
+            classify_startup_chain_conflicts(&[inconsistent_summary]),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -425,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn classified_or_chain_disagreement_can_only_transition_to_unsafe() {
+    fn classified_or_structural_chain_disagreement_can_only_transition_to_unsafe() {
         let admission = MoneyAdmission::healthy_test_fixture();
 
         let mut classified = exact_empty_fact();
@@ -436,8 +591,20 @@ mod tests {
         );
         assert!(!admission.decision(Rail::BitcoinChain).allowed());
 
+        let mut amount_mismatch = exact_empty_fact();
+        amount_mismatch.chain_witness.conflicting_manifest_count = 1;
+        amount_mismatch.chain_witness.amount_mismatch_manifest_count = 1;
+        assert_eq!(
+            admission.apply_provider_recovery_reconciliation_v1(Ok(amount_mismatch)),
+            ProviderRecoveryConsistencyTransitionV1::Safe
+        );
+        assert!(admission.decision(Rail::BitcoinChain).allowed());
+
         let mut chain_conflict = exact_empty_fact();
         chain_conflict.chain_witness.conflicting_manifest_count = 1;
+        chain_conflict
+            .chain_witness
+            .structural_conflicting_manifest_count = 1;
         assert_eq!(
             admission.apply_provider_recovery_reconciliation_v1(Ok(chain_conflict)),
             ProviderRecoveryConsistencyTransitionV1::Unsafe

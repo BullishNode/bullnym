@@ -227,6 +227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         chain.unconfirmed_manifest_count,
                                     chain_confirmed_manifest_count = chain.confirmed_manifest_count,
                                     chain_spent_manifest_count = chain.spent_manifest_count,
+                                    chain_conflicting_manifest_count =
+                                        chain.conflicting_manifest_count,
+                                    chain_amount_mismatch_manifest_count =
+                                        chain.amount_mismatch_manifest_count,
                                     "startup recovery sources agree exactly"
                                 );
                             } else {
@@ -252,6 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     chain_observation_count = chain.observation_count,
                                     chain_conflicting_manifest_count =
                                         chain.conflicting_manifest_count,
+                                    chain_amount_mismatch_manifest_count =
+                                        chain.amount_mismatch_manifest_count,
+                                    chain_structural_conflicting_manifest_count =
+                                        chain.structural_conflicting_manifest_count,
                                     "startup recovery sources differ; new Bitcoin chain-swap admission is closed"
                                 );
                             }

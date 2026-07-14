@@ -47,6 +47,24 @@ Missing`, while every bounded finding is retained. An amount mismatch is not
 discarded and is not declared a loss: underpayments, overpayments, repeated
 funding, and monetary action belong to the later obligation reducer.
 
+## Startup admission semantics
+
+A successfully validated amount mismatch is chain evidence for one existing,
+persisted obligation. It is not a failure of the manifest store, PostgreSQL,
+provider restore inventory, or Bitcoin authority, and therefore does not close
+new chain-swap creation globally. The existing obligation remains visible to
+the primary-source projection and runtime reducer, which must reconcile its
+underpayment, overpayment, renegotiation, or recovery without crediting stale
+amounts.
+
+This distinction does not weaken the chain trust boundary. Adapter failures,
+incomplete scans, invalid observations, unknown or crossed identities, and
+chain/address/script target conflicts still fail closed. The startup report
+also verifies that every conflicting manifest was accounted for as either an
+amount-only mismatch or a structural conflict; unknown conflict shapes close
+admission. Opening unrelated creation neither mutates nor discards the existing
+obligation or its append-only witness.
+
 ## Deliberate v1 limit
 
 This slice covers only the payer's Bitcoin user lock because manifest v1 signs
