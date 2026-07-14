@@ -38,6 +38,8 @@ use crate::utxo::{
 use crate::AppState;
 
 const AUTOMATIC_FALLBACK_LIQUID_HISTORY_LIMIT: usize = 64;
+const LIQUID_MAINNET_GENESIS_HASH: &str =
+    "1466275836220db2944ca059a3a10ef6fd2ea684b0688d2c379296888a206003";
 const REDACTED: &str = "<redacted>";
 
 /// Owned snapshot handoff for the runtime reducer.
@@ -789,9 +791,15 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
         liquid_snapshot.as_ref().ok(),
     ) {
         (Some(backend), Some(target), Some(snapshot)) => {
-            let projected =
-                classify_liquid_server_lock(backend, target, snapshot, swap, liquid_intent_exists)
-                    .await?;
+            let projected = classify_liquid_server_lock(
+                backend,
+                target,
+                snapshot,
+                swap,
+                liquid_intent_exists,
+                state.config.liquid_watcher.finality_confirmations,
+            )
+            .await?;
             evidence.quality = merge_quality(evidence.quality, projected.quality);
             evidence.liquid_lock = projected.lock;
             evidence.liquid_claim_transaction = projected.transaction;
@@ -992,6 +1000,8 @@ struct LiquidServerLockTarget {
     asset_id: elements::AssetId,
     amount_sat: u64,
     timeout_height: i32,
+    refund_leaf: elements::Script,
+    provider_refund_key: elements::secp256k1_zkp::XOnlyPublicKey,
 }
 
 fn exact_liquid_server_lock_target(
@@ -1002,6 +1012,28 @@ fn exact_liquid_server_lock_target(
         serde_json::from_str(&swap.boltz_response_json).map_err(|error| {
             AppError::ClaimError(format!("invalid chain creation response: {error}"))
         })?;
+    let terms = swap
+        .creation_terms
+        .as_ref()
+        .ok_or_else(|| AppError::ClaimError("chain swap lacks immutable creation terms".into()))?;
+    let refund_leaf_bytes = hex::decode(&response.claim_details.swap_tree.refund_leaf.output)
+        .map_err(|_| AppError::ClaimError("Liquid refund leaf is invalid".into()))?;
+    if hex::encode(Sha256::digest(&refund_leaf_bytes)) != terms.liquid_refund_script_sha256 {
+        return Err(AppError::ClaimError(
+            "Liquid refund leaf differs from immutable creation terms".into(),
+        ));
+    }
+    let refund_leaf = elements::Script::from(refund_leaf_bytes);
+    let provider_refund_key = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(
+        &response
+            .claim_details
+            .server_public_key
+            .inner
+            .x_only_public_key()
+            .0
+            .serialize(),
+    )
+    .map_err(|_| AppError::ClaimError("Liquid provider refund key is invalid".into()))?;
     let blinding_key = response
         .claim_details
         .blinding_key
@@ -1011,10 +1043,7 @@ fn exact_liquid_server_lock_target(
         .map_err(|_| {
             AppError::ClaimError("Liquid server lock has an invalid blinding key".into())
         })?;
-    let asset_id = swap
-        .creation_terms
-        .as_ref()
-        .ok_or_else(|| AppError::ClaimError("chain swap lacks immutable creation terms".into()))?
+    let asset_id = terms
         .liquid_asset_id
         .parse()
         .map_err(|_| AppError::ClaimError("chain swap has an invalid Liquid asset".into()))?;
@@ -1022,23 +1051,29 @@ fn exact_liquid_server_lock_target(
         .ok()
         .filter(|amount| *amount > 0)
         .ok_or_else(|| AppError::ClaimError("chain swap has an invalid Liquid amount".into()))?;
-    let timeout_height = i32::try_from(
-        swap.creation_terms
-            .as_ref()
-            .ok_or_else(|| {
-                AppError::ClaimError("chain swap lacks immutable creation terms".into())
-            })?
-            .liquid_timeout_height,
-    )
-    .ok()
-    .filter(|height| *height > 0)
-    .ok_or_else(|| AppError::ClaimError("chain swap has an invalid Liquid timeout".into()))?;
+    let timeout_height = i32::try_from(terms.liquid_timeout_height)
+        .ok()
+        .filter(|height| *height > 0)
+        .ok_or_else(|| AppError::ClaimError("chain swap has an invalid Liquid timeout".into()))?;
+    let expected_refund_leaf = elements::script::Builder::new()
+        .push_slice(&provider_refund_key.serialize())
+        .push_opcode(elements::opcodes::all::OP_CHECKSIGVERIFY)
+        .push_int(i64::from(timeout_height))
+        .push_opcode(elements::opcodes::all::OP_CLTV)
+        .into_script();
+    if refund_leaf != expected_refund_leaf {
+        return Err(AppError::ClaimError(
+            "Liquid refund leaf does not bind the pinned provider key and timeout".into(),
+        ));
+    }
     Ok(LiquidServerLockTarget {
         script,
         blinding_key,
         asset_id,
         amount_sat,
         timeout_height,
+        refund_leaf,
+        provider_refund_key,
     })
 }
 
@@ -1055,6 +1090,7 @@ async fn classify_liquid_server_lock(
     snapshot: &LiquidHistorySnapshot,
     swap: &ChainSwapRecord,
     liquid_intent_exists: bool,
+    finality_confirmations: u32,
 ) -> Result<LiquidLockProjection, AppError> {
     let claim_intent = liquid_claim_transaction_evidence(swap, liquid_intent_exists);
     if snapshot.entries.is_empty() {
@@ -1062,7 +1098,11 @@ async fn classify_liquid_server_lock(
             quality: EvidenceQuality::CompleteAndAgreed,
             lock: LiquidLockEvidence::NotObserved,
             transaction: claim_intent,
-            path_unavailable: snapshot.tip_height >= target.timeout_height,
+            path_unavailable: liquid_height_is_finalized(
+                snapshot.tip_height,
+                target.timeout_height,
+                finality_confirmations,
+            ),
         });
     }
 
@@ -1104,7 +1144,7 @@ async fn classify_liquid_server_lock(
                 invalid_candidate = true;
                 continue;
             };
-            candidates.push((entry, vout));
+            candidates.push((entry, vout, output.clone()));
         }
     }
     if invalid_candidate || candidates.len() != 1 {
@@ -1120,21 +1160,33 @@ async fn classify_liquid_server_lock(
         });
     }
 
-    let (funding, vout) = candidates[0];
+    let (funding, vout, funding_output) = &candidates[0];
     let mut spenders = Vec::new();
     for entry in &snapshot.entries {
         let raw = backend.get_raw_tx(&entry.txid).await?;
         let transaction: elements::Transaction = elements::encode::deserialize(&raw)
             .map_err(|_| AppError::ElectrumError("decode Liquid outspend evidence".into()))?;
+        if !transaction
+            .txid()
+            .to_string()
+            .eq_ignore_ascii_case(&entry.txid)
+        {
+            return Ok(LiquidLockProjection {
+                quality: EvidenceQuality::BackendDisagreement,
+                lock: LiquidLockEvidence::Unknown,
+                transaction: claim_intent,
+                path_unavailable: false,
+            });
+        }
         if transaction.input.iter().any(|input| {
             input
                 .previous_output
                 .txid
                 .to_string()
                 .eq_ignore_ascii_case(&funding.txid)
-                && input.previous_output.vout == vout
+                && input.previous_output.vout == *vout
         }) {
-            spenders.push(entry);
+            spenders.push((entry, transaction));
         }
     }
     if spenders.is_empty() {
@@ -1157,16 +1209,160 @@ async fn classify_liquid_server_lock(
             path_unavailable: false,
         });
     }
-    // A parent txid/hex is not #83 merchant-output authority. Until the exact
-    // settlement journal/lifecycle is restored here, every observed Liquid
-    // outspend remains a positive integrity stop rather than guessed claim or
-    // provider-refund evidence.
+    let (spender_entry, spender_transaction) = &spenders[0];
+    if liquid_history_entry_is_finalized(snapshot, funding, finality_confirmations)
+        && liquid_history_entry_is_finalized(snapshot, spender_entry, finality_confirmations)
+        && validates_exact_liquid_provider_refund(
+            target,
+            &funding.txid,
+            *vout,
+            funding_output,
+            spender_transaction,
+        )
+    {
+        return Ok(LiquidLockProjection {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            lock: LiquidLockEvidence::SpentByProviderRefund,
+            transaction: claim_intent,
+            path_unavailable: true,
+        });
+    }
+
+    // A txid alone is not #83-compatible raw-transaction authority. A
+    // non-final, cooperative, malformed, wrong-leaf, or wrong-key outspend is
+    // an integrity stop rather than guessed provider-refund evidence.
     Ok(LiquidLockProjection {
         quality: EvidenceQuality::CompleteAndAgreed,
         lock: LiquidLockEvidence::UnknownOutspend,
         transaction: claim_intent,
         path_unavailable: false,
     })
+}
+
+fn liquid_height_is_finalized(
+    tip_height: i32,
+    fact_height: i32,
+    finality_confirmations: u32,
+) -> bool {
+    if fact_height <= 0 || finality_confirmations == 0 {
+        return false;
+    }
+    tip_height
+        .checked_sub(fact_height)
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|confirmations| u32::try_from(confirmations).ok())
+        .is_some_and(|confirmations| confirmations >= finality_confirmations)
+}
+
+fn liquid_history_entry_is_finalized(
+    snapshot: &LiquidHistorySnapshot,
+    entry: &crate::utxo::LiquidHistoryEntry,
+    finality_confirmations: u32,
+) -> bool {
+    liquid_height_is_finalized(snapshot.tip_height, entry.height, finality_confirmations)
+        && entry.block_hash.as_ref().is_some_and(|block_hash| {
+            snapshot.anchored_block_hashes.get(&entry.height) == Some(block_hash)
+        })
+}
+
+/// Prove the exact unilateral server-refund script path emitted by the pinned
+/// Boltz protocol implementation. A Liquid txid does not commit witness bytes,
+/// so classification requires the raw witness's taproot commitment and
+/// provider signature, not merely a matching funding outpoint.
+fn validates_exact_liquid_provider_refund(
+    target: &LiquidServerLockTarget,
+    funding_txid: &str,
+    funding_vout: u32,
+    funding_output: &elements::TxOut,
+    spender: &elements::Transaction,
+) -> bool {
+    use elements::hashes::Hash as _;
+    use elements::schnorr::TapTweak as _;
+
+    let Ok(timeout_height) = u32::try_from(target.timeout_height) else {
+        return false;
+    };
+    let [input] = spender.input.as_slice() else {
+        return false;
+    };
+    if spender.version != 2
+        || funding_output.script_pubkey != target.script
+        || !input
+            .previous_output
+            .txid
+            .to_string()
+            .eq_ignore_ascii_case(funding_txid)
+        || input.previous_output.vout != funding_vout
+        || input.sequence != elements::Sequence::ZERO
+        || input.is_pegin
+        || input.asset_issuance != elements::AssetIssuance::default()
+        || !input.script_sig.is_empty()
+        || input.witness.amount_rangeproof.is_some()
+        || input.witness.inflation_keys_rangeproof.is_some()
+        || !input.witness.pegin_witness.is_empty()
+        || spender.lock_time.to_consensus_u32() != timeout_height
+    {
+        return false;
+    }
+    let [signature_bytes, refund_leaf_bytes, control_block_bytes] =
+        input.witness.script_witness.as_slice()
+    else {
+        return false;
+    };
+    if signature_bytes.len() != 64 || refund_leaf_bytes.as_slice() != target.refund_leaf.as_bytes()
+    {
+        return false;
+    }
+    let Ok(signature) = elements::SchnorrSig::from_slice(signature_bytes) else {
+        return false;
+    };
+    if signature.hash_ty != elements::SchnorrSighashType::Default {
+        return false;
+    }
+    let Ok(control_block) = elements::taproot::ControlBlock::from_slice(control_block_bytes) else {
+        return false;
+    };
+    if control_block.leaf_version != elements::taproot::LeafVersion::default() {
+        return false;
+    }
+    let script_bytes = funding_output.script_pubkey.as_bytes();
+    if script_bytes.len() != 34 || script_bytes[0] != 0x51 || script_bytes[1] != 0x20 {
+        return false;
+    }
+    let Ok(output_key) = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&script_bytes[2..])
+    else {
+        return false;
+    };
+    let output_key = output_key.dangerous_assume_tweaked();
+    let secp = elements::secp256k1_zkp::Secp256k1::verification_only();
+    if !control_block.verify_taproot_commitment(&secp, &output_key, &target.refund_leaf) {
+        return false;
+    }
+
+    let Ok(genesis_hash) = elements::BlockHash::from_str(LIQUID_MAINNET_GENESIS_HASH) else {
+        return false;
+    };
+    let refund_leaf_hash = elements::taproot::TapLeafHash::from_script(
+        &target.refund_leaf,
+        elements::taproot::LeafVersion::default(),
+    );
+    let Ok(sighash) = elements::sighash::SighashCache::new(spender)
+        .taproot_script_spend_signature_hash(
+            0,
+            &elements::sighash::Prevouts::All(&[funding_output]),
+            refund_leaf_hash,
+            elements::SchnorrSighashType::Default,
+            genesis_hash,
+        )
+    else {
+        return false;
+    };
+    let Ok(message) = elements::secp256k1_zkp::Message::from_digest_slice(sighash.as_byte_array())
+    else {
+        return false;
+    };
+    secp.verify_schnorr(&signature.sig, &message, &target.provider_refund_key)
+        .is_ok()
 }
 
 fn classify_renegotiation(
@@ -1479,6 +1675,119 @@ mod tests {
         (second_gate, mutations)
     }
 
+    fn signed_provider_refund_fixture() -> (
+        LiquidServerLockTarget,
+        String,
+        u32,
+        elements::TxOut,
+        elements::Transaction,
+    ) {
+        use elements::hashes::Hash as _;
+
+        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let provider_secret = elements::secp256k1_zkp::SecretKey::from_slice(&[3_u8; 32]).unwrap();
+        let provider_keypair =
+            elements::secp256k1_zkp::Keypair::from_secret_key(&secp, &provider_secret);
+        let (provider_refund_key, _) = provider_keypair.x_only_public_key();
+        let internal_secret = elements::secp256k1_zkp::SecretKey::from_slice(&[4_u8; 32]).unwrap();
+        let internal_keypair =
+            elements::secp256k1_zkp::Keypair::from_secret_key(&secp, &internal_secret);
+        let (internal_key, _) = internal_keypair.x_only_public_key();
+        let timeout_height = 1_000;
+        let refund_leaf = elements::script::Builder::new()
+            .push_slice(&provider_refund_key.serialize())
+            .push_opcode(elements::opcodes::all::OP_CHECKSIGVERIFY)
+            .push_int(i64::from(timeout_height))
+            .push_opcode(elements::opcodes::all::OP_CLTV)
+            .into_script();
+        let claim_leaf = elements::script::Builder::new()
+            .push_opcode(elements::opcodes::all::OP_PUSHNUM_1)
+            .into_script();
+        let spend_info = elements::taproot::TaprootBuilder::new()
+            .add_leaf_with_ver(1, claim_leaf, elements::taproot::LeafVersion::default())
+            .unwrap()
+            .add_leaf_with_ver(
+                1,
+                refund_leaf.clone(),
+                elements::taproot::LeafVersion::default(),
+            )
+            .unwrap()
+            .finalize(&secp, internal_key)
+            .unwrap();
+        let script = elements::Script::new_v1_p2tr_tweaked(spend_info.output_key());
+        let asset_id = elements::AssetId::LIQUID_BTC;
+        let funding_output = elements::TxOut {
+            asset: elements::confidential::Asset::Explicit(asset_id),
+            value: elements::confidential::Value::Explicit(50_000),
+            nonce: elements::confidential::Nonce::Null,
+            script_pubkey: script.clone(),
+            witness: elements::TxOutWitness::default(),
+        };
+        let funding_txid: elements::Txid = "11".repeat(32).parse().unwrap();
+        let funding_vout = 2;
+        let mut spender = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::from_consensus(timeout_height as u32),
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(funding_txid, funding_vout),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::ZERO,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![elements::TxOut::new_fee(250, asset_id)],
+        };
+        let genesis_hash = elements::BlockHash::from_str(LIQUID_MAINNET_GENESIS_HASH).unwrap();
+        let leaf_hash = elements::taproot::TapLeafHash::from_script(
+            &refund_leaf,
+            elements::taproot::LeafVersion::default(),
+        );
+        let sighash = elements::sighash::SighashCache::new(&spender)
+            .taproot_script_spend_signature_hash(
+                0,
+                &elements::sighash::Prevouts::All(&[&funding_output]),
+                leaf_hash,
+                elements::SchnorrSighashType::Default,
+                genesis_hash,
+            )
+            .unwrap();
+        let message =
+            elements::secp256k1_zkp::Message::from_digest_slice(sighash.as_byte_array()).unwrap();
+        let signature = elements::SchnorrSig {
+            sig: secp.sign_schnorr(&message, &provider_keypair),
+            hash_ty: elements::SchnorrSighashType::Default,
+        };
+        let control_block = spend_info
+            .control_block(&(
+                refund_leaf.clone(),
+                elements::taproot::LeafVersion::default(),
+            ))
+            .unwrap();
+        spender.input[0].witness.script_witness = vec![
+            signature.to_vec(),
+            refund_leaf.as_bytes().to_vec(),
+            control_block.serialize(),
+        ];
+
+        let target = LiquidServerLockTarget {
+            script,
+            blinding_key: elements::secp256k1_zkp::SecretKey::from_slice(&[5_u8; 32]).unwrap(),
+            asset_id,
+            amount_sat: 50_000,
+            timeout_height,
+            refund_leaf,
+            provider_refund_key,
+        };
+        (
+            target,
+            funding_txid.to_string(),
+            funding_vout,
+            funding_output,
+            spender,
+        )
+    }
+
     fn automatic_candidate() -> ChainSwapEvidence {
         ChainSwapEvidence {
             quality: EvidenceQuality::CompleteAndAgreed,
@@ -1577,6 +1886,66 @@ mod tests {
             assert_eq!(mutations.journaled, 0);
             assert_eq!(mutations.broadcast, 1);
         }
+    }
+
+    #[test]
+    fn provider_refund_requires_exact_signed_script_path() {
+        let (target, funding_txid, funding_vout, funding_output, spender) =
+            signed_provider_refund_fixture();
+        assert!(validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &spender,
+        ));
+
+        let mut wrong_signature = spender.clone();
+        wrong_signature.input[0].witness.script_witness[0][0] ^= 1;
+        assert!(!validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &wrong_signature,
+        ));
+
+        let mut cooperative_key_path = spender;
+        cooperative_key_path.input[0]
+            .witness
+            .script_witness
+            .truncate(1);
+        assert!(!validates_exact_liquid_provider_refund(
+            &target,
+            &funding_txid,
+            funding_vout,
+            &funding_output,
+            &cooperative_key_path,
+        ));
+    }
+
+    #[test]
+    fn liquid_refund_and_timeout_require_configured_finality_and_anchor() {
+        assert!(!liquid_height_is_finalized(100, 100, 2));
+        assert!(liquid_height_is_finalized(101, 100, 2));
+        assert!(!liquid_height_is_finalized(101, 100, 0));
+        assert!(!liquid_height_is_finalized(99, 100, 1));
+
+        let entry = crate::utxo::LiquidHistoryEntry {
+            txid: "22".repeat(32),
+            height: 100,
+            block_hash: Some("33".repeat(32)),
+        };
+        let mut snapshot = LiquidHistorySnapshot {
+            authority: "liquid-electrum-agreement:test".into(),
+            tip_height: 101,
+            tip_hash: "44".repeat(32),
+            entries: vec![entry.clone()],
+            anchored_block_hashes: std::collections::BTreeMap::from([(100, "33".repeat(32))]),
+        };
+        assert!(liquid_history_entry_is_finalized(&snapshot, &entry, 2));
+        snapshot.anchored_block_hashes.insert(100, "55".repeat(32));
+        assert!(!liquid_history_entry_is_finalized(&snapshot, &entry, 2));
     }
 
     #[test]
