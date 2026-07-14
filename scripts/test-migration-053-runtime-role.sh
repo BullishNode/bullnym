@@ -262,6 +262,52 @@ scripts/check-migration-058-boundary.sh \
 
 admin_sql success "
   SET ROLE migration_owner;
+  CREATE OR REPLACE FUNCTION guard_public_name_migration_choice()
+  RETURNS TRIGGER
+  LANGUAGE plpgsql
+  AS \$guard\$
+  BEGIN
+      IF TG_OP = 'DELETE' THEN
+          RETURN OLD;
+      END IF;
+      RETURN NEW;
+  END
+  \$guard\$;
+"
+if scripts/check-migration-058-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-058 test: probe accepted a no-op snapshot guard body" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  CREATE OR REPLACE FUNCTION guard_public_name_migration_choice()
+  RETURNS TRIGGER
+  LANGUAGE plpgsql
+  AS \$guard\$
+  BEGIN
+      IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION 'public-name migration candidate snapshot is immutable'
+              USING ERRCODE = '23000',
+                    CONSTRAINT = 'public_name_migration_snapshot_immutable';
+      END IF;
+      IF NEW.owner_npub IS DISTINCT FROM OLD.owner_npub
+         OR NEW.candidate_nyms IS DISTINCT FROM OLD.candidate_nyms
+         OR NEW.active_nym IS DISTINCT FROM OLD.active_nym
+         OR NEW.candidate_aliases IS DISTINCT FROM OLD.candidate_aliases THEN
+          RAISE EXCEPTION 'public-name migration candidate snapshot is immutable'
+              USING ERRCODE = '23000',
+                    CONSTRAINT = 'public_name_migration_snapshot_immutable';
+      END IF;
+      RETURN NEW;
+  END
+  \$guard\$;
+"
+scripts/check-migration-058-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
+admin_sql success "
+  SET ROLE migration_owner;
   GRANT SELECT (owner_npub)
     ON public_name_migration_choices TO bullnym_app;
 "
@@ -285,6 +331,24 @@ fi
 admin_sql success "
   SET ROLE migration_owner;
   REVOKE SELECT (owner_npub)
+    ON public_name_migration_merchant_communications FROM bullnym_app;
+"
+scripts/check-migration-058-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
+admin_sql success "
+  SET ROLE migration_owner;
+  GRANT INSERT, UPDATE
+    ON public_name_migration_merchant_communications TO bullnym_app;
+"
+if scripts/check-migration-058-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-058 test: probe accepted review-view write privileges" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  REVOKE INSERT, UPDATE
     ON public_name_migration_merchant_communications FROM bullnym_app;
 "
 scripts/check-migration-058-boundary.sh \

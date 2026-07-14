@@ -1694,6 +1694,12 @@ SELECT (
                current_user, pg_get_userbyid(relation.relowner), 'SET'
            )
            AND NOT has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND NOT has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
            AND NOT EXISTS (
                SELECT 1
                  FROM aclexplode(COALESCE(
@@ -1720,6 +1726,38 @@ SELECT (
            AND function_info.pronargs = 0
            AND function_info.prokind = 'f'
            AND function_info.prorettype = 'trigger'::REGTYPE
+           AND position(
+               'IF TG_OP = ''DELETE'' THEN'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'NEW.owner_npub IS DISTINCT FROM OLD.owner_npub'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'NEW.candidate_nyms IS DISTINCT FROM OLD.candidate_nyms'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'NEW.active_nym IS DISTINCT FROM OLD.active_nym'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'NEW.candidate_aliases IS DISTINCT FROM OLD.candidate_aliases'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'public-name migration candidate snapshot is immutable'
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'ERRCODE = ''23000'''
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
+           AND position(
+               'CONSTRAINT = ''public_name_migration_snapshot_immutable'''
+               IN pg_get_functiondef(function_info.oid)
+           ) > 0
            AND pg_get_userbyid(function_info.proowner) <> current_user
            AND NOT pg_has_role(
                current_user,
