@@ -1,0 +1,375 @@
+use std::fmt;
+use std::str::FromStr;
+
+use sqlx::{PgPool, Postgres, Transaction};
+use uuid::Uuid;
+
+use crate::chain_swap_renegotiation::{
+    ChainSwapRenegotiationOperation, RenegotiationDomainError, RenegotiationErrorClass,
+    RenegotiationIdentity, RenegotiationState, RenegotiationTransition,
+    RenegotiationTransitionKind, TransitionDisposition,
+};
+
+const OPERATION_COLUMNS: &str = "chain_swap_id, state, quoted_actual_amount_sat, \
+    quote_response_digest, EXTRACT(EPOCH FROM quote_observed_at)::BIGINT \
+        AS quote_observed_at_unix, \
+    policy_version, policy_evidence_digest, \
+    EXTRACT(EPOCH FROM policy_validated_at)::BIGINT AS policy_validated_at_unix, \
+    accept_attempt_count, last_error_class, version, \
+    EXTRACT(EPOCH FROM accept_requested_at)::BIGINT AS accept_requested_at_unix, \
+    EXTRACT(EPOCH FROM ambiguous_at)::BIGINT AS ambiguous_at_unix, \
+    terminal_response_digest, \
+    EXTRACT(EPOCH FROM terminal_observed_at)::BIGINT AS terminal_observed_at_unix, \
+    EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix, \
+    EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenegotiationTransitionOutcome {
+    pub operation: ChainSwapRenegotiationOperation,
+    pub disposition: TransitionDisposition,
+}
+
+#[derive(Debug)]
+pub enum ChainSwapRenegotiationStoreError {
+    Database(sqlx::Error),
+    Domain(RenegotiationDomainError),
+    NotFound { chain_swap_id: Uuid },
+    IdentityConflict { chain_swap_id: Uuid },
+    CasMiss { chain_swap_id: Uuid },
+}
+
+impl fmt::Display for ChainSwapRenegotiationStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(_) => f.write_str("renegotiation operation database request failed"),
+            Self::Domain(error) => error.fmt(f),
+            Self::NotFound { .. } => f.write_str("renegotiation operation was not found"),
+            Self::IdentityConflict { .. } => {
+                f.write_str("chain swap already has a different renegotiation quote policy")
+            }
+            Self::CasMiss { .. } => {
+                f.write_str("renegotiation operation changed during compare-and-swap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChainSwapRenegotiationStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Domain(error) => Some(error),
+            // PostgreSQL diagnostics may contain quote evidence. Do not expose
+            // raw database errors through a chained generic reporter.
+            Self::Database(_)
+            | Self::NotFound { .. }
+            | Self::IdentityConflict { .. }
+            | Self::CasMiss { .. } => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for ChainSwapRenegotiationStoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<RenegotiationDomainError> for ChainSwapRenegotiationStoreError {
+    fn from(error: RenegotiationDomainError) -> Self {
+        Self::Domain(error)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RenegotiationOperationDbRow {
+    chain_swap_id: Uuid,
+    state: String,
+    quoted_actual_amount_sat: i64,
+    quote_response_digest: String,
+    quote_observed_at_unix: i64,
+    policy_version: String,
+    policy_evidence_digest: String,
+    policy_validated_at_unix: i64,
+    accept_attempt_count: i32,
+    last_error_class: Option<String>,
+    version: i64,
+    accept_requested_at_unix: Option<i64>,
+    ambiguous_at_unix: Option<i64>,
+    terminal_response_digest: Option<String>,
+    terminal_observed_at_unix: Option<i64>,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+}
+
+impl TryFrom<RenegotiationOperationDbRow> for ChainSwapRenegotiationOperation {
+    type Error = RenegotiationDomainError;
+
+    fn try_from(row: RenegotiationOperationDbRow) -> Result<Self, Self::Error> {
+        let quoted_actual_amount_sat =
+            u64::try_from(row.quoted_actual_amount_sat).map_err(|_| {
+                RenegotiationDomainError::InvalidIdentity {
+                    field: "quoted_actual_amount_sat",
+                }
+            })?;
+        let identity = RenegotiationIdentity::new(
+            row.chain_swap_id,
+            quoted_actual_amount_sat,
+            row.quote_response_digest,
+            row.quote_observed_at_unix,
+            row.policy_version,
+            row.policy_evidence_digest,
+            row.policy_validated_at_unix,
+        )?;
+        let state = RenegotiationState::from_str(&row.state)?;
+        let accept_attempt_count = u32::try_from(row.accept_attempt_count)
+            .map_err(|_| RenegotiationDomainError::InvalidStoredAttemptCount)?;
+        let version = u64::try_from(row.version)
+            .map_err(|_| RenegotiationDomainError::InvalidStoredVersion)?;
+        let last_error_class = row
+            .last_error_class
+            .as_deref()
+            .map(RenegotiationErrorClass::from_str)
+            .transpose()?;
+
+        ChainSwapRenegotiationOperation::from_persisted_parts(
+            identity,
+            state,
+            accept_attempt_count,
+            last_error_class,
+            version,
+            row.accept_requested_at_unix,
+            row.ambiguous_at_unix,
+            row.terminal_response_digest,
+            row.terminal_observed_at_unix,
+            row.created_at_unix,
+            row.updated_at_unix,
+        )
+    }
+}
+
+/// Persist the exact quote and policy evidence in the initial `quoted` state.
+/// A retry with identical immutable evidence returns the current operation;
+/// different evidence for the same swap is rejected.
+pub async fn persist_quoted_chain_swap_renegotiation(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+) -> Result<ChainSwapRenegotiationOperation, ChainSwapRenegotiationStoreError> {
+    identity.validate()?;
+    let quoted_actual_amount_sat =
+        i64::try_from(identity.quoted_actual_amount_sat).map_err(|_| {
+            RenegotiationDomainError::InvalidIdentity {
+                field: "quoted_actual_amount_sat",
+            }
+        })?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO chain_swap_renegotiation_operations ( \
+             chain_swap_id, state, quoted_actual_amount_sat, quote_response_digest, \
+             quote_observed_at, policy_version, policy_evidence_digest, \
+             policy_validated_at, accept_attempt_count, version \
+         ) VALUES ( \
+             $1, 'quoted', $2, $3, to_timestamp($4::double precision), \
+             $5, $6, to_timestamp($7::double precision), 0, 1 \
+         ) ON CONFLICT (chain_swap_id) DO NOTHING",
+    )
+    .bind(identity.chain_swap_id)
+    .bind(quoted_actual_amount_sat)
+    .bind(identity.quote_response_digest())
+    .bind(identity.quote_observed_at_unix)
+    .bind(identity.policy_version())
+    .bind(identity.policy_evidence_digest())
+    .bind(identity.policy_validated_at_unix)
+    .execute(&mut *tx)
+    .await?;
+
+    let operation = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
+    if operation.identity != *identity {
+        return Err(ChainSwapRenegotiationStoreError::IdentityConflict {
+            chain_swap_id: identity.chain_swap_id,
+        });
+    }
+    tx.commit().await?;
+    Ok(operation)
+}
+
+pub async fn get_chain_swap_renegotiation(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+) -> Result<Option<ChainSwapRenegotiationOperation>, ChainSwapRenegotiationStoreError> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} \
+           FROM chain_swap_renegotiation_operations \
+          WHERE chain_swap_id = $1"
+    );
+    let row = sqlx::query_as::<_, RenegotiationOperationDbRow>(&sql)
+        .bind(chain_swap_id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(TryInto::try_into).transpose().map_err(Into::into)
+}
+
+/// Commit `accept_requested` before returning to the caller.
+///
+/// A caller may mutate Boltz only after this function returns `Ok`. This
+/// function and the generic transition adapter perform no network I/O and hold
+/// the row lock only for the database compare-and-swap transaction.
+pub async fn request_chain_swap_renegotiation_accept(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    expected_version: u64,
+) -> Result<RenegotiationTransitionOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        expected_version,
+        RenegotiationTransitionKind::RequestAccept,
+    )?;
+    transition_chain_swap_renegotiation(pool, &transition).await
+}
+
+pub async fn mark_chain_swap_renegotiation_ambiguous(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    expected_version: u64,
+    error_class: RenegotiationErrorClass,
+) -> Result<RenegotiationTransitionOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        expected_version,
+        RenegotiationTransitionKind::MarkAmbiguous { error_class },
+    )?;
+    transition_chain_swap_renegotiation(pool, &transition).await
+}
+
+pub async fn mark_chain_swap_renegotiation_accepted(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    expected_version: u64,
+    terminal_response_digest: impl Into<String>,
+) -> Result<RenegotiationTransitionOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        expected_version,
+        RenegotiationTransitionKind::MarkAccepted {
+            terminal_response_digest: terminal_response_digest.into(),
+        },
+    )?;
+    transition_chain_swap_renegotiation(pool, &transition).await
+}
+
+pub async fn mark_chain_swap_renegotiation_declined(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    expected_version: u64,
+    terminal_response_digest: impl Into<String>,
+) -> Result<RenegotiationTransitionOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        expected_version,
+        RenegotiationTransitionKind::MarkDeclined {
+            terminal_response_digest: terminal_response_digest.into(),
+        },
+    )?;
+    transition_chain_swap_renegotiation(pool, &transition).await
+}
+
+pub async fn transition_chain_swap_renegotiation(
+    pool: &PgPool,
+    transition: &RenegotiationTransition,
+) -> Result<RenegotiationTransitionOutcome, ChainSwapRenegotiationStoreError> {
+    let mut tx = pool.begin().await?;
+    let current = load_operation_for_update(&mut tx, transition.identity.chain_swap_id).await?;
+    let disposition = current.plan_transition(transition)?;
+    if disposition == TransitionDisposition::ExactRetry {
+        tx.commit().await?;
+        return Ok(RenegotiationTransitionOutcome {
+            operation: current,
+            disposition,
+        });
+    }
+
+    let sql = transition_update_sql(&transition.kind);
+    let mut query = sqlx::query_as::<_, RenegotiationOperationDbRow>(&sql)
+        .bind(transition.identity.chain_swap_id)
+        .bind(
+            i64::try_from(transition.expected_version)
+                .map_err(|_| RenegotiationDomainError::InvalidExpectedVersion)?,
+        );
+    query = match &transition.kind {
+        RenegotiationTransitionKind::RequestAccept => query,
+        RenegotiationTransitionKind::MarkAmbiguous { error_class } => {
+            query.bind(error_class.as_str())
+        }
+        RenegotiationTransitionKind::MarkAccepted {
+            terminal_response_digest,
+        }
+        | RenegotiationTransitionKind::MarkDeclined {
+            terminal_response_digest,
+        } => query.bind(terminal_response_digest),
+    };
+    let row =
+        query
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ChainSwapRenegotiationStoreError::CasMiss {
+                chain_swap_id: transition.identity.chain_swap_id,
+            })?;
+    let operation = ChainSwapRenegotiationOperation::try_from(row)?;
+    tx.commit().await?;
+    Ok(RenegotiationTransitionOutcome {
+        operation,
+        disposition,
+    })
+}
+
+async fn load_operation_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    chain_swap_id: Uuid,
+) -> Result<ChainSwapRenegotiationOperation, ChainSwapRenegotiationStoreError> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} \
+           FROM chain_swap_renegotiation_operations \
+          WHERE chain_swap_id = $1 \
+          FOR UPDATE"
+    );
+    let row = sqlx::query_as::<_, RenegotiationOperationDbRow>(&sql)
+        .bind(chain_swap_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ChainSwapRenegotiationStoreError::NotFound { chain_swap_id })?;
+    row.try_into().map_err(Into::into)
+}
+
+fn transition_update_sql(kind: &RenegotiationTransitionKind) -> String {
+    let mutation = match kind {
+        RenegotiationTransitionKind::RequestAccept => {
+            "state = 'accept_requested', \
+             accept_attempt_count = accept_attempt_count + 1, \
+             accept_requested_at = clock_timestamp()"
+        }
+        RenegotiationTransitionKind::MarkAmbiguous { .. } => {
+            "state = 'ambiguous', \
+             last_error_class = $3, \
+             ambiguous_at = clock_timestamp()"
+        }
+        RenegotiationTransitionKind::MarkAccepted { .. } => {
+            "state = 'accepted', \
+             terminal_response_digest = $3, \
+             terminal_observed_at = clock_timestamp()"
+        }
+        RenegotiationTransitionKind::MarkDeclined { .. } => {
+            "state = 'declined', \
+             terminal_response_digest = $3, \
+             terminal_observed_at = clock_timestamp()"
+        }
+    };
+    format!(
+        "UPDATE chain_swap_renegotiation_operations \
+            SET {mutation}, \
+                version = version + 1, \
+                updated_at = clock_timestamp() \
+          WHERE chain_swap_id = $1 \
+            AND version = $2 \
+        RETURNING {OPERATION_COLUMNS}"
+    )
+}
