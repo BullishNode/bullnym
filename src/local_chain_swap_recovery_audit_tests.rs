@@ -6,8 +6,9 @@ use super::{
 use crate::local_chain_swap_recovery_audit::{
     audit_manifest_set_against_local_recovery_snapshot_v1, LocalChainSwapRecoveryAllocationV1,
     LocalChainSwapRecoveryAuditError, LocalChainSwapRecoveryEvidenceV1,
-    LocalChainSwapRecoveryFieldV1, LocalChainSwapRecoverySnapshotSummaryV1,
-    LocalChainSwapRecoverySnapshotV1, LocalRecoveryHighWaterRelationV1,
+    LocalChainSwapRecoveryFieldV1, LocalChainSwapRecoveryInventoryRecordV1,
+    LocalChainSwapRecoverySnapshotSummaryV1, LocalChainSwapRecoverySnapshotV1,
+    LocalChainSwapRecoveryStructuralClassV1, LocalRecoveryHighWaterRelationV1,
     LocalRecoveryLineageHighWaterV1, MAX_RECOVERY_AUDIT_LOCAL_LINEAGES_V1,
     MAX_RECOVERY_AUDIT_LOCAL_RECORDS_V1, MAX_RECOVERY_AUDIT_MANIFEST_RECORDS_V1,
 };
@@ -45,9 +46,21 @@ fn snapshot(
     records: Vec<LocalChainSwapRecoveryEvidenceV1>,
     lineage_high_waters: Vec<LocalRecoveryLineageHighWaterV1>,
 ) -> LocalChainSwapRecoverySnapshotV1 {
+    let chain_inventory = records
+        .iter()
+        .map(|record| LocalChainSwapRecoveryInventoryRecordV1 {
+            boltz_swap_id: record.boltz_swap_id.clone(),
+            structural_class: LocalChainSwapRecoveryStructuralClassV1::CurrentV1,
+            legacy_derivation: None,
+        })
+        .collect::<Vec<_>>();
     LocalChainSwapRecoverySnapshotV1 {
         summary: LocalChainSwapRecoverySnapshotSummaryV1 {
             record_count: records.len(),
+            chain_inventory_record_count: chain_inventory.len(),
+            chain_inventory,
+            active_root_fingerprint: "0011223344556677".into(),
+            active_root_legacy_high_water: None,
             lineage_high_waters,
         },
         records,
@@ -690,6 +703,10 @@ fn local_recovery_audit_enforces_limits_before_manifest_validation() {
     let oversized_local = LocalChainSwapRecoverySnapshotV1 {
         summary: LocalChainSwapRecoverySnapshotSummaryV1 {
             record_count: oversized_records.len(),
+            chain_inventory_record_count: 0,
+            chain_inventory: Vec::new(),
+            active_root_fingerprint: "0011223344556677".into(),
+            active_root_legacy_high_water: None,
             lineage_high_waters: Vec::new(),
         },
         records: oversized_records,
@@ -800,6 +817,14 @@ fn local_recovery_debug_and_errors_are_bounded_and_redacted() {
     };
     let sensitive_summary = LocalChainSwapRecoverySnapshotSummaryV1 {
         record_count: 1,
+        chain_inventory_record_count: 1,
+        chain_inventory: vec![LocalChainSwapRecoveryInventoryRecordV1 {
+            boltz_swap_id: SENTINEL.into(),
+            structural_class: LocalChainSwapRecoveryStructuralClassV1::CurrentV1,
+            legacy_derivation: None,
+        }],
+        active_root_fingerprint: SENTINEL.into(),
+        active_root_legacy_high_water: Some(2),
         lineage_high_waters: vec![LocalRecoveryLineageHighWaterV1 {
             root_fingerprint: SENTINEL.into(),
             key_epoch: 1,

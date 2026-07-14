@@ -209,6 +209,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     provider_record_count = report.boltz.validated_record_count,
                                     provider_chain_record_count = report.boltz.chain_record_count,
                                     local_record_count = report.local.local_record_count,
+                                    local_chain_inventory_count =
+                                        report.chain_inventory.local_chain_record_count,
+                                    current_v1_chain_record_count =
+                                        report.chain_inventory.current_v1_record_count,
+                                    complete_legacy_chain_record_count =
+                                        report.chain_inventory.complete_legacy_record_count,
                                     chain_observation_count = chain.observation_count,
                                     chain_missing_manifest_count = chain.missing_manifest_count,
                                     chain_unconfirmed_manifest_count =
@@ -229,6 +235,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     manifest_only_record_count =
                                         report.local.manifest_only_record_count,
                                     local_only_record_count = report.local.local_only_record_count,
+                                    local_chain_inventory_count =
+                                        report.chain_inventory.local_chain_record_count,
+                                    current_v1_chain_record_count =
+                                        report.chain_inventory.current_v1_record_count,
+                                    complete_legacy_chain_record_count =
+                                        report.chain_inventory.complete_legacy_record_count,
                                     chain_observation_count = chain.observation_count,
                                     chain_conflicting_manifest_count =
                                         chain.conflicting_manifest_count,

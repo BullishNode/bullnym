@@ -218,9 +218,9 @@ mod tests {
         Dependency, MoneyAdmission, ProviderRecoveryConsistencyTransitionV1, Rail, ReasonCode,
     };
     use crate::recovery_shadow_audit::{
-        RecoveryShadowBoltzReportV1, RecoveryShadowCoverageV1,
-        RecoveryShadowLineageClassificationsV1, RecoveryShadowLocalReportV1,
-        RecoveryShadowProviderLocalHighWaterRelationV1,
+        RecoveryShadowBoltzReportV1, RecoveryShadowChainInventoryReportV1,
+        RecoveryShadowCoverageV1, RecoveryShadowLineageClassificationsV1,
+        RecoveryShadowLocalReportV1, RecoveryShadowProviderLocalHighWaterRelationV1,
     };
 
     use super::*;
@@ -250,6 +250,13 @@ mod tests {
                     local_max_child_index: None,
                     lineage_classifications: RecoveryShadowLineageClassificationsV1::default(),
                     coverage: RecoveryShadowCoverageV1::Exact,
+                },
+                chain_inventory: RecoveryShadowChainInventoryReportV1 {
+                    local_chain_record_count: 0,
+                    current_v1_record_count: 0,
+                    complete_legacy_record_count: 0,
+                    exact_provider_local_id_count: 0,
+                    legacy_provider_key_count: 0,
                 },
                 classification: RecoveryShadowClassificationV1::Consistent,
             },

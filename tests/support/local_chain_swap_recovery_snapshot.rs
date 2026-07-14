@@ -10,6 +10,7 @@ use pay_service::db::{
     LocalRecoverySnapshotReadErrorV1, NewChainSwapCreationEvidence, NewChainSwapCreationTerms,
     NewChainSwapRecord, NewSwapKeyAllocation, SwapKeyPurpose, DERIVATION_SCHEME_VERSION,
 };
+use pay_service::local_chain_swap_recovery_audit::LocalChainSwapRecoveryStructuralClassV1;
 
 use super::{
     cleanup_db, create_test_user, insert_test_invoice, insert_test_recovery_commitment,
@@ -265,10 +266,36 @@ async fn local_chain_swap_recovery_snapshot_projects_complete_rows_and_allocator
     .await
     .unwrap();
 
-    let snapshot = load_local_chain_swap_recovery_snapshot_v1(&pool)
+    let snapshot = load_local_chain_swap_recovery_snapshot_v1(&pool, "1111111111111111")
         .await
         .unwrap();
     assert_eq!(snapshot.summary.record_count, 2);
+    assert_eq!(snapshot.summary.chain_inventory_record_count, 3);
+    assert_eq!(snapshot.summary.chain_inventory.len(), 3);
+    assert_eq!(snapshot.summary.active_root_fingerprint, "1111111111111111");
+    assert_eq!(
+        snapshot
+            .summary
+            .chain_inventory
+            .iter()
+            .filter(|record| {
+                record.structural_class == LocalChainSwapRecoveryStructuralClassV1::CurrentV1
+            })
+            .count(),
+        2
+    );
+    let legacy_inventory = snapshot
+        .summary
+        .chain_inventory
+        .iter()
+        .find(|record| {
+            record.structural_class == LocalChainSwapRecoveryStructuralClassV1::CompleteLegacy
+        })
+        .unwrap();
+    let legacy_derivation = legacy_inventory.legacy_derivation.as_ref().unwrap();
+    assert_eq!(legacy_derivation.root_fingerprint, "9999999999999999");
+    assert_eq!(legacy_derivation.claim_child_index, 90);
+    assert_eq!(legacy_derivation.refund_child_index, 91);
     assert_eq!(snapshot.records.len(), 2);
     assert!(snapshot
         .records
@@ -416,8 +443,9 @@ async fn local_chain_swap_recovery_snapshot_is_one_repeatable_read_view() {
         .unwrap();
 
     let loader_pool = pool.clone();
-    let loader =
-        tokio::spawn(async move { load_local_chain_swap_recovery_snapshot_v1(&loader_pool).await });
+    let loader = tokio::spawn(async move {
+        load_local_chain_swap_recovery_snapshot_v1(&loader_pool, "3333333333333333").await
+    });
 
     let mut observed_blocked_lineage_count = false;
     for _ in 0..100 {
@@ -475,7 +503,7 @@ async fn local_chain_swap_recovery_snapshot_is_one_repeatable_read_view() {
         "allocations reserved before the snapshot remain visible"
     );
 
-    let next_snapshot = load_local_chain_swap_recovery_snapshot_v1(&pool)
+    let next_snapshot = load_local_chain_swap_recovery_snapshot_v1(&pool, "3333333333333333")
         .await
         .unwrap();
     assert_eq!(next_snapshot.summary.record_count, 2);
@@ -526,7 +554,7 @@ async fn local_chain_swap_recovery_snapshot_bounds_before_bulk_reads() {
     records_tx.commit().await.unwrap();
 
     assert_eq!(
-        load_local_chain_swap_recovery_snapshot_v1(&pool)
+        load_local_chain_swap_recovery_snapshot_v1(&pool, "4444444444444444")
             .await
             .unwrap_err(),
         LocalRecoverySnapshotReadErrorV1::TooManyRecords
@@ -553,7 +581,7 @@ async fn local_chain_swap_recovery_snapshot_bounds_before_bulk_reads() {
     lineages_tx.commit().await.unwrap();
 
     assert_eq!(
-        load_local_chain_swap_recovery_snapshot_v1(&pool)
+        load_local_chain_swap_recovery_snapshot_v1(&pool, "4444444444444444")
             .await
             .unwrap_err(),
         LocalRecoverySnapshotReadErrorV1::TooManyLineages
@@ -599,7 +627,7 @@ async fn local_chain_swap_recovery_snapshot_rejects_corrupt_registry_without_lea
         .unwrap();
     corrupt.commit().await.unwrap();
 
-    let overlong_error = load_local_chain_swap_recovery_snapshot_v1(&pool)
+    let overlong_error = load_local_chain_swap_recovery_snapshot_v1(&pool, "5555555555555555")
         .await
         .unwrap_err();
     assert_eq!(
@@ -626,7 +654,7 @@ async fn local_chain_swap_recovery_snapshot_rejects_corrupt_registry_without_lea
         .unwrap();
     corrupt.commit().await.unwrap();
 
-    let registry_error = load_local_chain_swap_recovery_snapshot_v1(&pool)
+    let registry_error = load_local_chain_swap_recovery_snapshot_v1(&pool, "5555555555555555")
         .await
         .unwrap_err();
     assert_eq!(
