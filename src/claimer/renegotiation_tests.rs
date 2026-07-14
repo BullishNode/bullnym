@@ -176,8 +176,24 @@ impl MemoryStore {
         let mut state = self.state.lock().unwrap();
         let operation = state.operation.as_mut().unwrap();
         assert_eq!(operation.state, RenegotiationState::AcceptRequested);
-        operation.accept_requested_at_unix =
-            Some(current_unix_time().unwrap() - RENEGOTIATION_ACCEPT_REQUEST_STALE_AFTER_SECS - 1);
+        let requested_at = operation.accept_requested_at_unix.unwrap();
+        let stale_requested_at =
+            current_unix_time().unwrap() - RENEGOTIATION_ACCEPT_REQUEST_STALE_AFTER_SECS - 1;
+        let delta = requested_at.checked_sub(stale_requested_at).unwrap();
+        assert!(delta > 0);
+        operation.identity.quote_observed_at_unix = operation
+            .identity
+            .quote_observed_at_unix
+            .checked_sub(delta)
+            .unwrap();
+        operation.identity.policy_validated_at_unix = operation
+            .identity
+            .policy_validated_at_unix
+            .checked_sub(delta)
+            .unwrap();
+        operation.created_at_unix = operation.created_at_unix.checked_sub(delta).unwrap();
+        operation.updated_at_unix = operation.updated_at_unix.checked_sub(delta).unwrap();
+        operation.accept_requested_at_unix = Some(stale_requested_at);
     }
 
     fn fail_next_acceptance_commit(&self) {
@@ -191,7 +207,7 @@ impl MemoryStore {
         terminal_response_digest: Option<String>,
     ) -> ChainSwapRenegotiationOperation {
         let next_version = current.version + 1;
-        let now = current.updated_at_unix + 1;
+        let now = current_unix_time().unwrap().max(current.updated_at_unix);
         let is_request = state == RenegotiationState::AcceptRequested;
         let is_ambiguous = state == RenegotiationState::Ambiguous;
         let is_terminal = state.is_terminal();
@@ -357,7 +373,7 @@ impl ChainSwapRenegotiationStore for MemoryStore {
         if disposition == TransitionDisposition::ExactRetry {
             return Ok(RenegotiationStoreTransition::ExactRetry(persisted));
         }
-        let now = persisted.updated_at_unix + 1;
+        let now = current_unix_time().unwrap().max(persisted.updated_at_unix);
         let next = ChainSwapRenegotiationOperation::from_persisted_parts(
             replacement.clone(),
             RenegotiationState::AcceptRequested,
