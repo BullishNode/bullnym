@@ -29,13 +29,33 @@ pub struct RenegotiationTransitionOutcome {
     pub disposition: TransitionDisposition,
 }
 
-#[derive(Debug)]
 pub enum ChainSwapRenegotiationStoreError {
     Database(sqlx::Error),
     Domain(RenegotiationDomainError),
     NotFound { chain_swap_id: Uuid },
     IdentityConflict { chain_swap_id: Uuid },
     CasMiss { chain_swap_id: Uuid },
+}
+
+impl fmt::Debug for ChainSwapRenegotiationStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(_) => f.write_str("Database(<redacted>)"),
+            Self::Domain(error) => f.debug_tuple("Domain").field(error).finish(),
+            Self::NotFound { chain_swap_id } => f
+                .debug_struct("NotFound")
+                .field("chain_swap_id", chain_swap_id)
+                .finish(),
+            Self::IdentityConflict { chain_swap_id } => f
+                .debug_struct("IdentityConflict")
+                .field("chain_swap_id", chain_swap_id)
+                .finish(),
+            Self::CasMiss { chain_swap_id } => f
+                .debug_struct("CasMiss")
+                .field("chain_swap_id", chain_swap_id)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for ChainSwapRenegotiationStoreError {
