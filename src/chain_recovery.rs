@@ -1888,22 +1888,14 @@ fn validate_automatic_attempt_authority(
             "automatic recovery requires exactly one source outpoint per journal attempt".into(),
         ));
     }
-    let expected = authority
-        .exact_sources()
-        .iter()
-        .map(|source| (source.txid(), source.vout()))
-        .collect::<HashSet<_>>();
-    let actual = attempt
-        .source_prevouts
-        .0
-        .iter()
-        .map(|source| (source.txid.as_str(), source.vout))
-        .collect::<HashSet<_>>();
-    if actual != expected {
-        return Err(AppError::ClaimError(
-            "automatic recovery journal sources differ from the fresh primary source set".into(),
-        ));
-    }
+    let primary_source = &authority.exact_sources()[0];
+    validate_exact_primary_source_tuple(
+        primary_source.txid(),
+        primary_source.vout(),
+        primary_source.amount_sat(),
+        primary_source.script_pubkey_hex(),
+        &attempt.source_prevouts.0[0],
+    )?;
     let raw = hex::decode(&attempt.raw_tx_hex)
         .map_err(|_| AppError::ClaimError("automatic recovery journal hex is invalid".into()))?;
     let transaction: Transaction = deserialize(&raw)
@@ -1917,6 +1909,37 @@ fn validate_automatic_attempt_authority(
     }
     validate_automatic_path_position(authority, path, &transaction)?;
     Ok(path)
+}
+
+fn validate_exact_primary_source_tuple(
+    primary_txid: &str,
+    primary_vout: u32,
+    primary_amount_sat: u64,
+    primary_script_pubkey_hex: &str,
+    journaled: &RecoverySourcePrevout,
+) -> Result<(), AppError> {
+    let primary_script = hex::decode(primary_script_pubkey_hex)
+        .map_err(|_| AppError::ClaimError("fresh primary source script is invalid hex".into()))?;
+    let journaled_script = hex::decode(&journaled.script_pubkey_hex).map_err(|_| {
+        AppError::ClaimError("automatic recovery journal source script is invalid hex".into())
+    })?;
+    if hex::encode(&primary_script) != primary_script_pubkey_hex
+        || hex::encode(&journaled_script) != journaled.script_pubkey_hex
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery source script is not canonical".into(),
+        ));
+    }
+    if journaled.txid != primary_txid
+        || journaled.vout != primary_vout
+        || journaled.amount_sat != primary_amount_sat
+        || journaled.script_pubkey_hex != primary_script_pubkey_hex
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal source tuple differs from fresh primary authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn journaled_source_txouts(sources: &[RecoverySourcePrevout]) -> Result<Vec<TxOut>, AppError> {
@@ -2275,16 +2298,14 @@ async fn validate_constructed_attempt(
                     .into(),
             ));
         }
-        let expected = authority
-            .exact_sources()
-            .iter()
-            .map(|source| (source.txid().to_owned(), source.vout()))
-            .collect::<HashSet<_>>();
-        if seen != expected {
-            return Err(AppError::ClaimError(
-                "automatic recovery inputs do not match the exact primary source set".into(),
-            ));
-        }
+        let primary_source = &authority.exact_sources()[0];
+        validate_exact_primary_source_tuple(
+            primary_source.txid(),
+            primary_source.vout(),
+            primary_source.amount_sat(),
+            primary_source.script_pubkey_hex(),
+            &source_prevouts[0],
+        )?;
         let expected_path = automatic_path.ok_or_else(|| {
             AppError::ClaimError("automatic recovery lacks its selected spend path".into())
         })?;
@@ -2769,9 +2790,9 @@ mod tests {
     use super::{
         automatic_action_for_path_evidence, automatic_existing_attempt_may_reconcile,
         bitcoin_recovery_fee, classify_authoritative_automatic_attempt,
-        validate_automatic_cooperative_keypath_signature, validate_reloaded_fee_intent,
-        AuthoritativeAutomaticAttemptDecision, BitcoinRecoveryBackend, BitcoinRecoveryEvidence,
-        BitcoinRecoveryTransactionStatus,
+        validate_automatic_cooperative_keypath_signature, validate_exact_primary_source_tuple,
+        validate_reloaded_fee_intent, AuthoritativeAutomaticAttemptDecision,
+        BitcoinRecoveryBackend, BitcoinRecoveryEvidence, BitcoinRecoveryTransactionStatus,
     };
     use crate::builder_fee::BitcoinBuilderFeeDecision;
     use crate::chain_swap_action::{
@@ -2903,6 +2924,61 @@ mod tests {
         let mut aggregated = transaction;
         aggregated.input.push(aggregated.input[0].clone());
         assert!(validate_automatic_cooperative_keypath_signature(&aggregated, &sources).is_err());
+    }
+
+    #[test]
+    fn automatic_replay_rejects_same_outpoint_with_primary_amount_drift() {
+        let script = format!("5120{}", "11".repeat(32));
+        let journaled = RecoverySourcePrevout {
+            txid: "22".repeat(32),
+            vout: 3,
+            amount_sat: 100_000,
+            script_pubkey_hex: script.clone(),
+        };
+        validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &script,
+            &journaled,
+        )
+        .unwrap();
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat - 1,
+            &script,
+            &journaled,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn automatic_prebroadcast_rejects_same_outpoint_with_primary_script_drift() {
+        let script = format!("5120{}", "ab".repeat(32));
+        let journaled = RecoverySourcePrevout {
+            txid: "22".repeat(32),
+            vout: 3,
+            amount_sat: 100_000,
+            script_pubkey_hex: script.clone(),
+        };
+        let different_script = format!("5120{}", "33".repeat(32));
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &different_script,
+            &journaled,
+        )
+        .is_err());
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &script.to_ascii_uppercase(),
+            &journaled,
+        )
+        .is_err());
     }
 
     #[test]

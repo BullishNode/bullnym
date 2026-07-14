@@ -28,6 +28,7 @@ use crate::builder_fee::BitcoinBuilderFeeDecision;
 use crate::error::AppError;
 
 const COOPERATIVE_INPUT_INDEX: u32 = 0;
+const MUSIG_SECRET_NONCE_LEN: usize = 132;
 
 /// Non-secret exact provider request. Its canonical JSON fields are
 /// `pubNonce`, `transaction`, and `index`, matching Boltz API v2.
@@ -61,7 +62,7 @@ impl PreparedCooperativeRefund {
 
 /// Key-grade nonce material. It is never formatted and is overwritten on
 /// drop after the caller seals it into the protected operation journal.
-pub(crate) struct SecretNonceMaterial(Zeroizing<Vec<u8>>);
+pub(crate) struct SecretNonceMaterial(Zeroizing<[u8; MUSIG_SECRET_NONCE_LEN]>);
 
 impl SecretNonceMaterial {
     pub(crate) fn expose(&self) -> &[u8] {
@@ -132,6 +133,8 @@ pub(crate) fn prepare_exact_cooperative_refund(
         ));
     }
 
+    let destination_script = destination.script_pubkey();
+    let minimum_relayable_destination_sat = destination_script.minimal_non_dust().to_sat();
     let mut template = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -143,7 +146,7 @@ pub(crate) fn prepare_exact_cooperative_refund(
         }],
         output: vec![TxOut {
             value: Amount::from_sat(1),
-            script_pubkey: destination.script_pubkey(),
+            script_pubkey: destination_script,
         }],
     };
     let vbytes = u64::try_from(template.vsize()).map_err(|_| {
@@ -159,9 +162,11 @@ pub(crate) fn prepare_exact_cooperative_refund(
         .value
         .to_sat()
         .checked_sub(fee_sat)
-        .filter(|amount| *amount > 0)
+        .filter(|amount| *amount >= minimum_relayable_destination_sat)
         .ok_or_else(|| {
-            AppError::ClaimError("cooperative recovery fee consumes its source".into())
+            AppError::ClaimError(
+                "cooperative recovery destination would be below the relay dust threshold".into(),
+            )
         })?;
     template.output[0].value = Amount::from_sat(destination_sat);
 
@@ -184,10 +189,13 @@ pub(crate) fn prepare_exact_cooperative_refund(
         musig::SessionSecretRand::assume_unique_per_nonce_gen(*session_secret_bytes);
     let mut extra_randomness = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(extra_randomness.as_mut());
-    let (secret_nonce, public_nonce) =
-        key_agg_cache.nonce_gen(session_secret, our_public_key, &message, Some(*extra_randomness));
-    let secret_nonce =
-        SecretNonceMaterial(Zeroizing::new(secret_nonce.dangerous_into_bytes().to_vec()));
+    let (secret_nonce, public_nonce) = key_agg_cache.nonce_gen(
+        session_secret,
+        our_public_key,
+        &message,
+        Some(*extra_randomness),
+    );
+    let secret_nonce = SecretNonceMaterial(Zeroizing::new(secret_nonce.dangerous_into_bytes()));
     let unsigned_tx_hex = hex::encode(bitcoin::consensus::serialize(&template));
     let txid = template.compute_txid().to_string();
 
@@ -390,6 +398,8 @@ fn p2tr_output_key(script: &ScriptBuf) -> Result<bitcoin::XOnlyPublicKey, AppErr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     fn exact_swap_fixture() -> (BtcSwapScript, ChainSwapDetails, Keypair, Keypair, TxOut) {
@@ -514,6 +524,27 @@ mod tests {
         let mut wrong_script = txout.clone();
         wrong_script.script_pubkey = ScriptBuf::from_bytes(vec![0x51]);
         assert!(select_exact_source(&expected, &txout, vec![(expected, wrong_script)],).is_err());
+    }
+
+    #[test]
+    fn dust_destination_is_rejected_before_any_provider_request() {
+        let (script, details, refund_keypair, _, mut source) = exact_swap_fixture();
+        source.value = Amount::from_sat(500);
+        let provider_posts = AtomicUsize::new(0);
+        let preparation = prepare_exact_cooperative_refund(
+            &script,
+            &details,
+            &refund_keypair,
+            OutPoint::null(),
+            source,
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+            fee_decision(),
+        );
+        if preparation.is_ok() {
+            provider_posts.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(preparation.is_err());
+        assert_eq!(provider_posts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
