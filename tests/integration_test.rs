@@ -28,7 +28,13 @@ use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use pay_service::boltz::BoltzService;
+use pay_service::boltz::{
+    BoltzService, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind,
+};
+use pay_service::boltz_transport::{
+    ScriptedBoltzCall, ScriptedBoltzError, ScriptedBoltzStep, ScriptedBoltzTransport,
+    ScriptedBoltzWebhookEvent, ScriptedBoltzWebhookInstruction, ScriptedBoltzWebhookPlan,
+};
 use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
 };
@@ -67,8 +73,9 @@ use bitcoin::script::Builder;
 use bitcoin::ScriptBuf;
 use boltz_client::network::{BitcoinChain, LiquidChain, Network};
 use boltz_client::swaps::boltz::{
-    ChainPair, ChainSwapDetails, CreateChainResponse, HeightResponse, Leaf, PairMinerFees,
-    ReverseFees, ReverseLimits, ReversePair, Side, SwapTree, SwapType,
+    ChainPair, ChainSwapDetails, CreateChainResponse, GetChainPairsResponse, GetSwapResponse,
+    HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair, Side, SwapTree,
+    SwapType,
 };
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
@@ -5945,6 +5952,203 @@ async fn webhook_advances_chain_swap_records() {
     assert_eq!(invoice_after.direct_settlement_status, "none");
     assert_eq!(invoice_after.swap_settlement_status, "pending");
     assert_eq!(invoice_after.direct_payment_projection_version, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue88_scripted_webhook_disorder_and_poll_errors_converge_idempotently() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "issue88webhookscript").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "issue88webhookscript",
+        &npub,
+        "lq1issue88webhookscript",
+        60,
+    )
+    .await;
+    let swap_id = "ISSUE88_WEBHOOK_SCRIPT_1";
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("issue88webhookscript"),
+            boltz_swap_id: swap_id,
+            lockup_address: "bc1qissue88webhookscript",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+    let transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetSwap {
+            swap_id: swap_id.into(),
+            result: Err(ScriptedBoltzError::Timeout),
+        },
+        ScriptedBoltzStep::GetSwap {
+            swap_id: swap_id.into(),
+            result: Ok(GetSwapResponse {
+                status: "transaction.server.confirmed".into(),
+                zero_conf_rejected: None,
+                transaction: None,
+            }),
+        },
+        ScriptedBoltzStep::Quote {
+            swap_id: swap_id.into(),
+            result: Err(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::Timeout,
+                terminal_evidence_sha256: None,
+            }),
+        },
+        ScriptedBoltzStep::AcceptQuote {
+            swap_id: swap_id.into(),
+            amount_sat: 990,
+            result: Err(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::ProviderServerError,
+                terminal_evidence_sha256: None,
+            }),
+        },
+    ]));
+    let state = issue88_state_with_scripted_boltz(
+        pool.clone(),
+        in_memory_recovery_manifest_runtime(),
+        transport.clone(),
+    );
+    let app = test_app(state.clone());
+
+    // Source event 2 is deliberately dropped. Event 1 is delivered twice,
+    // then the older event 0 arrives late: duplicate + reorder + delay all
+    // cross the actual HTTP webhook route.
+    let deliveries = ScriptedBoltzWebhookPlan::new(
+        vec![
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.mempool".into(),
+            },
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.confirmed".into(),
+            },
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.server.confirmed".into(),
+            },
+        ],
+        vec![
+            ScriptedBoltzWebhookInstruction {
+                event_index: 1,
+                delay: Duration::from_millis(2),
+            },
+            ScriptedBoltzWebhookInstruction {
+                event_index: 1,
+                delay: Duration::ZERO,
+            },
+            ScriptedBoltzWebhookInstruction {
+                event_index: 0,
+                delay: Duration::from_millis(3),
+            },
+        ],
+    )
+    .into_deliveries()
+    .unwrap();
+
+    let mut stable_updated_at = None;
+    for (index, delivery) in deliveries.into_iter().enumerate() {
+        tokio::time::sleep(delivery.delay).await;
+        let (status, body) = post_json(&app, "/webhook/boltz", delivery.payload).await;
+        assert_eq!(status, StatusCode::OK, "delivery {index}: {body}");
+        let observed = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.status, "user_lock_confirmed");
+        let exact_updated_at: String =
+            sqlx::query_scalar("SELECT updated_at::TEXT FROM chain_swap_records WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        match stable_updated_at.as_ref() {
+            None => stable_updated_at = Some(exact_updated_at),
+            Some(timestamp) => assert_eq!(
+                &exact_updated_at, timestamp,
+                "duplicate/reordered delivery mutated the reducer timestamp"
+            ),
+        }
+    }
+
+    let current = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        pay_service::reconciler::exercise_chain_swap_provider_poll_once(&state, &current)
+            .await
+            .is_err(),
+        "the scripted timeout must remain retryable"
+    );
+    let after_error = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_error.status, "user_lock_confirmed");
+    pay_service::reconciler::exercise_chain_swap_provider_poll_once(&state, &after_error)
+        .await
+        .unwrap();
+    let converged = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(converged.status, "server_lock_confirmed");
+
+    assert_eq!(
+        state
+            .boltz
+            .get_chain_swap_quote(swap_id)
+            .await
+            .unwrap_err()
+            .kind,
+        ChainSwapQuoteProviderErrorKind::Timeout
+    );
+    assert_eq!(
+        state
+            .boltz
+            .accept_chain_swap_quote(swap_id, 990)
+            .await
+            .unwrap_err()
+            .kind,
+        ChainSwapQuoteProviderErrorKind::ProviderServerError
+    );
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetSwap {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::GetSwap {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::Quote {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::AcceptQuote {
+                swap_id: swap_id.into(),
+                amount_sat: 990,
+            },
+        ]
+    );
 
     cleanup_db(&pool).await;
 }
@@ -23192,6 +23396,240 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
 
     provider.shutdown().await;
     cleanup_db(&pool).await;
+}
+
+fn issue88_state_with_scripted_boltz(
+    pool: PgPool,
+    runtime: Arc<RecoveryManifestRuntimeV1>,
+    transport: Arc<ScriptedBoltzTransport>,
+) -> AppState {
+    let mut state = test_state(pool);
+    let swap_master_key =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    state.boltz = Arc::new(BoltzService::with_transport_for_integration_tests(
+        swap_master_key,
+        None,
+        transport,
+    ));
+    state.recovery_manifest_runtime_v1 = Some(runtime);
+    state
+}
+
+#[tokio::test]
+async fn issue88_scripted_create_errors_cross_the_production_service_boundary() {
+    let chain_transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetChainPairs(Ok(
+            serde_json::from_value::<GetChainPairsResponse>(json!({
+                "BTC": {"L-BTC": issue84_chain_pair()},
+                "L-BTC": {}
+            }))
+            .unwrap(),
+        )),
+        ScriptedBoltzStep::GetHeight(Ok(issue84_chain_heights())),
+        ScriptedBoltzStep::CreateChain(Box::new(Err(ScriptedBoltzError::HttpStatus(503)))),
+    ]));
+    let master =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let chain_service = BoltzService::with_transport_for_integration_tests(
+        master,
+        None,
+        chain_transport.clone(),
+    );
+    let claim = chain_service.derive_swap_key(90_001).unwrap();
+    let refund = chain_service.derive_swap_key(90_002).unwrap();
+    assert!(matches!(
+        chain_service
+            .create_btc_to_lbtc_chain_swap(claim, refund, ISSUE84_CHAIN_AMOUNT_SAT)
+            .await,
+        Err(AppError::BoltzError(_))
+    ));
+    assert_eq!(
+        chain_transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetChainPairs,
+            ScriptedBoltzCall::GetHeight,
+            ScriptedBoltzCall::CreateChain {
+                server_lock_amount_sat: Some(ISSUE84_CHAIN_AMOUNT_SAT),
+            },
+        ]
+    );
+
+    let reverse_transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::CreateReverse(Box::new(Err(ScriptedBoltzError::Timeout))),
+    ]));
+    let master =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let reverse_service = BoltzService::with_transport_for_integration_tests(
+        master,
+        None,
+        reverse_transport.clone(),
+    );
+    let reverse_key = reverse_service.derive_swap_key(90_003).unwrap();
+    assert!(matches!(
+        reverse_service
+            .create_reverse_swap(reverse_key, 50_000, None, None)
+            .await,
+        Err(AppError::BoltzError(_))
+    ));
+    assert_eq!(
+        reverse_transport.calls(),
+        vec![ScriptedBoltzCall::CreateReverse {
+            amount_sat: Some(50_000),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn issue88_scripted_creation_kill_restart_never_duplicates_provider_or_loses_manifest() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue88scriptedrestart";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    let invoice = Arc::new(issue84_chain_invoice(&pool, nym, &npub, 0).await);
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let swap_id = "Issue88ScriptedRestart1";
+    let (pair, heights, creation) = issue84_chain_creation_response(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        swap_id,
+    );
+    let pairs: GetChainPairsResponse = serde_json::from_value(json!({
+        "BTC": {"L-BTC": pair},
+        "L-BTC": {}
+    }))
+    .unwrap();
+    let expected_address = creation.lockup_details.lockup_address.clone();
+    let transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetChainPairs(Ok(pairs)),
+        ScriptedBoltzStep::GetHeight(Ok(heights)),
+        ScriptedBoltzStep::CreateChain(Box::new(Ok(creation))),
+    ]));
+    let runtime = in_memory_recovery_manifest_runtime();
+    let state = Arc::new(issue88_state_with_scripted_boltz(
+        pool.clone(),
+        runtime.clone(),
+        transport.clone(),
+    ));
+    let fault = Arc::new(PausingChainSwapPersistenceFault::new(
+        pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint::
+            AfterCanonicalSwapCommit,
+    ));
+
+    let task_state = state.clone();
+    let task_invoice = invoice.clone();
+    let task_fault = fault.clone();
+    let creation_attempt = tokio::spawn(async move {
+        pay_service::invoice::exercise_bitcoin_chain_offer_creation_with_faults(
+            task_state.as_ref(),
+            Some(nym),
+            ISSUE84_CHAIN_AMOUNT_SAT,
+            task_invoice.as_ref(),
+            task_fault.as_ref(),
+        )
+        .await
+    });
+    fault.wait_until_reached().await;
+    creation_attempt.abort();
+    assert!(creation_attempt.await.unwrap_err().is_cancelled());
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetChainPairs,
+            ScriptedBoltzCall::GetHeight,
+            ScriptedBoltzCall::CreateChain {
+                server_lock_amount_sat: Some(ISSUE84_CHAIN_AMOUNT_SAT),
+            },
+        ]
+    );
+
+    // Discard every old connection before reconstructing only from durable
+    // database and object-store state, as a process restart would.
+    drop(state);
+    pool.close().await;
+    let restarted = test_pool().await;
+    let restarted_state = issue88_state_with_scripted_boltz(
+        restarted.clone(),
+        runtime,
+        transport.clone(),
+    );
+    let invoice = pay_service::db::get_invoice_by_id(&restarted, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let repair_attempt = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .expect_err("the repair request must refuse before returning a new creation permit");
+    assert!(matches!(repair_attempt, AppError::ServiceUnavailable(_)));
+
+    let first_retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("the clean retry must rediscover the repaired payer instruction");
+    let repeated_retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("repeat retries must remain idempotent");
+    assert_eq!(first_retry, repeated_retry);
+    assert_eq!(first_retry.0, expected_address);
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, ScriptedBoltzCall::CreateChain { .. }))
+            .count(),
+        1,
+        "restart crossed the mutating provider boundary more than once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&restarted)
+            .await
+            .unwrap(),
+        1
+    );
+    let deliveries = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].delivery_state, "delivered");
+    assert!(
+        pay_service::db::list_pending_manifest_deliveries(&restarted)
+            .await
+            .unwrap()
+            .is_empty(),
+        "restart left a manifest obligation pending"
+    );
+
+    cleanup_db(&restarted).await;
+    restarted.close().await;
 }
 
 #[tokio::test]

@@ -188,8 +188,8 @@ pub enum ScriptedBoltzStep {
     GetReversePairs(Result<GetReversePairsResponse, ScriptedBoltzError>),
     GetChainPairs(Result<GetChainPairsResponse, ScriptedBoltzError>),
     GetHeight(Result<HeightResponse, ScriptedBoltzError>),
-    CreateReverse(Result<CreateReverseResponse, ScriptedBoltzError>),
-    CreateChain(Result<CreateChainResponse, ScriptedBoltzError>),
+    CreateReverse(Box<Result<CreateReverseResponse, ScriptedBoltzError>>),
+    CreateChain(Box<Result<CreateChainResponse, ScriptedBoltzError>>),
     GetSwap {
         swap_id: String,
         result: Result<GetSwapResponse, ScriptedBoltzError>,
@@ -341,7 +341,7 @@ impl BoltzTransport for ScriptedBoltzTransport {
         });
         match self.next("create_reverse")? {
             ScriptedBoltzStep::CreateReverse(result) => {
-                result.map_err(ScriptedBoltzError::into_client_error)
+                (*result).map_err(ScriptedBoltzError::into_client_error)
             }
             _ => unreachable!("step kind checked"),
         }
@@ -356,7 +356,7 @@ impl BoltzTransport for ScriptedBoltzTransport {
         });
         match self.next("create_chain")? {
             ScriptedBoltzStep::CreateChain(result) => {
-                result.map_err(ScriptedBoltzError::into_client_error)
+                (*result).map_err(ScriptedBoltzError::into_client_error)
             }
             _ => unreachable!("step kind checked"),
         }
