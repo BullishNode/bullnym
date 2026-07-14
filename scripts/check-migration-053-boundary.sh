@@ -422,6 +422,31 @@ SELECT (
            )
            AND acl.grantee = 0
     )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'invoice_payment_events_accounting_sequence_seq'
+           AND relation.relkind = 'S'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user,
+               pg_get_userbyid(relation.relowner),
+               'MEMBER'
+           )
+           AND has_sequence_privilege(current_user, relation.oid, 'USAGE')
+           AND NOT has_sequence_privilege(current_user, relation.oid, 'SELECT')
+           AND NOT has_sequence_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM aclexplode(COALESCE(
+                     relation.relacl,
+                     acldefault('S', relation.relowner)
+                 )) acl
+                WHERE acl.grantee = 0
+           )
+    )
     AND NOT EXISTS (
         SELECT 1 FROM chain_swap_records
          WHERE status IN (

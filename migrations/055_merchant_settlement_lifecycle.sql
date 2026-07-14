@@ -659,6 +659,7 @@ REVOKE ALL ON chain_swap_tx_attempts FROM PUBLIC;
 REVOKE ALL ON invoice_payment_events FROM PUBLIC;
 REVOKE ALL ON merchant_settlement_checkpoints FROM PUBLIC;
 REVOKE ALL ON merchant_settlement_retained_outputs FROM PUBLIC;
+REVOKE ALL ON SEQUENCE invoice_payment_events_accounting_sequence_seq FROM PUBLIC;
 
 DO $$
 DECLARE
@@ -692,6 +693,38 @@ BEGIN
                 USING ERRCODE = '42501';
         END IF;
     END LOOP;
+
+    EXECUTE format(
+        'REVOKE ALL ON SEQUENCE public.invoice_payment_events_accounting_sequence_seq FROM %I',
+        runtime_role_name
+    );
+    EXECUTE format(
+        'GRANT USAGE ON SEQUENCE public.invoice_payment_events_accounting_sequence_seq TO %I',
+        runtime_role_name
+    );
+    SELECT relowner INTO STRICT relation_owner_oid
+      FROM pg_class
+     WHERE oid = 'public.invoice_payment_events_accounting_sequence_seq'::REGCLASS;
+    IF relation_owner_oid = runtime_role_oid
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+       OR NOT has_sequence_privilege(
+           runtime_role_name,
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'USAGE'
+       )
+       OR has_sequence_privilege(
+           runtime_role_name,
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'SELECT'
+       )
+       OR has_sequence_privilege(
+           runtime_role_name,
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'UPDATE'
+       ) THEN
+        RAISE EXCEPTION 'migration 055 failed protected runtime ACL for accounting sequence'
+            USING ERRCODE = '42501';
+    END IF;
 END
 $$;
 
