@@ -369,6 +369,55 @@ impl ChainSwapRenegotiationStore for MemoryStore {
         Ok(operation)
     }
 
+    async fn record_initial_decline(
+        &self,
+        identity: &RenegotiationIdentity,
+        terminal_response_digest: &str,
+    ) -> Result<DefiniteDeclineFinalization, AppError> {
+        let mut state = self.state.lock().unwrap();
+        if state.accepted_parent_amount_sat.is_some() {
+            return Ok(DefiniteDeclineFinalization::LiquidPathActive);
+        }
+        if let Some(current) = state.operation.as_ref() {
+            if current.identity == *identity
+                && current.state == RenegotiationState::Declined
+                && current.terminal_response_digest() == Some(terminal_response_digest)
+            {
+                return Ok(DefiniteDeclineFinalization::Declined(Box::new(
+                    current.clone(),
+                )));
+            }
+            return Err(AppError::DbError(
+                "fake initial decline identity conflict".into(),
+            ));
+        }
+
+        let created_at = identity.policy_validated_at_unix.max(1);
+        let quoted = ChainSwapRenegotiationOperation::from_persisted_parts(
+            identity.clone(),
+            RenegotiationState::Quoted,
+            0,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            created_at,
+            created_at,
+        )
+        .unwrap();
+        let declined = Self::operation_after(
+            &quoted,
+            RenegotiationState::Declined,
+            None,
+            Some(terminal_response_digest.to_owned()),
+        );
+        state.events.push(RenegotiationState::Declined);
+        state.operation = Some(declined.clone());
+        Ok(DefiniteDeclineFinalization::Declined(Box::new(declined)))
+    }
+
     async fn request_accept(
         &self,
         identity: &RenegotiationIdentity,
@@ -941,10 +990,11 @@ async fn creation_pair_bounds_never_preempt_the_live_quote_protocol() {
         let provider =
             FakeProvider::new([Err(quote_error(kind, Some(TERMINAL_DIGEST)))], Vec::new());
         let evidence = primary_mismatch(observed_amount_sat, 1_000);
+        let observer = FaultObserver::never_fail();
         assert!(!try_renegotiate_chain_swap_with_verified_mismatch_using(
             &store,
             &provider,
-            &FaultObserver::never_fail(),
+            &observer,
             &swap,
             "transaction.lockupFailed",
             &evidence,
@@ -955,8 +1005,127 @@ async fn creation_pair_bounds_never_preempt_the_live_quote_protocol() {
             provider.calls(),
             vec![ProviderCall::GetQuote(swap.boltz_swap_id.clone())]
         );
-        assert!(store.operation().is_none());
+        let operation = store.operation().unwrap();
+        assert_eq!(operation.state, RenegotiationState::Declined);
+        assert_eq!(operation.version, 2);
+        assert_eq!(operation.accept_attempt_count, 0);
+        assert_eq!(operation.terminal_response_digest(), Some(TERMINAL_DIGEST));
+        assert_eq!(store.events(), vec![RenegotiationState::Declined]);
+        assert_eq!(
+            observer.reached(),
+            vec![
+                RenegotiationCheckpoint::ExplicitDeclineObservedBeforePersistence,
+                RenegotiationCheckpoint::ExplicitDeclinePersisted,
+            ]
+        );
+
+        // Restarting the same webhook consumes only the durable terminal row;
+        // it cannot call either provider endpoint again.
+        assert!(!try_renegotiate_chain_swap_with_verified_mismatch_using(
+            &store,
+            &provider,
+            &FaultObserver::never_fail(),
+            &swap,
+            "transaction.lockupFailed",
+            &evidence,
+        )
+        .await
+        .unwrap());
+        assert_eq!(store.events(), vec![RenegotiationState::Declined]);
+        assert_eq!(
+            provider.calls(),
+            vec![ProviderCall::GetQuote(swap.boltz_swap_id.clone())]
+        );
     }
+}
+
+#[tokio::test]
+async fn initial_explicit_refusal_crash_boundaries_never_expose_an_acceptable_quote() {
+    let swap = chain_swap(1_000);
+    let evidence = primary_mismatch(900, 1_000);
+
+    let before_store = MemoryStore::default();
+    let before_provider = FakeProvider::new(
+        [
+            Err(quote_error(
+                ChainSwapQuoteProviderErrorKind::BelowMinimum,
+                Some(TERMINAL_DIGEST),
+            )),
+            Err(quote_error(
+                ChainSwapQuoteProviderErrorKind::BelowMinimum,
+                Some(TERMINAL_DIGEST),
+            )),
+        ],
+        Vec::new(),
+    );
+    let before_persistence =
+        FaultObserver::fail_at(RenegotiationCheckpoint::ExplicitDeclineObservedBeforePersistence);
+    assert!(try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &before_store,
+        &before_provider,
+        &before_persistence,
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .is_err());
+    assert!(before_store.operation().is_none());
+    assert!(before_store.events().is_empty());
+
+    assert!(!try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &before_store,
+        &before_provider,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .unwrap());
+    assert_eq!(before_store.events(), vec![RenegotiationState::Declined]);
+    assert!(before_provider
+        .calls()
+        .iter()
+        .all(|call| matches!(call, ProviderCall::GetQuote(_))));
+
+    let after_store = MemoryStore::default();
+    let after_provider = FakeProvider::new(
+        [Err(quote_error(
+            ChainSwapQuoteProviderErrorKind::BelowMinimum,
+            Some(TERMINAL_DIGEST),
+        ))],
+        Vec::new(),
+    );
+    assert!(try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &after_store,
+        &after_provider,
+        &FaultObserver::fail_at(RenegotiationCheckpoint::ExplicitDeclinePersisted),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .is_err());
+    let durable = after_store.operation().unwrap();
+    assert_eq!(durable.state, RenegotiationState::Declined);
+    assert_eq!(durable.accept_attempt_count, 0);
+    assert_eq!(after_store.events(), vec![RenegotiationState::Declined]);
+
+    assert!(!try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &after_store,
+        &after_provider,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        after_provider.calls(),
+        vec![ProviderCall::GetQuote(swap.boltz_swap_id.clone())]
+    );
 }
 
 #[tokio::test]

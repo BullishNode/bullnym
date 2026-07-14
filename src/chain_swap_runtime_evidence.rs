@@ -28,6 +28,7 @@ use crate::chain_swap_primary_source::{
     PrimaryBitcoinSourceAuthorityV1, PrimaryBitcoinSourceProjectionV1,
     PrimaryBitcoinSourceTargetV1,
 };
+use crate::chain_swap_renegotiation::{ChainSwapRenegotiationOperation, RenegotiationState};
 use crate::db::{self, ChainSwapRecord, ChainSwapTxAttempt};
 use crate::error::AppError;
 use crate::merchant_settlement_lifecycle::SettlementFinalityPolicy;
@@ -652,6 +653,9 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
     swap: &ChainSwapRecord,
     recovery_attempt: Option<&ChainSwapTxAttempt>,
 ) -> Result<CollectedAutomaticFallbackEvidence, AppError> {
+    let renegotiation = db::get_chain_swap_renegotiation_for_update(&mut *conn, swap.id)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
     let delivery = db::get_delivered_manifest_for_chain_swap(&mut *conn, swap.id)
         .await
         .map_err(|error| AppError::DbError(error.to_string()))?;
@@ -826,7 +830,11 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
             | LiquidLockEvidence::UnknownOutspend => LiquidPathEvidence::Unknown,
         };
     }
-    evidence.renegotiation = classify_renegotiation(swap, amount_relation);
+    evidence.renegotiation = classify_renegotiation(
+        swap.renegotiated_server_lock_amount_sat,
+        amount_relation,
+        renegotiation.as_ref(),
+    );
 
     Ok(CollectedAutomaticFallbackEvidence {
         evidence,
@@ -1370,19 +1378,37 @@ fn validates_exact_liquid_provider_refund(
 }
 
 fn classify_renegotiation(
-    swap: &ChainSwapRecord,
+    parent_accepted_amount_sat: Option<i64>,
     amount_relation: PrimaryBitcoinAmountRelationV1,
+    operation: Option<&ChainSwapRenegotiationOperation>,
 ) -> RenegotiationEvidence {
-    if swap.renegotiated_server_lock_amount_sat.is_some() {
-        return RenegotiationEvidence::AcceptedAwaitingLock;
-    }
     match amount_relation {
         PrimaryBitcoinAmountRelationV1::NotFunded | PrimaryBitcoinAmountRelationV1::Exact => {
             RenegotiationEvidence::NotRequired
         }
-        PrimaryBitcoinAmountRelationV1::Unknown
-        | PrimaryBitcoinAmountRelationV1::Underfunded
-        | PrimaryBitcoinAmountRelationV1::Overfunded => RenegotiationEvidence::Ambiguous,
+        PrimaryBitcoinAmountRelationV1::Unknown => RenegotiationEvidence::Ambiguous,
+        PrimaryBitcoinAmountRelationV1::Underfunded
+        | PrimaryBitcoinAmountRelationV1::Overfunded => {
+            if let Some(parent_amount) = parent_accepted_amount_sat {
+                let parent_amount = u64::try_from(parent_amount).ok();
+                return match (parent_amount, operation) {
+                    (Some(parent_amount), Some(operation))
+                        if operation.state == RenegotiationState::Accepted
+                            && operation.identity.quoted_actual_amount_sat == parent_amount =>
+                    {
+                        RenegotiationEvidence::AcceptedAwaitingLock
+                    }
+                    _ => RenegotiationEvidence::Ambiguous,
+                };
+            }
+            match operation.map(|operation| operation.state) {
+                None | Some(RenegotiationState::Quoted) => RenegotiationEvidence::Available,
+                Some(RenegotiationState::AcceptRequested) => RenegotiationEvidence::Requested,
+                Some(RenegotiationState::Ambiguous) => RenegotiationEvidence::Ambiguous,
+                Some(RenegotiationState::Accepted) => RenegotiationEvidence::AcceptedAwaitingLock,
+                Some(RenegotiationState::Declined) => RenegotiationEvidence::ExplicitlyUnavailable,
+            }
+        }
     }
 }
 
@@ -1805,6 +1831,141 @@ mod tests {
             bitcoin_timeout: BitcoinTimeoutEvidence::Reached,
             liquid_claim_transaction: MerchantTransactionEvidence::None,
             bitcoin_recovery_transaction: MerchantTransactionEvidence::None,
+        }
+    }
+
+    fn journal_operation(state: RenegotiationState) -> ChainSwapRenegotiationOperation {
+        use crate::chain_swap_renegotiation::{RenegotiationErrorClass, RenegotiationIdentity};
+
+        let identity = RenegotiationIdentity::new(
+            uuid::Uuid::from_u128(0x85),
+            900,
+            "11".repeat(32),
+            99,
+            "issue38-primary-mismatch-v1",
+            "22".repeat(32),
+            100,
+        )
+        .unwrap();
+        let (attempts, version, requested, ambiguous, error, terminal) = match state {
+            RenegotiationState::Quoted => (0, 1, None, None, None, None),
+            RenegotiationState::AcceptRequested => (1, 2, Some(101), None, None, None),
+            RenegotiationState::Ambiguous => (
+                1,
+                3,
+                Some(101),
+                Some(102),
+                Some(RenegotiationErrorClass::Transport),
+                None,
+            ),
+            RenegotiationState::Accepted => (1, 3, Some(101), None, None, Some("33".repeat(32))),
+            RenegotiationState::Declined => (0, 2, None, None, None, Some("33".repeat(32))),
+        };
+        ChainSwapRenegotiationOperation::from_persisted_parts(
+            identity,
+            state,
+            attempts,
+            error,
+            version,
+            requested,
+            ambiguous,
+            terminal,
+            state.is_terminal().then_some(102),
+            100,
+            102,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wrong_amount_fallback_uses_the_exact_durable_renegotiation_state() {
+        use PrimaryBitcoinAmountRelationV1 as Amount;
+        use RenegotiationEvidence as Evidence;
+        use RenegotiationState as State;
+
+        assert_eq!(
+            classify_renegotiation(None, Amount::Underfunded, None),
+            Evidence::Available
+        );
+        for (state, expected) in [
+            (State::Quoted, Evidence::Available),
+            (State::AcceptRequested, Evidence::Requested),
+            (State::Ambiguous, Evidence::Ambiguous),
+            (State::Accepted, Evidence::AcceptedAwaitingLock),
+            (State::Declined, Evidence::ExplicitlyUnavailable),
+        ] {
+            let operation = journal_operation(state);
+            assert_eq!(
+                classify_renegotiation(None, Amount::Underfunded, Some(&operation)),
+                expected,
+                "state {state:?}"
+            );
+            assert_eq!(
+                classify_renegotiation(None, Amount::Overfunded, Some(&operation)),
+                expected,
+                "state {state:?}"
+            );
+        }
+
+        let accepted = journal_operation(State::Accepted);
+        assert_eq!(
+            classify_renegotiation(Some(900), Amount::Underfunded, Some(&accepted)),
+            Evidence::AcceptedAwaitingLock
+        );
+        assert_eq!(
+            classify_renegotiation(Some(901), Amount::Underfunded, Some(&accepted)),
+            Evidence::Ambiguous
+        );
+        let declined = journal_operation(State::Declined);
+        assert_eq!(
+            classify_renegotiation(Some(900), Amount::Underfunded, Some(&declined)),
+            Evidence::Ambiguous
+        );
+        assert_eq!(
+            classify_renegotiation(Some(900), Amount::Underfunded, None),
+            Evidence::Ambiguous
+        );
+
+        for amount in [Amount::NotFunded, Amount::Exact] {
+            assert_eq!(
+                classify_renegotiation(Some(900), amount, Some(&declined)),
+                Evidence::NotRequired
+            );
+        }
+        assert_eq!(
+            classify_renegotiation(None, Amount::Unknown, Some(&declined)),
+            Evidence::Ambiguous
+        );
+    }
+
+    #[test]
+    fn declined_is_the_only_wrong_amount_journal_state_that_opens_recovery() {
+        use PrimaryBitcoinAmountRelationV1 as Amount;
+        use RenegotiationState as State;
+
+        let mut no_journal = automatic_candidate();
+        no_journal.renegotiation = classify_renegotiation(None, Amount::Underfunded, None);
+        assert_ne!(
+            recheck_recovery_under_lock(&no_journal),
+            RecoveryExecutionGate::Authorized
+        );
+
+        for state in [
+            State::Quoted,
+            State::AcceptRequested,
+            State::Ambiguous,
+            State::Accepted,
+            State::Declined,
+        ] {
+            let operation = journal_operation(state);
+            let mut evidence = automatic_candidate();
+            evidence.renegotiation =
+                classify_renegotiation(None, Amount::Underfunded, Some(&operation));
+            assert_eq!(
+                recheck_recovery_under_lock(&evidence) == RecoveryExecutionGate::Authorized,
+                state == State::Declined,
+                "state {state:?}"
+            );
         }
     }
 

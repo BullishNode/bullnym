@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::chain_swap_renegotiation::{
@@ -233,14 +233,29 @@ pub async fn persist_quoted_chain_swap_renegotiation(
     identity: &RenegotiationIdentity,
 ) -> Result<ChainSwapRenegotiationOperation, ChainSwapRenegotiationStoreError> {
     identity.validate()?;
+    let mut tx = pool.begin().await?;
+    insert_quoted_operation(&mut tx, identity).await?;
+
+    let operation = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
+    if operation.identity != *identity {
+        return Err(ChainSwapRenegotiationStoreError::IdentityConflict {
+            chain_swap_id: identity.chain_swap_id,
+        });
+    }
+    tx.commit().await?;
+    Ok(operation)
+}
+
+async fn insert_quoted_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &RenegotiationIdentity,
+) -> Result<(), ChainSwapRenegotiationStoreError> {
     let quoted_actual_amount_sat =
         i64::try_from(identity.quoted_actual_amount_sat).map_err(|_| {
             RenegotiationDomainError::InvalidIdentity {
                 field: "quoted_actual_amount_sat",
             }
         })?;
-
-    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO chain_swap_renegotiation_operations ( \
              chain_swap_id, state, quoted_actual_amount_sat, quote_response_digest, \
@@ -258,17 +273,9 @@ pub async fn persist_quoted_chain_swap_renegotiation(
     .bind(identity.policy_version())
     .bind(identity.policy_evidence_digest())
     .bind(identity.policy_validated_at_unix)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-
-    let operation = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
-    if operation.identity != *identity {
-        return Err(ChainSwapRenegotiationStoreError::IdentityConflict {
-            chain_swap_id: identity.chain_swap_id,
-        });
-    }
-    tx.commit().await?;
-    Ok(operation)
+    Ok(())
 }
 
 pub async fn get_chain_swap_renegotiation(
@@ -283,6 +290,26 @@ pub async fn get_chain_swap_renegotiation(
     let row = sqlx::query_as::<_, RenegotiationOperationDbRow>(&sql)
         .bind(chain_swap_id)
         .fetch_optional(pool)
+        .await?;
+    row.map(TryInto::try_into).transpose().map_err(Into::into)
+}
+
+/// Load the durable renegotiation journal through the caller's existing
+/// per-swap transaction. Automatic fallback callers hold `chain-claim:<id>`
+/// and the parent row lock before reaching this boundary.
+pub async fn get_chain_swap_renegotiation_for_update(
+    conn: &mut PgConnection,
+    chain_swap_id: Uuid,
+) -> Result<Option<ChainSwapRenegotiationOperation>, ChainSwapRenegotiationStoreError> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} \
+           FROM chain_swap_renegotiation_operations \
+          WHERE chain_swap_id = $1 \
+          FOR UPDATE"
+    );
+    let row = sqlx::query_as::<_, RenegotiationOperationDbRow>(&sql)
+        .bind(chain_swap_id)
+        .fetch_optional(&mut *conn)
         .await?;
     row.map(TryInto::try_into).transpose().map_err(Into::into)
 }
@@ -598,6 +625,59 @@ pub async fn mark_chain_swap_renegotiation_declined(
         },
     )?;
     transition_chain_swap_renegotiation(pool, &transition).await
+}
+
+/// Persist the first positively decoded GET-quote refusal as one atomic
+/// `quoted -> declined` journal transaction. The pristine quoted shape exists
+/// only inside this transaction: a crash can expose no row or the complete
+/// terminal refusal, never a quote that a restart could submit to Boltz.
+pub async fn record_initial_definite_declined_chain_swap_renegotiation(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    terminal_response_digest: impl Into<String>,
+) -> Result<RecordDeclinedRenegotiationOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        1,
+        RenegotiationTransitionKind::MarkDeclined {
+            terminal_response_digest: terminal_response_digest.into(),
+        },
+    )?;
+    let mut tx = pool.begin().await?;
+    if let Err(error) = acquire_accept_parent_boundary(&mut tx, identity.chain_swap_id).await {
+        if matches!(error, ChainSwapRenegotiationStoreError::Busy { .. }) {
+            tx.rollback().await?;
+            return Ok(RecordDeclinedRenegotiationOutcome::Busy);
+        }
+        return Err(error);
+    }
+    let parent = load_parent_for_update(&mut tx, identity.chain_swap_id).await?;
+    if parent.renegotiated_server_lock_amount_sat.is_some() || liquid_path_is_active(&parent.status)
+    {
+        tx.commit().await?;
+        return Ok(RecordDeclinedRenegotiationOutcome::LiquidPathActive);
+    }
+
+    insert_quoted_operation(&mut tx, identity).await?;
+    let current = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
+    if current.identity != *identity {
+        return Err(ChainSwapRenegotiationStoreError::IdentityConflict {
+            chain_swap_id: identity.chain_swap_id,
+        });
+    }
+    let disposition = current.plan_transition(&transition)?;
+    let operation = if disposition == TransitionDisposition::Apply {
+        execute_transition_update(&mut tx, &transition).await?
+    } else {
+        current
+    };
+    tx.commit().await?;
+    Ok(match disposition {
+        TransitionDisposition::Apply => RecordDeclinedRenegotiationOutcome::Applied(operation),
+        TransitionDisposition::ExactRetry => {
+            RecordDeclinedRenegotiationOutcome::ExactRetry(operation)
+        }
+    })
 }
 
 /// Serialize a positively decoded provider refusal against a late Liquid lock
