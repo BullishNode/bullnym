@@ -16199,14 +16199,17 @@ async fn liquid_merchant_settlement_broadcast_marker_requires_exact_unheld_paren
     cleanup_db(&pool).await;
     let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "broadcast").await;
 
-    pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
-        &pool,
-        swap_id,
-        &txid,
-        "liquid_claim",
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+            &pool,
+            swap_id,
+            &txid,
+            "liquid_claim",
+        )
+        .await
+        .unwrap(),
+        pay_service::db::LiquidMerchantSettlementBroadcastStartDisposition::Started
+    );
     pay_service::db::mark_liquid_merchant_settlement_broadcast(
         &pool,
         swap_id,
@@ -16426,10 +16429,10 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
         "liquid_claim",
     )
     .await;
-    assert!(matches!(
-        non_claiming_start,
-        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
-    ));
+    assert_eq!(
+        non_claiming_start.unwrap(),
+        pay_service::db::LiquidMerchantSettlementBroadcastStartDisposition::Superseded
+    );
     let refused_attempts: i32 = sqlx::query_scalar(
         "SELECT broadcast_attempts FROM chain_swap_tx_attempts \
           WHERE chain_swap_id = $1 AND txid = $2",
@@ -16598,6 +16601,27 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     assert!(finalized_state.1);
     assert_eq!(finalized_state.2, "finalized");
     assert_eq!(finalized_state.3, "claimed");
+    assert_eq!(
+        pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+            &pool,
+            swap_id,
+            &txid,
+            "liquid_claim",
+        )
+        .await
+        .unwrap(),
+        pay_service::db::LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled
+    );
+    let settled_broadcast_attempts: i32 = sqlx::query_scalar(
+        "SELECT broadcast_attempts FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settled_broadcast_attempts, 1);
 
     let stale = pay_service::db::persist_merchant_settlement_outcome(
         &pool,

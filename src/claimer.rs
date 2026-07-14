@@ -2776,13 +2776,38 @@ async fn claim_chain_swap_inner(
     let claim_tx = reload_chain_claim_for_broadcast(pool, swap.id, &expected_hex).await?;
 
     let txid = btc_like_txid(&claim_tx);
-    db::mark_liquid_merchant_settlement_broadcast_started(pool, swap.id, &txid, "liquid_claim")
-        .await
-        .map_err(|error| {
-            AppError::DbError(format!(
-                "start Liquid merchant settlement broadcast: {error}"
-             ))
-         })?;
+    match db::mark_liquid_merchant_settlement_broadcast_started(
+        pool,
+        swap.id,
+        &txid,
+        "liquid_claim",
+    )
+    .await
+    .map_err(|error| {
+        AppError::DbError(format!(
+            "start Liquid merchant settlement broadcast: {error}"
+        ))
+    })? {
+        db::LiquidMerchantSettlementBroadcastStartDisposition::Started => {}
+        db::LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled => {
+            tracing::info!(
+                event = "chain_claim_broadcast_start_already_settled",
+                swap_id = %swap.boltz_swap_id,
+                txid = %txid,
+                "exact Liquid claim settled before broadcast start; skipping network call"
+            );
+            return Ok(ClaimOutcome::AlreadyTerminal);
+        }
+        db::LiquidMerchantSettlementBroadcastStartDisposition::Superseded => {
+            tracing::info!(
+                event = "chain_claim_broadcast_start_superseded",
+                swap_id = %swap.boltz_swap_id,
+                txid = %txid,
+                "another worker superseded the prepared Liquid claim; skipping network call"
+            );
+            return Ok(ClaimOutcome::AlreadyTerminal);
+        }
+    }
     let liquid_client = claim_clients.connect().await?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
     let broadcast_result = match chain_client.try_broadcast_tx(&claim_tx).await {

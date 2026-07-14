@@ -29,6 +29,56 @@ use crate::{
 const CHECKPOINT_FORMAT_VERSION: i16 = 1;
 const LIQUID_BROADCAST_START_PARENT_STATUS: &str = "claiming";
 
+/// Outcome of the atomic parent/attempt lock taken immediately before a
+/// Liquid claim network call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidMerchantSettlementBroadcastStartDisposition {
+    /// The exact attempt was durably marked ambiguous and may be broadcast.
+    Started,
+    /// Exact confirmation/finality won the race; no broadcast is necessary.
+    AlreadySettled,
+    /// Another worker published a terminal claim failure; no broadcast may run.
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiquidBroadcastStartAction {
+    Start,
+    AlreadySettled,
+    Superseded,
+}
+
+fn liquid_broadcast_start_action(
+    expected_txid: &str,
+    attempt_txid: &str,
+    attempt_status: &str,
+    parent_claim_txid: Option<&str>,
+    parent_status: &str,
+) -> Result<LiquidBroadcastStartAction, MerchantSettlementRepositoryError> {
+    if attempt_txid != expected_txid || parent_claim_txid != Some(expected_txid) {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    match (attempt_status, parent_status) {
+        ("integrity_hold", _) => {
+            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+        }
+        ("confirmed", "claiming") | ("finalized", "claimed") => {
+            Ok(LiquidBroadcastStartAction::AlreadySettled)
+        }
+        (
+            "constructed" | "broadcast_ambiguous" | "broadcast",
+            LIQUID_BROADCAST_START_PARENT_STATUS,
+        ) => {
+            Ok(LiquidBroadcastStartAction::Start)
+        }
+        (
+            "constructed" | "broadcast_ambiguous" | "broadcast",
+            "claim_failed" | "claim_stuck",
+        ) => Ok(LiquidBroadcastStartAction::Superseded),
+        _ => Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointWriteKind {
     InsertInitial,
@@ -533,39 +583,75 @@ pub async fn mark_liquid_merchant_settlement_broadcast_started(
     chain_swap_id: Uuid,
     txid: &str,
     purpose: &str,
-) -> Result<(), MerchantSettlementRepositoryError> {
+) -> Result<
+    LiquidMerchantSettlementBroadcastStartDisposition,
+    MerchantSettlementRepositoryError,
+> {
     if chain_swap_id.is_nil()
         || !matches!(purpose, "liquid_claim" | "liquid_claim_replacement")
         || !canonical_hash(txid)
     {
         return Err(MerchantSettlementRepositoryError::InvalidCommand);
     }
-    let rows = sqlx::query(
-        "UPDATE chain_swap_tx_attempts attempt SET \
-             status = CASE WHEN attempt.status IN ('constructed','broadcast_ambiguous') \
-                           THEN 'broadcast_ambiguous' ELSE attempt.status END, \
-             broadcast_attempts = attempt.broadcast_attempts + 1, \
-             first_broadcast_attempt_at = COALESCE(attempt.first_broadcast_attempt_at, NOW()), \
-             last_broadcast_attempt_at = NOW(), \
-             last_broadcast_result = 'broadcast attempt started; outcome unknown', \
-             updated_at = NOW() \
-          FROM chain_swap_records parent \
-         WHERE attempt.chain_swap_id = $1 AND attempt.txid = $2 AND attempt.purpose = $3 \
-           AND attempt.status IN ('constructed','broadcast_ambiguous','broadcast') \
-           AND parent.id = attempt.chain_swap_id AND parent.claim_txid = attempt.txid \
-           AND parent.status = $4",
+    let mut transaction = pool.begin().await?;
+    let parent: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT claim_txid, status FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let (parent_claim_txid, parent_status) =
+        parent.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, txid, status FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND txid = $2 AND purpose = $3 FOR UPDATE",
     )
     .bind(chain_swap_id)
     .bind(txid)
     .bind(purpose)
-    .bind(LIQUID_BROADCAST_START_PARENT_STATUS)
-    .execute(pool)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let (attempt_id, attempt_txid, attempt_status) =
+        row.ok_or(MerchantSettlementRepositoryError::MissingJournal)?;
+    match liquid_broadcast_start_action(
+        txid,
+        &attempt_txid,
+        &attempt_status,
+        parent_claim_txid.as_deref(),
+        &parent_status,
+    )? {
+        LiquidBroadcastStartAction::AlreadySettled => {
+            transaction.commit().await?;
+            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::AlreadySettled);
+        }
+        LiquidBroadcastStartAction::Superseded => {
+            transaction.commit().await?;
+            return Ok(LiquidMerchantSettlementBroadcastStartDisposition::Superseded);
+        }
+        LiquidBroadcastStartAction::Start => {}
+    }
+    let rows = sqlx::query(
+        "UPDATE chain_swap_tx_attempts SET \
+             status = CASE WHEN status IN ('constructed','broadcast_ambiguous') \
+                           THEN 'broadcast_ambiguous' ELSE status END, \
+             broadcast_attempts = broadcast_attempts + 1, \
+             first_broadcast_attempt_at = COALESCE(first_broadcast_attempt_at, NOW()), \
+             last_broadcast_attempt_at = NOW(), \
+             last_broadcast_result = 'broadcast attempt started; outcome unknown', \
+             updated_at = NOW() \
+         WHERE id = $1 AND txid = $2 AND status = $3",
+    )
+    .bind(attempt_id)
+    .bind(txid)
+    .bind(&attempt_status)
+    .execute(&mut *transaction)
     .await?
     .rows_affected();
     if rows != 1 {
         return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
     }
-    Ok(())
+    transaction.commit().await?;
+    Ok(LiquidMerchantSettlementBroadcastStartDisposition::Started)
 }
 
 /// Finalize a successful or already-known Liquid broadcast only when the
@@ -2206,8 +2292,61 @@ mod tests {
     #[test]
     fn liquid_broadcast_start_requires_claiming_parent() {
         assert_eq!(LIQUID_BROADCAST_START_PARENT_STATUS, "claiming");
-        for status in ["claim_failed", "claim_stuck", "claimed", "expired"] {
-            assert_ne!(status, LIQUID_BROADCAST_START_PARENT_STATUS);
+        for attempt_status in ["constructed", "broadcast_ambiguous", "broadcast"] {
+            assert_eq!(
+                liquid_broadcast_start_action(
+                    TXID,
+                    TXID,
+                    attempt_status,
+                    Some(TXID),
+                    "claiming",
+                )
+                .unwrap(),
+                LiquidBroadcastStartAction::Start
+            );
+            for parent_status in ["claim_failed", "claim_stuck"] {
+                assert_eq!(
+                    liquid_broadcast_start_action(
+                        TXID,
+                        TXID,
+                        attempt_status,
+                        Some(TXID),
+                        parent_status,
+                    )
+                    .unwrap(),
+                    LiquidBroadcastStartAction::Superseded
+                );
+            }
+        }
+        assert_eq!(
+            liquid_broadcast_start_action(TXID, TXID, "confirmed", Some(TXID), "claiming")
+                .unwrap(),
+            LiquidBroadcastStartAction::AlreadySettled
+        );
+        assert_eq!(
+            liquid_broadcast_start_action(TXID, TXID, "finalized", Some(TXID), "claimed")
+                .unwrap(),
+            LiquidBroadcastStartAction::AlreadySettled
+        );
+        for (attempt_txid, attempt_status, parent_txid, parent_status) in [
+            (CHILD, "constructed", Some(TXID), "claiming"),
+            (TXID, "constructed", Some(CHILD), "claiming"),
+            (TXID, "constructed", None, "claiming"),
+            (TXID, "integrity_hold", Some(TXID), "claim_failed"),
+            (TXID, "constructed", Some(TXID), "claimed"),
+            (TXID, "confirmed", Some(TXID), "claimed"),
+            (TXID, "finalized", Some(TXID), "claiming"),
+        ] {
+            assert!(matches!(
+                liquid_broadcast_start_action(
+                    TXID,
+                    attempt_txid,
+                    attempt_status,
+                    parent_txid,
+                    parent_status,
+                ),
+                Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+            ));
         }
     }
 
