@@ -20114,6 +20114,82 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
 }
 
 #[tokio::test]
+async fn automatic_fallback_worklist_redrives_refunding_journal_after_restart() {
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_services, NoRecoveryFaults, RecoveryFaultPoint,
+    };
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "worklist-restart", [FakeBroadcastResult::Accept])
+            .await;
+
+    let fault = OneShotRecoveryFault::at(RecoveryFaultPoint::AfterBroadcastAttemptCommit);
+    assert!(
+        execute_journaled_recovery_with_services(
+            &pool,
+            harness.swap.id,
+            harness.builder.as_ref(),
+            &harness.fee_decision,
+            harness.chain.as_ref(),
+            harness.broadcaster.as_ref(),
+            &fault,
+        )
+        .await
+        .is_err(),
+        "the scripted process death must stop after the durable attempt marker"
+    );
+
+    let parent = pay_service::db::get_chain_swap_by_id(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.status, "refunding");
+    assert_eq!(attempt.status, "broadcast_ambiguous");
+    assert!(harness.broadcaster.calls().is_empty());
+
+    let due = pay_service::db::list_automatic_fallback_due_chain_swaps(&pool, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        due.iter().map(|swap| swap.id).collect::<Vec<_>>(),
+        [harness.swap.id],
+        "a restarted executor must rediscover the committed exact bytes"
+    );
+
+    let resumed = execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &harness.fee_decision,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &NoRecoveryFaults,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed, harness.expected_txid);
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.broadcaster.calls(), [harness.expected_raw_hex]);
+
+    let redrivable = pay_service::db::list_automatic_fallback_due_chain_swaps(&pool, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        redrivable.iter().map(|swap| swap.id).collect::<Vec<_>>(),
+        [harness.swap.id],
+        "a broadcast transaction remains scheduled until terminal chain evidence adopts it"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
     use pay_service::chain_recovery::{
         execute_journaled_recovery_with_services, NoRecoveryFaults, RecoveryFaultPoint,
