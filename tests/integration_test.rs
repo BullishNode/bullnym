@@ -347,6 +347,7 @@ fn test_state_with_provider_limits(
         utxo_backend: None,
         liquid_claim_client_factory: Some(liquid_claim_client_factory),
         bitcoin_recovery_backend: Some(bitcoin_recovery_backend),
+        bitcoin_lockup_witness_adapter: None,
         fee_runtime,
         pricer,
         pwa_shells: Arc::new(PwaShells::default()),

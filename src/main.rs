@@ -178,7 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1::from_watcher_config(
             &config.bitcoin_watcher,
         )
-        .ok();
+        .ok()
+        .map(Arc::new);
     let provider_recovery_reconciliation = match (
         recovery_manifest_runtime_v1.as_deref(),
         startup_chain_witness.as_ref(),
@@ -585,6 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_backend,
         liquid_claim_client_factory,
         bitcoin_recovery_backend,
+        bitcoin_lockup_witness_adapter: startup_chain_witness,
         fee_runtime: fee_runtime.clone(),
         pricer: pricer_client,
         pwa_shells,

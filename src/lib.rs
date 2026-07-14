@@ -15,6 +15,7 @@ pub mod chain_recovery;
 pub mod chain_swap_action;
 pub mod chain_swap_creation_permit;
 pub mod chain_swap_primary_source;
+pub mod chain_swap_runtime_evidence;
 pub mod chain_watcher;
 pub mod claimer;
 pub mod config;
@@ -84,6 +85,11 @@ pub struct AppState {
     pub utxo_backend: Option<Arc<dyn utxo::UtxoBackend>>,
     pub liquid_claim_client_factory: Option<Arc<claimer::LiquidClaimClientFactory>>,
     pub bitcoin_recovery_backend: Option<Arc<chain_recovery::BitcoinRecoveryBackend>>,
+    /// Read-only, bounded Bitcoin history authority retained for per-swap
+    /// chain-evidence reduction. Missing configuration keeps runtime decisions
+    /// observational; it never falls back to provider status.
+    pub bitcoin_lockup_witness_adapter:
+        Option<Arc<chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1>>,
     pub fee_runtime: Arc<fee_runtime::FeeRuntime>,
     pub pricer: Arc<pricer::PricerClient>,
     pub pwa_shells: Arc<donation_render::PwaShells>,
