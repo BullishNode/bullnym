@@ -203,28 +203,34 @@ pub async fn mark_recovery_broadcast_started(
         return Ok(0);
     };
     let mut tx = pool.begin().await?;
-    let parent_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    let parent: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, refund_txid FROM chain_swap_records WHERE id = $1 FOR UPDATE",
     )
     .bind(chain_swap_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if parent_exists.is_none() {
+    let Some((parent_status, parent_refund_txid)) = parent else {
         tx.rollback().await?;
         return Ok(0);
-    }
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM chain_swap_tx_attempts \
+    };
+    let attempt: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, txid FROM chain_swap_tx_attempts \
           WHERE id = $1 AND chain_swap_id = $2 AND purpose = 'btc_recovery' FOR UPDATE",
     )
     .bind(attempt_id)
     .bind(chain_swap_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(next_status) = status
-        .as_deref()
-        .and_then(recovery_broadcast_start_next_status)
-    else {
+    let Some((status, txid)) = attempt else {
+        tx.rollback().await?;
+        return Ok(0);
+    };
+    let Some(next_status) = recovery_broadcast_start_next_status(
+        &parent_status,
+        parent_refund_txid.as_deref(),
+        &txid,
+        &status,
+    ) else {
         tx.rollback().await?;
         return Ok(0);
     };
@@ -242,7 +248,7 @@ pub async fn mark_recovery_broadcast_started(
     .bind(attempt_id)
     .bind(chain_swap_id)
     .bind(next_status)
-    .bind(status.as_deref().expect("status selected above"))
+    .bind(&status)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -261,10 +267,22 @@ pub async fn mark_recovery_broadcast_started(
     Ok(1)
 }
 
-fn recovery_broadcast_start_next_status(status: &str) -> Option<&'static str> {
-    match status {
-        "constructed" | "broadcast_ambiguous" => Some("broadcast_ambiguous"),
-        "broadcast" => Some("broadcast"),
+fn recovery_broadcast_start_next_status(
+    parent_status: &str,
+    parent_refund_txid: Option<&str>,
+    attempt_txid: &str,
+    attempt_status: &str,
+) -> Option<&'static str> {
+    if parent_status != "refunding" {
+        return None;
+    }
+    match attempt_status {
+        "constructed" | "broadcast_ambiguous"
+            if parent_refund_txid.is_none_or(|refund_txid| refund_txid == attempt_txid) =>
+        {
+            Some("broadcast_ambiguous")
+        }
+        "broadcast" if parent_refund_txid == Some(attempt_txid) => Some("broadcast"),
         _ => None,
     }
 }
@@ -273,23 +291,54 @@ fn recovery_broadcast_start_next_status(status: &str) -> Option<&'static str> {
 mod recovery_broadcast_start_tests {
     use super::recovery_broadcast_start_next_status;
 
+    const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_TXID: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[test]
     fn start_preserves_redrivable_wal_states_and_rejects_terminal_states() {
         assert_eq!(
-            recovery_broadcast_start_next_status("constructed"),
+            recovery_broadcast_start_next_status("refunding", None, TXID, "constructed"),
             Some("broadcast_ambiguous")
         );
         assert_eq!(
-            recovery_broadcast_start_next_status("broadcast_ambiguous"),
+            recovery_broadcast_start_next_status(
+                "refunding",
+                Some(TXID),
+                TXID,
+                "broadcast_ambiguous",
+            ),
             Some("broadcast_ambiguous")
         );
         assert_eq!(
-            recovery_broadcast_start_next_status("broadcast"),
+            recovery_broadcast_start_next_status("refunding", Some(TXID), TXID, "broadcast"),
             Some("broadcast")
         );
+        assert_eq!(
+            recovery_broadcast_start_next_status("refunding", None, TXID, "broadcast"),
+            None
+        );
         for status in ["confirmed", "finalized", "integrity_hold", "unknown"] {
-            assert_eq!(recovery_broadcast_start_next_status(status), None);
+            assert_eq!(
+                recovery_broadcast_start_next_status("refunding", Some(TXID), TXID, status),
+                None
+            );
         }
+        for parent_status in ["refund_due", "refunded", "claiming", "claimed"] {
+            assert_eq!(
+                recovery_broadcast_start_next_status(parent_status, Some(TXID), TXID, "broadcast"),
+                None
+            );
+        }
+        assert_eq!(
+            recovery_broadcast_start_next_status(
+                "refunding",
+                Some(OTHER_TXID),
+                TXID,
+                "broadcast",
+            ),
+            None
+        );
     }
 }
 
