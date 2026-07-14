@@ -562,7 +562,17 @@ async fn process_journaled_merchant_settlement(
             {
                 Ok(observation) => observation,
                 Err(LiquidMerchantObservationError::CandidateNotObserved) => {
-                    return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                    match work.service.resume_missing_candidate_redrive() {
+                        Some(processing) => {
+                            return persist_merchant_settlement_processing(
+                                state, chain_swap, context, policy, work, processing,
+                            )
+                            .await
+                        }
+                        None => {
+                            return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                        }
+                    }
                 }
                 Err(error) => return Err(map_liquid_observation_error(error)),
             };
@@ -585,7 +595,17 @@ async fn process_journaled_merchant_settlement(
                 {
                     Ok(observation) => observation,
                     Err(BitcoinMerchantObservationError::CandidateNotObserved) => {
-                        return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                        match work.service.resume_missing_candidate_redrive() {
+                            Some(processing) => {
+                                return persist_merchant_settlement_processing(
+                                    state, chain_swap, context, policy, work, processing,
+                                )
+                                .await
+                            }
+                            None => {
+                                return Ok(JournaledMerchantSettlementTick::CandidateNotObserved);
+                            }
+                        }
                     }
                     Err(error) => return Err(map_bitcoin_observation_error(error)),
                 };
@@ -595,6 +615,18 @@ async fn process_journaled_merchant_settlement(
         }
     };
 
+    persist_merchant_settlement_processing(state, chain_swap, context, policy, work, processing)
+        .await
+}
+
+async fn persist_merchant_settlement_processing(
+    state: &AppState,
+    chain_swap: &ChainSwapRecord,
+    context: MerchantSettlementContext,
+    policy: SettlementFinalityPolicy,
+    work: db::MerchantSettlementWorkItem,
+    processing: MerchantSettlementProcessingOutcome,
+) -> Result<JournaledMerchantSettlementTick, AppError> {
     let action = match work.service.lifecycle().accounting_state() {
         SettlementAccountingState::Finalized => AppliedMerchantSettlementAction::Finalized,
         SettlementAccountingState::Demoted => AppliedMerchantSettlementAction::Demoted,

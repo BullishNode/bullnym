@@ -611,6 +611,25 @@ impl MerchantSettlementAdoptionService {
             .map(|retained| &retained.intent)
     }
 
+    /// Resume an exact-journal replay when a fresh complete observation still
+    /// cannot find the candidate after an eviction or reorg was already
+    /// checkpointed. Without this restart seam, the observation adapter's
+    /// `CandidateNotObserved` result would bypass the durable redrive state and
+    /// fall back to provider polling even though the immutable journal remains
+    /// the stronger local authority.
+    pub fn resume_missing_candidate_redrive(&self) -> Option<MerchantSettlementProcessingOutcome> {
+        matches!(
+            self.lifecycle.state(),
+            crate::merchant_settlement_lifecycle::SettlementState::Evicted
+                | crate::merchant_settlement_lifecycle::SettlementState::Reorged { .. }
+        )
+        .then_some(MerchantSettlementProcessingOutcome {
+            commands: Vec::new(),
+            redrive_observation: true,
+            rebroadcast_journaled: true,
+        })
+    }
+
     /// Construction of this service proves an immutable settlement journal is
     /// still owned. Eviction/reorg request redrive; they never authorize a
     /// value-changing fallback.
@@ -1497,6 +1516,35 @@ mod tests {
                 service.lifecycle().state(),
                 SettlementState::Evicted
             ));
+        }
+    }
+
+    #[test]
+    fn durable_demotion_resumes_exact_redrive_when_candidate_remains_missing() {
+        for path in [
+            MerchantSettlementPath::LiquidClaim,
+            MerchantSettlementPath::BitcoinRecovery,
+        ] {
+            let mut evicted = service(path);
+            evicted.mark_mempool().unwrap();
+            evicted.apply_eviction().unwrap();
+            let resumed = evicted.resume_missing_candidate_redrive().unwrap();
+            assert!(resumed.commands.is_empty());
+            assert!(resumed.redrive_observation);
+            assert!(resumed.rebroadcast_journaled);
+
+            let mut reorged = service(path);
+            let confirmed = verified(path, ORIGINAL_TXID, false, 62_000, 1, 900_000, BLOCK_A);
+            reorged.apply_verified_confirmation(&confirmed).unwrap();
+            reorged.apply_reorg(900_000, BLOCK_A).unwrap();
+            let resumed = reorged.resume_missing_candidate_redrive().unwrap();
+            assert!(resumed.commands.is_empty());
+            assert!(resumed.redrive_observation);
+            assert!(resumed.rebroadcast_journaled);
+
+            let mut watching = service(path);
+            watching.mark_mempool().unwrap();
+            assert!(watching.resume_missing_candidate_redrive().is_none());
         }
     }
 
