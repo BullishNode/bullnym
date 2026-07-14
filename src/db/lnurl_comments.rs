@@ -1,11 +1,10 @@
 //! Durable, rail-neutral LNURL payer-comment intent ledger.
 //!
-//! This is intentionally a persistence seam, not an HTTP API. The public
-//! callback still lacks a stable Lightning idempotency token and Bullnym has no
-//! authenticated Lightning-Address payment-history route. A later coordinator
-//! can wire both rails only after it can supply one stable intent digest across
-//! retries. Until then these functions prevent a partial implementation from
-//! silently dropping direct-Liquid or fallback comments.
+//! This is the persistence seam behind the stable opaque callback digest, the
+//! Lightning coordinator's atomic swap/evidence bindings, and the separately
+//! authenticated history projection. Direct-Liquid callbacks fail closed when
+//! a comment is present until that rail has the same atomic reservation and
+//! settlement boundary.
 
 use std::fmt;
 
@@ -34,7 +33,7 @@ pub struct NewLnurlCommentIntent<'a> {
     /// Merchant identity resolved from the active nym before persistence.
     pub owner_npub: &'a str,
     pub nym: &'a str,
-    /// Opaque stable digest supplied by the future callback coordinator.
+    /// Opaque stable digest supplied by the callback coordinator.
     pub idempotency_key: &'a LnurlCommentIntentKey,
     pub amount_msat: u64,
     pub comment: &'a LnurlPayerComment,
@@ -88,8 +87,8 @@ impl fmt::Debug for LnurlCommentPaymentEvidence {
 
 /// One private comment intent and its monotonic instruction/payment bindings.
 ///
-/// This type has no `Serialize` implementation. A future authenticated route
-/// must explicitly project the comment as escaped plain text after checking
+/// This type has no `Serialize` implementation. The authenticated route
+/// explicitly projects the comment as escaped plain text only after checking
 /// [`Self::payment_evidence`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct LnurlCommentIntent {
@@ -539,6 +538,90 @@ pub async fn bind_lnurl_comment_payment_evidence_in_tx(
     .await?
     .ok_or(LnurlCommentPersistenceError::PaymentEvidenceMismatch)?;
     row.try_into()
+}
+
+/// Atomically mark one reverse swap claimed and expose any private comment
+/// bound to that Lightning instruction as received-payment evidence.
+///
+/// The claim transaction id is the authoritative merchant-side settlement
+/// evidence. Keeping the terminal swap transition and evidence binding in one
+/// transaction means a crash can leave both pending, but can never publish a
+/// comment without a claimed swap or strand a claimed comment without its
+/// evidence. Reverse swaps without comments retain the existing status-update
+/// behavior.
+pub async fn mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
+    pool: &PgPool,
+    swap_id: Uuid,
+    claim_txid: &str,
+) -> Result<u64, LnurlCommentPersistenceError> {
+    validate_reference(claim_txid, "payment_evidence_reference")?;
+
+    let mut tx = pool.begin().await?;
+    let swap: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, boltz_swap_id, claim_txid \
+           FROM swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(swap_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, instruction_reference, stored_claim_txid)) = swap else {
+        tx.commit().await?;
+        return Ok(0);
+    };
+
+    let transitioned = if status == "claimed" {
+        if stored_claim_txid.as_deref() != Some(claim_txid) {
+            return Err(LnurlCommentPersistenceError::PaymentEvidenceMismatch);
+        }
+        0
+    } else if matches!(
+        status.as_str(),
+        "expired" | "claim_stuck" | "lockup_refunded"
+    ) {
+        tx.commit().await?;
+        return Ok(0);
+    } else {
+        let result = sqlx::query(
+            "UPDATE swap_records \
+                SET status = 'claimed', claim_txid = $2, updated_at = NOW() \
+              WHERE id = $1 \
+                AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+        )
+        .bind(swap_id)
+        .bind(claim_txid)
+        .execute(&mut *tx)
+        .await?;
+        result.rows_affected()
+    };
+
+    // The immutable unique instruction binding is enough to recover the
+    // merchant-scoped key. Do not row-lock here: the transaction-aware binder
+    // owns the canonical advisory-lock-then-row-lock order.
+    let comment_identity: Option<(String, String)> = sqlx::query_as(
+        "SELECT owner_npub, idempotency_key \
+           FROM lnurl_comment_intents \
+          WHERE instruction_rail = 'lightning' \
+            AND instruction_reference = $1",
+    )
+    .bind(&instruction_reference)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((owner_npub, stored_key)) = comment_identity {
+        let idempotency_key =
+            LnurlCommentIntentKey::from_stored(stored_key).map_err(map_stored_value_error)?;
+        bind_lnurl_comment_payment_evidence_in_tx(
+            &mut tx,
+            &owner_npub,
+            &idempotency_key,
+            LnurlCommentRail::Lightning,
+            &instruction_reference,
+            claim_txid,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(transitioned)
 }
 
 /// Evidence-gated projection for a route that has already authenticated the

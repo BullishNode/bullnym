@@ -11,11 +11,11 @@ The normal LUD-06 metadata response adds `payment_methods`:
 ```json
 {
   "tag": "payRequest",
-  "callback": "https://pay.example.com/lnurlp/callback/alice",
+  "callback": "https://pay.example.com/lnurlp/callback/alice/0000000000000000000000000000000000000000000000000000000000000000",
   "minSendable": 100000,
   "maxSendable": 25000000000,
   "metadata": "[[\"text/identifier\",\"alice@pay.example.com\"],[\"text/plain\",\"Sats for alice\"]]",
-  "commentAllowed": 144,
+  "commentAllowed": 120,
   "payment_methods": ["L-BTC"]
 }
 ```
@@ -30,8 +30,13 @@ The callback remains an HTTP GET. All requests include:
 | Query field | Format | Meaning |
 |---|---|---|
 | `amount` | unsigned decimal integer | Millisatoshis; must be within the advertised limits and divisible by 1,000. |
-| `comment` | optional UTF-8 string | LUD-06 comment. The server rejects more than `commentAllowed` Unicode characters. |
+| `comment` | optional UTF-8 string | Private LUD-06 comment, bounded to 120 user-visible Unicode characters and 512 UTF-8 bytes. Comments currently require the Lightning rail. |
 | `payment_method` | optional comma-separated string | Include `L-BTC` to request direct Liquid. Omit it for Lightning. |
+
+The callback path contains the opaque per-metadata intent token. Clients must
+retain the complete URL across an exact callback retry. Bullnym rejects a
+comment sent to the legacy tokenless route, or together with `L-BTC`, rather
+than accepting text it cannot durably associate with that rail.
 
 A public client requesting `L-BTC` also supplies every Approach B proof field:
 

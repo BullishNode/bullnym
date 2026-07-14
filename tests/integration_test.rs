@@ -389,6 +389,10 @@ fn test_app(state: AppState) -> Router {
         .route("/ready", get(readiness::ready))
         .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
         .route("/.well-known/nostr.json", get(nostr::nostr_json))
+        .route(
+            "/lnurlp/callback/:nym/:comment_intent",
+            get(lnurl::callback_with_comment_intent),
+        )
         .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/donation-page", put(donation_page::save))
         .route("/donation-page/:nym", get(donation_page::get))
@@ -1021,6 +1025,87 @@ async fn spawn_counting_http_server() -> (String, Arc<AtomicUsize>, tokio::task:
     (format!("http://{address}"), calls, task)
 }
 
+fn valid_reverse_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(hashlock.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&receiver.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script()
+}
+
+fn valid_reverse_refund_script(sender: &BoltzPublicKey, timeout_height: u32) -> ScriptBuf {
+    Builder::new()
+        .push_x_only_key(&sender.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(timeout_height))
+        .push_opcode(OP_CLTV)
+        .into_script()
+}
+
+fn valid_reverse_response_for_index(
+    swap_id: &str,
+    claim_key_index: u64,
+    amount_sat: u64,
+) -> CreateReverseResponse {
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    const TIMEOUT_HEIGHT: u32 = 2_000_000;
+    const LIQUID_TAPSCRIPT_LEAF_VERSION: u8 = 0xc4;
+
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(claim_key_index).unwrap();
+    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+    let preimage = Preimage::from_swap_key(&claim_keypair);
+    let refund_keypair = master.derive_swapkey(9_999).unwrap();
+    let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let claim_script = valid_reverse_claim_script(preimage.hash160, &claim_public_key);
+    let refund_script = valid_reverse_refund_script(&refund_public_key, TIMEOUT_HEIGHT);
+    let lockup_address = LBtcSwapScript {
+        swap_type: SwapType::ReverseSubmarine,
+        side: None,
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(TIMEOUT_HEIGHT),
+        sender_pubkey: refund_public_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+
+    CreateReverseResponse {
+        id: swap_id.to_owned(),
+        invoice: Some(fresh_bolt11_for_payment_hash(amount_sat, preimage.sha256)),
+        swap_tree: SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(claim_script.as_bytes()),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(refund_script.as_bytes()),
+                version: LIQUID_TAPSCRIPT_LEAF_VERSION,
+            },
+            covenant_claim_leaf: None,
+        },
+        lockup_address,
+        refund_public_key,
+        timeout_block_height: TIMEOUT_HEIGHT,
+        onchain_amount: amount_sat,
+        blinding_key: Some(BLINDING_KEY.to_owned()),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct M11CreationMutationSnapshot {
     next_key_index: i64,
@@ -1134,10 +1219,18 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
 }
 
 #[derive(Clone)]
+enum SuccessfulReverseBarrierResponse {
+    Dynamic {
+        swap_id: String,
+        invoice_amount_sat: u64,
+        next_key_index: Arc<AtomicU64>,
+    },
+    Fixed(Value),
+}
+
+#[derive(Clone)]
 struct SuccessfulReverseBarrierState {
-    swap_id: String,
-    invoice_amount_sat: u64,
-    next_key_index: Arc<AtomicU64>,
+    response: SuccessfulReverseBarrierResponse,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
     invoices: Arc<Mutex<Vec<String>>>,
@@ -1259,50 +1352,85 @@ async fn successful_reverse_barrier_handler(
     axum::Json(request): axum::Json<Value>,
 ) -> axum::Json<Value> {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    let key_index = state.next_key_index.fetch_add(1, Ordering::SeqCst);
-    let master = SwapMasterKey::from_mnemonic(
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-        None,
-        Network::Mainnet,
-    )
-    .unwrap();
-    let claim_keypair = master.derive_swapkey(key_index).unwrap();
-    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
-    let preimage = Preimage::from_swap_key(&claim_keypair);
-    let claim_public_key_string = claim_public_key.to_string();
-    let preimage_hash_string = preimage.sha256.to_string();
-    assert_eq!(
-        request["claimPublicKey"].as_str(),
-        Some(claim_public_key_string.as_str()),
-        "fixture key index did not match the production request"
-    );
-    assert_eq!(
-        request["preimageHash"].as_str(),
-        Some(preimage_hash_string.as_str()),
-        "fixture preimage did not match the production request"
-    );
+    let response = match &state.response {
+        SuccessfulReverseBarrierResponse::Dynamic {
+            swap_id,
+            invoice_amount_sat,
+            next_key_index,
+        } => {
+            let key_index = next_key_index.fetch_add(1, Ordering::SeqCst);
+            let master = SwapMasterKey::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                None,
+                Network::Mainnet,
+            )
+            .unwrap();
+            let claim_keypair = master.derive_swapkey(key_index).unwrap();
+            let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+            let preimage = Preimage::from_swap_key(&claim_keypair);
+            let claim_public_key_string = claim_public_key.to_string();
+            let preimage_hash_string = preimage.sha256.to_string();
+            assert_eq!(
+                request["claimPublicKey"].as_str(),
+                Some(claim_public_key_string.as_str()),
+                "fixture key index did not match the production request"
+            );
+            assert_eq!(
+                request["preimageHash"].as_str(),
+                Some(preimage_hash_string.as_str()),
+                "fixture preimage did not match the production request"
+            );
 
-    let invoice = fresh_bolt11_for_payment_hash(state.invoice_amount_sat, preimage.sha256);
-    let response = protocol_valid_reverse_response(
-        &state.swap_id,
-        invoice.clone(),
-        claim_public_key,
-        &preimage,
-        request["onchainAmount"]
-            .as_u64()
-            .expect("fixed checkout request onchainAmount"),
-    );
-    state.invoices.lock().await.push(invoice);
+            let invoice = fresh_bolt11_for_payment_hash(*invoice_amount_sat, preimage.sha256);
+            let response = protocol_valid_reverse_response(
+                swap_id,
+                invoice.clone(),
+                claim_public_key,
+                &preimage,
+                request["onchainAmount"]
+                    .as_u64()
+                    .expect("fixed checkout request onchainAmount"),
+            );
+            state.invoices.lock().await.push(invoice);
+            serde_json::to_value(response).unwrap()
+        }
+        SuccessfulReverseBarrierResponse::Fixed(template) => {
+            let mut response = template.clone();
+            response["onchainAmount"] = request
+                .get("onchainAmount")
+                .or_else(|| request.get("invoiceAmount"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            response
+        }
+    };
     state.requests.lock().await.push(request);
     state.request_barrier.wait().await;
     state.release_barrier.wait().await;
-    axum::Json(serde_json::to_value(response).unwrap())
+    axum::Json(response)
 }
 
 async fn spawn_successful_reverse_barrier_server(
     swap_id: &str,
     invoice_amount_sat: u64,
     first_key_index: u64,
+) -> SuccessfulReverseBarrierServer {
+    spawn_successful_reverse_barrier(SuccessfulReverseBarrierResponse::Dynamic {
+        swap_id: swap_id.to_owned(),
+        invoice_amount_sat,
+        next_key_index: Arc::new(AtomicU64::new(first_key_index)),
+    })
+    .await
+}
+
+async fn spawn_successful_reverse_barrier_response(
+    response: Value,
+) -> SuccessfulReverseBarrierServer {
+    spawn_successful_reverse_barrier(SuccessfulReverseBarrierResponse::Fixed(response)).await
+}
+
+async fn spawn_successful_reverse_barrier(
+    response: SuccessfulReverseBarrierResponse,
 ) -> SuccessfulReverseBarrierServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1314,9 +1442,7 @@ async fn spawn_successful_reverse_barrier_server(
     let request_barrier = Arc::new(Barrier::new(2));
     let release_barrier = Arc::new(Barrier::new(2));
     let state = SuccessfulReverseBarrierState {
-        swap_id: swap_id.to_owned(),
-        invoice_amount_sat,
-        next_key_index: Arc::new(AtomicU64::new(first_key_index)),
+        response,
         calls: calls.clone(),
         requests: requests.clone(),
         invoices: invoices.clone(),
@@ -8016,6 +8142,221 @@ async fn callback_rejects_invalid_amounts() {
 }
 
 #[tokio::test]
+async fn lnurl_comment_callback_persists_binds_and_replays_one_private_lightning_intent() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "commentruntime";
+    let owner_npub = create_test_user(&pool, nym).await;
+
+    let claim_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider_response =
+        valid_reverse_response_for_index("COMMENT_RUNTIME_SWAP_1", claim_key_index, 100);
+    let bolt11 = provider_response.invoice.clone().unwrap();
+    let provider =
+        spawn_successful_reverse_barrier_response(serde_json::to_value(provider_response).unwrap())
+            .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let metadata_origin = format!("https://{}", config.domain);
+    let app = test_app(test_state_with_config(pool.clone(), config));
+
+    let (metadata_status, metadata) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(metadata_status, StatusCode::OK, "{metadata}");
+    assert_eq!(metadata["commentAllowed"], 120);
+    let callback = metadata["callback"].as_str().unwrap();
+    let callback_path = callback.strip_prefix(&metadata_origin).unwrap();
+    let token = callback_path
+        .strip_prefix(&format!("/lnurlp/callback/{nym}/"))
+        .expect("metadata callback includes a private-intent token");
+    assert_eq!(token.len(), 64);
+    assert!(token
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+    let over_limit = "x".repeat(121);
+    let (over_limit_status, over_limit_body) = get_path(
+        &app,
+        &format!("{callback_path}?amount=100000&comment={over_limit}"),
+    )
+    .await;
+    assert_eq!(over_limit_status, StatusCode::OK, "{over_limit_body}");
+    assert_eq!(over_limit_body["code"], "InvalidComment");
+    assert!(!over_limit_body.to_string().contains(&over_limit));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    let (legacy_status, legacy_body) = get_path(
+        &app,
+        &format!("/lnurlp/callback/{nym}?amount=100000&comment=private"),
+    )
+    .await;
+    assert_eq!(legacy_status, StatusCode::OK, "{legacy_body}");
+    assert_eq!(legacy_body["code"], "InvalidComment");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    let (liquid_status, liquid_body) = get_path(
+        &app,
+        &format!("{callback_path}?amount=100000&comment=private&payment_method=L-BTC"),
+    )
+    .await;
+    assert_eq!(liquid_status, StatusCode::OK, "{liquid_body}");
+    assert_eq!(liquid_body["code"], "InvalidComment");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    let exact_text = "table seven private";
+    let callback_request = format!("{callback_path}?amount=100000&comment=table%20seven%20private");
+    let first_app = app.clone();
+    let first_request = callback_request.clone();
+    let first = tokio::spawn(async move { get_path(&first_app, &first_request).await });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    let (first_status, first_body) = first.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(first_body["pr"], bolt11, "{first_body}");
+    assert!(!first_body.to_string().contains(exact_text));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    let (retry_status, retry_body) = get_path(&app, &callback_request).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+    assert_eq!(retry_body, first_body);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "exact retry called the provider instead of replaying the bound swap"
+    );
+
+    let (mismatch_status, mismatch_body) = get_path(
+        &app,
+        &format!("{callback_path}?amount=100000&comment=different"),
+    )
+    .await;
+    assert_eq!(mismatch_status, StatusCode::OK, "{mismatch_body}");
+    assert_eq!(mismatch_body["code"], "InvalidComment");
+    assert!(!mismatch_body.to_string().contains("different"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    let (amount_mismatch_status, amount_mismatch_body) = get_path(
+        &app,
+        &format!("{callback_path}?amount=101000&comment=table%20seven%20private"),
+    )
+    .await;
+    assert_eq!(
+        amount_mismatch_status,
+        StatusCode::OK,
+        "{amount_mismatch_body}"
+    );
+    assert_eq!(amount_mismatch_body["code"], "InvalidComment");
+    assert!(!amount_mismatch_body.to_string().contains(exact_text));
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "amount-mismatched retry called the provider"
+    );
+
+    let stored: (String, i16, String, String, Option<String>) = sqlx::query_as(
+        "SELECT comment, comment_grapheme_count, instruction_rail, \
+                instruction_reference, payment_evidence_reference \
+           FROM lnurl_comment_intents",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, exact_text);
+    assert_eq!(stored.1, 19);
+    assert_eq!(stored.2, "lightning");
+    assert_eq!(stored.3, "COMMENT_RUNTIME_SWAP_1");
+    assert!(stored.4.is_none());
+    let swaps: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM swap_records WHERE boltz_swap_id = 'COMMENT_RUNTIME_SWAP_1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(swaps, 1);
+
+    let swap_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM swap_records WHERE boltz_swap_id = 'COMMENT_RUNTIME_SWAP_1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pay_service::db::mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
+            &pool,
+            swap_id,
+            "comment-runtime-claim-txid",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let settled: (String, String, String) = sqlx::query_as(
+        "SELECT s.status, s.claim_txid, c.payment_evidence_reference \
+           FROM swap_records s \
+           JOIN lnurl_comment_intents c \
+             ON c.instruction_rail = 'lightning' \
+            AND c.instruction_reference = s.boltz_swap_id \
+          WHERE s.id = $1",
+    )
+    .bind(swap_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        settled,
+        (
+            "claimed".to_string(),
+            "comment-runtime-claim-txid".to_string(),
+            "comment-runtime-claim-txid".to_string(),
+        )
+    );
+    let received = pay_service::db::list_received_lnurl_comments_for_authenticated_merchant(
+        &pool,
+        &owner_npub,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].comment().as_str(), exact_text);
+    let evidenced_at = received[0]
+        .payment_evidence
+        .as_ref()
+        .unwrap()
+        .evidenced_at_unix;
+    assert_eq!(
+        pay_service::db::mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
+            &pool,
+            swap_id,
+            "comment-runtime-claim-txid",
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let retry_received = pay_service::db::list_received_lnurl_comments_for_authenticated_merchant(
+        &pool,
+        &owner_npub,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        retry_received[0]
+            .payment_evidence
+            .as_ref()
+            .unwrap()
+            .evidenced_at_unix,
+        evidenced_at,
+        "exact settlement retry changed the server-owned evidence timestamp"
+    );
+
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn m11_fresh_provider_range_is_cached_and_callback_revalidates_before_mutation() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -8146,8 +8487,18 @@ async fn m11_unsafe_provider_snapshots_disable_only_lightning() {
         let callback = metadata_body["callback"]
             .as_str()
             .expect("metadata callback string");
-        let expected_callback = format!("{metadata_origin}/lnurlp/callback/{nym}");
-        assert_eq!(callback, expected_callback, "case {case}");
+        let expected_callback_prefix = format!("{metadata_origin}/lnurlp/callback/{nym}/");
+        let comment_intent_token = callback
+            .strip_prefix(&expected_callback_prefix)
+            .unwrap_or_else(|| panic!("case {case}: callback missing opaque intent token"));
+        assert_eq!(comment_intent_token.len(), 64, "case {case}");
+        assert!(
+            comment_intent_token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "case {case}: callback intent token is not canonical lowercase hex"
+        );
+        assert_eq!(metadata_body["commentAllowed"], 120, "case {case}");
         let callback_path = callback
             .strip_prefix(&metadata_origin)
             .expect("callback on configured metadata origin");

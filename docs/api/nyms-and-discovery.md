@@ -7,11 +7,11 @@ Returns LUD-06 metadata:
 ```json
 {
   "tag": "payRequest",
-  "callback": "https://pay.example.com/lnurlp/callback/alice",
+  "callback": "https://pay.example.com/lnurlp/callback/alice/0000000000000000000000000000000000000000000000000000000000000000",
   "minSendable": 100000,
   "maxSendable": 25000000000,
   "metadata": "[[\"text/identifier\",\"alice@pay.example.com\"],[\"text/plain\",\"Sats for alice\"]]",
-  "commentAllowed": 144,
+  "commentAllowed": 120,
   "payment_methods": ["L-BTC"]
 }
 ```
@@ -22,14 +22,19 @@ be changed by the operator, so treat the returned limits as authoritative.
 the implicit default Lightning method. Generic LNURL clients can ignore the
 extension and use Lightning.
 
-## `GET /lnurlp/callback/:nym`
+## `GET /lnurlp/callback/:nym/:comment_intent`
+
+Use the complete opaque callback URL returned by metadata. The final path
+component gives an exact retry the same private intent identity. The legacy
+`/lnurlp/callback/:nym` route remains available for no-comment payments, but
+fails closed if a `comment` is supplied.
 
 Common query fields:
 
 | Field | Required | Meaning |
 |---|---|---|
 | `amount` | yes | Requested millisatoshis, within metadata limits and divisible by 1,000 (whole sats). |
-| `comment` | no | LNURL comment. The server rejects more than `commentAllowed` Unicode characters. |
+| `comment` | no | Private LNURL comment. The server preserves at most 120 user-visible Unicode characters and 512 UTF-8 bytes exactly. |
 | `payment_method` | no | Omit for Lightning; `L-BTC` requests direct Liquid through LUD-22. |
 
 The default response is:
@@ -67,6 +72,9 @@ has a larger privacy surface. Mapping `(nym, outpoint)` is idempotent; a UTXO
 can target only a bounded number of distinct nyms. On rate-limit/backend
 throttle errors the implementation may fall back to Lightning, so clients must
 inspect the response type rather than assume the requested rail was selected.
+Comments are currently bound only on the Lightning path. A callback combining
+`comment` with `payment_method=L-BTC` fails closed instead of dropping private
+text during direct-Liquid creation or fallback.
 
 ## `GET /.well-known/nostr.json?name=:nym`
 

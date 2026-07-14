@@ -6,6 +6,7 @@ use axum::Json;
 use lwk_wollet::elements;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::admission::Rail;
 use crate::certification::{self, CertificationScope};
@@ -13,6 +14,10 @@ use crate::db;
 use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
+use crate::lnurl_comment::{
+    LnurlCommentIntentKey, LnurlCommentRail, LnurlCommentValidationError, LnurlPayerComment,
+    LNURL_COMMENT_ALLOWED,
+};
 use crate::provider_limits::{LightningAddressCreationError, LightningAddressUnavailable};
 use crate::utxo::{script_matches_pubkey, verify_ownership_sig, ParsedOutpoint};
 use crate::AppState;
@@ -98,6 +103,28 @@ pub struct SuccessAction {
     pub message: String,
 }
 
+const COMMENT_BYTES_EXCEEDED: &str =
+    "Comment exceeds the 512-byte UTF-8 limit. Shorten it and try again.";
+const COMMENT_CHARACTERS_EXCEEDED: &str =
+    "Comment exceeds the 120-character limit. Shorten it and try again.";
+const COMMENT_INTENT_REQUIRED: &str =
+    "Comment requires a fresh LNURL callback. Refresh the Lightning Address and try again.";
+const COMMENT_RETRY_MISMATCH: &str =
+    "Comment retry does not match the original payment intent. Refresh the Lightning Address and try again.";
+const COMMENT_LIGHTNING_ONLY: &str =
+    "Comments are currently available only for Lightning payments. Retry without the L-BTC payment method.";
+const COMMENT_INTERNAL_FAILURE: &str = "LNURL comment persistence failed";
+
+struct RequestedLnurlComment {
+    key: LnurlCommentIntentKey,
+    comment: LnurlPayerComment,
+}
+
+struct LnurlCommentInstructionBinding<'a> {
+    owner_npub: &'a str,
+    idempotency_key: &'a LnurlCommentIntentKey,
+}
+
 // --- Metadata builder ---
 
 fn build_metadata(nym: &str, domain: &str) -> String {
@@ -108,6 +135,91 @@ fn build_metadata(nym: &str, domain: &str) -> String {
         vec!["text/plain", &plain],
     ])
     .expect("metadata serialization cannot fail")
+}
+
+fn new_comment_intent_key() -> LnurlCommentIntentKey {
+    // Metadata needs a fresh stable callback identity without retaining
+    // private payer data or server-side pre-intent state. Two independent v4
+    // UUIDs provide the entropy; the domain-separated digest is the only value
+    // exposed to and echoed by the payer across exact callback retries.
+    let mut digest = Sha256::new();
+    digest.update(b"bullnym-lnurl-comment-intent-v1\0");
+    digest.update(Uuid::new_v4().as_bytes());
+    digest.update(Uuid::new_v4().as_bytes());
+    LnurlCommentIntentKey::from_digest(digest.finalize().into())
+}
+
+fn comment_validation_error(error: LnurlCommentValidationError) -> AppError {
+    match error {
+        LnurlCommentValidationError::TooManyBytes { .. } => {
+            AppError::InvalidComment(COMMENT_BYTES_EXCEEDED)
+        }
+        LnurlCommentValidationError::TooManyGraphemes { .. } => {
+            AppError::InvalidComment(COMMENT_CHARACTERS_EXCEEDED)
+        }
+        LnurlCommentValidationError::Empty => AppError::InvalidComment(COMMENT_INTENT_REQUIRED),
+    }
+}
+
+fn comment_persistence_error(error: db::LnurlCommentPersistenceError, nym: &str) -> AppError {
+    match error {
+        db::LnurlCommentPersistenceError::RetryMismatch
+        | db::LnurlCommentPersistenceError::InstructionMismatch
+        | db::LnurlCommentPersistenceError::PaymentEvidenceMismatch => {
+            AppError::InvalidComment(COMMENT_RETRY_MISMATCH)
+        }
+        db::LnurlCommentPersistenceError::SourceIdentityNotActive => {
+            AppError::NymNotFound(nym.to_owned())
+        }
+        db::LnurlCommentPersistenceError::InvalidInput { .. }
+        | db::LnurlCommentPersistenceError::IntentNotFound
+        | db::LnurlCommentPersistenceError::InstructionNotBound
+        | db::LnurlCommentPersistenceError::CorruptStoredValue { .. }
+        | db::LnurlCommentPersistenceError::Database => {
+            AppError::DbError(COMMENT_INTERNAL_FAILURE.to_owned())
+        }
+    }
+}
+
+fn lightning_response(nym: &str, domain: &str, invoice: String) -> LightningResponse {
+    LightningResponse {
+        pr: invoice,
+        routes: vec![],
+        disposable: false,
+        success_action: SuccessAction {
+            tag: "message".to_string(),
+            message: format!("Payment received to {nym}@{domain}"),
+        },
+    }
+}
+
+async fn replay_bound_comment_instruction(
+    state: &AppState,
+    nym: &str,
+    amount_msat: u64,
+    intent: &db::LnurlCommentIntent,
+) -> Result<Option<(LightningResponse, String)>, AppError> {
+    let Some(instruction) = intent.instruction.as_ref() else {
+        return Ok(None);
+    };
+    if instruction.rail != LnurlCommentRail::Lightning {
+        return Err(AppError::DbError(COMMENT_INTERNAL_FAILURE.to_owned()));
+    }
+    let swap = db::get_swap_by_boltz_id(&state.db, instruction.reference())
+        .await?
+        .ok_or_else(|| AppError::DbError(COMMENT_INTERNAL_FAILURE.to_owned()))?;
+    let expected_amount_sat = i64::try_from(amount_msat / 1_000)
+        .map_err(|_| AppError::DbError(COMMENT_INTERNAL_FAILURE.to_owned()))?;
+    if swap.nym.as_deref() != Some(nym)
+        || swap.amount_sat != expected_amount_sat
+        || swap.invoice.is_empty()
+    {
+        return Err(AppError::DbError(COMMENT_INTERNAL_FAILURE.to_owned()));
+    }
+    Ok(Some((
+        lightning_response(nym, &state.config.domain, swap.invoice),
+        swap.boltz_swap_id,
+    )))
 }
 
 // --- Helpers ---
@@ -216,7 +328,13 @@ pub async fn metadata(
         }
     };
 
-    let callback = format!("https://{}/lnurlp/callback/{}", state.config.domain, nym);
+    let comment_intent_key = new_comment_intent_key();
+    let callback = format!(
+        "https://{}/lnurlp/callback/{}/{}",
+        state.config.domain,
+        nym,
+        comment_intent_key.as_str()
+    );
 
     Ok(Json(LnurlPayMetadata {
         callback,
@@ -224,7 +342,7 @@ pub async fn metadata(
         min_sendable,
         metadata: build_metadata(&nym, &state.config.domain),
         tag: "payRequest".to_string(),
-        comment_allowed: 144,
+        comment_allowed: LNURL_COMMENT_ALLOWED,
         payment_methods: vec!["L-BTC"],
     }))
 }
@@ -412,18 +530,74 @@ async fn serve_liquid(
 async fn serve_lightning(
     state: &AppState,
     nym: &str,
+    user: &db::User,
     amount_msat: u64,
     caller_ip: Option<std::net::IpAddr>,
     is_whitelisted: bool,
+    requested_comment: Option<&RequestedLnurlComment>,
 ) -> Result<axum::response::Response, AppError> {
+    let persisted_comment = if let Some(requested) = requested_comment {
+        let intent = db::persist_lnurl_comment_intent(
+            &state.db,
+            &db::NewLnurlCommentIntent {
+                owner_npub: &user.npub,
+                nym,
+                idempotency_key: &requested.key,
+                amount_msat,
+                comment: &requested.comment,
+            },
+        )
+        .await
+        .map_err(|error| comment_persistence_error(error, nym))?;
+        if let Some((response, _swap_id)) =
+            replay_bound_comment_instruction(state, nym, amount_msat, &intent).await?
+        {
+            return Ok(Json(response).into_response());
+        }
+        Some(intent)
+    } else {
+        None
+    };
+
     if !is_whitelisted {
         if let Some(ip) = caller_ip {
             state.rate_limiter.check_lightning_per_source(ip).await?;
         }
     }
 
-    let (resp, _swap_id) = create_lightning_swap(state, nym, amount_msat).await?;
-    Ok(Json(resp).into_response())
+    let binding = requested_comment.map(|requested| LnurlCommentInstructionBinding {
+        owner_npub: &user.npub,
+        idempotency_key: &requested.key,
+    });
+    match create_lightning_swap(state, nym, amount_msat, binding.as_ref()).await {
+        Ok((response, _swap_id)) => Ok(Json(response).into_response()),
+        Err(creation_error) => {
+            // A simultaneous exact callback may have won the immutable
+            // instruction binding while this request was at the provider. Its
+            // transaction rolls our conflicting swap insert back; reload the
+            // durable winner and return the exact original instruction.
+            if let (Some(requested), Some(_)) = (requested_comment, persisted_comment) {
+                let intent = db::persist_lnurl_comment_intent(
+                    &state.db,
+                    &db::NewLnurlCommentIntent {
+                        owner_npub: &user.npub,
+                        nym,
+                        idempotency_key: &requested.key,
+                        amount_msat,
+                        comment: &requested.comment,
+                    },
+                )
+                .await
+                .map_err(|error| comment_persistence_error(error, nym))?;
+                if let Some((response, _swap_id)) =
+                    replay_bound_comment_instruction(state, nym, amount_msat, &intent).await?
+                {
+                    return Ok(Json(response).into_response());
+                }
+            }
+            Err(creation_error)
+        }
+    }
 }
 
 /// Reusable Lightning-swap creation. Allocates a swap key, asks Boltz for
@@ -432,10 +606,11 @@ async fn serve_lightning(
 ///
 /// Rate-limit is the caller's responsibility — different callers gate on
 /// different buckets.
-pub(crate) async fn create_lightning_swap(
+async fn create_lightning_swap(
     state: &AppState,
     nym: &str,
     amount_msat: u64,
+    comment_binding: Option<&LnurlCommentInstructionBinding<'_>>,
 ) -> Result<(LightningResponse, String), AppError> {
     state
         .admission
@@ -491,45 +666,55 @@ pub(crate) async fn create_lightning_swap(
     let boltz_response_json = serde_json::to_string(&result.boltz_response)
         .map_err(|e| AppError::BoltzError(format!("failed to serialize boltz response: {e}")))?;
 
-    db::record_swap_with_lineage(
-        &state.db,
-        &db::NewSwapRecord {
-            nym: Some(nym),
-            boltz_swap_id: &result.swap_id,
-            address: None,
-            address_index: None,
-            amount_sat,
-            invoice: &result.invoice,
-            preimage_hex: &preimage_hex,
-            claim_key_hex: &claim_key_hex,
-            boltz_response_json: &boltz_response_json,
-            // LNURL Lightning Address path is invoice-less by design.
-            invoice_id: None,
-            key_index: Some(swap_key_index as i64),
-            root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
-        },
-        &db::ReverseSwapLineage {
-            allocation_id: key_allocation_id,
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            claim_public_key_hex: &claim_public_key_hex,
-            preimage_hash_hex: &preimage_hash_hex,
-        },
-    )
-    .await
-    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
-
-    let resp = LightningResponse {
-        pr: result.invoice,
-        routes: vec![],
-        disposable: false,
-        success_action: SuccessAction {
-            tag: "message".to_string(),
-            message: format!("Payment received to {nym}@{}", state.config.domain),
-        },
+    let new_swap = db::NewSwapRecord {
+        nym: Some(nym),
+        boltz_swap_id: &result.swap_id,
+        address: None,
+        address_index: None,
+        amount_sat,
+        invoice: &result.invoice,
+        preimage_hex: &preimage_hex,
+        claim_key_hex: &claim_key_hex,
+        boltz_response_json: &boltz_response_json,
+        // LNURL Lightning Address path is invoice-less by design.
+        invoice_id: None,
+        key_index: Some(swap_key_index as i64),
+        root_fingerprint: Some(state.swap_key_root_fingerprint.as_str()),
     };
+    let lineage = db::ReverseSwapLineage {
+        allocation_id: key_allocation_id,
+        key_epoch: state.config.boltz.key_epoch,
+        derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+        claim_public_key_hex: &claim_public_key_hex,
+        preimage_hash_hex: &preimage_hash_hex,
+    };
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| AppError::DbError(format!("failed to record swap {}", result.swap_id)))?;
+    db::record_swap_in_tx_with_lineage(&mut tx, &new_swap, &lineage)
+        .await
+        .map_err(|_| AppError::DbError(format!("failed to record swap {}", result.swap_id)))?;
+    if let Some(binding) = comment_binding {
+        db::bind_lnurl_comment_instruction_in_tx(
+            &mut tx,
+            binding.owner_npub,
+            binding.idempotency_key,
+            LnurlCommentRail::Lightning,
+            &result.swap_id,
+        )
+        .await
+        .map_err(|error| comment_persistence_error(error, nym))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DbError(format!("failed to record swap {}", result.swap_id)))?;
+
+    let resp = lightning_response(nym, &state.config.domain, result.invoice);
+    let swap_id = result.swap_id;
     db::touch_user_callback(&state.db, nym).await;
-    Ok((resp, result.swap_id))
+    Ok((resp, swap_id))
 }
 
 pub async fn callback(
@@ -538,6 +723,35 @@ pub async fn callback(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
+) -> Result<axum::response::Response, AppError> {
+    callback_inner(state, nym, None, peer_opt, headers, params).await
+}
+
+pub async fn callback_with_comment_intent(
+    State(state): State<AppState>,
+    Path((nym, comment_intent_token)): Path<(String, String)>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Query(params): Query<CallbackParams>,
+) -> Result<axum::response::Response, AppError> {
+    callback_inner(
+        state,
+        nym,
+        Some(comment_intent_token),
+        peer_opt,
+        headers,
+        params,
+    )
+    .await
+}
+
+async fn callback_inner(
+    state: AppState,
+    nym: String,
+    comment_intent_token: Option<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    mut params: CallbackParams,
 ) -> Result<axum::response::Response, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
 
@@ -554,7 +768,7 @@ pub async fn callback(
             state.config.limits.max_sendable_msat
         )));
     }
-    if params.amount % 1000 != 0 {
+    if !params.amount.is_multiple_of(1_000) {
         return Err(AppError::InvalidAmount(
             "amount must be a multiple of 1000 msat".to_string(),
         ));
@@ -564,6 +778,19 @@ pub async fn callback(
     let user = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
+
+    let payer_comment = LnurlPayerComment::from_optional(params.comment.take())
+        .map_err(comment_validation_error)?;
+    let requested_comment = payer_comment
+        .map(|comment| -> Result<RequestedLnurlComment, AppError> {
+            let token = comment_intent_token
+                .as_deref()
+                .ok_or(AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
+            let key = LnurlCommentIntentKey::from_callback_token(token)
+                .map_err(|_| AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
+            Ok(RequestedLnurlComment { key, comment })
+        })
+        .transpose()?;
 
     // --- Caller IP + whitelist ---
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
@@ -582,6 +809,13 @@ pub async fn callback(
         if let Some(ip) = caller_ip {
             state.rate_limiter.check_per_ip(ip).await?;
         }
+    }
+
+    // A comment must never be silently dropped on the direct-Liquid path or
+    // during its soft fallback. Until that rail has an atomic reservation and
+    // settlement binding, require the fully wired Lightning path.
+    if requested_comment.is_some() && requests_method(params.payment_method.as_deref(), "L-BTC") {
+        return Err(AppError::InvalidComment(COMMENT_LIGHTNING_ONLY));
     }
 
     let liquid_throttle = if requests_method(params.payment_method.as_deref(), "L-BTC") {
@@ -614,7 +848,17 @@ pub async fn callback(
     };
 
     // Lightning path — default rail AND fallback destination.
-    match serve_lightning(&state, &nym, params.amount, caller_ip, is_whitelisted).await {
+    match serve_lightning(
+        &state,
+        &nym,
+        &user,
+        params.amount,
+        caller_ip,
+        is_whitelisted,
+        requested_comment.as_ref(),
+    )
+    .await
+    {
         Ok(response) => Ok(response),
         Err(fallback_error) => {
             if let Some(liquid_throttle) = liquid_throttle {

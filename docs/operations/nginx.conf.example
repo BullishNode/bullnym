@@ -57,6 +57,21 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # LUD-12 carries the payer's private comment in this GET query. Standard
+    # nginx access formats include the complete request URI, so this endpoint
+    # must not enter access logs. nginx error records can also include the full
+    # request line, so discard location-local proxy errors and use Bullnym's
+    # privacy-safe structured errors for diagnosis. Its trace span is redacted.
+    location ^~ /lnurlp/callback/ {
+        access_log off;
+        error_log /dev/null crit;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location ~ ^/[a-z0-9-]+/manifest\.webmanifest$ {
         limit_req zone=bullnym_api burst=10 nodelay;
         proxy_pass http://127.0.0.1:8080;

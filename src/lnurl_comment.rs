@@ -12,6 +12,9 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Maximum number of user-perceived Unicode characters accepted from LUD-12.
 pub const LNURL_COMMENT_MAX_GRAPHEMES: usize = 120;
 
+/// Value advertised through LUD-06 `commentAllowed`.
+pub const LNURL_COMMENT_ALLOWED: u16 = 120;
+
 /// Defensive UTF-8 ceiling applied before grapheme segmentation.
 pub const LNURL_COMMENT_MAX_BYTES: usize = 512;
 
@@ -116,11 +119,12 @@ impl fmt::Display for LnurlCommentValidationError {
 
 impl std::error::Error for LnurlCommentValidationError {}
 
-/// Stable, opaque callback identity supplied by the future runtime coordinator.
+/// Stable, opaque callback identity supplied by LNURL metadata.
 ///
-/// The current public callback has no safe Lightning idempotency token, so the
-/// persistence foundation intentionally accepts a digest rather than deriving
-/// one from ambiguous `(nym, amount, comment)` values.
+/// The coordinator issues fresh randomness in each metadata callback instead
+/// of deriving identity from ambiguous `(nym, amount, comment)` values. Exact
+/// callback retries retain this digest; a newly resolved payment gets a new
+/// one.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LnurlCommentIntentKey(String);
 
@@ -129,12 +133,20 @@ impl LnurlCommentIntentKey {
         Self(hex::encode(digest))
     }
 
+    /// Parse the opaque callback token issued by LNURL metadata.
+    ///
+    /// Tokens are canonical lowercase SHA-256 digests. Rejecting alternate
+    /// spellings keeps one callback URL mapped to exactly one persisted key.
+    pub fn from_callback_token(value: &str) -> Result<Self, LnurlCommentIntentTokenError> {
+        if is_canonical_digest(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(LnurlCommentIntentTokenError)
+        }
+    }
+
     pub(crate) fn from_stored(value: String) -> Result<Self, LnurlCommentStoredValueError> {
-        if value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if is_canonical_digest(&value) {
             Ok(Self(value))
         } else {
             Err(LnurlCommentStoredValueError::IntentKey)
@@ -145,6 +157,25 @@ impl LnurlCommentIntentKey {
         &self.0
     }
 }
+
+fn is_canonical_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Privacy-safe malformed callback-token error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LnurlCommentIntentTokenError;
+
+impl fmt::Display for LnurlCommentIntentTokenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid LNURL comment intent token")
+    }
+}
+
+impl std::error::Error for LnurlCommentIntentTokenError {}
 
 impl fmt::Debug for LnurlCommentIntentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -258,5 +289,19 @@ mod tests {
         let key = LnurlCommentIntentKey::from_digest([0xab; 32]);
         let key_debug = format!("{key:?}");
         assert!(!key_debug.contains(key.as_str()));
+    }
+
+    #[test]
+    fn callback_token_requires_one_canonical_lowercase_digest() {
+        let token = "ab".repeat(32);
+        assert_eq!(
+            LnurlCommentIntentKey::from_callback_token(&token)
+                .unwrap()
+                .as_str(),
+            token
+        );
+        assert!(LnurlCommentIntentKey::from_callback_token(&"AB".repeat(32)).is_err());
+        assert!(LnurlCommentIntentKey::from_callback_token(&"a".repeat(63)).is_err());
+        assert!(LnurlCommentIntentKey::from_callback_token(&"g".repeat(64)).is_err());
     }
 }

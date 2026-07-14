@@ -18,7 +18,9 @@ The descriptor is stored in `users.ct_descriptor` and uses
 
 1. Sender wallet resolves `nym@domain` to `/.well-known/lnurlp/:nym`.
 2. Bullnym returns LNURL metadata and supported payment methods.
-3. Sender calls `/lnurlp/callback/:nym`.
+3. Sender calls the complete opaque `/lnurlp/callback/:nym/:comment_intent`
+   URL returned by metadata. The tokenless route remains a no-comment
+   compatibility path.
 4. Bullnym returns either:
    - a BOLT11 invoice backed by a Boltz reverse swap, or
    - a LUD-22 direct Liquid address if the sender proves Liquid UTXO ownership.
@@ -29,6 +31,13 @@ For standard Lightning senders, Bullnym creates a Boltz reverse swap. The
 sender pays Lightning; Bullnym claims LBTC to a fresh address from the nym
 descriptor. Payment accounting is tied to successful recipient-side claim, not
 only to payer-side Lightning payment.
+
+Optional payer comments are preserved exactly under a 120-grapheme/512-byte
+private contract before the BOLT11 is returned. Exact callback retries reuse
+the same bound swap. The comment becomes received history only after the
+merchant-side claim transaction is durable; it is never placed in public
+payment responses or provider descriptions. Direct-Liquid comments currently
+fail closed until that rail has the same atomic instruction/evidence binding.
 
 ## LUD-22 Liquid Shortcut
 

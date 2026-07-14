@@ -84,6 +84,9 @@ pub enum AppError {
 
     // --- Amount validation (LNURL callback) ---
     InvalidAmount(String),
+    /// LUD-12 comment validation or stable-retry failure. The inner value is
+    /// always server-authored static text and must never contain payer input.
+    InvalidComment(&'static str),
     /// Wallet-origin invoice tried to reuse a BTC receive address that is
     /// already assigned to an invoice. Address reuse makes chain payment
     /// attribution ambiguous, so it is rejected at create time.
@@ -184,6 +187,7 @@ impl AppError {
             | Self::UtxoSpent
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
+            | Self::InvalidComment(_)
             | Self::RecoveryAddressInvalid(_)
             | Self::RecoveryNotAvailable(_)
             | Self::BitcoinAddressAlreadyUsed
@@ -237,6 +241,7 @@ impl AppError {
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
 
             Self::InvalidAmount(_) => "InvalidAmount",
+            Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
             Self::AliasAlreadyAssigned { .. } => "AliasAlreadyAssigned",
@@ -308,6 +313,7 @@ impl std::fmt::Display for AppError {
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
 
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
+            Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
             Self::AliasAlreadyAssigned { alias } => {
@@ -392,6 +398,7 @@ impl IntoResponse for AppError {
             AppError::PubkeyUtxoMismatch => "The proof-of-funds public key does not match the script of the referenced UTXO.".into(),
 
             AppError::InvalidAmount(reason) => reason.clone(),
+            AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
                 "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
