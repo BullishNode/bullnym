@@ -15681,7 +15681,10 @@ async fn seed_recovery_journal_harness(
         .construct_for_fee_decision(pay_service::builder_fee::BitcoinBuilderFeeDecision::from(
             &fee_decision,
         ))
-        .unwrap();
+        .unwrap()
+    else {
+        unreachable!("scripted recovery builder returns a Bitcoin transaction")
+    };
     let expected_txid = recovery_tx.compute_txid().to_string();
     let expected_raw_hex = hex::encode(bitcoin::consensus::serialize(&recovery_tx));
 
