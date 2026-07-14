@@ -118,7 +118,7 @@ pub async fn collect_pending_expiry_evidence_under_lock(
                 &snapshot,
                 provider_hint
                     .as_ref()
-                    .and_then(|hint| hint.user_lock_txid()),
+                    .and_then(|hint| hint.transaction_txid()),
                 authority,
             )
             .ok()

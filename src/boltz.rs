@@ -50,7 +50,7 @@ pub struct ChainSwapResult {
 /// found by the configured Bitcoin evidence source.
 pub struct FreshChainSwapProviderHint {
     status: String,
-    user_lock_txid: Option<String>,
+    transaction_txid: Option<String>,
 }
 
 impl FreshChainSwapProviderHint {
@@ -58,8 +58,8 @@ impl FreshChainSwapProviderHint {
         &self.status
     }
 
-    pub fn user_lock_txid(&self) -> Option<&str> {
-        self.user_lock_txid.as_deref()
+    pub fn transaction_txid(&self) -> Option<&str> {
+        self.transaction_txid.as_deref()
     }
 }
 
@@ -515,10 +515,9 @@ impl BoltzService {
         &self.provider_limits
     }
 
-    /// Re-read the two provider hints needed by an under-lock chain-swap
-    /// decision. A partial provider response is not returned: callers must
-    /// classify any status/transaction transport or decode failure as
-    /// incomplete evidence.
+    /// Re-read the provider hints needed by an under-lock chain-swap decision
+    /// from one typed response. Transport and decode failures are returned so
+    /// callers classify them as incomplete evidence.
     pub async fn fresh_chain_swap_provider_hint(
         &self,
         swap_id: &str,
@@ -526,18 +525,12 @@ impl BoltzService {
         let api = self.api.as_ref().ok_or_else(|| {
             AppError::BoltzError("Boltz client unavailable for chain-swap evidence".to_string())
         })?;
-        let (swap, transactions) = tokio::join!(api.get_swap(swap_id), api.get_chain_txs(swap_id));
-        let swap = swap.map_err(|error| {
+        let swap = api.get_swap(swap_id).await.map_err(|error| {
             AppError::BoltzError(format!("fetch fresh chain-swap status: {error}"))
-        })?;
-        let transactions = transactions.map_err(|error| {
-            AppError::BoltzError(format!("fetch fresh chain-swap transactions: {error}"))
         })?;
         Ok(FreshChainSwapProviderHint {
             status: swap.status,
-            user_lock_txid: transactions
-                .user_lock
-                .map(|lock| lock.transaction.id),
+            transaction_txid: swap.transaction.map(|transaction| transaction.id),
         })
     }
 
