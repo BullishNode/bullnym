@@ -45,6 +45,16 @@ pub trait BoltzTransport: Send + Sync {
         &self,
         request: CreateReverseRequest,
     ) -> Result<CreateReverseResponse, BoltzClientError>;
+    /// Create the fixed-checkout reverse swap with the exact payer-pricing
+    /// extension fields that are not represented by boltz-client's typed
+    /// request. Keeping this operation on the shared boundary preserves the
+    /// production JSON while making its network outcome injectable.
+    async fn create_fixed_checkout_reverse(
+        &self,
+        request: CreateReverseRequest,
+        onchain_amount_sat: u64,
+        pair_hash: &str,
+    ) -> Result<CreateReverseResponse, BoltzClientError>;
     async fn create_chain(
         &self,
         request: CreateChainRequest,
@@ -102,6 +112,56 @@ impl BoltzTransport for HttpBoltzTransport {
         request: CreateReverseRequest,
     ) -> Result<CreateReverseResponse, BoltzClientError> {
         self.api.post_reverse_req(request).await
+    }
+
+    async fn create_fixed_checkout_reverse(
+        &self,
+        request: CreateReverseRequest,
+        onchain_amount_sat: u64,
+        pair_hash: &str,
+    ) -> Result<CreateReverseResponse, BoltzClientError> {
+        let mut request = serde_json::to_value(request).map_err(|error| {
+            BoltzClientError::Protocol(format!(
+                "failed to encode fixed-checkout reverse request: {error}"
+            ))
+        })?;
+        let object = request.as_object_mut().ok_or_else(|| {
+            BoltzClientError::Protocol(
+                "fixed-checkout reverse request did not encode as an object".into(),
+            )
+        })?;
+        object.insert(
+            "onchainAmount".into(),
+            serde_json::Value::from(onchain_amount_sat),
+        );
+        object.insert(
+            "pairHash".into(),
+            serde_json::Value::String(pair_hash.to_owned()),
+        );
+        let response = self
+            .quote_client
+            .post(format!(
+                "{}/swap/reverse",
+                self.base_url.trim_end_matches('/')
+            ))
+            .timeout(Duration::from_secs(10))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| BoltzClientError::HTTP(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({ "error": "invalid provider error" }));
+            return Err(BoltzClientError::HTTPStatusNotSuccess(status, body));
+        }
+        response.json().await.map_err(|error| {
+            BoltzClientError::Protocol(format!(
+                "fixed-checkout reverse response was invalid: {error}"
+            ))
+        })
     }
 
     async fn create_chain(
@@ -189,6 +249,11 @@ pub enum ScriptedBoltzStep {
     GetChainPairs(Result<GetChainPairsResponse, ScriptedBoltzError>),
     GetHeight(Result<HeightResponse, ScriptedBoltzError>),
     CreateReverse(Box<Result<CreateReverseResponse, ScriptedBoltzError>>),
+    CreateFixedCheckoutReverse {
+        onchain_amount_sat: u64,
+        pair_hash: String,
+        result: Box<Result<CreateReverseResponse, ScriptedBoltzError>>,
+    },
     CreateChain(Box<Result<CreateChainResponse, ScriptedBoltzError>>),
     GetSwap {
         swap_id: String,
@@ -212,6 +277,7 @@ impl ScriptedBoltzStep {
             Self::GetChainPairs(_) => "get_chain_pairs",
             Self::GetHeight(_) => "get_height",
             Self::CreateReverse(_) => "create_reverse",
+            Self::CreateFixedCheckoutReverse { .. } => "create_fixed_checkout_reverse",
             Self::CreateChain(_) => "create_chain",
             Self::GetSwap { .. } => "get_swap",
             Self::Quote { .. } => "quote",
@@ -227,6 +293,10 @@ pub enum ScriptedBoltzCall {
     GetChainPairs,
     GetHeight,
     CreateReverse { amount_sat: Option<u64> },
+    CreateFixedCheckoutReverse {
+        onchain_amount_sat: u64,
+        pair_hash: String,
+    },
     CreateChain { server_lock_amount_sat: Option<u64> },
     GetSwap { swap_id: String },
     Quote { swap_id: String },
@@ -343,6 +413,31 @@ impl BoltzTransport for ScriptedBoltzTransport {
             ScriptedBoltzStep::CreateReverse(result) => {
                 (*result).map_err(ScriptedBoltzError::into_client_error)
             }
+            _ => unreachable!("step kind checked"),
+        }
+    }
+
+    async fn create_fixed_checkout_reverse(
+        &self,
+        _request: CreateReverseRequest,
+        onchain_amount_sat: u64,
+        pair_hash: &str,
+    ) -> Result<CreateReverseResponse, BoltzClientError> {
+        self.record(ScriptedBoltzCall::CreateFixedCheckoutReverse {
+            onchain_amount_sat,
+            pair_hash: pair_hash.to_owned(),
+        });
+        match self.next("create_fixed_checkout_reverse")? {
+            ScriptedBoltzStep::CreateFixedCheckoutReverse {
+                onchain_amount_sat: expected_amount,
+                pair_hash: expected_hash,
+                result,
+            } if expected_amount == onchain_amount_sat && expected_hash == pair_hash => {
+                (*result).map_err(ScriptedBoltzError::into_client_error)
+            }
+            ScriptedBoltzStep::CreateFixedCheckoutReverse { .. } => Err(
+                BoltzClientError::Generic("scripted fixed-checkout request mismatch".into()),
+            ),
             _ => unreachable!("step kind checked"),
         }
     }

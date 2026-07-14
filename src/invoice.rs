@@ -2161,9 +2161,19 @@ async fn create_bitcoin_chain_offer_with_faults(
     if let Some(existing) =
         db::latest_payer_exposable_chain_swap_for_invoice(&state.db, invoice.id, amount_i64).await?
     {
+        let payer_amount_sat = validated_payer_chain_amount_sat(
+            existing.user_lock_amount_sat,
+            existing.server_lock_amount_sat,
+        )
+        .ok_or_else(|| {
+            AppError::DbError(
+                "payer-exposable chain swap has an invalid persisted amount pair".into(),
+            )
+        })?;
         return Ok(Some(BitcoinChainOffer {
             lockup_address: existing.lockup_address,
             lockup_bip21: existing.lockup_bip21,
+            payer_amount_sat,
         }));
     }
 

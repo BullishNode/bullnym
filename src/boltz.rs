@@ -863,57 +863,22 @@ impl BoltzService {
             }),
             claim_covenant: None,
         };
-        let mut request = serde_json::to_value(base_request).map_err(|error| {
-            AppError::BoltzError(format!("failed to encode reverse swap request: {error}"))
-        })?;
-        let request_object = request.as_object_mut().ok_or_else(|| {
-            AppError::BoltzError("reverse swap request did not encode as an object".into())
-        })?;
-        request_object.insert(
-            "onchainAmount".into(),
-            serde_json::Value::from(quote.onchain_amount_sat()),
-        );
-        request_object.insert(
-            "pairHash".into(),
-            serde_json::Value::String(quote.pair_hash().to_owned()),
-        );
-
-        let client = self
-            .quote_http_client
-            .as_ref()
-            .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))?;
-        let base_url = self
-            .quote_api_url
-            .as_deref()
-            .ok_or_else(|| AppError::BoltzError("Boltz client is unavailable".to_string()))?;
-        let response = client
-            .post(format!("{}/swap/reverse", base_url.trim_end_matches('/')))
-            .timeout(std::time::Duration::from_secs(10))
-            .json(&request)
-            .send()
+        let provider_result = self
+            .transport()?
+            .create_fixed_checkout_reverse(
+                base_request,
+                quote.onchain_amount_sat(),
+                quote.pair_hash(),
+            )
             .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                self.breaker.record(true);
-                return Err(AppError::BoltzError(format!(
-                    "fixed checkout reverse swap request failed: {error}"
-                )));
-            }
-        };
-        let status = response.status();
-        if !status.is_success() {
-            self.breaker.record(status.is_server_error());
-            return Err(AppError::BoltzError(format!(
-                "fixed checkout reverse swap request failed with HTTP {}",
-                status.as_u16()
-            )));
-        }
-        self.breaker.record(false);
-        let response: CreateReverseResponse = response.json().await.map_err(|error| {
-            AppError::BoltzError(format!(
-                "fixed checkout reverse swap response was invalid: {error}"
-            ))
+        self.breaker.record(
+            provider_result
+                .as_ref()
+                .err()
+                .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
+        );
+        let response = provider_result.map_err(|error| {
+            AppError::BoltzError(format!("fixed checkout reverse swap request failed: {error}"))
         })?;
         let invoice = response
             .invoice
