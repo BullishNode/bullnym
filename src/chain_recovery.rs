@@ -15,27 +15,37 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
 use bitcoin::{
-    Address, Amount, Network, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
+    Address, Amount, Network, OutPoint, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
     XOnlyPublicKey,
 };
 use boltz_client::network::esplora::EsploraBitcoinClient;
 use boltz_client::network::{BitcoinChain, Chain};
-use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateChainResponse, Side};
+use boltz_client::swaps::bitcoin::BtcSwapScript;
+use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateChainResponse, PartialSig, Side};
 use boltz_client::swaps::{
     BtcLikeTransaction, ChainClient, SwapScript, SwapTransactionParams, TransactionOptions,
 };
 use boltz_client::util::fees::Fee;
 use boltz_client::{Keypair, PublicKey, Secp256k1};
+use secp256k1_musig::musig;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::builder_fee::BitcoinBuilderFeeDecision;
 use crate::chain_swap_action::{
-    reduce_chain_swap_evidence, BitcoinSourceEvidence, ChainSwapAction, MerchantTransactionEvidence,
+    reduce_chain_swap_evidence, BitcoinSourceEvidence, BitcoinTimeoutEvidence, ChainSwapAction,
+    CooperativeRecoveryEvidence, MerchantTransactionEvidence,
 };
 use crate::chain_swap_runtime_evidence::{
-    collect_automatic_fallback_evidence_under_lock, CollectedAutomaticFallbackEvidence,
+    collect_automatic_fallback_evidence_under_lock, AutomaticFallbackConstructionPath,
+    CollectedAutomaticFallbackEvidence,
+};
+use crate::cooperative_bitcoin_refund::{
+    complete_exact_cooperative_refund, exact_chain_lockup_script, prepare_exact_cooperative_refund,
+    provider_partial_signature_for_integration_test, select_exact_source,
+    DurableCooperativeRequest, PreparedCooperativeRefund,
 };
 use crate::db::{
     self, ChainSwapRecord, ChainSwapStatus, ChainSwapTxAttempt, NewBitcoinRecoveryAttempt,
@@ -45,6 +55,7 @@ use crate::error::AppError;
 use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
 use crate::fee_policy::{BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness};
 use crate::fee_runtime::FeeRuntime;
+use crate::swap_manifest_runtime::CooperativeSigningNonceEnvelopeV1;
 use crate::AppState;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -69,6 +80,10 @@ pub enum RecoveryFaultPoint {
     AfterJournalCommitBeforeBroadcast,
     AfterBroadcastAttemptCommit,
     AfterBroadcastCallBeforeOutcomeCommit,
+    AfterCooperativeRequestedCommitBeforeProvider,
+    AfterCooperativeProviderBeforeResponseCommit,
+    AfterCooperativeResponseCommit,
+    AfterCooperativeAttemptWriteBeforeCommit,
 }
 
 pub trait RecoveryFaultInjector: Send + Sync {
@@ -94,6 +109,21 @@ pub trait BitcoinRecoveryBuilder: Send + Sync {
         destination_address: &str,
         fee_decision: BitcoinBuilderFeeDecision,
     ) -> Result<BtcLikeTransaction, AppError>;
+
+    /// Automatic execution must choose the spend path from fresh under-lock
+    /// evidence. Test builders retain the compatibility default; the live
+    /// builder overrides it so a pre-timeout failure can never fall through to
+    /// the unilateral script path.
+    async fn construct_automatic(
+        &self,
+        swap: &ChainSwapRecord,
+        destination_address: &str,
+        fee_decision: BitcoinBuilderFeeDecision,
+        _path: AutomaticFallbackConstructionPath,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        self.construct(swap, destination_address, fee_decision)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +195,24 @@ impl BitcoinRecoveryBuilder for LiveRecoveryBuilder<'_> {
         destination_address: &str,
         fee_decision: BitcoinBuilderFeeDecision,
     ) -> Result<BtcLikeTransaction, AppError> {
-        construct_live_refund(self.state, swap, destination_address, fee_decision).await
+        construct_live_refund(
+            self.state,
+            swap,
+            destination_address,
+            fee_decision,
+            AutomaticFallbackConstructionPath::Unilateral,
+        )
+        .await
+    }
+
+    async fn construct_automatic(
+        &self,
+        swap: &ChainSwapRecord,
+        destination_address: &str,
+        fee_decision: BitcoinBuilderFeeDecision,
+        path: AutomaticFallbackConstructionPath,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        construct_live_refund(self.state, swap, destination_address, fee_decision, path).await
     }
 }
 
@@ -534,6 +581,1507 @@ struct EsploraRecoveryBroadcaster {
     endpoints: Vec<String>,
 }
 
+/// Narrow boundary around the single provider-mutating cooperative request.
+/// The executor calls this only after the exact request transition commits;
+/// tests inject a counter so source drift and CAS retries can prove zero POSTs.
+#[async_trait]
+trait CooperativeSigningProvider: Send + Sync {
+    async fn request_partial_signature(
+        &self,
+        boltz_swap_id: &str,
+        input_index: u32,
+        client_public_nonce_hex: &str,
+        transaction_hex: &str,
+    ) -> Result<PartialSig, AppError>;
+}
+
+struct LiveCooperativeSigningProvider {
+    api_url: String,
+}
+
+#[async_trait]
+impl CooperativeSigningProvider for LiveCooperativeSigningProvider {
+    async fn request_partial_signature(
+        &self,
+        boltz_swap_id: &str,
+        input_index: u32,
+        client_public_nonce_hex: &str,
+        transaction_hex: &str,
+    ) -> Result<PartialSig, AppError> {
+        if input_index != 0 {
+            return Err(AppError::ClaimError(
+                "cooperative provider request input index is not canonical".into(),
+            ));
+        }
+        let public_nonce = musig::PublicNonce::from_str(client_public_nonce_hex).map_err(|_| {
+            AppError::ClaimError("cooperative provider request public nonce is invalid".into())
+        })?;
+        let provider = BoltzApiClientV2::new(self.api_url.clone(), Some(Duration::from_secs(15)));
+        provider
+            .get_chain_partial_sig(
+                &boltz_swap_id.to_owned(),
+                input_index as usize,
+                &public_nonce,
+                &transaction_hex.to_owned(),
+            )
+            .await
+            .map_err(|_| {
+                AppError::RecoveryNotAvailable(
+                    "cooperative provider request outcome is unknown".into(),
+                )
+            })
+    }
+}
+
+/// Every configured construction backend must expose exactly the one source
+/// selected by the primary authority. This check happens before the durable
+/// signing request is prepared, and the exact returned prevout is injected
+/// directly into Bullnym's transaction template; no address-wide SDK fetch is
+/// performed after this boundary.
+async fn exact_cooperative_source_across_backends(
+    script: &BtcSwapScript,
+    expected: OutPoint,
+    expected_txout: &TxOut,
+    endpoints: &[String],
+) -> Result<TxOut, AppError> {
+    if endpoints.is_empty() {
+        return Err(AppError::ElectrumError(
+            "cooperative recovery has no construction backend".into(),
+        ));
+    }
+    let mut agreed = None;
+    for endpoint in endpoints {
+        let client = EsploraBitcoinClient::new(BitcoinChain::Bitcoin, endpoint, 30);
+        let sources = script.fetch_utxos(&client).await.map_err(|error| {
+            AppError::ElectrumError(format!(
+                "cooperative recovery source read failed on {endpoint}: {error}"
+            ))
+        })?;
+        let candidate = select_exact_source(&expected, expected_txout, sources)?;
+        if agreed.as_ref().is_some_and(|prior| prior != &candidate) {
+            return Err(AppError::ElectrumError(
+                "cooperative recovery construction backends disagree on the exact source".into(),
+            ));
+        }
+        agreed.get_or_insert(candidate);
+    }
+    agreed.ok_or_else(|| {
+        AppError::ElectrumError("cooperative recovery exact source disappeared".into())
+    })
+}
+
+struct LiveCooperativePreparation {
+    prepared: PreparedCooperativeRefund,
+    source_outpoint: OutPoint,
+    source_txout: TxOut,
+    destination_address: String,
+    fee_record: FeeDecisionRecord,
+}
+
+struct CooperativeOperationDigests {
+    provider_request_sha256: String,
+    session_sha256: String,
+}
+
+fn framed_sha256(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn cooperative_operation_digests(
+    swap: &ChainSwapRecord,
+    preparation: &LiveCooperativePreparation,
+) -> Result<CooperativeOperationDigests, AppError> {
+    let request = preparation.prepared.durable_request();
+    let input_index = request.input_index.to_string();
+    let provider_request_sha256 = framed_sha256(
+        b"bullnym/boltz-chain-refund-signature-request/v1",
+        &[
+            swap.boltz_swap_id.as_bytes(),
+            request.public_nonce_hex.as_bytes(),
+            request.unsigned_tx_hex.as_bytes(),
+            input_index.as_bytes(),
+        ],
+    );
+    let source_txid = preparation.source_outpoint.txid.to_string();
+    let source_vout = preparation.source_outpoint.vout.to_string();
+    let source_amount = preparation.source_txout.value.to_sat().to_string();
+    let fee = &preparation.fee_record;
+    let fee_rate = fee.rate().as_f64().to_bits().to_string();
+    let fee_quoted = fee.quoted_at_unix().to_string();
+    let fee_evaluated = fee.evaluated_at_unix().to_string();
+    let fee_age = fee.freshness_age_secs().to_string();
+    let fee_max_age = fee.freshness_max_age_secs().to_string();
+    let fee_floor = fee.policy_floor().as_f64().to_bits().to_string();
+    let fee_cap = fee.policy_cap().as_f64().to_bits().to_string();
+    let secret_commitment =
+        hex::encode(Sha256::digest(preparation.prepared.secret_nonce().expose()));
+    let session_sha256 = framed_sha256(
+        b"bullnym/cooperative-signing-session/v1",
+        &[
+            swap.id.as_bytes(),
+            swap.boltz_swap_id.as_bytes(),
+            source_txid.as_bytes(),
+            source_vout.as_bytes(),
+            source_amount.as_bytes(),
+            preparation.source_txout.script_pubkey.as_bytes(),
+            request.unsigned_tx_hex.as_bytes(),
+            request.sighash_hex.as_bytes(),
+            request.tweaked_aggregate_key_hex.as_bytes(),
+            request.public_nonce_hex.as_bytes(),
+            fee.purpose().as_str().as_bytes(),
+            fee.rail().as_str().as_bytes(),
+            fee.target().as_str().as_bytes(),
+            fee.source().as_str().as_bytes(),
+            fee_rate.as_bytes(),
+            fee_quoted.as_bytes(),
+            fee_evaluated.as_bytes(),
+            fee_age.as_bytes(),
+            fee_max_age.as_bytes(),
+            fee.provenance_for_persistence().as_bytes(),
+            fee_floor.as_bytes(),
+            fee_cap.as_bytes(),
+            fee.policy_version().as_bytes(),
+            provider_request_sha256.as_bytes(),
+            secret_commitment.as_bytes(),
+        ],
+    );
+    Ok(CooperativeOperationDigests {
+        provider_request_sha256,
+        session_sha256,
+    })
+}
+
+fn cooperative_signing_material(
+    swap: &ChainSwapRecord,
+) -> Result<(CreateChainResponse, BtcSwapScript, Keypair), AppError> {
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let response: CreateChainResponse =
+        serde_json::from_str(&swap.boltz_response_json).map_err(|_| {
+            AppError::ClaimError("cooperative signing creation response is invalid".into())
+        })?;
+    let refund_key_bytes =
+        Zeroizing::new(hex::decode(&swap.refund_key_hex).map_err(|_| {
+            AppError::ClaimError("cooperative signing refund key is invalid".into())
+        })?);
+    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(refund_key_bytes.as_slice())
+        .map_err(|_| AppError::ClaimError("cooperative signing refund key is invalid".into()))?;
+    let refund_keypair = Keypair::from_secret_key(&Secp256k1::new(), &refund_secret_key);
+    let refund_public_key = PublicKey::new(refund_keypair.public_key());
+    let script = exact_chain_lockup_script(&response.lockup_details, refund_public_key)?;
+    Ok((response, script, refund_keypair))
+}
+
+async fn prepare_live_cooperative_operation(
+    state: &AppState,
+    swap: &ChainSwapRecord,
+    authority: &CollectedAutomaticFallbackEvidence,
+) -> Result<LiveCooperativePreparation, AppError> {
+    if authority.automatic_construction_path()
+        != Some(AutomaticFallbackConstructionPath::Cooperative)
+        || authority.exact_sources().len() != 1
+    {
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative recovery lacks one exact current source".into(),
+        ));
+    }
+    let destination = authority.committed_destination().ok_or_else(|| {
+        AppError::ClaimError("cooperative recovery lacks its committed destination".into())
+    })?;
+    let source = &authority.exact_sources()[0];
+    let source_outpoint = OutPoint {
+        txid: source
+            .txid()
+            .parse()
+            .map_err(|_| AppError::ClaimError("cooperative source txid is invalid".into()))?,
+        vout: source.vout(),
+    };
+    let authoritative_script = hex::decode(source.script_pubkey_hex()).map_err(|_| {
+        AppError::ClaimError("cooperative authoritative source script is invalid".into())
+    })?;
+    let authoritative_txout = TxOut {
+        value: Amount::from_sat(source.amount_sat()),
+        script_pubkey: ScriptBuf::from_bytes(authoritative_script),
+    };
+    let (response, script, refund_keypair) = cooperative_signing_material(swap)?;
+    let evidence_backend = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+    })?;
+    let source_txout = exact_cooperative_source_across_backends(
+        &script,
+        source_outpoint,
+        &authoritative_txout,
+        evidence_backend.endpoints(),
+    )
+    .await?;
+    let (decision, fee_record) = state
+        .fee_runtime
+        .bitcoin_construction_decision_now(FeeConstructionPurpose::BitcoinRecovery)
+        .map_err(|_| AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into()))?;
+    let prepared = prepare_exact_cooperative_refund(
+        &script,
+        &response.lockup_details,
+        &refund_keypair,
+        source_outpoint,
+        source_txout.clone(),
+        destination,
+        BitcoinBuilderFeeDecision::from(&decision),
+    )?;
+    if !fee_record.authorizes_construction_now() {
+        return Err(AppError::RecoveryNotAvailable(
+            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+        ));
+    }
+    Ok(LiveCooperativePreparation {
+        prepared,
+        source_outpoint,
+        source_txout,
+        destination_address: destination.to_owned(),
+        fee_record,
+    })
+}
+
+fn build_cooperative_signing_identity(
+    swap: &ChainSwapRecord,
+    preparation: &LiveCooperativePreparation,
+    runtime: &crate::swap_manifest_runtime::RecoveryManifestRuntimeV1,
+) -> Result<db::ChainSwapCooperativeSigningIdentity, AppError> {
+    let digests = cooperative_operation_digests(swap, preparation)?;
+    let durable_request = preparation.prepared.durable_request();
+    if durable_request.input_index != 0 {
+        return Err(AppError::ClaimError(
+            "cooperative signing request input index is not canonical".into(),
+        ));
+    }
+    let raw_request = hex::decode(&durable_request.unsigned_tx_hex).map_err(|_| {
+        AppError::ClaimError("cooperative signing request transaction hex is invalid".into())
+    })?;
+    let request_transaction: Transaction = deserialize(&raw_request).map_err(|_| {
+        AppError::ClaimError("cooperative signing request transaction is invalid".into())
+    })?;
+    if request_transaction.input.len() != 1 || request_transaction.output.len() != 1 {
+        return Err(AppError::ClaimError(
+            "cooperative signing request transaction shape changed".into(),
+        ));
+    }
+    let destination = &request_transaction.output[0];
+    let fee_amount_sat = preparation
+        .source_txout
+        .value
+        .to_sat()
+        .checked_sub(destination.value.to_sat())
+        .filter(|fee| *fee > 0)
+        .ok_or_else(|| AppError::ClaimError("cooperative signing request fee is invalid".into()))?;
+    let fee_vbytes = u64::try_from(request_transaction.vsize()).map_err(|_| {
+        AppError::ClaimError("cooperative signing request virtual size is invalid".into())
+    })?;
+    let sealed = runtime
+        .seal_cooperative_signing_nonce_v1(
+            swap.id,
+            &digests.session_sha256,
+            preparation.prepared.secret_nonce().expose(),
+        )
+        .map_err(|error| AppError::RecoveryNotAvailable(error.to_string()))?;
+    let encrypted_nonce = db::EncryptedCooperativeSecretNonce::new(
+        sealed.key_id,
+        sealed.encryption_nonce,
+        sealed.ciphertext,
+        sealed.plaintext_sha256,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let request = db::CooperativeSigningRequest::new(
+        durable_request.unsigned_tx_hex.clone(),
+        durable_request.txid.clone(),
+        durable_request.sighash_hex.clone(),
+        durable_request.tweaked_aggregate_key_hex.clone(),
+        durable_request.public_nonce_hex.clone(),
+        digests.provider_request_sha256,
+        digests.session_sha256,
+        encrypted_nonce,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let source = db::CooperativeSigningSource::new(
+        preparation.source_outpoint.txid.to_string(),
+        preparation.source_outpoint.vout,
+        preparation.source_txout.value.to_sat(),
+        hex::encode(preparation.source_txout.script_pubkey.as_bytes()),
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let destination = db::CooperativeSigningDestination::new(
+        preparation.destination_address.clone(),
+        hex::encode(destination.script_pubkey.as_bytes()),
+        destination.value.to_sat(),
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    let fee_authority = db::CooperativeSigningFeeAuthority::from_decision(&preparation.fee_record)
+        .map_err(|error| AppError::ClaimError(error.to_string()))?;
+    db::ChainSwapCooperativeSigningIdentity::new(
+        swap.id,
+        swap.boltz_swap_id.clone(),
+        source,
+        destination,
+        fee_amount_sat,
+        fee_vbytes,
+        fee_authority,
+        request,
+    )
+    .map_err(|error| AppError::ClaimError(error.to_string()))
+}
+
+/// Prepare one cryptographically valid selected-response fixture through the
+/// same constructor, nonce sealing, digest, and MuSig code used in production.
+/// The caller still persists each lifecycle transition through the real DB
+/// adapter before exercising completion.
+#[doc(hidden)]
+// Keep every independent authority field visible at this test-only boundary;
+// bundling them would make accidental fixture drift harder to review.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_cooperative_signing_completion_fixture_for_test(
+    swap: &ChainSwapRecord,
+    source_txid: &str,
+    source_vout: u32,
+    source_amount_sat: u64,
+    destination_address: &str,
+    fee_decision: &BitcoinFeeDecision,
+    fee_record: FeeDecisionRecord,
+    runtime: &crate::swap_manifest_runtime::RecoveryManifestRuntimeV1,
+    provider_secret_key: [u8; 32],
+) -> Result<(db::ChainSwapCooperativeSigningIdentity, PartialSig), AppError> {
+    if fee_record.rate() != fee_decision.rate() {
+        return Err(AppError::ClaimError(
+            "cooperative fixture fee authority differs from construction".into(),
+        ));
+    }
+    let source_outpoint = OutPoint {
+        txid: source_txid
+            .parse()
+            .map_err(|_| AppError::ClaimError("cooperative fixture source txid invalid".into()))?,
+        vout: source_vout,
+    };
+    let (response, script, refund_keypair) = cooperative_signing_material(swap)?;
+    let source_txout = TxOut {
+        value: Amount::from_sat(source_amount_sat),
+        script_pubkey: script
+            .to_address(BitcoinChain::Bitcoin)
+            .map_err(|_| AppError::ClaimError("cooperative fixture lockup invalid".into()))?
+            .script_pubkey(),
+    };
+    let prepared = prepare_exact_cooperative_refund(
+        &script,
+        &response.lockup_details,
+        &refund_keypair,
+        source_outpoint,
+        source_txout.clone(),
+        destination_address,
+        BitcoinBuilderFeeDecision::from(fee_decision),
+    )?;
+    let provider_secret = bitcoin::secp256k1::SecretKey::from_slice(&provider_secret_key)
+        .map_err(|_| AppError::ClaimError("cooperative fixture provider key invalid".into()))?;
+    let provider_keypair = Keypair::from_secret_key(&Secp256k1::new(), &provider_secret);
+    let provider_public_key = PublicKey::new(provider_keypair.public_key());
+    if provider_public_key != response.lockup_details.server_public_key {
+        return Err(AppError::ClaimError(
+            "cooperative fixture provider key differs from creation response".into(),
+        ));
+    }
+    let provider_response = provider_partial_signature_for_integration_test(
+        &script,
+        &response.lockup_details,
+        &provider_keypair,
+        prepared.durable_request(),
+    )?;
+    let preparation = LiveCooperativePreparation {
+        prepared,
+        source_outpoint,
+        source_txout,
+        destination_address: destination_address.to_owned(),
+        fee_record,
+    };
+    let identity = build_cooperative_signing_identity(swap, &preparation, runtime)?;
+    Ok((identity, provider_response))
+}
+
+fn validate_cooperative_operation_authority(
+    operation: &db::ChainSwapCooperativeSigningOperation,
+    authority: &CollectedAutomaticFallbackEvidence,
+    swap: &ChainSwapRecord,
+    require_pre_timeout_selection: bool,
+) -> Result<(), AppError> {
+    if !authority.dependencies_available() || authority.exact_sources().len() != 1 {
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative signing exact authority is unavailable".into(),
+        ));
+    }
+    if require_pre_timeout_selection
+        && authority.automatic_construction_path()
+            != Some(AutomaticFallbackConstructionPath::Cooperative)
+    {
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative signing is no longer the selected pre-timeout path".into(),
+        ));
+    }
+    let identity = operation.identity();
+    if identity.chain_swap_id() != swap.id || identity.boltz_swap_id() != swap.boltz_swap_id {
+        return Err(AppError::ClaimError(
+            "cooperative signing parent identity changed".into(),
+        ));
+    }
+    let committed_destination = authority.committed_destination().ok_or_else(|| {
+        AppError::ClaimError("cooperative signing destination authority is missing".into())
+    })?;
+    if identity.destination().address() != committed_destination
+        || swap.refund_address.as_deref() != Some(committed_destination)
+    {
+        return Err(AppError::ClaimError(
+            "cooperative signing destination differs from current authority".into(),
+        ));
+    }
+    let address = Address::from_str(committed_destination)
+        .map_err(|_| AppError::ClaimError("cooperative signing destination is invalid".into()))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| {
+            AppError::ClaimError("cooperative signing destination is not mainnet".into())
+        })?;
+    if hex::encode(address.script_pubkey().as_bytes()) != identity.destination().script_pubkey_hex()
+    {
+        return Err(AppError::ClaimError(
+            "cooperative signing destination script changed".into(),
+        ));
+    }
+    let source = identity.source();
+    let journaled_source = RecoverySourcePrevout {
+        txid: source.txid().to_owned(),
+        vout: source.vout(),
+        amount_sat: source.amount_sat(),
+        script_pubkey_hex: source.script_pubkey_hex().to_owned(),
+    };
+    let primary_source = &authority.exact_sources()[0];
+    validate_exact_primary_source_tuple(
+        primary_source.txid(),
+        primary_source.vout(),
+        primary_source.amount_sat(),
+        primary_source.script_pubkey_hex(),
+        &journaled_source,
+    )?;
+    if automatic_action_for_path_evidence(
+        authority.evidence,
+        AutomaticFallbackConstructionPath::Cooperative,
+    ) != ChainSwapAction::RecoverBitcoin
+    {
+        return Err(AppError::RecoveryNotAvailable(
+            "current authority no longer permits the selected cooperative transaction".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepared_attempt_from_completed_cooperative_signing(
+    identity: &db::ChainSwapCooperativeSigningIdentity,
+    transaction: &Transaction,
+) -> Result<PreparedAttempt, AppError> {
+    if transaction.input.len() != 1
+        || transaction.output.len() != 1
+        || transaction.input[0].previous_output.txid.to_string() != identity.source().txid()
+        || transaction.input[0].previous_output.vout != identity.source().vout()
+        || transaction.compute_txid().to_string() != identity.request().transaction_txid()
+        || transaction.output[0].value.to_sat() != identity.destination().amount_sat()
+        || hex::encode(transaction.output[0].script_pubkey.as_bytes())
+            != identity.destination().script_pubkey_hex()
+    {
+        return Err(AppError::ClaimError(
+            "completed cooperative transaction differs from its durable identity".into(),
+        ));
+    }
+    let fee_amount_sat = identity
+        .source()
+        .amount_sat()
+        .checked_sub(transaction.output[0].value.to_sat())
+        .filter(|fee| *fee == identity.fee_amount_sat())
+        .ok_or_else(|| {
+            AppError::ClaimError("completed cooperative transaction fee changed".into())
+        })?;
+    let vbytes = u64::try_from(transaction.vsize()).map_err(|_| {
+        AppError::ClaimError("completed cooperative transaction virtual size is invalid".into())
+    })?;
+    if vbytes != identity.fee_vbytes() {
+        return Err(AppError::ClaimError(
+            "completed cooperative transaction virtual size changed".into(),
+        ));
+    }
+    Ok(PreparedAttempt {
+        raw_tx_hex: hex::encode(serialize(transaction)),
+        txid: transaction.compute_txid().to_string(),
+        source_prevouts: vec![RecoverySourcePrevout {
+            txid: identity.source().txid().to_owned(),
+            vout: identity.source().vout(),
+            amount_sat: identity.source().amount_sat(),
+            script_pubkey_hex: identity.source().script_pubkey_hex().to_owned(),
+        }],
+        destination_address: identity.destination().address().to_owned(),
+        destination_script_hex: identity.destination().script_pubkey_hex().to_owned(),
+        destination_amount_sat: i64::try_from(identity.destination().amount_sat()).map_err(
+            |_| {
+                AppError::ClaimError("cooperative destination amount exceeds database range".into())
+            },
+        )?,
+        fee_amount_sat: i64::try_from(fee_amount_sat).map_err(|_| {
+            AppError::ClaimError("cooperative fee amount exceeds database range".into())
+        })?,
+        fee_rate_sat_vb: fee_amount_sat as f64 / vbytes as f64,
+    })
+}
+
+/// Finish only the provider response already selected by the durable journal.
+/// Opening the protected nonce before this boundary would make an uncommitted
+/// or losing response capable of consuming signing material.
+fn complete_selected_cooperative_signing(
+    swap: &ChainSwapRecord,
+    operation: &db::ChainSwapCooperativeSigningOperation,
+    runtime: &crate::swap_manifest_runtime::RecoveryManifestRuntimeV1,
+) -> Result<
+    (
+        PreparedAttempt,
+        db::CooperativeSigningCompletion,
+        FeeDecisionRecord,
+    ),
+    AppError,
+> {
+    if operation.state() != db::CooperativeSigningState::ResponseReceived {
+        return Err(AppError::ClaimError(
+            "cooperative signing response is not durably selected".into(),
+        ));
+    }
+    let identity = operation.identity();
+    if identity.chain_swap_id() != swap.id || identity.boltz_swap_id() != swap.boltz_swap_id {
+        return Err(AppError::ClaimError(
+            "cooperative signing response belongs to a different swap".into(),
+        ));
+    }
+    let request = identity.request();
+    let encrypted_nonce = request.secret_nonce();
+    let envelope = CooperativeSigningNonceEnvelopeV1::from_persisted(
+        encrypted_nonce.key_id().to_owned(),
+        encrypted_nonce.encryption_nonce_for_decryption().to_vec(),
+        encrypted_nonce.ciphertext_for_decryption().to_vec(),
+        encrypted_nonce.plaintext_sha256().to_owned(),
+    )
+    .map_err(|_| AppError::ClaimError("cooperative signing nonce envelope is invalid".into()))?;
+    let secret_nonce = runtime
+        .open_cooperative_signing_nonce_v1(swap.id, request.session_sha256(), &envelope)
+        .map_err(|_| {
+            AppError::ClaimError("cooperative signing nonce could not be opened".into())
+        })?;
+    let (response, script, refund_keypair) = cooperative_signing_material(swap)?;
+
+    let source_script = hex::decode(identity.source().script_pubkey_hex())
+        .map_err(|_| AppError::ClaimError("cooperative signing source script is invalid".into()))?;
+    if hex::encode(&source_script) != identity.source().script_pubkey_hex() {
+        return Err(AppError::ClaimError(
+            "cooperative signing source script is not canonical".into(),
+        ));
+    }
+    let source_txout = TxOut {
+        value: Amount::from_sat(identity.source().amount_sat()),
+        script_pubkey: ScriptBuf::from_bytes(source_script),
+    };
+    let durable_request = DurableCooperativeRequest {
+        unsigned_tx_hex: request.transaction_hex().to_owned(),
+        txid: request.transaction_txid().to_owned(),
+        public_nonce_hex: request.client_public_nonce_hex().to_owned(),
+        sighash_hex: request.sighash_hex().to_owned(),
+        tweaked_aggregate_key_hex: request.aggregate_key_xonly_hex().to_owned(),
+        input_index: 0,
+    };
+    let selected_response = operation.provider_response().ok_or_else(|| {
+        AppError::ClaimError("cooperative signing selected response is missing".into())
+    })?;
+    let provider_response = PartialSig {
+        pub_nonce: selected_response.public_nonce_hex().to_owned(),
+        partial_signature: selected_response.partial_signature_hex().to_owned(),
+    };
+    let completed = complete_exact_cooperative_refund(
+        &script,
+        &response.lockup_details,
+        &refund_keypair,
+        &source_txout,
+        &durable_request,
+        secret_nonce.expose(),
+        &provider_response,
+    )?;
+    let prepared =
+        prepared_attempt_from_completed_cooperative_signing(identity, &completed.transaction)?;
+    let completion = db::CooperativeSigningCompletion::new(
+        prepared.raw_tx_hex.clone(),
+        completed.local_partial_signature_sha256,
+    )
+    .map_err(|_| AppError::ClaimError("cooperative signing completion is invalid".into()))?;
+    let fee_record = identity
+        .fee_authority()
+        .to_fee_decision_record_for_committed_bytes()
+        .map_err(|_| AppError::ClaimError("cooperative signing fee authority is invalid".into()))?;
+    Ok((prepared, completion, fee_record))
+}
+
+fn cooperative_store_error(error: db::ChainSwapCooperativeSigningStoreError) -> AppError {
+    match error {
+        db::ChainSwapCooperativeSigningStoreError::Database(_) => {
+            AppError::DbError("cooperative signing database request failed".into())
+        }
+        error => AppError::ClaimError(error.to_string()),
+    }
+}
+
+async fn persist_cooperative_integrity_hold_in_transaction(
+    conn: &mut sqlx::PgConnection,
+    chain_swap_id: Uuid,
+    expected_version: u64,
+    reason_domain: &[u8],
+) -> Result<(), AppError> {
+    let reason_sha256 = framed_sha256(reason_domain, &[chain_swap_id.as_bytes()]);
+    let outcome = db::mark_chain_swap_cooperative_signing_integrity_hold_in_transaction(
+        conn,
+        chain_swap_id,
+        expected_version,
+        &reason_sha256,
+    )
+    .await
+    .map_err(cooperative_store_error)?;
+    if outcome.operation.state() != db::CooperativeSigningState::IntegrityHold {
+        return Err(AppError::ClaimError(
+            "cooperative signing integrity hold did not become durable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_durable_cooperative_provider_request(
+    identity: &db::ChainSwapCooperativeSigningIdentity,
+) -> Result<(), AppError> {
+    let request = identity.request();
+    let input_index = 0_u32.to_string();
+    let digest = framed_sha256(
+        b"bullnym/boltz-chain-refund-signature-request/v1",
+        &[
+            identity.boltz_swap_id().as_bytes(),
+            request.client_public_nonce_hex().as_bytes(),
+            request.transaction_hex().as_bytes(),
+            input_index.as_bytes(),
+        ],
+    );
+    if digest != request.provider_request_sha256() {
+        return Err(AppError::ClaimError(
+            "cooperative provider request digest changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Execute the one permitted provider mutation and immediately persist its
+/// response. This function is reachable only from an `Applied` requested CAS.
+async fn request_and_record_cooperative_response(
+    pool: &sqlx::PgPool,
+    operation: &db::ChainSwapCooperativeSigningOperation,
+    provider: &dyn CooperativeSigningProvider,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<(), AppError> {
+    if operation.state() != db::CooperativeSigningState::Requested
+        || operation.request_attempt_count() != 1
+    {
+        return Err(AppError::ClaimError(
+            "cooperative provider call lacks one committed request intent".into(),
+        ));
+    }
+    let identity = operation.identity();
+    validate_durable_cooperative_provider_request(identity)?;
+    let request = identity.request();
+    let response = match provider
+        .request_partial_signature(
+            identity.boltz_swap_id(),
+            0,
+            request.client_public_nonce_hex(),
+            request.transaction_hex(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            let outcome = db::mark_chain_swap_cooperative_signing_ambiguous(
+                pool,
+                identity.chain_swap_id(),
+                operation.version(),
+                db::CooperativeSigningErrorClass::UnknownProviderOutcome,
+            )
+            .await
+            .map_err(cooperative_store_error)?;
+            if outcome.operation.state() != db::CooperativeSigningState::Ambiguous {
+                return Err(AppError::ClaimError(
+                    "cooperative provider uncertainty was not preserved".into(),
+                ));
+            }
+            // Return progress so the caller reacquires the chain lock once.
+            // A parent/Liquid transition that won while the POST was in
+            // flight must terminally hold this ambiguous evidence now.
+            return Ok(());
+        }
+    };
+
+    // A crash here deliberately leaves `requested`. Restart reconciliation
+    // never POSTs that intent again because the remote outcome is unknowable.
+    faults.check(RecoveryFaultPoint::AfterCooperativeProviderBeforeResponseCommit)?;
+    let durable_response = match db::CooperativeSigningProviderResponse::new(
+        response.pub_nonce.to_ascii_lowercase(),
+        response.partial_signature.to_ascii_lowercase(),
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            let outcome = db::mark_chain_swap_cooperative_signing_ambiguous(
+                pool,
+                identity.chain_swap_id(),
+                operation.version(),
+                db::CooperativeSigningErrorClass::MalformedResponse,
+            )
+            .await
+            .map_err(cooperative_store_error)?;
+            if outcome.operation.state() != db::CooperativeSigningState::Ambiguous {
+                return Err(AppError::ClaimError(
+                    "malformed cooperative response was not preserved".into(),
+                ));
+            }
+            // Re-lock once after the response is durably quarantined; this
+            // closes the parent-transition window around the remote call.
+            return Ok(());
+        }
+    };
+    let outcome = db::record_chain_swap_cooperative_signing_response(
+        pool,
+        identity.chain_swap_id(),
+        operation.version(),
+        &durable_response,
+    )
+    .await
+    .map_err(cooperative_store_error)?;
+    match outcome.operation.state() {
+        db::CooperativeSigningState::ResponseReceived => {}
+        db::CooperativeSigningState::IntegrityHold => {
+            return Err(AppError::ClaimError(
+                "cooperative provider returned conflicting signing evidence".into(),
+            ));
+        }
+        _ => {
+            return Err(AppError::ClaimError(
+                "cooperative provider response did not become durable".into(),
+            ));
+        }
+    }
+    faults.check(RecoveryFaultPoint::AfterCooperativeResponseCommit)?;
+    Ok(())
+}
+
+struct CooperativeProviderHarness<'a> {
+    calls: &'a std::sync::atomic::AtomicUsize,
+    response: Option<PartialSig>,
+}
+
+#[async_trait]
+impl CooperativeSigningProvider for CooperativeProviderHarness<'_> {
+    async fn request_partial_signature(
+        &self,
+        _boltz_swap_id: &str,
+        _input_index: u32,
+        _client_public_nonce_hex: &str,
+        _transaction_hex: &str,
+    ) -> Result<PartialSig, AppError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.response.clone().ok_or_else(|| {
+            AppError::RecoveryNotAvailable(
+                "cooperative provider harness returned an unknown outcome".into(),
+            )
+        })
+    }
+}
+
+/// DB-backed crash seam for the one irreversible provider boundary.
+///
+/// This deliberately omits construction and chain authority; those belong to
+/// the live state machine. It exercises the production atomic
+/// `prepared -> requested` CAS and the exact production response persistence
+/// helper so integration tests can prove that only `Applied` calls the
+/// provider and every restart `ExactRetry` performs zero POSTs.
+#[doc(hidden)]
+pub async fn exercise_cooperative_provider_transition_for_test(
+    pool: &sqlx::PgPool,
+    identity: &db::ChainSwapCooperativeSigningIdentity,
+    response: Option<PartialSig>,
+    calls: &std::sync::atomic::AtomicUsize,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<db::CooperativeSigningState, AppError> {
+    if let Some(existing) = db::get_chain_swap_cooperative_signing(pool, identity.chain_swap_id())
+        .await
+        .map_err(cooperative_store_error)?
+    {
+        if existing.identity() != identity {
+            return Err(AppError::ClaimError(
+                "cooperative provider harness identity changed".into(),
+            ));
+        }
+        if !matches!(
+            existing.state(),
+            db::CooperativeSigningState::Prepared | db::CooperativeSigningState::Requested
+        ) {
+            // The provider boundary has already been resolved or terminally
+            // quarantined. A worker restart observes it without reopening the
+            // one-shot request path.
+            return Ok(existing.state());
+        }
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| AppError::DbError("cooperative provider harness transaction failed".into()))?;
+    let outcome = db::prepare_and_mark_chain_swap_cooperative_signing_requested_in_transaction(
+        &mut tx, identity,
+    )
+    .await
+    .map_err(cooperative_store_error)?;
+    tx.commit().await.map_err(|_| {
+        AppError::DbError("cooperative provider harness request commit failed".into())
+    })?;
+    if outcome.disposition == db::CooperativeSigningCasDisposition::Applied {
+        faults.check(RecoveryFaultPoint::AfterCooperativeRequestedCommitBeforeProvider)?;
+        let provider = CooperativeProviderHarness { calls, response };
+        request_and_record_cooperative_response(pool, &outcome.operation, &provider, faults)
+            .await?;
+    }
+    let operation = db::get_chain_swap_cooperative_signing(pool, identity.chain_swap_id())
+        .await
+        .map_err(cooperative_store_error)?
+        .ok_or_else(|| {
+            AppError::ClaimError("cooperative provider harness operation disappeared".into())
+        })?;
+    Ok(operation.state())
+}
+
+/// Drive the exact live cooperative state machine with a counted provider.
+/// This is used for database-backed preflight and crash-boundary regressions;
+/// production continues to inject its real Boltz provider.
+#[doc(hidden)]
+pub async fn exercise_cooperative_signing_advance_for_test(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    response: Option<PartialSig>,
+    calls: &std::sync::atomic::AtomicUsize,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<(), AppError> {
+    let provider = CooperativeProviderHarness { calls, response };
+    advance_cooperative_signing_operation(state, chain_swap_id, &provider, faults).await
+}
+
+async fn cooperative_requested_intent_is_stale(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_swap_id: Uuid,
+) -> Result<bool, AppError> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(\
+             requested_at <= clock_timestamp() - INTERVAL '30 seconds', FALSE\
+           ) \
+           FROM chain_swap_cooperative_signing_operations \
+          WHERE chain_swap_id = $1",
+    )
+    .bind(chain_swap_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| AppError::DbError("cooperative signing request age read failed".into()))
+}
+
+#[derive(Clone, Copy)]
+struct CooperativeParentConflict {
+    reason_domain: &'static [u8],
+    commit_error: &'static str,
+    claim_error: &'static str,
+}
+
+fn cooperative_nonterminal_parent_conflict(
+    swap: &ChainSwapRecord,
+    status: ChainSwapStatus,
+    operation: Option<&db::ChainSwapCooperativeSigningOperation>,
+) -> Option<CooperativeParentConflict> {
+    if operation.is_none_or(|operation| operation.state().is_terminal()) {
+        return None;
+    }
+    if status != ChainSwapStatus::RefundDue {
+        return Some(CooperativeParentConflict {
+            reason_domain: b"bullnym/cooperative-signing/parent-status-integrity/v1",
+            commit_error: "cooperative signing parent-conflict commit failed",
+            claim_error: "cooperative signing intent conflicts with the parent lifecycle",
+        });
+    }
+    if swap.claim_txid.is_some() || swap.claim_tx_hex.is_some() {
+        return Some(CooperativeParentConflict {
+            reason_domain: b"bullnym/cooperative-signing/liquid-claim-integrity/v1",
+            commit_error: "cooperative signing Liquid-conflict commit failed",
+            claim_error: "cooperative signing intent conflicts with a persisted Liquid claim",
+        });
+    }
+    None
+}
+
+async fn persist_cooperative_parent_conflict(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_swap_id: Uuid,
+    operation: &db::ChainSwapCooperativeSigningOperation,
+    conflict: CooperativeParentConflict,
+) -> Result<(), AppError> {
+    persist_cooperative_integrity_hold_in_transaction(
+        tx,
+        chain_swap_id,
+        operation.version(),
+        conflict.reason_domain,
+    )
+    .await
+}
+
+enum CooperativeCompletionAuthority<'a> {
+    Live(&'a CollectedAutomaticFallbackEvidence),
+    IntegrationFixture,
+}
+
+// This is the single atomic production boundary. Its explicit arguments make
+// the attempt, selected response, fee authority, live evidence, and fault seam
+// independently auditable rather than hidden in a permissive context bag.
+#[allow(clippy::too_many_arguments)]
+async fn persist_selected_cooperative_completion_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &ChainSwapRecord,
+    operation: &db::ChainSwapCooperativeSigningOperation,
+    prepared: &PreparedAttempt,
+    completion: &db::CooperativeSigningCompletion,
+    fee_record: &FeeDecisionRecord,
+    authority: CooperativeCompletionAuthority<'_>,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<ChainSwapTxAttempt, AppError> {
+    let attempt = db::insert_bitcoin_recovery_attempt(tx, &prepared.as_new(swap.id, fee_record))
+        .await
+        .map_err(|_| AppError::DbError("cooperative recovery attempt insert failed".into()))?;
+    validate_reloaded_attempt(&attempt)?;
+    match authority {
+        CooperativeCompletionAuthority::Live(authority) => {
+            validate_automatic_attempt_authority(
+                &attempt,
+                authority,
+                swap,
+                Some(AutomaticFallbackConstructionPath::Cooperative),
+            )?;
+        }
+        CooperativeCompletionAuthority::IntegrationFixture => {}
+    }
+    let rows = db::mark_chain_swap_refunding(&mut **tx, swap.id)
+        .await
+        .map_err(|_| AppError::DbError("cooperative recovery parent transition failed".into()))?;
+    if rows != 1 {
+        return Err(AppError::ClaimError(
+            "cooperative recovery race lost before commit".into(),
+        ));
+    }
+    let completed = db::complete_chain_swap_cooperative_signing_in_transaction(
+        tx,
+        swap.id,
+        operation.version(),
+        completion,
+    )
+    .await
+    .map_err(cooperative_store_error)?;
+    if completed.operation.state() != db::CooperativeSigningState::Completed {
+        return Err(AppError::ClaimError(
+            "cooperative signing completion did not become durable".into(),
+        ));
+    }
+    faults.check(RecoveryFaultPoint::AfterCooperativeAttemptWriteBeforeCommit)?;
+    Ok(attempt)
+}
+
+/// Exercise valid selected-response completion through the production signer
+/// and the exact atomic attempt/parent/journal commit helper. External chain
+/// authority is deliberately omitted because the fixture's immutable identity
+/// already supplies the transaction tuple; the live caller validates fresh
+/// authority immediately before entering this same helper.
+#[doc(hidden)]
+pub async fn preview_cooperative_signing_completion_for_test(
+    state: &AppState,
+    chain_swap_id: Uuid,
+) -> Result<String, AppError> {
+    let swap = db::get_chain_swap_by_id(&state.db, chain_swap_id)
+        .await
+        .map_err(|_| AppError::DbError("cooperative completion preview parent read failed".into()))?
+        .ok_or_else(|| {
+            AppError::ClaimError("cooperative completion preview parent missing".into())
+        })?;
+    let operation = db::get_chain_swap_cooperative_signing(&state.db, chain_swap_id)
+        .await
+        .map_err(cooperative_store_error)?
+        .ok_or_else(|| {
+            AppError::ClaimError("cooperative completion preview intent missing".into())
+        })?;
+    let runtime = state.recovery_manifest_runtime_v1().ok_or_else(|| {
+        AppError::RecoveryNotAvailable("cooperative completion preview runtime missing".into())
+    })?;
+    let (prepared, _, _) = complete_selected_cooperative_signing(&swap, &operation, runtime)?;
+    Ok(prepared.raw_tx_hex)
+}
+
+#[doc(hidden)]
+pub async fn exercise_cooperative_signing_completion_for_test(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<String, AppError> {
+    let mut tx = state.db.begin().await.map_err(|_| {
+        AppError::DbError("cooperative completion harness transaction failed".into())
+    })?;
+    let lock_key = format!("chain-claim:{chain_swap_id}");
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| AppError::DbError("cooperative completion harness lock failed".into()))?;
+    if !got_lock {
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative completion harness lock is busy".into(),
+        ));
+    }
+    let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+        .await
+        .map_err(|_| AppError::DbError("cooperative completion harness parent read failed".into()))?
+        .ok_or_else(|| {
+            AppError::ClaimError("cooperative completion harness parent missing".into())
+        })?;
+    let operation = db::get_chain_swap_cooperative_signing_for_update(&mut tx, chain_swap_id)
+        .await
+        .map_err(cooperative_store_error)?
+        .ok_or_else(|| {
+            AppError::ClaimError("cooperative completion harness intent missing".into())
+        })?;
+    if let Some(attempt) = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
+        .await
+        .map_err(|_| {
+            AppError::DbError("cooperative completion harness attempt read failed".into())
+        })?
+    {
+        validate_reloaded_attempt(&attempt)?;
+        let exact_completed_replay = swap.parsed_status().map_err(AppError::DbError)?
+            == ChainSwapStatus::Refunding
+            && operation.state() == db::CooperativeSigningState::Completed
+            && operation
+                .completion()
+                .is_some_and(|completion| completion.final_transaction_hex() == attempt.raw_tx_hex);
+        if !exact_completed_replay {
+            if !operation.state().is_terminal() {
+                persist_cooperative_integrity_hold_in_transaction(
+                    &mut tx,
+                    chain_swap_id,
+                    operation.version(),
+                    b"bullnym/cooperative-signing/completion-replay-integrity/v1",
+                )
+                .await?;
+                tx.commit().await.map_err(|_| {
+                    AppError::DbError(
+                        "cooperative completion harness replay hold commit failed".into(),
+                    )
+                })?;
+            }
+            return Err(AppError::ClaimError(
+                "cooperative completion harness replay state is inconsistent".into(),
+            ));
+        }
+        tx.commit().await.map_err(|_| {
+            AppError::DbError("cooperative completion harness replay commit failed".into())
+        })?;
+        return Ok(attempt.raw_tx_hex);
+    }
+    if swap.parsed_status().map_err(AppError::DbError)? != ChainSwapStatus::RefundDue {
+        return Err(AppError::ClaimError(
+            "cooperative completion harness parent is not refund due".into(),
+        ));
+    }
+    let runtime = state.recovery_manifest_runtime_v1().ok_or_else(|| {
+        AppError::RecoveryNotAvailable("cooperative completion harness runtime missing".into())
+    })?;
+    let (prepared, completion, fee_record) =
+        complete_selected_cooperative_signing(&swap, &operation, runtime)?;
+    let raw_tx_hex = prepared.raw_tx_hex.clone();
+    persist_selected_cooperative_completion_in_transaction(
+        &mut tx,
+        &swap,
+        &operation,
+        &prepared,
+        &completion,
+        &fee_record,
+        CooperativeCompletionAuthority::IntegrationFixture,
+        faults,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DbError("cooperative completion harness commit failed".into()))?;
+    Ok(raw_tx_hex)
+}
+
+/// Advance the provider-assisted branch until either an immutable Bitcoin
+/// attempt exists or current evidence selects the unilateral executor. Every
+/// loop iteration reacquires the shared lock and fresh #82 authority.
+async fn advance_cooperative_signing_operation(
+    state: &AppState,
+    chain_swap_id: Uuid,
+    provider: &dyn CooperativeSigningProvider,
+    faults: &dyn RecoveryFaultInjector,
+) -> Result<(), AppError> {
+    for _ in 0..8 {
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|_| AppError::DbError("cooperative signing transaction failed".into()))?;
+        let lock_key = format!("chain-claim:{chain_swap_id}");
+        let got_lock: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(&lock_key)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| {
+                    AppError::DbError("cooperative signing execution lock failed".into())
+                })?;
+        if !got_lock {
+            return Err(AppError::RecoveryNotAvailable(
+                "cooperative signing execution lock is busy".into(),
+            ));
+        }
+        let swap = db::get_chain_swap_by_id_for_update(&mut *tx, chain_swap_id)
+            .await
+            .map_err(|_| AppError::DbError("cooperative signing parent read failed".into()))?
+            .ok_or_else(|| AppError::ClaimError("cooperative signing parent is missing".into()))?;
+        let status = swap.parsed_status().map_err(AppError::DbError)?;
+        if db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
+            .await
+            .map_err(|_| AppError::DbError("cooperative signing attempt read failed".into()))?
+            .is_some()
+        {
+            tx.commit()
+                .await
+                .map_err(|_| AppError::DbError("cooperative signing commit failed".into()))?;
+            return Ok(());
+        }
+        let operation = db::get_chain_swap_cooperative_signing_for_update(&mut tx, chain_swap_id)
+            .await
+            .map_err(cooperative_store_error)?;
+        if let Some(conflict) =
+            cooperative_nonterminal_parent_conflict(&swap, status, operation.as_ref())
+        {
+            let operation = operation.as_ref().ok_or_else(|| {
+                AppError::ClaimError("cooperative signing conflict lost its intent".into())
+            })?;
+            persist_cooperative_parent_conflict(&mut tx, chain_swap_id, operation, conflict)
+                .await?;
+            tx.commit()
+                .await
+                .map_err(|_| AppError::DbError(conflict.commit_error.into()))?;
+            return Err(AppError::ClaimError(conflict.claim_error.into()));
+        }
+        if status != ChainSwapStatus::RefundDue {
+            if status == ChainSwapStatus::Refunding {
+                // Preserve the core executor's legacy-ambiguity refusal when
+                // no cooperative intent remains capable of local signing.
+                tx.commit()
+                    .await
+                    .map_err(|_| AppError::DbError("cooperative signing commit failed".into()))?;
+                return Ok(());
+            }
+            return Err(AppError::ClaimError(format!(
+                "chain swap not recoverable (status {status})"
+            )));
+        }
+        if swap.claim_txid.is_some() || swap.claim_tx_hex.is_some() {
+            return Err(AppError::ClaimError(
+                "recovery blocked: a Liquid claim is already in progress for this payment".into(),
+            ));
+        }
+
+        let authority =
+            collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, None).await?;
+        if !authority.dependencies_available() {
+            return Err(AppError::ElectrumError(
+                "cooperative signing evidence dependencies are unavailable".into(),
+            ));
+        }
+        let path = authority.automatic_construction_path();
+
+        let Some(operation) = operation else {
+            match path {
+                Some(AutomaticFallbackConstructionPath::Unilateral) => {
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing commit failed".into())
+                    })?;
+                    return Ok(());
+                }
+                Some(AutomaticFallbackConstructionPath::Cooperative) => {
+                    let runtime = state.recovery_manifest_runtime_v1().ok_or_else(|| {
+                        AppError::RecoveryNotAvailable(
+                            "protected cooperative signing runtime is unavailable".into(),
+                        )
+                    })?;
+                    let preparation =
+                        prepare_live_cooperative_operation(state, &swap, &authority).await?;
+                    let identity =
+                        build_cooperative_signing_identity(&swap, &preparation, runtime)?;
+                    let outcome = db::prepare_and_mark_chain_swap_cooperative_signing_requested_in_transaction(
+                        &mut tx,
+                        &identity,
+                    )
+                    .await
+                    .map_err(cooperative_store_error)?;
+                    if outcome.operation.state() != db::CooperativeSigningState::Requested
+                        || outcome.operation.identity() != &identity
+                    {
+                        return Err(AppError::ClaimError(
+                            "cooperative signing request intent did not become immutable".into(),
+                        ));
+                    }
+                    if !preparation.fee_record.authorizes_construction_now() {
+                        return Err(AppError::RecoveryNotAvailable(
+                            BITCOIN_FEE_DECISION_PENDING_REASON.into(),
+                        ));
+                    }
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing request commit failed".into())
+                    })?;
+                    if outcome.disposition == db::CooperativeSigningCasDisposition::Applied {
+                        faults.check(
+                            RecoveryFaultPoint::AfterCooperativeRequestedCommitBeforeProvider,
+                        )?;
+                        request_and_record_cooperative_response(
+                            &state.db,
+                            &outcome.operation,
+                            provider,
+                            faults,
+                        )
+                        .await?;
+                    }
+                    // ExactRetry proves the request already committed and may
+                    // never authorize a second provider POST.
+                    continue;
+                }
+                None => {
+                    return Err(AppError::RecoveryNotAvailable(
+                        "automatic fallback evidence does not select a signing path".into(),
+                    ));
+                }
+            }
+        };
+
+        match operation.state() {
+            db::CooperativeSigningState::Prepared => match path {
+                Some(AutomaticFallbackConstructionPath::Cooperative) => {
+                    validate_cooperative_operation_authority(&operation, &authority, &swap, true)?;
+                    return Err(AppError::RecoveryNotAvailable(
+                        "legacy prepared cooperative intent cannot authorize a provider call"
+                            .into(),
+                    ));
+                }
+                Some(AutomaticFallbackConstructionPath::Unilateral) => {
+                    validate_cooperative_operation_authority(&operation, &authority, &swap, false)?;
+                    db::supersede_chain_swap_cooperative_signing_at_unilateral_timeout_in_transaction(
+                        &mut tx,
+                        chain_swap_id,
+                        operation.version(),
+                    )
+                    .await
+                    .map_err(cooperative_store_error)?;
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing supersede commit failed".into())
+                    })?;
+                    return Ok(());
+                }
+                None => {
+                    return Err(AppError::RecoveryNotAvailable(
+                        "prepared cooperative signing intent lacks current authority".into(),
+                    ));
+                }
+            },
+            db::CooperativeSigningState::Requested => {
+                if path == Some(AutomaticFallbackConstructionPath::Unilateral) {
+                    validate_cooperative_operation_authority(&operation, &authority, &swap, false)?;
+                    db::supersede_chain_swap_cooperative_signing_at_unilateral_timeout_in_transaction(
+                        &mut tx,
+                        chain_swap_id,
+                        operation.version(),
+                    )
+                    .await
+                    .map_err(cooperative_store_error)?;
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing supersede commit failed".into())
+                    })?;
+                    return Ok(());
+                }
+                let stale = cooperative_requested_intent_is_stale(&mut tx, chain_swap_id).await?;
+                let version = operation.version();
+                tx.commit().await.map_err(|_| {
+                    AppError::DbError("cooperative signing request check commit failed".into())
+                })?;
+                if stale {
+                    let outcome = db::mark_chain_swap_cooperative_signing_ambiguous(
+                        &state.db,
+                        chain_swap_id,
+                        version,
+                        db::CooperativeSigningErrorClass::LocalCommitUncertainty,
+                    )
+                    .await
+                    .map_err(cooperative_store_error)?;
+                    if outcome.operation.state() != db::CooperativeSigningState::Ambiguous {
+                        return Err(AppError::ClaimError(
+                            "stale cooperative request was not quarantined".into(),
+                        ));
+                    }
+                }
+                return Err(AppError::RecoveryNotAvailable(
+                    "cooperative signing request has an unknown remote outcome; no retry permitted"
+                        .into(),
+                ));
+            }
+            db::CooperativeSigningState::Ambiguous => {
+                if path == Some(AutomaticFallbackConstructionPath::Unilateral) {
+                    validate_cooperative_operation_authority(&operation, &authority, &swap, false)?;
+                    db::supersede_chain_swap_cooperative_signing_at_unilateral_timeout_in_transaction(
+                        &mut tx,
+                        chain_swap_id,
+                        operation.version(),
+                    )
+                    .await
+                    .map_err(cooperative_store_error)?;
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing supersede commit failed".into())
+                    })?;
+                    return Ok(());
+                }
+                return Err(AppError::RecoveryNotAvailable(
+                    "cooperative signing outcome is ambiguous; waiting for unilateral timeout"
+                        .into(),
+                ));
+            }
+            db::CooperativeSigningState::ResponseReceived => {
+                let action = automatic_action_for_path_evidence(
+                    authority.evidence,
+                    AutomaticFallbackConstructionPath::Cooperative,
+                );
+                let authority_integrity_failure = match action {
+                    ChainSwapAction::Observe => {
+                        return Err(AppError::RecoveryNotAvailable(
+                            "cooperative signing response awaits complete current authority".into(),
+                        ));
+                    }
+                    ChainSwapAction::RecoverBitcoin => validate_cooperative_operation_authority(
+                        &operation, &authority, &swap, false,
+                    )
+                    .is_err(),
+                    // A selected response cannot be completed after the
+                    // Liquid path, an unknown outspend, or another terminal
+                    // reducer decision wins. Preserve that conflict instead
+                    // of leaving a response in an infinite retry loop.
+                    _ => true,
+                };
+                if authority_integrity_failure {
+                    let version = operation.version();
+                    persist_cooperative_integrity_hold_in_transaction(
+                        &mut tx,
+                        chain_swap_id,
+                        version,
+                        b"bullnym/cooperative-signing/authority-integrity/v1",
+                    )
+                    .await?;
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing authority hold commit failed".into())
+                    })?;
+                    return Err(AppError::ClaimError(
+                        "cooperative signing response conflicts with current authority".into(),
+                    ));
+                }
+                let runtime = state.recovery_manifest_runtime_v1().ok_or_else(|| {
+                    AppError::RecoveryNotAvailable(
+                        "protected cooperative signing runtime is unavailable".into(),
+                    )
+                })?;
+                let (prepared, completion, fee_record) =
+                    match complete_selected_cooperative_signing(&swap, &operation, runtime) {
+                        Ok(completed) => completed,
+                        Err(AppError::ClaimError(_)) => {
+                            let version = operation.version();
+                            persist_cooperative_integrity_hold_in_transaction(
+                                &mut tx,
+                                chain_swap_id,
+                                version,
+                                b"bullnym/cooperative-signing/completion-integrity/v1",
+                            )
+                            .await?;
+                            tx.commit().await.map_err(|_| {
+                                AppError::DbError(
+                                    "cooperative signing integrity hold commit failed".into(),
+                                )
+                            })?;
+                            return Err(AppError::ClaimError(
+                                "cooperative signing completion failed integrity validation".into(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                persist_selected_cooperative_completion_in_transaction(
+                    &mut tx,
+                    &swap,
+                    &operation,
+                    &prepared,
+                    &completion,
+                    &fee_record,
+                    CooperativeCompletionAuthority::Live(&authority),
+                    faults,
+                )
+                .await?;
+                tx.commit().await.map_err(|_| {
+                    AppError::DbError("cooperative signing completion commit failed".into())
+                })?;
+                return Ok(());
+            }
+            db::CooperativeSigningState::Completed => {
+                return Err(AppError::ClaimError(
+                    "completed cooperative signing has no immutable recovery attempt".into(),
+                ));
+            }
+            db::CooperativeSigningState::IntegrityHold => {
+                return Err(AppError::ClaimError(
+                    "cooperative signing operation is on integrity hold".into(),
+                ));
+            }
+            db::CooperativeSigningState::Superseded => {
+                if path == Some(AutomaticFallbackConstructionPath::Unilateral) {
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError("cooperative signing commit failed".into())
+                    })?;
+                    return Ok(());
+                }
+                return Err(AppError::RecoveryNotAvailable(
+                    "cooperative signing was superseded; waiting for unilateral authority".into(),
+                ));
+            }
+        }
+    }
+    Err(AppError::RecoveryNotAvailable(
+        "cooperative signing state machine did not converge".into(),
+    ))
+}
+
 #[async_trait]
 impl BitcoinRecoveryBroadcaster for EsploraRecoveryBroadcaster {
     async fn broadcast(&self, raw_tx_hex: &str, expected_txid: &str) -> Result<String, AppError> {
@@ -552,9 +2100,20 @@ pub(crate) async fn execute_journaled_recovery_automatically(
         AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
     })?;
     let endpoints = evidence.endpoints().to_vec();
-    // This first production slice is positively authorized only after the
-    // immutable timeout. Its only live builder is unilateral; no provider
-    // response can select or downgrade the transaction path.
+    let cooperative_provider = LiveCooperativeSigningProvider {
+        api_url: state.config.boltz.api_url.clone(),
+    };
+    advance_cooperative_signing_operation(
+        state,
+        chain_swap_id,
+        &cooperative_provider,
+        &NoRecoveryFaults,
+    )
+    .await?;
+
+    // The cooperative state machine either committed the exact final attempt
+    // or positively yielded to the timeout-safe unilateral builder. The core
+    // executor below remains the only broadcast boundary for both paths.
     let builder = LiveRecoveryBuilder { state };
     let broadcaster = EsploraRecoveryBroadcaster { endpoints };
     execute_journaled_recovery_with_builder_fee(
@@ -1006,8 +2565,8 @@ async fn prepare_or_reload_attempt(
     let existing = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
-    let automatic_authority = match mode {
-        RecoveryExecutionMode::InjectedHarness => None,
+    let (automatic_authority, automatic_construction_path) = match mode {
+        RecoveryExecutionMode::InjectedHarness => (None, None),
         RecoveryExecutionMode::Automatic(state) => {
             let collected = collect_automatic_fallback_evidence_under_lock(
                 state,
@@ -1021,27 +2580,16 @@ async fn prepare_or_reload_attempt(
                     "automatic fallback evidence dependencies are unavailable".into(),
                 ));
             }
-            let action = reduce_chain_swap_evidence(&collected.evidence);
-            let decision = classify_authoritative_automatic_attempt(
-                action,
-                collected.evidence.bitcoin_source,
-                collected.evidence.bitcoin_recovery_transaction,
-            );
             if existing.is_some() {
-                if !automatic_existing_attempt_may_reconcile(decision) {
-                    return Err(AppError::RecoveryNotAvailable(
-                        "automatic fallback evidence no longer permits attempt reconciliation"
-                            .into(),
-                    ));
-                }
-                if decision == AuthoritativeAutomaticAttemptDecision::Broadcast
-                    && !collected.authorizes_automatic_recovery()
-                {
-                    return Err(AppError::ClaimError(
-                        "automatic fallback authorization packet is incomplete".into(),
-                    ));
-                }
-            } else if !collected.authorizes_automatic_recovery() {
+                (Some(collected), None)
+            } else if let Some(path) = collected.automatic_construction_path() {
+                (Some(collected), Some(path))
+            } else {
+                let decision = classify_authoritative_automatic_attempt(
+                    reduce_chain_swap_evidence(&collected.evidence),
+                    collected.evidence.bitcoin_source,
+                    collected.evidence.bitcoin_recovery_transaction,
+                );
                 if decision == AuthoritativeAutomaticAttemptDecision::IntegrityHold {
                     return Err(AppError::ClaimError(
                         "automatic fallback evidence requires an integrity hold".into(),
@@ -1051,7 +2599,6 @@ async fn prepare_or_reload_attempt(
                     "automatic fallback evidence no longer authorizes recovery".into(),
                 ));
             }
-            Some(collected)
         }
     };
 
@@ -1060,13 +2607,19 @@ async fn prepare_or_reload_attempt(
         // before repairing any parent lifecycle state.
         validate_reloaded_attempt(&attempt)?;
         if let Some(authority) = automatic_authority.as_ref() {
+            let path = classify_automatic_attempt_path(&attempt, &swap)?;
             let decision = classify_authoritative_automatic_attempt(
-                reduce_chain_swap_evidence(&authority.evidence),
+                automatic_action_for_attempt(authority, path),
                 authority.evidence.bitcoin_source,
                 authority.evidence.bitcoin_recovery_transaction,
             );
+            if !automatic_existing_attempt_may_reconcile(decision) {
+                return Err(AppError::RecoveryNotAvailable(
+                    "automatic fallback evidence no longer permits attempt reconciliation".into(),
+                ));
+            }
             if decision != AuthoritativeAutomaticAttemptDecision::IntegrityHold {
-                validate_automatic_attempt_authority(&attempt, authority, &swap)?;
+                validate_automatic_attempt_authority(&attempt, authority, &swap, Some(path))?;
             }
         }
         if attempt.status == "integrity_hold" {
@@ -1177,7 +2730,21 @@ async fn prepare_or_reload_attempt(
     }
 
     faults.check(RecoveryFaultPoint::BeforeConstruction)?;
-    let transaction = builder.construct(&swap, &destination, fee_decision).await?;
+    let transaction = match mode {
+        RecoveryExecutionMode::InjectedHarness => {
+            builder.construct(&swap, &destination, fee_decision).await?
+        }
+        RecoveryExecutionMode::Automatic(_) => {
+            let path = automatic_construction_path.ok_or_else(|| {
+                AppError::RecoveryNotAvailable(
+                    "automatic fallback has no current construction path".into(),
+                )
+            })?;
+            builder
+                .construct_automatic(&swap, &destination, fee_decision, path)
+                .await?
+        }
+    };
     let prepared = validate_constructed_attempt(
         &swap,
         &destination,
@@ -1185,6 +2752,7 @@ async fn prepare_or_reload_attempt(
         fee_record,
         evidence,
         automatic_authority.as_ref(),
+        automatic_construction_path,
     )
     .await?;
     faults.check(RecoveryFaultPoint::AfterConstructionBeforeJournal)?;
@@ -1202,7 +2770,12 @@ async fn prepare_or_reload_attempt(
     // journal instead of committing an unreplayable immutable attempt.
     validate_reloaded_attempt(&attempt)?;
     if let Some(authority) = automatic_authority.as_ref() {
-        validate_automatic_attempt_authority(&attempt, authority, &swap)?;
+        validate_automatic_attempt_authority(
+            &attempt,
+            authority,
+            &swap,
+            automatic_construction_path,
+        )?;
     }
     let rows = db::mark_chain_swap_refunding(&mut *tx, chain_swap_id)
         .await
@@ -1280,14 +2853,15 @@ async fn preflight_automatic_attempt_under_lock(
             "automatic fallback evidence dependencies changed during preflight".into(),
         ));
     }
+    let path = classify_automatic_attempt_path(&attempt, &swap)?;
     let decision = classify_authoritative_automatic_attempt(
-        reduce_chain_swap_evidence(&collected.evidence),
+        automatic_action_for_attempt(&collected, path),
         collected.evidence.bitcoin_source,
         collected.evidence.bitcoin_recovery_transaction,
     );
     let result = match decision {
         AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
-            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            validate_automatic_attempt_authority(&attempt, &collected, &swap, Some(path))?;
             AutomaticAttemptPreflight::ExpectedObserved(attempt)
         }
         AuthoritativeAutomaticAttemptDecision::IntegrityHold => {
@@ -1298,12 +2872,7 @@ async fn preflight_automatic_attempt_under_lock(
             }
         }
         AuthoritativeAutomaticAttemptDecision::Broadcast => {
-            if !collected.authorizes_automatic_recovery() {
-                return Err(AppError::ClaimError(
-                    "automatic fallback preflight authorization packet is incomplete".into(),
-                ));
-            }
-            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            validate_automatic_attempt_authority(&attempt, &collected, &swap, Some(path))?;
             AutomaticAttemptPreflight::BroadcastReady
         }
         AuthoritativeAutomaticAttemptDecision::Deferred => {
@@ -1366,14 +2935,15 @@ async fn broadcast_automatic_attempt_under_lock(
             "automatic fallback evidence dependencies changed before broadcast".into(),
         ));
     }
-    let action = reduce_chain_swap_evidence(&collected.evidence);
+    let path = classify_automatic_attempt_path(&attempt, &swap)?;
+    let action = automatic_action_for_attempt(&collected, path);
     match classify_authoritative_automatic_attempt(
         action,
         collected.evidence.bitcoin_source,
         collected.evidence.bitcoin_recovery_transaction,
     ) {
         AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
-            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            validate_automatic_attempt_authority(&attempt, &collected, &swap, Some(path))?;
             tx.commit()
                 .await
                 .map_err(|error| AppError::DbError(error.to_string()))?;
@@ -1395,12 +2965,7 @@ async fn broadcast_automatic_attempt_under_lock(
             ));
         }
         AuthoritativeAutomaticAttemptDecision::Broadcast => {
-            if !collected.authorizes_automatic_recovery() {
-                return Err(AppError::ClaimError(
-                    "automatic fallback authorization packet is incomplete before broadcast".into(),
-                ));
-            }
-            validate_automatic_attempt_authority(&attempt, &collected, &swap)?;
+            validate_automatic_attempt_authority(&attempt, &collected, &swap, Some(path))?;
         }
     }
     // Keep the transaction-scoped `chain-claim` lock through the exact-byte
@@ -1421,14 +2986,20 @@ async fn broadcast_automatic_attempt_under_lock(
             collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, Some(&attempt))
                 .await?;
         if reconciled.dependencies_available() {
-            let reconciled_action = reduce_chain_swap_evidence(&reconciled.evidence);
+            let reconciled_path = classify_automatic_attempt_path(&attempt, &swap)?;
+            let reconciled_action = automatic_action_for_attempt(&reconciled, reconciled_path);
             match classify_authoritative_automatic_attempt(
                 reconciled_action,
                 reconciled.evidence.bitcoin_source,
                 reconciled.evidence.bitcoin_recovery_transaction,
             ) {
                 AuthoritativeAutomaticAttemptDecision::ExpectedObserved => {
-                    validate_automatic_attempt_authority(&attempt, &reconciled, &swap)?;
+                    validate_automatic_attempt_authority(
+                        &attempt,
+                        &reconciled,
+                        &swap,
+                        Some(reconciled_path),
+                    )?;
                     tx.commit()
                         .await
                         .map_err(|error| AppError::DbError(error.to_string()))?;
@@ -1448,12 +3019,12 @@ async fn broadcast_automatic_attempt_under_lock(
                     // Revalidate all immutable attempt authority even though
                     // this call remains ambiguous and will not rebroadcast in
                     // the current invocation.
-                    if !reconciled.authorizes_automatic_recovery() {
-                        return Err(AppError::ClaimError(
-                            "automatic post-broadcast authorization packet is incomplete".into(),
-                        ));
-                    }
-                    validate_automatic_attempt_authority(&attempt, &reconciled, &swap)?;
+                    validate_automatic_attempt_authority(
+                        &attempt,
+                        &reconciled,
+                        &swap,
+                        Some(reconciled_path),
+                    )?;
                 }
                 AuthoritativeAutomaticAttemptDecision::Deferred => {}
             }
@@ -1469,11 +3040,78 @@ async fn broadcast_automatic_attempt_under_lock(
     })
 }
 
+fn automatic_action_for_attempt(
+    authority: &CollectedAutomaticFallbackEvidence,
+    path: AutomaticFallbackConstructionPath,
+) -> ChainSwapAction {
+    automatic_action_for_path_evidence(authority.evidence, path)
+}
+
+fn automatic_action_for_path_evidence(
+    mut evidence: crate::chain_swap_action::ChainSwapEvidence,
+    path: AutomaticFallbackConstructionPath,
+) -> ChainSwapAction {
+    if path == AutomaticFallbackConstructionPath::Cooperative {
+        // A locally verified key-path witness is stronger than a transient
+        // provider probe: it proves that cooperative recovery was available
+        // for these exact bytes. This fact exists only in memory; the durable
+        // authority remains the immutable transaction journal itself.
+        evidence.cooperative_recovery = CooperativeRecoveryEvidence::Available;
+    }
+    reduce_chain_swap_evidence(&evidence)
+}
+
+fn validate_automatic_path_position(
+    authority: &CollectedAutomaticFallbackEvidence,
+    path: AutomaticFallbackConstructionPath,
+    transaction: &Transaction,
+) -> Result<(), AppError> {
+    match path {
+        AutomaticFallbackConstructionPath::Cooperative => {
+            if authority.evidence.bitcoin_timeout == BitcoinTimeoutEvidence::Unknown {
+                return Err(AppError::ClaimError(
+                    "cooperative automatic recovery lacks a stable timeout position".into(),
+                ));
+            }
+        }
+        AutomaticFallbackConstructionPath::Unilateral => {
+            if authority.evidence.bitcoin_timeout != BitcoinTimeoutEvidence::Reached {
+                return Err(AppError::RecoveryNotAvailable(
+                    "unilateral automatic recovery is not yet script-path spendable".into(),
+                ));
+            }
+            let timeout_height = authority.bitcoin_timeout_height().ok_or_else(|| {
+                AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
+            })?;
+            if transaction.lock_time.to_consensus_u32() != timeout_height {
+                return Err(AppError::ClaimError(
+                    "automatic recovery journal does not enforce the immutable script timeout"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn classify_automatic_attempt_path(
+    attempt: &ChainSwapTxAttempt,
+    swap: &ChainSwapRecord,
+) -> Result<AutomaticFallbackConstructionPath, AppError> {
+    let raw = hex::decode(&attempt.raw_tx_hex)
+        .map_err(|_| AppError::ClaimError("automatic recovery journal hex is invalid".into()))?;
+    let transaction: Transaction = deserialize(&raw)
+        .map_err(|_| AppError::ClaimError("automatic recovery journal is invalid".into()))?;
+    let source_txouts = journaled_source_txouts(&attempt.source_prevouts.0)?;
+    validate_automatic_recovery_witness(swap, &transaction, &source_txouts)
+}
+
 fn validate_automatic_attempt_authority(
     attempt: &ChainSwapTxAttempt,
     authority: &CollectedAutomaticFallbackEvidence,
     swap: &ChainSwapRecord,
-) -> Result<(), AppError> {
+    expected_path: Option<AutomaticFallbackConstructionPath>,
+) -> Result<AutomaticFallbackConstructionPath, AppError> {
     let destination = authority.committed_destination().ok_or_else(|| {
         AppError::ClaimError("automatic fallback lacks its immutable destination".into())
     })?;
@@ -1496,41 +3134,62 @@ fn validate_automatic_attempt_authority(
         ));
     }
 
-    let expected = authority
-        .exact_sources()
-        .iter()
-        .map(|source| (source.txid(), source.vout()))
-        .collect::<HashSet<_>>();
-    let actual = attempt
-        .source_prevouts
-        .0
-        .iter()
-        .map(|source| (source.txid.as_str(), source.vout))
-        .collect::<HashSet<_>>();
-    if actual != expected {
+    if authority.exact_sources().len() != 1 || attempt.source_prevouts.0.len() != 1 {
         return Err(AppError::ClaimError(
-            "automatic recovery journal sources differ from the fresh primary source set".into(),
+            "automatic recovery requires exactly one source outpoint per journal attempt".into(),
         ));
     }
+    let primary_source = &authority.exact_sources()[0];
+    validate_exact_primary_source_tuple(
+        primary_source.txid(),
+        primary_source.vout(),
+        primary_source.amount_sat(),
+        primary_source.script_pubkey_hex(),
+        &attempt.source_prevouts.0[0],
+    )?;
     let raw = hex::decode(&attempt.raw_tx_hex)
         .map_err(|_| AppError::ClaimError("automatic recovery journal hex is invalid".into()))?;
     let transaction: Transaction = deserialize(&raw)
         .map_err(|_| AppError::ClaimError("automatic recovery journal is invalid".into()))?;
-    let timeout_height = authority.bitcoin_timeout_height().ok_or_else(|| {
-        AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
-    })?;
-    if transaction.lock_time.to_consensus_u32() != timeout_height
-        || transaction
-            .input
-            .iter()
-            .any(|input| input.sequence != bitcoin::Sequence::ZERO)
-    {
+    let source_txouts = journaled_source_txouts(&attempt.source_prevouts.0)?;
+    let path = validate_automatic_recovery_witness(swap, &transaction, &source_txouts)?;
+    if expected_path.is_some_and(|expected| expected != path) {
         return Err(AppError::ClaimError(
-            "automatic recovery journal does not enforce the immutable script timeout".into(),
+            "automatic recovery builder returned a different spend path than authorized".into(),
         ));
     }
-    let source_txouts = journaled_source_txouts(&attempt.source_prevouts.0)?;
-    validate_automatic_unilateral_refund_witness(swap, &transaction, &source_txouts)?;
+    validate_automatic_path_position(authority, path, &transaction)?;
+    Ok(path)
+}
+
+fn validate_exact_primary_source_tuple(
+    primary_txid: &str,
+    primary_vout: u32,
+    primary_amount_sat: u64,
+    primary_script_pubkey_hex: &str,
+    journaled: &RecoverySourcePrevout,
+) -> Result<(), AppError> {
+    let primary_script = hex::decode(primary_script_pubkey_hex)
+        .map_err(|_| AppError::ClaimError("fresh primary source script is invalid hex".into()))?;
+    let journaled_script = hex::decode(&journaled.script_pubkey_hex).map_err(|_| {
+        AppError::ClaimError("automatic recovery journal source script is invalid hex".into())
+    })?;
+    if hex::encode(&primary_script) != primary_script_pubkey_hex
+        || hex::encode(&journaled_script) != journaled.script_pubkey_hex
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery source script is not canonical".into(),
+        ));
+    }
+    if journaled.txid != primary_txid
+        || journaled.vout != primary_vout
+        || journaled.amount_sat != primary_amount_sat
+        || journaled.script_pubkey_hex != primary_script_pubkey_hex
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery journal source tuple differs from fresh primary authority".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1554,6 +3213,115 @@ fn journaled_source_txouts(sources: &[RecoverySourcePrevout]) -> Result<Vec<TxOu
             })
         })
         .collect()
+}
+
+fn validate_automatic_recovery_witness(
+    swap: &ChainSwapRecord,
+    transaction: &Transaction,
+    source_txouts: &[TxOut],
+) -> Result<AutomaticFallbackConstructionPath, AppError> {
+    if transaction.input.len() != 1 || source_txouts.len() != 1 {
+        return Err(AppError::ClaimError(
+            "automatic recovery requires exactly one source outpoint per transaction".into(),
+        ));
+    }
+    let cooperative_shape = transaction.lock_time == bitcoin::absolute::LockTime::ZERO
+        && transaction.input.iter().all(|input| {
+            input.sequence == bitcoin::Sequence::MAX
+                && input.witness.len() == 1
+                && input.witness[0].len() == 64
+        });
+    if cooperative_shape {
+        validate_automatic_cooperative_refund_witness(swap, transaction, source_txouts)?;
+        return Ok(AutomaticFallbackConstructionPath::Cooperative);
+    }
+
+    let timeout_height = swap
+        .creation_terms
+        .as_ref()
+        .and_then(|terms| u32::try_from(terms.btc_timeout_height).ok())
+        .filter(|height| *height > 0)
+        .ok_or_else(|| {
+            AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
+        })?;
+    if transaction.lock_time.to_consensus_u32() != timeout_height
+        || transaction
+            .input
+            .iter()
+            .any(|input| input.sequence != bitcoin::Sequence::ZERO)
+    {
+        return Err(AppError::ClaimError(
+            "automatic recovery transaction is neither an exact cooperative key-path spend nor the immutable unilateral refund path".into(),
+        ));
+    }
+    validate_automatic_unilateral_refund_witness(swap, transaction, source_txouts)?;
+    Ok(AutomaticFallbackConstructionPath::Unilateral)
+}
+
+/// Prove that the returned transaction is a Taproot key-path refund of the
+/// exact committed source. A valid signature for the tweaked output key proves
+/// successful provider cooperation; transport errors never reach this helper.
+fn validate_automatic_cooperative_refund_witness(
+    swap: &ChainSwapRecord,
+    transaction: &Transaction,
+    source_txouts: &[TxOut],
+) -> Result<(), AppError> {
+    swap.verify_creation_response_integrity()
+        .map_err(AppError::ClaimError)?;
+    let lockup_script = Address::from_str(&swap.lockup_address)
+        .map_err(|_| AppError::ClaimError("automatic recovery lockup address is invalid".into()))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| AppError::ClaimError("automatic recovery lockup is not mainnet".into()))?
+        .script_pubkey();
+    if source_txouts[0].script_pubkey != lockup_script {
+        return Err(AppError::ClaimError(
+            "automatic cooperative source differs from the immutable lockup".into(),
+        ));
+    }
+    validate_automatic_cooperative_keypath_signature(transaction, source_txouts)
+}
+
+fn validate_automatic_cooperative_keypath_signature(
+    transaction: &Transaction,
+    source_txouts: &[TxOut],
+) -> Result<(), AppError> {
+    if transaction.input.len() != 1 || source_txouts.len() != 1 {
+        return Err(AppError::ClaimError(
+            "automatic cooperative recovery requires exactly one source".into(),
+        ));
+    }
+    let input = &transaction.input[0];
+    if transaction.lock_time != bitcoin::absolute::LockTime::ZERO
+        || input.sequence != bitcoin::Sequence::MAX
+        || input.witness.len() != 1
+    {
+        return Err(AppError::ClaimError(
+            "automatic cooperative recovery does not use the exact key-path shape".into(),
+        ));
+    }
+    let signature = TaprootSignature::from_slice(&input.witness[0]).map_err(|_| {
+        AppError::ClaimError("automatic cooperative recovery signature is invalid".into())
+    })?;
+    if signature.sighash_type != TapSighashType::Default {
+        return Err(AppError::ClaimError(
+            "automatic cooperative recovery does not use the pinned sighash mode".into(),
+        ));
+    }
+    let sighash = SighashCache::new(transaction.clone())
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(source_txouts), TapSighashType::Default)
+        .map_err(|_| {
+            AppError::ClaimError("automatic cooperative recovery sighash is invalid".into())
+        })?;
+    let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let output_key = p2tr_output_key(&source_txouts[0].script_pubkey)?;
+    bitcoin::secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&signature.signature, &message, &output_key)
+        .map_err(|_| {
+            AppError::ClaimError(
+                "automatic cooperative recovery is not signed by the committed Taproot output key"
+                    .into(),
+            )
+        })
 }
 
 /// Prove that every automatic input is the exact unilateral Boltz refund
@@ -1589,9 +3357,11 @@ fn validate_automatic_unilateral_refund_witness(
     let refund_leaf = ScriptBuf::from_bytes(refund_leaf_bytes);
     let leaf_hash = TapLeafHash::from_script(&refund_leaf, LeafVersion::TapScript);
 
-    let key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
-    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
+    let key_bytes =
+        Zeroizing::new(hex::decode(&swap.refund_key_hex).map_err(|_| {
+            AppError::ClaimError("automatic recovery refund key is invalid".into())
+        })?);
+    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(key_bytes.as_slice())
         .map_err(|_| AppError::ClaimError("automatic recovery refund key is invalid".into()))?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let refund_keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret_key);
@@ -1687,6 +3457,7 @@ async fn validate_constructed_attempt(
     fee_record: &FeeDecisionRecord,
     evidence: &dyn BitcoinRecoveryEvidence,
     automatic_authority: Option<&CollectedAutomaticFallbackEvidence>,
+    automatic_path: Option<AutomaticFallbackConstructionPath>,
 ) -> Result<PreparedAttempt, AppError> {
     let BtcLikeTransaction::Bitcoin(tx) = transaction else {
         return Err(AppError::ClaimError(
@@ -1774,31 +3545,35 @@ async fn validate_constructed_attempt(
     }
 
     if let Some(authority) = automatic_authority {
-        let expected = authority
-            .exact_sources()
-            .iter()
-            .map(|source| (source.txid().to_owned(), source.vout()))
-            .collect::<HashSet<_>>();
-        if seen != expected {
+        if tx.input.len() != 1 || authority.exact_sources().len() != 1 {
             return Err(AppError::ClaimError(
-                "automatic recovery inputs do not match the exact primary source set".into(),
-            ));
-        }
-        let timeout_height = authority.bitcoin_timeout_height().ok_or_else(|| {
-            AppError::ClaimError("automatic recovery lacks its immutable timeout".into())
-        })?;
-        if tx.lock_time.to_consensus_u32() != timeout_height
-            || tx
-                .input
-                .iter()
-                .any(|input| input.sequence != bitcoin::Sequence::ZERO)
-        {
-            return Err(AppError::ClaimError(
-                "automatic recovery transaction does not enforce the immutable script timeout"
+                "automatic recovery requires exactly one source outpoint per journal attempt"
                     .into(),
             ));
         }
-        validate_automatic_unilateral_refund_witness(swap, tx, &source_txouts)?;
+        let primary_source = &authority.exact_sources()[0];
+        validate_exact_primary_source_tuple(
+            primary_source.txid(),
+            primary_source.vout(),
+            primary_source.amount_sat(),
+            primary_source.script_pubkey_hex(),
+            &source_prevouts[0],
+        )?;
+        let expected_path = automatic_path.ok_or_else(|| {
+            AppError::ClaimError("automatic recovery lacks its selected spend path".into())
+        })?;
+        let actual_path = validate_automatic_recovery_witness(swap, tx, &source_txouts)?;
+        if actual_path != expected_path {
+            return Err(AppError::ClaimError(
+                "automatic recovery builder returned a different spend path than authorized".into(),
+            ));
+        }
+        validate_automatic_path_position(authority, actual_path, tx)?;
+        if automatic_action_for_attempt(authority, actual_path) != ChainSwapAction::RecoverBitcoin {
+            return Err(AppError::RecoveryNotAvailable(
+                "automatic recovery evidence changed before exact bytes were journaled".into(),
+            ));
+        }
     }
 
     let total_output_sat = tx.output.iter().try_fold(0u64, |sum, output| {
@@ -2182,13 +3957,24 @@ async fn construct_live_refund(
     swap: &ChainSwapRecord,
     refund_address: &str,
     fee_decision: BitcoinBuilderFeeDecision,
+    path: AutomaticFallbackConstructionPath,
 ) -> Result<BtcLikeTransaction, AppError> {
+    if path == AutomaticFallbackConstructionPath::Cooperative {
+        // Cooperative construction is a provider-mutating operation. It must
+        // use the dedicated exact-source prepare/request/response journal and
+        // may never enter boltz-client's address-wide one-shot helper.
+        return Err(AppError::RecoveryNotAvailable(
+            "cooperative recovery requires its durable signing operation".into(),
+        ));
+    }
     swap.verify_creation_response_integrity()
         .map_err(AppError::ClaimError)?;
-    let refund_key_bytes = hex::decode(&swap.refund_key_hex)
-        .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?;
+    let refund_key_bytes = Zeroizing::new(
+        hex::decode(&swap.refund_key_hex)
+            .map_err(|e| AppError::ClaimError(format!("invalid chain refund key hex: {e}")))?,
+    );
     let secp = Secp256k1::new();
-    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(&refund_key_bytes)
+    let refund_secret_key = bitcoin::secp256k1::SecretKey::from_slice(refund_key_bytes.as_slice())
         .map_err(|e| AppError::ClaimError(format!("invalid chain refund secret key: {e}")))?;
     let refund_keypair = Keypair::from_secret_key(&secp, &refund_secret_key);
     let refund_public_key = PublicKey::new(refund_keypair.public_key());
@@ -2235,7 +4021,7 @@ async fn construct_live_refund(
                         event = "chain_swap_refund_construct_failover",
                         swap_id = %swap.boltz_swap_id,
                         endpoint = %endpoint,
-                        "unilateral recovery construction failed; rotating Bitcoin backend"
+                        "recovery construction failed; rotating Bitcoin backend without changing spend path"
                     );
                 }
                 errors.push(format!("{endpoint}: script={script_error}"));
@@ -2257,15 +4043,20 @@ mod tests {
     use boltz_client::util::fees::Fee;
 
     use super::{
-        automatic_existing_attempt_may_reconcile, bitcoin_recovery_fee,
-        classify_authoritative_automatic_attempt, validate_reloaded_fee_intent,
-        AuthoritativeAutomaticAttemptDecision, BitcoinRecoveryBackend, BitcoinRecoveryEvidence,
-        BitcoinRecoveryTransactionStatus,
+        automatic_action_for_path_evidence, automatic_existing_attempt_may_reconcile,
+        bitcoin_recovery_fee, classify_authoritative_automatic_attempt,
+        validate_automatic_cooperative_keypath_signature, validate_exact_primary_source_tuple,
+        validate_reloaded_fee_intent, AuthoritativeAutomaticAttemptDecision,
+        BitcoinRecoveryBackend, BitcoinRecoveryEvidence, BitcoinRecoveryTransactionStatus,
     };
     use crate::builder_fee::BitcoinBuilderFeeDecision;
     use crate::chain_swap_action::{
-        BitcoinSourceEvidence, ChainSwapAction, MerchantTransactionEvidence,
+        BitcoinSourceEvidence, BitcoinTimeoutEvidence, ChainSwapAction, ChainSwapEvidence,
+        CooperativeRecoveryEvidence, EvidenceQuality, LiquidLockEvidence, LiquidPathEvidence,
+        MerchantTransactionEvidence, ProviderStatusEvidence, RecoveryDestinationEvidence,
+        RenegotiationEvidence,
     };
+    use crate::chain_swap_runtime_evidence::AutomaticFallbackConstructionPath;
     use crate::db::{BitcoinRecoveryFeeAuthority, RecoverySourcePrevout};
     use crate::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
     use axum::{
@@ -2322,6 +4113,173 @@ mod tests {
             script_pubkey_hex: String::new(),
         }];
         (tx, sources, fee_amount_sat, fee_rate_sat_vb)
+    }
+
+    fn cooperative_keypath_fixture() -> (Transaction, Vec<TxOut>) {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::sighash::{Prevouts, SighashCache};
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let (output_key, _) = keypair.x_only_public_key();
+        let mut source_script = vec![0x51, 0x20];
+        source_script.extend_from_slice(&output_key.serialize());
+        let sources = vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes(source_script),
+        }];
+        let mut transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let sighash = SighashCache::new(transaction.clone())
+            .taproot_key_spend_signature_hash(
+                0,
+                &Prevouts::All(&sources),
+                bitcoin::TapSighashType::Default,
+            )
+            .unwrap();
+        let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        let signature = secp.sign_schnorr(&message, &keypair);
+        transaction.input[0].witness.push(signature.as_ref());
+        (transaction, sources)
+    }
+
+    #[test]
+    fn cooperative_keypath_witness_is_exact_and_rejects_path_drift() {
+        let (transaction, sources) = cooperative_keypath_fixture();
+        validate_automatic_cooperative_keypath_signature(&transaction, &sources).unwrap();
+
+        let mut changed_signature = transaction.clone();
+        let mut bytes = changed_signature.input[0].witness[0].to_vec();
+        bytes[0] ^= 1;
+        changed_signature.input[0].witness.clear();
+        changed_signature.input[0].witness.push(bytes);
+        assert!(
+            validate_automatic_cooperative_keypath_signature(&changed_signature, &sources).is_err()
+        );
+
+        let mut unilateral_shape = transaction.clone();
+        unilateral_shape.input[0].sequence = Sequence::ZERO;
+        assert!(
+            validate_automatic_cooperative_keypath_signature(&unilateral_shape, &sources).is_err()
+        );
+
+        let mut aggregated = transaction;
+        aggregated.input.push(aggregated.input[0].clone());
+        assert!(validate_automatic_cooperative_keypath_signature(&aggregated, &sources).is_err());
+    }
+
+    #[test]
+    fn automatic_replay_rejects_same_outpoint_with_primary_amount_drift() {
+        let script = format!("5120{}", "11".repeat(32));
+        let journaled = RecoverySourcePrevout {
+            txid: "22".repeat(32),
+            vout: 3,
+            amount_sat: 100_000,
+            script_pubkey_hex: script.clone(),
+        };
+        validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &script,
+            &journaled,
+        )
+        .unwrap();
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat - 1,
+            &script,
+            &journaled,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn automatic_prebroadcast_rejects_same_outpoint_with_primary_script_drift() {
+        let script = format!("5120{}", "ab".repeat(32));
+        let journaled = RecoverySourcePrevout {
+            txid: "22".repeat(32),
+            vout: 3,
+            amount_sat: 100_000,
+            script_pubkey_hex: script.clone(),
+        };
+        let different_script = format!("5120{}", "33".repeat(32));
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &different_script,
+            &journaled,
+        )
+        .is_err());
+        assert!(validate_exact_primary_source_tuple(
+            &journaled.txid,
+            journaled.vout,
+            journaled.amount_sat,
+            &script.to_ascii_uppercase(),
+            &journaled,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn journaled_cooperative_bytes_survive_signer_loss_and_timeout() {
+        let (transaction, sources) = cooperative_keypath_fixture();
+        let raw = bitcoin::consensus::serialize(&transaction);
+        let reloaded: Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
+        assert_eq!(bitcoin::consensus::serialize(&reloaded), raw);
+        validate_automatic_cooperative_keypath_signature(&reloaded, &sources).unwrap();
+
+        let mut evidence = ChainSwapEvidence {
+            quality: EvidenceQuality::CompleteAndAgreed,
+            provider_status: ProviderStatusEvidence::Unknown,
+            bitcoin_source: BitcoinSourceEvidence::ConfirmedUnspent,
+            liquid_lock: LiquidLockEvidence::NotObserved,
+            liquid_path: LiquidPathEvidence::Unavailable,
+            renegotiation: RenegotiationEvidence::NotRequired,
+            recovery_destination: RecoveryDestinationEvidence::Committed,
+            // Model the signing endpoint becoming unavailable after the exact
+            // cooperative transaction was journaled. Replay derives the
+            // positive cooperative fact from the verified witness, not from a
+            // second signing request.
+            cooperative_recovery: CooperativeRecoveryEvidence::Unavailable,
+            bitcoin_timeout: BitcoinTimeoutEvidence::BeforeTimeout,
+            liquid_claim_transaction: MerchantTransactionEvidence::None,
+            bitcoin_recovery_transaction: MerchantTransactionEvidence::Prepared,
+        };
+        assert_eq!(
+            automatic_action_for_path_evidence(
+                evidence,
+                AutomaticFallbackConstructionPath::Cooperative,
+            ),
+            ChainSwapAction::RecoverBitcoin
+        );
+
+        // Reaching the unilateral timeout must not replace or reconstruct an
+        // already-journaled cooperative transaction. The same exact bytes
+        // remain the single authorized recovery intent.
+        evidence.bitcoin_timeout = BitcoinTimeoutEvidence::Reached;
+        assert_eq!(
+            automatic_action_for_path_evidence(
+                evidence,
+                AutomaticFallbackConstructionPath::Cooperative,
+            ),
+            ChainSwapAction::RecoverBitcoin
+        );
     }
 
     #[test]

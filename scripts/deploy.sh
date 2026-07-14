@@ -38,6 +38,9 @@ stage_pwa() {
 
 binary_switch_started=0
 pwa_switch_started=0
+rollback_writer_stopped=0
+compatibility_writer_stopped=0
+compatibility_writer_was_active=0
 ready_response="$(mktemp)"
 version_response="$(mktemp)"
 candidate_build_info="$(mktemp)"
@@ -57,13 +60,16 @@ print(marker)
 PY
 }
 
-direct_transition_history_count() {
+runtime_guard_count() {
+  local query_kind="$1"
   sudo -n bash -s -- \
-    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE" <<'ROOT'
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE" \
+    "$query_kind" <<'ROOT'
 set -euo pipefail
 env_file="$1"
 expected_role="$2"
 expected_database="$3"
+query_kind="$4"
 [[ -f "$env_file" && ! -L "$env_file" && -O "$env_file" && -r "$env_file" ]]
 env_mode="$(stat --format='%a' "$env_file")"
 (( (8#$env_mode & 077) == 0 ))
@@ -148,23 +154,64 @@ IFS='|' read -r actual_role actual_database extra <<<"$identity"
 [[ -z "${extra:-}" && "$actual_role" == "$expected_role" \
    && "$actual_database" == "$expected_database" ]]
 
+case "$query_kind" in
+  direct-transition-history)
+    relation_query="SELECT COALESCE(to_regclass('public.invoice_direct_payment_transitions')::TEXT, '')"
+    count_query='SELECT COUNT(*) FROM public.invoice_direct_payment_transitions'
+    missing_relation_count=0
+    ;;
+  cooperative-signing-nonterminal)
+    relation_query="SELECT COALESCE(to_regclass('public.chain_swap_cooperative_signing_operations')::TEXT, '')"
+    count_query="SELECT COUNT(*) FROM public.chain_swap_cooperative_signing_operations WHERE state IN ('prepared', 'requested', 'ambiguous', 'response_received')"
+    missing_relation_count=
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+
 relation="$(
   clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
-    --tuples-only --no-align \
-    --command "SELECT COALESCE(to_regclass('public.invoice_direct_payment_transitions')::TEXT, '')"
+    --tuples-only --no-align --command "$relation_query"
 )"
 if [[ -z "$relation" ]]; then
-  echo 0
-  exit 0
+  if [[ -n "$missing_relation_count" ]]; then
+    echo "$missing_relation_count"
+    exit 0
+  fi
+  exit 1
 fi
 count="$(
   clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
-    --tuples-only --no-align \
-    --command 'SELECT COUNT(*) FROM public.invoice_direct_payment_transitions'
+    --tuples-only --no-align --command "$count_query"
 )"
 [[ "$count" =~ ^[0-9]+$ ]]
 echo "$count"
 ROOT
+}
+
+direct_transition_history_count() {
+  runtime_guard_count direct-transition-history
+}
+
+cooperative_nonterminal_count() {
+  runtime_guard_count cooperative-signing-nonterminal
+}
+
+require_no_nonterminal_cooperative_operations() {
+  local context="$1" count
+  count="$(cooperative_nonterminal_count)" || {
+    echo "$context refused: cooperative-signing state could not be inspected" >&2
+    return 1
+  }
+  [[ "$count" =~ ^[0-9]+$ ]] || {
+    echo "$context refused: cooperative-signing state could not be inspected" >&2
+    return 1
+  }
+  if ((10#$count != 0)); then
+    echo "$context refused: a nonterminal cooperative-signing operation still binds the current runtime" >&2
+    return 1
+  fi
 }
 
 migration_053_boundary_ready() {
@@ -179,6 +226,11 @@ migration_055_boundary_ready() {
 
 migration_056_boundary_ready() {
   sudo -n "$REPO/scripts/check-migration-056-boundary.sh" \
+    "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
+}
+
+migration_057_boundary_ready() {
+  sudo -n "$REPO/scripts/check-migration-057-boundary.sh" \
     "$RUNTIME_ENV_FILE" "$RUNTIME_DB_ROLE" "$RUNTIME_DATABASE"
 }
 
@@ -217,6 +269,25 @@ automatic_binary_rollback_allowed() {
     return 1
   fi
 
+  if [[ "$candidate_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 57)) \
+      && { [[ ! "$previous_version" =~ ^[0-9]+$ ]] \
+           || ((10#$previous_version < 57)); }; then
+    echo "automatic rollback refused: migration 057 is a roll-forward-only cooperative-signing-intent boundary" >&2
+    return 1
+  fi
+
+  if [[ "$candidate_version" =~ ^[0-9]+$ \
+        && "$previous_version" =~ ^[0-9]+$ ]] \
+      && ((10#$candidate_version >= 57 && 10#$previous_version >= 57)); then
+    if ((rollback_writer_stopped != 1)); then
+      echo "automatic rollback refused: candidate writer is not proven stopped for the cooperative-signing compatibility check" >&2
+      return 1
+    fi
+    require_no_nonterminal_cooperative_operations "automatic rollback" \
+      || return 1
+  fi
+
   if [[ "$previous_schema" == "$candidate_schema" ]]; then
     transition_count=0
   elif [[ "$previous_schema" == "046_chain_swap_tx_attempts" \
@@ -240,12 +311,32 @@ rollback_on_failure() {
   rollback_failed=0
   rm -f "$ready_response" "$version_response"
   if ((status != 0)); then
+    if ((binary_switch_started == 0 \
+          && compatibility_writer_stopped == 1 \
+          && compatibility_writer_was_active == 1)); then
+      if sudo systemctl start payservice; then
+        compatibility_writer_stopped=0
+      else
+        rollback_failed=1
+        echo "deployment failed before the binary switch and the prior writer could not be restarted" >&2
+      fi
+    fi
     rollback_allowed=1
-    if ((binary_switch_started == 1)) \
-        && ! automatic_binary_rollback_allowed; then
-      rollback_allowed=0
-      rollback_failed=1
-      echo "deployment failed; automatic binary/PWA rollback refused; candidate files remain installed for operator recovery" >&2
+    if ((binary_switch_started == 1)); then
+      if sudo systemctl stop payservice \
+          && ! sudo systemctl is-active --quiet payservice; then
+        rollback_writer_stopped=1
+      else
+        rollback_allowed=0
+        rollback_failed=1
+        echo "deployment failed; automatic rollback refused because the candidate writer could not be stopped" >&2
+      fi
+      if ((rollback_allowed == 1)) \
+          && ! automatic_binary_rollback_allowed; then
+        rollback_allowed=0
+        rollback_failed=1
+        echo "deployment failed; automatic binary/PWA rollback refused; candidate files remain installed and the writer remains stopped for operator recovery" >&2
+      fi
     fi
     if ((rollback_allowed == 1)); then
       echo "deployment failed; restoring previous binary and PWA" >&2
@@ -322,6 +413,17 @@ EOF
     exit 1
   fi
 fi
+if [[ -f "$REPO/migrations/057_chain_swap_cooperative_signing_operations.sql" ]]; then
+  if ! migration_057_boundary_ready; then
+    cat >&2 <<'EOF'
+deployment refused before build: migration 057 is absent or its exact runtime boundary could not be verified.
+Stop payservice and every database writer, apply migration 057 with
+--set runtime_role=bullnym_app as the distinct privileged schema owner, then
+rerun this script. Never fabricate cooperative signing operation evidence.
+EOF
+    exit 1
+  fi
+fi
 echo "NOTE: all migrations are applied manually using their documented ownership and stopped-writer boundaries."
 ls -1 "$REPO"/migrations | tail -3 | sed 's/^/  latest in repo: /'
 
@@ -347,6 +449,30 @@ stage_pwa
 staged_pwa_digest="$(./scripts/content-sha256.py "$APP/pwa/dist.new")"
 [[ "$staged_pwa_digest" == "$expected_pwa_digest" ]] \
   || { echo "staged PWA digest does not match release record" >&2; exit 1; }
+
+candidate_schema="$(build_info_schema_marker "$candidate_build_info")" \
+  || { echo "candidate schema marker is unreadable" >&2; exit 1; }
+candidate_schema_version="${candidate_schema%%_*}"
+if [[ "$candidate_schema_version" =~ ^[0-9]+$ ]] \
+    && ((10#$candidate_schema_version >= 57)); then
+  if sudo systemctl is-active --quiet payservice; then
+    compatibility_writer_was_active=1
+  fi
+  sudo systemctl stop payservice \
+    || { echo "deployment refused: the current writer could not be stopped" >&2; exit 1; }
+  if sudo systemctl is-active --quiet payservice; then
+    echo "deployment refused: the current writer remains active" >&2
+    exit 1
+  fi
+  compatibility_writer_stopped=1
+  if ! require_no_nonterminal_cooperative_operations "deployment"; then
+    if ((compatibility_writer_was_active == 1)) \
+        && sudo systemctl start payservice; then
+      compatibility_writer_stopped=0
+    fi
+    exit 1
+  fi
+fi
 
 sudo rm -f "$APP/pay-service.prev"
 if sudo test -f "$APP/pay-service"; then

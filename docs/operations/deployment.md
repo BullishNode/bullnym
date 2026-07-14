@@ -326,6 +326,66 @@ curl --fail --silent --show-error http://127.0.0.1:8080/ready
 curl --fail --silent --show-error http://127.0.0.1:8080/version
 ```
 
+## Migration 057 cooperative-signing boundary
+
+Migration 057 is a stopped-writer, roll-forward-only boundary. Stop
+`bullnym.service` and every database writer, then apply
+`migrations/057_chain_swap_cooperative_signing_operations.sql` as the same
+distinct protected schema owner used for migrations 053–056. Pass
+`--set runtime_role=bullnym_app`; never apply it as `bullnym_app`, never
+backfill historical provider calls, and never start a pre-057 writer after it
+commits.
+
+Before restarting, verify the runtime view through the protected runtime
+environment. This proves the exact 60-column journal, state/fee/digest
+constraints, RESTRICT parent identity, active index, trigger bindings,
+non-assumable owner, runtime `SELECT/INSERT/UPDATE` ACL, absent PUBLIC/function
+authority, and absence of generated sequence authority.
+
+```bash
+sudo /opt/bullnym/bullnym/scripts/check-migration-057-boundary.sh \
+  /etc/bullnym/bullnym.env bullnym_app bullnym
+```
+
+The signing executor may issue its single provider request only after the
+outer transaction containing exact preparation and `prepared -> requested`
+commits under `chain-claim:<id>`. Completion must insert the exact immutable
+`btc_recovery` attempt and advance `response_received -> completed` in one
+transaction. An ambiguous request is never posted again; it can only receive
+the exact late response or become `superseded` at unilateral timeout. The
+generic deploy preflight verifies this boundary and refuses automatic rollback
+across schema 057.
+
+Every generic deployment of a schema-057-or-later artifact also stops the
+current writer before inspecting the cooperative-signing journal. It refuses
+the switch when that protected runtime-role query is unreadable or any row is
+still nonterminal. If candidate verification later fails, automatic rollback
+first stops the candidate writer and repeats the same zero-row check; a
+nonzero or unreadable result leaves the candidate files installed and the
+writer stopped for fix-forward recovery. This ordering closes the race in
+which a candidate could otherwise create a nonce-bound operation after a
+successful count and before its replacement. Deployments ending before schema
+057 retain their existing rollback rules. The specialized hosted-artifact
+schema-057 helper owns the initial production boundary; this generic drain gate
+applies to subsequent schema-057-or-later replacements.
+
+Do not rotate `BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_ID` or
+`BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_HEX`, change the build target
+platform/architecture, or change the pinned `secp256k1` MuSig package while
+any cooperative-signing row is nonterminal (`prepared`, `requested`,
+`ambiguous`, or `response_received`). Serialized secret nonces are valid only
+with the same protected key, libsecp version, and platform. Drain each row to
+`completed`, `integrity_hold`, or timeout `superseded` using the original
+artifact first; never re-POST an ambiguous request or reuse its nonce with a
+different provider nonce/session.
+
+The zero-nonterminal gate deliberately freezes the entire runtime tuple rather
+than attempting to compare or print individual capabilities: artifact,
+key ID and key material, MuSig/libsecp implementation, and target platform.
+Neither the protected key nor any derived key/artifact fingerprint is emitted
+by the check. Drain with the original artifact before changing any member of
+that tuple.
+
 ## Reproducing a prior artifact
 
 1. Check out the Bullnym `build_commit` from its preserved release record.

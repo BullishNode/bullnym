@@ -83,6 +83,9 @@ pub struct FeeDecisionRecord {
     /// comparing production wall time to synthetic compatibility fixtures.
     construction_authority_captured_at: Instant,
     construction_authority_remaining: Duration,
+    /// Persisted replay authority validates already-committed bytes but must
+    /// never authorize construction of a new transaction template.
+    construction_authority_replay_only: bool,
 }
 
 impl PartialEq for FeeDecisionRecord {
@@ -210,7 +213,50 @@ impl FeeDecisionRecord {
             policy_cap,
             construction_authority_captured_at: Instant::now(),
             construction_authority_remaining,
+            construction_authority_replay_only: false,
         })
+    }
+
+    /// Rehydrate complete Bitcoin authority solely for persisting or checking
+    /// bytes that the cooperative-signing journal already committed. This
+    /// record deliberately fails every new-construction freshness check.
+    #[allow(clippy::too_many_arguments, dead_code)] // Used by the #85 executor composition.
+    pub(crate) fn from_persisted_bitcoin_authority(
+        source: FeeObservationSource,
+        rate: SatPerVbyte,
+        quoted_at_unix: u64,
+        evaluated_at_unix: u64,
+        freshness_age_secs: u64,
+        freshness_max_age_secs: u64,
+        provenance: FeeProvenance,
+        policy_floor: SatPerVbyte,
+        policy_cap: SatPerVbyte,
+    ) -> Result<Self, FeeDecisionRecordError> {
+        if !matches!(
+            source,
+            FeeObservationSource::LiveBitcoin | FeeObservationSource::BitcoinLastKnownGood
+        ) {
+            return Err(FeeDecisionRecordError::DecisionSourceMismatch {
+                rail: FeeRail::Bitcoin,
+                source,
+            });
+        }
+        let mut record = Self::new(
+            FeeConstructionPurpose::BitcoinRecovery,
+            source,
+            rate,
+            quoted_at_unix,
+            FeeFreshness::Fresh {
+                age_secs: freshness_age_secs,
+                max_age_secs: freshness_max_age_secs,
+            },
+            provenance,
+            policy_floor,
+            policy_cap,
+            evaluated_at_unix,
+        )?;
+        record.construction_authority_replay_only = true;
+        Ok(record)
     }
 
     pub const fn purpose(&self) -> FeeConstructionPurpose {
@@ -253,8 +299,10 @@ impl FeeDecisionRecord {
     /// new bytes at the supplied instant. Persisted wall-clock evidence remains
     /// unchanged and is not consulted again after initial policy acceptance.
     fn authorizes_construction_at(&self, now: Instant) -> bool {
-        now.checked_duration_since(self.construction_authority_captured_at)
-            .is_some_and(|elapsed| elapsed <= self.construction_authority_remaining)
+        !self.construction_authority_replay_only
+            && now
+                .checked_duration_since(self.construction_authority_captured_at)
+                .is_some_and(|elapsed| elapsed <= self.construction_authority_remaining)
     }
 
     /// Recheck fee authority after any pool/lock/construction delay.
@@ -508,6 +556,26 @@ mod tests {
         assert_eq!(record, same_persisted_authority);
         same_persisted_authority.freshness_max_age_secs += 1;
         assert_ne!(record, same_persisted_authority);
+    }
+
+    #[test]
+    fn rehydrated_authority_validates_committed_fee_but_never_constructs_new_bytes() {
+        let replay = FeeDecisionRecord::from_persisted_bitcoin_authority(
+            FeeObservationSource::LiveBitcoin,
+            rate(12.5),
+            1_000,
+            1_007,
+            7,
+            30,
+            provenance("persisted-cooperative-signing"),
+            rate(1.0),
+            rate(100.0),
+        )
+        .unwrap();
+
+        assert!(!replay.authorizes_construction_now());
+        assert_eq!(replay.exact_authorized_fee_sat(141).unwrap(), 1_763);
+        assert_eq!(replay.purpose(), FeeConstructionPurpose::BitcoinRecovery);
     }
 
     #[test]

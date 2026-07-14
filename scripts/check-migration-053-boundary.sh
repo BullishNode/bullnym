@@ -14,6 +14,7 @@ expected_runtime_role="${2:-bullnym_app}"
 expected_database="${3:-bullnym}"
 require_migration_055="${REQUIRE_MIGRATION_055:-0}"
 require_migration_056="${REQUIRE_MIGRATION_056:-0}"
+require_migration_057="${REQUIRE_MIGRATION_057:-0}"
 
 [[ "$require_migration_055" == "0" || "$require_migration_055" == "1" ]] || {
   echo "migration boundary: REQUIRE_MIGRATION_055 must be 0 or 1" >&2
@@ -23,8 +24,16 @@ require_migration_056="${REQUIRE_MIGRATION_056:-0}"
   echo "migration boundary: REQUIRE_MIGRATION_056 must be 0 or 1" >&2
   exit 2
 }
+[[ "$require_migration_057" == "0" || "$require_migration_057" == "1" ]] || {
+  echo "migration boundary: REQUIRE_MIGRATION_057 must be 0 or 1" >&2
+  exit 2
+}
 if [[ "$require_migration_056" == "1" && "$require_migration_055" != "1" ]]; then
   echo "migration boundary: REQUIRE_MIGRATION_056 requires REQUIRE_MIGRATION_055=1" >&2
+  exit 2
+fi
+if [[ "$require_migration_057" == "1" && "$require_migration_056" != "1" ]]; then
+  echo "migration boundary: REQUIRE_MIGRATION_057 requires REQUIRE_MIGRATION_056=1" >&2
   exit 2
 fi
 
@@ -1134,10 +1143,402 @@ SQL
   }
 fi
 
+if [[ "$require_migration_057" == "1" ]]; then
+  migration_057_ready="$(
+    clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
+      --quiet --tuples-only --no-align <<'SQL'
+SELECT (
+    (SELECT COUNT(*) = 60
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'chain_swap_cooperative_signing_operations')
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_id', 'uuid', 'NO'),
+              ('state', 'text', 'NO'),
+              ('boltz_swap_id', 'text', 'NO'),
+              ('source_txid', 'text', 'NO'),
+              ('source_vout', 'bigint', 'NO'),
+              ('source_amount_sat', 'bigint', 'NO'),
+              ('source_script_pubkey_hex', 'text', 'NO'),
+              ('destination_address', 'text', 'NO'),
+              ('destination_script_pubkey_hex', 'text', 'NO'),
+              ('destination_amount_sat', 'bigint', 'NO'),
+              ('fee_amount_sat', 'bigint', 'NO'),
+              ('fee_vbytes', 'bigint', 'NO'),
+              ('fee_decision_purpose', 'text', 'NO'),
+              ('fee_decision_rail', 'text', 'NO'),
+              ('fee_decision_target', 'text', 'NO'),
+              ('fee_decision_source', 'text', 'NO'),
+              ('fee_decision_rate_sat_vb', 'double precision', 'NO'),
+              ('fee_decision_quoted_at_unix', 'bigint', 'NO'),
+              ('fee_decision_evaluated_at_unix', 'bigint', 'NO'),
+              ('fee_decision_freshness_age_secs', 'bigint', 'NO'),
+              ('fee_decision_freshness_max_age_secs', 'bigint', 'NO'),
+              ('fee_decision_provenance', 'text', 'NO'),
+              ('fee_decision_policy_floor_sat_vb', 'double precision', 'NO'),
+              ('fee_decision_policy_cap_sat_vb', 'double precision', 'NO'),
+              ('fee_decision_policy_version', 'text', 'NO'),
+              ('request_transaction_hex', 'text', 'NO'),
+              ('request_transaction_sha256', 'text', 'NO'),
+              ('request_transaction_txid', 'text', 'NO'),
+              ('request_input_index', 'integer', 'NO'),
+              ('sighash_hex', 'text', 'NO'),
+              ('aggregate_key_xonly_hex', 'text', 'NO'),
+              ('client_public_nonce_hex', 'text', 'NO'),
+              ('provider_request_sha256', 'text', 'NO'),
+              ('session_sha256', 'text', 'NO'),
+              ('secret_nonce_format', 'text', 'NO'),
+              ('secret_nonce_encryption_algorithm', 'text', 'NO'),
+              ('secret_nonce_key_id', 'text', 'NO'),
+              ('secret_nonce_encryption_nonce', 'bytea', 'NO'),
+              ('secret_nonce_ciphertext', 'bytea', 'NO'),
+              ('secret_nonce_plaintext_sha256', 'text', 'NO'),
+              ('request_attempt_count', 'integer', 'NO'),
+              ('version', 'bigint', 'NO'),
+              ('requested_at', 'timestamp with time zone', 'YES'),
+              ('ambiguous_at', 'timestamp with time zone', 'YES'),
+              ('last_error_class', 'text', 'YES'),
+              ('provider_public_nonce_hex', 'text', 'YES'),
+              ('provider_partial_signature_hex', 'text', 'YES'),
+              ('provider_response_sha256', 'text', 'YES'),
+              ('response_received_at', 'timestamp with time zone', 'YES'),
+              ('final_transaction_hex', 'text', 'YES'),
+              ('final_transaction_sha256', 'text', 'YES'),
+              ('final_txid', 'text', 'YES'),
+              ('local_partial_signature_sha256', 'text', 'YES'),
+              ('completed_at', 'timestamp with time zone', 'YES'),
+              ('integrity_reason_sha256', 'text', 'YES'),
+              ('integrity_hold_at', 'timestamp with time zone', 'YES'),
+              ('superseded_reason', 'text', 'YES'),
+              ('superseded_at', 'timestamp with time zone', 'YES'),
+              ('created_at', 'timestamp with time zone', 'NO'),
+              ('updated_at', 'timestamp with time zone', 'NO')
+          ) required(column_name, data_type, is_nullable)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns column_info
+              WHERE column_info.table_schema = 'public'
+                AND column_info.table_name =
+                    'chain_swap_cooperative_signing_operations'
+                AND column_info.column_name = required.column_name
+                AND column_info.data_type = required.data_type
+                AND column_info.is_nullable = required.is_nullable
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('state', '''prepared''::text'),
+              ('request_input_index', '0'),
+              ('request_attempt_count', '0'),
+              ('version', '1'),
+              ('created_at', 'now()'),
+              ('updated_at', 'now()')
+          ) required(column_name, column_default)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM information_schema.columns column_info
+              WHERE column_info.table_schema = 'public'
+                AND column_info.table_name =
+                    'chain_swap_cooperative_signing_operations'
+                AND column_info.column_name = required.column_name
+                AND column_info.column_default = required.column_default
+         )
+    )
+    AND (SELECT COUNT(*) = 14
+           FROM pg_constraint
+          WHERE conrelid =
+              'public.chain_swap_cooperative_signing_operations'::REGCLASS
+            AND contype = 'c')
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_cooperative_signing_state_check'),
+              ('chain_swap_cooperative_signing_parent_identity_check'),
+              ('chain_swap_cooperative_signing_source_check'),
+              ('chain_swap_cooperative_signing_destination_check'),
+              ('chain_swap_cooperative_signing_exact_fee_check'),
+              ('chain_swap_cooperative_signing_fee_authority_check'),
+              ('chain_swap_cooperative_signing_request_check'),
+              ('chain_swap_cooperative_signing_secret_nonce_check'),
+              ('chain_swap_cooperative_signing_attempt_check'),
+              ('chain_swap_cooperative_signing_error_check'),
+              ('chain_swap_cooperative_signing_response_check'),
+              ('chain_swap_cooperative_signing_completion_check'),
+              ('chain_swap_cooperative_signing_terminal_check'),
+              ('chain_swap_cooperative_signing_lifecycle_shape_check')
+          ) required(constraint_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_constraint constraint_info
+              WHERE constraint_info.conrelid =
+                    'public.chain_swap_cooperative_signing_operations'::REGCLASS
+                AND constraint_info.conname = required.constraint_name
+                AND constraint_info.contype = 'c'
+                AND constraint_info.convalidated
+         )
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND conname = 'chain_swap_cooperative_signing_operations_pkey'
+           AND contype = 'p' AND convalidated
+    )
+    AND EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND confrelid = 'public.chain_swap_records'::REGCLASS
+           AND conname = 'chain_swap_cooperative_signing_chain_fkey'
+           AND contype = 'f' AND convalidated
+           AND confupdtype = 'r' AND confdeltype = 'r'
+           AND NOT condeferrable AND NOT condeferred
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND conname = 'chain_swap_cooperative_signing_state_check'
+           AND pg_get_constraintdef(oid) LIKE '%prepared%requested%ambiguous%response_received%completed%integrity_hold%superseded%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND conname = 'chain_swap_cooperative_signing_response_check'
+           AND pg_get_constraintdef(oid) LIKE
+               '%bullnym:cooperative-signing-provider-response:v1:%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND conname = 'chain_swap_cooperative_signing_completion_check'
+           AND pg_get_constraintdef(oid) LIKE
+               '%final_txid = request_transaction_txid%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_index index_info
+          JOIN pg_class index_relation
+            ON index_relation.oid = index_info.indexrelid
+         WHERE index_info.indrelid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND index_relation.relname =
+               'chain_swap_cooperative_signing_active_idx'
+           AND NOT index_info.indisunique AND index_info.indisvalid
+           AND pg_get_indexdef(index_info.indexrelid) LIKE
+               '%(updated_at, chain_swap_id)%'
+           AND pg_get_expr(index_info.indpred, index_info.indrelid) LIKE
+               '%completed%integrity_hold%superseded%'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('chain_swap_cooperative_signing_validate_insert',
+                  'enforce_chain_swap_cooperative_signing_insert', 7),
+              ('chain_swap_cooperative_signing_validate_update',
+                  'enforce_chain_swap_cooperative_signing_update', 19),
+              ('chain_swap_cooperative_signing_reject_delete',
+                  'reject_chain_swap_cooperative_signing_delete', 11)
+          ) required(trigger_name, function_name, trigger_type)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_trigger trigger_info
+               JOIN pg_class relation ON relation.oid = trigger_info.tgrelid
+               JOIN pg_namespace relation_namespace
+                 ON relation_namespace.oid = relation.relnamespace
+               JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
+               JOIN pg_namespace function_namespace
+                 ON function_namespace.oid = function_info.pronamespace
+              WHERE relation_namespace.nspname = 'public'
+                AND function_namespace.nspname = 'public'
+                AND relation.relname =
+                    'chain_swap_cooperative_signing_operations'
+                AND relation.relkind = 'r'
+                AND trigger_info.tgname = required.trigger_name
+                AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND trigger_info.tgnargs = 0
+                AND trigger_info.tgattr::TEXT = ''
+                AND trigger_info.tgqual IS NULL
+                AND trigger_info.tgconstraint = 0
+                AND NOT trigger_info.tgdeferrable
+                AND NOT trigger_info.tginitdeferred
+                AND NOT trigger_info.tgisinternal
+                AND trigger_info.tgenabled = 'O'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_chain_swap_cooperative_signing_insert'),
+              ('enforce_chain_swap_cooperative_signing_update'),
+              ('reject_chain_swap_cooperative_signing_delete')
+          ) required(function_name)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+               JOIN pg_language language_info
+                 ON language_info.oid = function_info.prolang
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND function_info.prokind = 'f'
+                AND function_info.prorettype = 'trigger'::REGTYPE
+                AND language_info.lanname = 'plpgsql'
+                AND function_info.provolatile = 'v'
+                AND NOT function_info.proisstrict
+                AND NOT function_info.prosecdef
+                AND NOT function_info.proleakproof
+                AND function_info.proparallel = 'u'
+                AND function_info.proconfig IS NULL
+                AND pg_get_userbyid(function_info.proowner) <> current_user
+                AND NOT pg_has_role(
+                    current_user, pg_get_userbyid(function_info.proowner), 'USAGE'
+                )
+                AND NOT pg_has_role(
+                    current_user, pg_get_userbyid(function_info.proowner), 'SET'
+                )
+                AND NOT has_function_privilege(
+                    current_user, function_info.oid, 'EXECUTE'
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM aclexplode(COALESCE(
+                          function_info.proacl,
+                          acldefault('f', function_info.proowner)
+                      )) acl
+                     WHERE acl.grantee = 0
+                       AND acl.privilege_type = 'EXECUTE'
+                )
+         )
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_cooperative_signing_insert'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%FROM public.chain_swap_records%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.clock_timestamp()%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'enforce_chain_swap_cooperative_signing_update'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%NEW.requested_at := transitioned_at%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%terminal cooperative signing evidence is immutable%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%completion requires the exact immutable recovery attempt%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%FROM public.chain_swap_tx_attempts attempt%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.jsonb_array_length(attempt.source_prevouts)%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%pg_catalog.clock_timestamp()%'
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%unilateral_timeout_reached%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_proc function_info
+          JOIN pg_namespace namespace ON namespace.oid = function_info.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND function_info.proname =
+               'reject_chain_swap_cooperative_signing_delete'
+           AND function_info.pronargs = 0
+           AND pg_get_functiondef(function_info.oid) LIKE
+               '%cooperative signing operation evidence cannot be deleted%'
+    )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname =
+               'chain_swap_cooperative_signing_operations'
+           AND relation.relkind = 'r'
+           AND pg_get_userbyid(relation.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
+           )
+           AND NOT pg_has_role(
+               current_user, pg_get_userbyid(relation.relowner), 'SET'
+           )
+           AND has_table_privilege(current_user, relation.oid, 'SELECT')
+           AND has_table_privilege(current_user, relation.oid, 'INSERT')
+           AND has_table_privilege(current_user, relation.oid, 'UPDATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
+           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM aclexplode(COALESCE(
+                     relation.relacl, acldefault('r', relation.relowner)
+                 )) acl
+                WHERE acl.grantee = 0
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM information_schema.columns column_info
+         WHERE column_info.table_schema = 'public'
+           AND column_info.table_name =
+               'chain_swap_cooperative_signing_operations'
+           AND (
+               column_info.is_identity <> 'NO'
+               OR column_info.is_generated <> 'NEVER'
+               OR column_info.column_default LIKE 'nextval(%'
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_depend dependency
+          JOIN pg_class sequence_info ON sequence_info.oid = dependency.objid
+         WHERE dependency.classid = 'pg_class'::REGCLASS
+           AND dependency.refclassid = 'pg_class'::REGCLASS
+           AND dependency.refobjid =
+               'public.chain_swap_cooperative_signing_operations'::REGCLASS
+           AND dependency.deptype IN ('a', 'i')
+           AND sequence_info.relkind = 'S'
+    )
+)::INT;
+SQL
+  )"
+  [[ "$migration_057_ready" == "1" ]] || {
+    echo "migration-057 boundary: schema, state machine, owner, or ACL invariant failed" >&2
+    exit 1
+  }
+fi
+
 echo "migration 053 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 if [[ "$require_migration_055" == "1" ]]; then
   echo "migration 055 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 fi
 if [[ "$require_migration_056" == "1" ]]; then
   echo "migration 056 boundary verified for runtime role $actual_runtime_role on database $actual_database"
+fi
+if [[ "$require_migration_057" == "1" ]]; then
+  echo "migration 057 boundary verified for runtime role $actual_runtime_role on database $actual_database"
 fi

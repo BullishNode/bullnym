@@ -1207,8 +1207,13 @@ pub async fn list_refund_due_chain_swaps(
 ///
 /// Eligibility is intentionally only a scheduling hint: every returned swap
 /// must reacquire the shared advisory lock and rebuild the complete #82 packet
-/// before construction or replay. Keeping this query independent of admission
-/// lets already-created obligations drain while new-money admission is closed.
+/// before construction or replay. In addition to `refund_due`, every parent
+/// with nonterminal cooperative-signing evidence remains queued regardless of
+/// parent status. That closes the crash window where a Liquid/parent transition
+/// wins after the provider response commits and the signing row still needs a
+/// terminal integrity disposition on restart. Keeping this query independent
+/// of admission lets already-created obligations drain while new-money
+/// admission is closed.
 ///
 /// `after_id` is a fair-work cursor, not execution authority. Rows after its
 /// `(created_at, id)` position are returned first and the ordering then wraps to
@@ -1223,6 +1228,14 @@ pub(crate) const AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL: &str = "WITH cursor AS ( \
            FROM chain_swap_records candidate \
            LEFT JOIN cursor ON TRUE \
           WHERE candidate.status = 'refund_due' \
+             OR EXISTS ( \
+                    SELECT 1 \
+                      FROM chain_swap_cooperative_signing_operations signing \
+                     WHERE signing.chain_swap_id = candidate.id \
+                       AND signing.state IN ( \
+                           'prepared', 'requested', 'ambiguous', 'response_received' \
+                       ) \
+                ) \
           ORDER BY CASE \
                        WHEN cursor.id IS NULL \
                          OR (candidate.created_at, candidate.id) \
@@ -1269,6 +1282,17 @@ mod automatic_fallback_worklist_tests {
         assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL.contains("THEN 0 ELSE 1"));
         assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL
             .contains("candidate.created_at ASC, candidate.id ASC"));
+    }
+
+    #[test]
+    fn nonterminal_cooperative_evidence_stays_queued_across_parent_status_changes() {
+        assert!(
+            AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL.contains("signing.chain_swap_id = candidate.id")
+        );
+        assert!(AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL
+            .contains("'prepared', 'requested', 'ambiguous', 'response_received'"));
+        assert!(!AUTOMATIC_FALLBACK_DUE_WORKLIST_SQL
+            .contains("signing.state IN ('completed', 'integrity_hold', 'superseded')"));
     }
 
     #[test]

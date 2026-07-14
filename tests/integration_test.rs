@@ -35,13 +35,13 @@ use pay_service::boltz_transport::{
     ScriptedBoltzCall, ScriptedBoltzError, ScriptedBoltzStep, ScriptedBoltzTransport,
     ScriptedBoltzWebhookEvent, ScriptedBoltzWebhookInstruction, ScriptedBoltzWebhookPlan,
 };
-use pay_service::chain_swap_creation_permit::{
-    ChainSwapCreationPermit, ChainSwapCreationPermitError,
-};
 use pay_service::chain_fault_harness::{
     ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
     ScriptedBitcoinRecoveryBackend as FakeBitcoinChain,
     ScriptedBitcoinRecoveryBroadcaster as FakeRecoveryBroadcaster,
+};
+use pay_service::chain_swap_creation_permit::{
+    ChainSwapCreationPermit, ChainSwapCreationPermitError,
 };
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
@@ -755,6 +755,12 @@ async fn cleanup_db(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
+    // Cooperative-signing rows are append-only and hold a RESTRICT parent FK.
+    // Test-database ownership uses DDL solely for isolation.
+    sqlx::query("TRUNCATE chain_swap_cooperative_signing_operations")
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM watcher_lane_progress")
         .execute(pool)
         .await
@@ -1267,7 +1273,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "056_chain_swap_renegotiation_journal"
+        "057_chain_swap_cooperative_signing_operations"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -15220,6 +15226,1030 @@ async fn chain_swap_records_are_invoice_scoped_and_retrievable() {
 }
 
 #[tokio::test]
+async fn cooperative_signing_late_response_is_exact_or_integrity_held_without_overwrite() {
+    use pay_service::db::ChainSwapCooperativeSigningStoreError;
+    use pay_service::db::{
+        persist_prepared_chain_swap_cooperative_signing,
+        record_chain_swap_cooperative_signing_response, ChainSwapCooperativeSigningIdentity,
+        CooperativeSigningCasDisposition, CooperativeSigningCompletion,
+        CooperativeSigningDestination, CooperativeSigningErrorClass,
+        CooperativeSigningFeeAuthority, CooperativeSigningProviderResponse,
+        CooperativeSigningRequest, CooperativeSigningSource, CooperativeSigningState,
+        EncryptedCooperativeSecretNonce,
+    };
+    use pay_service::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let npub = create_test_user(&admin, "coopsigningresponse").await;
+    let invoice = insert_test_invoice(
+        &admin,
+        "coopsigningresponse",
+        &npub,
+        "lq1coopsigningresponse",
+        60,
+    )
+    .await;
+    let boltz_swap_id = "cooperative-signing-response-swap";
+    let row = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("coopsigningresponse"),
+            boltz_swap_id,
+            lockup_address: JOURNAL_LOCKUP_ADDRESS,
+            lockup_bip21: None,
+            user_lock_amount_sat: 100_000,
+            server_lock_amount_sat: 99_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"cooperative-signing-response-swap\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let direct_boltz_swap_id = "cooperative-signing-direct-response-swap";
+    let direct_row = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("coopsigningresponse"),
+            boltz_swap_id: direct_boltz_swap_id,
+            lockup_address: JOURNAL_LOCKUP_ADDRESS,
+            lockup_bip21: None,
+            user_lock_amount_sat: 100_000,
+            server_lock_amount_sat: 99_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"cooperative-signing-direct-response-swap\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let normal_harness_row = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("coopsigningresponse"),
+            boltz_swap_id: "cooperative-signing-harness-normal",
+            lockup_address: JOURNAL_LOCKUP_ADDRESS,
+            lockup_bip21: None,
+            user_lock_amount_sat: 100_000,
+            server_lock_amount_sat: 99_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"cooperative-signing-harness-normal\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let requested_fault_row = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("coopsigningresponse"),
+            boltz_swap_id: "cooperative-signing-harness-requested-fault",
+            lockup_address: JOURNAL_LOCKUP_ADDRESS,
+            lockup_bip21: None,
+            user_lock_amount_sat: 100_000,
+            server_lock_amount_sat: 99_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"cooperative-signing-harness-requested-fault\"}",
+        },
+    )
+    .await
+    .unwrap();
+    let provider_fault_row = record_pre_050_chain_fixture(
+        &admin,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("coopsigningresponse"),
+            boltz_swap_id: "cooperative-signing-harness-provider-fault",
+            lockup_address: JOURNAL_LOCKUP_ADDRESS,
+            lockup_bip21: None,
+            user_lock_amount_sat: 100_000,
+            server_lock_amount_sat: 99_000,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{\"id\":\"cooperative-signing-harness-provider-fault\"}",
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_script = bitcoin::Address::from_str(JOURNAL_LOCKUP_ADDRESS)
+        .unwrap()
+        .require_network(bitcoin::Network::Bitcoin)
+        .unwrap()
+        .script_pubkey();
+    let destination_script = bitcoin::Address::from_str(JOURNAL_DESTINATION_ADDRESS)
+        .unwrap()
+        .require_network(bitcoin::Network::Bitcoin)
+        .unwrap()
+        .script_pubkey();
+    let source_txid = bitcoin::Txid::from_str(&"44".repeat(32)).unwrap();
+    let mut transaction = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::new(source_txid, 0),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1),
+            script_pubkey: destination_script.clone(),
+        }],
+    };
+    let mut signed_sizing_copy = transaction.clone();
+    signed_sizing_copy.input[0].witness.push([0x77; 64]);
+    let fee_vbytes = signed_sizing_copy.vsize() as u64;
+    let rate = SatPerVbyte::try_from(12.5).unwrap();
+    let fee_amount_sat = rate.checked_fee_for_vbytes(fee_vbytes).unwrap();
+    let source_amount_sat = 100_000_u64;
+    let destination_amount_sat = source_amount_sat - fee_amount_sat;
+    transaction.output[0].value = bitcoin::Amount::from_sat(destination_amount_sat);
+    transaction.input[0].witness.push([0_u8; 64]);
+    let transaction_hex = hex::encode(bitcoin::consensus::serialize(&transaction));
+
+    let fee_policy = BitcoinFeePolicy::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        SatPerVbyte::try_from(500.0).unwrap(),
+        120,
+        900,
+    )
+    .unwrap();
+    let fee_observation = LiveBitcoin::new(
+        rate,
+        1_000,
+        FeeProvenance::new("cooperative-signing-test").unwrap(),
+    );
+    let fee_decision = fee_policy
+        .decide_typed(Some(&fee_observation), None, 1_000)
+        .unwrap();
+    let fee_record = FeeDecisionRecord::from_bitcoin(
+        FeeConstructionPurpose::BitcoinRecovery,
+        &fee_decision,
+        &fee_policy,
+        1_000,
+    )
+    .unwrap();
+    let identity = ChainSwapCooperativeSigningIdentity::new(
+        row.id,
+        boltz_swap_id,
+        CooperativeSigningSource::new(
+            source_txid.to_string(),
+            0,
+            source_amount_sat,
+            hex::encode(source_script.as_bytes()),
+        )
+        .unwrap(),
+        CooperativeSigningDestination::new(
+            JOURNAL_DESTINATION_ADDRESS,
+            hex::encode(destination_script.as_bytes()),
+            destination_amount_sat,
+        )
+        .unwrap(),
+        fee_amount_sat,
+        fee_vbytes,
+        CooperativeSigningFeeAuthority::from_decision(&fee_record).unwrap(),
+        CooperativeSigningRequest::new(
+            transaction_hex,
+            transaction.compute_txid().to_string(),
+            "55".repeat(32),
+            "66".repeat(32),
+            "77".repeat(66),
+            "88".repeat(32),
+            "99".repeat(32),
+            EncryptedCooperativeSecretNonce::new(
+                "manifest-key:test",
+                vec![0xaa; 24],
+                vec![0xbb; 148],
+                "cc".repeat(32),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let direct_identity = ChainSwapCooperativeSigningIdentity::new(
+        direct_row.id,
+        direct_boltz_swap_id,
+        CooperativeSigningSource::new(
+            source_txid.to_string(),
+            0,
+            source_amount_sat,
+            hex::encode(source_script.as_bytes()),
+        )
+        .unwrap(),
+        CooperativeSigningDestination::new(
+            JOURNAL_DESTINATION_ADDRESS,
+            hex::encode(destination_script.as_bytes()),
+            destination_amount_sat,
+        )
+        .unwrap(),
+        fee_amount_sat,
+        fee_vbytes,
+        CooperativeSigningFeeAuthority::from_decision(&fee_record).unwrap(),
+        CooperativeSigningRequest::new(
+            hex::encode(bitcoin::consensus::serialize(&transaction)),
+            transaction.compute_txid().to_string(),
+            "15".repeat(32),
+            "16".repeat(32),
+            "17".repeat(66),
+            "18".repeat(32),
+            "19".repeat(32),
+            EncryptedCooperativeSecretNonce::new(
+                "manifest-key:direct-test",
+                vec![0x1a; 24],
+                vec![0x1b; 148],
+                "1c".repeat(32),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let make_harness_identity = |chain_swap_id: Uuid, harness_boltz_swap_id: &str, marker: u8| {
+        let marker_hex = format!("{marker:02x}");
+        let transaction_hex = hex::encode(bitcoin::consensus::serialize(&transaction));
+        let client_public_nonce_hex = format!("{:02x}", marker.wrapping_add(2)).repeat(66);
+        let mut request_hasher = Sha256::new();
+        let request_domain = b"bullnym/boltz-chain-refund-signature-request/v1";
+        request_hasher.update((request_domain.len() as u64).to_be_bytes());
+        request_hasher.update(request_domain);
+        for field in [
+            harness_boltz_swap_id.as_bytes(),
+            client_public_nonce_hex.as_bytes(),
+            transaction_hex.as_bytes(),
+            b"0",
+        ] {
+            request_hasher.update((field.len() as u64).to_be_bytes());
+            request_hasher.update(field);
+        }
+        let provider_request_sha256 = hex::encode(request_hasher.finalize());
+        ChainSwapCooperativeSigningIdentity::new(
+            chain_swap_id,
+            harness_boltz_swap_id,
+            CooperativeSigningSource::new(
+                source_txid.to_string(),
+                0,
+                source_amount_sat,
+                hex::encode(source_script.as_bytes()),
+            )
+            .unwrap(),
+            CooperativeSigningDestination::new(
+                JOURNAL_DESTINATION_ADDRESS,
+                hex::encode(destination_script.as_bytes()),
+                destination_amount_sat,
+            )
+            .unwrap(),
+            fee_amount_sat,
+            fee_vbytes,
+            CooperativeSigningFeeAuthority::from_decision(&fee_record).unwrap(),
+            CooperativeSigningRequest::new(
+                transaction_hex,
+                transaction.compute_txid().to_string(),
+                marker_hex.repeat(32),
+                format!("{:02x}", marker.wrapping_add(1)).repeat(32),
+                client_public_nonce_hex,
+                provider_request_sha256,
+                format!("{:02x}", marker.wrapping_add(4)).repeat(32),
+                EncryptedCooperativeSecretNonce::new(
+                    format!("manifest-key:harness-{marker}"),
+                    vec![marker.wrapping_add(5); 24],
+                    vec![marker.wrapping_add(6); 148],
+                    format!("{:02x}", marker.wrapping_add(7)).repeat(32),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let normal_harness_identity = make_harness_identity(
+        normal_harness_row.id,
+        "cooperative-signing-harness-normal",
+        0x21,
+    );
+    let requested_fault_identity = make_harness_identity(
+        requested_fault_row.id,
+        "cooperative-signing-harness-requested-fault",
+        0x31,
+    );
+    let provider_fault_identity = make_harness_identity(
+        provider_fault_row.id,
+        "cooperative-signing-harness-provider-fault",
+        0x41,
+    );
+
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+
+    let harness_response = boltz_client::swaps::boltz::PartialSig {
+        pub_nonce: "ac".repeat(66),
+        partial_signature: "bd".repeat(32),
+    };
+    let response_commit_fault = OneShotRecoveryFault::at(
+        pay_service::chain_recovery::RecoveryFaultPoint::AfterCooperativeResponseCommit,
+    );
+    let normal_calls = AtomicUsize::new(0);
+    let normal_state =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &normal_harness_identity,
+            Some(harness_response.clone()),
+            &normal_calls,
+            &response_commit_fault,
+        )
+        .await;
+    assert!(normal_state.is_err());
+    assert!(response_commit_fault.fired.load(Ordering::SeqCst));
+    assert_eq!(normal_calls.load(Ordering::SeqCst), 1);
+    let restarted_normal =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &normal_harness_identity,
+            Some(harness_response.clone()),
+            &normal_calls,
+            &response_commit_fault,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted_normal, CooperativeSigningState::ResponseReceived);
+    assert_eq!(normal_calls.load(Ordering::SeqCst), 1);
+    let normal_operation =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, normal_harness_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(normal_operation.request_attempt_count(), 1);
+    assert!(normal_operation.provider_response().is_some());
+
+    let before_provider_fault = OneShotRecoveryFault::at(
+        pay_service::chain_recovery::RecoveryFaultPoint::AfterCooperativeRequestedCommitBeforeProvider,
+    );
+    let requested_fault_calls = AtomicUsize::new(0);
+    let requested_fault =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &requested_fault_identity,
+            Some(harness_response.clone()),
+            &requested_fault_calls,
+            &before_provider_fault,
+        )
+        .await;
+    assert!(requested_fault.is_err());
+    assert!(before_provider_fault.fired.load(Ordering::SeqCst));
+    assert_eq!(requested_fault_calls.load(Ordering::SeqCst), 0);
+    let restarted_requested =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &requested_fault_identity,
+            Some(harness_response.clone()),
+            &requested_fault_calls,
+            &before_provider_fault,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted_requested, CooperativeSigningState::Requested);
+    assert_eq!(requested_fault_calls.load(Ordering::SeqCst), 0);
+    let requested_operation =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, requested_fault_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(requested_operation.version(), 2);
+    assert_eq!(requested_operation.request_attempt_count(), 1);
+    assert!(requested_operation.provider_response().is_none());
+
+    let after_provider_fault = OneShotRecoveryFault::at(
+        pay_service::chain_recovery::RecoveryFaultPoint::AfterCooperativeProviderBeforeResponseCommit,
+    );
+    let provider_fault_calls = AtomicUsize::new(0);
+    let provider_fault =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &provider_fault_identity,
+            Some(harness_response),
+            &provider_fault_calls,
+            &after_provider_fault,
+        )
+        .await;
+    assert!(provider_fault.is_err());
+    assert!(after_provider_fault.fired.load(Ordering::SeqCst));
+    assert_eq!(provider_fault_calls.load(Ordering::SeqCst), 1);
+    let restarted_provider_fault =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &runtime,
+            &provider_fault_identity,
+            None,
+            &provider_fault_calls,
+            &after_provider_fault,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted_provider_fault, CooperativeSigningState::Requested);
+    assert_eq!(provider_fault_calls.load(Ordering::SeqCst), 1);
+    let provider_fault_operation =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, provider_fault_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(provider_fault_operation.version(), 2);
+    assert_eq!(provider_fault_operation.request_attempt_count(), 1);
+    assert!(provider_fault_operation.provider_response().is_none());
+
+    // Exercise the exact live advance loop with a nonterminal request whose
+    // RefundDue parent already carries Liquid claim bytes. The preflight must
+    // atomically quarantine the operation before provider or Bitcoin work.
+    let mut conflict_seed = admin.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *conflict_seed)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records \
+            SET status = 'refund_due', claim_txid = $2, claim_tx_hex = '00' \
+          WHERE id = $1",
+    )
+    .bind(requested_fault_row.id)
+    .bind("cd".repeat(32))
+    .execute(&mut *conflict_seed)
+    .await
+    .unwrap();
+    conflict_seed.commit().await.unwrap();
+    let parent_conflict_calls = AtomicUsize::new(0);
+    let parent_conflict_state = test_state(runtime.clone());
+    let parent_conflict =
+        pay_service::chain_recovery::exercise_cooperative_signing_advance_for_test(
+            &parent_conflict_state,
+            requested_fault_row.id,
+            None,
+            &parent_conflict_calls,
+            &pay_service::chain_recovery::NoRecoveryFaults,
+        )
+        .await;
+    assert!(matches!(parent_conflict, Err(AppError::ClaimError(_))));
+    assert_eq!(parent_conflict_calls.load(Ordering::SeqCst), 0);
+    let held_parent_conflict =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, requested_fault_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        held_parent_conflict.state(),
+        CooperativeSigningState::IntegrityHold
+    );
+    assert_eq!(held_parent_conflict.version(), 3);
+    assert_eq!(held_parent_conflict.request_attempt_count(), 1);
+    assert!(held_parent_conflict.provider_response().is_none());
+    assert!(held_parent_conflict.integrity_reason_sha256().is_some());
+    let persisted_parent: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, claim_txid, claim_tx_hex FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(requested_fault_row.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(persisted_parent.0, "refund_due");
+    assert_eq!(persisted_parent.1, Some("cd".repeat(32)));
+    assert_eq!(persisted_parent.2.as_deref(), Some("00"));
+    let bitcoin_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_tx_attempts WHERE chain_swap_id = $1")
+            .bind(requested_fault_row.id)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(bitcoin_attempts, 0);
+
+    // A direct requested -> response transition consumes only the requested
+    // version. A stale prepared token must not become an idempotency wildcard
+    // for either the durable response or its subsequent conflict hold.
+    let direct_prepared =
+        persist_prepared_chain_swap_cooperative_signing(&runtime, &direct_identity)
+            .await
+            .unwrap();
+    assert_eq!(direct_prepared.state(), CooperativeSigningState::Prepared);
+    assert_eq!(direct_prepared.version(), 1);
+    let direct_requested =
+        pay_service::db::mark_chain_swap_cooperative_signing_requested(&runtime, direct_row.id, 1)
+            .await
+            .unwrap();
+    assert_eq!(
+        direct_requested.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    assert_eq!(direct_requested.operation.version(), 2);
+    let direct_first =
+        CooperativeSigningProviderResponse::new("ca".repeat(66), "da".repeat(32)).unwrap();
+    let direct_recorded =
+        record_chain_swap_cooperative_signing_response(&runtime, direct_row.id, 2, &direct_first)
+            .await
+            .unwrap();
+    assert_eq!(
+        direct_recorded.operation.state(),
+        CooperativeSigningState::ResponseReceived
+    );
+    assert_eq!(direct_recorded.operation.version(), 3);
+    let direct_conflicting =
+        CooperativeSigningProviderResponse::new("ea".repeat(66), "fa".repeat(32)).unwrap();
+    for stale_response in [&direct_first, &direct_conflicting] {
+        let stale = record_chain_swap_cooperative_signing_response(
+            &runtime,
+            direct_row.id,
+            1,
+            stale_response,
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            Err(ChainSwapCooperativeSigningStoreError::CasMiss { chain_swap_id })
+                if chain_swap_id == direct_row.id
+        ));
+    }
+    let direct_still_recorded =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, direct_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        direct_still_recorded.state(),
+        CooperativeSigningState::ResponseReceived
+    );
+    assert_eq!(direct_still_recorded.version(), 3);
+    assert_eq!(
+        direct_still_recorded.provider_response(),
+        Some(&direct_first)
+    );
+    let direct_held = record_chain_swap_cooperative_signing_response(
+        &runtime,
+        direct_row.id,
+        2,
+        &direct_conflicting,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        direct_held.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    assert_eq!(
+        direct_held.operation.state(),
+        CooperativeSigningState::IntegrityHold
+    );
+    assert_eq!(direct_held.operation.version(), 4);
+    let stale_hold_retry = record_chain_swap_cooperative_signing_response(
+        &runtime,
+        direct_row.id,
+        1,
+        &direct_conflicting,
+    )
+    .await;
+    assert!(matches!(
+        stale_hold_retry,
+        Err(ChainSwapCooperativeSigningStoreError::CasMiss { chain_swap_id })
+            if chain_swap_id == direct_row.id
+    ));
+    let direct_still_held =
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, direct_row.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        direct_still_held.state(),
+        CooperativeSigningState::IntegrityHold
+    );
+    assert_eq!(direct_still_held.version(), 4);
+    assert_eq!(direct_still_held.provider_response(), Some(&direct_first));
+
+    let prepared = persist_prepared_chain_swap_cooperative_signing(&runtime, &identity)
+        .await
+        .unwrap();
+    assert_eq!(prepared.state(), CooperativeSigningState::Prepared);
+    let requested =
+        pay_service::db::mark_chain_swap_cooperative_signing_requested(&runtime, row.id, 1)
+            .await
+            .unwrap();
+    assert_eq!(
+        requested.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    assert_eq!(
+        requested.operation.state(),
+        CooperativeSigningState::Requested
+    );
+
+    let first = CooperativeSigningProviderResponse::new("ab".repeat(66), "bc".repeat(32)).unwrap();
+    let ambiguous = pay_service::db::mark_chain_swap_cooperative_signing_ambiguous(
+        &runtime,
+        row.id,
+        2,
+        CooperativeSigningErrorClass::Transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ambiguous.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    assert_eq!(
+        ambiguous.operation.state(),
+        CooperativeSigningState::Ambiguous
+    );
+    assert_eq!(ambiguous.operation.version(), 3);
+    let recorded = record_chain_swap_cooperative_signing_response(&runtime, row.id, 2, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    assert_eq!(
+        recorded.operation.state(),
+        CooperativeSigningState::ResponseReceived
+    );
+    assert_eq!(recorded.operation.version(), 4);
+
+    // The attempt stores the exact effective rate paid by the final bytes,
+    // while its 13-field authority packet retains the selected 12.5 sat/vB.
+    // For this 111-vB fixture, ceil(12.5 * 111) makes those rates differ.
+    let effective_rate = fee_amount_sat as f64 / fee_vbytes as f64;
+    assert_ne!(effective_rate, rate.as_f64());
+    let mut final_transaction = transaction.clone();
+    final_transaction.input[0].witness = bitcoin::Witness::new();
+    final_transaction.input[0].witness.push([0x42; 64]);
+    let final_transaction_hex = hex::encode(bitcoin::consensus::serialize(&final_transaction));
+    let final_txid = final_transaction.compute_txid().to_string();
+    let destination_script_hex = hex::encode(destination_script.as_bytes());
+    let completion =
+        CooperativeSigningCompletion::new(final_transaction_hex.clone(), "d1".repeat(32)).unwrap();
+    let source_prevouts = [pay_service::db::RecoverySourcePrevout {
+        txid: source_txid.to_string(),
+        vout: 0,
+        amount_sat: source_amount_sat,
+        script_pubkey_hex: hex::encode(source_script.as_bytes()),
+    }];
+    let mut completion_tx = runtime.begin().await.unwrap();
+    pay_service::db::insert_bitcoin_recovery_attempt(
+        &mut completion_tx,
+        &pay_service::db::NewBitcoinRecoveryAttempt {
+            chain_swap_id: row.id,
+            raw_tx_hex: &final_transaction_hex,
+            txid: &final_txid,
+            source_prevouts: &source_prevouts,
+            destination_address: JOURNAL_DESTINATION_ADDRESS,
+            destination_script_hex: &destination_script_hex,
+            destination_vout: 0,
+            destination_amount_sat: destination_amount_sat as i64,
+            fee_amount_sat: fee_amount_sat as i64,
+            fee_rate_sat_vb: effective_rate,
+            fee_decision: &fee_record,
+        },
+    )
+    .await
+    .unwrap();
+    let completed = pay_service::db::complete_chain_swap_cooperative_signing_in_transaction(
+        &mut completion_tx,
+        row.id,
+        4,
+        &completion,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        completed.operation.state(),
+        CooperativeSigningState::Completed
+    );
+    assert_eq!(
+        completed.disposition,
+        CooperativeSigningCasDisposition::Applied
+    );
+    completion_tx.rollback().await.unwrap();
+    assert_eq!(
+        pay_service::db::get_chain_swap_cooperative_signing(&runtime, row.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        CooperativeSigningState::ResponseReceived
+    );
+
+    let duplicate = record_chain_swap_cooperative_signing_response(&runtime, row.id, 2, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.disposition,
+        CooperativeSigningCasDisposition::ExactRetry
+    );
+    assert_eq!(duplicate.operation.version(), 4);
+
+    let conflicting =
+        CooperativeSigningProviderResponse::new("de".repeat(66), "ef".repeat(32)).unwrap();
+    let held = record_chain_swap_cooperative_signing_response(&runtime, row.id, 2, &conflicting)
+        .await
+        .unwrap();
+    assert_eq!(held.disposition, CooperativeSigningCasDisposition::Applied);
+    assert_eq!(
+        held.operation.state(),
+        CooperativeSigningState::IntegrityHold
+    );
+    assert_eq!(held.operation.provider_response(), Some(&first));
+    assert_eq!(held.operation.version(), 5);
+
+    let held_retry =
+        record_chain_swap_cooperative_signing_response(&runtime, row.id, 2, &conflicting)
+            .await
+            .unwrap();
+    assert_eq!(
+        held_retry.disposition,
+        CooperativeSigningCasDisposition::ExactRetry
+    );
+    assert_eq!(held_retry.operation.provider_response(), Some(&first));
+    assert_eq!(held_retry.operation.version(), 5);
+
+    let stored: (String, String, String, String) = sqlx::query_as(
+        "SELECT state, provider_public_nonce_hex, \
+                provider_partial_signature_hex, provider_response_sha256 \
+           FROM chain_swap_cooperative_signing_operations \
+          WHERE chain_swap_id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, "integrity_hold");
+    assert_eq!(stored.1, first.public_nonce_hex());
+    assert_eq!(stored.2, first.partial_signature_hex());
+    assert_eq!(stored.3, first.response_sha256());
+
+    runtime.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn cooperative_signing_attempt_write_crash_rolls_back_and_retries_exact_selected_bytes() {
+    use pay_service::db::{CooperativeSigningProviderResponse, CooperativeSigningState};
+    use pay_service::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeProvenance, LiveBitcoin, SatPerVbyte};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "coopsigningattemptcrash";
+    let (npub, merchant_keypair) = issue84_test_merchant(&pool, nym).await;
+    issue84_persist_recovery_commitment(
+        &pool,
+        &merchant_keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    let invoice = issue84_chain_invoice(&pool, nym, &npub, 0).await;
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider_secret_bytes = [4_u8; 32];
+    let provider_secret = SecretKey::from_slice(&provider_secret_bytes).unwrap();
+    let provider_public = BoltzPublicKey::new(secp256k1::PublicKey::from_secret_key(
+        &Secp256k1::new(),
+        &provider_secret,
+    ));
+    let provider_fixture = issue84_chain_creation_response_with_bitcoin_server(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        "Issue85CompletionCrash1",
+        provider_public,
+    );
+    let provider = spawn_issue84_chain_provider_fixture(
+        provider_fixture.0,
+        provider_fixture.1,
+        provider_fixture.2,
+    )
+    .await;
+    let runtime = in_memory_recovery_manifest_runtime();
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(runtime.clone());
+    pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("valid recovery commitment should admit the fixture chain swap");
+    provider.shutdown().await;
+
+    let swap = pay_service::db::get_chain_swap_by_boltz_id(&pool, "Issue85CompletionCrash1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
+            .await
+            .unwrap(),
+        1
+    );
+    set_test_refund_destination(&pool, swap.id, RECOVERY_COMMITMENT_P2WPKH).await;
+    let swap = pay_service::db::get_chain_swap_by_id(&pool, swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let fee_policy = BitcoinFeePolicy::default();
+    let fee_observation = LiveBitcoin::new(
+        SatPerVbyte::try_from(2.0).unwrap(),
+        1_000,
+        FeeProvenance::new("cooperative-completion-crash-test").unwrap(),
+    );
+    let fee_decision = fee_policy
+        .decide_typed(Some(&fee_observation), None, 1_000)
+        .unwrap();
+    let fee_record = FeeDecisionRecord::from_bitcoin(
+        FeeConstructionPurpose::BitcoinRecovery,
+        &fee_decision,
+        &fee_policy,
+        1_000,
+    )
+    .unwrap();
+    let (identity, provider_partial) =
+        pay_service::chain_recovery::prepare_cooperative_signing_completion_fixture_for_test(
+            &swap,
+            &"a1".repeat(32),
+            0,
+            u64::try_from(swap.user_lock_amount_sat).unwrap(),
+            RECOVERY_COMMITMENT_P2WPKH,
+            &fee_decision,
+            fee_record,
+            runtime.as_ref(),
+            provider_secret_bytes,
+        )
+        .unwrap();
+    let provider_response = CooperativeSigningProviderResponse::new(
+        provider_partial.pub_nonce.clone(),
+        provider_partial.partial_signature.clone(),
+    )
+    .unwrap();
+    let provider_calls = AtomicUsize::new(0);
+    let response_state =
+        pay_service::chain_recovery::exercise_cooperative_provider_transition_for_test(
+            &pool,
+            &identity,
+            Some(provider_partial),
+            &provider_calls,
+            &pay_service::chain_recovery::NoRecoveryFaults,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response_state, CooperativeSigningState::ResponseReceived);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let response = pay_service::db::get_chain_swap_cooperative_signing(&pool, swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.state(), CooperativeSigningState::ResponseReceived);
+    assert_eq!(response.version(), 3);
+    assert_eq!(response.provider_response(), Some(&provider_response));
+    let expected_raw =
+        pay_service::chain_recovery::preview_cooperative_signing_completion_for_test(
+            &state, swap.id,
+        )
+        .await
+        .unwrap();
+
+    let fault = OneShotRecoveryFault::at(
+        pay_service::chain_recovery::RecoveryFaultPoint::AfterCooperativeAttemptWriteBeforeCommit,
+    );
+    let crashed = pay_service::chain_recovery::exercise_cooperative_signing_completion_for_test(
+        &state, swap.id, &fault,
+    )
+    .await;
+    assert!(matches!(
+        crashed,
+        Err(AppError::ClaimError(ref message))
+            if message == "scripted worker stop at AfterCooperativeAttemptWriteBeforeCommit"
+    ));
+    assert!(fault.fired.load(Ordering::SeqCst));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let after_crash = pay_service::db::get_chain_swap_cooperative_signing(&pool, swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_crash.state(),
+        CooperativeSigningState::ResponseReceived
+    );
+    assert_eq!(after_crash.version(), 3);
+    assert_eq!(after_crash.provider_response(), Some(&provider_response));
+    let rolled_back_parent: String =
+        sqlx::query_scalar("SELECT status FROM chain_swap_records WHERE id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rolled_back_parent, "refund_due");
+    let rolled_back_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_tx_attempts WHERE chain_swap_id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rolled_back_attempts, 0);
+
+    let committed_raw =
+        pay_service::chain_recovery::exercise_cooperative_signing_completion_for_test(
+            &state, swap.id, &fault,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed_raw, expected_raw);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let completed = pay_service::db::get_chain_swap_cooperative_signing(&pool, swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state(), CooperativeSigningState::Completed);
+    assert_eq!(completed.version(), 4);
+    assert_eq!(
+        completed.completion().unwrap().final_transaction_hex(),
+        committed_raw
+    );
+    let committed_attempts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT raw_tx_hex, txid FROM chain_swap_tx_attempts WHERE chain_swap_id = $1",
+    )
+    .bind(swap.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(committed_attempts.len(), 1);
+    assert_eq!(committed_attempts[0].0, committed_raw);
+    let committed_parent: String =
+        sqlx::query_scalar("SELECT status FROM chain_swap_records WHERE id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(committed_parent, "refunding");
+
+    let replayed_raw =
+        pay_service::chain_recovery::exercise_cooperative_signing_completion_for_test(
+            &state,
+            swap.id,
+            &pay_service::chain_recovery::NoRecoveryFaults,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed_raw, committed_raw);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let replay_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chain_swap_tx_attempts WHERE chain_swap_id = $1")
+            .bind(swap.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(replay_attempts, 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() {
     use pay_service::chain_swap_renegotiation::{
         RenegotiationDomainError, RenegotiationErrorClass, RenegotiationIdentity,
@@ -23182,6 +24212,24 @@ fn issue84_chain_creation_response(
     refund_key_index: u64,
     swap_id: &str,
 ) -> (ChainPair, HeightResponse, CreateChainResponse) {
+    let bitcoin_server_key = BoltzPublicKey::from_str(
+        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
+    )
+    .unwrap();
+    issue84_chain_creation_response_with_bitcoin_server(
+        claim_key_index,
+        refund_key_index,
+        swap_id,
+        bitcoin_server_key,
+    )
+}
+
+fn issue84_chain_creation_response_with_bitcoin_server(
+    claim_key_index: u64,
+    refund_key_index: u64,
+    swap_id: &str,
+    bitcoin_server_key: BoltzPublicKey,
+) -> (ChainPair, HeightResponse, CreateChainResponse) {
     const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
     let pair = issue84_chain_pair();
     let heights = issue84_chain_heights();
@@ -23192,10 +24240,6 @@ fn issue84_chain_creation_response(
     let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
     let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
     let hashlock = Preimage::from_swap_key(&claim_keypair).hash160;
-    let bitcoin_server_key = BoltzPublicKey::from_str(
-        "031c7f04c2d5c797ec5aa59b432ae3ccc8ffd5e9355db0b5faa91eb1e25a0453e8",
-    )
-    .unwrap();
     let liquid_server_key = BoltzPublicKey::from_str(
         "033009adf109ae3c4cb4fd6c1887b33e51d8fb5262ed2e4c6deb99fced3da9d01a",
     )
@@ -23285,6 +24329,14 @@ async fn spawn_issue84_chain_provider(
 ) -> Issue84ChainProvider {
     let (pair, heights, response) =
         issue84_chain_creation_response(claim_key_index, refund_key_index, swap_id);
+    spawn_issue84_chain_provider_fixture(pair, heights, response).await
+}
+
+async fn spawn_issue84_chain_provider_fixture(
+    pair: ChainPair,
+    heights: HeightResponse,
+    response: CreateChainResponse,
+) -> Issue84ChainProvider {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -23563,23 +24615,20 @@ fn issue88_state_with_scripted_boltz(
 #[tokio::test]
 async fn issue88_scripted_create_errors_cross_the_production_service_boundary() {
     let chain_transport = Arc::new(ScriptedBoltzTransport::new([
-        ScriptedBoltzStep::GetChainPairs(Ok(
-            serde_json::from_value::<GetChainPairsResponse>(json!({
+        ScriptedBoltzStep::GetChainPairs(Ok(serde_json::from_value::<GetChainPairsResponse>(
+            json!({
                 "BTC": {"L-BTC": issue84_chain_pair()},
                 "L-BTC": {}
-            }))
-            .unwrap(),
-        )),
+            }),
+        )
+        .unwrap())),
         ScriptedBoltzStep::GetHeight(Ok(issue84_chain_heights())),
         ScriptedBoltzStep::CreateChain(Box::new(Err(ScriptedBoltzError::HttpStatus(503)))),
     ]));
     let master =
         SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
-    let chain_service = BoltzService::with_transport_for_integration_tests(
-        master,
-        None,
-        chain_transport.clone(),
-    );
+    let chain_service =
+        BoltzService::with_transport_for_integration_tests(master, None, chain_transport.clone());
     let claim = chain_service.derive_swap_key(90_001).unwrap();
     let refund = chain_service.derive_swap_key(90_002).unwrap();
     assert!(matches!(
@@ -23604,11 +24653,8 @@ async fn issue88_scripted_create_errors_cross_the_production_service_boundary() 
     ]));
     let master =
         SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
-    let reverse_service = BoltzService::with_transport_for_integration_tests(
-        master,
-        None,
-        reverse_transport.clone(),
-    );
+    let reverse_service =
+        BoltzService::with_transport_for_integration_tests(master, None, reverse_transport.clone());
     let reverse_key = reverse_service.derive_swap_key(90_003).unwrap();
     assert!(matches!(
         reverse_service
@@ -23703,11 +24749,8 @@ async fn issue88_scripted_creation_kill_restart_never_duplicates_provider_or_los
     drop(state);
     pool.close().await;
     let restarted = test_pool().await;
-    let restarted_state = issue88_state_with_scripted_boltz(
-        restarted.clone(),
-        runtime,
-        transport.clone(),
-    );
+    let restarted_state =
+        issue88_state_with_scripted_boltz(restarted.clone(), runtime, transport.clone());
     let invoice = pay_service::db::get_invoice_by_id(&restarted, invoice.id)
         .await
         .unwrap()
