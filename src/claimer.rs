@@ -2439,8 +2439,13 @@ async fn claim_chain_swap_inner(
         return Err(AppError::ClaimError(CHAIN_TEST_GUARD_REJECTED.to_string()));
     }
 
-    let had_persisted_claim = swap.claim_tx_hex.is_some();
-    if !had_persisted_claim
+    let journal_mode = persisted_chain_claim_journal_mode(
+        swap.claim_tx_hex.as_deref(),
+        swap.claim_txid.as_deref(),
+    )?;
+    let had_persisted_claim =
+        journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact;
+    if journal_mode == PersistedChainClaimJournalMode::ConstructAndInsert
         && (fee_decision.is_none()
             || !liquid_claim_journal_authorized(had_persisted_claim, fee_record))
     {
@@ -2448,10 +2453,6 @@ async fn claim_chain_swap_inner(
             reason: LIQUID_FEE_DECISION_PENDING_REASON,
         });
     }
-    let journal_mode = persisted_chain_claim_journal_mode(
-        swap.claim_tx_hex.as_deref(),
-        swap.claim_txid.as_deref(),
-    )?;
     let persisted_claim_tx = if journal_mode == PersistedChainClaimJournalMode::DecodeAndLoadExact {
         let claim_tx_hex = swap
             .claim_tx_hex
