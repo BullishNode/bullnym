@@ -237,7 +237,7 @@ fn database_error_debug_never_exposes_quote_evidence() {
 }
 
 #[test]
-fn durable_fallback_gate_only_opens_after_explicit_decline() {
+fn renegotiation_durable_fallback_gate_only_opens_after_explicit_decline() {
     let accepted = operation(
         exact_identity(),
         RenegotiationState::Accepted,
@@ -286,7 +286,7 @@ fn durable_fallback_gate_only_opens_after_explicit_decline() {
 }
 
 #[test]
-fn restart_never_blindly_retries_an_unresolved_accept() {
+fn renegotiation_restart_never_blindly_retries_an_unresolved_accept() {
     assert_eq!(
         accept_requested_operation().restart_action(),
         RenegotiationRestartAction::ObserveUntilReconciled
@@ -298,7 +298,7 @@ fn restart_never_blindly_retries_an_unresolved_accept() {
 }
 
 #[test]
-fn old_or_repeated_ambiguity_never_becomes_decline_without_new_evidence() {
+fn renegotiation_old_or_repeated_ambiguity_never_becomes_decline_without_new_evidence() {
     let exhausted_looking = operation(
         exact_identity(),
         RenegotiationState::Ambiguous,
@@ -335,7 +335,7 @@ fn old_or_repeated_ambiguity_never_becomes_decline_without_new_evidence() {
 }
 
 #[test]
-fn uncertain_local_commit_is_a_durable_blocking_ambiguity() {
+fn renegotiation_uncertain_local_commit_is_a_durable_blocking_ambiguity() {
     let requested = accept_requested_operation();
     let transition = RenegotiationTransition::new(
         requested.identity.clone(),
@@ -373,7 +373,7 @@ fn uncertain_local_commit_is_a_durable_blocking_ambiguity() {
 }
 
 #[test]
-fn verified_acceptance_must_match_the_current_exact_identity() {
+fn renegotiation_verified_acceptance_must_match_the_current_exact_identity() {
     let current = accept_requested_operation();
     let different_identity = RenegotiationIdentity::new(
         current.identity.chain_swap_id,
@@ -412,7 +412,7 @@ fn verified_acceptance_must_match_the_current_exact_identity() {
 }
 
 #[test]
-fn changed_quote_redrive_has_exact_cas_and_retry_semantics() {
+fn renegotiation_changed_quote_redrive_has_exact_cas_and_retry_semantics() {
     let current = ambiguous_operation();
     let replacement = RenegotiationIdentity::new(
         current.identity.chain_swap_id,
