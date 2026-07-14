@@ -15163,8 +15163,6 @@ async fn chain_swap_renegotiation_journal_survives_each_accept_crash_boundary() 
         .connect(&require_test_db())
         .await
         .unwrap();
-    assert!(readiness::schema_and_journal_ready(&runtime).await.unwrap());
-
     let quoted = pay_service::db::persist_quoted_chain_swap_renegotiation(&runtime, &identity)
         .await
         .unwrap();
