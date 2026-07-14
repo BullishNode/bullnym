@@ -1285,67 +1285,7 @@ mod automatic_fallback_worklist_tests {
     }
 }
 
-/// The `refund_due` chain swap for an invoice, if any (Phase 4). Used by the
-/// customer self-claim endpoint to locate the swap whose BTC is refundable.
-/// There is at most one refundable chain swap per invoice in practice; newest
-/// first for determinism.
-pub async fn find_refund_due_chain_swap_for_invoice(
-    pool: &PgPool,
-    invoice_id: Uuid,
-) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-         FROM chain_swap_records \
-         WHERE invoice_id = $1 AND status = 'refund_due' \
-         ORDER BY created_at DESC \
-         LIMIT 1"
-    ))
-    .bind(invoice_id)
-    .fetch_optional(pool)
-    .await
-}
-
-/// The already-`refunded` chain swap for an invoice, if any (Phase 4). Lets the
-/// self-claim endpoint short-circuit a retried request idempotently — returning
-/// the recorded `refund_txid` instead of erroring because the swap is no longer
-/// `refund_due`.
-pub async fn get_refunded_chain_swap_for_invoice(
-    pool: &PgPool,
-    invoice_id: Uuid,
-) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-         FROM chain_swap_records \
-         WHERE invoice_id = $1 AND status = 'refunded' \
-         ORDER BY updated_at DESC \
-         LIMIT 1"
-    ))
-    .bind(invoice_id)
-    .fetch_optional(pool)
-    .await
-}
-
-/// The in-flight (`refunding`) chain swap for an invoice, if any (Phase 4).
-/// Lets the recovery endpoint return a distinct "recovery in progress" signal
-/// (rather than "not available") when a merchant retries during the broadcast
-/// window or while a stuck row awaits the reconciler backstop.
-pub async fn get_refunding_chain_swap_for_invoice(
-    pool: &PgPool,
-    invoice_id: Uuid,
-) -> Result<Option<ChainSwapRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ChainSwapRecord>(&format!(
-        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} \
-         FROM chain_swap_records \
-         WHERE invoice_id = $1 AND status = 'refunding' \
-         ORDER BY updated_at DESC \
-         LIMIT 1"
-    ))
-    .bind(invoice_id)
-    .fetch_optional(pool)
-    .await
-}
-
-/// Merchant-detection projection: one row per chain swap of this npub in a
+/// Merchant status projection: one row per chain swap of this npub in a
 /// recovery lifecycle state (`refund_due | refunding | refunded`), joined with
 /// minimal invoice context. Excludes ALL key material (`preimage_hex`,
 /// `claim_key_hex`, `refund_key_hex`, `boltz_response_json`, `boltz_swap_id`)
@@ -1356,8 +1296,8 @@ pub async fn get_refunding_chain_swap_for_invoice(
 pub struct RecoverableChainSwapRow {
     pub invoice_id: Uuid,
     /// Owning nym (SF1 guarantees this is set for any swap that can exist; a
-    /// NULL row is legacy/manual data the API path skips). Used to build the
-    /// per-nym recover URL client-side.
+    /// NULL row is legacy fixture data the API path skips). Included as
+    /// read-only ownership context.
     pub nym: Option<String>,
     pub status: String,
     pub user_lock_amount_sat: i64,
@@ -1428,30 +1368,6 @@ pub async fn list_recoverable_chain_swaps_for_npub(
     .bind(limit)
     .fetch_all(pool)
     .await
-}
-
-/// Records the customer's BTC refund address, FIRST-WRITE-WINS and immutable
-/// (G13/G14): the UPDATE only fires when `refund_address IS NULL` and the swap
-/// is still `refund_due`, so a bystander who knows the public invoice URL cannot
-/// overwrite an address already committed. Returns rows affected (1 = this call
-/// set it; 0 = already set, or the swap is no longer `refund_due`). The caller
-/// distinguishes "already set to the same address" (idempotent success) from
-/// "set to a different address" (reject) by reading the row.
-pub async fn set_chain_swap_refund_address(
-    pool: &PgPool,
-    id: Uuid,
-    refund_address: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE chain_swap_records \
-         SET refund_address = $2, updated_at = NOW() \
-         WHERE id = $1 AND refund_address IS NULL AND status = 'refund_due'",
-    )
-    .bind(id)
-    .bind(refund_address)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 /// Atomically transitions `refund_due` -> `refunding` (Phase 4 G12 double-payout

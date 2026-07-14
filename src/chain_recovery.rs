@@ -541,10 +541,9 @@ impl BitcoinRecoveryBroadcaster for EsploraRecoveryBroadcaster {
     }
 }
 
-/// Existing-obligation #85 entry. Unlike the authenticated diagnostic path,
-/// this performs no provider-status precheck and never selects an address from
-/// a late request. The complete independent #82 packet is rebuilt under the
-/// shared lock before construction and again immediately before broadcast.
+/// Existing-obligation #85 entry. This never selects an address from a request.
+/// The complete independent #82 packet is rebuilt under the shared lock before
+/// construction and again immediately before broadcast.
 pub(crate) async fn execute_journaled_recovery_automatically(
     state: &AppState,
     chain_swap_id: Uuid,
@@ -618,7 +617,7 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
         evidence,
         broadcaster,
         faults,
-        RecoveryExecutionMode::Manual,
+        RecoveryExecutionMode::InjectedHarness,
     )
     .await
 }
@@ -655,7 +654,7 @@ impl<'a> RecoveryConstructionFee<'a> {
 
 #[derive(Clone, Copy)]
 enum RecoveryExecutionMode<'a> {
-    Manual,
+    InjectedHarness,
     Automatic(&'a AppState),
 }
 
@@ -784,7 +783,7 @@ async fn execute_journaled_recovery_with_builder_fee(
         return Ok(attempt.txid);
     }
 
-    if matches!(mode, RecoveryExecutionMode::Manual) {
+    if matches!(mode, RecoveryExecutionMode::InjectedHarness) {
         let observed_token = attempt.observed_state_token();
         match reconcile_attempt_evidence(&attempt, evidence).await? {
             EvidenceDecision::ExpectedObserved(reason) => {
@@ -820,7 +819,7 @@ async fn execute_journaled_recovery_with_builder_fee(
                     source_txid = %source.txid,
                     source_vout = source.vout,
                     unexpected_spender = %spender,
-                    "Bitcoin recovery source has an unknown outspend; manual recovery stopped"
+                    "Bitcoin recovery source has an unknown outspend; injected harness stopped"
                 );
                 return Err(AppError::ClaimError(reason));
             }
@@ -874,7 +873,7 @@ async fn execute_journaled_recovery_with_builder_fee(
     faults.check(RecoveryFaultPoint::AfterBroadcastAttemptCommit)?;
 
     let dispatch = match mode {
-        RecoveryExecutionMode::Manual => RecoveryBroadcastDispatch::Network {
+        RecoveryExecutionMode::InjectedHarness => RecoveryBroadcastDispatch::Network {
             result: broadcaster
                 .broadcast(&attempt.raw_tx_hex, &attempt.txid)
                 .await,
@@ -995,7 +994,7 @@ async fn prepare_or_reload_attempt(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
     let automatic_authority = match mode {
-        RecoveryExecutionMode::Manual => None,
+        RecoveryExecutionMode::InjectedHarness => None,
         RecoveryExecutionMode::Automatic(state) => {
             let collected = collect_automatic_fallback_evidence_under_lock(
                 state,

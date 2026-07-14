@@ -25,17 +25,13 @@ pub enum AppError {
     /// invoice's owning nym. Same wire copy in both cases — never reveal
     /// existence cross-nym.
     InvoiceNotFound(String),
-    /// Merchant-submitted BTC recovery address is malformed or on the wrong
-    /// network (chain-swap merchant recovery). Inner string is operator-facing.
+    /// A recovery-policy BTC address is malformed, non-canonical, or on the
+    /// wrong network. Inner string is operator-facing.
     RecoveryAddressInvalid(String),
-    /// No recoverable (`refund_due`) chain swap for this invoice, the swap is no
-    /// longer recoverable, or the recovery address was already committed to a
-    /// different value (first-write-wins). Inner string is operator-facing.
+    /// Automatic recovery cannot proceed for this swap because its immutable
+    /// evidence or lifecycle state is not eligible. Inner string is
+    /// operator-facing.
     RecoveryNotAvailable(String),
-    /// A recovery is already in flight (`refunding`) for this invoice — distinct
-    /// from `RecoveryNotAvailable` so a retry after a client timeout is not
-    /// mistaken for "the funds never existed". Inner string is operator-facing.
-    RecoveryInProgress(String),
     /// Image upload rejected (magic-byte sniff fail, decode error, etc.).
     /// Inner string is operator-facing.
     ImageInvalid(String),
@@ -180,7 +176,6 @@ impl AppError {
             | Self::InvalidAmount(_)
             | Self::RecoveryAddressInvalid(_)
             | Self::RecoveryNotAvailable(_)
-            | Self::RecoveryInProgress(_)
             | Self::BitcoinAddressAlreadyUsed
             | Self::LiquidAddressAlreadyUsed
             | Self::AliasTaken => ErrorClass::Identity,
@@ -214,7 +209,6 @@ impl AppError {
             Self::InvoiceNotFound(_) => "InvoiceNotFound",
             Self::RecoveryAddressInvalid(_) => "RecoveryAddressInvalid",
             Self::RecoveryNotAvailable(_) => "RecoveryNotAvailable",
-            Self::RecoveryInProgress(_) => "RecoveryInProgress",
             Self::ImageInvalid(_) => "ImageInvalid",
             Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
             Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
@@ -272,7 +266,6 @@ impl std::fmt::Display for AppError {
             Self::InvoiceNotFound(id) => write!(f, "invoice not found: {id}"),
             Self::RecoveryAddressInvalid(reason) => write!(f, "recovery address invalid: {reason}"),
             Self::RecoveryNotAvailable(reason) => write!(f, "recovery not available: {reason}"),
-            Self::RecoveryInProgress(reason) => write!(f, "recovery in progress: {reason}"),
             Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
             Self::ImageDimensionsTooLarge { max } => {
                 write!(f, "image dimensions exceed {max}px cap")
@@ -348,8 +341,7 @@ impl IntoResponse for AppError {
             AppError::DonationPageNotFound(_) => "No donation page exists for this name.".into(),
             AppError::InvoiceNotFound(_) => "Invoice not found.".into(),
             AppError::RecoveryAddressInvalid(_) => "This is not a valid Bitcoin address for the correct network. Check the address and try again.".into(),
-            AppError::RecoveryNotAvailable(_) => "This payment has no recoverable on-chain funds, or a recovery was already completed to a different address.".into(),
-            AppError::RecoveryInProgress(_) => "A recovery is already in progress for this payment. Check back shortly.".into(),
+            AppError::RecoveryNotAvailable(_) => "Automatic Bitcoin recovery is not currently available for this payment.".into(),
             AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
             AppError::ImageDimensionsTooLarge { max } => format!(
                 "Image dimensions are too large. Maximum {max}×{max} pixels."

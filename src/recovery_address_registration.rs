@@ -549,7 +549,7 @@ mod tests {
         let timestamp = now_secs();
 
         let wrong_action_message = auth::build_la_v2_message(
-            "invoice-recover",
+            "invoice-create",
             &npub,
             "",
             &[RECOVERY_ADDRESS_REGISTRATION_VERSION_FIELD, MAINNET_P2WPKH],

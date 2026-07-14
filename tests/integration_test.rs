@@ -407,10 +407,6 @@ fn test_app(state: AppState) -> Router {
             get(invoice::list_recoverable_signed),
         )
         .route(
-            "/api/v1/:nym/invoices/:id/recover",
-            post(invoice::recover_chain_swap),
-        )
-        .route(
             "/api/v1/:nym/invoices/:id",
             axum::routing::delete(invoice::cancel_linked),
         )
@@ -671,25 +667,9 @@ fn sign_invoice_list_with_keypair(
     )
 }
 
-// Recoverable-swaps detection list: npub-keyed, empty nym, ZERO payload fields.
+// Recovery lifecycle status: npub-keyed, empty nym, ZERO payload fields.
 fn sign_invoice_recovery_list_with_keypair(keypair: &Keypair, npub: &str) -> (String, u64) {
     sign_la_action(keypair, "invoice-recovery-list", npub, "", &[])
-}
-
-fn sign_invoice_recover_with_keypair(
-    keypair: &Keypair,
-    npub: &str,
-    nym: &str,
-    invoice_id: &str,
-    btc_address: &str,
-) -> (String, u64) {
-    sign_la_action(
-        keypair,
-        "invoice-recover",
-        npub,
-        nym,
-        &[invoice_id, btc_address],
-    )
 }
 
 struct DonationSaveSignFields<'a> {
@@ -9109,81 +9089,6 @@ async fn closed_admission_rejects_absent_and_expired_lazy_lightning_without_muta
     cleanup_db(&pool).await;
 }
 
-#[tokio::test]
-async fn closed_admission_does_not_authorize_legacy_uncommitted_recovery() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-    let nym = "recoverclosed";
-    let (npub, keypair, invoice, swap) = seed_merchant_invoice_swap(
-        &pool,
-        nym,
-        "RECOVER_CLOSED_1",
-        JOURNAL_LOCKUP_ADDRESS,
-        1_010,
-        1_000,
-    )
-    .await;
-    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
-        .await
-        .unwrap();
-
-    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
-    let mut config = test_config();
-    config.boltz.api_url = boltz_url;
-    config.features.chain_swap_merchant_recovery = true;
-    let state = test_state_with_config(pool.clone(), config);
-    state.admission.set_workers_enabled(false);
-    let app = test_app(state);
-    let invoice_id = invoice.id.to_string();
-    let (signature, timestamp) = sign_invoice_recover_with_keypair(
-        &keypair,
-        &npub,
-        nym,
-        &invoice_id,
-        JOURNAL_DESTINATION_ADDRESS,
-    );
-
-    let (status, body) = post_json(
-        &app,
-        &format!("/api/v1/{nym}/invoices/{invoice_id}/recover"),
-        json!({
-            "npub": npub,
-            "timestamp": timestamp,
-            "signature": signature,
-            "btc_address": JOURNAL_DESTINATION_ADDRESS,
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({
-            "status": "ERROR",
-            "code": "RecoveryNotAvailable",
-            "reason": "This payment has no recoverable on-chain funds, or a recovery was already completed to a different address."
-        })
-    );
-    assert_eq!(
-        provider_calls.load(Ordering::SeqCst),
-        0,
-        "legacy recovery must be rejected before provider interaction"
-    );
-    let persisted = pay_service::db::get_chain_swap_by_id(&pool, swap.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(persisted.status, "refund_due");
-    assert_eq!(
-        persisted.refund_address, None,
-        "a late signed request cannot materialize an uncommitted destination"
-    );
-    provider_task.abort();
-    let _ = provider_task.await;
-
-    cleanup_db(&pool).await;
-}
-
 // --- Delete registration ---
 
 #[tokio::test]
@@ -16157,6 +16062,27 @@ const JOURNAL_LOCKUP_ADDRESS: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
 const JOURNAL_DESTINATION_ADDRESS: &str =
     "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
 
+/// Test-only fixture shortcut. Production materializes the immutable address
+/// atomically while scheduling automatic fallback; tests that exercise later
+/// journal states may seed that already-established fact directly.
+async fn set_test_refund_destination(pool: &PgPool, id: Uuid, address: &str) {
+    let result = sqlx::query(
+        "UPDATE chain_swap_records \
+         SET refund_address = $2, updated_at = NOW() \
+         WHERE id = $1 AND refund_address IS NULL AND status = 'refund_due'",
+    )
+    .bind(id)
+    .bind(address)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        result.rows_affected(),
+        1,
+        "fixture address must be seeded once"
+    );
+}
+
 fn bitcoin_fee_decision(rate: f64) -> pay_service::fee_policy::BitcoinFeeDecision {
     bitcoin_fee_decision_with_cap(rate, 500.0)
 }
@@ -16587,9 +16513,7 @@ async fn seed_recovery_journal_harness(
     pay_service::db::mark_chain_swap_refund_due(pool, swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(pool, swap.id, JOURNAL_DESTINATION_ADDRESS)
-        .await
-        .unwrap();
+    set_test_refund_destination(pool, swap.id, JOURNAL_DESTINATION_ADDRESS).await;
     let swap = pay_service::db::get_chain_swap_by_id(pool, swap.id)
         .await
         .unwrap()
@@ -18779,7 +18703,11 @@ async fn recoverable_list_shows_refund_due_swap() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["recovery_enabled"], false, "flag defaults OFF");
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(3),
+        "read-only response exposes only items, count, and has_more"
+    );
     assert_eq!(body["count"], 1, "body: {body}");
     assert_eq!(body["has_more"], false);
     let item = &body["items"][0];
@@ -18852,9 +18780,7 @@ async fn recoverable_list_returns_committed_address_and_txid() {
     pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(&pool, swap.id, committed)
-        .await
-        .unwrap();
+    set_test_refund_destination(&pool, swap.id, committed).await;
 
     // refund_due, address committed, no txid yet.
     let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
@@ -18913,13 +18839,12 @@ async fn recoverable_list_orders_and_uses_effective_amount() {
     pay_service::db::mark_chain_swap_refund_due(&pool, done_swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(
+    set_test_refund_destination(
         &pool,
         done_swap.id,
         "bc1qdonedest0000000000000000000000000",
     )
-    .await
-    .unwrap();
+    .await;
     pay_service::db::mark_chain_swap_refunding(&pool, done_swap.id)
         .await
         .unwrap();
@@ -19014,9 +18939,7 @@ async fn public_status_never_leaks_recovery_state() {
     pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
         .await
         .unwrap();
-    pay_service::db::set_chain_swap_refund_address(&pool, swap.id, canary)
-        .await
-        .unwrap();
+    set_test_refund_destination(&pool, swap.id, canary).await;
 
     for stage in ["refund_due", "refunding", "refunded"] {
         if stage == "refunding" {
@@ -19113,55 +19036,13 @@ async fn recoverable_list_auth_negative() {
 }
 
 #[tokio::test]
-async fn recoverable_list_reports_recovery_enabled_flag() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-    let (npub, keypair, _, swap) =
-        seed_merchant_invoice_swap(&pool, "recflag", "recflag-1", "bc1qflaglock", 1_010, 1_000)
-            .await;
-    pay_service::db::mark_chain_swap_refund_due(&pool, swap.id)
-        .await
-        .unwrap();
-
-    // Flag OFF (default): items still returned, recovery_enabled false.
-    let app_off = test_app(test_state(pool.clone()));
-    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
-    let (status, body) = get_path(
-        &app_off,
-        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["recovery_enabled"], false);
-    assert_eq!(
-        body["count"], 1,
-        "detection is always-on regardless of the flag"
-    );
-
-    // Flag ON: recovery_enabled true.
-    let mut config = test_config();
-    config.features.chain_swap_merchant_recovery = true;
-    let app_on = test_app(test_state_with_config(pool.clone(), config));
-    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
-    let (status, body) = get_path(
-        &app_on,
-        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["recovery_enabled"], true);
-
-    cleanup_db(&pool).await;
-}
-
-#[tokio::test]
 async fn recoverable_list_skips_nymless_swap() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
     // Good swap (has nym) + a legacy NULL-nym swap on a second invoice of the
-    // same merchant. The NULL-nym row is unusable (no recover URL) and must be
-    // silently skipped while the good one is still returned.
+    // same merchant. The NULL-nym row has no attributable recovery policy and
+    // must be silently skipped while the good one is still returned.
     let (npub, keypair, _, good_swap) = seed_merchant_invoice_swap(
         &pool,
         "recnymless",
