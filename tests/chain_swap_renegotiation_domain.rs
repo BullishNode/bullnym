@@ -1,8 +1,12 @@
 use std::str::FromStr;
 
 use pay_service::chain_swap_renegotiation::{
-    RenegotiationDomainError, RenegotiationErrorClass, RenegotiationIdentity, RenegotiationState,
-    RenegotiationTransition, RenegotiationTransitionKind,
+    ChainSwapRenegotiationOperation, ChangedQuoteRedrive, RenegotiationBlockReason,
+    RenegotiationDomainError, RenegotiationErrorClass, RenegotiationFallbackGate,
+    RenegotiationIdentity, RenegotiationReconciliationDecision,
+    RenegotiationReconciliationObservation, RenegotiationRestartAction, RenegotiationState,
+    RenegotiationTransition, RenegotiationTransitionKind, TransitionDisposition,
+    VerifiedRenegotiationAcceptance,
 };
 use pay_service::db::ChainSwapRenegotiationStoreError;
 use uuid::Uuid;
@@ -18,6 +22,84 @@ fn exact_identity() -> RenegotiationIdentity {
         1_721_000_001,
     )
     .unwrap()
+}
+
+const CREATED_AT: i64 = 1_721_000_002;
+const ACCEPT_REQUESTED_AT: i64 = 1_721_000_003;
+const AMBIGUOUS_AT: i64 = 1_721_000_004;
+const TERMINAL_AT: i64 = 1_721_000_005;
+
+fn operation(
+    identity: RenegotiationIdentity,
+    state: RenegotiationState,
+    accept_attempt_count: u32,
+    last_error_class: Option<RenegotiationErrorClass>,
+    version: u64,
+    accept_requested_at_unix: Option<i64>,
+    ambiguous_at_unix: Option<i64>,
+    terminal_response_digest: Option<String>,
+    terminal_observed_at_unix: Option<i64>,
+    updated_at_unix: i64,
+) -> ChainSwapRenegotiationOperation {
+    ChainSwapRenegotiationOperation::from_persisted_parts(
+        identity,
+        state,
+        accept_attempt_count,
+        last_error_class,
+        version,
+        accept_requested_at_unix,
+        ambiguous_at_unix,
+        terminal_response_digest,
+        terminal_observed_at_unix,
+        CREATED_AT,
+        updated_at_unix,
+    )
+    .unwrap()
+}
+
+fn quoted_operation() -> ChainSwapRenegotiationOperation {
+    operation(
+        exact_identity(),
+        RenegotiationState::Quoted,
+        0,
+        None,
+        1,
+        None,
+        None,
+        None,
+        None,
+        CREATED_AT,
+    )
+}
+
+fn accept_requested_operation() -> ChainSwapRenegotiationOperation {
+    operation(
+        exact_identity(),
+        RenegotiationState::AcceptRequested,
+        1,
+        None,
+        2,
+        Some(ACCEPT_REQUESTED_AT),
+        None,
+        None,
+        None,
+        ACCEPT_REQUESTED_AT,
+    )
+}
+
+fn ambiguous_operation() -> ChainSwapRenegotiationOperation {
+    operation(
+        exact_identity(),
+        RenegotiationState::Ambiguous,
+        1,
+        Some(RenegotiationErrorClass::Timeout),
+        3,
+        Some(ACCEPT_REQUESTED_AT),
+        Some(AMBIGUOUS_AT),
+        None,
+        None,
+        AMBIGUOUS_AT,
+    )
 }
 
 #[test]
@@ -147,5 +229,198 @@ fn database_error_debug_never_exposes_quote_evidence() {
     assert_eq!(
         error.to_string(),
         "renegotiation operation database request failed"
+    );
+}
+
+#[test]
+fn durable_fallback_gate_only_opens_after_explicit_decline() {
+    let accepted = operation(
+        exact_identity(),
+        RenegotiationState::Accepted,
+        1,
+        None,
+        3,
+        Some(ACCEPT_REQUESTED_AT),
+        None,
+        Some("cc".repeat(32)),
+        Some(TERMINAL_AT),
+        TERMINAL_AT,
+    );
+    let declined = operation(
+        exact_identity(),
+        RenegotiationState::Declined,
+        0,
+        None,
+        2,
+        None,
+        None,
+        Some("dd".repeat(32)),
+        Some(TERMINAL_AT),
+        TERMINAL_AT,
+    );
+
+    for (operation, reason) in [
+        (quoted_operation(), RenegotiationBlockReason::QuotePending),
+        (
+            accept_requested_operation(),
+            RenegotiationBlockReason::AcceptRequested,
+        ),
+        (ambiguous_operation(), RenegotiationBlockReason::Ambiguous),
+        (accepted, RenegotiationBlockReason::AcceptedAwaitingLiquid),
+    ] {
+        assert_eq!(
+            operation.fallback_gate(),
+            RenegotiationFallbackGate::Blocked(reason)
+        );
+        assert!(operation.fallback_gate().blocks_bitcoin_fallback());
+    }
+    assert_eq!(
+        declined.fallback_gate(),
+        RenegotiationFallbackGate::ExplicitlyDeclined
+    );
+    assert!(!declined.fallback_gate().blocks_bitcoin_fallback());
+}
+
+#[test]
+fn restart_never_blindly_retries_an_unresolved_accept() {
+    assert_eq!(
+        accept_requested_operation().restart_action(),
+        RenegotiationRestartAction::ObserveUntilReconciled
+    );
+    assert_eq!(
+        ambiguous_operation().restart_action(),
+        RenegotiationRestartAction::ReobserveAndRevalidateQuote
+    );
+}
+
+#[test]
+fn old_or_repeated_ambiguity_never_becomes_decline_without_new_evidence() {
+    let exhausted_looking = operation(
+        exact_identity(),
+        RenegotiationState::Ambiguous,
+        i32::MAX as u32,
+        Some(RenegotiationErrorClass::UnknownProviderOutcome),
+        1_000_000,
+        Some(ACCEPT_REQUESTED_AT),
+        Some(AMBIGUOUS_AT),
+        None,
+        None,
+        AMBIGUOUS_AT,
+    );
+
+    assert_eq!(
+        exhausted_looking.fallback_gate(),
+        RenegotiationFallbackGate::Blocked(RenegotiationBlockReason::Ambiguous)
+    );
+    assert_eq!(
+        exhausted_looking
+            .reconcile(RenegotiationReconciliationObservation::NoNewEvidence)
+            .unwrap(),
+        RenegotiationReconciliationDecision::Observe
+    );
+    assert_eq!(
+        exhausted_looking
+            .reconcile(
+                RenegotiationReconciliationObservation::DefinitelyUnavailable {
+                    terminal_response_digest: "ee".repeat(32),
+                }
+            )
+            .unwrap(),
+        RenegotiationReconciliationDecision::Observe
+    );
+}
+
+#[test]
+fn verified_acceptance_must_match_the_current_exact_identity() {
+    let current = accept_requested_operation();
+    let different_identity = RenegotiationIdentity::new(
+        current.identity.chain_swap_id,
+        current.identity.quoted_actual_amount_sat,
+        "cc".repeat(32),
+        current.identity.quote_observed_at_unix + 1,
+        "issue38-v2",
+        "dd".repeat(32),
+        current.identity.policy_validated_at_unix + 1,
+    )
+    .unwrap();
+    let evidence = VerifiedRenegotiationAcceptance::new(
+        different_identity.clone(),
+        different_identity.quoted_actual_amount_sat,
+        different_identity.quote_response_digest(),
+        "ee".repeat(32),
+    )
+    .unwrap();
+
+    assert_eq!(
+        current
+            .reconcile(RenegotiationReconciliationObservation::AcceptanceConfirmed { evidence })
+            .unwrap_err(),
+        RenegotiationDomainError::AcceptanceEvidenceMismatch
+    );
+    assert_eq!(
+        VerifiedRenegotiationAcceptance::new(
+            exact_identity(),
+            exact_identity().quoted_actual_amount_sat + 1,
+            exact_identity().quote_response_digest(),
+            "ff".repeat(32),
+        )
+        .unwrap_err(),
+        RenegotiationDomainError::AcceptanceEvidenceMismatch
+    );
+}
+
+#[test]
+fn changed_quote_redrive_has_exact_cas_and_retry_semantics() {
+    let current = ambiguous_operation();
+    let replacement = RenegotiationIdentity::new(
+        current.identity.chain_swap_id,
+        current.identity.quoted_actual_amount_sat + 500,
+        "cc".repeat(32),
+        1_721_000_010,
+        "issue38-v2",
+        "dd".repeat(32),
+        1_721_000_011,
+    )
+    .unwrap();
+    let redrive = ChangedQuoteRedrive::new(
+        current.identity.clone(),
+        replacement.clone(),
+        current.version,
+    )
+    .unwrap();
+    assert_eq!(
+        redrive.plan(&current).unwrap(),
+        TransitionDisposition::Apply
+    );
+
+    let accepted_request = operation(
+        replacement,
+        RenegotiationState::AcceptRequested,
+        current.accept_attempt_count + 1,
+        current.last_error_class,
+        current.version + 1,
+        Some(1_721_000_012),
+        current.ambiguous_at_unix,
+        None,
+        None,
+        1_721_000_012,
+    );
+    assert_eq!(
+        redrive.plan(&accepted_request).unwrap(),
+        TransitionDisposition::ExactRetry
+    );
+
+    let stale = ChangedQuoteRedrive::new(
+        current.identity.clone(),
+        redrive.replacement_identity.clone(),
+        current.version - 1,
+    )
+    .unwrap();
+    assert_eq!(
+        stale.plan(&current).unwrap_err(),
+        RenegotiationDomainError::StaleVersion {
+            expected: current.version - 1,
+            actual: current.version,
+        }
     );
 }

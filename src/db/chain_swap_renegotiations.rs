@@ -37,6 +37,14 @@ pub enum RecordAcceptedRenegotiationOutcome {
     Busy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordDeclinedRenegotiationOutcome {
+    Applied(ChainSwapRenegotiationOperation),
+    ExactRetry(ChainSwapRenegotiationOperation),
+    Busy,
+    LiquidPathActive,
+}
+
 pub enum ChainSwapRenegotiationStoreError {
     Database(sqlx::Error),
     Domain(RenegotiationDomainError),
@@ -158,6 +166,7 @@ struct RenegotiationOperationDbRow {
 
 #[derive(sqlx::FromRow)]
 struct RenegotiationParentDbRow {
+    status: String,
     renegotiated_server_lock_amount_sat: Option<i64>,
 }
 
@@ -402,7 +411,7 @@ pub async fn record_accepted_chain_swap_renegotiation(
     }
 
     let parent = sqlx::query_as::<_, RenegotiationParentDbRow>(
-        "SELECT renegotiated_server_lock_amount_sat \
+        "SELECT status, renegotiated_server_lock_amount_sat \
            FROM chain_swap_records WHERE id = $1 FOR UPDATE",
     )
     .bind(identity.chain_swap_id)
@@ -514,6 +523,67 @@ pub async fn mark_chain_swap_renegotiation_declined(
     transition_chain_swap_renegotiation(pool, &transition).await
 }
 
+/// Serialize a positively decoded provider refusal against a late Liquid lock
+/// or claim. The caller must classify the provider response before entering;
+/// ambiguous outcomes are not accepted by the domain transition.
+pub async fn record_definite_declined_chain_swap_renegotiation(
+    pool: &PgPool,
+    identity: &RenegotiationIdentity,
+    expected_version: u64,
+    terminal_response_digest: impl Into<String>,
+) -> Result<RecordDeclinedRenegotiationOutcome, ChainSwapRenegotiationStoreError> {
+    let transition = RenegotiationTransition::new(
+        identity.clone(),
+        expected_version,
+        RenegotiationTransitionKind::MarkDeclined {
+            terminal_response_digest: terminal_response_digest.into(),
+        },
+    )?;
+    let mut tx = pool.begin().await?;
+    let lock_key = format!("chain-claim:{}", identity.chain_swap_id);
+    let got_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&lock_key)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !got_lock {
+        tx.rollback().await?;
+        return Ok(RecordDeclinedRenegotiationOutcome::Busy);
+    }
+
+    let parent = sqlx::query_as::<_, RenegotiationParentDbRow>(
+        "SELECT status, renegotiated_server_lock_amount_sat \
+           FROM chain_swap_records WHERE id = $1 FOR UPDATE",
+    )
+    .bind(identity.chain_swap_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ChainSwapRenegotiationStoreError::NotFound {
+        chain_swap_id: identity.chain_swap_id,
+    })?;
+    let current = load_operation_for_update(&mut tx, identity.chain_swap_id).await?;
+
+    if parent.renegotiated_server_lock_amount_sat.is_some() || liquid_path_is_active(&parent.status)
+    {
+        tx.commit().await?;
+        return Ok(RecordDeclinedRenegotiationOutcome::LiquidPathActive);
+    }
+
+    let disposition = current.plan_transition(&transition)?;
+    let operation = if disposition == TransitionDisposition::Apply {
+        execute_transition_update(&mut tx, &transition).await?
+    } else {
+        current
+    };
+    tx.commit().await?;
+    Ok(match disposition {
+        TransitionDisposition::Apply => RecordDeclinedRenegotiationOutcome::Applied(operation),
+        TransitionDisposition::ExactRetry => {
+            RecordDeclinedRenegotiationOutcome::ExactRetry(operation)
+        }
+    })
+}
+
 pub(crate) async fn transition_chain_swap_renegotiation(
     pool: &PgPool,
     transition: &RenegotiationTransition,
@@ -617,5 +687,17 @@ fn transition_update_sql(kind: &RenegotiationTransitionKind) -> String {
           WHERE chain_swap_id = $1 \
             AND version = $2 \
         RETURNING {OPERATION_COLUMNS}"
+    )
+}
+
+fn liquid_path_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "server_lock_mempool"
+            | "server_lock_confirmed"
+            | "claiming"
+            | "claimed"
+            | "claim_failed"
+            | "claim_stuck"
     )
 }

@@ -373,7 +373,10 @@ impl ChainSwapRenegotiationOperation {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_persisted_parts(
+    /// Rehydrate a durable operation through the same shape validation used by
+    /// the PostgreSQL adapter. This is also the pure state-machine boundary for
+    /// focused lifecycle tests and non-database recovery adapters.
+    pub fn from_persisted_parts(
         identity: RenegotiationIdentity,
         state: RenegotiationState,
         accept_attempt_count: u32,
