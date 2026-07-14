@@ -934,11 +934,73 @@ SELECT (
                 AND relation.relkind = 'r'
                 AND trigger_info.tgname = required.trigger_name
                 AND trigger_info.tgtype = required.trigger_type::SMALLINT
+                AND trigger_info.tgnargs = 0
+                AND trigger_info.tgattr::TEXT = ''
+                AND trigger_info.tgqual IS NULL
+                AND trigger_info.tgconstraint = 0
+                AND NOT trigger_info.tgdeferrable
+                AND NOT trigger_info.tginitdeferred
                 AND NOT trigger_info.tgisinternal
-                AND trigger_info.tgenabled IN ('O', 'A')
+                AND trigger_info.tgenabled = 'O'
                 AND function_info.proname = required.function_name
                 AND function_info.pronargs = 0
          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM (VALUES
+              ('enforce_chain_swap_renegotiation_insert',
+                  'd4e7f872cc933a4179535eb8b726f3b3b381b98bef4f811b3c233160df1af5f9'),
+              ('enforce_chain_swap_renegotiation_update',
+                  '4e8e004ca1509192f13c56a58ebbac285bf7bc8699954431b97bdcdfcd05d222'),
+              ('reject_chain_swap_renegotiation_delete',
+                  'cf155d3f1e2fd1429049e21e0a00535de72d4459dee453f1149b9144cc6e25c9')
+          ) required(function_name, body_sha256)
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM pg_proc function_info
+               JOIN pg_namespace namespace
+                 ON namespace.oid = function_info.pronamespace
+               JOIN pg_language language_info
+                 ON language_info.oid = function_info.prolang
+              WHERE namespace.nspname = 'public'
+                AND function_info.proname = required.function_name
+                AND function_info.pronargs = 0
+                AND function_info.prokind = 'f'
+                AND function_info.prorettype = 'trigger'::REGTYPE
+                AND language_info.lanname = 'plpgsql'
+                AND function_info.provolatile = 'v'
+                AND NOT function_info.proisstrict
+                AND NOT function_info.prosecdef
+                AND NOT function_info.proleakproof
+                AND function_info.proparallel = 'u'
+                AND function_info.proconfig IS NULL
+                AND encode(
+                    sha256(convert_to(function_info.prosrc, 'UTF8')), 'hex'
+                ) = required.body_sha256
+         )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM information_schema.columns column_info
+         WHERE column_info.table_schema = 'public'
+           AND column_info.table_name = 'chain_swap_renegotiation_operations'
+           AND (
+               column_info.is_identity <> 'NO'
+               OR column_info.is_generated <> 'NEVER'
+               OR column_info.column_default LIKE 'nextval(%'
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_depend dependency
+          JOIN pg_class sequence_info ON sequence_info.oid = dependency.objid
+         WHERE dependency.classid = 'pg_class'::REGCLASS
+           AND dependency.refclassid = 'pg_class'::REGCLASS
+           AND dependency.refobjid =
+                 'public.chain_swap_renegotiation_operations'::REGCLASS
+           AND dependency.deptype IN ('a', 'i')
+           AND sequence_info.relkind = 'S'
     )
     AND EXISTS (
         SELECT 1
