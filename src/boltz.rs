@@ -43,6 +43,26 @@ pub struct ChainSwapResult {
     pub creation_terms: ValidatedChainSwapCreationTerms,
 }
 
+/// Fresh provider hints consumed by the chain-swap evidence reducer.
+///
+/// Neither field is chain authority. The status selects a reducer branch and
+/// the optional transaction id may only select a transaction independently
+/// found by the configured Bitcoin evidence source.
+pub struct FreshChainSwapProviderHint {
+    status: String,
+    user_lock_txid: Option<String>,
+}
+
+impl FreshChainSwapProviderHint {
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn user_lock_txid(&self) -> Option<&str> {
+        self.user_lock_txid.as_deref()
+    }
+}
+
 /// Complete non-secret provider evidence approved before a payer can see the
 /// Bitcoin address. The database copies this packet into immutable columns.
 #[derive(Debug)]
@@ -493,6 +513,32 @@ impl BoltzService {
     /// Shared provider-limit reader. Calls on this value are in-memory only.
     pub fn provider_limits(&self) -> &crate::provider_limits_runtime::ProviderLimitsRuntime {
         &self.provider_limits
+    }
+
+    /// Re-read the two provider hints needed by an under-lock chain-swap
+    /// decision. A partial provider response is not returned: callers must
+    /// classify any status/transaction transport or decode failure as
+    /// incomplete evidence.
+    pub async fn fresh_chain_swap_provider_hint(
+        &self,
+        swap_id: &str,
+    ) -> Result<FreshChainSwapProviderHint, AppError> {
+        let api = self.api.as_ref().ok_or_else(|| {
+            AppError::BoltzError("Boltz client unavailable for chain-swap evidence".to_string())
+        })?;
+        let (swap, transactions) = tokio::join!(api.get_swap(swap_id), api.get_chain_txs(swap_id));
+        let swap = swap.map_err(|error| {
+            AppError::BoltzError(format!("fetch fresh chain-swap status: {error}"))
+        })?;
+        let transactions = transactions.map_err(|error| {
+            AppError::BoltzError(format!("fetch fresh chain-swap transactions: {error}"))
+        })?;
+        Ok(FreshChainSwapProviderHint {
+            status: swap.status,
+            user_lock_txid: transactions
+                .user_lock
+                .map(|lock| lock.transaction.id),
+        })
     }
 
     async fn fetch_btc_to_lbtc_reverse_pair(

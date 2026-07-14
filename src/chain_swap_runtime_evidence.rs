@@ -26,6 +26,9 @@ use crate::AppState;
 
 /// Owned snapshot handoff for the runtime reducer.
 pub struct CollectedPendingExpiryEvidence {
+    /// Fresh provider status, or `None` when either provider read failed.
+    /// This selects a reducer branch but is never chain authority.
+    pub provider_status: Option<String>,
     pub evidence: ChainSwapEvidence,
     pub primary_bitcoin: Option<PrimaryBitcoinSourceProjectionV1>,
 }
@@ -79,6 +82,9 @@ pub async fn collect_pending_expiry_evidence_under_lock(
     });
     let liquid_script = exact_liquid_server_lock_script(swap).ok();
 
+    let provider_read = state
+        .boltz
+        .fresh_chain_swap_provider_hint(&swap.boltz_swap_id);
     let bitcoin_read = async {
         let adapter = state.bitcoin_lockup_witness_adapter.as_deref()?;
         let target = primary_target.as_ref()?;
@@ -95,16 +101,32 @@ pub async fn collect_pending_expiry_evidence_under_lock(
         } else {
             PrimaryBitcoinSourceAuthorityV1::UntrustedSingleBackend
         };
-        project_primary_bitcoin_source_snapshot_v1(target, &snapshot, None, authority).ok()
+        Some((snapshot, authority))
     };
     let liquid_read = async {
         let backend = state.utxo_backend.as_deref()?;
         let script = liquid_script.as_ref()?;
         backend.script_history(script).await.ok()
     };
-    let (primary_bitcoin, liquid_history) = tokio::join!(bitcoin_read, liquid_read);
+    let (provider_hint, bitcoin_snapshot, liquid_history) =
+        tokio::join!(provider_read, bitcoin_read, liquid_read);
+    let provider_hint = provider_hint.ok();
+    let primary_bitcoin = match (primary_target.as_ref(), bitcoin_snapshot) {
+        (Some(target), Some((snapshot, authority))) => {
+            project_primary_bitcoin_source_snapshot_v1(
+                target,
+                &snapshot,
+                provider_hint
+                    .as_ref()
+                    .and_then(|hint| hint.user_lock_txid()),
+                authority,
+            )
+            .ok()
+        }
+        _ => None,
+    };
 
-    if primary_bitcoin.is_none() {
+    if provider_hint.is_none() || primary_bitcoin.is_none() {
         evidence.quality = EvidenceQuality::Incomplete;
     }
     match liquid_history {
@@ -130,6 +152,7 @@ pub async fn collect_pending_expiry_evidence_under_lock(
     }
 
     Ok(CollectedPendingExpiryEvidence {
+        provider_status: provider_hint.map(|hint| hint.status().to_owned()),
         evidence,
         primary_bitcoin,
     })
