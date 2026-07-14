@@ -454,6 +454,9 @@ pub async fn insert_liquid_merchant_settlement_journal(
             .ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?,
     };
     assert_liquid_journal_matches(&row, journal, purpose)?;
+    if !liquid_attempt_is_broadcastable(&row.status) {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
     if !matches!(
         row.fee_authority.as_ref(),
         Some(persisted) if fee_authority_matches(persisted, &fee_authority)
@@ -488,6 +491,9 @@ pub async fn load_exact_liquid_merchant_settlement_journal(
     .ok_or(MerchantSettlementRepositoryError::MissingJournal)?
     .try_into()?;
     assert_liquid_journal_matches(&row, journal, purpose)?;
+    if !liquid_attempt_is_broadcastable(&row.status) {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
     if row.fee_authority.is_none() {
         return Err(MerchantSettlementRepositoryError::MissingJournal);
     }
@@ -636,6 +642,10 @@ fn fee_authority_matches(
         && persisted.policy_floor_sat_vb.to_bits() == expected.policy_floor_sat_vb.to_bits()
         && persisted.policy_cap_sat_vb.to_bits() == expected.policy_cap_sat_vb.to_bits()
         && persisted.policy_version == expected.policy_version
+}
+
+fn liquid_attempt_is_broadcastable(status: &str) -> bool {
+    matches!(status, "constructed" | "broadcast_ambiguous" | "broadcast")
 }
 
 fn validate_new_liquid_journal(
@@ -1993,6 +2003,16 @@ mod tests {
                 unrecorded_rebroadcast_update_required(true, status),
                 Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
             ));
+        }
+    }
+
+    #[test]
+    fn liquid_redrive_accepts_only_broadcastable_attempt_states() {
+        for status in ["constructed", "broadcast_ambiguous", "broadcast"] {
+            assert!(liquid_attempt_is_broadcastable(status));
+        }
+        for status in ["confirmed", "finalized", "integrity_hold"] {
+            assert!(!liquid_attempt_is_broadcastable(status));
         }
     }
 
