@@ -470,12 +470,24 @@ impl fmt::Debug for CooperativeSigningFeeAuthority {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CooperativeSigningSource {
     txid: String,
     vout: u32,
     amount_sat: u64,
     script_pubkey_hex: String,
+}
+
+impl fmt::Debug for CooperativeSigningSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CooperativeSigningSource")
+            .field("txid", &"<redacted>")
+            .field("vout", &"<redacted>")
+            .field("amount_sat", &"<redacted>")
+            .field("script_pubkey_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CooperativeSigningSource {
@@ -2444,6 +2456,22 @@ mod tests {
         assert!(!diagnostic.contains(&"11".repeat(24)));
         assert!(!diagnostic.contains(&"22".repeat(32)));
         assert!(!diagnostic.contains(&"33".repeat(32)));
+    }
+
+    #[test]
+    fn cooperative_source_debug_redacts_exact_prevout_and_value() {
+        let source = CooperativeSigningSource::new(
+            "11".repeat(32),
+            7,
+            123_456,
+            format!("5120{}", "22".repeat(32)),
+        )
+        .unwrap();
+        let diagnostic = format!("{source:?}");
+        assert!(diagnostic.contains("<redacted>"));
+        assert!(!diagnostic.contains(&"11".repeat(32)));
+        assert!(!diagnostic.contains("123456"));
+        assert!(!diagnostic.contains(&"22".repeat(32)));
     }
 
     #[test]

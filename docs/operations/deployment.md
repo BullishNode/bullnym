@@ -356,6 +356,16 @@ the exact late response or become `superseded` at unilateral timeout. The
 generic deploy preflight verifies this boundary and refuses automatic rollback
 across schema 057.
 
+Do not rotate `BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_ID` or
+`BULLNYM_RECOVERY_MANIFEST_ENCRYPTION_KEY_HEX`, change the build target
+platform/architecture, or change the pinned `secp256k1` MuSig package while
+any cooperative-signing row is nonterminal (`prepared`, `requested`,
+`ambiguous`, or `response_received`). Serialized secret nonces are valid only
+with the same protected key, libsecp version, and platform. Drain each row to
+`completed`, `integrity_hold`, or timeout `superseded` using the original
+artifact first; never re-POST an ambiguous request or reuse its nonce with a
+different provider nonce/session.
+
 ## Reproducing a prior artifact
 
 1. Check out the Bullnym `build_commit` from its preserved release record.
