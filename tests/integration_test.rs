@@ -21301,6 +21301,22 @@ impl AtomicManifestPersistenceFixture {
         pay_service::db::ChainSwapRecord,
         pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
     > {
+        let faults = pay_service::swap_manifest_persistence::NoChainSwapPersistenceFaults;
+        self.persist_with_faults(pool, store, manifest_id, policy, &faults)
+            .await
+    }
+
+    async fn persist_with_faults(
+        &self,
+        pool: &PgPool,
+        store: &RecoveryManifestStore,
+        manifest_id: uuid::Uuid,
+        policy: Option<&pay_service::swap_manifest::MerchantPolicyReferencesV1>,
+        faults: &dyn pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultInjector,
+    ) -> Result<
+        pay_service::db::ChainSwapRecord,
+        pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
+    > {
         let swap = pay_service::db::NewChainSwapRecord {
             invoice_id: self.invoice_id,
             nym: Some(&self.nym),
@@ -21343,7 +21359,7 @@ impl AtomicManifestPersistenceFixture {
             merchant_liquid_destination: &terms.merchant_liquid_destination,
             merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
         };
-        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap(
+        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap_with_faults(
             pool,
             store,
             pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapRequest {
@@ -21359,6 +21375,7 @@ impl AtomicManifestPersistenceFixture {
                     &self.pinned_signer,
                 ),
             },
+            faults,
         )
         .await
     }
@@ -21417,6 +21434,44 @@ impl AtomicManifestPersistenceFixture {
     }
 }
 
+struct PausingChainSwapPersistenceFault {
+    point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PausingChainSwapPersistenceFault {
+    fn new(point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint) -> Self {
+        Self {
+            point,
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.reached.notified())
+            .await
+            .expect("chain-swap persistence did not reach the injected kill boundary");
+    }
+}
+
+#[async_trait]
+impl pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultInjector
+    for PausingChainSwapPersistenceFault
+{
+    async fn check(
+        &self,
+        point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint,
+    ) -> Result<(), pay_service::swap_manifest_persistence::InjectedChainSwapPersistenceFault> {
+        if point == self.point {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery() {
     let pool = test_pool().await;
@@ -21464,6 +21519,172 @@ async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery()
     );
 
     cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_creation_kill_restart_converges_at_every_persistence_boundary() {
+    use pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint as Point;
+
+    let cases = [
+        (Point::AfterCanonicalSwapCommit, "killcanonical", 11_001),
+        (
+            Point::AfterManifestLedgerWriteBeforeCommit,
+            "killledgerwrite",
+            11_101,
+        ),
+        (
+            Point::AfterManifestLedgerCommitBeforeDelivery,
+            "killledgercommit",
+            11_201,
+        ),
+        (
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn,
+            "killafterack",
+            11_301,
+        ),
+    ];
+
+    for (point, nym, child_index) in cases {
+        let pool = test_pool().await;
+        cleanup_db(&pool).await;
+        let fixture =
+            Arc::new(AtomicManifestPersistenceFixture::seed(&pool, nym, child_index).await);
+        let manifest_id = uuid::Uuid::new_v4();
+        let backend = InstrumentedManifestObjectStore::new();
+        let store = coordinator_manifest_store(backend);
+        let fault = Arc::new(PausingChainSwapPersistenceFault::new(point));
+
+        let task_pool = pool.clone();
+        let task_store = store.clone();
+        let task_fixture = fixture.clone();
+        let task_fault = fault.clone();
+        let attempt = tokio::spawn(async move {
+            task_fixture
+                .persist_with_faults(
+                    &task_pool,
+                    &task_store,
+                    manifest_id,
+                    None,
+                    task_fault.as_ref(),
+                )
+                .await
+        });
+
+        fault.wait_until_reached().await;
+        attempt.abort();
+        assert!(
+            attempt.await.unwrap_err().is_cancelled(),
+            "the injected process-loss task was not cancelled at {point:?}"
+        );
+
+        // Closing every old-pool connection models a process restart and also
+        // makes a pre-commit cancellation's transaction rollback observable
+        // before the restarted process reads any state.
+        pool.close().await;
+        let restarted = test_pool().await;
+        let retained =
+            pay_service::db::get_chain_swap_by_boltz_id(&restarted, &fixture.boltz_swap_id)
+                .await
+                .unwrap()
+                .expect("a post-provider process kill erased the canonical swap");
+        assert_eq!(retained.status, "pending");
+        assert_eq!(
+            retained.boltz_response_json,
+            fixture.canonical_provider_response
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+                .fetch_one(&restarted)
+                .await
+                .unwrap(),
+            1,
+            "restart recovery duplicated the provider-created swap at {point:?}"
+        );
+
+        let deliveries_before = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+            .await
+            .unwrap();
+        match point {
+            Point::AfterCanonicalSwapCommit | Point::AfterManifestLedgerWriteBeforeCommit => {
+                assert!(
+                    deliveries_before.is_empty(),
+                    "an uncommitted ledger row survived process loss at {point:?}"
+                );
+            }
+            Point::AfterManifestLedgerCommitBeforeDelivery => {
+                assert_eq!(deliveries_before.len(), 1);
+                assert_eq!(deliveries_before[0].manifest_id, manifest_id);
+                assert_eq!(deliveries_before[0].delivery_state, "pending");
+            }
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn => {
+                assert_eq!(deliveries_before.len(), 1);
+                assert_eq!(deliveries_before[0].manifest_id, manifest_id);
+                assert_eq!(deliveries_before[0].delivery_state, "delivered");
+            }
+        }
+
+        let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store.clone());
+        let acquisition = ChainSwapCreationPermit::acquire(&restarted, &runtime).await;
+        match point {
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn => {
+                acquisition
+                    .expect("an acknowledged creation should need no restart repair")
+                    .release()
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                assert_eq!(
+                    acquisition.unwrap_err(),
+                    ChainSwapCreationPermitError::ManifestRepairCompleted,
+                    "restart must repair/resume without crossing the provider boundary"
+                );
+                ChainSwapCreationPermit::acquire(&restarted, &runtime)
+                    .await
+                    .expect("a clean attempt after restart repair should receive the permit")
+                    .release()
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let deliveries = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].chain_swap_id, retained.id);
+        assert_eq!(deliveries[0].delivery_state, "delivered");
+        assert!(deliveries[0].delivered_at_unix.is_some());
+        assert_eq!(
+            pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+                &restarted,
+                fixture.invoice_id,
+                25_000,
+            )
+            .await
+            .unwrap()
+            .map(|candidate| candidate.id),
+            Some(retained.id),
+            "restart did not converge to one payer-exposable canonical swap"
+        );
+        assert!(
+            pay_service::db::list_pending_manifest_deliveries(&restarted)
+                .await
+                .unwrap()
+                .is_empty(),
+            "restart left a pending manifest obligation at {point:?}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+                .fetch_one(&restarted)
+                .await
+                .unwrap(),
+            1
+        );
+
+        cleanup_db(&restarted).await;
+        restarted.close().await;
+    }
 }
 
 #[tokio::test]
