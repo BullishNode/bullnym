@@ -16398,6 +16398,37 @@ async fn merchant_settlement_cas_persists_confirm_finalize_and_reorg_demote() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let (swap_id, txid) = seed_liquid_merchant_settlement_attempt(&pool, "cas").await;
+    sqlx::query("UPDATE chain_swap_records SET status = 'claim_failed' WHERE id = $1")
+        .bind(swap_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let non_claiming_start = pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
+        &pool,
+        swap_id,
+        &txid,
+        "liquid_claim",
+    )
+    .await;
+    assert!(matches!(
+        non_claiming_start,
+        Err(pay_service::db::MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+    ));
+    let refused_attempts: i32 = sqlx::query_scalar(
+        "SELECT broadcast_attempts FROM chain_swap_tx_attempts \
+          WHERE chain_swap_id = $1 AND txid = $2",
+    )
+    .bind(swap_id)
+    .bind(&txid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refused_attempts, 0);
+    sqlx::query("UPDATE chain_swap_records SET status = 'claiming' WHERE id = $1")
+        .bind(swap_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     pay_service::db::mark_liquid_merchant_settlement_broadcast_started(
         &pool,
         swap_id,
