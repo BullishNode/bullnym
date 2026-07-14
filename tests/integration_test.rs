@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -78,9 +78,9 @@ use bitcoin::script::Builder;
 use bitcoin::ScriptBuf;
 use boltz_client::network::{BitcoinChain, LiquidChain, Network};
 use boltz_client::swaps::boltz::{
-    ChainPair, ChainSwapDetails, CreateChainResponse, GetChainPairsResponse, GetSwapResponse,
-    HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair, Side, SwapTree,
-    SwapType,
+    ChainPair, ChainSwapDetails, CreateChainResponse, CreateReverseResponse, GetChainPairsResponse,
+    GetSwapResponse, HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair,
+    Side, SwapTree, SwapType,
 };
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
@@ -475,14 +475,16 @@ fn fresh_bolt11(amount_sat: u64) -> String {
         .to_string()
 }
 
-fn fresh_replacement_bolt11(amount_sat: u64) -> String {
-    let private_key = SecretKey::from_slice(&[44; 32]).unwrap();
-    let payment_hash = bitcoin::hashes::sha256::Hash::hash(b"bullnym-terminal-replacement-test");
+fn fresh_bolt11_for_payment_hash(
+    amount_sat: u64,
+    payment_hash: bitcoin::hashes::sha256::Hash,
+) -> String {
+    let private_key = SecretKey::from_slice(&[45; 32]).unwrap();
     InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
-        .description("Bullnym terminal replacement test".into())
+        .description("Bullnym protocol-valid reverse fixture".into())
         .payment_hash(payment_hash)
-        .payment_secret(PaymentSecret([26; 32]))
+        .payment_secret(PaymentSecret([27; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp()))
         .expiry_time(Duration::from_secs(3_600))
         .min_final_cltv_expiry_delta(144)
@@ -1122,17 +1124,92 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
 
 #[derive(Clone)]
 struct SuccessfulReverseBarrierState {
-    response: Value,
+    swap_id: String,
+    invoice_amount_sat: u64,
+    next_key_index: Arc<AtomicU64>,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
+    invoices: Arc<Mutex<Vec<String>>>,
     request_barrier: Arc<Barrier>,
     release_barrier: Arc<Barrier>,
+}
+
+fn protocol_valid_reverse_response(
+    swap_id: &str,
+    invoice: String,
+    claim_public_key: BoltzPublicKey,
+    preimage: &Preimage,
+    onchain_amount_sat: u64,
+) -> CreateReverseResponse {
+    const BLINDING_KEY: &str = "0ede1f5a31e6abc5ed59d0ae20c6089782de3296229bf361fbd3e4fe6babf22f";
+    const TIMEOUT_HEIGHT: u32 = 2_000_000;
+
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let refund_keypair = master.derive_swapkey(9_999).unwrap();
+    let refund_public_key = BoltzPublicKey::new(refund_keypair.public_key());
+    let claim_script = Builder::new()
+        .push_opcode(OP_SIZE)
+        .push_int(32)
+        .push_opcode(OP_EQUALVERIFY)
+        .push_opcode(OP_HASH160)
+        .push_slice(preimage.hash160.to_byte_array())
+        .push_opcode(OP_EQUALVERIFY)
+        .push_x_only_key(&claim_public_key.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
+    let refund_script = Builder::new()
+        .push_x_only_key(&refund_public_key.inner.x_only_public_key().0)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .push_lock_time(LockTime::from_consensus(TIMEOUT_HEIGHT))
+        .push_opcode(OP_CLTV)
+        .into_script();
+    let blinding_key = ZKKeyPair::from_seckey_str(&ZKSecp256k1::new(), BLINDING_KEY).unwrap();
+    let lockup_address = LBtcSwapScript {
+        swap_type: SwapType::ReverseSubmarine,
+        side: None,
+        funding_addrs: None,
+        hashlock: preimage.hash160,
+        receiver_pubkey: claim_public_key,
+        locktime: boltz_client::elements::LockTime::from_consensus(TIMEOUT_HEIGHT),
+        sender_pubkey: refund_public_key,
+        blinding_key,
+    }
+    .to_address(LiquidChain::Liquid)
+    .unwrap()
+    .to_string();
+
+    CreateReverseResponse {
+        id: swap_id.to_owned(),
+        invoice: Some(invoice),
+        swap_tree: SwapTree {
+            claim_leaf: Leaf {
+                output: hex::encode(claim_script.as_bytes()),
+                version: 0xc4,
+            },
+            refund_leaf: Leaf {
+                output: hex::encode(refund_script.as_bytes()),
+                version: 0xc4,
+            },
+            covenant_claim_leaf: None,
+        },
+        lockup_address,
+        refund_public_key,
+        timeout_block_height: TIMEOUT_HEIGHT,
+        onchain_amount: onchain_amount_sat,
+        blinding_key: Some(BLINDING_KEY.into()),
+    }
 }
 
 struct SuccessfulReverseBarrierServer {
     base_url: String,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
+    invoices: Arc<Mutex<Vec<String>>>,
     request_barrier: Arc<Barrier>,
     release_barrier: Arc<Barrier>,
     task: tokio::task::JoinHandle<()>,
@@ -1151,6 +1228,15 @@ impl SuccessfulReverseBarrierServer {
             .expect("Boltz reverse response handler did not reach the release barrier");
     }
 
+    async fn latest_invoice(&self) -> String {
+        self.invoices
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("Boltz reverse fixture did not produce an invoice")
+    }
+
     async fn shutdown(self) {
         self.task.abort();
         let _ = self.task.await;
@@ -1162,17 +1248,50 @@ async fn successful_reverse_barrier_handler(
     axum::Json(request): axum::Json<Value>,
 ) -> axum::Json<Value> {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    let mut response = state.response.clone();
-    response["onchainAmount"] = request.get("onchainAmount").cloned().unwrap_or(Value::Null);
+    let key_index = state.next_key_index.fetch_add(1, Ordering::SeqCst);
+    let master = SwapMasterKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        None,
+        Network::Mainnet,
+    )
+    .unwrap();
+    let claim_keypair = master.derive_swapkey(key_index).unwrap();
+    let claim_public_key = BoltzPublicKey::new(claim_keypair.public_key());
+    let preimage = Preimage::from_swap_key(&claim_keypair);
+    let claim_public_key_string = claim_public_key.to_string();
+    let preimage_hash_string = preimage.sha256.to_string();
+    assert_eq!(
+        request["claimPublicKey"].as_str(),
+        Some(claim_public_key_string.as_str()),
+        "fixture key index did not match the production request"
+    );
+    assert_eq!(
+        request["preimageHash"].as_str(),
+        Some(preimage_hash_string.as_str()),
+        "fixture preimage did not match the production request"
+    );
+
+    let invoice = fresh_bolt11_for_payment_hash(state.invoice_amount_sat, preimage.sha256);
+    let response = protocol_valid_reverse_response(
+        &state.swap_id,
+        invoice.clone(),
+        claim_public_key,
+        &preimage,
+        request["onchainAmount"]
+            .as_u64()
+            .expect("fixed checkout request onchainAmount"),
+    );
+    state.invoices.lock().await.push(invoice);
     state.requests.lock().await.push(request);
     state.request_barrier.wait().await;
     state.release_barrier.wait().await;
-    axum::Json(response)
+    axum::Json(serde_json::to_value(response).unwrap())
 }
 
 async fn spawn_successful_reverse_barrier_server(
     swap_id: &str,
-    bolt11: &str,
+    invoice_amount_sat: u64,
+    first_key_index: u64,
 ) -> SuccessfulReverseBarrierServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1180,23 +1299,16 @@ async fn spawn_successful_reverse_barrier_server(
     let address = listener.local_addr().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let invoices = Arc::new(Mutex::new(Vec::new()));
     let request_barrier = Arc::new(Barrier::new(2));
     let release_barrier = Arc::new(Barrier::new(2));
     let state = SuccessfulReverseBarrierState {
-        response: json!({
-            "id": swap_id,
-            "invoice": bolt11,
-            "swapTree": {
-                "claimLeaf": {"output": "51", "version": 192},
-                "refundLeaf": {"output": "51", "version": 192}
-            },
-            "lockupAddress": "lq1qqtestreversebarrier",
-            "refundPublicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-            "timeoutBlockHeight": 2_000_000,
-            "onchainAmount": 1
-        }),
+        swap_id: swap_id.to_owned(),
+        invoice_amount_sat,
+        next_key_index: Arc::new(AtomicU64::new(first_key_index)),
         calls: calls.clone(),
         requests: requests.clone(),
+        invoices: invoices.clone(),
         request_barrier: request_barrier.clone(),
         release_barrier: release_barrier.clone(),
     };
@@ -1212,6 +1324,7 @@ async fn spawn_successful_reverse_barrier_server(
         base_url: format!("http://{address}"),
         calls,
         requests,
+        invoices,
         request_barrier,
         release_barrier,
         task,
@@ -8776,9 +8889,15 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .await
         .unwrap();
 
-    let bolt11 = fresh_bolt11(1_050);
-    let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_CANCEL_RETRY_1", &bolt11).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&admin)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "LAZY_OFFER_CANCEL_RETRY_1",
+        1_050,
+        first_key_index,
+    )
+    .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let constrained = constrained_test_pool(1, None);
@@ -8808,6 +8927,7 @@ async fn cancelled_lazy_offer_does_not_leak_its_session_advisory_lock() {
         .await
         .expect("retry could not acquire the single-connection pool after cancellation")
         .expect("lazy-offer retry task failed");
+    let bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pr"], bolt11);
     assert_eq!(body["lightning_amount_sat"], 1_050);
@@ -8990,10 +9110,13 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
     .await
     .unwrap();
 
-    let replacement_bolt11 = fresh_replacement_bolt11(1_050);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider = spawn_successful_reverse_barrier_server(
         "LAZY_OFFER_TERMINAL_REPLACEMENT_1",
-        &replacement_bolt11,
+        1_050,
+        first_key_index,
     )
     .await;
     let mut config = test_config();
@@ -9021,6 +9144,7 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
         .await
         .expect("replacement offer request did not finish")
         .expect("replacement offer request task failed");
+    let replacement_bolt11 = provider.latest_invoice().await;
     assert_eq!(offer_status, StatusCode::OK, "{offer}");
     assert_eq!(offer["pr"], replacement_bolt11);
     assert_eq!(offer["lightning_amount_sat"], 1_050);
@@ -9146,9 +9270,12 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
     assert_eq!(before.status, "partially_paid");
     assert_eq!(before.presentation_status.as_deref(), Some("partial"));
 
-    let stale_bolt11 = fresh_bolt11(649);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", &stale_bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_PARTIAL_RACE_1", 649, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9171,6 +9298,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_partial_ter
         .await
         .expect("lazy offer request did not finish after provider release")
         .expect("lazy offer request task failed");
+    let stale_bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert!(body.get("pr").is_none(), "stale offer escaped: {body}");
@@ -9245,9 +9373,12 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
     .await
     .unwrap();
 
-    let bolt11 = fresh_bolt11(649);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", &bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_COMMIT_ORDER_1", 649, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9282,6 +9413,7 @@ async fn lazy_lightning_final_row_lock_orders_terminalization_after_offer_commit
         .await
         .expect("offer request did not finish after commit release")
         .expect("offer request task failed");
+    let bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["pr"], bolt11);
     assert_eq!(body["lightning_amount_sat"], 649);
@@ -9323,9 +9455,12 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
         .await
         .unwrap();
 
-    let stale_bolt11 = fresh_bolt11(1_050);
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
     let provider =
-        spawn_successful_reverse_barrier_server("LAZY_OFFER_EXPIRY_RACE_1", &stale_bolt11).await;
+        spawn_successful_reverse_barrier_server("LAZY_OFFER_EXPIRY_RACE_1", 1_050, first_key_index)
+            .await;
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let app = test_app(test_state_with_config(pool.clone(), config));
@@ -9357,6 +9492,7 @@ async fn lazy_lightning_provider_result_is_recorded_but_hidden_after_hard_expiry
         .await
         .expect("lazy offer request did not finish after provider release")
         .expect("lazy offer request task failed");
+    let stale_bolt11 = provider.latest_invoice().await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["code"], "ServiceUnavailable");
     assert!(body.get("pr").is_none(), "stale offer escaped: {body}");
