@@ -24,6 +24,14 @@ pub const MAX_BOLTZ_RESTORE_INDEX_BYTES: usize = 4 * 1024;
 
 const BOLTZ_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
 const JSON_MEDIA_TYPE: &str = "application/json";
+// `SwapMasterKey::get_master_xpub` returns the already-derived swap-account
+// xpub. Boltz must therefore append each direct child index to `m`, rather than
+// applying its unrelated default path below that account key.
+const BOLTZ_RESTORE_DERIVATION_PATH: &str = "m";
+// Boltz bounds xpub restore scans to 1..=150 keys. Use the full bounded window:
+// Bullnym durably reserves keys before provider I/O, so failed calls leave
+// permanent sparse indexes that a smaller/default window could truncate.
+const BOLTZ_RESTORE_GAP_LIMIT: u32 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoltzRestoreEndpoint {
@@ -130,7 +138,8 @@ impl std::error::Error for BoltzRestoreFetchError {}
 ///
 /// Production construction accepts only HTTPS. Redirects are disabled so the
 /// xpub cannot be forwarded to a provider-selected location. The adapter sends
-/// only the public master xpub; it never serializes `SwapMasterKey` itself.
+/// only the public master xpub and its fixed public scan contract; it never
+/// serializes `SwapMasterKey` itself.
 pub struct BoltzRestoreFetcher {
     client: reqwest::Client,
     records_url: Url,
@@ -160,7 +169,7 @@ impl BoltzRestoreFetcher {
         swap_master_key: &SwapMasterKey,
     ) -> Result<ValidatedBoltzRestoreSet, BoltzRestoreFetchError> {
         let xpub = swap_master_key.get_master_xpub().to_string();
-        let request = RestoreRequest { xpub: &xpub };
+        let request = RestoreRequest::for_swap_account_xpub(&xpub);
 
         let records: Vec<SwapRestoreResponse> = self
             .post_json(
@@ -289,8 +298,21 @@ impl BoltzRestoreFetcher {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RestoreRequest<'a> {
     xpub: &'a str,
+    derivation_path: &'static str,
+    gap_limit: u32,
+}
+
+impl<'a> RestoreRequest<'a> {
+    fn for_swap_account_xpub(xpub: &'a str) -> Self {
+        Self {
+            xpub,
+            derivation_path: BOLTZ_RESTORE_DERIVATION_PATH,
+            gap_limit: BOLTZ_RESTORE_GAP_LIMIT,
+        }
+    }
 }
 
 fn normalize_base_url(raw: &str, allow_loopback_http: bool) -> Result<Url, BoltzRestoreFetchError> {
@@ -491,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_only_the_public_xpub_and_validates_the_exact_pinned_snapshot() {
+    async fn sends_exact_account_relative_contract_to_both_restore_endpoints() {
         let (records, index) = valid_responses();
         let (server, client) = fixture_client(records, index).await;
         let master = master_key();
@@ -502,20 +524,45 @@ mod tests {
         assert_eq!(validated.records.len(), 2);
         assert_eq!(validated.max_child_index, Some(102));
         let requests = server.requests();
+        let exact_request = json!({
+            "xpub": &expected_xpub,
+            "derivationPath": "m",
+            "gapLimit": 150,
+        });
         assert_eq!(
-            requests
-                .iter()
-                .map(|(endpoint, _)| *endpoint)
-                .collect::<Vec<_>>(),
-            [BoltzRestoreEndpoint::Records, BoltzRestoreEndpoint::Index]
+            requests,
+            [
+                (BoltzRestoreEndpoint::Records, exact_request.clone()),
+                (BoltzRestoreEndpoint::Index, exact_request),
+            ]
         );
-        for (_, request) in requests {
-            assert_eq!(request, json!({ "xpub": &expected_xpub }));
+        for (_, request) in server.requests() {
             let encoded = serde_json::to_string(&request).unwrap();
             assert!(!encoded.contains("mnemonic"));
             assert!(!encoded.contains("xprv"));
             assert!(!encoded.contains(TEST_MNEMONIC));
         }
+    }
+
+    #[test]
+    fn restore_request_cannot_fall_back_to_provider_derivation_defaults() {
+        let request =
+            serde_json::to_value(RestoreRequest::for_swap_account_xpub("public-account-xpub"))
+                .unwrap();
+
+        assert_eq!(
+            request,
+            json!({
+                "xpub": "public-account-xpub",
+                "derivationPath": BOLTZ_RESTORE_DERIVATION_PATH,
+                "gapLimit": BOLTZ_RESTORE_GAP_LIMIT,
+            })
+        );
+        assert_eq!(request["derivationPath"], "m");
+        assert_eq!(request["gapLimit"], 150);
+        assert!(request.get("derivation_path").is_none());
+        assert!(request.get("gap_limit").is_none());
+        assert!(!request.to_string().contains("m/44/0/0/0"));
     }
 
     #[tokio::test]
