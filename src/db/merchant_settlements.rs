@@ -782,6 +782,26 @@ pub async fn load_merchant_settlement_work_item(
             )?,
         ),
     };
+    let service_snapshot = service.snapshot();
+    let lifecycle_linked_replacement = service_snapshot
+        .lifecycle
+        .linked_replacement
+        .as_ref()
+        .map(|(parent, child)| (parent.as_str(), child.as_str()));
+    validate_checkpoint_journal_family(
+        service_snapshot.lifecycle.journal_txid.as_str(),
+        lifecycle_linked_replacement,
+        &original_journal,
+        linked_replacement.as_ref(),
+    )?;
+    for retained in &service_snapshot.retained {
+        validate_retained_journal_commitment(
+            &retained.evidence.snapshot(),
+            lifecycle_linked_replacement,
+            &original_journal,
+            linked_replacement.as_ref(),
+        )?;
+    }
     let approved_destination = approved_from_journal(&original_journal)?;
     let liquid_blinding_key_hex = match context.path() {
         MerchantSettlementPath::LiquidClaim => Some(
@@ -792,7 +812,7 @@ pub async fn load_merchant_settlement_work_item(
         ),
         MerchantSettlementPath::BitcoinRecovery => None,
     };
-    let previous_confirmation = previous_confirmation(service.lifecycle().snapshot());
+    let previous_confirmation = previous_confirmation(service_snapshot.lifecycle);
     tx.commit().await?;
     Ok(Some(MerchantSettlementWorkItem {
         checkpoint_version,
@@ -1493,6 +1513,68 @@ fn select_journals(
     Ok((original, replacement))
 }
 
+fn validate_checkpoint_journal_family(
+    lifecycle_journal_txid: &str,
+    lifecycle_linked_replacement: Option<(&str, &str)>,
+    original: &MerchantSettlementJournalRow,
+    selected_replacement: Option<&MerchantSettlementJournalRow>,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    if lifecycle_journal_txid != original.txid {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    let Some((parent_txid, child_txid)) = lifecycle_linked_replacement else {
+        // A replacement may already be journaled before its independently
+        // observed lineage is adopted into the durable lifecycle checkpoint.
+        return Ok(());
+    };
+    let replacement =
+        selected_replacement.ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?;
+    if parent_txid != original.txid
+        || replacement.replaces_txid.as_deref() != Some(parent_txid)
+        || replacement.txid != child_txid
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
+}
+
+fn validate_retained_journal_commitment(
+    evidence: &ConfirmedMerchantOutputEvidenceSnapshot,
+    lifecycle_linked_replacement: Option<(&str, &str)>,
+    original: &MerchantSettlementJournalRow,
+    selected_replacement: Option<&MerchantSettlementJournalRow>,
+) -> Result<(), MerchantSettlementRepositoryError> {
+    if evidence.journal_txid != original.txid {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    let journal = if evidence.txid == original.txid && !evidence.linked_replacement {
+        original
+    } else if let Some((parent_txid, child_txid)) = lifecycle_linked_replacement {
+        let replacement = selected_replacement
+            .ok_or(MerchantSettlementRepositoryError::ImmutableIdentityConflict)?;
+        if !evidence.linked_replacement
+            || parent_txid != original.txid
+            || child_txid != replacement.txid
+            || replacement.replaces_txid.as_deref() != Some(parent_txid)
+            || evidence.txid != replacement.txid
+        {
+            return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+        }
+        replacement
+    } else {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    };
+    if evidence.destination_address != journal.destination_address
+        || evidence.destination_script_hex != journal.destination_script_hex
+        || evidence.asset != journal.asset
+        || u64::try_from(evidence.actual_amount_sat).ok() != Some(journal.destination_amount_sat)
+        || evidence.vout != journal.destination_vout
+    {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
+    Ok(())
+}
+
 fn approved_from_journal(
     journal: &MerchantSettlementJournalRow,
 ) -> Result<ApprovedMerchantDestination, MerchantSettlementRepositoryError> {
@@ -2020,6 +2102,36 @@ mod tests {
         }
     }
 
+    fn retained_evidence(
+        journal: &MerchantSettlementJournalRow,
+        journal_txid: &str,
+        linked_replacement: bool,
+    ) -> ConfirmedMerchantOutputEvidenceSnapshot {
+        let family_key = format!(
+            "chain_swap_merchant_output:{}:{journal_txid}",
+            journal.chain_swap_id
+        );
+        ConfirmedMerchantOutputEvidenceSnapshot {
+            invoice_id: Uuid::from_u128(4),
+            chain_swap_id: journal.chain_swap_id,
+            boltz_swap_id: "merchant-settlement-unit".to_owned(),
+            path: MerchantSettlementPath::LiquidClaim,
+            event_key: format!("{family_key}:{}:{}", journal.txid, journal.destination_vout),
+            family_key,
+            journal_txid: journal_txid.to_owned(),
+            txid: journal.txid.clone(),
+            destination_address: journal.destination_address.clone(),
+            destination_script_hex: journal.destination_script_hex.clone(),
+            asset: journal.asset.clone(),
+            actual_amount_sat: i64::try_from(journal.destination_amount_sat).unwrap(),
+            vout: journal.destination_vout,
+            confirmations: 1,
+            block_height: 1,
+            block_hash: BLOCK_A.to_owned(),
+            linked_replacement,
+        }
+    }
+
     #[test]
     fn new_liquid_journal_requires_exact_chain_claim_fee_authority() {
         assert!(matches!(
@@ -2110,6 +2222,127 @@ mod tests {
             next_checkpoint_version(i64::MAX),
             Err(MerchantSettlementRepositoryError::InvalidCheckpoint)
         ));
+    }
+
+    #[test]
+    fn checkpoint_journal_binding_requires_exact_adopted_lineage() {
+        const CHILD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        const OTHER: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+        let original = journal("liquid_claim", TXID);
+        let replacement = journal("liquid_claim_replacement", CHILD);
+        let wrong_original = journal("liquid_claim", CHILD);
+
+        assert!(matches!(
+            validate_checkpoint_journal_family(TXID, None, &wrong_original, None),
+            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+        ));
+        assert!(validate_checkpoint_journal_family(TXID, None, &original, None).is_ok());
+        assert!(
+            validate_checkpoint_journal_family(TXID, None, &original, Some(&replacement)).is_ok()
+        );
+        assert!(matches!(
+            validate_checkpoint_journal_family(TXID, Some((TXID, CHILD)), &original, None),
+            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+        ));
+
+        let mut wrong_parent = replacement.clone();
+        wrong_parent.replaces_txid = Some(OTHER.to_owned());
+        assert!(matches!(
+            validate_checkpoint_journal_family(
+                TXID,
+                Some((TXID, CHILD)),
+                &original,
+                Some(&wrong_parent)
+            ),
+            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+        ));
+        let wrong_child = journal("liquid_claim_replacement", OTHER);
+        assert!(matches!(
+            validate_checkpoint_journal_family(
+                TXID,
+                Some((TXID, CHILD)),
+                &original,
+                Some(&wrong_child)
+            ),
+            Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+        ));
+        assert!(validate_checkpoint_journal_family(
+            TXID,
+            Some((TXID, CHILD)),
+            &original,
+            Some(&replacement)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_journal_binding_rejects_retained_value_substitution() {
+        const CHILD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        let original = journal("liquid_claim", TXID);
+        let replacement = journal("liquid_claim_replacement", CHILD);
+        let valid = retained_evidence(&original, TXID, false);
+        assert!(validate_retained_journal_commitment(&valid, None, &original, None).is_ok());
+
+        let mut corruptions = Vec::new();
+        let mut amount = valid.clone();
+        amount.actual_amount_sat += 1;
+        corruptions.push(amount);
+        let mut vout = valid.clone();
+        vout.vout += 1;
+        corruptions.push(vout);
+        let mut address = valid.clone();
+        address.destination_address.push_str("-wrong");
+        corruptions.push(address);
+        let mut script = valid.clone();
+        script.destination_script_hex = "0014dcba".to_owned();
+        corruptions.push(script);
+        let mut asset = valid;
+        asset.asset = MerchantAsset::Liquid(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+        );
+        corruptions.push(asset);
+        for corrupted in corruptions {
+            assert!(matches!(
+                validate_retained_journal_commitment(&corrupted, None, &original, None),
+                Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+            ));
+        }
+
+        let linked = retained_evidence(&replacement, TXID, true);
+        assert!(validate_retained_journal_commitment(
+            &linked,
+            Some((TXID, CHILD)),
+            &original,
+            Some(&replacement)
+        )
+        .is_ok());
+        let original_history = retained_evidence(&original, TXID, false);
+        assert!(validate_retained_journal_commitment(
+            &original_history,
+            Some((TXID, CHILD)),
+            &original,
+            Some(&replacement)
+        )
+        .is_ok());
+
+        let child_without_link_flag = retained_evidence(&replacement, TXID, false);
+        let original_with_link_flag = retained_evidence(&original, TXID, true);
+        let wrong_journal = retained_evidence(&original, CHILD, false);
+        for corrupted in [
+            child_without_link_flag,
+            original_with_link_flag,
+            wrong_journal,
+        ] {
+            assert!(matches!(
+                validate_retained_journal_commitment(
+                    &corrupted,
+                    Some((TXID, CHILD)),
+                    &original,
+                    Some(&replacement)
+                ),
+                Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict)
+            ));
+        }
     }
 
     #[test]
