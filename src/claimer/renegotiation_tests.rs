@@ -45,6 +45,8 @@ struct FakeProvider {
     accept_results: Mutex<VecDeque<Result<String, ChainSwapQuoteProviderError>>>,
     calls: Mutex<Vec<ProviderCall>>,
     accept_barrier: Option<Arc<tokio::sync::Barrier>>,
+    accept_started_barrier: Option<Arc<tokio::sync::Barrier>>,
+    accept_release_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl FakeProvider {
@@ -57,11 +59,23 @@ impl FakeProvider {
             accept_results: Mutex::new(accept_results.into_iter().collect()),
             calls: Mutex::new(Vec::new()),
             accept_barrier: None,
+            accept_started_barrier: None,
+            accept_release_barrier: None,
         }
     }
 
     fn with_accept_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
         self.accept_barrier = Some(barrier);
+        self
+    }
+
+    fn with_accept_gates(
+        mut self,
+        started: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.accept_started_barrier = Some(started);
+        self.accept_release_barrier = Some(release);
         self
     }
 
@@ -103,6 +117,12 @@ impl ChainSwapRenegotiationProvider for FakeProvider {
             .pop_front()
             .expect("unexpected accept_quote call");
         if let Some(barrier) = self.accept_barrier.as_ref() {
+            barrier.wait().await;
+        }
+        if let Some(barrier) = self.accept_started_barrier.as_ref() {
+            barrier.wait().await;
+        }
+        if let Some(barrier) = self.accept_release_barrier.as_ref() {
             barrier.wait().await;
         }
         result
@@ -166,6 +186,11 @@ impl MemoryStore {
 
     fn accepted_parent_amount_sat(&self) -> Option<u64> {
         self.state.lock().unwrap().accepted_parent_amount_sat
+    }
+
+    fn operation_and_parent(&self) -> (Option<ChainSwapRenegotiationOperation>, Option<u64>) {
+        let state = self.state.lock().unwrap();
+        (state.operation.clone(), state.accepted_parent_amount_sat)
     }
 
     fn events(&self) -> Vec<RenegotiationState> {
@@ -1216,6 +1241,185 @@ async fn duplicate_workers_converge_and_accepted_replay_makes_no_provider_call()
     .await
     .unwrap());
     assert_eq!(provider.calls(), calls_after_race);
+}
+
+#[tokio::test]
+async fn duplicate_runtime_and_server_lock_race_converge_with_at_most_one_provider_mutation() {
+    let swap = chain_swap(1_000);
+    let evidence = primary_mismatch(900, 1_000);
+    let server_lock = VerifiedLiquidServerLockProgression::new(
+        swap.id,
+        890,
+        "liquid:server-lock:race",
+        CHANGED_QUOTE_DIGEST,
+        current_unix_time().unwrap(),
+    )
+    .unwrap();
+
+    // Provider-first ordering: one worker owns the durable intent and blocks
+    // inside its one POST. A duplicate worker observes the fresh intent and
+    // does not mutate the provider; verified Liquid progression atomically
+    // wins before the first response is released.
+    let provider_first_store = MemoryStore::default();
+    let accept_started = Arc::new(tokio::sync::Barrier::new(2));
+    let accept_release = Arc::new(tokio::sync::Barrier::new(2));
+    let provider_first = FakeProvider::new(
+        [Ok(quote(890, QUOTE_DIGEST))],
+        [Ok(TERMINAL_DIGEST.to_string())],
+    )
+    .with_accept_gates(accept_started.clone(), accept_release.clone());
+    assert!(try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &provider_first_store,
+        &provider_first,
+        &FaultObserver::fail_at(RenegotiationCheckpoint::QuotePersisted),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .is_err());
+    assert!(provider_first_store
+        .operation()
+        .unwrap()
+        .fallback_gate()
+        .blocks_bitcoin_fallback());
+
+    let owning_worker = try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &provider_first_store,
+        &provider_first,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    );
+    let reordered_work_and_reconciliation = async {
+        accept_started.wait().await;
+        let requested = provider_first_store.operation().unwrap();
+        assert_eq!(requested.state, RenegotiationState::AcceptRequested);
+        assert!(requested.fallback_gate().blocks_bitcoin_fallback());
+        let duplicate = try_renegotiate_chain_swap_with_verified_mismatch_using(
+            &provider_first_store,
+            &provider_first,
+            &FaultObserver::never_fail(),
+            &swap,
+            "transaction.lockupFailed",
+            &evidence,
+        )
+        .await;
+        let reconciled = reconcile_renegotiation_from_verified_server_lock_using(
+            &provider_first_store,
+            &swap,
+            &server_lock,
+        )
+        .await;
+        accept_release.wait().await;
+        (duplicate, reconciled)
+    };
+    let (owning_worker, (duplicate, reconciled)) =
+        tokio::join!(owning_worker, reordered_work_and_reconciliation);
+    assert!(owning_worker.unwrap());
+    assert!(duplicate.unwrap());
+    assert_eq!(
+        reconciled.unwrap(),
+        ServerLockRenegotiationOutcome::LiquidPathWon
+    );
+    assert_eq!(
+        provider_first
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, ProviderCall::AcceptQuote { .. }))
+            .count(),
+        1
+    );
+    let (operation, parent_amount) = provider_first_store.operation_and_parent();
+    let operation = operation.unwrap();
+    assert_eq!(operation.state, RenegotiationState::Accepted);
+    assert_eq!(operation.version, 3);
+    assert_eq!(operation.accept_attempt_count, 1);
+    assert_eq!(parent_amount, Some(890));
+    assert!(operation.fallback_gate().blocks_bitcoin_fallback());
+    assert_eq!(
+        provider_first_store.events(),
+        vec![
+            RenegotiationState::Quoted,
+            RenegotiationState::AcceptRequested,
+            RenegotiationState::Accepted,
+        ]
+    );
+
+    // Server-first ordering: crash after the durable request but before POST,
+    // adopt verified Liquid progression, then replay duplicate runtime work.
+    // Both workers converge without any provider mutation.
+    let server_first_store = MemoryStore::default();
+    let server_first = FakeProvider::new(
+        [Ok(quote(890, QUOTE_DIGEST))],
+        Vec::<Result<String, ChainSwapQuoteProviderError>>::new(),
+    );
+    assert!(try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &server_first_store,
+        &server_first,
+        &FaultObserver::fail_at(RenegotiationCheckpoint::AcceptRequested),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    )
+    .await
+    .is_err());
+    let requested = server_first_store.operation().unwrap();
+    assert_eq!(requested.state, RenegotiationState::AcceptRequested);
+    assert!(requested.fallback_gate().blocks_bitcoin_fallback());
+    assert_eq!(
+        reconcile_renegotiation_from_verified_server_lock_using(
+            &server_first_store,
+            &swap,
+            &server_lock,
+        )
+        .await
+        .unwrap(),
+        ServerLockRenegotiationOutcome::LiquidPathWon
+    );
+    let first_replay = try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &server_first_store,
+        &server_first,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    );
+    let second_replay = try_renegotiate_chain_swap_with_verified_mismatch_using(
+        &server_first_store,
+        &server_first,
+        &FaultObserver::never_fail(),
+        &swap,
+        "transaction.lockupFailed",
+        &evidence,
+    );
+    let (first_replay, second_replay) = tokio::join!(first_replay, second_replay);
+    assert!(first_replay.unwrap());
+    assert!(second_replay.unwrap());
+    assert_eq!(
+        server_first
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, ProviderCall::AcceptQuote { .. }))
+            .count(),
+        0
+    );
+    let (operation, parent_amount) = server_first_store.operation_and_parent();
+    let operation = operation.unwrap();
+    assert_eq!(operation.state, RenegotiationState::Accepted);
+    assert_eq!(operation.version, 3);
+    assert_eq!(operation.accept_attempt_count, 1);
+    assert_eq!(parent_amount, Some(890));
+    assert!(operation.fallback_gate().blocks_bitcoin_fallback());
+    assert_eq!(
+        server_first_store.events(),
+        vec![
+            RenegotiationState::Quoted,
+            RenegotiationState::AcceptRequested,
+            RenegotiationState::Accepted,
+        ]
+    );
 }
 
 #[test]
