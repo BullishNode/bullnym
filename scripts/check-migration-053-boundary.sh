@@ -597,6 +597,45 @@ SELECT (
            )
            AND acl.grantee = 0
     )
+    AND EXISTS (
+        SELECT 1
+          FROM pg_class sequence_info
+          JOIN pg_namespace namespace
+            ON namespace.oid = sequence_info.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND sequence_info.relname =
+               'invoice_payment_events_accounting_sequence_seq'
+           AND sequence_info.relkind = 'S'
+           AND pg_get_userbyid(sequence_info.relowner) <> current_user
+           AND NOT pg_has_role(
+               current_user,
+               pg_get_userbyid(sequence_info.relowner),
+               'MEMBER'
+           )
+           AND has_sequence_privilege(
+               current_user,
+               sequence_info.oid,
+               'USAGE'
+           )
+           AND NOT has_sequence_privilege(
+               current_user,
+               sequence_info.oid,
+               'SELECT'
+           )
+           AND NOT has_sequence_privilege(
+               current_user,
+               sequence_info.oid,
+               'UPDATE'
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM aclexplode(COALESCE(
+                     sequence_info.relacl,
+                     acldefault('S', sequence_info.relowner)
+                 )) acl
+                WHERE acl.grantee = 0
+           )
+    )
     AND NOT EXISTS (
         SELECT 1 FROM chain_swap_records
          WHERE status IN (

@@ -280,5 +280,29 @@ BEGIN
                 function_name;
         END IF;
     END LOOP;
+
+    SELECT relowner INTO STRICT relation_owner_oid
+      FROM pg_class
+     WHERE oid = 'public.invoice_payment_events_accounting_sequence_seq'::REGCLASS
+       AND relkind = 'S';
+    IF relation_owner_oid = runtime_role_oid
+       OR pg_has_role(runtime_role_oid, relation_owner_oid, 'MEMBER')
+       OR NOT has_sequence_privilege(
+           'bullnym_app',
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'USAGE'
+       )
+       OR has_sequence_privilege(
+           'bullnym_app',
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'SELECT'
+       )
+       OR has_sequence_privilege(
+           'bullnym_app',
+           'public.invoice_payment_events_accounting_sequence_seq',
+           'UPDATE'
+       ) THEN
+        RAISE EXCEPTION 'migration 055 retained unsafe accounting sequence owner/ACL';
+    END IF;
 END
 $$;
