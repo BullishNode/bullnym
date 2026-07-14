@@ -153,6 +153,14 @@ pub struct RegistrationLookupStatus {
     pub used: i64,
 }
 
+type RegistrationLookupRow = (
+    String,
+    bool,
+    Option<String>,
+    sqlx::types::Json<Vec<PreviousNym>>,
+    i64,
+);
+
 /// Resolve only the canonical permanent nym and alias for this owner. An
 /// offline canonical nym remains the returned identity and is additionally
 /// retained in `previous_nyms` for compatibility; historical tombstones never
@@ -161,13 +169,7 @@ pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
 ) -> Result<Option<RegistrationLookupStatus>, sqlx::Error> {
-    let row: Option<(
-        String,
-        bool,
-        Option<String>,
-        sqlx::types::Json<Vec<PreviousNym>>,
-        i64,
-    )> = sqlx::query_as(
+    let row: Option<RegistrationLookupRow> = sqlx::query_as(
         "SELECT \
                 canonical_nym.name, \
                 users.is_active, \
