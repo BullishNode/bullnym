@@ -28,6 +28,9 @@ use boltz_client::Keypair;
 
 use crate::admission::WorkerReporter;
 use crate::builder_fee::LiquidBuilderFeeDecision;
+use crate::chain_swap_runtime::{
+    apply_chain_swap_provider_effect, ChainSwapProviderApplyOutcome, ChainSwapProviderEvidence,
+};
 use crate::config::Config;
 use crate::db::{self, ChainSwapStatus, SwapStatus};
 use crate::descriptor;
@@ -582,8 +585,9 @@ async fn try_renegotiate_chain_swap(
     // an ambiguous transport error AFTER Boltz already accepted (it is now
     // settling), so flagging `refund_due` would corrupt the operator surface and
     // risk a double-refund. Leaving the swap live is fund-safe — it either
-    // settles (crediting the amount reconciled at claim time) or, if Boltz truly
-    // rejected, expires into the `swap.expired`+funded → `refund_due` backstop.
+    // settles (crediting the amount reconciled at claim time) or remains for a
+    // later complete chain-evidence reduction. Provider expiry alone cannot
+    // select the Bitcoin recovery branch.
     if let Err(e) = state
         .boltz
         .accept_chain_swap_quote(&swap.boltz_swap_id, quote_amount)
@@ -636,6 +640,91 @@ pub(crate) async fn handle_chain_swap_webhook(
     swap: &db::ChainSwapRecord,
     boltz_status: &str,
 ) -> Result<(), AppError> {
+    handle_chain_swap_webhook_with_provider_evidence(state, swap, boltz_status, None).await
+}
+
+/// Shared chain-swap provider-observation path with an explicit independently
+/// assembled evidence handoff. Ordinary webhook/reconciler callers pass no
+/// snapshot and therefore observe fail-closed until the runtime evidence
+/// collector supplies one.
+#[doc(hidden)]
+pub async fn handle_chain_swap_webhook_with_provider_evidence(
+    state: &AppState,
+    swap: &db::ChainSwapRecord,
+    boltz_status: &str,
+    provider_evidence: Option<ChainSwapProviderEvidence<'_>>,
+) -> Result<(), AppError> {
+    let observed_local_status = swap
+        .parsed_status()
+        .map_err(|error| AppError::DbError(format!("invalid persisted chain status: {error}")))?;
+    if boltz_status == "swap.expired" && observed_local_status == ChainSwapStatus::Pending {
+        let outcome = apply_chain_swap_provider_effect(
+            &state.db,
+            swap.id,
+            boltz_status,
+            provider_evidence.unwrap_or_else(ChainSwapProviderEvidence::incomplete),
+        )
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+        match outcome {
+            ChainSwapProviderApplyOutcome::Finalized => {
+                tracing::info!(
+                    event = "chain_swap_unfunded_expiry_finalized",
+                    swap_id = %swap.boltz_swap_id,
+                    "complete independent evidence proved the pending chain swap unfunded"
+                );
+            }
+            ChainSwapProviderApplyOutcome::AlreadyFinalized => {
+                tracing::debug!(
+                    swap_id = %swap.boltz_swap_id,
+                    "duplicate unfunded expiry evidence left the chain swap finalized"
+                );
+            }
+            ChainSwapProviderApplyOutcome::IntegrityHold => {
+                tracing::error!(
+                    event = "chain_swap_provider_evidence_integrity_hold",
+                    swap_id = %swap.boltz_swap_id,
+                    "independent chain evidence conflicts with provider expiry; automation stopped"
+                );
+            }
+            ChainSwapProviderApplyOutcome::Reconcile(action) => {
+                tracing::info!(
+                    event = "chain_swap_provider_evidence_reconcile",
+                    swap_id = %swap.boltz_swap_id,
+                    ?action,
+                    "provider expiry reduced to an action owned by a later evidence executor"
+                );
+            }
+            ChainSwapProviderApplyOutcome::Busy => {
+                tracing::debug!(
+                    swap_id = %swap.boltz_swap_id,
+                    "chain swap execution lock is busy; later reconciliation will retry expiry evidence"
+                );
+            }
+            ChainSwapProviderApplyOutcome::Missing => {
+                tracing::debug!(
+                    swap_id = %swap.boltz_swap_id,
+                    "chain swap disappeared before expiry evidence could be applied"
+                );
+            }
+            ChainSwapProviderApplyOutcome::StateChanged(status) => {
+                tracing::debug!(
+                    swap_id = %swap.boltz_swap_id,
+                    %status,
+                    "unfunded expiry evidence arrived after the pending branch changed"
+                );
+            }
+            ChainSwapProviderApplyOutcome::Observed => {
+                tracing::debug!(
+                    event = "chain_swap_provider_expiry_observed",
+                    swap_id = %swap.boltz_swap_id,
+                    "provider expiry lacks complete independent chain evidence; observing without mutation or claim redrive"
+                );
+            }
+        }
+        return Ok(());
+    }
+
     let Some(input) = chain_swap_provider_input(boltz_status) else {
         tracing::debug!(
             "ignoring chain-swap webhook status: {} for {}",
@@ -752,19 +841,16 @@ pub(crate) async fn handle_chain_swap_webhook(
     }
 
     if boltz_status == "swap.expired" {
-        // Server lockup exists (or claim in progress): still claimable until
-        // timeoutBlockHeight. The atomic transition has flipped the one-way
-        // script-path flag without regressing status.
+        // Preserve the existing funded Liquid path in this narrow slice. The
+        // new reducer intercept above only retires or observes locally pending
+        // offers; a server lock already seen by the runtime remains claimable.
         tracing::warn!(
             event = "chain_swap_expired_webhook",
             swap_id = %swap.boltz_swap_id,
             local_status = %status,
             cooperative_refused = transition.cooperative_refused,
-            "chain swap.expired received; retaining the forward-most local branch"
+            "chain swap.expired received; retaining the forward-most funded branch"
         );
-        // Nudge the claimer: if the server lockup is already confirmed/claiming
-        // the script-path claim runs now; otherwise the sweep / reconciler
-        // picks it up once the lockup appears.
         try_claim_chain_swap_with_retry(swap, ClaimAttemptContext::from_state(state)).await;
         return Ok(());
     }
@@ -939,11 +1025,10 @@ fn chain_swap_provider_input(boltz_status: &str) -> Option<db::ChainSwapProvider
         "transaction.server.confirmed" => {
             Some(db::ChainSwapProviderStatusInput::ServerLockConfirmed)
         }
-        // NOTE: `swap.expired` is deliberately NOT mapped to terminal `Expired`.
-        // It is the wall-clock swap timer, not the on-chain lockup timeout — the
-        // server lockup stays claimable until timeoutBlockHeight. It is handled
-        // in `handle_chain_swap_webhook` (flip cooperative_refused, keep
-        // sweepable) so we don't abandon a still-claimable lockup.
+        // Locally pending `swap.expired` observations are intercepted before
+        // this mapper and reduced from independently assembled evidence. The
+        // remaining funded branches retain the existing script-claim hint in
+        // this narrow integration slice.
         // 0-conf rejection is NOT a failure: Boltz just wants a confirmation
         // before proceeding, then the swap continues normally. Treat it as a
         // (re)sighting of the user lockup in the mempool — previously this was
@@ -2616,9 +2701,10 @@ async fn claim_chain_swap_inner(
             fee_decision.expect("unjournaled chain claims require a policy decision"),
         );
         // Cooperative MuSig2 claim by default; script-path (preimage) claim once
-        // `cooperative_refused` is set — by the `swap.expired` webhook or a prior
-        // runtime refusal below. One-way flag, so no cooperative/script ping-pong.
-        // Mirrors claim_swap_inner (reverse path).
+        // a concrete runtime refusal below sets `cooperative_refused`. Provider
+        // expiry is interpreted by the shared evidence reducer and cannot flip
+        // this execution selector by itself. One-way flag, so no
+        // cooperative/script ping-pong. Mirrors claim_swap_inner (reverse path).
         let use_cooperative = !swap.cooperative_refused;
         let constructed = match construct_chain_claim_tx(
             &swap,

@@ -6252,7 +6252,7 @@ async fn issue30_chain_provider_transition_is_atomic_forward_safe_and_retryable(
 }
 
 #[tokio::test]
-async fn issue30_user_lock_projection_converges_after_failure_or_expiry_in_either_order() {
+async fn issue30_user_lock_projection_converges_after_failure_in_either_order() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -6287,7 +6287,7 @@ async fn issue30_user_lock_projection_converges_after_failure_or_expiry_in_eithe
     .await
     .unwrap();
 
-    for failure_status in ["transaction.failed", "swap.expired"] {
+    for failure_status in ["transaction.failed"] {
         sqlx::query(
             "UPDATE chain_swap_records \
              SET status = 'pending', cooperative_refused = FALSE WHERE id = $1",

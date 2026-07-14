@@ -836,10 +836,9 @@ async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
 
 #[test]
 fn chain_swap_expired_is_not_terminal() {
-    // `swap.expired` is Boltz's wall-clock timer, not the on-chain lockup
-    // timeout — the server lockup stays claimable until timeoutBlockHeight.
-    // It must NOT map to terminal `Expired` (which abandoned claimable funds);
-    // it is folded by the shared transition as a one-way script-claim hint.
+    // Locally pending expiry is intercepted by the shared evidence reducer.
+    // Funded branches retain this non-terminal script-claim hint in the narrow
+    // runtime slice so an observed server lock remains claim-eligible.
     assert_eq!(
         chain_swap_provider_input("swap.expired"),
         Some(db::ChainSwapProviderStatusInput::SwapExpired)

@@ -1202,9 +1202,9 @@ pub async fn get_ready_to_claim_chain_swaps(
     .await
 }
 
-/// Flip `cooperative_refused` to TRUE (one-way). Set when Boltz reports
-/// `swap.expired` for a chain swap, or when a cooperative claim is refused at
-/// runtime, so the next claim attempt takes the script path. Never writes
+/// Flip `cooperative_refused` to TRUE (one-way) after a concrete cooperative
+/// claim refusal, so the next claim attempt takes the script path. Provider
+/// expiry alone is reduced separately and cannot call this write. Never writes
 /// through a terminal row. Mirrors `swaps::mark_cooperative_refused`.
 pub async fn mark_chain_swap_cooperative_refused<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
