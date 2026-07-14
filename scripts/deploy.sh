@@ -442,7 +442,8 @@ EOF
     exit 1
   fi
 fi
-if [[ -f "$REPO/migrations/058_permanent_public_names.sql" ]]; then
+if [[ -f "$REPO/migrations/058_permanent_public_names.sql" \
+   && ! -f "$REPO/migrations/059_remove_surface_alias.sql" ]]; then
   if ! migration_058_boundary_ready; then
     cat >&2 <<'EOF'
 deployment refused before build: migration 058 is absent or its exact immutable public-name boundary could not be verified.
@@ -461,10 +462,15 @@ if [[ -f "$REPO/migrations/059_remove_surface_alias.sql" ]]; then
     cat >&2 <<'EOF'
 deployment refused before build: migration 059 is absent or mutable per-surface alias authority remains.
 Keep payservice and every database writer stopped, take the documented backup,
-then apply migration 059 with --set runtime_role=bullnym_app as the privileged
-schema owner. It revalidates both candidate sets, snapshots fallback Page
-descriptors/cursors, preserves canonical names and tombstones, and only then
-removes the old alias column. Never bypass an unresolved or drift refusal.
+then prove the exact migration-058 boundary. If it is absent, apply migration
+058 with --set runtime_role=bullnym_app as the privileged schema owner. Review
+its exact candidate snapshot and merchant-communication view, explicitly
+resolve every ambiguous canonical choice, and capture the review evidence.
+Only then apply migration 059 with the same owner and runtime-role binding. It
+revalidates both candidate sets, snapshots fallback Page descriptors/cursors,
+preserves canonical names and tombstones, and only then removes the old alias
+column. Never apply 059 directly from schema 057 or bypass an unresolved,
+drift, snapshot, or review refusal.
 EOF
     exit 1
   fi
