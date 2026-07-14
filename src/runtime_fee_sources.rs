@@ -6,6 +6,7 @@ use crate::bitcoin_fee_adapter::{MempoolFastestFeeAdapter, OrderedMempoolFeeSour
 use crate::config::{
     FeePolicyConfig, FeePolicyConfigValidationFacts, FeeRailConfigValidationFacts,
 };
+use crate::fee_policy::FeeProvenance;
 use crate::fee_policy::{FeeRail, SatPerVbyte};
 use crate::liquid_fee_sources::{LiquidFeeSource, LiquidFeeSources};
 
@@ -84,6 +85,14 @@ impl RuntimeFeeSourceSets {
 
     pub const fn liquid_settings(&self) -> RuntimeFeeRailSettings {
         self.liquid_settings
+    }
+
+    pub(crate) fn authorizes_bitcoin_provenance(&self, provenance: &FeeProvenance) -> bool {
+        self.bitcoin_sources.authorizes_provenance(provenance)
+    }
+
+    pub(crate) fn authorizes_liquid_provenance(&self, provenance: &FeeProvenance) -> bool {
+        self.liquid_sources.authorizes_provenance(provenance)
     }
 
     #[cfg(test)]

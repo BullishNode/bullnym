@@ -316,8 +316,8 @@ impl FeeRuntime {
                 (bitcoin, liquid)
             }
             Err(_) => (
-                FeeRailPersistenceOutcome::NotUpdated,
-                FeeRailPersistenceOutcome::NotUpdated,
+                self.discard_unpersisted_bitcoin(refresh.bitcoin()),
+                self.discard_unpersisted_liquid(refresh.liquid()),
             ),
         };
         let readiness = self
@@ -501,7 +501,8 @@ impl FeeRuntime {
             (FeeRail::Liquid, Ok(now_unix)) => {
                 self.persist_liquid_if_updated(outcome, now_unix).await
             }
-            (_, Err(_)) => FeeRailPersistenceOutcome::NotUpdated,
+            (FeeRail::Bitcoin, Err(_)) => self.discard_unpersisted_bitcoin(outcome),
+            (FeeRail::Liquid, Err(_)) => self.discard_unpersisted_liquid(outcome),
         };
         let readiness = self
             .sample_refresh_clock(&clock)
@@ -517,18 +518,14 @@ impl FeeRuntime {
         if self
             .snapshot
             .read_bitcoin(&self.bitcoin_policy, now_unix)
-            .is_ok_and(|current| {
-                current.decision().source() == FeeObservationSource::BitcoinLastKnownGood
-            })
+            .is_ok_and(|current| self.bitcoin_authority_is_consistent(&current))
         {
             self.bitcoin_lkg_authorized.store(true, Ordering::Release);
         }
         if self
             .snapshot
             .read_liquid(&self.liquid_policy, now_unix)
-            .is_ok_and(|current| {
-                current.decision().source() == FeeObservationSource::LiquidLastKnownGood
-            })
+            .is_ok_and(|current| self.liquid_authority_is_consistent(&current))
         {
             self.liquid_lkg_authorized.store(true, Ordering::Release);
         }
@@ -552,6 +549,31 @@ impl FeeRuntime {
             .unix_time_high_watermark
             .fetch_max(sample, Ordering::AcqRel);
         previous.max(sample)
+    }
+
+    fn discard_unpersisted_bitcoin(
+        &self,
+        outcome: FeeRailRefreshOutcome,
+    ) -> FeeRailPersistenceOutcome {
+        if !matches!(outcome, FeeRailRefreshOutcome::Updated { .. }) {
+            return FeeRailPersistenceOutcome::NotUpdated;
+        }
+        self.bitcoin_persisted_generation
+            .store(0, Ordering::Release);
+        let _ = self.snapshot.clear_bitcoin();
+        FeeRailPersistenceOutcome::Failed
+    }
+
+    fn discard_unpersisted_liquid(
+        &self,
+        outcome: FeeRailRefreshOutcome,
+    ) -> FeeRailPersistenceOutcome {
+        if !matches!(outcome, FeeRailRefreshOutcome::Updated { .. }) {
+            return FeeRailPersistenceOutcome::NotUpdated;
+        }
+        self.liquid_persisted_generation.store(0, Ordering::Release);
+        let _ = self.snapshot.clear_liquid();
+        FeeRailPersistenceOutcome::Failed
     }
 
     async fn persist_bitcoin_if_updated(
@@ -591,9 +613,7 @@ impl FeeRuntime {
             let restored = self
                 .snapshot
                 .read_bitcoin(&self.bitcoin_policy, now_unix)
-                .is_ok_and(|current| {
-                    current.decision().source() == FeeObservationSource::BitcoinLastKnownGood
-                });
+                .is_ok_and(|current| self.bitcoin_authority_is_consistent(&current));
             self.bitcoin_lkg_authorized
                 .store(restored, Ordering::Release);
             return if restored {
@@ -654,9 +674,7 @@ impl FeeRuntime {
             let restored = self
                 .snapshot
                 .read_liquid(&self.liquid_policy, now_unix)
-                .is_ok_and(|current| {
-                    current.decision().source() == FeeObservationSource::LiquidLastKnownGood
-                });
+                .is_ok_and(|current| self.liquid_authority_is_consistent(&current));
             self.liquid_lkg_authorized
                 .store(restored, Ordering::Release);
             return if restored {
@@ -696,6 +714,9 @@ impl FeeRuntime {
             .snapshot
             .read_bitcoin(&self.bitcoin_policy, now_unix)
             .map_err(|_| FeeRuntimeUnavailable::Bitcoin)?;
+        if !self.bitcoin_authority_is_consistent(&current) {
+            return Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Bitcoin));
+        }
         match current.decision().source() {
             FeeObservationSource::LiveBitcoin
                 if self.bitcoin_persisted_generation.load(Ordering::Acquire)
@@ -717,6 +738,9 @@ impl FeeRuntime {
             .snapshot
             .read_liquid(&self.liquid_policy, now_unix)
             .map_err(|_| FeeRuntimeUnavailable::Liquid)?;
+        if !self.liquid_authority_is_consistent(&current) {
+            return Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid));
+        }
         match current.decision().source() {
             FeeObservationSource::LiveLiquid
                 if self.liquid_persisted_generation.load(Ordering::Acquire)
@@ -731,6 +755,24 @@ impl FeeRuntime {
             }
             _ => Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid)),
         }
+    }
+
+    fn bitcoin_authority_is_consistent(&self, current: &CurrentBitcoinFee) -> bool {
+        matches!(
+            current.decision().source(),
+            FeeObservationSource::LiveBitcoin | FeeObservationSource::BitcoinLastKnownGood
+        ) && self
+            .source_sets
+            .authorizes_bitcoin_provenance(current.decision().provenance())
+    }
+
+    fn liquid_authority_is_consistent(&self, current: &CurrentLiquidFee) -> bool {
+        matches!(
+            current.decision().source(),
+            FeeObservationSource::LiveLiquid | FeeObservationSource::LiquidLastKnownGood
+        ) && self
+            .source_sets
+            .authorizes_liquid_provenance(current.decision().provenance())
     }
 }
 
@@ -776,6 +818,10 @@ mod tests {
     const TEST_PERSISTENCE_TIME: u64 = i64::MAX as u64;
     const TEST_EVALUATION_TIME: u64 = TEST_PERSISTENCE_TIME - 1;
     const TEST_READINESS_TIME: u64 = u64::MAX;
+    const DEFAULT_BITCOIN_PROVENANCE: &str = "mempool_precise_fastest_fee:bull-bitcoin";
+    const DEFAULT_LIQUID_PROVENANCE: &str = "liquid_esplora_target_1_fee:liquid-network";
+    const TEST_BITCOIN_PROVENANCE: &str = "mempool_precise_fastest_fee:bitcoin-test";
+    const TEST_LIQUID_PROVENANCE: &str = "liquid_esplora_target_1_fee:liquid-test";
 
     #[derive(Default)]
     struct RecordingPersistence {
@@ -1075,6 +1121,97 @@ mod tests {
         bitcoin.finish().await;
     }
 
+    #[tokio::test]
+    async fn failed_post_acquisition_clock_discards_live_and_retains_authorized_lkg() {
+        let mut bitcoin = HeldFeeServer::spawn(br#"{"fastestFee":2.0,"minimumFee":1.0}"#).await;
+        let mut liquid = HeldFeeServer::spawn(br#"{"1":0.2}"#).await;
+        let runtime = Arc::new(runtime_with_sources(
+            runtime_sources(&bitcoin.endpoint, Some(&liquid.endpoint)),
+            Arc::new(RecordingPersistence::default()),
+        ));
+        runtime
+            .snapshot
+            .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
+                SatPerVbyte::try_from(3.0).unwrap(),
+                TEST_EVALUATION_TIME,
+                FeeProvenance::new(TEST_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .snapshot
+            .restore_liquid_last_known_good(LiquidLastKnownGood::new(
+                SatPerVbyte::try_from(0.3).unwrap(),
+                TEST_EVALUATION_TIME,
+                FeeProvenance::new(TEST_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .bitcoin_lkg_authorized
+            .store(true, Ordering::Release);
+        runtime.liquid_lkg_authorized.store(true, Ordering::Release);
+
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let refresh = {
+            let runtime = Arc::clone(&runtime);
+            let clock_calls = Arc::clone(&clock_calls);
+            tokio::spawn(async move {
+                runtime
+                    .refresh_once_with_clock(move || {
+                        let call = clock_calls.fetch_add(1, Ordering::SeqCst);
+                        match call {
+                            0 | 1 | 3 => Ok(TEST_EVALUATION_TIME),
+                            2 => Err(FeeRefreshClockError::Unavailable),
+                            _ => panic!("unexpected refresh clock call {call}"),
+                        }
+                    })
+                    .await
+            })
+        };
+
+        bitcoin.wait_until_requested().await;
+        liquid.wait_until_requested().await;
+        bitcoin.release();
+        liquid.release();
+        let report = refresh.await.unwrap();
+
+        assert!(matches!(
+            report.refresh().bitcoin(),
+            FeeRailRefreshOutcome::Updated { .. }
+        ));
+        assert!(matches!(
+            report.refresh().liquid(),
+            FeeRailRefreshOutcome::Updated { .. }
+        ));
+        assert_eq!(
+            report.bitcoin_persistence(),
+            FeeRailPersistenceOutcome::Failed
+        );
+        assert_eq!(
+            report.liquid_persistence(),
+            FeeRailPersistenceOutcome::Failed
+        );
+        assert!(report.readiness().ready());
+        assert_eq!(clock_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            runtime
+                .bitcoin_current_at(TEST_EVALUATION_TIME)
+                .unwrap()
+                .decision()
+                .source(),
+            FeeObservationSource::BitcoinLastKnownGood
+        );
+        assert_eq!(
+            runtime
+                .liquid_current_at(TEST_EVALUATION_TIME)
+                .unwrap()
+                .decision()
+                .source(),
+            FeeObservationSource::LiquidLastKnownGood
+        );
+        bitcoin.finish().await;
+        liquid.finish().await;
+    }
+
     #[test]
     fn readiness_requires_both_current_decisions_to_match_persisted_generations() {
         let runtime = runtime();
@@ -1084,7 +1221,7 @@ mod tests {
             .update_bitcoin(LiveBitcoin::new(
                 SatPerVbyte::try_from(2.0).unwrap(),
                 now,
-                FeeProvenance::new("bitcoin-test").unwrap(),
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
             ))
             .unwrap();
         let liquid_generation = runtime
@@ -1092,7 +1229,7 @@ mod tests {
             .update_liquid(LiveLiquid::new(
                 SatPerVbyte::try_from(0.2).unwrap(),
                 now,
-                FeeProvenance::new("liquid-test").unwrap(),
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
             ))
             .unwrap();
 
@@ -1118,7 +1255,7 @@ mod tests {
             .update_bitcoin(LiveBitcoin::new(
                 SatPerVbyte::try_from(2.0).unwrap(),
                 observed_at,
-                FeeProvenance::new("bitcoin-test").unwrap(),
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
             ))
             .unwrap();
         runtime
@@ -1140,7 +1277,7 @@ mod tests {
             .update_bitcoin(LiveBitcoin::new(
                 SatPerVbyte::try_from(2.0).unwrap(),
                 observed_at,
-                FeeProvenance::new("bitcoin-live").unwrap(),
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
             ))
             .unwrap();
         runtime
@@ -1151,7 +1288,7 @@ mod tests {
             .restore_liquid_last_known_good(LiquidLastKnownGood::new(
                 SatPerVbyte::try_from(0.2).unwrap(),
                 observed_at,
-                FeeProvenance::new("liquid-lkg").unwrap(),
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
             ))
             .unwrap();
         runtime.liquid_lkg_authorized.store(true, Ordering::Release);
@@ -1173,6 +1310,64 @@ mod tests {
         let effective_rollback = runtime.sample_refresh_clock(&|| Ok(observed_at)).unwrap();
         assert_eq!(effective_rollback, stale_at);
         assert!(!runtime.readiness_at(effective_rollback).ready());
+    }
+
+    #[test]
+    fn readiness_rejects_durable_evidence_from_unconfigured_or_incompatible_sources() {
+        let runtime = runtime();
+        let now = 10_000;
+        runtime
+            .snapshot
+            .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
+                SatPerVbyte::try_from(2.0).unwrap(),
+                now,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .snapshot
+            .restore_liquid_last_known_good(LiquidLastKnownGood::new(
+                SatPerVbyte::try_from(0.2).unwrap(),
+                now,
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .bitcoin_lkg_authorized
+            .store(true, Ordering::Release);
+        runtime.liquid_lkg_authorized.store(true, Ordering::Release);
+        assert!(runtime.readiness_at(now).ready());
+
+        runtime
+            .snapshot
+            .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
+                SatPerVbyte::try_from(2.0).unwrap(),
+                now,
+                FeeProvenance::new("mempool_precise_fastest_fee:removed-source").unwrap(),
+            ))
+            .unwrap();
+        assert!(!runtime.readiness_at(now).bitcoin_ready());
+        assert!(runtime.readiness_at(now).liquid_ready());
+
+        runtime
+            .snapshot
+            .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
+                SatPerVbyte::try_from(2.0).unwrap(),
+                now,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .snapshot
+            .restore_liquid_last_known_good(LiquidLastKnownGood::new(
+                SatPerVbyte::try_from(0.2).unwrap(),
+                now,
+                FeeProvenance::new("legacy-liquid-route:liquid-network").unwrap(),
+            ))
+            .unwrap();
+        assert!(runtime.readiness_at(now).bitcoin_ready());
+        assert!(!runtime.readiness_at(now).liquid_ready());
+        assert!(!runtime.readiness_at(now).ready());
     }
 
     #[tokio::test(start_paused = true)]

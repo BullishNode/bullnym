@@ -383,7 +383,7 @@ async fn production_runtime_authorizes_only_a_complete_durable_restore() {
         original_source: FeeObservationSource::LiveBitcoin,
         rate_sat_per_vbyte: 11.0,
         observed_at_unix: now_unix,
-        provenance: "runtime-restored-bitcoin".to_owned(),
+        provenance: "mempool_precise_fastest_fee:offline-bitcoin".to_owned(),
     }
     .restore_bitcoin()
     .unwrap();
@@ -392,7 +392,7 @@ async fn production_runtime_authorizes_only_a_complete_durable_restore() {
         original_source: FeeObservationSource::LiveLiquid,
         rate_sat_per_vbyte: 0.75,
         observed_at_unix: now_unix,
-        provenance: "runtime-restored-liquid".to_owned(),
+        provenance: "liquid_esplora_target_1_fee:offline-liquid".to_owned(),
     }
     .restore_liquid()
     .unwrap();
@@ -417,7 +417,7 @@ async fn production_runtime_authorizes_only_a_complete_durable_restore() {
     assert_eq!(bitcoin_decision.observed_at_unix(), now_unix);
     assert_eq!(
         bitcoin_decision.provenance().expose_for_persistence(),
-        "runtime-restored-bitcoin"
+        "mempool_precise_fastest_fee:offline-bitcoin"
     );
     let liquid_decision = complete.liquid_decision_now().unwrap();
     assert_eq!(

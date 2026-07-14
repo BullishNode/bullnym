@@ -1,5 +1,7 @@
+use crate::fee_policy::FeeProvenance;
 use crate::liquid_fee_adapter::{
     LiquidEsploraTargetOneFeeAdapter, LiquidEsploraTargetOneFeeObservation,
+    LiquidFeeObservationSource,
 };
 use std::{collections::HashSet, error::Error, fmt, time::Duration};
 use tokio::time::{timeout, Instant};
@@ -181,6 +183,22 @@ impl LiquidFeeSources {
         self.sources.is_empty()
     }
 
+    /// Whether persisted provenance names this exact adapter contract and one
+    /// of the currently configured source identities.
+    pub(crate) fn authorizes_provenance(&self, provenance: &FeeProvenance) -> bool {
+        let expected_prefix =
+            LiquidFeeObservationSource::ConfiguredTargetOneEstimate.stable_label();
+        provenance
+            .expose_for_persistence()
+            .strip_prefix(expected_prefix)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .is_some_and(|source_id| {
+                self.sources
+                    .iter()
+                    .any(|source| source.id.stable_label() == source_id)
+            })
+    }
+
     /// Observe sources in their configured order until caller policy accepts
     /// one. Adapter and policy rejection are both local to that source and
     /// advance to the next source without inventing a quote.
@@ -288,6 +306,30 @@ mod tests {
     };
 
     const TEST_ADAPTER_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+    #[test]
+    fn configured_source_set_authorizes_only_target_one_provenance_from_a_current_identity() {
+        let sources = LiquidFeeSources::new(vec![
+            LiquidFeeSource::new("primary", "https://one.example/api").unwrap(),
+            LiquidFeeSource::new("secondary", "https://two.example/api").unwrap(),
+        ])
+        .unwrap();
+
+        for authorized in [
+            "liquid_esplora_target_1_fee:primary",
+            "liquid_esplora_target_1_fee:secondary",
+        ] {
+            assert!(sources.authorizes_provenance(&FeeProvenance::new(authorized).unwrap()));
+        }
+        for rejected in [
+            "liquid_esplora_target_1_fee:removed",
+            "liquid_esplora_target_1_fee:",
+            "liquid_esplora_target_1_fee:primary:extra",
+            "legacy-liquid-route:primary",
+        ] {
+            assert!(!sources.authorizes_provenance(&FeeProvenance::new(rejected).unwrap()));
+        }
+    }
 
     struct FakeHttpResponse {
         status: &'static str,
