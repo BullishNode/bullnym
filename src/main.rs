@@ -22,9 +22,10 @@ use tower_http::trace::TraceLayer;
 use pay_service::{
     admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl, nostr, og_image,
-    pricer, qr, rate_limit, readiness, reconciler, recovery_address_registration, registration,
-    startup_provider_reconciliation, swap_manifest_runtime,
+    donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl,
+    lnurl_comment_history, nostr, og_image, pricer, qr, rate_limit, readiness, reconciler,
+    recovery_address_registration, registration, startup_provider_reconciliation,
+    swap_manifest_runtime,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -885,6 +886,10 @@ fn build_router(state: AppState) -> Router {
 
     let mut router: Router<AppState> = Router::new()
         .route(
+            "/api/v1/lnurl/comments",
+            get(lnurl_comment_history::list_signed),
+        )
+        .route(
             "/api/v1/recovery-address",
             get(recovery_address_registration::lookup)
                 .put(recovery_address_registration::register)
@@ -922,6 +927,10 @@ fn build_router(state: AppState) -> Router {
     if features.lightning_address {
         router = router
             .route("/.well-known/lnurlp/:nym", get(lnurl::metadata))
+            .route(
+                "/lnurlp/callback/:nym/:comment_intent",
+                get(lnurl::callback_with_comment_intent),
+            )
             .route("/lnurlp/callback/:nym", get(lnurl::callback))
             .route("/register", post(registration::register))
             .route("/register", put(registration::update_registration))
@@ -1071,7 +1080,25 @@ fn build_router(state: AppState) -> Router {
 
     router
         .layer(RequestBodyLimitLayer::new(64 * 1024))
-        .layer(TraceLayer::new_for_http())
+        // LNURL payer comments arrive in a GET query by protocol. Never put a
+        // request URI (and therefore its query string) into tracing spans.
+        // Path-only spans retain route diagnostics without copying private
+        // payer text into application logs.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                let path = request.uri().path();
+                let trace_path = if path.starts_with("/lnurlp/callback/") {
+                    "/lnurlp/callback/<redacted>"
+                } else {
+                    path
+                };
+                tracing::debug_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = trace_path
+                )
+            }),
+        )
         // Signature-auth API (no cookies/ambient credentials), so CORS is not
         // itself a security boundary here — but `permissive()` echoes any
         // attacker-requested header via `Access-Control-Allow-Headers: *`

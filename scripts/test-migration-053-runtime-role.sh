@@ -215,7 +215,7 @@ if scripts/check-migration-053-boundary.sh \
 fi
 
 # Advance the same empty disposable database through the later privileged-owner
-# migrations and prove the deploy wrapper's complete migration-059 boundary.
+# migrations and prove the current privileged-owner bootstrap through 060.
 # The non-empty candidate/resolution/drift rehearsal belongs to test-db's
 # upgrade lane; this lane verifies the empty bootstrap and runtime-role ACLs.
 for later_migration in \
@@ -224,7 +224,8 @@ for later_migration in \
   migrations/056_chain_swap_renegotiation_journal.sql \
   migrations/057_chain_swap_cooperative_signing_operations.sql \
   migrations/058_permanent_public_names.sql \
-  migrations/059_remove_surface_alias.sql; do
+  migrations/059_remove_surface_alias.sql \
+  migrations/060_lnurl_private_comment_intents.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \
@@ -297,4 +298,4 @@ if scripts/check-migration-053-boundary.sh \
   exit 1
 fi
 
-echo "migration-053/059 test: runtime-role refusals and read-only probes passed"
+echo "migration-053/060 test: runtime-role refusals and privileged bootstrap passed"

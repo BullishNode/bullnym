@@ -170,5 +170,7 @@ expect_refusal \
   059_remove_surface_alias \
   'migration 059 removes mutable per-surface alias authority'
 expect_allowed 059_remove_surface_alias 059_remove_surface_alias
+expect_allowed 059_remove_surface_alias 060_lnurl_private_comment_intents
+expect_allowed 060_lnurl_private_comment_intents 060_lnurl_private_comment_intents
 
 echo "renegotiation rollback checks passed"

@@ -150,11 +150,33 @@ The probe must print successful boundaries for 053, 055, 056, 057, 058, and
 059. It
 proves the typed canonical/tombstone registry, runtime ACL/trigger contract,
 canonical active-nym rule, surface descriptor independence, and absence of the
-obsolete alias column/index. `/ready` must then report expected schema marker
-`059_remove_surface_alias`. Before 059, an unresolved preflight may be left in
-place while writers are unfrozen and the deployment is regrouped. After 059,
-automatic binary rollback is forbidden; repair or roll forward with a
-compatible binary or restore the validated pre-059 backup.
+obsolete alias column/index. Before applying later migrations, a 059 binary's
+`/ready` reports `059_remove_surface_alias`. Before 059, an unresolved
+preflight may be left in place while writers are unfrozen and the deployment
+is regrouped. After 059, automatic binary rollback is forbidden; repair or roll
+forward with a compatible binary or restore the validated pre-059 backup.
+
+## Migration 060 private LNURL comments
+
+Apply `060_lnurl_private_comment_intents.sql` as the privileged schema owner
+with `--set runtime_role=bullnym_app`. It adds an append-only private intent
+ledger and column-scoped runtime grants. The matching binary advertises a
+120-character callback contract, persists Lightning comments, and atomically
+binds their swap and merchant-side claim evidence. Direct-Liquid comments fail
+closed. The signed `/api/v1/lnurl/comments` projection exposes only
+payment-evidenced rows to the authenticated merchant, with bounded pagination
+and private no-store response headers. The binary expects schema marker
+`060_lnurl_private_comment_intents` and refuses readiness when the ledger,
+guards, or private ACL boundary is missing. Once the 060 callback is serving,
+automatic rollback to a 059-aware binary is forbidden because that binary
+would advertise a different limit and discard newly submitted comments. Roll
+forward or restore the validated pre-060 backup while writers are stopped.
+Before enabling the callback, apply the dedicated `/lnurlp/callback/` nginx
+location from `nginx.conf.example` and verify both `access_log off` and its
+location-local error-log sink; LUD-12 places the private comment in the GET
+query string and nginx error records can include the request line. The
+application trace span records neither the URI query nor the callback's opaque
+intent token.
 
 `bullnym.allow_public_name_delete=on` is a schema-owner-only emergency escape
 hatch for a validated database restore/repair. The runtime role has no table

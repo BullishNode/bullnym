@@ -1209,6 +1209,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !chain_swap_renegotiation_invariants_present(pool).await?
         || !chain_swap_cooperative_signing_invariants_present(pool).await?
         || !permanent_public_name_invariants_present(pool).await?
+        || !lnurl_private_comment_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -1371,6 +1372,149 @@ async fn chain_swap_cooperative_signing_invariants_present(
     sqlx::query_scalar::<_, bool>(CHAIN_SWAP_COOPERATIVE_SIGNING_INVARIANTS_SQL)
         .fetch_one(pool)
         .await
+}
+
+async fn lnurl_private_comment_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT \
+            to_regclass('public.lnurl_comment_intents') IS NOT NULL \
+            AND ( \
+                SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'lnurl_comment_intents' \
+                   AND column_name IN ( \
+                       'intent_id', 'owner_npub', 'nym', 'idempotency_key', \
+                       'amount_msat', 'comment', 'comment_grapheme_count', \
+                       'instruction_rail', 'instruction_reference', \
+                       'payment_evidence_reference', 'created_at', \
+                       'instruction_bound_at', 'payment_evidenced_at' \
+                   ) \
+            ) = 13 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('lnurl_comment_intents_pkey', 'p'), \
+                    ('lnurl_comment_intents_id_non_nil_check', 'c'), \
+                    ('lnurl_comment_intents_owner_shape_check', 'c'), \
+                    ('lnurl_comment_intents_nym_shape_check', 'c'), \
+                    ('lnurl_comment_intents_idempotency_shape_check', 'c'), \
+                    ('lnurl_comment_intents_amount_check', 'c'), \
+                    ('lnurl_comment_intents_grapheme_count_check', 'c'), \
+                    ('lnurl_comment_intents_comment_bytes_check', 'c'), \
+                    ('lnurl_comment_intents_instruction_rail_check', 'c'), \
+                    ('lnurl_comment_intents_instruction_shape_check', 'c'), \
+                    ('lnurl_comment_intents_evidence_shape_check', 'c'), \
+                    ('lnurl_comment_intents_owner_idempotency_key', 'u'), \
+                    ('lnurl_comment_intents_instruction_once_key', 'u'), \
+                    ('lnurl_comment_intents_payment_evidence_once_key', 'u') \
+                ) required(constraint_name, constraint_type) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM pg_constraint constraint_info \
+                     WHERE constraint_info.conrelid = \
+                               to_regclass('public.lnurl_comment_intents') \
+                       AND constraint_info.conname = required.constraint_name \
+                       AND constraint_info.contype = required.constraint_type::\"char\" \
+                       AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'public' \
+                   AND tablename = 'lnurl_comment_intents' \
+                   AND indexname = 'lnurl_comment_intents_received_history_idx' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('lnurl_comment_intents_enforce_write', \
+                     'enforce_lnurl_comment_intent_write', 23), \
+                    ('lnurl_comment_intents_reject_delete', \
+                     'reject_lnurl_comment_intent_delete', 11) \
+                ) required(trigger_name, function_name, trigger_type) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM pg_trigger trigger_info \
+                      JOIN pg_proc function_info \
+                        ON function_info.oid = trigger_info.tgfoid \
+                     WHERE trigger_info.tgrelid = \
+                               to_regclass('public.lnurl_comment_intents') \
+                       AND trigger_info.tgname = required.trigger_name \
+                       AND function_info.proname = required.function_name \
+                       AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                       AND NOT trigger_info.tgisinternal \
+                       AND trigger_info.tgenabled = 'O' \
+                 ) \
+            ) \
+            AND pg_get_userbyid( \
+                (SELECT relowner FROM pg_class \
+                  WHERE oid = to_regclass('public.lnurl_comment_intents')) \
+            ) <> current_user \
+            AND NOT pg_has_role( \
+                current_user, \
+                pg_get_userbyid( \
+                    (SELECT relowner FROM pg_class \
+                      WHERE oid = to_regclass('public.lnurl_comment_intents')) \
+                ), \
+                'USAGE' \
+            ) \
+            AND NOT pg_has_role( \
+                current_user, \
+                pg_get_userbyid( \
+                    (SELECT relowner FROM pg_class \
+                      WHERE oid = to_regclass('public.lnurl_comment_intents')) \
+                ), \
+                'SET' \
+            ) \
+            AND has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'SELECT' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'INSERT' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'UPDATE' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'DELETE' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'TRUNCATE' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'REFERENCES' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), 'TRIGGER' \
+            ) \
+            AND has_column_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), \
+                'comment', 'INSERT' \
+            ) \
+            AND NOT has_column_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), \
+                'comment', 'UPDATE' \
+            ) \
+            AND has_column_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), \
+                'instruction_reference', 'UPDATE' \
+            ) \
+            AND has_column_privilege( \
+                current_user, to_regclass('public.lnurl_comment_intents'), \
+                'payment_evidence_reference', 'UPDATE' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM pg_class relation \
+                  CROSS JOIN LATERAL aclexplode(COALESCE( \
+                      relation.relacl, acldefault('r', relation.relowner) \
+                  )) acl \
+                 WHERE relation.oid = to_regclass('public.lnurl_comment_intents') \
+                   AND acl.grantee = 0 \
+            )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn permanent_public_name_invariants_present(

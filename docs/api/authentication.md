@@ -40,6 +40,7 @@ unlinked invoice operations it is the empty string.
 | create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, `public_description`, `recipient_name`, `invoice_number`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
+| list received LNURL comments | `lnurl-comment-history` | `page`, then `pageSize`; the nym slot is the empty string and `npub` must be canonical lowercase hex |
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 | register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
 | look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |

@@ -3334,7 +3334,7 @@ async fn claim_swap_inner(
     tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid);
 
     // Mark Claimed and clear retry bookkeeping.
-    db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
+    db::mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(pool, swap.id, &txid)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
     if let Err(e) = db::mark_invoice_settlement_status(pool, swap.invoice_id, "settled").await {
