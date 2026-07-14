@@ -56,7 +56,7 @@ BEGIN
     END IF;
 
     IF (
-        SELECT array_agg(conname ORDER BY conname)
+        SELECT array_agg(conname::TEXT ORDER BY conname)
           FROM pg_constraint
          WHERE conrelid = 'public.chain_swap_renegotiation_operations'::REGCLASS
            AND contype = 'c'
