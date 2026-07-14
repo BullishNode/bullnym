@@ -21,6 +21,7 @@
 
 use std::fmt;
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -269,11 +270,25 @@ pub async fn persist_created_chain_swap(
     runtime: &RecoveryManifestRuntimeV1,
     input: CreatedChainSwapPersistenceInput<'_>,
 ) -> Result<ChainSwapRecord, PersistCreatedChainSwapError> {
+    let faults = NoChainSwapPersistenceFaults;
+    persist_created_chain_swap_with_faults(pool, runtime, input, &faults).await
+}
+
+/// Execute the complete production post-provider path with deterministic
+/// process-loss checkpoints. The ordinary route always supplies the inert
+/// implementation through [`persist_created_chain_swap`].
+#[doc(hidden)]
+pub async fn persist_created_chain_swap_with_faults(
+    pool: &PgPool,
+    runtime: &RecoveryManifestRuntimeV1,
+    input: CreatedChainSwapPersistenceInput<'_>,
+    faults: &dyn ChainSwapPersistenceFaultInjector,
+) -> Result<ChainSwapRecord, PersistCreatedChainSwapError> {
     let prepared = prepare_created_chain_swap_persistence(input)
         .map_err(|_| PersistCreatedChainSwapError::InvalidPersistenceInput)?;
     let parts = prepared.coordinator_request_parts();
 
-    persist_and_deliver_chain_swap(
+    persist_and_deliver_chain_swap_with_faults(
         pool,
         runtime.store(),
         PersistAndDeliverChainSwapRequest {
@@ -284,6 +299,7 @@ pub async fn persist_created_chain_swap(
             merchant_policy: parts.merchant_policy,
             crypto: runtime.borrow_manifest_staging_crypto_v1(),
         },
+        faults,
     )
     .await
     .map_err(|_| PersistCreatedChainSwapError::PersistenceOrDeliveryFailed)
@@ -301,6 +317,47 @@ pub struct PersistAndDeliverChainSwapRequest<'a> {
     pub manifest_id: Uuid,
     pub merchant_policy: &'a MerchantPolicyReferencesV1,
     pub crypto: ManifestStagingCrypto<'a>,
+}
+
+/// Deterministic process-loss boundaries for the post-provider creation path.
+///
+/// A fault harness may pause at any point and cancel the owning task to model
+/// a process kill. Production always uses [`NoChainSwapPersistenceFaults`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSwapPersistenceFaultPoint {
+    AfterCanonicalSwapCommit,
+    AfterManifestLedgerWriteBeforeCommit,
+    AfterManifestLedgerCommitBeforeDelivery,
+    AfterManifestDeliveryAcknowledgedBeforeReturn,
+}
+
+/// Source-free marker returned by an injected persistence fault.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InjectedChainSwapPersistenceFault;
+
+/// Inert-by-default async seam for kill, timeout, and failed-boundary tests.
+#[doc(hidden)]
+#[async_trait]
+pub trait ChainSwapPersistenceFaultInjector: Send + Sync {
+    async fn check(
+        &self,
+        point: ChainSwapPersistenceFaultPoint,
+    ) -> Result<(), InjectedChainSwapPersistenceFault>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoChainSwapPersistenceFaults;
+
+#[async_trait]
+impl ChainSwapPersistenceFaultInjector for NoChainSwapPersistenceFaults {
+    async fn check(
+        &self,
+        _point: ChainSwapPersistenceFaultPoint,
+    ) -> Result<(), InjectedChainSwapPersistenceFault> {
+        Ok(())
+    }
 }
 
 /// Fixed, source-free failure classes for the atomic persistence boundary.
@@ -323,6 +380,7 @@ pub enum PersistAndDeliverChainSwapError {
     TransactionCommitFailed,
     ManifestDeliveryFailed,
     ManifestDeliveryInvariantFailed,
+    FaultInjected,
 }
 
 impl fmt::Display for PersistAndDeliverChainSwapError {
@@ -354,6 +412,7 @@ impl fmt::Display for PersistAndDeliverChainSwapError {
             Self::ManifestDeliveryInvariantFailed => {
                 "recovery-manifest durable delivery did not match the committed row"
             }
+            Self::FaultInjected => "chain-swap persistence fault was injected",
         };
         f.write_str(message)
     }
@@ -710,6 +769,22 @@ pub async fn persist_and_deliver_chain_swap(
     store: &RecoveryManifestStore,
     request: PersistAndDeliverChainSwapRequest<'_>,
 ) -> Result<ChainSwapRecord, PersistAndDeliverChainSwapError> {
+    let faults = NoChainSwapPersistenceFaults;
+    persist_and_deliver_chain_swap_with_faults(pool, store, request, &faults).await
+}
+
+/// Execute the production coordinator with deterministic async checkpoints.
+///
+/// This is public only so the external database integration target can pause
+/// and cancel the real future at process-loss boundaries, then reconnect and
+/// prove restart convergence from committed state alone.
+#[doc(hidden)]
+pub async fn persist_and_deliver_chain_swap_with_faults(
+    pool: &PgPool,
+    store: &RecoveryManifestStore,
+    request: PersistAndDeliverChainSwapRequest<'_>,
+    faults: &dyn ChainSwapPersistenceFaultInjector,
+) -> Result<ChainSwapRecord, PersistAndDeliverChainSwapError> {
     let PersistAndDeliverChainSwapRequest {
         swap,
         lineage,
@@ -735,6 +810,10 @@ pub async fn persist_and_deliver_chain_swap(
     )
     .await
     .map_err(|_| PersistAndDeliverChainSwapError::ChainSwapPersistenceFailed)?;
+    faults
+        .check(ChainSwapPersistenceFaultPoint::AfterCanonicalSwapCommit)
+        .await
+        .map_err(|_| PersistAndDeliverChainSwapError::FaultInjected)?;
 
     // Only the manifest-ledger reservation and row are transactional from
     // here. Rolling this transaction back must never erase `chain_swap`.
@@ -838,15 +917,35 @@ pub async fn persist_and_deliver_chain_swap(
         .await);
     }
 
+    if faults
+        .check(ChainSwapPersistenceFaultPoint::AfterManifestLedgerWriteBeforeCommit)
+        .await
+        .is_err()
+    {
+        return Err(rollback_or_replace(tx, PersistAndDeliverChainSwapError::FaultInjected).await);
+    }
+
     tx.commit()
         .await
         .map_err(|_| PersistAndDeliverChainSwapError::TransactionCommitFailed)?;
+    faults
+        .check(ChainSwapPersistenceFaultPoint::AfterManifestLedgerCommitBeforeDelivery)
+        .await
+        .map_err(|_| PersistAndDeliverChainSwapError::FaultInjected)?;
 
     match deliver_exact_manifest_delivery(pool, store, &delivery).await {
         Ok(ManifestDeliveryResumeOutcome::Delivered {
             identity: delivered_identity,
             ..
-        }) if delivered_identity == identity => Ok(chain_swap),
+        }) if delivered_identity == identity => {
+            faults
+                .check(
+                    ChainSwapPersistenceFaultPoint::AfterManifestDeliveryAcknowledgedBeforeReturn,
+                )
+                .await
+                .map_err(|_| PersistAndDeliverChainSwapError::FaultInjected)?;
+            Ok(chain_swap)
+        }
         Ok(_) => Err(PersistAndDeliverChainSwapError::ManifestDeliveryInvariantFailed),
         Err(_) => Err(PersistAndDeliverChainSwapError::ManifestDeliveryFailed),
     }

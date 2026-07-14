@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boltz_client::error::Error as BoltzClientError;
-use boltz_client::swaps::boltz::BoltzApiClientV2;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -236,17 +235,12 @@ fn report_epoch_outcome<const N: usize>(
 /// Spawn the reconciler background task. One task per process.
 pub fn spawn(
     pool: PgPool,
-    boltz_api_url: String,
+    boltz: Arc<crate::boltz::BoltzService>,
     config: Arc<ReconcilerConfig>,
     cancel: CancellationToken,
     mut reporter: WorkerReporter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Bounded timeout: a hung get_swap must not freeze the reconciler loop
-        // (the only recovery for dropped webhooks / the only chain-swap poll
-        // driver). Without it, one black-holed Boltz call permanently disables
-        // recovery and in-flight swaps stay stuck.
-        let client = BoltzApiClientV2::new(boltz_api_url, Some(Duration::from_secs(10)));
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         let mut scan = EpochScan::<1>::default();
         loop {
@@ -268,7 +262,7 @@ pub fn spawn(
                     };
                     match run_one_tick(
                         &pool,
-                        &client,
+                        boltz.as_ref(),
                         &config,
                         &cancel,
                         &reporter,
@@ -856,12 +850,6 @@ pub fn spawn_chain(
     mut reporter: WorkerReporter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Bounded timeout (see spawn() above): a hung chain get_swap must not
-        // freeze the chain reconciler loop.
-        let client = BoltzApiClientV2::new(
-            state.config.boltz.api_url.clone(),
-            Some(Duration::from_secs(10)),
-        );
         let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs));
         let mut scan = EpochScan::<2>::default();
         loop {
@@ -883,7 +871,6 @@ pub fn spawn_chain(
                     };
                     match run_one_chain_tick(
                         &state,
-                        &client,
                         &config,
                         &cancel,
                         &reporter,
@@ -912,6 +899,42 @@ pub fn spawn_chain(
             }
         }
     })
+}
+
+enum ChainSwapProviderPollError {
+    Provider(BoltzClientError),
+    Handler(AppError),
+}
+
+async fn poll_chain_swap_provider_once(
+    state: &AppState,
+    swap: &ChainSwapRecord,
+) -> Result<(), ChainSwapProviderPollError> {
+    let remote = state
+        .boltz
+        .get_swap(&swap.boltz_swap_id)
+        .await
+        .map_err(ChainSwapProviderPollError::Provider)?;
+    crate::claimer::handle_chain_swap_webhook(state, swap, &remote.status)
+        .await
+        .map_err(ChainSwapProviderPollError::Handler)
+}
+
+/// Execute one real chain-reconciler provider read and idempotent reducer
+/// handoff without spawning the periodic worker.
+#[doc(hidden)]
+pub async fn exercise_chain_swap_provider_poll_once(
+    state: &AppState,
+    swap: &ChainSwapRecord,
+) -> Result<(), AppError> {
+    poll_chain_swap_provider_once(state, swap)
+        .await
+        .map_err(|error| match error {
+            ChainSwapProviderPollError::Provider(error) => {
+                AppError::BoltzError(format!("chain provider poll failed: {error}"))
+            }
+            ChainSwapProviderPollError::Handler(error) => error,
+        })
 }
 
 /// Settlement-repair task. Re-records invoice payment events for reverse
@@ -1360,7 +1383,6 @@ async fn run_settlement_repair_tick(
 
 async fn run_one_chain_tick(
     state: &AppState,
-    client: &BoltzApiClientV2,
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
     reporter: &WorkerReporter,
@@ -1704,32 +1726,25 @@ async fn run_one_chain_tick(
             }
             reporter.progress();
 
-            let remote = match client.get_swap(&swap.boltz_swap_id).await {
-                Ok(r) => {
+            match poll_chain_swap_provider_once(state, swap).await {
+                Ok(()) => {
                     health.provider_succeeded();
-                    r
                 }
-                Err(e) => {
-                    health.provider_error(&e);
+                Err(ChainSwapProviderPollError::Provider(error)) => {
+                    health.provider_error(&error);
                     tracing::warn!(
-                        "chain reconciler: get_swap({}) failed: {e}",
+                        "chain reconciler: get_swap({}) failed: {error}",
                         swap.boltz_swap_id
                     );
-                    cursors[1].visit(swap.id);
-                    continue;
                 }
-            };
-
-            // Re-drive through the idempotent webhook handler with Boltz's current
-            // view — exactly what a delivered webhook would have done.
-            if let Err(e) =
-                crate::claimer::handle_chain_swap_webhook(state, swap, &remote.status).await
-            {
-                health.observe_app_error(&e);
-                tracing::error!(
-                    "chain reconciler: handle failed for {}: {e}",
-                    swap.boltz_swap_id
-                );
+                Err(ChainSwapProviderPollError::Handler(error)) => {
+                    health.provider_succeeded();
+                    health.observe_app_error(&error);
+                    tracing::error!(
+                        "chain reconciler: handle failed for {}: {error}",
+                        swap.boltz_swap_id
+                    );
+                }
             }
             cursors[1].visit(swap.id);
         }
@@ -1753,7 +1768,7 @@ async fn run_one_chain_tick(
 
 async fn run_one_tick(
     pool: &PgPool,
-    client: &BoltzApiClientV2,
+    boltz: &crate::boltz::BoltzService,
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
     reporter: &WorkerReporter,
@@ -1806,7 +1821,7 @@ async fn run_one_tick(
         }
         reporter.progress();
 
-        let remote = match client.get_swap(&swap.boltz_swap_id).await {
+        let remote = match boltz.get_swap(&swap.boltz_swap_id).await {
             Ok(r) => {
                 health.provider_succeeded();
                 r

@@ -2106,6 +2106,17 @@ async fn create_bitcoin_chain_offer(
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<Option<BitcoinChainOffer>, AppError> {
+    let faults = crate::swap_manifest_persistence::NoChainSwapPersistenceFaults;
+    create_bitcoin_chain_offer_with_faults(state, swap_nym, amount_sat, invoice, &faults).await
+}
+
+async fn create_bitcoin_chain_offer_with_faults(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+    persistence_faults: &dyn crate::swap_manifest_persistence::ChainSwapPersistenceFaultInjector,
+) -> Result<Option<BitcoinChainOffer>, AppError> {
     let Some(liquid_address) = invoice.liquid_address.as_deref() else {
         return Ok(None);
     };
@@ -2138,6 +2149,32 @@ async fn create_bitcoin_chain_offer(
             "refusing to create a chain-swap offer with mismatched swap and invoice ownership"
         );
         return Ok(None);
+    }
+
+    // A completed post-provider retry must rediscover the exact durable payer
+    // instruction before any admission, identity-rotation, key-allocation, or
+    // provider boundary. The public invoice renderer uses this same predicate.
+    // This is what turns a process loss after provider creation into one remote
+    // swap rather than a second mutating request.
+    let amount_i64 = i64::try_from(amount_sat)
+        .map_err(|_| AppError::BoltzError("chain swap amount exceeds storage range".into()))?;
+    if let Some(existing) =
+        db::latest_payer_exposable_chain_swap_for_invoice(&state.db, invoice.id, amount_i64).await?
+    {
+        let payer_amount_sat = validated_payer_chain_amount_sat(
+            existing.user_lock_amount_sat,
+            existing.server_lock_amount_sat,
+        )
+        .ok_or_else(|| {
+            AppError::DbError(
+                "payer-exposable chain swap has an invalid persisted amount pair".into(),
+            )
+        })?;
+        return Ok(Some(BitcoinChainOffer {
+            lockup_address: existing.lockup_address,
+            lockup_bip21: existing.lockup_bip21,
+            payer_amount_sat,
+        }));
     }
 
     state
@@ -2283,7 +2320,7 @@ async fn create_bitcoin_chain_offer(
         )
     })?;
 
-    crate::swap_manifest_persistence::persist_created_chain_swap(
+    crate::swap_manifest_persistence::persist_created_chain_swap_with_faults(
         &state.db,
         recovery_runtime,
         crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
@@ -2301,6 +2338,7 @@ async fn create_bitcoin_chain_offer(
             merchant_policy: &merchant_policy,
             manifest_id,
         },
+        persistence_faults,
     )
     .await
     .map_err(|error| AppError::DbError(error.to_string()))?;
@@ -2333,6 +2371,27 @@ pub async fn exercise_bitcoin_chain_offer_creation(
             .await?
             .map(|offer| (offer.lockup_address, offer.lockup_bip21)),
     )
+}
+
+/// Focused integration seam for deterministic process-loss checkpoints inside
+/// the exact production creation and recovery-manifest path.
+#[doc(hidden)]
+pub async fn exercise_bitcoin_chain_offer_creation_with_faults(
+    state: &AppState,
+    swap_nym: Option<&str>,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+    persistence_faults: &dyn crate::swap_manifest_persistence::ChainSwapPersistenceFaultInjector,
+) -> Result<Option<(String, Option<String>)>, AppError> {
+    Ok(create_bitcoin_chain_offer_with_faults(
+        state,
+        swap_nym,
+        amount_sat,
+        invoice,
+        persistence_faults,
+    )
+    .await?
+    .map(|offer| (offer.lockup_address, offer.lockup_bip21)))
 }
 
 // =====================================================================

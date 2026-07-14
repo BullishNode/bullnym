@@ -16,7 +16,7 @@ use object_store::{
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,9 +28,20 @@ use tokio::sync::{Barrier, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use pay_service::boltz::BoltzService;
+use pay_service::boltz::{
+    BoltzService, ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind,
+};
+use pay_service::boltz_transport::{
+    ScriptedBoltzCall, ScriptedBoltzError, ScriptedBoltzStep, ScriptedBoltzTransport,
+    ScriptedBoltzWebhookEvent, ScriptedBoltzWebhookInstruction, ScriptedBoltzWebhookPlan,
+};
 use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
+};
+use pay_service::chain_fault_harness::{
+    ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
+    ScriptedBitcoinRecoveryBackend as FakeBitcoinChain,
+    ScriptedBitcoinRecoveryBroadcaster as FakeRecoveryBroadcaster,
 };
 use pay_service::config::{
     BitcoinWatcherConfig, BoltzConfig, CertificationConfig, ClaimConfig, Config, DonationConfig,
@@ -67,8 +78,9 @@ use bitcoin::script::Builder;
 use bitcoin::ScriptBuf;
 use boltz_client::network::{BitcoinChain, LiquidChain, Network};
 use boltz_client::swaps::boltz::{
-    ChainPair, ChainSwapDetails, CreateChainResponse, HeightResponse, Leaf, PairMinerFees,
-    ReverseFees, ReverseLimits, ReversePair, Side, SwapTree, SwapType,
+    ChainPair, ChainSwapDetails, CreateChainResponse, GetChainPairsResponse, GetSwapResponse,
+    HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair, Side, SwapTree,
+    SwapType,
 };
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
@@ -5945,6 +5957,203 @@ async fn webhook_advances_chain_swap_records() {
     assert_eq!(invoice_after.direct_settlement_status, "none");
     assert_eq!(invoice_after.swap_settlement_status, "pending");
     assert_eq!(invoice_after.direct_payment_projection_version, 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue88_scripted_webhook_disorder_and_poll_errors_converge_idempotently() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "issue88webhookscript").await;
+    let invoice = insert_test_invoice(
+        &pool,
+        "issue88webhookscript",
+        &npub,
+        "lq1issue88webhookscript",
+        60,
+    )
+    .await;
+    let swap_id = "ISSUE88_WEBHOOK_SCRIPT_1";
+    let row = record_pre_050_chain_fixture(
+        &pool,
+        &pay_service::db::NewChainSwapRecord {
+            claim_key_index: None,
+            refund_key_index: None,
+            root_fingerprint: None,
+            invoice_id: invoice.id,
+            nym: Some("issue88webhookscript"),
+            boltz_swap_id: swap_id,
+            lockup_address: "bc1qissue88webhookscript",
+            lockup_bip21: None,
+            user_lock_amount_sat: 1_000,
+            server_lock_amount_sat: 990,
+            preimage_hex: "11".repeat(32).as_str(),
+            claim_key_hex: "22".repeat(32).as_str(),
+            refund_key_hex: "33".repeat(32).as_str(),
+            boltz_response_json: "{}",
+        },
+    )
+    .await
+    .unwrap();
+    let transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetSwap {
+            swap_id: swap_id.into(),
+            result: Err(ScriptedBoltzError::Timeout),
+        },
+        ScriptedBoltzStep::GetSwap {
+            swap_id: swap_id.into(),
+            result: Ok(GetSwapResponse {
+                status: "transaction.server.confirmed".into(),
+                zero_conf_rejected: None,
+                transaction: None,
+            }),
+        },
+        ScriptedBoltzStep::Quote {
+            swap_id: swap_id.into(),
+            result: Err(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::Timeout,
+                terminal_evidence_sha256: None,
+            }),
+        },
+        ScriptedBoltzStep::AcceptQuote {
+            swap_id: swap_id.into(),
+            amount_sat: 990,
+            result: Err(ChainSwapQuoteProviderError {
+                kind: ChainSwapQuoteProviderErrorKind::ProviderServerError,
+                terminal_evidence_sha256: None,
+            }),
+        },
+    ]));
+    let state = issue88_state_with_scripted_boltz(
+        pool.clone(),
+        in_memory_recovery_manifest_runtime(),
+        transport.clone(),
+    );
+    let app = test_app(state.clone());
+
+    // Source event 2 is deliberately dropped. Event 1 is delivered twice,
+    // then the older event 0 arrives late: duplicate + reorder + delay all
+    // cross the actual HTTP webhook route.
+    let deliveries = ScriptedBoltzWebhookPlan::new(
+        vec![
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.mempool".into(),
+            },
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.confirmed".into(),
+            },
+            ScriptedBoltzWebhookEvent {
+                swap_id: swap_id.into(),
+                status: "transaction.server.confirmed".into(),
+            },
+        ],
+        vec![
+            ScriptedBoltzWebhookInstruction {
+                event_index: 1,
+                delay: Duration::from_millis(2),
+            },
+            ScriptedBoltzWebhookInstruction {
+                event_index: 1,
+                delay: Duration::ZERO,
+            },
+            ScriptedBoltzWebhookInstruction {
+                event_index: 0,
+                delay: Duration::from_millis(3),
+            },
+        ],
+    )
+    .into_deliveries()
+    .unwrap();
+
+    let mut stable_updated_at = None;
+    for (index, delivery) in deliveries.into_iter().enumerate() {
+        tokio::time::sleep(delivery.delay).await;
+        let (status, body) = post_json(&app, "/webhook/boltz", delivery.payload).await;
+        assert_eq!(status, StatusCode::OK, "delivery {index}: {body}");
+        let observed = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.status, "user_lock_confirmed");
+        let exact_updated_at: String =
+            sqlx::query_scalar("SELECT updated_at::TEXT FROM chain_swap_records WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        match stable_updated_at.as_ref() {
+            None => stable_updated_at = Some(exact_updated_at),
+            Some(timestamp) => assert_eq!(
+                &exact_updated_at, timestamp,
+                "duplicate/reordered delivery mutated the reducer timestamp"
+            ),
+        }
+    }
+
+    let current = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        pay_service::reconciler::exercise_chain_swap_provider_poll_once(&state, &current)
+            .await
+            .is_err(),
+        "the scripted timeout must remain retryable"
+    );
+    let after_error = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_error.status, "user_lock_confirmed");
+    pay_service::reconciler::exercise_chain_swap_provider_poll_once(&state, &after_error)
+        .await
+        .unwrap();
+    let converged = pay_service::db::get_chain_swap_by_id(&pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(converged.status, "server_lock_confirmed");
+
+    assert_eq!(
+        state
+            .boltz
+            .get_chain_swap_quote(swap_id)
+            .await
+            .unwrap_err()
+            .kind,
+        ChainSwapQuoteProviderErrorKind::Timeout
+    );
+    assert_eq!(
+        state
+            .boltz
+            .accept_chain_swap_quote(swap_id, 990)
+            .await
+            .unwrap_err()
+            .kind,
+        ChainSwapQuoteProviderErrorKind::ProviderServerError
+    );
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetSwap {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::GetSwap {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::Quote {
+                swap_id: swap_id.into()
+            },
+            ScriptedBoltzCall::AcceptQuote {
+                swap_id: swap_id.into(),
+                amount_sat: 990,
+            },
+        ]
+    );
 
     cleanup_db(&pool).await;
 }
@@ -16268,109 +16477,6 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FeeSensitiveRecover
     }
 }
 
-#[derive(Default)]
-struct FakeBitcoinChain {
-    transactions: Mutex<HashMap<String, Vec<u8>>>,
-    outspends: Mutex<HashMap<(String, u32), pay_service::chain_recovery::BitcoinOutspend>>,
-}
-
-#[async_trait]
-impl pay_service::chain_recovery::BitcoinRecoveryEvidence for FakeBitcoinChain {
-    async fn raw_transaction(&self, txid: &str) -> Result<Option<Vec<u8>>, AppError> {
-        Ok(self.transactions.lock().await.get(txid).cloned())
-    }
-
-    async fn outspend(
-        &self,
-        txid: &str,
-        vout: u32,
-    ) -> Result<pay_service::chain_recovery::BitcoinOutspend, AppError> {
-        Ok(self
-            .outspends
-            .lock()
-            .await
-            .get(&(txid.to_string(), vout))
-            .cloned()
-            .unwrap_or(pay_service::chain_recovery::BitcoinOutspend::Unspent))
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FakeBroadcastResult {
-    Accept,
-    AcceptResponseLost,
-    BackendUnavailable,
-    Reject,
-    WrongTxid,
-}
-
-struct FakeRecoveryBroadcaster {
-    chain: Arc<FakeBitcoinChain>,
-    source: (String, u32),
-    results: Mutex<VecDeque<FakeBroadcastResult>>,
-    calls: Mutex<Vec<String>>,
-}
-
-impl FakeRecoveryBroadcaster {
-    fn new(
-        chain: Arc<FakeBitcoinChain>,
-        source: (String, u32),
-        results: impl IntoIterator<Item = FakeBroadcastResult>,
-    ) -> Self {
-        Self {
-            chain,
-            source,
-            results: Mutex::new(results.into_iter().collect()),
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    async fn accepted(&self, raw_tx_hex: &str, expected_txid: &str) {
-        self.chain.transactions.lock().await.insert(
-            expected_txid.to_string(),
-            hex::decode(raw_tx_hex).expect("fake broadcaster receives valid hex"),
-        );
-        self.chain.outspends.lock().await.insert(
-            self.source.clone(),
-            pay_service::chain_recovery::BitcoinOutspend::Spent {
-                txid: expected_txid.to_string(),
-            },
-        );
-    }
-}
-
-#[async_trait]
-impl pay_service::chain_recovery::BitcoinRecoveryBroadcaster for FakeRecoveryBroadcaster {
-    async fn broadcast(&self, raw_tx_hex: &str, expected_txid: &str) -> Result<String, AppError> {
-        self.calls.lock().await.push(raw_tx_hex.to_string());
-        let result = self
-            .results
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or(FakeBroadcastResult::Accept);
-        match result {
-            FakeBroadcastResult::Accept => {
-                self.accepted(raw_tx_hex, expected_txid).await;
-                Ok(expected_txid.to_string())
-            }
-            FakeBroadcastResult::AcceptResponseLost => {
-                self.accepted(raw_tx_hex, expected_txid).await;
-                Err(AppError::ClaimError(
-                    "scripted broadcaster accepted the transaction but lost the response".into(),
-                ))
-            }
-            FakeBroadcastResult::BackendUnavailable => Err(AppError::ElectrumError(
-                "scripted Bitcoin broadcast backend unavailable".into(),
-            )),
-            FakeBroadcastResult::Reject => Err(AppError::ClaimError(
-                "scripted broadcaster rejected the transaction".into(),
-            )),
-            FakeBroadcastResult::WrongTxid => Ok("ab".repeat(32)),
-        }
-    }
-}
-
 struct OneShotRecoveryFault {
     point: pay_service::chain_recovery::RecoveryFaultPoint,
     fired: AtomicBool,
@@ -16505,10 +16611,12 @@ async fn seed_recovery_journal_harness(
     let expected_raw_hex = hex::encode(bitcoin::consensus::serialize(&recovery_tx));
 
     let chain = Arc::new(FakeBitcoinChain::default());
-    chain.transactions.lock().await.insert(
-        source_txid.clone(),
-        bitcoin::consensus::serialize(&source_tx),
-    );
+    chain
+        .insert_raw_transaction(
+            source_txid.clone(),
+            bitcoin::consensus::serialize(&source_tx),
+        )
+        .unwrap();
     let broadcaster = Arc::new(FakeRecoveryBroadcaster::new(
         chain.clone(),
         (source_txid.clone(), 0),
@@ -17784,7 +17892,7 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
 
     assert_eq!(txid, harness.expected_txid);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
     let final_swap = pay_service::db::get_chain_swap_by_id(&state.db, harness.swap.id)
         .await
         .unwrap()
@@ -17850,7 +17958,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             "fault {point:?} left the wrong commit state"
         );
         assert_eq!(
-            harness.broadcaster.calls.lock().await.len(),
+            harness.broadcaster.calls().len(),
             usize::from(point == RecoveryFaultPoint::AfterBroadcastCallBeforeOutcomeCommit),
             "fault {point:?} reached the broadcaster at the wrong boundary"
         );
@@ -17929,7 +18037,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             Some(harness.expected_txid.as_str())
         );
 
-        let calls = harness.broadcaster.calls.lock().await;
+        let calls = harness.broadcaster.calls();
         assert!(calls.iter().all(|raw| raw == &harness.expected_raw_hex));
         assert_eq!(
             harness.builder.calls.load(Ordering::SeqCst),
@@ -18120,7 +18228,7 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
         committed_fee_decision
     );
     assert_eq!(
-        harness.broadcaster.calls.lock().await.as_slice(),
+        harness.broadcaster.calls().as_slice(),
         &[committed.raw_tx_hex]
     );
 
@@ -18176,7 +18284,7 @@ async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
             if reason == BITCOIN_FEE_DECISION_PENDING_REASON
     ));
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18224,7 +18332,7 @@ async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_
             if reason == BITCOIN_FEE_DECISION_PENDING_REASON
     ));
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 0);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18251,7 +18359,7 @@ async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_
     .expect("a later accepted live decision must resume recovery construction");
     assert_eq!(txid, harness.expected_txid);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
 
     cleanup_db(&pool).await;
 }
@@ -18281,7 +18389,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
     .await
     .unwrap();
     assert_eq!(txid, harness.expected_txid);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
 
     // A complete retry is a read-only idempotent success.
     let retry = execute_journaled_recovery_with_services(
@@ -18296,7 +18404,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
     .await
     .unwrap();
     assert_eq!(retry, harness.expected_txid);
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 1);
+    assert_eq!(harness.broadcaster.calls().len(), 1);
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
     cleanup_db(&pool).await;
 }
@@ -18342,7 +18450,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
     )
     .await
     .unwrap();
-    let calls = harness.broadcaster.calls.lock().await;
+    let calls = harness.broadcaster.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0], harness.expected_raw_hex);
     assert_eq!(calls[1], harness.expected_raw_hex);
@@ -18520,7 +18628,7 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
     )
     .await;
     assert!(result.is_err());
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -18558,8 +18666,9 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
     .await
     .is_err());
     let unknown_txid = "ab".repeat(32);
-    harness.chain.outspends.lock().await.insert(
-        (harness.source_txid.clone(), 0),
+    harness.chain.set_outspend(
+        harness.source_txid.clone(),
+        0,
         pay_service::chain_recovery::BitcoinOutspend::Spent {
             txid: unknown_txid.clone(),
         },
@@ -18576,7 +18685,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
     )
     .await;
     assert!(result.is_err());
-    assert_eq!(harness.broadcaster.calls.lock().await.len(), 0);
+    assert_eq!(harness.broadcaster.calls().len(), 0);
     let held = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
         .await
         .unwrap()
@@ -18632,7 +18741,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
     .await
     .unwrap();
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
-    let calls = harness.broadcaster.calls.lock().await;
+    let calls = harness.broadcaster.calls();
     assert!(!calls.is_empty());
     assert!(calls.iter().all(|raw| raw == &harness.expected_raw_hex));
     drop(calls);
@@ -18678,7 +18787,7 @@ async fn legacy_refunding_without_journal_is_never_reconstructed() {
     .await;
     assert!(result.is_err());
     assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 0);
-    assert!(harness.broadcaster.calls.lock().await.is_empty());
+    assert!(harness.broadcaster.calls().is_empty());
     assert!(
         pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
             .await
@@ -21301,6 +21410,22 @@ impl AtomicManifestPersistenceFixture {
         pay_service::db::ChainSwapRecord,
         pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
     > {
+        let faults = pay_service::swap_manifest_persistence::NoChainSwapPersistenceFaults;
+        self.persist_with_faults(pool, store, manifest_id, policy, &faults)
+            .await
+    }
+
+    async fn persist_with_faults(
+        &self,
+        pool: &PgPool,
+        store: &RecoveryManifestStore,
+        manifest_id: uuid::Uuid,
+        policy: Option<&pay_service::swap_manifest::MerchantPolicyReferencesV1>,
+        faults: &dyn pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultInjector,
+    ) -> Result<
+        pay_service::db::ChainSwapRecord,
+        pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapError,
+    > {
         let swap = pay_service::db::NewChainSwapRecord {
             invoice_id: self.invoice_id,
             nym: Some(&self.nym),
@@ -21343,7 +21468,7 @@ impl AtomicManifestPersistenceFixture {
             merchant_liquid_destination: &terms.merchant_liquid_destination,
             merchant_emergency_btc_address: terms.merchant_emergency_btc_address.as_deref(),
         };
-        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap(
+        pay_service::swap_manifest_persistence::persist_and_deliver_chain_swap_with_faults(
             pool,
             store,
             pay_service::swap_manifest_persistence::PersistAndDeliverChainSwapRequest {
@@ -21359,6 +21484,7 @@ impl AtomicManifestPersistenceFixture {
                     &self.pinned_signer,
                 ),
             },
+            faults,
         )
         .await
     }
@@ -21417,6 +21543,44 @@ impl AtomicManifestPersistenceFixture {
     }
 }
 
+struct PausingChainSwapPersistenceFault {
+    point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PausingChainSwapPersistenceFault {
+    fn new(point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint) -> Self {
+        Self {
+            point,
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.reached.notified())
+            .await
+            .expect("chain-swap persistence did not reach the injected kill boundary");
+    }
+}
+
+#[async_trait]
+impl pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultInjector
+    for PausingChainSwapPersistenceFault
+{
+    async fn check(
+        &self,
+        point: pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint,
+    ) -> Result<(), pay_service::swap_manifest_persistence::InjectedChainSwapPersistenceFault> {
+        if point == self.point {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery() {
     let pool = test_pool().await;
@@ -21464,6 +21628,172 @@ async fn atomic_manifest_persistence_returns_only_after_exact_durable_delivery()
     );
 
     cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn chain_swap_creation_kill_restart_converges_at_every_persistence_boundary() {
+    use pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint as Point;
+
+    let cases = [
+        (Point::AfterCanonicalSwapCommit, "killcanonical", 11_001),
+        (
+            Point::AfterManifestLedgerWriteBeforeCommit,
+            "killledgerwrite",
+            11_101,
+        ),
+        (
+            Point::AfterManifestLedgerCommitBeforeDelivery,
+            "killledgercommit",
+            11_201,
+        ),
+        (
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn,
+            "killafterack",
+            11_301,
+        ),
+    ];
+
+    for (point, nym, child_index) in cases {
+        let pool = test_pool().await;
+        cleanup_db(&pool).await;
+        let fixture =
+            Arc::new(AtomicManifestPersistenceFixture::seed(&pool, nym, child_index).await);
+        let manifest_id = uuid::Uuid::new_v4();
+        let backend = InstrumentedManifestObjectStore::new();
+        let store = coordinator_manifest_store(backend);
+        let fault = Arc::new(PausingChainSwapPersistenceFault::new(point));
+
+        let task_pool = pool.clone();
+        let task_store = store.clone();
+        let task_fixture = fixture.clone();
+        let task_fault = fault.clone();
+        let attempt = tokio::spawn(async move {
+            task_fixture
+                .persist_with_faults(
+                    &task_pool,
+                    &task_store,
+                    manifest_id,
+                    None,
+                    task_fault.as_ref(),
+                )
+                .await
+        });
+
+        fault.wait_until_reached().await;
+        attempt.abort();
+        assert!(
+            attempt.await.unwrap_err().is_cancelled(),
+            "the injected process-loss task was not cancelled at {point:?}"
+        );
+
+        // Closing every old-pool connection models a process restart and also
+        // makes a pre-commit cancellation's transaction rollback observable
+        // before the restarted process reads any state.
+        pool.close().await;
+        let restarted = test_pool().await;
+        let retained =
+            pay_service::db::get_chain_swap_by_boltz_id(&restarted, &fixture.boltz_swap_id)
+                .await
+                .unwrap()
+                .expect("a post-provider process kill erased the canonical swap");
+        assert_eq!(retained.status, "pending");
+        assert_eq!(
+            retained.boltz_response_json,
+            fixture.canonical_provider_response
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+                .fetch_one(&restarted)
+                .await
+                .unwrap(),
+            1,
+            "restart recovery duplicated the provider-created swap at {point:?}"
+        );
+
+        let deliveries_before = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+            .await
+            .unwrap();
+        match point {
+            Point::AfterCanonicalSwapCommit | Point::AfterManifestLedgerWriteBeforeCommit => {
+                assert!(
+                    deliveries_before.is_empty(),
+                    "an uncommitted ledger row survived process loss at {point:?}"
+                );
+            }
+            Point::AfterManifestLedgerCommitBeforeDelivery => {
+                assert_eq!(deliveries_before.len(), 1);
+                assert_eq!(deliveries_before[0].manifest_id, manifest_id);
+                assert_eq!(deliveries_before[0].delivery_state, "pending");
+            }
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn => {
+                assert_eq!(deliveries_before.len(), 1);
+                assert_eq!(deliveries_before[0].manifest_id, manifest_id);
+                assert_eq!(deliveries_before[0].delivery_state, "delivered");
+            }
+        }
+
+        let runtime = RecoveryManifestRuntimeV1::from_store_for_integration_tests(store.clone());
+        let acquisition = ChainSwapCreationPermit::acquire(&restarted, &runtime).await;
+        match point {
+            Point::AfterManifestDeliveryAcknowledgedBeforeReturn => {
+                acquisition
+                    .expect("an acknowledged creation should need no restart repair")
+                    .release()
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                assert_eq!(
+                    acquisition.unwrap_err(),
+                    ChainSwapCreationPermitError::ManifestRepairCompleted,
+                    "restart must repair/resume without crossing the provider boundary"
+                );
+                ChainSwapCreationPermit::acquire(&restarted, &runtime)
+                    .await
+                    .expect("a clean attempt after restart repair should receive the permit")
+                    .release()
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let deliveries = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].chain_swap_id, retained.id);
+        assert_eq!(deliveries[0].delivery_state, "delivered");
+        assert!(deliveries[0].delivered_at_unix.is_some());
+        assert_eq!(
+            pay_service::db::latest_payer_exposable_chain_swap_for_invoice(
+                &restarted,
+                fixture.invoice_id,
+                25_000,
+            )
+            .await
+            .unwrap()
+            .map(|candidate| candidate.id),
+            Some(retained.id),
+            "restart did not converge to one payer-exposable canonical swap"
+        );
+        assert!(
+            pay_service::db::list_pending_manifest_deliveries(&restarted)
+                .await
+                .unwrap()
+                .is_empty(),
+            "restart left a pending manifest obligation at {point:?}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+                .fetch_one(&restarted)
+                .await
+                .unwrap(),
+            1
+        );
+
+        cleanup_db(&restarted).await;
+        restarted.close().await;
+    }
 }
 
 #[tokio::test]
@@ -22971,6 +23301,240 @@ async fn issue84_chain_offer_copies_commitment_durably_before_return() {
 
     provider.shutdown().await;
     cleanup_db(&pool).await;
+}
+
+fn issue88_state_with_scripted_boltz(
+    pool: PgPool,
+    runtime: Arc<RecoveryManifestRuntimeV1>,
+    transport: Arc<ScriptedBoltzTransport>,
+) -> AppState {
+    let mut state = test_state(pool);
+    let swap_master_key =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    state.boltz = Arc::new(BoltzService::with_transport_for_integration_tests(
+        swap_master_key,
+        None,
+        transport,
+    ));
+    state.recovery_manifest_runtime_v1 = Some(runtime);
+    state
+}
+
+#[tokio::test]
+async fn issue88_scripted_create_errors_cross_the_production_service_boundary() {
+    let chain_transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetChainPairs(Ok(
+            serde_json::from_value::<GetChainPairsResponse>(json!({
+                "BTC": {"L-BTC": issue84_chain_pair()},
+                "L-BTC": {}
+            }))
+            .unwrap(),
+        )),
+        ScriptedBoltzStep::GetHeight(Ok(issue84_chain_heights())),
+        ScriptedBoltzStep::CreateChain(Box::new(Err(ScriptedBoltzError::HttpStatus(503)))),
+    ]));
+    let master =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let chain_service = BoltzService::with_transport_for_integration_tests(
+        master,
+        None,
+        chain_transport.clone(),
+    );
+    let claim = chain_service.derive_swap_key(90_001).unwrap();
+    let refund = chain_service.derive_swap_key(90_002).unwrap();
+    assert!(matches!(
+        chain_service
+            .create_btc_to_lbtc_chain_swap(claim, refund, ISSUE84_CHAIN_AMOUNT_SAT)
+            .await,
+        Err(AppError::BoltzError(_))
+    ));
+    assert_eq!(
+        chain_transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetChainPairs,
+            ScriptedBoltzCall::GetHeight,
+            ScriptedBoltzCall::CreateChain {
+                server_lock_amount_sat: Some(ISSUE84_CHAIN_AMOUNT_SAT),
+            },
+        ]
+    );
+
+    let reverse_transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::CreateReverse(Box::new(Err(ScriptedBoltzError::Timeout))),
+    ]));
+    let master =
+        SwapMasterKey::from_mnemonic(ISSUE84_SWAP_MNEMONIC, None, Network::Mainnet).unwrap();
+    let reverse_service = BoltzService::with_transport_for_integration_tests(
+        master,
+        None,
+        reverse_transport.clone(),
+    );
+    let reverse_key = reverse_service.derive_swap_key(90_003).unwrap();
+    assert!(matches!(
+        reverse_service
+            .create_reverse_swap(reverse_key, 50_000, None, None)
+            .await,
+        Err(AppError::BoltzError(_))
+    ));
+    assert_eq!(
+        reverse_transport.calls(),
+        vec![ScriptedBoltzCall::CreateReverse {
+            amount_sat: Some(50_000),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn issue88_scripted_creation_kill_restart_never_duplicates_provider_or_loses_manifest() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue88scriptedrestart";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    let invoice = Arc::new(issue84_chain_invoice(&pool, nym, &npub, 0).await);
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let swap_id = "Issue88ScriptedRestart1";
+    let (pair, heights, creation) = issue84_chain_creation_response(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        swap_id,
+    );
+    let pairs: GetChainPairsResponse = serde_json::from_value(json!({
+        "BTC": {"L-BTC": pair},
+        "L-BTC": {}
+    }))
+    .unwrap();
+    let expected_address = creation.lockup_details.lockup_address.clone();
+    let transport = Arc::new(ScriptedBoltzTransport::new([
+        ScriptedBoltzStep::GetChainPairs(Ok(pairs)),
+        ScriptedBoltzStep::GetHeight(Ok(heights)),
+        ScriptedBoltzStep::CreateChain(Box::new(Ok(creation))),
+    ]));
+    let runtime = in_memory_recovery_manifest_runtime();
+    let state = Arc::new(issue88_state_with_scripted_boltz(
+        pool.clone(),
+        runtime.clone(),
+        transport.clone(),
+    ));
+    let fault = Arc::new(PausingChainSwapPersistenceFault::new(
+        pay_service::swap_manifest_persistence::ChainSwapPersistenceFaultPoint::
+            AfterCanonicalSwapCommit,
+    ));
+
+    let task_state = state.clone();
+    let task_invoice = invoice.clone();
+    let task_fault = fault.clone();
+    let creation_attempt = tokio::spawn(async move {
+        pay_service::invoice::exercise_bitcoin_chain_offer_creation_with_faults(
+            task_state.as_ref(),
+            Some(nym),
+            ISSUE84_CHAIN_AMOUNT_SAT,
+            task_invoice.as_ref(),
+            task_fault.as_ref(),
+        )
+        .await
+    });
+    fault.wait_until_reached().await;
+    creation_attempt.abort();
+    assert!(creation_attempt.await.unwrap_err().is_cancelled());
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport.calls(),
+        vec![
+            ScriptedBoltzCall::GetChainPairs,
+            ScriptedBoltzCall::GetHeight,
+            ScriptedBoltzCall::CreateChain {
+                server_lock_amount_sat: Some(ISSUE84_CHAIN_AMOUNT_SAT),
+            },
+        ]
+    );
+
+    // Discard every old connection before reconstructing only from durable
+    // database and object-store state, as a process restart would.
+    drop(state);
+    pool.close().await;
+    let restarted = test_pool().await;
+    let restarted_state = issue88_state_with_scripted_boltz(
+        restarted.clone(),
+        runtime,
+        transport.clone(),
+    );
+    let invoice = pay_service::db::get_invoice_by_id(&restarted, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let repair_attempt = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .expect_err("the repair request must refuse before returning a new creation permit");
+    assert!(matches!(repair_attempt, AppError::ServiceUnavailable(_)));
+
+    let first_retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("the clean retry must rediscover the repaired payer instruction");
+    let repeated_retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &restarted_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("repeat retries must remain idempotent");
+    assert_eq!(first_retry, repeated_retry);
+    assert_eq!(first_retry.0, expected_address);
+    assert_eq!(transport.remaining_steps(), 0);
+    assert_eq!(
+        transport
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, ScriptedBoltzCall::CreateChain { .. }))
+            .count(),
+        1,
+        "restart crossed the mutating provider boundary more than once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&restarted)
+            .await
+            .unwrap(),
+        1
+    );
+    let deliveries = pay_service::db::list_manifest_delivery_audit(&restarted, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].delivery_state, "delivered");
+    assert!(
+        pay_service::db::list_pending_manifest_deliveries(&restarted)
+            .await
+            .unwrap()
+            .is_empty(),
+        "restart left a manifest obligation pending"
+    );
+
+    cleanup_db(&restarted).await;
+    restarted.close().await;
 }
 
 #[tokio::test]
