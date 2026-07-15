@@ -47,7 +47,7 @@ rather than a custodial money transmission service.
 | nym | A 1-32 character permanent public namespace and Lightning Address local part. | One per npub; offline status never releases or changes ownership. |
 | alias | Optional 1-32 character permanent web name in the same namespace as nyms. | One per npub, shared by Page/POS; never cleared, renamed, or released. |
 | CT descriptor | Liquid confidential descriptor from which the server derives fresh addresses. | The server can derive and unblind payments in that descriptor. Use a dedicated Bullnym wallet, not a general-purpose wallet. |
-| Payment Page | Public `/<nym>` or `/a/<alias>` checkout surface. | Can use a dedicated descriptor; legacy rows may fall back to the Lightning Address descriptor. |
+| Payment Page | Public `/<nym>` or `/a/<alias>` checkout surface. | Requires its own descriptor and address cursor. |
 | POS | Public `/<nym>/pos` or `/a/<alias>` terminal. | Requires its own descriptor and never falls back to the Lightning Address descriptor. |
 | wallet invoice | Signed recipient-created receivable. | Recipient supplies unique BTC/Liquid addresses; the server does not derive them from a descriptor. |
 | checkout invoice | Anonymous payer-created session from Payment Page/POS. | Destination and enabled rails are controlled by the configured surface. |

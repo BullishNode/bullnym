@@ -727,9 +727,9 @@ struct DonationSaveSignFields<'a> {
     twitter: &'a str,
     instagram: &'a str,
     enabled: bool,
-    pos_mode: Option<bool>,
-    ct_descriptor: Option<&'a str>,
-    kind: Option<&'a str>,
+    pos_mode: bool,
+    ct_descriptor: &'a str,
+    kind: &'a str,
     alias: Option<&'a str>,
 }
 
@@ -740,9 +740,7 @@ fn sign_donation_page_save_with_keypair(
     save: DonationSaveSignFields<'_>,
 ) -> (String, u64) {
     let enabled_str = if save.enabled { "1" } else { "0" };
-    let pos_mode_str = save
-        .pos_mode
-        .map(|pos_mode| if pos_mode { "1" } else { "0" });
+    let pos_mode_str = if save.pos_mode { "1" } else { "0" };
     let mut fields = vec![
         save.header,
         save.description,
@@ -751,16 +749,10 @@ fn sign_donation_page_save_with_keypair(
         save.twitter,
         save.instagram,
         enabled_str,
+        pos_mode_str,
+        save.ct_descriptor,
+        save.kind,
     ];
-    if let Some(pos_mode_str) = pos_mode_str {
-        fields.push(pos_mode_str);
-    }
-    if let Some(ct_descriptor) = save.ct_descriptor {
-        fields.push(ct_descriptor);
-    }
-    if let Some(kind) = save.kind {
-        fields.push(kind);
-    }
     if let Some(alias) = save.alias {
         fields.push(alias);
     }
@@ -1215,14 +1207,14 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
         &pay_service::db::UpsertDonationPage {
             nym,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Recovery-gated checkout",
             description: "Chain creation must remain behind recovery readiness",
             display_currency: "BTC",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3767,14 +3759,14 @@ async fn donation_page_upsert_round_trips_pos_mode() {
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "POS Store",
             description: "Counter checkout",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(true),
+            pos_mode: true,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3799,14 +3791,14 @@ async fn donation_page_upsert_round_trips_pos_mode() {
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: None,
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Donation Store",
             description: "Tip jar",
             display_currency: "CAD",
             website: Some("https://example.com"),
             twitter: Some("posround"),
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3830,14 +3822,14 @@ async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
         &pay_service::db::UpsertDonationPage {
             nym: "ogretry",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Retry test",
             description: "A short retry description",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3907,14 +3899,14 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
         &pay_service::db::UpsertDonationPage {
             nym: "ogbackfill",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Legacy preview",
             description: "Backfill this Page after the worker starts.",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3928,14 +3920,14 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
         &pay_service::db::UpsertDonationPage {
             nym: "ogmissing",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Missing preview",
             description: "Repair a database reference whose local file is absent.",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4047,9 +4039,9 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
         },
     );
@@ -4064,6 +4056,7 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             "header": "Persist despite preview failure",
             "description": "Payments must not depend on social image storage.",
             "display_currency": "USD",
+            "pos_mode": false,
             "enabled": true,
             "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
@@ -4099,14 +4092,14 @@ async fn og_key_attaches_only_to_the_matching_persisted_page_content() {
         pay_service::db::UpsertDonationPage {
             nym: "ogcommit",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Persist first",
             description,
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4195,14 +4188,14 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
         &pay_service::db::UpsertDonationPage {
             nym,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "",
             description: "Manifest test",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -4263,7 +4256,7 @@ async fn manifest_returns_404_for_unknown_nym() {
 }
 
 #[tokio::test]
-async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
+async fn donation_page_save_requires_current_signed_fields() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -4272,42 +4265,24 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
     pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
-    pay_service::db::upsert_donation_page(
-        &pool,
-        &pay_service::db::UpsertDonationPage {
-            nym,
-            kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            header: "Existing POS",
-            description: "Already counter mode",
-            display_currency: "USD",
-            website: None,
-            twitter: None,
-            instagram: None,
-            pos_mode: Some(true),
-            enabled: true,
-            generated_og_template_version: None,
-            alias: None,
-        },
-    )
-    .await
-    .unwrap();
-
+    // Sign the full current payload, then omit one required JSON field. The
+    // request must fail during deserialization rather than verify a shorter
+    // historical byte layout.
     let (signature, timestamp) = sign_donation_page_save_with_keypair(
         &keypair,
         &npub,
         nym,
         DonationSaveSignFields {
-            header: "Legacy Save",
-            description: "Old clients do not sign pos_mode",
+            header: "Current Save",
+            description: "Current clients sign every required field",
             display_currency: "USD",
             website: "",
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: None,
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
         },
     );
@@ -4318,25 +4293,102 @@ async fn donation_page_save_legacy_payload_preserves_existing_pos_mode() {
             "nym": nym,
             "npub": npub,
             "ct_descriptor": TEST_DESCRIPTOR,
-            "header": "Legacy Save",
-            "description": "Old clients do not sign pos_mode",
+            "header": "Current Save",
+            "description": "Current clients sign every required field",
             "display_currency": "USD",
             "enabled": true,
+            "kind": pay_service::db::KIND_PAYMENT_PAGE,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(pay_service::db::get_donation_page_by_nym(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn donation_page_archive_requires_signed_kind() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "archivekind";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Archive current contract",
+            description: "Kind is signed",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: false,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (signature, timestamp) = sign_la_action(
+        &keypair,
+        "donation-page-archive",
+        &npub,
+        nym,
+        &[pay_service::db::KIND_PAYMENT_PAGE],
+    );
+    let (status, body) = delete_json_path(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(
+        !pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE,)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_archived
+    );
+
+    let (status, body) = delete_json_path(
+        &app,
+        "/donation-page",
+        json!({
+            "nym": nym,
+            "npub": npub,
+            "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
             "signature": signature,
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["pos_mode"], true);
-
-    let row =
-        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-            .await
-            .unwrap()
-            .unwrap();
-    assert!(row.pos_mode);
-    assert_eq!(row.header, "Legacy Save");
+    assert_eq!(body["kind"], pay_service::db::KIND_PAYMENT_PAGE);
+    assert!(body["is_archived"].as_bool().unwrap());
 
     cleanup_db(&pool).await;
 }
@@ -4364,9 +4416,9 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             twitter: "posnew",
             instagram: "pos.new",
             enabled: true,
-            pos_mode: Some(true),
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: None,
+            pos_mode: true,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
         },
     );
@@ -4385,6 +4437,7 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             "instagram": "pos.new",
             "pos_mode": true,
             "enabled": true,
+            "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
             "signature": signature,
         }),
@@ -4415,7 +4468,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         .await
         .unwrap();
 
-    // Payment Page surface: kind omitted => payment_page (legacy contract).
+    // Payment Page surface.
     let (sig, ts) = sign_donation_page_save_with_keypair(
         &keypair,
         &npub,
@@ -4428,9 +4481,9 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: None,
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
         },
     );
@@ -4440,7 +4493,8 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice Page", "description": "Tip jar", "display_currency": "USD",
-            "enabled": true, "timestamp": ts, "signature": sig,
+            "pos_mode": false, "enabled": true, "kind": "payment_page",
+            "timestamp": ts, "signature": sig,
         }),
     )
     .await;
@@ -4460,9 +4514,9 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some("pos"),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: "pos",
             alias: None,
         },
     );
@@ -4472,7 +4526,8 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice POS", "description": "Counter", "display_currency": "USD",
-            "enabled": true, "kind": "pos", "timestamp": ts, "signature": sig,
+            "pos_mode": false, "enabled": true, "kind": "pos",
+            "timestamp": ts, "signature": sig,
         }),
     )
     .await;
@@ -4525,9 +4580,9 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(alias),
         },
     );
@@ -4537,7 +4592,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared Page", "description": "Permanent alias Page",
-            "display_currency": "USD", "enabled": true,
+            "display_currency": "USD", "pos_mode": false, "enabled": true,
             "kind": "payment_page", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4561,9 +4616,9 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some(pay_service::db::KIND_POS),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_POS,
             alias: Some(alias),
         },
     );
@@ -4573,7 +4628,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared POS", "description": "Permanent alias POS",
-            "display_currency": "CRC", "enabled": true,
+            "display_currency": "CRC", "pos_mode": false, "enabled": true,
             "kind": "pos", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4609,9 +4664,9 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some("different-shop"),
         },
     );
@@ -4621,7 +4676,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Not Commit", "description": "Rejected rename",
-            "display_currency": "USD", "enabled": true,
+            "display_currency": "USD", "pos_mode": false, "enabled": true,
             "kind": "payment_page", "alias": "different-shop",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4649,9 +4704,9 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(""),
         },
     );
@@ -4661,7 +4716,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Still Not Commit", "description": "Empty is not a clear",
-            "display_currency": "USD", "enabled": true,
+            "display_currency": "USD", "pos_mode": false, "enabled": true,
             "kind": "payment_page", "alias": "",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4683,14 +4738,14 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
     let colliding_surface = pay_service::db::UpsertDonationPage {
         nym: "otherowner",
         kind: pay_service::db::KIND_PAYMENT_PAGE,
-        ct_descriptor: Some(TEST_DESCRIPTOR),
+        ct_descriptor: TEST_DESCRIPTOR,
         header: "Collision",
         description: "Must not commit",
         display_currency: "USD",
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: None,
+        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some(alias),
@@ -4797,14 +4852,14 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
     let page = pay_service::db::UpsertDonationPage {
         nym: "aliasrace",
         kind: pay_service::db::KIND_PAYMENT_PAGE,
-        ct_descriptor: Some(TEST_DESCRIPTOR),
+        ct_descriptor: TEST_DESCRIPTOR,
         header: "Page winner",
         description: "Page race",
         display_currency: "USD",
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: None,
+        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("page-choice"),
@@ -4812,14 +4867,14 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
     let pos = pay_service::db::UpsertDonationPage {
         nym: "aliasrace",
         kind: pay_service::db::KIND_POS,
-        ct_descriptor: Some(TEST_DESCRIPTOR),
+        ct_descriptor: TEST_DESCRIPTOR,
         header: "POS winner",
         description: "POS race",
         display_currency: "USD",
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: None,
+        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("pos-choice"),
@@ -4872,52 +4927,6 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
 }
 
 #[tokio::test]
-async fn permanent_alias_legacy_page_fallback_remains_payable_while_la_is_offline() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-    let npub = create_test_user(&pool, "aliasfallback").await;
-    pay_service::db::upsert_donation_page(
-        &pool,
-        &pay_service::db::UpsertDonationPage {
-            nym: "aliasfallback",
-            kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: None,
-            header: "Fallback Page",
-            description: "Legacy descriptor compatibility",
-            display_currency: "USD",
-            website: None,
-            twitter: None,
-            instagram: None,
-            pos_mode: None,
-            enabled: true,
-            generated_og_template_version: None,
-            alias: Some("fallback-shop"),
-        },
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1")
-        .bind(npub)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let app = test_app(test_state(pool.clone()));
-    let (status, invoice) = post_json(
-        &app,
-        "/a/fallback-shop/invoice",
-        json!({ "amount_sat": 1_000 }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{invoice:?}");
-    assert!(invoice["liquid_address"]
-        .as_str()
-        .is_some_and(|address| !address.is_empty()));
-
-    cleanup_db(&pool).await;
-}
-
-#[tokio::test]
 async fn pos_save_without_descriptor_is_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -4928,9 +4937,8 @@ async fn pos_save_without_descriptor_is_rejected() {
         .await
         .unwrap();
 
-    // kind='pos' with no descriptor: the POS surface owns wallet idx 103, so a
-    // save without a descriptor is rejected (KR-1) rather than settling POS
-    // receipts into the Lightning Address wallet.
+    // The signature covers the full current contract. Omitting the descriptor
+    // from JSON must fail before any shorter historical payload is considered.
     let (sig, ts) = sign_donation_page_save_with_keypair(
         &keypair,
         &npub,
@@ -4943,9 +4951,9 @@ async fn pos_save_without_descriptor_is_rejected() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: None,
-            kind: Some("pos"),
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: "pos",
             alias: None,
         },
     );
@@ -4955,19 +4963,24 @@ async fn pos_save_without_descriptor_is_rejected() {
         json!({
             "nym": nym, "npub": npub,
             "header": "No Desc POS", "description": "Missing wallet", "display_currency": "USD",
-            "enabled": true, "kind": "pos", "timestamp": ts, "signature": sig,
+            "pos_mode": false, "enabled": true, "kind": "pos",
+            "timestamp": ts, "signature": sig,
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ERROR");
-    assert_eq!(body["code"], "DonationPageInvalid");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(
+        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_POS)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     cleanup_db(&pool).await;
 }
 
 #[tokio::test]
-async fn legacy_save_without_kind_writes_payment_page_row() {
+async fn donation_page_save_without_kind_is_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -4977,23 +4990,22 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
         .await
         .unwrap();
 
-    // A client that omits kind entirely (legacy byte layout) still verifies
-    // and lands in the payment_page row.
+    // Omission cannot select Payment Page or verify the old byte layout.
     let (sig, ts) = sign_donation_page_save_with_keypair(
         &keypair,
         &npub,
         nym,
         DonationSaveSignFields {
-            header: "Legacy",
-            description: "No kind field",
+            header: "Current",
+            description: "Kind is required",
             display_currency: "USD",
             website: "",
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: None,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
-            kind: None,
+            pos_mode: false,
+            ct_descriptor: TEST_DESCRIPTOR,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
         },
     );
@@ -5002,27 +5014,20 @@ async fn legacy_save_without_kind_writes_payment_page_row() {
         "/donation-page",
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
-            "header": "Legacy", "description": "No kind field", "display_currency": "USD",
-            "enabled": true, "timestamp": ts, "signature": sig,
+            "header": "Current", "description": "Kind is required", "display_currency": "USD",
+            "pos_mode": false, "enabled": true, "timestamp": ts, "signature": sig,
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["kind"], "payment_page");
-
-    let row =
-        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(row.kind, "payment_page");
-    // No POS row was created.
-    assert!(
-        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_POS)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(pay_service::db::get_donation_page_by_nym(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE,
+    )
+    .await
+    .unwrap()
+    .is_none());
 
     cleanup_db(&pool).await;
 }
@@ -5050,14 +5055,14 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
         &pay_service::db::UpsertDonationPage {
             nym,
             kind: pay_service::db::KIND_POS,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "POS",
             description: "Counter",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: None,
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -5131,24 +5136,13 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
 
     // Save would reject a descriptor-less POS row; insert it directly to
     // exercise the checkout branch's hard-fail.
-    pay_service::db::upsert_donation_page(
-        &pool,
-        &pay_service::db::UpsertDonationPage {
-            nym,
-            kind: pay_service::db::KIND_POS,
-            ct_descriptor: None,
-            header: "Broken POS",
-            description: "No wallet",
-            display_currency: "USD",
-            website: None,
-            twitter: None,
-            instagram: None,
-            pos_mode: None,
-            enabled: true,
-            generated_og_template_version: None,
-            alias: None,
-        },
+    sqlx::query(
+        "INSERT INTO donation_pages \
+            (nym, kind, ct_descriptor, header, description, display_currency, pos_mode, enabled) \
+         VALUES ($1, 'pos', NULL, 'Broken POS', 'No wallet', 'USD', FALSE, TRUE)",
     )
+    .bind(nym)
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -8932,14 +8926,14 @@ async fn healthy_direct_liquid_checkout_omits_closed_swap_rails() {
         &pay_service::db::UpsertDonationPage {
             nym: "directbaseline",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Direct baseline",
             description: "Direct Liquid remains independently payable",
             display_currency: "BTC",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -9021,14 +9015,14 @@ async fn certification_invoice_scope_does_not_bypass_closed_admission() {
         &pay_service::db::UpsertDonationPage {
             nym: "certclosed",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Certification closed",
             description: "Certification cannot bypass money safety",
             display_currency: "BTC",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -20660,14 +20654,14 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
             &pay_service::db::UpsertDonationPage {
                 nym: "permanent-life",
                 kind,
-                ct_descriptor: Some(TEST_DESCRIPTOR),
+                ct_descriptor: TEST_DESCRIPTOR,
                 header: "Permanent merchant",
                 description: "Independent product state",
                 display_currency: "USD",
                 website: None,
                 twitter: None,
                 instagram: None,
-                pos_mode: None,
+                pos_mode: false,
                 enabled: true,
                 generated_og_template_version: None,
                 alias: None,
@@ -30030,14 +30024,14 @@ async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
         &pay_service::db::UpsertDonationPage {
             nym,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
-            ct_descriptor: Some(TEST_DESCRIPTOR),
+            ct_descriptor: TEST_DESCRIPTOR,
             header: "Atomic route",
             description: "Atomic chain-swap route fixture",
             display_currency: "BTC",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: Some(false),
+            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,

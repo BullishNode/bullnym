@@ -12,43 +12,23 @@ fn save_payload_fields_fixed_order() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
-        Some(TEST_DESCRIPTOR),
-        None,
+        "0",
+        TEST_DESCRIPTOR,
+        "payment_page",
         None,
     );
-    assert_eq!(fields.len(), 9);
+    assert_eq!(fields.len(), 10);
     assert_eq!(fields[0], "Alice's Coffee");
     assert_eq!(fields[2], "USD");
     assert_eq!(fields[6], "1");
     assert_eq!(fields[7], "0");
     assert_eq!(fields[8], TEST_DESCRIPTOR);
-}
-
-#[test]
-fn save_payload_fields_omit_descriptor() {
-    let fields = save_payload_fields(
-        "Alice's Coffee",
-        "Buy me a coffee!",
-        "USD",
-        "https://alice.example",
-        "alice",
-        "alice_ig",
-        "1",
-        Some("0"),
-        None,
-        None,
-        None,
-    );
-    assert_eq!(fields.len(), 8);
-    assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], "0");
+    assert_eq!(fields[9], "payment_page");
 }
 
 #[test]
 fn save_payload_fields_kind_is_trailing_after_descriptor() {
-    // The POS surface sends kind='pos' AFTER ct_descriptor; kind is the last
-    // signed field so legacy layouts stay a prefix of the new one.
+    // The surface kind follows the descriptor and precedes the optional alias.
     let fields = save_payload_fields(
         "Alice's Coffee",
         "Buy me a coffee!",
@@ -57,45 +37,15 @@ fn save_payload_fields_kind_is_trailing_after_descriptor() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
-        Some(TEST_DESCRIPTOR),
-        Some("pos"),
+        "0",
+        TEST_DESCRIPTOR,
+        "pos",
         None,
     );
     assert_eq!(fields.len(), 10);
     assert_eq!(fields[7], "0");
     assert_eq!(fields[8], TEST_DESCRIPTOR);
     assert_eq!(fields[9], "pos");
-}
-
-#[test]
-fn save_payload_fields_legacy_omitting_kind_is_prefix() {
-    // A legacy client omits kind entirely: the field list is byte-identical to
-    // the pre-POS layout, so its old signature still verifies.
-    let with_kind = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, None,
-    );
-    assert_eq!(with_kind.len(), 7);
-}
-
-#[test]
-fn save_payload_fields_legacy_without_pos_mode() {
-    let fields = save_payload_fields(
-        "Alice's Coffee",
-        "Buy me a coffee!",
-        "USD",
-        "https://alice.example",
-        "alice",
-        "alice_ig",
-        "1",
-        None,
-        Some(TEST_DESCRIPTOR),
-        None,
-        None,
-    );
-    assert_eq!(fields.len(), 8);
-    assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], TEST_DESCRIPTOR);
 }
 
 /// Byte-exact contract test for the v2 signing protocol.
@@ -113,9 +63,9 @@ fn v2_save_message_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
-        Some(TEST_DESCRIPTOR),
-        None,
+        "0",
+        TEST_DESCRIPTOR,
+        "payment_page",
         None,
     );
     let npub = "00".repeat(32);
@@ -138,52 +88,20 @@ fn v2_save_message_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 13);
-}
-
-#[test]
-fn v2_save_message_legacy_without_pos_mode_byte_exact_contract() {
-    let fields = save_payload_fields(
-        "Alice's Coffee",
-        "Buy me a coffee!",
-        "USD",
-        "https://alice.example",
-        "alice",
-        "alice_ig",
-        "1",
-        None,
-        Some(TEST_DESCRIPTOR),
-        None,
-        None,
-    );
-    let npub = "00".repeat(32);
-    let timestamp: u64 = 1_700_000_000;
-    let msg = crate::auth::build_la_v2_message(ACTION_SAVE, &npub, "alice", &fields, timestamp);
-
-    let mut expected: Vec<u8> = Vec::new();
-    expected.extend_from_slice(b"bullpay-la-v2");
-    expected.push(0);
-    expected.extend_from_slice(b"donation-page-save");
-    expected.push(0);
-    expected.extend_from_slice(npub.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"alice");
-    expected.push(0);
-    for f in &fields {
-        expected.extend_from_slice(f.as_bytes());
-        expected.push(0);
-    }
-    expected.extend_from_slice(b"1700000000");
-
-    assert_eq!(msg, expected, "v2 legacy byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 12);
+    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 14);
 }
 
 #[test]
 fn v2_archive_message_byte_exact_contract() {
     let npub = "ab".repeat(32);
     let timestamp: u64 = 1_700_000_000;
-    let msg = crate::auth::build_la_v2_message(ACTION_ARCHIVE, &npub, "alice", &[], timestamp);
+    let msg = crate::auth::build_la_v2_message(
+        ACTION_ARCHIVE,
+        &npub,
+        "alice",
+        &[db::KIND_PAYMENT_PAGE],
+        timestamp,
+    );
 
     let mut expected: Vec<u8> = Vec::new();
     expected.extend_from_slice(b"bullpay-la-v2");
@@ -193,6 +111,8 @@ fn v2_archive_message_byte_exact_contract() {
     expected.extend_from_slice(npub.as_bytes());
     expected.push(0);
     expected.extend_from_slice(b"alice");
+    expected.push(0);
+    expected.extend_from_slice(db::KIND_PAYMENT_PAGE.as_bytes());
     expected.push(0);
     expected.extend_from_slice(b"1700000000");
 
@@ -234,16 +154,16 @@ fn make_req() -> SaveDonationPageRequest {
     SaveDonationPageRequest {
         nym: "alice".to_string(),
         npub: "00".repeat(32),
-        ct_descriptor: Some(TEST_DESCRIPTOR.to_string()),
+        ct_descriptor: TEST_DESCRIPTOR.to_string(),
         header: "Title".to_string(),
         description: "Desc".to_string(),
         display_currency: "USD".to_string(),
         website: Some("https://example.com".to_string()),
         twitter: Some("alice".to_string()),
         instagram: Some("alice.ig".to_string()),
-        pos_mode: Some(false),
+        pos_mode: false,
         enabled: true,
-        kind: None,
+        kind: db::KIND_PAYMENT_PAGE.to_string(),
         alias: None,
         timestamp: 0,
         signature: String::new(),
@@ -264,10 +184,13 @@ fn validates_minimal_request() {
 }
 
 #[test]
-fn validates_legacy_request_without_page_descriptor() {
+fn rejects_empty_or_invalid_descriptor() {
     let mut req = make_req();
-    req.ct_descriptor = None;
-    assert!(validate_req(&req).is_ok());
+    req.ct_descriptor.clear();
+    assert!(validate_req(&req).is_err());
+
+    req.ct_descriptor = "not-a-descriptor".to_string();
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
@@ -309,7 +232,7 @@ fn rejects_long_description() {
 #[test]
 fn explicit_payment_page_requires_a_short_description() {
     let mut req = make_req();
-    req.kind = Some(db::KIND_PAYMENT_PAGE.to_string());
+    req.kind = db::KIND_PAYMENT_PAGE.to_string();
     req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
     assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
 
@@ -323,7 +246,7 @@ fn explicit_payment_page_requires_a_short_description() {
 #[test]
 fn payment_page_description_has_independent_grapheme_and_utf8_byte_caps() {
     let mut req = make_req();
-    req.kind = Some(db::KIND_PAYMENT_PAGE.to_string());
+    req.kind = db::KIND_PAYMENT_PAGE.to_string();
 
     // Each family is one user-perceived character but 25 UTF-8 bytes. Twenty
     // families fit both contracts; the twenty-first exceeds only the byte cap.
@@ -345,22 +268,9 @@ fn payment_page_description_has_independent_grapheme_and_utf8_byte_caps() {
 }
 
 #[test]
-fn omitted_kind_uses_the_payment_page_description_contract() {
+fn pos_retains_its_optional_description_contract() {
     let mut req = make_req();
-    req.kind = None;
-    req.description = "a".repeat(og_image::DESCRIPTION_MAX_GRAPHEMES);
-    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_ok());
-    req.description.push('a');
-    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
-
-    req.description.clear();
-    assert!(validate_description_for_kind(&req, db::KIND_PAYMENT_PAGE).is_err());
-}
-
-#[test]
-fn pos_retains_its_optional_legacy_description_contract() {
-    let mut req = make_req();
-    req.kind = Some(db::KIND_POS.to_string());
+    req.kind = db::KIND_POS.to_string();
     req.description.clear();
     assert!(validate_description_for_kind(&req, db::KIND_POS).is_ok());
 
@@ -409,8 +319,7 @@ fn rejects_bad_twitter_handle() {
 
 #[test]
 fn save_payload_fields_alias_is_trailing_after_kind() {
-    // All four optional trailing fields present: alias is the terminal field,
-    // immediately after kind.
+    // Alias is the sole optional terminal field, immediately after kind.
     let fields = save_payload_fields(
         "Alice's Coffee",
         "Buy me a coffee!",
@@ -419,9 +328,9 @@ fn save_payload_fields_alias_is_trailing_after_kind() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
-        Some(TEST_DESCRIPTOR),
-        Some("pos"),
+        "0",
+        TEST_DESCRIPTOR,
+        "pos",
         Some("alices-shop"),
     );
     assert_eq!(fields.len(), 11);
@@ -429,24 +338,8 @@ fn save_payload_fields_alias_is_trailing_after_kind() {
     assert_eq!(fields[10], "alices-shop");
 }
 
-#[test]
-fn save_payload_fields_alias_without_kind_is_prefix_extension() {
-    // A client may claim an alias without sending kind. The alias is still
-    // appended last; every layout that omits it stays a byte-prefix.
-    let with_alias = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, Some("shop"),
-    );
-    assert_eq!(with_alias.len(), 8);
-    assert_eq!(with_alias[7], "shop");
-    let without = save_payload_fields(
-        "h", "d", "USD", "", "", "", "1", None, None, None, None,
-    );
-    assert_eq!(without.len(), 7);
-    assert_eq!(&with_alias[..7], &without[..]);
-}
-
-/// Byte-exact contract for a save message carrying an alias (10 trailing
-/// fields → 14 NUL separators). Mobile's `buildSavePayloadFields` must append
+/// Byte-exact contract for a save message carrying an alias (11 payload
+/// fields → 15 NUL separators). Mobile's `buildSavePayloadFields` must append
 /// alias in lockstep.
 #[test]
 fn v2_save_message_with_alias_byte_exact_contract() {
@@ -458,9 +351,9 @@ fn v2_save_message_with_alias_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
-        Some(TEST_DESCRIPTOR),
-        None,
+        "0",
+        TEST_DESCRIPTOR,
+        "payment_page",
         Some("alices-shop"),
     );
     let npub = "00".repeat(32);
@@ -483,7 +376,7 @@ fn v2_save_message_with_alias_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 alias byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 14);
+    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 15);
 }
 
 #[test]
@@ -510,14 +403,18 @@ fn alias_regex_rejects_invalid_slugs() {
 }
 
 #[test]
-fn alias_blocklist_rejects_confusion_and_brand_values() {
-    // "0"/"1" are the pos_mode value domain (signed-field confusion guard);
-    // "pos" is a kind value; brand names are impersonation risks.
-    for s in ["0", "1", "pos", "bull", "bullbitcoin", "bull-bitcoin", "bullpay"] {
-        assert!(
-            reserved_nyms::is_reserved_alias(s),
-            "should reserve {s:?}"
-        );
+fn alias_blocklist_rejects_reserved_surface_and_brand_values() {
+    // Surface-related tokens and brand names remain reserved public names.
+    for s in [
+        "0",
+        "1",
+        "pos",
+        "bull",
+        "bullbitcoin",
+        "bull-bitcoin",
+        "bullpay",
+    ] {
+        assert!(reserved_nyms::is_reserved_alias(s), "should reserve {s:?}");
     }
     // A normal merchant slug is allowed.
     assert!(!reserved_nyms::is_reserved_alias("alices-shop"));
