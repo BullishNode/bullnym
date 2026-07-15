@@ -2,10 +2,13 @@
 
 > [!WARNING]
 > **Historical / superseded.** This document is not implementation or rollout
-> guidance. Name reactivation, grandfathered claims, multi-owner migration
-> choices, and tombstones described below are not supported. The authoritative
-> design is [RFC-003](003-permanent-public-names.md); current wire behavior is
-> documented in [Nyms and discovery](../api/nyms-and-discovery.md) and
+> guidance. Name-level deactivation/reactivation, grandfathered claims,
+> multi-owner migration choices, and tombstones described below are not part of
+> the current ownership model. Product availability is separate: the permanent
+> owner may bring the same Lightning Address online again without reclaiming or
+> changing its name. The authoritative design is
+> [RFC-003](003-permanent-public-names.md); current wire behavior is documented
+> in [Nyms and discovery](../api/nyms-and-discovery.md) and
 > [Payment Page and POS](../api/payment-pages-and-pos.md).
 
 - Status: Superseded by RFC-003
