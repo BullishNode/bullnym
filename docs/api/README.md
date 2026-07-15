@@ -12,7 +12,7 @@ types, and contract tests remain the implementation authority:
 
 - [Conventions, availability, and errors](conventions-and-errors.md)
 - [Authentication and byte-exact signing](authentication.md)
-- [Discovery, pricing, and nym lifecycle](nyms-and-discovery.md)
+- [Discovery, pricing, permanent nyms, and availability](nyms-and-discovery.md)
 - [Payment Page and POS APIs](payment-pages-and-pos.md)
 - [Invoices and payment state](invoices-and-payment-state.md)
 - [Private LNURL payer-comment history](private-lnurl-comments.md)

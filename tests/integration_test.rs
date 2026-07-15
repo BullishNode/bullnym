@@ -12361,7 +12361,7 @@ async fn registration_lifecycle_keeps_address_index_monotonic() {
         .unwrap()
         .unwrap();
     let reactivated =
-        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 5, 0)
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, None, 0)
             .await
             .unwrap();
     match reactivated {
@@ -21027,7 +21027,6 @@ async fn concurrent_registrations_respect_global_active_user_ceiling() {
         "active-cap-a",
         TEST_DESCRIPTOR,
         None,
-        3,
         1,
     );
     let register_b = pay_service::db::register_user_atomic(
@@ -21036,7 +21035,6 @@ async fn concurrent_registrations_respect_global_active_user_ceiling() {
         "active-cap-b",
         TEST_DESCRIPTOR,
         None,
-        3,
         1,
     );
     let (outcome_a, outcome_b) = tokio::join!(register_a, register_b);

@@ -52,8 +52,9 @@ the reservation and advances the durable descriptor cursor.
 Replacing the nym descriptor can change the address derived at that cached
 index; descriptor rotation must be coordinated with in-flight payments.
 
-## Deactivation
+## Online and offline availability
 
-Deleting a registration deactivates the nym for new payment instructions.
-Existing swaps remain claimable and must still settle. The nym remains
-reserved to the original owner.
+Deleting a registration takes the Lightning Address offline for new payment
+instructions. Existing swaps remain claimable and must still settle. The nym
+remains permanently owned by the original owner; availability never changes
+name ownership.

@@ -11,9 +11,10 @@ derivation power but make the client responsible for uniqueness and recovery.
 ## Linked or unlinked invoice
 
 Link when the payer benefits from the recipient's stable name/branding and the
-recipient owns an active nym. Use unlinked invoices for a minimally branded
-share URL or identities without a nym. Neither mode hides the invoice from the
-server, and the UUID remains a public bearer capability for status.
+recipient's Lightning Address is online under its permanent nym. Use unlinked
+invoices for a minimally branded share URL or identities without an online
+Lightning Address. Neither mode hides the invoice from the server, and the UUID
+remains a public bearer capability for status.
 
 ## Lightning, Liquid, or Bitcoin
 

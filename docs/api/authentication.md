@@ -34,7 +34,7 @@ unlinked invoice operations it is the empty string.
 |---|---|---|
 | register | `register` | `ct_descriptor`, then `verification_npub` only when its JSON value is non-null |
 | update registration | `update` | `ct_descriptor` |
-| deactivate/purge | `delete` or `purge` | none |
+| take Lightning Address offline/purge | `delete` or `purge` | none |
 | save surface | `donation-page-save` | `header`, `description`, `display_currency`, `website_or_empty`, `twitter_or_empty`, `instagram_or_empty`, `enabled`; then each of `pos_mode`, `ct_descriptor`, `kind`, `alias` only when its JSON value is non-null (`alias: ""` is non-null and is signed) |
 | archive surface | `donation-page-archive` | `kind` only when its JSON value is non-null |
 | create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, `public_description`, `recipient_name`, `invoice_number`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
@@ -55,10 +55,11 @@ SHA-256 digest of UTF-8 `reservations:<nym>:<ts>` and send it as `sig`.
 ## Retry implications
 
 Sign immediately before sending. A retry within the 300-second window may
-reuse the request; after that, rebuild the timestamp and signature. Registration
-reactivation, cancellation, and most reads are safe to retry. A lost invoice
-creation response may hide a newly created receivable; clients should reconcile
-through the signed list endpoint before creating a replacement.
+reuse the request; after that, rebuild the timestamp and signature. Registering
+an owned name to bring its Lightning Address online, cancellation, and most
+reads are safe to retry. A lost invoice creation response may hide a newly
+created receivable; clients should reconcile through the signed list endpoint
+before creating a replacement.
 Recovery-address registration is idempotent only
 for the exact signed request: rebuilding its timestamp or signature appends a
 new immutable policy version, even when the address is unchanged.

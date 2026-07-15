@@ -41,9 +41,9 @@ Options and implications:
 | `alias: ""` | Append the empty terminal signed field, then reject with `DonationPageInvalid`. | Empty is never a clear/release operation. |
 | non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different value from the same owner returns `AliasAlreadyAssigned` with `details.alias` set to the owner's permanent alias; a name owned by anyone else returns `NameTaken` without ownership details. |
 
-Every successful save clears `archived_at`, so saving an archived surface
-reactivates it. The request body limit is 8 KiB. Length checks use UTF-8 byte
-length, not user-perceived character count.
+Every successful save clears `archived_at`, so saving an archived surface makes
+that surface available again. The request body limit is 8 KiB. Length checks
+use UTF-8 byte length, not user-perceived character count.
 
 Response is a `DonationPageView`:
 

@@ -21,8 +21,8 @@ settlement state.
 
 | Product | Payment methods | Settlement destination | Notes |
 |---|---|---|---|
-| Lightning Address | Lightning via Boltz reverse swap; Liquid via LUD-22 | Derived from the active nym CT descriptor | Mostly unchanged. No invoice partial/under/over semantics. |
-| Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the Payment Page CT descriptor when present, otherwise the active nym CT descriptor for legacy pages | Payer enters amount at `/:nym`. |
+| Lightning Address | Lightning via Boltz reverse swap; Liquid via LUD-22 | Derived from the online Lightning Address CT descriptor | Mostly unchanged. No invoice partial/under/over semantics. |
+| Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the Payment Page CT descriptor when present, otherwise the permanent nym's CT descriptor for legacy pages | Payer enters amount at `/:nym`. |
 | POS | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the POS CT descriptor | Cashier enters amount at `/:nym/pos`. POS has no Lightning Address fallback. |
 | Invoices | Lightning via Boltz reverse swap; Liquid direct; Bitcoin direct | Merchant supplied Liquid/BTC addresses | Merchant receivable. No BTC-to-LBTC Boltz chain swap in v1 invoices. |
 
@@ -38,20 +38,24 @@ the server never falls back to the auth `npub`.
 
 `nym` is a public alias and route namespace owned by one `npub`.
 
-An active nym has one Lightning Address CT descriptor in `users.ct_descriptor`
+An online Lightning Address has one CT descriptor in `users.ct_descriptor`
 (mobile path 75). Public checkout surfaces have independent Get Paid CT
 descriptors in `donation_pages.ct_descriptor`: Payment Page uses mobile path
 102 and POS uses mobile path 103. Each `(nym, kind)` row has its own
 `donation_pages.next_addr_idx` cursor. Legacy Payment Pages without a page
 descriptor fall back to the nym descriptor; POS does not.
 
-Nym lifecycle invariants:
+Permanent name and Lightning Address availability invariants:
 
-- Active nym: owned by one `npub`, has one Lightning Address CT descriptor,
-  payable.
-- Deactivated nym: not payable for new Lightning Address, Payment Page, or
-  POS sessions; existing sessions and swaps must still settle.
-- Purged nym: reserved but not payable; descriptor material is scrubbed.
+- Permanent nym: owned by one `npub`; no product operation clears, renames,
+  releases, reassigns, or changes that ownership.
+- Online Lightning Address: has one CT descriptor and is payable through its
+  Lightning Address surface.
+- Offline Lightning Address: issues no new Lightning Address instructions;
+  existing sessions and swaps must still settle. Page/POS availability is
+  independent.
+- Purged registration: the permanent nym remains owned and non-payable while
+  descriptor material is scrubbed.
 
 CT descriptors are not account identities. They are receive capabilities.
 Payment sessions should store their concrete settlement destination rather than
@@ -104,7 +108,8 @@ Lightning Address:
 Public checkout surfaces:
 
 - Payment Page derives a Liquid address from the Payment Page CT descriptor
-  when present, otherwise from the active nym CT descriptor for legacy pages.
+  when present, otherwise from the permanent nym's CT descriptor for legacy
+  pages.
 - POS derives a Liquid address from the POS CT descriptor and has no fallback.
 - Lightning reverse swaps claim to that session Liquid address.
 - Direct Liquid pays that session Liquid address.
@@ -439,7 +444,7 @@ Requirements:
 
 Lightning Address:
 
-- deactivation stops new payment instructions
+- taking the Lightning Address offline stops new payment instructions
 - existing swaps must still settle
 
 Payment Page and POS:

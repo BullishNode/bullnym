@@ -15,7 +15,7 @@ use crate::descriptor;
 use crate::error::AppError;
 use crate::ip_whitelist;
 use crate::reserved_nyms;
-use crate::version::PUBLIC_NAME_POLICY;
+use crate::version::{PERMANENT_NYM_CAP, PUBLIC_NAME_POLICY};
 use crate::AppState;
 
 /// Resolve the caller IP using the same logic as `/lnurlp/callback`:
@@ -75,8 +75,6 @@ fn validate_verification_npub(verification_npub: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-const PERMANENT_NYM_CAP: i64 = 1;
-
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub nym: String,
@@ -99,11 +97,11 @@ pub struct QuotaView {
 }
 
 impl QuotaView {
-    fn new(used: i64, cap: i64) -> Self {
+    fn new(used: i64) -> Self {
         Self {
             used,
-            cap,
-            remaining: (cap - used).max(0),
+            cap: PERMANENT_NYM_CAP,
+            remaining: (PERMANENT_NYM_CAP - used).max(0),
         }
     }
 }
@@ -235,7 +233,6 @@ pub async fn register(
         &req.nym,
         &req.ct_descriptor,
         verification_npub,
-        PERMANENT_NYM_CAP,
         active_cap,
     )
     .await?
@@ -271,7 +268,7 @@ pub async fn register(
             nym: user.nym,
             lightning_address,
             nip05,
-            quota: QuotaView::new(used, PERMANENT_NYM_CAP),
+            quota: QuotaView::new(used),
         }),
     ))
 }
@@ -396,7 +393,7 @@ pub async fn delete_registration(
 
     let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
     Ok(Json(DeleteResponse {
-        quota: QuotaView::new(used, PERMANENT_NYM_CAP),
+        quota: QuotaView::new(used),
     }))
 }
 
@@ -470,7 +467,7 @@ pub async fn lookup_by_npub(
         lightning_address_online: online,
         alias: status.canonical_alias,
         public_name_policy: PUBLIC_NAME_POLICY,
-        quota: QuotaView::new(status.used, PERMANENT_NYM_CAP),
+        quota: QuotaView::new(status.used),
         previous_nyms: status.previous_nyms,
         lifetime_nyms_used: status.used,
         lifetime_nyms_cap: PERMANENT_NYM_CAP,

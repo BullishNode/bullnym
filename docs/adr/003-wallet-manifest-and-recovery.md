@@ -1,7 +1,15 @@
 # 003 Wallet Manifest and Recovery
 
 - Status: Accepted
+- Superseded guidance: client-triggered recovery actions
 - Scope: `bullbitcoin-mobile`
+
+The earlier client-triggered Get Paid recovery guidance in this record is
+superseded. Current chain-swap recovery is server-executed automatically
+against the merchant's immutable pre-registered Bitcoin address. Clients may
+register and read that policy and supervise signed lifecycle status, but cannot
+choose a late destination or trigger a recovery broadcast. See
+[Chain-Swap Recovery](../api/chain-swap-recovery.md).
 
 ## Decision
 
@@ -24,14 +32,6 @@ manifest-listed wallets only. It does not scan reserved Get Paid paths
 opportunistically. If the manifest is missing, empty, invalid, or unavailable,
 automatic restore creates no Get Paid fallback wallets.
 
-Get Paid Advanced manual recovery is the explicit fallback. It recreates only:
-
-- `75 + liquid` Lightning Address;
-- `102 + liquid` Payment Page;
-- `103 + liquid` POS;
-- `77 + liquid` BTCPay;
-- `77 + bitcoin` BTCPay.
-
 ## Rationale
 
 One Bull seed can produce multiple purpose wallets, but recovery cannot rely on
@@ -51,5 +51,6 @@ backup authorities.
 - Manifest publish is full-snapshot replacement, best-effort, and non-blocking.
 - A partial restore must not publish a replacement snapshot that erases fetched
   entries that were not restored.
-- Manual recovery must ship with manifest-driven automatic restore because a
-  failed publish/fetch can otherwise hide real funds from automatic recovery.
+- Manifest restore does not create a client-side chain-swap execution action.
+  Bullnym's signed recovery lifecycle is read-only to clients and its automatic
+  executor remains responsible for existing funded obligations.

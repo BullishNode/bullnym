@@ -123,7 +123,7 @@ The public endpoints have a dedicated per-source throttle, while a short cache
 and per-currency request coalescing bound upstream work without consuming
 payment, status, settlement, or recovery limits.
 
-## Nym lifecycle
+## Permanent nym ownership and Lightning Address availability
 
 ## `POST /register`
 
@@ -139,9 +139,13 @@ payment, status, settlement, or recovery limits.
 ```
 
 Nyms allow lowercase ASCII letters, digits, and internal hyphens. Reserved
-route/product names are rejected. A key may have only one active nym and a
-configured lifetime quota (default deployment value: three). Deactivation does
-not restore quota. Registering a formerly owned nym reactivates it.
+route/product names are rejected. A key may claim exactly one permanent nym.
+This cap is a product and database invariant, not an operator-configurable
+limit. The claim never becomes inactive and is never cleared, renamed,
+released, or reassigned. `users.is_active` controls only whether the Lightning
+Address is online. Registering the exact nym already owned by an offline wallet
+brings that Lightning Address online; trying to register a different name is a
+conflict.
 
 Response (`201`):
 
@@ -150,7 +154,7 @@ Response (`201`):
   "nym": "alice",
   "lightning_address": "alice@pay.example.com",
   "nip05": "alice@pay.example.com",
-  "quota": { "used": 1, "cap": 3, "remaining": 2 }
+  "quota": { "used": 1, "cap": 1, "remaining": 0 }
 }
 ```
 
@@ -188,13 +192,14 @@ Response: `{ "nym": "alice", "lightning_address": "alice@pay.example.com" }`.
 }
 ```
 
-Omit/false `purge` for normal soft deactivation (`delete` action). It stops new
-payments but preserves history and allows reactivation. `purge: true` uses the
-`purge` action and deletes swap/reservation state only when no payment is in
-flight. Purge never makes the nym claimable by another identity and does not
-restore lifetime quota.
+Omit/false `purge` to take the Lightning Address offline (`delete` action). It
+stops new Lightning Address payment instructions but preserves history and
+permanent name ownership; Page and POS availability remain independent.
+`purge: true` uses the `purge` action and deletes swap/reservation state only
+when no payment is in flight. Neither operation releases the nym, changes its
+owner, or permits the wallet to claim another name.
 
-Response: `{ "quota": { "used": 2, "cap": 3, "remaining": 1 } }`.
+Response: `{ "quota": { "used": 1, "cap": 1, "remaining": 0 } }`.
 
 ## `GET /register/lookup?npub=<64-hex>`
 

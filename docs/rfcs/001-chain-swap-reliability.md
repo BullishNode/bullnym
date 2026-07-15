@@ -1,10 +1,22 @@
 # Chain-Swap Reliability v3
 
-- Status: Proposed
+- Status: Superseded
+- Superseded by: the maintained automatic-recovery contract linked below
 - Owner: Unassigned
 - Affected repositories: `bullnym`, `bullbitcoin-mobile`
 - Written against: `origin/main` at `6e73944` (PR #76, schema marker 044)
 - Last updated: 2026-07-11
+
+> **Historical design record.** This RFC preserves the reasoning that led to
+> the durable chain-swap implementation, but its rollout stages, issue list,
+> client execution ideas, fee-replacement proposal, and optional economic
+> backstop are not current product commitments. The maintained server contract
+> is [Chain-Swap Recovery](../api/chain-swap-recovery.md): Bullnym executes the
+> immutable recovery policy automatically and clients have read-only
+> supervision. Operator handling is documented in
+> [Swaps requiring attention](../operations/runbooks/stuck-swaps.md). Explicit
+> transaction replacement remains deferred; no public recovery action or
+> loss-compensation guarantee is shipped.
 
 **Supersedes:** the implementation ordering and unresolved server model in
 [archived Recovery v2](../../archive/plans/superseded/recovery-v2.md). The

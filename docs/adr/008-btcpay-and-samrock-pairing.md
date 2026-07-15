@@ -35,5 +35,5 @@ accepted descriptors.
   requested BTC/LBTC wallets exists.
 - Server-connected state is BTCPay/SamRock-owned and is not inferred from local
   wallet existence.
-- Get Paid manual recovery can recreate BTCPay path-77 wallets but does not
-  recreate server pairing state.
+- Manifest/seed restore may recreate BTCPay path-77 wallets, but local wallet
+  existence does not recreate server pairing state.

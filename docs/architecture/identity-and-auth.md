@@ -31,7 +31,7 @@ or linked/unlinked invoice scopes.
 |---|---|---|
 | `register` | `npub` | `nym`, Lightning Address `ct_descriptor`, optional `verification_npub`. |
 | `update` | `npub` | Replacement Lightning Address `ct_descriptor`. |
-| `delete` | `npub` | Deactivate the current nym. |
+| `delete` | `npub` | Take the current Lightning Address offline without changing nym ownership. |
 | `donation-page-save` | `npub` | Surface fields, display currency, links, optional `pos_mode`, optional `ct_descriptor`, optional `kind`. |
 | `donation-page-archive` | `npub` | Archive a surface. Optional `kind` defaults to `payment_page`. |
 | `invoice-create` | `npub` | Amount, accepted rails, recipient-supplied addresses, metadata, expiry. |
@@ -52,9 +52,10 @@ Wallet-origin invoices do not require server-stored descriptors. The mobile
 client supplies concrete Bitcoin and/or Liquid settlement addresses at invoice
 creation time.
 
-## Nym Reservation Rules
+## Permanent nym ownership
 
-Deactivated nyms remain reserved to the original owner and cannot be claimed by
-another `npub`. The server enforces a lifetime nym cap per owner key and blocks
-reserved names that would shadow explicit routes such as `/health`, `/api`, or
-`/register`.
+Each owner key may permanently claim one nym, which cannot be cleared, renamed,
+released, reassigned, or claimed by another `npub`. Lightning Address online/
+offline availability is a separate property and never changes that ownership.
+The server also blocks names that would shadow explicit routes such as
+`/health`, `/api`, or `/register`.
