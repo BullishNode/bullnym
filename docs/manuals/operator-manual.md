@@ -14,9 +14,9 @@ certification evidence:
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
 | **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
-| **Verified installed schema-063 release** | Through PR #183, migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves that deployment identity and readiness at the observed times, not the unfinished payment journeys. |
-| **Current merged source** | PR #185 exact main contains the final runtime fixes described below. A merge and green source tests are not evidence that its artifact is installed, running, or journey-certified. |
-| **Journey-certified production release** | Use this label only after the final PR #185 artifact and release record are verified, the schema-063 no-funds smoke and bounded live-Liquid/recycler journey pass, and certification authority is removed with a clean final audit. Those results remain explicit placeholders below. |
+| **Verified installed schema-063 release** | Through PR #185, migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves deployment identity and readiness at the observed times, not the unfinished payment journeys. |
+| **Current deployed source** | PR #185 exact main contains the final runtime fixes described below. Its exact artifact and active release record are verified, but deployment identity is not journey certification. |
+| **Journey-certified production release** | Use this label only after the schema-063 no-funds smoke and bounded live-Liquid/recycler journey pass, and certification authority is removed with a clean final audit. Those results remain explicit placeholders below. |
 
 Exact revisions used for this manual:
 
@@ -32,13 +32,13 @@ Exact revisions used for this manual:
 - first schema-063 deployed binary SHA-256: `2ab891a3c372cf5f619c0a702beb099bd5b80f447f571d2fb66c1c2a3a3c9a5b`;
 - first schema-063 deployed release-record SHA-256: `652819a2c8a4e8812b1c8722b742aba200a8cee33ade69697b72fcb35b92de56`;
 - prior schema-063 production source: PR #182 merge `0f459fff770d4eef24e7858b7c546e652846ed08`, tree `b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`;
-- most recently verified installed production source: PR #183 merge `71203f082b8f09c7f257bc1cd53ba981f71924f2`, tree `3b5ce89b2e205f724f1969866534feba3e7e43c4`, expected schema `063_checkout_private_memo`;
-- most recently verified installed and running binary SHA-256: `d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`;
-- most recently verified active release-record SHA-256: `f43abde09473e24f7ef55a96bd1c0fdb64510c5e3fd2b3b12cfa914a58ba88f5`;
+- prior verified installed production source: PR #183 merge `71203f082b8f09c7f257bc1cd53ba981f71924f2`, tree `3b5ce89b2e205f724f1969866534feba3e7e43c4`, expected schema `063_checkout_private_memo`;
+- prior verified installed and running binary SHA-256: `d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`;
+- prior verified active release-record SHA-256: `f43abde09473e24f7ef55a96bd1c0fdb64510c5e3fd2b3b12cfa914a58ba88f5`;
 - most recently verified PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
-- current merged source awaiting final deployment evidence: PR #185 merge `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree `203abc2352b7d06819e383b56c91b99f113633eb`, expected schema `063_checkout_private_memo`;
-- final deployed PR #185 artifact SHA-256: `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
-- final active PR #185 release-record SHA-256: `PENDING_FINAL_RELEASE_RECORD_SHA256`;
+- current deployed source: PR #185 merge `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree `203abc2352b7d06819e383b56c91b99f113633eb`, expected schema `063_checkout_private_memo`;
+- final deployed PR #185 artifact SHA-256: `eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`;
+- final active PR #185 release-record SHA-256: `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`;
 - certification harness source: `65f46fa70fa41cd99f291a54af0970d5304a72cb`, clean, simulator SHA-256 `663613f01315390d1a59cdb179ccfcfd0def238635a2cc2d1c5b7a9984d3ecdd`;
 - protected production configuration SHA-256 after the test-certification
   allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`; the forward deploy verified that configuration and the runtime environment were byte-preserved.
@@ -174,15 +174,19 @@ persisted request amount or pair hash.
 
 PR #185 is merged at exact main
 `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
-`203abc2352b7d06819e383b56c91b99f113633eb`. This manual does not yet claim
-that its artifact is installed, running, or journey-certified.
+`203abc2352b7d06819e383b56c91b99f113633eb`. Its exact artifact is installed
+and running with the active release record below; this manual does not yet
+claim that it is journey-certified.
 
-The only deliberately unresolved evidence fields in this revision are:
+Its verified deployment digests are:
 
 - final deployed PR #185 binary/artifact SHA-256:
-  `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
+  `eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`;
 - final active PR #185 release-record SHA-256:
-  `PENDING_FINAL_RELEASE_RECORD_SHA256`;
+  `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`.
+
+The deliberately unresolved evidence fields in this revision are:
+
 - final no-funds schema-063 result: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
 - final bounded live-Liquid/recycler result:
   `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
@@ -376,16 +380,15 @@ It moved no funds, called no provider, and made only public `GET` requests to
 readiness evidence, not as schema-062 smoke or live-money certification.
 
 The production marker is exactly `063_checkout_private_memo`. The most recently
-verified installed identity is PR #183 merge
-`71203f082b8f09c7f257bc1cd53ba981f71924f2`, artifact digest
-`d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`,
+verified installed identity is PR #185 merge
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`, artifact digest
+`eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`,
+active release-record digest
+`4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`,
 PWA digest `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`,
-and this schema marker. Current merged source is newer PR #185 exact main
-`c026691cdede46cff56c9a34fade0fd4339bd5b7`; use its final artifact and release
-record only after the two corresponding `PENDING_FINAL_*` digests are replaced
-with observed values. Never reuse the schema-062 certification report as proof
-of the current release, and never substitute merge or deployment identity for
-a pending journey result.
+and this schema marker. Never reuse the schema-062 certification report as
+proof of the current release, and never substitute merge or deployment
+identity for a pending journey result.
 
 The production configuration supports a narrowly scoped certification bypass
 for exactly one allowlisted source, the TEST VM, and exactly these five scopes:

@@ -17,11 +17,11 @@ baseline reported clean build
 `060_lnurl_private_comment_intents`, and permanent-name policy
 `permanent_names_v1`.
 
-The complete server/PWA behavior described below is current merged source
+The complete server/PWA behavior described below is current deployed source
 `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
 `203abc2352b7d06819e383b56c91b99f113633eb`, with expected schema
-`063_checkout_private_memo`. This source has merged, but this manual does not
-yet claim that its final artifact is installed or journey-certified. It
+`063_checkout_private_memo`. Its exact artifact and active release record are
+installed, but this manual does not yet claim that it is journey-certified. It
 includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
@@ -81,10 +81,13 @@ path and fills it from the immutable request amount; a present mismatch, null,
 duplicate, or otherwise malformed value still fails closed, and ordinary
 reverse-swap responses remain strict.
 
-The final PR #185 production evidence remains deliberately incomplete:
+The final PR #185 deployment identity is complete; journey and cleanup evidence
+remain deliberately incomplete:
 
-- deployed binary/artifact SHA-256: `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
-- active release-record SHA-256: `PENDING_FINAL_RELEASE_RECORD_SHA256`;
+- deployed binary/artifact SHA-256:
+  `eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`;
+- active release-record SHA-256:
+  `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`;
 - zero-spend/no-funds journey: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
 - bounded live-Liquid and recycler journey:
   `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
@@ -486,7 +489,7 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Historical baseline behavior was checked against the first deployed probe
-above. Current merged behavior was checked against Bullnym source and tests at
+above. Current deployed behavior was checked against Bullnym source and tests at
 `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
 `203abc2352b7d06819e383b56c91b99f113633eb`, plus the
 product/API/architecture documents in this repository and the locked
@@ -496,11 +499,11 @@ maintained outside this repository.
 The historical read-only certification proves the schema-062 deployment
 identity at its observed time. The later schema-063 cutover records, public
 probes, and artifact digests separately prove each recorded deployment identity
-and public-readiness observation through installed PR #183. Exact hotfix
+and public-readiness observation through installed PR #185. Exact hotfix
 startup evidence reported a consistent recovery pass; the Operator Manual
 records that evidence and its limits. The schema-062 and schema-063 no-funds
-failures and their closed funds boundaries are recorded there. Merged PR #185
-source is newer than that installed evidence. Its final artifact, release
-record, no-funds journey, bounded live-Liquid/recycler journey, and
-certification cleanup/audit remain the conspicuous `PENDING_FINAL_*` fields in
-the release-status section; none may be inferred from merge status.
+failures and their closed funds boundaries are recorded there. PR #185's exact
+artifact and active release record are recorded above. Its no-funds journey,
+bounded live-Liquid/recycler journey, and certification cleanup/audit remain
+the conspicuous `PENDING_FINAL_*` fields in the release-status section; none may
+be inferred from deployment identity.
