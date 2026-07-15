@@ -690,6 +690,15 @@ fn api_tolerance_uses_configured_values() {
     };
 
     assert_eq!(payment_tolerance_sat(&inv, tolerances), 42);
+
+    inv.accept_btc = true;
+    inv.accept_liquid = true;
+    inv.accept_ln = true;
+    assert_eq!(
+        payment_tolerance_sat(&inv, tolerances),
+        3,
+        "the API must advertise the strictest accepted-rail tolerance"
+    );
 }
 
 fn payment_template_fixture(

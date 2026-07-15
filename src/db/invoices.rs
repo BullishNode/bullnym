@@ -702,13 +702,32 @@ impl InvoiceAccountingTolerances {
     }
 }
 
-fn payment_tolerance_sat_for_amount(
+/// One shortfall-tolerance contract for every projection of an invoice.
+///
+/// A payer sees one `payment_tolerance_sat` value even when several rails are
+/// accepted, so accounting and presentation must enforce that same value. Use
+/// the strictest accepted-rail tolerance, capped at one percent of the invoice
+/// amount. This is intentionally independent of which rail delivers the latest
+/// event; otherwise a mixed-rail invoice can be accepted outside its public
+/// contract and its result can depend on event order.
+pub(crate) fn invoice_payment_tolerance_sat(
     amount_sat: i64,
-    rail: &str,
+    accept_btc: bool,
+    accept_liquid: bool,
+    accept_ln: bool,
     tolerances: InvoiceAccountingTolerances,
 ) -> i64 {
+    let rail_tolerance = [
+        accept_btc.then_some(tolerances.for_rail("bitcoin")),
+        accept_liquid.then_some(tolerances.for_rail("liquid")),
+        accept_ln.then_some(tolerances.for_rail("lightning")),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(tolerances.for_rail("lightning"));
     let one_percent = (amount_sat / 100).max(1);
-    tolerances.for_rail(rail).min(one_percent).max(0)
+    rail_tolerance.min(one_percent).max(0)
 }
 
 pub struct InvoicePaymentEvidence<'a> {
@@ -1010,15 +1029,15 @@ fn resolve_invoice_status(
 }
 
 fn resolve_invoice_presentation_status(
+    prior_accounting_status: &str,
     amount_sat: i64,
     events: &[(String, i64)],
-    tolerances: InvoiceAccountingTolerances,
+    tolerance_sat: i64,
 ) -> &'static str {
     let mut received_sat = 0_i64;
     let mut status = "unpaid";
-    for (rail, event_amount_sat) in events {
+    for (_rail, event_amount_sat) in events {
         received_sat = received_sat.saturating_add(*event_amount_sat);
-        let tolerance_sat = payment_tolerance_sat_for_amount(amount_sat, rail, tolerances);
         let computed = if received_sat > amount_sat {
             "overpaid"
         } else if amount_sat.saturating_sub(received_sat) <= tolerance_sat {
@@ -1032,7 +1051,19 @@ fn resolve_invoice_presentation_status(
             computed
         };
     }
-    status
+    // Keep presentation aligned with the durable accounting stickiness
+    // contract. This matters during rollout: an invoice accepted under the
+    // historical rail-local tolerance must not visually regress when a later
+    // event is evaluated under the corrected invoice-wide tolerance.
+    if prior_accounting_status == "overpaid" && status != "overpaid" {
+        "overpaid"
+    } else if prior_accounting_status == "paid"
+        && !matches!(status, "payment_received" | "overpaid")
+    {
+        "payment_received"
+    } else {
+        status
+    }
 }
 
 fn compose_invoice_settlement_status(direct: &str, swap: &str) -> &'static str {
@@ -1254,8 +1285,19 @@ pub async fn record_invoice_payment(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    let presentation_status =
-        resolve_invoice_presentation_status(inv.amount_sat, &presentation_events, tolerances);
+    let tolerance_sat = invoice_payment_tolerance_sat(
+        inv.amount_sat,
+        inv.accept_btc,
+        inv.accept_liquid,
+        inv.accept_ln,
+        tolerances,
+    );
+    let presentation_status = resolve_invoice_presentation_status(
+        &inv.status,
+        inv.amount_sat,
+        &presentation_events,
+        tolerance_sat,
+    );
 
     let rails: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT rail FROM invoice_payment_events \
@@ -1272,7 +1314,6 @@ pub async fn record_invoice_payment(
         "mixed"
     };
 
-    let tolerance_sat = payment_tolerance_sat_for_amount(inv.amount_sat, evidence.rail, tolerances);
     let expired = inv.expires_at_unix <= chrono_like_unix_now();
     let new_status = match inv.status.as_str() {
         // Cancellation/expiry close instructions but remain durable lifecycle
@@ -2078,15 +2119,68 @@ pub async fn latest_lightning_pr_for_invoice<'e, E: sqlx::PgExecutor<'e>>(
 #[cfg(test)]
 mod status_tests {
     use super::{
-        liquid_watcher_lane_sql, resolve_invoice_status, truncate_to_watcher_batch,
-        WatcherScanCursor, WatcherScanEpoch, LIQUID_WATCHER_BATCH_SIZE,
-        LIQUID_WATCHER_LANE_LAG_SQL, LIQUID_WATCHER_LANE_PAGE_SQL, LIQUID_WATCHER_PAGE_SQL,
-        LIQUID_WATCHER_RECENT_PREDICATE_SQL,
+        invoice_payment_tolerance_sat, liquid_watcher_lane_sql,
+        resolve_invoice_presentation_status, resolve_invoice_status, truncate_to_watcher_batch,
+        InvoiceAccountingTolerances, WatcherScanCursor, WatcherScanEpoch,
+        LIQUID_WATCHER_BATCH_SIZE, LIQUID_WATCHER_LANE_LAG_SQL, LIQUID_WATCHER_LANE_PAGE_SQL,
+        LIQUID_WATCHER_PAGE_SQL, LIQUID_WATCHER_RECENT_PREDICATE_SQL,
     };
     use uuid::Uuid;
 
     // amount 100_000; btc tolerance 300, liquid tolerance 60 (illustrative).
     const AMT: i64 = 100_000;
+
+    #[test]
+    fn mixed_invoice_enforcement_matches_the_advertised_minimum() {
+        let tolerances = InvoiceAccountingTolerances::default();
+        let advertised = invoice_payment_tolerance_sat(AMT, true, true, true, tolerances);
+
+        assert_eq!(advertised, 1);
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 99_750, advertised, false),
+            "partially_paid",
+            "a Bitcoin event must not widen the mixed invoice's public tolerance"
+        );
+        assert_eq!(
+            resolve_invoice_presentation_status(
+                "unpaid",
+                AMT,
+                &[("bitcoin".to_string(), 99_750)],
+                advertised,
+            ),
+            "partial",
+            "presentation and accounting must share the public tolerance"
+        );
+        assert_eq!(
+            resolve_invoice_status("unpaid", AMT, 99_999, advertised, false),
+            "paid",
+            "the exact advertised boundary must remain payable"
+        );
+        assert_eq!(
+            resolve_invoice_presentation_status(
+                "unpaid",
+                AMT,
+                &[("bitcoin".to_string(), 99_999)],
+                advertised,
+            ),
+            "payment_received"
+        );
+        assert_eq!(
+            resolve_invoice_status("paid", AMT, 99_750, advertised, false),
+            "paid",
+            "the corrected tolerance must preserve durable paid stickiness"
+        );
+        assert_eq!(
+            resolve_invoice_presentation_status(
+                "paid",
+                AMT,
+                &[("bitcoin".to_string(), 99_750)],
+                advertised,
+            ),
+            "payment_received",
+            "a legacy paid invoice must not visually regress during rollout"
+        );
+    }
 
     fn recent_liquid_lane_facts(
         age_new: bool,
@@ -2198,14 +2292,14 @@ mod status_tests {
         );
     }
 
-    // The R2 regression: a settled invoice must not un-pay when a later event
-    // on a tighter-tolerance rail arrives. btc pays 99_750 -> paid (tol 300);
-    // liquid tops up 150 -> received 99_900, remaining 100 > liquid tol 60.
-    // Pre-fix this recomputed to partially_paid; post-fix it stays paid.
+    // The R2 regression: a settled invoice must not un-pay when active evidence
+    // or the applicable tolerance contract becomes stricter. This also keeps
+    // rollout compatible with invoices accepted under the historical
+    // rail-local tolerance.
     #[test]
-    fn settled_paid_does_not_regress_on_tighter_rail() {
+    fn settled_paid_does_not_regress_when_the_threshold_tightens() {
         assert_eq!(
-            resolve_invoice_status("paid", AMT, 99_900, 60, false),
+            resolve_invoice_status("paid", AMT, 99_900, 1, false),
             "paid"
         );
     }
