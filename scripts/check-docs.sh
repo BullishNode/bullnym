@@ -34,8 +34,9 @@ done < <(
     ' README.md CONTRIBUTING.md SECURITY.md $(find docs archive -type f -name '*.md' | sort)
 )
 
-if rg -n 'docs/(components|features|decisions)/|docs/api-reference\.md|docs/payment-architecture\.md|docs/runbook-stuck-swap\.md' \
-    README.md CONTRIBUTING.md SECURITY.md docs --glob '*.md'; then
+if grep -R -n -E --include='*.md' \
+    'docs/(components|features|decisions)/|docs/api-reference\.md|docs/payment-architecture\.md|docs/runbook-stuck-swap\.md' \
+    README.md CONTRIBUTING.md SECURITY.md docs; then
     printf 'maintained documentation references a retired path\n' >&2
     status=1
 fi
@@ -49,26 +50,26 @@ fi
 # automatic, read-only-to-clients recovery. Superseded RFCs retain historical
 # reasoning and carry their own status notices, so they are deliberately not
 # part of this current-contract scan.
-if rg -n -i \
+if grep -R -n -i -E \
     'reactivat|manual recovery|\bRBF\b|compensation|alias release' \
     docs/api docs/products docs/architecture docs/adr; then
     printf 'maintained documentation contains a retired product promise\n' >&2
     status=1
 fi
 
-if ! rg -q '^- Status: Superseded$' \
+if ! grep -Fqx -- '- Status: Superseded' \
     docs/rfcs/001-chain-swap-reliability.md \
-    || ! rg -q '^- Superseded by: the maintained automatic-recovery contract linked below$' \
+    || ! grep -Fqx -- '- Superseded by: the maintained automatic-recovery contract linked below' \
         docs/rfcs/001-chain-swap-reliability.md \
-    || ! rg -q '^> \*\*Historical design record\.\*\*' \
+    || ! grep -Fq -- '> **Historical design record.**' \
         docs/rfcs/001-chain-swap-reliability.md; then
     printf 'chain-swap RFC is missing its historical/superseded status notice\n' >&2
     status=1
 fi
 
-if ! rg -q '^- Status: Superseded by RFC-003$' \
+if ! grep -Fqx -- '- Status: Superseded by RFC-003' \
     docs/rfcs/002-public-name-reservation.md \
-    || ! rg -q '^This is a historical research/design record\.' \
+    || ! grep -Fq -- 'This is a historical research/design record.' \
         docs/rfcs/002-public-name-reservation.md; then
     printf 'public-name RFC is missing its historical/superseded status notice\n' >&2
     status=1
