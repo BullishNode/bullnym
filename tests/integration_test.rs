@@ -31164,6 +31164,152 @@ async fn issue84_offline_page_owner_keeps_exactly_one_chain_offer_and_lnurl_stay
 }
 
 #[tokio::test]
+async fn versioned_fiat_bitcoin_quote_uses_permanent_page_owner_while_lnurl_is_offline() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "fiatquoteofflinepage";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Offline LA fiat checkout",
+            description: "The permanent Page remains independently payable",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before Lightning Address deactivation");
+
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        "Phase7OfflineFiatQuote1",
+    )
+    .await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
+    let app = test_app(state);
+
+    let (lnurl_status, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(lnurl_status, StatusCode::OK, "{unavailable}");
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let (create_status, created) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({ "fiat_amount_minor": 2_500, "fiat_currency": "USD" }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{created}");
+    assert_eq!(created["pricing_mode"], "fiat_fixed", "{created}");
+    let invoice_id = Uuid::parse_str(created["invoice_id"].as_str().unwrap()).unwrap();
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 0);
+
+    let quote_path = format!("/api/v1/invoices/{invoice_id}/quote");
+    let (quote_status, quote) = post_json(&app, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(quote_status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["selected_rail"], "bitcoin", "{quote}");
+    assert_eq!(quote["quote"]["merchant_amount_sat"], 25_000, "{quote}");
+    assert_eq!(
+        quote["instruction"]["kind"], "bitcoin_boltz_chain",
+        "{quote}"
+    );
+    assert!(
+        quote["instruction"]["quote_offer_id"].is_string(),
+        "{quote}"
+    );
+    assert!(quote["instruction"]["address"].is_string(), "{quote}");
+    assert!(quote["instruction"]["bip21"].is_string(), "{quote}");
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+
+    let durable: (i64, i64, i64, i64, Uuid, String) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1), \
+             recovery_address_commitment_id, boltz_swap_id \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable.0, 1);
+    assert_eq!(durable.1, 1);
+    assert_eq!(durable.2, 1);
+    assert_eq!(durable.3, 1);
+    assert_eq!(durable.4, recovery_commitment_id);
+    assert_eq!(durable.5, "Phase7OfflineFiatQuote1");
+
+    let provider_calls_before_retry = provider.calls.load(Ordering::SeqCst);
+    let (retry_status, retry) = post_json(&app, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["quote"], quote["quote"]);
+    assert_eq!(retry["instruction"], quote["instruction"]);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        provider_calls_before_retry
+    );
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+    let retry_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_counts, (1, 1, 1));
+
+    let (_, still_unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(
+        still_unavailable["code"], "NymNotFound",
+        "{still_unavailable}"
+    );
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn issue84_chain_offer_copies_commitment_durably_before_return() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

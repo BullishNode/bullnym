@@ -2670,18 +2670,19 @@ async fn ensure_versioned_bitcoin_chain_offer(
         .admission
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
-    let active_owner = db::get_active_user_by_nym(&state.db, nym)
-        .await?
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable("Bitcoin recovery owner is unavailable".into())
-        })?;
-    if active_owner.npub != invoice.npub_owner {
+    // Page/POS ownership and the recovery contract are permanent. Taking the
+    // separate Lightning Address product offline must close LNURL without
+    // disabling an already-enabled checkout surface's Bitcoin quote.
+    let owner = db::get_user_by_nym(&state.db, nym).await?.ok_or_else(|| {
+        AppError::ServiceUnavailable("Bitcoin recovery owner is unavailable".into())
+    })?;
+    if owner.npub != invoice.npub_owner {
         return Err(AppError::DbError(
             "Bitcoin recovery owner does not match invoice recipient".into(),
         ));
     }
     let recovery_commitment =
-        db::select_current_recovery_address_commitment(&state.db, &active_owner.npub)
+        db::select_current_recovery_address_commitment(&state.db, &owner.npub)
             .await
             .map_err(|error| {
                 AppError::DbError(format!(
