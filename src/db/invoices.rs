@@ -83,7 +83,10 @@ const INVOICE_COLUMNS: &str =
      EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
      EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
      EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
-     EXTRACT(EPOCH FROM rate_locks_until)::BIGINT AS rate_locks_until_unix, \
+     CASE \
+         WHEN pricing_mode = 'fiat_fixed' AND rate_minor_per_btc IS NULL THEN 0 \
+         ELSE EXTRACT(EPOCH FROM rate_locks_until)::BIGINT \
+     END AS rate_locks_until_unix, \
      EXTRACT(EPOCH FROM paid_at)::BIGINT          AS paid_at_unix, \
      EXTRACT(EPOCH FROM cancelled_at)::BIGINT     AS cancelled_at_unix";
 

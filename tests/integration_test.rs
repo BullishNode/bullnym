@@ -12077,6 +12077,199 @@ async fn fiat_checkout_private_note_survives_pricer_outage_and_first_quote_owns_
 }
 
 #[tokio::test]
+async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preserves_sat_fixed_deadline(
+) {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let nym = "prequoteratelock";
+    create_test_user(&pool, nym).await;
+    let page_descriptor = test_descriptor_with_blinding_key(0x31);
+    let pos_descriptor = test_descriptor_with_blinding_key(0x32);
+    for (kind, descriptor) in [
+        (pay_service::db::KIND_PAYMENT_PAGE, &page_descriptor),
+        (pay_service::db::KIND_POS, &pos_descriptor),
+    ] {
+        pay_service::db::upsert_donation_page(
+            &pool,
+            &pay_service::db::UpsertDonationPage {
+                nym,
+                kind,
+                ct_descriptor: descriptor,
+                header: "Prequote projection",
+                description: "No invoice-level rate exists before payer demand",
+                display_currency: "USD",
+                website: None,
+                twitter: None,
+                instagram: None,
+                enabled: true,
+                generated_og_template_version: None,
+                alias: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = test_app(test_state(pool.clone()));
+    let mut fiat_invoice_ids = Vec::new();
+    for path in [format!("/{nym}/invoice"), format!("/{nym}/pos/invoice")] {
+        let (create_status, create_body) = post_json(
+            &app,
+            &path,
+            json!({
+                "fiat_amount_minor": 1_000,
+                "fiat_currency": "USD"
+            }),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK, "{path}: {create_body}");
+        assert_eq!(create_body["pricing_mode"], "fiat_fixed", "{path}");
+        fiat_invoice_ids.push(
+            Uuid::parse_str(create_body["invoice_id"].as_str().expect("invoice id")).unwrap(),
+        );
+    }
+
+    let (wallet_npub, _, _, wallet_keypair) =
+        sign_registration_with_keypair("prequotewallet", TEST_DESCRIPTOR);
+    let fiat_bitcoin_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let expires_at = expires_at_unix.to_string();
+    let (fiat_signature, fiat_timestamp) = sign_la_action(
+        &wallet_keypair,
+        "invoice-create",
+        &wallet_npub,
+        "",
+        &[
+            "",
+            "1000",
+            "USD",
+            "",
+            "",
+            "",
+            "true",
+            "false",
+            "false",
+            fiat_bitcoin_address,
+            "",
+            "",
+            &expires_at,
+        ],
+    );
+    let (wallet_status, wallet_body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": wallet_npub,
+            "amount_sat": null,
+            "fiat_amount_minor": 1_000,
+            "fiat_currency": "USD",
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": fiat_bitcoin_address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": fiat_timestamp,
+            "signature": fiat_signature,
+        }),
+    )
+    .await;
+    assert_eq!(wallet_status, StatusCode::OK, "{wallet_body}");
+    fiat_invoice_ids.push(
+        Uuid::parse_str(
+            wallet_body["invoice_id"]
+                .as_str()
+                .expect("wallet invoice id"),
+        )
+        .unwrap(),
+    );
+
+    for invoice_id in fiat_invoice_ids {
+        let raw: (String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT pricing_mode, rate_minor_per_btc, \
+                    EXTRACT(EPOCH FROM rate_locks_until)::BIGINT, \
+                    EXTRACT(EPOCH FROM expires_at)::BIGINT \
+               FROM invoices WHERE id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(raw.0, "fiat_fixed");
+        assert_eq!(raw.1, None);
+        assert_eq!(raw.2, raw.3, "legacy storage remains the invoice deadline");
+
+        let projected = pay_service::db::get_invoice_by_id(&pool, invoice_id)
+            .await
+            .unwrap()
+            .expect("projected invoice");
+        assert_eq!(projected.rate_locks_until_unix, 0);
+
+        let (status, body) = get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["pricing_mode"], "fiat_fixed");
+        assert_eq!(body["rate_minor_per_btc"], Value::Null);
+        assert_eq!(body["rate_locks_until_unix"], 0);
+        assert!(body["expires_at_unix"].as_i64().unwrap() > 0);
+    }
+
+    let sat_bitcoin_address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    let (sat_signature, sat_timestamp) = sign_invoice_create_with_keypair(
+        &wallet_keypair,
+        &wallet_npub,
+        sat_bitcoin_address,
+        expires_at_unix,
+    );
+    let (sat_create_status, sat_create_body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": wallet_npub,
+            "amount_sat": 1_000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": sat_bitcoin_address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": sat_timestamp,
+            "signature": sat_signature,
+        }),
+    )
+    .await;
+    assert_eq!(sat_create_status, StatusCode::OK, "{sat_create_body}");
+    let sat_invoice_id = Uuid::parse_str(
+        sat_create_body["invoice_id"]
+            .as_str()
+            .expect("sat invoice id"),
+    )
+    .unwrap();
+    let (sat_status, sat_body) =
+        get_path(&app, &format!("/api/v1/invoices/{sat_invoice_id}/status")).await;
+    assert_eq!(sat_status, StatusCode::OK, "{sat_body}");
+    assert_eq!(sat_body["pricing_mode"], "sat_fixed");
+    assert_eq!(sat_body["rate_minor_per_btc"], Value::Null);
+    assert_eq!(
+        sat_body["rate_locks_until_unix"], sat_body["expires_at_unix"],
+        "sat-fixed invoices keep the invoice deadline as their lock sentinel"
+    );
+    assert!(sat_body["rate_locks_until_unix"].as_i64().unwrap() > 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn payer_quote_refuses_a_partial_window_before_rate_or_provider_work() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
