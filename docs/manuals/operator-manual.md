@@ -7,26 +7,39 @@ integrity gates.
 
 ## Evidence and release status
 
-This revision deliberately separates source behavior from deployed behavior:
+This revision deliberately separates source, installation, and certification
+evidence:
 
 | Label | Meaning |
 |---|---|
-| **Deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC. |
-| **Merged release source** | Implemented, tested, reviewed, and merged at the exact source revision below, but not yet installed or production-certified. |
-| **Deployed release** | Use this label only after the final merge commit, artifact and PWA digests, schema marker, running-process digest, and public certification all agree. |
+| **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
+| **Installed schema-062 release** | The exact merged artifact, PWA, release record, running process, and fresh schema agree, but final certification and private rail admission are separate pending gates. |
+| **Certified production release** | Use this label only after installation identity, startup recovery evidence, private admission, and the final public and bounded money-journey certification all agree. |
 
 Exact revisions used for this manual:
 
-- deployed baseline: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
+- historical deployed baseline: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
 - reviewed PR #177 base: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`;
 - reviewed PR #177 head: `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`;
-- merged release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`.
+- installed release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`;
+- installed binary SHA-256: `21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
+- installed PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
+- active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`.
 
-The baseline public probe returned `200` for `/health`, `/ready`, `/version`,
+The historical baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
 `/ready` reported database and schema healthy. `/version` reported the baseline
 commit above, `build_dirty: false`, production mode, and
 `public_name_policy: permanent_names_v1`.
+
+At 2026-07-15 08:03 UTC, the stopped-writer fresh reset had applied all 62
+migrations and the application VM installed the exact release above. Read-only
+loopback and public probes returned `ok`, `/ready` reported `ready: true` with
+healthy database and schema components, and `/version` reported the exact
+installed commit, clean production build, schema
+`062_invoice_quote_provider_attempts`, and permanent-name policy. The installed
+file and running-process digests both matched the binary digest above, and the
+checked-out PWA matched its recorded content digest.
 
 Merged PR #177 is the complete server/PWA release source described by this
 manual.
@@ -38,13 +51,13 @@ It also carries forward the current-only automatic-recovery and permanent-name
 contract from its merged base. It does not restore the tokenless LNURL callback,
 legacy Payment Page media fields, or legacy payout/surface modes.
 
-At the time of writing, the merged release is not a production capability. Its
-local and hosted Rust, PWA, migration, recovery, and certification fault gates
-are source evidence; fresh-database cutover, artifact installation, and
-post-install certification remain release operations. Until all of those
-complete, a production result that still exposes the seven-day/single-conversion
-behavior is a merged-but-not-deployed condition, not a regression in the
-baseline release.
+Those facts prove cutover and installation, not full production certification.
+At the time of writing, the independent recovery-witness generation still must
+be separated from the retired database generation and reconciled against the
+active Boltz xpub before Bitcoin chain-swap admission can be certified. Final
+public certification, private per-rail admission evidence, and bounded
+money-journey evidence remain pending. Do not describe Bitcoin chain-swap
+admission as open merely because `/ready` is healthy.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the immutable release record. Do not infer deployment from a pull
@@ -187,7 +200,7 @@ Deployment principles:
    startup, non-money public surfaces, and logs before promotion.
 8. Observe at least one reconciler cycle after promotion.
 
-For the merged PR #177 release, the expected schema marker is exactly
+For the installed PR #177 release, the expected schema marker is exactly
 `062_invoice_quote_provider_attempts`. Run the read-only certification both
 against the staged release and after installation:
 
@@ -218,17 +231,17 @@ denomination rules, first-observation valuation, provider-attempt journals,
 runtime ACLs, and readiness boundary. Never infer product capability from a
 table's existence alone.
 
-At merged source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, migrations
+At installed source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, migrations
 058 and 059 are current-only empty-state guards: they require all user, surface,
 invoice, swap, allocation, and returned-address history to be empty before
 creating the permanent-name registry and removing pre-launch fields. Migration
 062 likewise refuses to fabricate monetary authority for incompatible legacy
-fiat or quote rows. The deployed schema-060 marker does not prove any of these
-merged-release boundaries. Do not apply rewritten migrations to an existing
+fiat or quote rows. The historical schema-060 marker did not prove any of these
+schema-062 boundaries. Do not apply rewritten migrations to an existing
 database; use only the approved stopped-writer fresh-database cutover and exact
 complete migration sequence through `062_invoice_quote_provider_attempts`.
 
-Do not start the merged release against schema 061, and do not reopen traffic
+Do not start the installed release against schema 061, and do not reopen traffic
 merely because schema 062 applied. Require the matching binary/PWA identity,
 `/health`, `/ready`, `/version`, worker starts, private admission evidence, and
 the read-only certification preflight. Once schema-062 quote or provider-attempt
@@ -243,6 +256,64 @@ preserve immutable monetary and recovery evidence for any existing test
 obligation, take a verified backup, prove the target really is the approved
 empty deployment, and retain the rollback/fix-forward record. Never erase rows
 to satisfy a migration precondition or conceal an unresolved obligation.
+
+The schema-062 cutover retained these restricted recovery records:
+
+- the final pre-reset PostgreSQL set at
+  `/opt/bullnym/backups/schema062-final-pre-reset-20260715T075659Z`, captured
+  from schema `060_lnurl_private_comment_intents` with 27 public tables and
+  3,755 rows; its `SHA256SUMS` digest is
+  `4ddbe3e3a39dfdaa1510c8ef0bc983b4933c45320c07dcedf76b066db6dd3935`
+  and its database dump digest is
+  `39e15dacc9004a5ec770d1807f468b705da4631ab65f65a3e5f01963afe43af9`;
+- the separately protected runtime supplement manifest has SHA-256
+  `9dca49561cd7904ded145e1c82f5d1da9bc8870dc548454df0540dbe6b3b7f1f`;
+- the stopped-MinIO physical snapshot at
+  `/var/backups/bullnym-witness-minio/schema062-precutover-20260715T075737Z`
+  has inventory SHA-256
+  `0ef741ffeecbff656fcbfa415a3ac29fb5e87ee4ec9f238d97d9655e8af68691`,
+  physical-tar SHA-256
+  `94b4f6497f3b7bb85318b74aff7fb41d3b06358c21068cc313586796b5b3dcab`,
+  and `SHA256SUMS` digest
+  `72f13a17fa3895c8800037be0ccdbba100ea13b668f5818ac5f073172ac1aa99`.
+
+These hashes identify restricted evidence; they are not restoration approval.
+Never publish the archived environment files, object keys, database contents,
+or secrets merely because their container hashes are documented here.
+
+### Current-only recovery generation separation
+
+A fresh current-only PostgreSQL generation must not be paired with a nonempty
+active witness namespace from the retired database generation. A post-cutover
+read-only inventory found 16 retained objects, 62,984 bytes, under the then
+configured witness prefix, with inventory SHA-256
+`0ba7f77a0b2e88fb2f7c712c68eb69ccacba057a807a8c9037be13f2bf807c8a`.
+Those authenticated manifests reference merchant, invoice, Liquid-address, and
+recovery-commitment rows that intentionally do not exist in the fresh database;
+startup therefore fails closed instead of fabricating them.
+
+Preserve the snapshotted namespace as an immutable retired generation. Point
+the current runtime at a newly provisioned empty bucket or prefix with the
+required versioning, retention, and least-privilege credentials. The entire
+physical bucket need not be empty: the loader reads only the configured
+`<prefix>/v1` namespace. Do not delete retained evidence or bypass retention to
+force an empty result.
+
+An empty witness namespace is necessary but not sufficient. Startup also
+validates the Boltz restore set for the xpub derived from `SWAP_MNEMONIC`. For a
+fresh database, require all three active sources to describe the same empty
+current generation: zero witness manifests, zero local swap/recovery inventory,
+and a validated provider response with no records and restore index `-1`. If
+the retired provider records remain visible under the existing xpub, rotate the
+mnemonic before accepting current-generation money; keep the old mnemonic in
+the restricted retired recovery set. Prefer new witness encryption/signing
+material and credentials as a generation boundary as well.
+
+Only a source-free `startup_provider_recovery_consistent` event whose manifest,
+provider, local, reconstruction, delivery, and chain-observation counts are all
+zero proves the empty-generation startup condition. A healthy `/ready` does
+not. Keep Bitcoin chain-swap admission closed until this evidence and all other
+rail foundations agree.
 
 Rollback principles:
 

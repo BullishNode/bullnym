@@ -10,14 +10,14 @@ a payment. Never send a second payment just because a page is slow to update.
 
 ## Release status
 
-This manual was checked against the public service at
+This manual was first checked against the public service at
 `https://pay2.bull-wallet.com` on 2026-07-15 04:23–04:26 UTC. That deployed
 baseline reported clean build
 `512fb32b9fec31702b1260314427df4420f8e27c`, schema
 `060_lnurl_private_comment_intents`, and permanent-name policy
 `permanent_names_v1`.
 
-The complete server/PWA behavior described below is merged release source
+The complete server/PWA behavior described below is current release source
 `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree
 `93f9f06f10d58520547a8d4d9ac85064c822fa07`, with expected schema
 `062_invoice_quote_provider_attempts`. It was reviewed at PR #177 head
@@ -30,14 +30,22 @@ The complete server/PWA behavior described below is merged release source
 - product-correct Bitcoin behavior and durable provider recovery/holds;
 - permanent names, independent public products, and current-only APIs.
 
-At the time of writing, that release is merged but not installed or
-production-certified. Production may therefore still show the baseline's
-seven-day/single-conversion behavior. Treat the merged contract as available
-only after `/version` reports the exact installed release with schema
-`062_invoice_quote_provider_attempts` and the release notes confirm successful
-certification. A pull request, documentation page, or database table alone is
-not deployment evidence. This merged release changes the server-hosted PWA; it
-does not include a mobile-wallet release.
+At 2026-07-15 08:03 UTC, the server completed a fresh schema-062 cutover and
+installed that exact release. The installed and running binary SHA-256 was
+`21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
+the server-hosted PWA content SHA-256 was
+`c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`.
+Public `/health`, `/ready`, and `/version` probes matched the installed commit
+and schema.
+
+Installation is not the same as final production certification. At the time of
+writing, recovery-generation reconciliation, private rail admission, and the
+final bounded production journeys remain pending. In particular, the Payment
+Page or PoS Bitcoin option may remain unavailable while Bitcoin chain-swap
+recovery evidence is reconciled; `/ready` does not promise that every payment
+rail is open. Use only the payment methods the current page actually offers and
+do not infer availability from this manual. This release changes the
+server-hosted PWA; it does not include a mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -417,14 +425,15 @@ choosing two conflicting irreversible outcomes.
 
 ## Evidence sources
 
-Baseline behavior was checked against the deployed probe above. Merged-release
-behavior was checked against Bullnym source and tests at
+Historical baseline behavior was checked against the first deployed probe
+above. Current-release behavior was checked against Bullnym source and tests at
 `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head was
 `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree, plus the
 product/API/architecture documents in this repository and the locked
 completion-plan, rationale, and server/PWA gap-audit records maintained outside
 this repository.
 
-Source and test evidence do not prove deployment. The Operator Manual defines
-the exact release, schema, digest, readiness, and certification evidence needed
-before changing this manual's pending-deployment status.
+The later public probes and artifact digests prove installation, not final rail
+certification. The Operator Manual defines the separate recovery, admission,
+and bounded journey evidence required before describing this release as fully
+certified.
