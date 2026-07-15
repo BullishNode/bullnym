@@ -376,15 +376,15 @@ impl IntoResponse for AppError {
             ),
             AppError::MultipartInvalid(_) => "Upload form was malformed. Retry from the app.".into(),
             AppError::KeyAlreadyRegistered { nym, domain } => format!(
-                "This wallet already has an active Lightning Address: {nym}@{domain}. \
-                 Deactivate it before registering a different name."
+                "This wallet's Lightning Address is already online at {nym}@{domain}. \
+                 A wallet cannot claim a second name."
             ),
             AppError::NymQuotaExceeded { cap, .. } => format!(
-                "This wallet has registered the maximum of {cap} lifetime Lightning Addresses. \
-                 Reactivate one of the existing addresses, or use a different wallet."
+                "This wallet has reached its lifetime Lightning Address name limit ({cap}). \
+                 Permanently owned names cannot be replaced."
             ),
             AppError::NymAlreadyAssigned { nym, domain } => format!(
-                "This wallet permanently owns {nym}@{domain}. Reactivate that Lightning Address; a wallet cannot claim a second name."
+                "This wallet permanently owns {nym}@{domain}. Register that owned name to bring its Lightning Address online; a wallet cannot claim a second name."
             ),
             AppError::InvalidDescriptor(reason) => format!("The wallet descriptor was rejected: {reason}."),
             AppError::AuthError(_) => "Wallet signature did not verify.".into(),
@@ -544,6 +544,64 @@ impl From<sqlx::Error> for AppError {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    async fn response_json(error: AppError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read error response body");
+        let value = serde_json::from_slice(&body).expect("parse error response JSON");
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn permanent_name_errors_describe_ownership_and_availability() {
+        let cases = [
+            (
+                AppError::KeyAlreadyRegistered {
+                    nym: "alice".to_string(),
+                    domain: "pay.example.com".to_string(),
+                },
+                StatusCode::OK,
+                "This wallet's Lightning Address is already online at alice@pay.example.com. A wallet cannot claim a second name.",
+            ),
+            (
+                AppError::NymQuotaExceeded { used: 1, cap: 1 },
+                StatusCode::OK,
+                "This wallet has reached its lifetime Lightning Address name limit (1). Permanently owned names cannot be replaced.",
+            ),
+            (
+                AppError::NymAlreadyAssigned {
+                    nym: "alice".to_string(),
+                    domain: "pay.example.com".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "This wallet permanently owns alice@pay.example.com. Register that owned name to bring its Lightning Address online; a wallet cannot claim a second name.",
+            ),
+        ];
+
+        for (error, expected_status, expected_reason) in cases {
+            let (status, body) = response_json(error).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["reason"], expected_reason);
+
+            let reason = body["reason"]
+                .as_str()
+                .expect("error reason must be a string")
+                .to_ascii_lowercase();
+            for stale_instruction in [
+                "reactivat",
+                "use a different wallet",
+                "deactivate it before registering a different name",
+            ] {
+                assert!(
+                    !reason.contains(stale_instruction),
+                    "stale permanent-name instruction leaked: {stale_instruction}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn alias_already_assigned_exposes_exact_owned_alias() {

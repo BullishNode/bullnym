@@ -47,7 +47,7 @@ session.
 | Module | Responsibility |
 |---|---|
 | `main.rs` | Dependency initialization, worker startup, router assembly |
-| `registration.rs`, `nostr.rs` | Nym lifecycle and public identity discovery |
+| `registration.rs`, `nostr.rs` | Permanent nym ownership, Lightning Address availability, and public identity discovery |
 | `lnurl.rs` | LNURL-pay and LUD-22 negotiation |
 | `donation_page.rs`, `donation_render.rs` | Payment Page/POS management and rendering |
 | `invoice.rs` | Checkout and merchant invoice lifecycle |

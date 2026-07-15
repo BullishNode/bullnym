@@ -97,12 +97,12 @@ When a commitment exists, the authenticated response is:
 ```
 
 When none exists, the three commitment-specific fields are `null` and
-`recovery_address_registered` is `false`. The lookup does not require an
-active nym: a restored wallet must still adopt the immutable address governing
-existing swaps after registration expiry. The caller must verify that its
-default Bitcoin wallet recognizes the returned mainnet address and reapply its
-local recovery label; it must not register a replacement merely because local
-label state was lost.
+`recovery_address_registered` is `false`. The lookup does not require the
+Lightning Address to be online: a restored wallet must still adopt the
+immutable address governing existing swaps after registration expiry. The
+caller must verify that its default Bitcoin wallet recognizes the returned
+mainnet address and reapply its local recovery label; it must not register a
+replacement merely because local label state was lost.
 
 The address is available only after a fresh signature from its owning npub.
 Anonymous Page, POS, invoice-status, registration-write, and error responses

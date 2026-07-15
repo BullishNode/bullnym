@@ -24,9 +24,10 @@ bullpay-la-v2 NUL lnurl-comment-history NUL npub NUL NUL
 page NUL pageSize NUL timestamp
 ```
 
-The authenticated identity does not need to remain active. This lets a
-merchant recover immutable received-payment history after restart or Lightning
-Address deactivation while still requiring fresh proof of the merchant key.
+The authenticated identity's Lightning Address does not need to remain online.
+This lets a merchant recover immutable received-payment history after restart
+or after taking the Lightning Address offline while still requiring fresh
+proof of the merchant key.
 
 ## Response
 
