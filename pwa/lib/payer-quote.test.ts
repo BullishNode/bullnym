@@ -7,6 +7,8 @@ import type {
 import {
   PayerQuoteCoordinator,
   activeQuoteSnapshot,
+  assertLightningQuoteAuthorityCurrent,
+  captureLightningQuoteAuthority,
   formatQuoteCountdown,
   quoteAccessibilityState,
   quoteRailPresentation,
@@ -147,6 +149,17 @@ describe('PayerQuoteCoordinator', () => {
     expect(coordinator.state.rails.lightning?.instruction.kind).toBe('lightning_boltz_reverse')
   })
 
+  it('lazily reuses a selected rail already bound to the active version', async () => {
+    const fetcher = vi.fn().mockResolvedValue(responseFor('liquid'))
+    const coordinator = new PayerQuoteCoordinator(INVOICE_ID, fetcher, () => CREATED_AT * 1_000)
+
+    await coordinator.ensure('liquid', 'tab')
+    const reused = await coordinator.ensure('liquid', 'tab')
+    expect(reused.ok).toBe(true)
+    expect(reused.snapshot).toBe(coordinator.state.rails.liquid)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
   it('reload adopts one complete immutable snapshot without mixing old and new fields', async () => {
     const fetcher = vi.fn().mockResolvedValue(responseFor('bitcoin', 3, 'reload', CREATED_AT, 6_000, 6_250))
     const coordinator = new PayerQuoteCoordinator(INVOICE_ID, fetcher, () => CREATED_AT * 1_000)
@@ -254,5 +267,45 @@ describe('PayerQuoteCoordinator', () => {
     expect(result.ok).toBe(false)
     expect(coordinator.state.quote).toBeNull()
     expect(coordinator.state.rails.lightning).toBeNull()
+  })
+
+  it('invalidates Bolt Card authority on pending, expiry, unavailability, and version replacement', async () => {
+    let now = CREATED_AT * 1_000
+    const replacement = deferred<PayerDemandQuoteResponse>()
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(responseFor('lightning', 1, 'card-v1'))
+      .mockReturnValueOnce(replacement.promise)
+    const coordinator = new PayerQuoteCoordinator(INVOICE_ID, fetcher, () => now)
+    await coordinator.refresh('lightning', 'initial')
+    const authority = captureLightningQuoteAuthority(coordinator.state, now)
+    expect(authority).not.toBeNull()
+    if (!authority) return
+    expect(() => assertLightningQuoteAuthorityCurrent(coordinator.state, authority, now)).not.toThrow()
+
+    const refreshing = coordinator.refresh('lightning', 'manual')
+    expect(captureLightningQuoteAuthority(coordinator.state, now)).toBeNull()
+    expect(() => assertLightningQuoteAuthorityCurrent(coordinator.state, authority, now)).toThrow(
+      /expired or changed/,
+    )
+
+    replacement.resolve(responseFor('lightning', 2, 'card-v2', CREATED_AT, 6_000, 6_100))
+    await refreshing
+    expect(() => assertLightningQuoteAuthorityCurrent(coordinator.state, authority, now)).toThrow(
+      /expired or changed/,
+    )
+
+    const replacementAuthority = captureLightningQuoteAuthority(coordinator.state, now)
+    expect(replacementAuthority?.quoteVersionId).toBe('quote-2')
+    now = (CREATED_AT + 300) * 1_000
+    expect(captureLightningQuoteAuthority(coordinator.state, now)).toBeNull()
+    if (replacementAuthority) {
+      expect(() =>
+        assertLightningQuoteAuthorityCurrent(coordinator.state, replacementAuthority, now),
+      ).toThrow(/expired or changed/)
+    }
+
+    coordinator.expire(now)
+    expect(captureLightningQuoteAuthority(coordinator.state, now)).toBeNull()
   })
 })

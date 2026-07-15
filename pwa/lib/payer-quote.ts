@@ -52,6 +52,15 @@ export interface QuoteAccessibilityState {
   readonly message: string
 }
 
+export interface LightningQuoteAuthority {
+  readonly key: string
+  readonly quoteVersionId: string
+  readonly versionNumber: number
+  readonly expiresAtUnix: number
+  readonly bolt11: string
+  readonly payerAmountSat: number
+}
+
 export type PayerQuoteFetcher = (
   rail: PayerQuoteRail,
   trigger: QuoteRefreshTrigger,
@@ -280,6 +289,43 @@ export function quoteAccessibilityState(
   return { busy: false, copyDisabled: true, message: `${rail} quote required` }
 }
 
+export function captureLightningQuoteAuthority(
+  state: PayerQuoteState,
+  nowMs: number,
+): LightningQuoteAuthority | null {
+  if (state.pending.lightning) return null
+  const snapshot = activeQuoteSnapshot(state, 'lightning', nowMs)
+  if (!snapshot || snapshot.instruction.kind !== 'lightning_boltz_reverse') return null
+  const authority = {
+    quoteVersionId: snapshot.quote.quote_version_id,
+    versionNumber: snapshot.quote.version_number,
+    expiresAtUnix: snapshot.quote.expires_at_unix,
+    bolt11: snapshot.instruction.pr,
+    payerAmountSat: snapshot.instruction.payer_amount_sat,
+  }
+  return Object.freeze({
+    ...authority,
+    key: [
+      authority.quoteVersionId,
+      authority.versionNumber,
+      authority.expiresAtUnix,
+      authority.bolt11,
+      authority.payerAmountSat,
+    ].join('\0'),
+  })
+}
+
+export function assertLightningQuoteAuthorityCurrent(
+  state: PayerQuoteState,
+  authority: LightningQuoteAuthority,
+  nowMs: number,
+): void {
+  const current = captureLightningQuoteAuthority(state, nowMs)
+  if (!current || current.key !== authority.key) {
+    throw new DOMException('Fiat Lightning quote expired or changed', 'AbortError')
+  }
+}
+
 /**
  * Owns a single immutable quote lineage and its rail-bound instructions.
  * Same-rail triggers share one Promise; different rails remain independent.
@@ -317,6 +363,14 @@ export class PayerQuoteCoordinator {
       }),
     )
     return true
+  }
+
+  ensure(rail: PayerQuoteRail, trigger: QuoteRefreshTrigger): Promise<QuoteRefreshResult> {
+    const snapshot = activeQuoteSnapshot(this.stateValue, rail, this.now())
+    if (snapshot) {
+      return Promise.resolve(Object.freeze({ ok: true, snapshot, error: null }))
+    }
+    return this.refresh(rail, trigger)
   }
 
   refresh(rail: PayerQuoteRail, trigger: QuoteRefreshTrigger): Promise<QuoteRefreshResult> {

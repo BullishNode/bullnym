@@ -56,11 +56,13 @@
   import { watchLiquidAddress } from '$lib/liquid-ws'
   import {
     PayerQuoteCoordinator,
-    activeQuoteSnapshot,
+    assertLightningQuoteAuthorityCurrent,
+    captureLightningQuoteAuthority,
     emptyPayerQuoteState,
     formatQuoteCountdown,
     quoteAccessibilityState,
     quoteRailPresentation,
+    type LightningQuoteAuthority,
     type QuoteRefreshTrigger,
   } from '$lib/payer-quote'
 
@@ -270,8 +272,9 @@
     trigger: QuoteRefreshTrigger,
   ): Promise<unknown> | undefined {
     if (stopped || !isFiatFixed || !showsRails(view) || !quoteRailAvailable(rail)) return
-    if (trigger === 'tab' && activeQuoteSnapshot(quoteState, rail, Date.now())) return
-    return quoteCoordinator.refresh(rail, trigger)
+    return trigger === 'tab'
+      ? quoteCoordinator.ensure(rail, trigger)
+      : quoteCoordinator.refresh(rail, trigger)
   }
 
   // Never show a selectable tab with a blank QR (today's bug — tabs used to
@@ -368,6 +371,7 @@
   let cardState = $state<CardState>('idle')
   let cardError = $state<string | null>(null)
   let cardAbort: AbortController | undefined
+  let cardFiatAuthority: LightningQuoteAuthority | null = null
 
   // While there's no current offer (empty or mid-refresh) or the remaining
   // amount isn't known yet, Tap Card must not start a scan (don't throw on
@@ -396,6 +400,7 @@
   function stopCardScan() {
     cardAbort?.abort()
     cardAbort = undefined
+    cardFiatAuthority = null
   }
 
   function startCardScan() {
@@ -405,28 +410,68 @@
       cardState = 'preparing'
       return
     }
+    const fiatAuthority = untrack(() =>
+      isFiatFixed
+        ? captureLightningQuoteAuthority(quoteState, Date.now())
+        : null,
+    )
+    if (untrack(() => isFiatFixed) && !fiatAuthority) {
+      cardState = 'preparing'
+      return
+    }
     cardState = 'scanning'
     const controller = new AbortController()
     cardAbort = controller
+    cardFiatAuthority = fiatAuthority
     scanForLnurl(controller.signal)
       .then(async (lnurl) => {
         if (controller.signal.aborted) return
         cardState = 'requesting'
-        const pr = boltCardLightningPr
-        const amt = boltCardAmountSat
+        const pr = fiatAuthority?.bolt11 ?? boltCardLightningPr
+        const amt = fiatAuthority?.payerAmountSat ?? boltCardAmountSat
         if (!pr || amt === null) throw new Error('Lightning offer not ready — try again in a moment')
-        await payViaBoltCard(lnurl, pr, amt)
+        await payViaBoltCard(lnurl, pr, amt, {
+          signal: controller.signal,
+          assertCurrent: fiatAuthority
+            ? () => assertLightningQuoteAuthorityCurrent(quoteState, fiatAuthority, Date.now())
+            : undefined,
+        })
         if (controller.signal.aborted) return
         cardState = 'sent'
         // Success detection is the existing status poller below — no
         // second poller here.
       })
       .catch((err: unknown) => {
-        if (err instanceof DOMException && err.name === 'AbortError') return
+        if (controller.signal.aborted) return
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          cardFiatAuthority = null
+          cardState = 'preparing'
+          return
+        }
         cardState = 'declined'
         cardError = err instanceof Error ? err.message : 'Card declined'
       })
   }
+
+  // A card operation is authority-bound, not merely UI-bound. Pending,
+  // unavailable, replaced, or expired fiat Lightning state invalidates the
+  // exact token captured when scanning began and aborts every remote await.
+  $effect(() => {
+    const currentAuthority = isFiatFixed
+      ? captureLightningQuoteAuthority(quoteState, quoteNowMs)
+      : null
+    if (!isFiatFixed) return
+    untrack(() => {
+      if (
+        (cardState === 'scanning' || cardState === 'requesting') &&
+        cardFiatAuthority?.key !== currentAuthority?.key
+      ) {
+        stopCardScan()
+        cardError = null
+        cardState = 'preparing'
+      }
+    })
+  })
 
   // Mount-time only: if the persisted/initial tab is already 'boltcard',
   // start scanning (the normal case — switching TO boltcard — is handled
