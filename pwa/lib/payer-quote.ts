@@ -127,6 +127,12 @@ function assertInstruction(
     }
     return
   }
+  if (instruction.kind === 'bitcoin_direct') {
+    if (!instruction.address || !instruction.bip21) {
+      throw new Error('quote instruction does not match the selected rail')
+    }
+    return
+  }
   if (
     instruction.kind !== 'bitcoin_boltz_chain' ||
     !instruction.quote_offer_id ||
@@ -197,11 +203,12 @@ function snapshotFromResponse(
   }
   assertQuote(response.quote, nowMs)
   assertInstruction(rail, response.instruction)
+  const direct =
+    response.instruction.kind === 'liquid_direct' ||
+    response.instruction.kind === 'bitcoin_direct'
   if (
-    (rail === 'liquid' &&
-      response.instruction.payer_amount_sat !== response.quote.merchant_amount_sat) ||
-    (rail !== 'liquid' &&
-      response.instruction.payer_amount_sat <= response.quote.merchant_amount_sat)
+    (direct && response.instruction.payer_amount_sat !== response.quote.merchant_amount_sat) ||
+    (!direct && response.instruction.payer_amount_sat <= response.quote.merchant_amount_sat)
   ) {
     throw new Error('payer amount does not match the selected rail policy')
   }

@@ -144,6 +144,12 @@ export type VersionedPayerInstruction =
       payer_amount_sat: number
     }
   | {
+      kind: 'bitcoin_direct'
+      address: string
+      bip21: string
+      payer_amount_sat: number
+    }
+  | {
       kind: 'bitcoin_boltz_chain'
       quote_offer_id: string
       address: string

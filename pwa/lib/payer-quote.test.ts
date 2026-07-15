@@ -78,6 +78,32 @@ function responseFor(
   }
 }
 
+function directBitcoinResponseFor(
+  version: number,
+  merchantAmountSat: number,
+  createdAt = CREATED_AT,
+): PayerDemandQuoteResponse {
+  const response = responseFor(
+    'bitcoin',
+    version,
+    `direct-v${version}`,
+    createdAt,
+    merchantAmountSat,
+    merchantAmountSat,
+  )
+  return {
+    ...response,
+    instruction: {
+      kind: 'bitcoin_direct',
+      address: 'bc1-stable-wallet-destination',
+      bip21: `bitcoin:bc1-stable-wallet-destination?amount=${
+        merchantAmountSat === 10_000 ? '0.00010000' : '0.00005000'
+      }`,
+      payer_amount_sat: merchantAmountSat,
+    },
+  }
+}
+
 function deferred<T>(): {
   promise: Promise<T>
   resolve: (value: T) => void
@@ -178,6 +204,42 @@ describe('PayerQuoteCoordinator', () => {
       swapCostSat: 250,
       qrValue: 'bitcoin:bc1-reload?amount=0.00010100&label=exact-reload',
       copyValue: 'bitcoin:bc1-reload?amount=0.00010100&label=exact-reload',
+    })
+  })
+
+  it('refreshes direct Bitcoin amount and BIP21 atomically over one stable address', async () => {
+    let now = CREATED_AT * 1_000
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(directBitcoinResponseFor(1, 10_000))
+      .mockResolvedValueOnce(directBitcoinResponseFor(2, 5_000, CREATED_AT + 300))
+    const coordinator = new PayerQuoteCoordinator(INVOICE_ID, fetcher, () => now)
+
+    await coordinator.refresh('bitcoin', 'initial')
+    expect(quoteRailPresentation(coordinator.state, 'bitcoin', now, ASSET_ID)).toMatchObject({
+      quoteVersionId: 'quote-1',
+      merchantAmountSat: 10_000,
+      payerAmountSat: 10_000,
+      swapCostSat: 0,
+      qrValue: 'bitcoin:bc1-stable-wallet-destination?amount=0.00010000',
+    })
+
+    now = (CREATED_AT + 300) * 1_000
+    coordinator.expire(now)
+    expect(quoteRailPresentation(coordinator.state, 'bitcoin', now, ASSET_ID)).toBeNull()
+    await coordinator.refresh('bitcoin', 'timer')
+    const refreshed = quoteRailPresentation(coordinator.state, 'bitcoin', now, ASSET_ID)
+    expect(refreshed).toMatchObject({
+      quoteVersionId: 'quote-2',
+      merchantAmountSat: 5_000,
+      payerAmountSat: 5_000,
+      swapCostSat: 0,
+      qrValue: 'bitcoin:bc1-stable-wallet-destination?amount=0.00005000',
+      copyValue: 'bitcoin:bc1-stable-wallet-destination?amount=0.00005000',
+    })
+    expect(coordinator.state.rails.bitcoin?.instruction).toMatchObject({
+      kind: 'bitcoin_direct',
+      address: 'bc1-stable-wallet-destination',
     })
   })
 
