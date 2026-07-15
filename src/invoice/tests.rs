@@ -794,6 +794,50 @@ fn fiat_display_uses_zero_decimal_crc() {
 }
 
 #[test]
+fn anonymous_checkout_create_accepts_only_the_current_wire_shapes() {
+    let sat: CreateAnonymousRequest = serde_json::from_value(serde_json::json!({
+        "amount_sat": 1_000
+    }))
+    .unwrap();
+    assert_eq!(sat.amount_sat, Some(1_000));
+    assert!(sat.fiat_amount_minor.is_none());
+    assert!(sat.fiat_currency.is_none());
+    assert!(sat.note.is_none());
+
+    let fiat: CreateAnonymousRequest = serde_json::from_value(serde_json::json!({
+        "fiat_amount_minor": 1_000,
+        "fiat_currency": "USD",
+        "note": "private checkout note"
+    }))
+    .unwrap();
+    assert!(fiat.amount_sat.is_none());
+    assert_eq!(fiat.fiat_amount_minor, Some(1_000));
+    assert_eq!(fiat.fiat_currency.as_deref(), Some("USD"));
+    assert_eq!(fiat.note.as_deref(), Some("private checkout note"));
+
+    for unknown in [
+        "recipient_label",
+        "recipient_name",
+        "public_description",
+        "invoice_number",
+        "unexpected",
+    ] {
+        let mut payload = serde_json::json!({ "amount_sat": 1_000 });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert(unknown.to_string(), serde_json::json!("forbidden"));
+        let error = serde_json::from_value::<CreateAnonymousRequest>(payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{unknown}`")),
+            "unexpected error for {unknown}: {error}"
+        );
+    }
+}
+
+#[test]
 fn signed_invoice_create_accepts_only_the_canonical_recipient_name_wire_key() {
     let canonical = serde_json::json!({
         "npub": "11".repeat(32),
