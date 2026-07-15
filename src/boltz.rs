@@ -39,6 +39,98 @@ pub struct FixedCheckoutReverseSwapResult {
     pub claim_fee_budget_sat: u64,
 }
 
+/// Canonical, non-secret authority for one fixed-checkout reverse mutation.
+///
+/// The exact request and validated fee packet are persisted before the POST.
+/// A reserved key can therefore be reconstructed after restart without
+/// consulting a newer provider snapshot or silently changing payer terms.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixedCheckoutReverseRequestAuthorityV1 {
+    schema_version: u8,
+    request: CreateReverseRequest,
+    merchant_amount_sat: u64,
+    payer_amount_sat: u64,
+    onchain_amount_sat: u64,
+    claim_fee_budget_sat: u64,
+    pair_hash: String,
+}
+
+/// Canonical, non-secret authority for one BTC -> L-BTC chain mutation.
+/// Pair and height evidence is captured before the POST and is reused when a
+/// positive xpub-restore record has to be validated after process loss.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainCreateRequestAuthorityV1 {
+    schema_version: u8,
+    request: CreateChainRequest,
+    pair: ChainPair,
+    btc_height: u32,
+    liquid_height: u32,
+    merchant_amount_sat: u64,
+}
+
+pub struct PreparedFixedCheckoutReverseCreate {
+    authority: FixedCheckoutReverseRequestAuthorityV1,
+    keypair: Keypair,
+    preimage: Preimage,
+}
+
+impl PreparedFixedCheckoutReverseCreate {
+    pub fn canonical_authority(&self) -> Result<(String, String), AppError> {
+        crate::canonical_json::canonical_json_and_sha256(&self.authority).map_err(|error| {
+            AppError::BoltzError(format!(
+                "cannot canonicalize reverse create authority: {error}"
+            ))
+        })
+    }
+}
+
+pub struct PreparedChainCreate {
+    authority: ChainCreateRequestAuthorityV1,
+    claim_keypair: Keypair,
+    refund_keypair: Keypair,
+    preimage: Preimage,
+}
+
+impl PreparedChainCreate {
+    pub fn canonical_authority(&self) -> Result<(String, String), AppError> {
+        crate::canonical_json::canonical_json_and_sha256(&self.authority).map_err(|error| {
+            AppError::BoltzError(format!(
+                "cannot canonicalize chain create authority: {error}"
+            ))
+        })
+    }
+}
+
+fn decode_canonical_provider_authority<T>(
+    canonical_json: &str,
+    expected_sha256: &str,
+) -> Result<T, AppError>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    if expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::BoltzError(
+            "persisted provider authority digest is invalid".into(),
+        ));
+    }
+    let decoded: T = serde_json::from_str(canonical_json)
+        .map_err(|_| AppError::BoltzError("persisted provider authority is invalid".into()))?;
+    let (reencoded, digest) = crate::canonical_json::canonical_json_and_sha256(&decoded)
+        .map_err(|_| AppError::BoltzError("persisted provider authority is invalid".into()))?;
+    if reencoded != canonical_json || digest != expected_sha256 {
+        return Err(AppError::BoltzError(
+            "persisted provider authority is not canonical".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
 pub struct ChainSwapResult {
     pub swap_id: String,
     pub lockup_address: String,
@@ -789,6 +881,101 @@ impl BoltzService {
         transport.get_swap(swap_id).await
     }
 
+    /// Positively recover one accepted reverse create by its exact reserved
+    /// xpub child. `Ok(None)` is deliberately not proof that Boltz rejected or
+    /// never received the POST and must never authorize a second mutation.
+    pub async fn recover_reverse_create_response(
+        &self,
+        claim_child_index: u32,
+    ) -> Result<Option<CreateReverseResponse>, AppError> {
+        let raw = self
+            .transport()?
+            .restore_swaps(&self.swap_master_key)
+            .await
+            .map_err(|_| AppError::BoltzError("Boltz restore reconciliation failed".into()))?;
+        let validated = crate::boltz_restore::validate_restore_records(&self.swap_master_key, &raw)
+            .map_err(|_| AppError::BoltzError("Boltz restore reconciliation was invalid".into()))?;
+        let matches: Vec<_> = validated
+            .records
+            .iter()
+            .filter(|record| {
+                record.kind == crate::boltz_restore::BoltzRestoreKind::Reverse
+                    && record.keys.len() == 1
+                    && record.keys[0].purpose
+                        == crate::boltz_restore::BoltzRestoreKeyPurpose::ReverseClaim
+                    && record.keys[0].child_index == claim_child_index
+            })
+            .collect();
+        let [record] = matches.as_slice() else {
+            return if matches.is_empty() {
+                Ok(None)
+            } else {
+                Err(AppError::BoltzError(
+                    "Boltz restore reconciliation was ambiguous".into(),
+                ))
+            };
+        };
+        let raw_record = raw
+            .iter()
+            .find(|candidate| candidate.id == record.provider_swap_id)
+            .ok_or_else(|| AppError::BoltzError("Boltz restore record disappeared".into()))?;
+        crate::boltz_restore::reconstruct_reverse_creation_response(raw_record)
+            .map(Some)
+            .map_err(|_| AppError::BoltzError("Boltz reverse restore response was invalid".into()))
+    }
+
+    /// Positively recover one accepted chain create only when both independently
+    /// reserved key roles identify the same validated provider record.
+    pub async fn recover_chain_create_response(
+        &self,
+        claim_child_index: u32,
+        refund_child_index: u32,
+    ) -> Result<Option<CreateChainResponse>, AppError> {
+        let raw = self
+            .transport()?
+            .restore_swaps(&self.swap_master_key)
+            .await
+            .map_err(|_| AppError::BoltzError("Boltz restore reconciliation failed".into()))?;
+        let validated = crate::boltz_restore::validate_restore_records(&self.swap_master_key, &raw)
+            .map_err(|_| AppError::BoltzError("Boltz restore reconciliation was invalid".into()))?;
+        let matches: Vec<_> = validated
+            .records
+            .iter()
+            .filter(|record| {
+                if record.kind != crate::boltz_restore::BoltzRestoreKind::Chain
+                    || record.keys.len() != 2
+                {
+                    return false;
+                }
+                let claim = record.keys.iter().any(|key| {
+                    key.purpose == crate::boltz_restore::BoltzRestoreKeyPurpose::ChainClaim
+                        && key.child_index == claim_child_index
+                });
+                let refund = record.keys.iter().any(|key| {
+                    key.purpose == crate::boltz_restore::BoltzRestoreKeyPurpose::ChainRefund
+                        && key.child_index == refund_child_index
+                });
+                claim && refund
+            })
+            .collect();
+        let [record] = matches.as_slice() else {
+            return if matches.is_empty() {
+                Ok(None)
+            } else {
+                Err(AppError::BoltzError(
+                    "Boltz restore reconciliation was ambiguous".into(),
+                ))
+            };
+        };
+        let raw_record = raw
+            .iter()
+            .find(|candidate| candidate.id == record.provider_swap_id)
+            .ok_or_else(|| AppError::BoltzError("Boltz restore record disappeared".into()))?;
+        crate::boltz_restore::reconstruct_chain_creation_response(raw_record)
+            .map(Some)
+            .map_err(|_| AppError::BoltzError("Boltz chain restore response was invalid".into()))
+    }
+
     /// Stable, non-secret identifier of the master seed behind this service's
     /// swap keys: first 8 bytes of SHA-256 over the pubkey derived at the
     /// reserved index 0, hex-encoded. Real swaps allocate from `swap_key_seq`
@@ -894,13 +1081,13 @@ impl BoltzService {
     /// the provider fee packet. Supplying `onchainAmount` asks Boltz to compute
     /// the BOLT11 principal around that exact lockup value, so a fee change can
     /// never silently reduce the merchant side of the swap.
-    pub async fn create_fixed_checkout_reverse_swap(
+    pub fn prepare_fixed_checkout_reverse_swap(
         &self,
         derived_key: DerivedSwapKey,
         merchant_amount_sat: u64,
         description: Option<&str>,
         description_hash: Option<&str>,
-    ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
+    ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
             return Err(AppError::BoltzError(
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
@@ -912,7 +1099,7 @@ impl BoltzService {
             .map_err(|error| AppError::BoltzError(error.to_string()))?;
         let DerivedSwapKey { keypair, preimage } = derived_key;
         let claim_public_key = PublicKey::new(keypair.public_key());
-        let base_request = CreateReverseRequest {
+        let request = CreateReverseRequest {
             from: "BTC".to_string(),
             to: "L-BTC".to_string(),
             claim_public_key,
@@ -937,13 +1124,72 @@ impl BoltzService {
             }),
             claim_covenant: None,
         };
+        Ok(PreparedFixedCheckoutReverseCreate {
+            authority: FixedCheckoutReverseRequestAuthorityV1 {
+                schema_version: 1,
+                request,
+                merchant_amount_sat,
+                payer_amount_sat: quote.payer_amount_sat(),
+                onchain_amount_sat: quote.onchain_amount_sat(),
+                claim_fee_budget_sat: quote.claim_fee_budget_sat(),
+                pair_hash: quote.pair_hash().to_owned(),
+            },
+            keypair,
+            preimage,
+        })
+    }
+
+    pub fn restore_prepared_fixed_checkout_reverse_swap(
+        &self,
+        derived_key: DerivedSwapKey,
+        canonical_authority_json: &str,
+        authority_sha256: &str,
+    ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
+        let authority: FixedCheckoutReverseRequestAuthorityV1 =
+            decode_canonical_provider_authority(canonical_authority_json, authority_sha256)?;
+        let DerivedSwapKey { keypair, preimage } = derived_key;
+        let expected_public_key = PublicKey::new(keypair.public_key());
+        if authority.schema_version != 1
+            || authority.request.from != "BTC"
+            || authority.request.to != "L-BTC"
+            || authority.request.claim_public_key != expected_public_key
+            || authority.request.preimage_hash != Some(preimage.sha256)
+            || authority.request.invoice.is_some()
+            || authority.request.invoice_amount.is_some()
+            || authority.merchant_amount_sat == 0
+            || authority.payer_amount_sat <= authority.merchant_amount_sat
+            || authority.onchain_amount_sat < authority.merchant_amount_sat
+            || authority
+                .onchain_amount_sat
+                .checked_sub(authority.merchant_amount_sat)
+                != Some(authority.claim_fee_budget_sat)
+            || authority.pair_hash.len() != 64
+            || !authority
+                .pair_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AppError::BoltzError(
+                "persisted reverse create authority is invalid".into(),
+            ));
+        }
+        Ok(PreparedFixedCheckoutReverseCreate {
+            authority,
+            keypair,
+            preimage,
+        })
+    }
+
+    pub async fn submit_fixed_checkout_reverse_swap(
+        &self,
+        prepared: PreparedFixedCheckoutReverseCreate,
+    ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
+        let request = prepared.authority.request.clone();
+        let onchain_amount_sat = prepared.authority.onchain_amount_sat;
+        let pair_hash = prepared.authority.pair_hash.clone();
         let provider_result = self
             .transport()?
-            .create_fixed_checkout_reverse(
-                base_request,
-                quote.onchain_amount_sat(),
-                quote.pair_hash(),
-            )
+            .create_fixed_checkout_reverse(request, onchain_amount_sat, &pair_hash)
             .await;
         self.breaker.record(
             provider_result
@@ -956,23 +1202,36 @@ impl BoltzService {
                 "fixed checkout reverse swap request failed: {error}"
             ))
         })?;
+        self.complete_fixed_checkout_reverse_swap(prepared, response)
+    }
+
+    pub fn complete_fixed_checkout_reverse_swap(
+        &self,
+        prepared: PreparedFixedCheckoutReverseCreate,
+        response: CreateReverseResponse,
+    ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
+        let PreparedFixedCheckoutReverseCreate {
+            authority,
+            keypair,
+            preimage,
+        } = prepared;
+        let claim_public_key = PublicKey::new(keypair.public_key());
         validate_reverse_creation_response(&response, &preimage, &claim_public_key)?;
         let invoice = response
             .invoice
             .clone()
             .ok_or_else(|| AppError::BoltzError("no invoice returned".to_string()))?;
         let payer_amount_sat = exact_bolt11_amount_sat(&invoice)?;
-        if payer_amount_sat != quote.payer_amount_sat() {
+        if payer_amount_sat != authority.payer_amount_sat {
             return Err(AppError::BoltzError(format!(
                 "fixed checkout reverse invoice amount mismatch: expected {}, got {payer_amount_sat}",
-                quote.payer_amount_sat()
+                authority.payer_amount_sat
             )));
         }
-        if response.onchain_amount != quote.onchain_amount_sat() {
+        if response.onchain_amount != authority.onchain_amount_sat {
             return Err(AppError::BoltzError(format!(
                 "fixed checkout reverse onchain amount mismatch: expected {}, got {}",
-                quote.onchain_amount_sat(),
-                response.onchain_amount
+                authority.onchain_amount_sat, response.onchain_amount
             )));
         }
 
@@ -989,17 +1248,33 @@ impl BoltzService {
                 boltz_response: response,
             },
             payer_amount_sat,
-            onchain_amount_sat: quote.onchain_amount_sat(),
-            claim_fee_budget_sat: quote.claim_fee_budget_sat(),
+            onchain_amount_sat: authority.onchain_amount_sat,
+            claim_fee_budget_sat: authority.claim_fee_budget_sat,
         })
     }
 
-    pub async fn create_btc_to_lbtc_chain_swap(
+    pub async fn create_fixed_checkout_reverse_swap(
+        &self,
+        derived_key: DerivedSwapKey,
+        merchant_amount_sat: u64,
+        description: Option<&str>,
+        description_hash: Option<&str>,
+    ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
+        let prepared = self.prepare_fixed_checkout_reverse_swap(
+            derived_key,
+            merchant_amount_sat,
+            description,
+            description_hash,
+        )?;
+        self.submit_fixed_checkout_reverse_swap(prepared).await
+    }
+
+    pub async fn prepare_btc_to_lbtc_chain_swap(
         &self,
         claim_key: DerivedSwapKey,
         refund_key: DerivedSwapKey,
         amount_sat: u64,
-    ) -> Result<ChainSwapResult, AppError> {
+    ) -> Result<PreparedChainCreate, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
             return Err(AppError::BoltzError(
                 "boltz temporarily unavailable (circuit breaker open)".to_string(),
@@ -1083,24 +1358,118 @@ impl BoltzService {
             }),
         };
 
-        let response: CreateChainResponse = {
-            let provider_result = self.transport()?.create_chain(request).await;
-            self.breaker.record(
-                provider_result
-                    .as_ref()
-                    .err()
-                    .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
-            );
-            provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?
+        Ok(PreparedChainCreate {
+            authority: ChainCreateRequestAuthorityV1 {
+                schema_version: 1,
+                request,
+                pair,
+                btc_height: heights.btc,
+                liquid_height: heights.lbtc,
+                merchant_amount_sat: amount_sat,
+            },
+            claim_keypair,
+            refund_keypair,
+            preimage,
+        })
+    }
+
+    pub fn restore_prepared_btc_to_lbtc_chain_swap(
+        &self,
+        claim_key: DerivedSwapKey,
+        refund_key: DerivedSwapKey,
+        canonical_authority_json: &str,
+        authority_sha256: &str,
+    ) -> Result<PreparedChainCreate, AppError> {
+        let authority: ChainCreateRequestAuthorityV1 =
+            decode_canonical_provider_authority(canonical_authority_json, authority_sha256)?;
+        let DerivedSwapKey {
+            keypair: claim_keypair,
+            preimage,
+        } = claim_key;
+        let DerivedSwapKey {
+            keypair: refund_keypair,
+            ..
+        } = refund_key;
+        let claim_public_key = PublicKey::new(claim_keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_keypair.public_key());
+        if authority.schema_version != 1
+            || authority.request.from != "BTC"
+            || authority.request.to != "L-BTC"
+            || authority.request.preimage_hash != preimage.sha256
+            || authority.request.claim_public_key != Some(claim_public_key)
+            || authority.request.refund_public_key != Some(refund_public_key)
+            || authority.request.user_lock_amount.is_some()
+            || authority.request.server_lock_amount != Some(authority.merchant_amount_sat)
+            || authority.request.pair_hash.as_deref() != Some(authority.pair.hash.as_str())
+            || authority.merchant_amount_sat == 0
+            || authority.btc_height == 0
+            || authority.liquid_height == 0
+        {
+            return Err(AppError::BoltzError(
+                "persisted chain create authority is invalid".into(),
+            ));
+        }
+        Ok(PreparedChainCreate {
+            authority,
+            claim_keypair,
+            refund_keypair,
+            preimage,
+        })
+    }
+
+    pub async fn submit_btc_to_lbtc_chain_swap(
+        &self,
+        prepared: PreparedChainCreate,
+    ) -> Result<ChainSwapResult, AppError> {
+        let request = prepared.authority.request.clone();
+        let provider_result = self.transport()?.create_chain(request).await;
+        self.breaker.record(
+            provider_result
+                .as_ref()
+                .err()
+                .is_some_and(crate::boltz_breaker::is_qualified_boltz_failure),
+        );
+        let response = provider_result.map_err(|error| AppError::BoltzError(format!("{error}")))?;
+        self.complete_btc_to_lbtc_chain_swap(prepared, response)
+    }
+
+    pub fn complete_btc_to_lbtc_chain_swap(
+        &self,
+        prepared: PreparedChainCreate,
+        mut response: CreateChainResponse,
+    ) -> Result<ChainSwapResult, AppError> {
+        let PreparedChainCreate {
+            authority,
+            claim_keypair,
+            refund_keypair,
+            preimage,
+        } = prepared;
+        let claim_public_key = PublicKey::new(claim_keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_keypair.public_key());
+        let heights = HeightResponse {
+            btc: authority.btc_height,
+            lbtc: authority.liquid_height,
         };
+        if response.claim_details.amount == authority.merchant_amount_sat
+            && response.lockup_details.amount == 0
+        {
+            // The pinned restore wire type omits the payer-side amount while
+            // retaining the merchant-side observation. For this one recovery
+            // path, the canonical pre-POST request
+            // and pair packet are the local monetary authority: hydrate only
+            // the explicit restore sentinel before running the ordinary exact
+            // response validator. A partially populated response is refused.
+            response.lockup_details.amount =
+                expected_chain_user_lock_amount(&authority.pair, authority.merchant_amount_sat)?;
+        }
 
         let (creation_terms, canonical_response_json) = validate_chain_creation_response(
-            &pair,
+            &authority.pair,
             &heights,
             preimage.hash160,
             &claim_public_key,
             &refund_public_key,
-            amount_sat,
+            authority.merchant_amount_sat,
             &response,
         )?;
         let preimage = preimage
@@ -1119,6 +1488,18 @@ impl BoltzService {
             canonical_response_json,
             creation_terms,
         })
+    }
+
+    pub async fn create_btc_to_lbtc_chain_swap(
+        &self,
+        claim_key: DerivedSwapKey,
+        refund_key: DerivedSwapKey,
+        amount_sat: u64,
+    ) -> Result<ChainSwapResult, AppError> {
+        let prepared = self
+            .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, amount_sat)
+            .await?;
+        self.submit_btc_to_lbtc_chain_swap(prepared).await
     }
 
     /// Ask Boltz for the server-lockup amount it will settle a verified
@@ -1296,6 +1677,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use crate::boltz_transport::{ScriptedBoltzCall, ScriptedBoltzStep, ScriptedBoltzTransport};
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -2436,6 +2819,129 @@ mod tests {
         );
         assert_eq!(fixture.request()["pairHash"], pair.hash);
 
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn chain_create_authority_survives_restart_and_exact_xpub_restore_without_resend() {
+        const CLAIM_INDEX: u64 = 8_100;
+        const REFUND_INDEX: u64 = 8_101;
+        let key_source = test_service(TEST_MNEMONIC);
+        let claim_key = key_source.derive_swap_key(CLAIM_INDEX).unwrap();
+        let refund_key = key_source.derive_swap_key(REFUND_INDEX).unwrap();
+        let claim_public_key = PublicKey::new(claim_key.keypair.public_key());
+        let refund_public_key = PublicKey::new(refund_key.keypair.public_key());
+        let preimage_sha256 = claim_key.preimage.sha256.to_string();
+        let (pair, heights, _, _, _, _) = live_chain_creation_fixture();
+        let response = dynamic_chain_creation_response(
+            &pair,
+            &heights,
+            claim_key.preimage.hash160,
+            claim_public_key,
+            refund_public_key,
+            25_000,
+            "bitcoin:provider-field-is-not-authority",
+        );
+        let fixture =
+            spawn_chain_transport_fixture(&pair, &heights, &response, StatusCode::OK).await;
+        let preparing_service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        let prepared = preparing_service
+            .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, 25_000)
+            .await
+            .unwrap();
+        let (authority_json, authority_sha256) = prepared.canonical_authority().unwrap();
+        assert_eq!(
+            fixture.calls(),
+            vec!["GET /swap/chain", "GET /chain/heights"]
+        );
+
+        // Exact authority bytes are mandatory on restart; semantically equal
+        // but non-canonical JSON cannot silently become a different request.
+        let noncanonical = format!(" {authority_json}");
+        assert!(preparing_service
+            .restore_prepared_btc_to_lbtc_chain_swap(
+                preparing_service.derive_swap_key(CLAIM_INDEX).unwrap(),
+                preparing_service.derive_swap_key(REFUND_INDEX).unwrap(),
+                &noncanonical,
+                &authority_sha256,
+            )
+            .is_err());
+
+        let restore_record: boltz_client::swaps::boltz::SwapRestoreResponse =
+            serde_json::from_value(json!({
+                "id": response.id,
+                "type": "chain",
+                "status": "swap.created",
+                "createdAt": 1_784_000_100_u64,
+                "from": "BTC",
+                "to": "L-BTC",
+                "claimDetails": {
+                    "tree": response.claim_details.swap_tree,
+                    "amount": response.claim_details.amount,
+                    "keyIndex": CLAIM_INDEX,
+                    "lockupAddress": response.claim_details.lockup_address,
+                    "serverPublicKey": response.claim_details.server_public_key,
+                    "timeoutBlockHeight": response.claim_details.timeout_block_height,
+                    "blindingKey": response.claim_details.blinding_key,
+                    "preimageHash": preimage_sha256,
+                },
+                "refundDetails": {
+                    "tree": response.lockup_details.swap_tree,
+                    "keyIndex": REFUND_INDEX,
+                    "lockupAddress": response.lockup_details.lockup_address,
+                    "serverPublicKey": response.lockup_details.server_public_key,
+                    "timeoutBlockHeight": response.lockup_details.timeout_block_height,
+                    "blindingKey": response.lockup_details.blinding_key,
+                }
+            }))
+            .unwrap();
+        let transport = Arc::new(ScriptedBoltzTransport::new([
+            ScriptedBoltzStep::RestoreSwaps(Box::new(Ok(vec![restore_record.clone()]))),
+            ScriptedBoltzStep::RestoreSwaps(Box::new(Ok(vec![restore_record.clone()]))),
+            ScriptedBoltzStep::RestoreSwaps(Box::new(Ok(vec![restore_record]))),
+        ]));
+        let master = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+        let restarted =
+            BoltzService::with_transport_for_integration_tests(master, None, transport.clone());
+
+        let first = restarted
+            .recover_chain_create_response(CLAIM_INDEX as u32, REFUND_INDEX as u32)
+            .await
+            .unwrap()
+            .expect("exact restore match");
+        let duplicate = restarted
+            .recover_chain_create_response(CLAIM_INDEX as u32, REFUND_INDEX as u32)
+            .await
+            .unwrap()
+            .expect("duplicate delivery remains exact");
+        assert_eq!(first.id, duplicate.id);
+        assert!(restarted
+            .recover_chain_create_response(CLAIM_INDEX as u32, (REFUND_INDEX + 1) as u32)
+            .await
+            .unwrap()
+            .is_none());
+
+        let restored_prepared = restarted
+            .restore_prepared_btc_to_lbtc_chain_swap(
+                restarted.derive_swap_key(CLAIM_INDEX).unwrap(),
+                restarted.derive_swap_key(REFUND_INDEX).unwrap(),
+                &authority_json,
+                &authority_sha256,
+            )
+            .unwrap();
+        let completed = restarted
+            .complete_btc_to_lbtc_chain_swap(restored_prepared, first)
+            .unwrap();
+        assert_eq!(completed.server_lock_amount_sat, 25_000);
+        assert_eq!(
+            transport.calls(),
+            vec![
+                ScriptedBoltzCall::RestoreSwaps,
+                ScriptedBoltzCall::RestoreSwaps,
+                ScriptedBoltzCall::RestoreSwaps,
+            ]
+        );
+        assert_eq!(transport.remaining_steps(), 0);
         fixture.shutdown().await;
     }
 }

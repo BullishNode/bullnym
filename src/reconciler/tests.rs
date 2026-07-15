@@ -11,6 +11,7 @@ fn fixture(our_status: &str) -> ReconcilerSwap {
         nym: Some("alice".to_string()),
         amount_sat: 100_000,
         invoice_id: None,
+        invoice_quote_version_id: None,
     }
 }
 

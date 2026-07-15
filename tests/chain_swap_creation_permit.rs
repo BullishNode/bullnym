@@ -105,6 +105,7 @@ async fn insert_invoice_fixture(pool: &PgPool, label: &str) -> (String, db::Invo
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,

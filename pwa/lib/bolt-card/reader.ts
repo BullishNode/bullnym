@@ -88,11 +88,21 @@ export function scanForLnurl(signal: AbortSignal): Promise<string> {
   })
 }
 
-export async function fetchWithdrawParams(lnurlOrUrl: string): Promise<WithdrawParams> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+}
+
+export async function fetchWithdrawParams(
+  lnurlOrUrl: string,
+  signal?: AbortSignal,
+): Promise<WithdrawParams> {
+  throwIfAborted(signal)
   const url = decodeLnurl(lnurlOrUrl)
-  const res = await fetch(url)
+  const res = await fetch(url, { signal })
+  throwIfAborted(signal)
   if (!res.ok) throw new Error('Failed to reach card service')
   const params = (await res.json()) as Partial<WithdrawParams> & { reason?: string }
+  throwIfAborted(signal)
   if (params.tag !== 'withdrawRequest') {
     throw new Error(params.reason ?? 'Tag is not a withdraw request')
   }
@@ -107,12 +117,18 @@ export function assertAmountWithinRange(amountSat: number, params: WithdrawParam
   }
 }
 
-export async function submitWithdraw(params: WithdrawParams, bolt11: string): Promise<void> {
+export async function submitWithdraw(
+  params: WithdrawParams,
+  bolt11: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal)
   const callbackUrl = new URL(params.callback)
   callbackUrl.searchParams.set('k1', params.k1)
   callbackUrl.searchParams.set('pr', bolt11)
 
-  const res = await fetch(callbackUrl.toString())
+  const res = await fetch(callbackUrl.toString(), { signal })
+  throwIfAborted(signal)
   if (!res.ok) throw new Error('Card service request failed')
   const result = (await res.json()) as { status: string; reason?: string }
   if (result.status !== 'OK') throw new Error(result.reason ?? 'Card declined')
@@ -124,8 +140,21 @@ export async function submitWithdraw(params: WithdrawParams, bolt11: string): Pr
  * is NOT detected here — the caller's existing invoice-status poller picks
  * up the resulting Lightning payment.
  */
-export async function payViaBoltCard(lnurlOrUrl: string, bolt11: string, amountSat: number): Promise<void> {
-  const params = await fetchWithdrawParams(lnurlOrUrl)
+export async function payViaBoltCard(
+  lnurlOrUrl: string,
+  bolt11: string,
+  amountSat: number,
+  authority: {
+    signal?: AbortSignal
+    /** Revalidates the exact caller-owned payment instruction. It is called
+     * after every remote await and immediately before callback submission. */
+    assertCurrent?: () => void
+  } = {},
+): Promise<void> {
+  authority.assertCurrent?.()
+  const params = await fetchWithdrawParams(lnurlOrUrl, authority.signal)
+  authority.assertCurrent?.()
   assertAmountWithinRange(amountSat, params)
-  await submitWithdraw(params, bolt11)
+  authority.assertCurrent?.()
+  await submitWithdraw(params, bolt11, authority.signal)
 }

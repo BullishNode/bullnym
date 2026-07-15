@@ -4,7 +4,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    validate_invoice_quote_attribution, InvoiceAccountingTolerances, InvoiceQuoteAttribution,
+    capture_direct_observation_candidate_locked, InvoiceAccountingTolerances,
+    NewInvoiceQuoteVersion,
 };
 
 /// Maximum number of direct observations the atomic reducer accepts in one
@@ -338,16 +339,6 @@ pub struct DirectObservationBatch<'a> {
     pub observations: &'a [DirectOutputObservation<'a>],
 }
 
-/// Event-specific quote lineage supplied alongside one watcher batch. A batch
-/// may contain copied instructions from several expired versions, so the
-/// attribution belongs to the immutable event key rather than to the batch as
-/// a whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DirectObservationQuoteAttribution<'a> {
-    pub event_key: &'a str,
-    pub attribution: InvoiceQuoteAttribution,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyDirectObservationOutcome {
     Applied { changed: bool },
@@ -430,6 +421,8 @@ struct AccountingProjection {
 #[derive(Debug, sqlx::FromRow)]
 struct LockedInvoice {
     amount_sat: i64,
+    pricing_mode: String,
+    fiat_amount_minor: Option<i32>,
     accept_btc: bool,
     accept_liquid: bool,
     accept_ln: bool,
@@ -740,10 +733,20 @@ fn public_settlement_status(direct: &str, swap: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn reduce_projection(
     invoice: &LockedInvoice,
     events: &[ProjectionEvent],
     tolerances: InvoiceAccountingTolerances,
+) -> ReducedProjection {
+    reduce_projection_with_fiat(invoice, events, tolerances, None)
+}
+
+fn reduce_projection_with_fiat(
+    invoice: &LockedInvoice,
+    events: &[ProjectionEvent],
+    tolerances: InvoiceAccountingTolerances,
+    fiat_projection: Option<super::FiatInvoiceCreditProjection>,
 ) -> ReducedProjection {
     let tolerance_sat = super::invoice_payment_tolerance_sat(
         invoice.amount_sat,
@@ -779,23 +782,31 @@ fn reduce_projection(
             .is_some_and(|prior| prior > 0 && accounting.received_sat >= prior);
     let direct_settlement_status =
         direct_settlement_status_for(events, &invoice.direct_settlement_status);
-    let presentation_status = presentation_status_for(
-        invoice.amount_sat,
-        events,
-        tolerance_sat,
-        &invoice.status,
-        preserve_prior_settlement,
-    );
-    let projected_status = if accounting.received_sat == 0 {
-        if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
-            "in_progress"
-        } else if invoice.status == "underpaid" {
-            "underpaid"
-        } else {
-            "unpaid"
-        }
+    let (presentation_status, projected_status) = if let Some(fiat) = fiat_projection {
+        (
+            super::fiat_invoice_presentation_status(fiat),
+            super::fiat_invoice_status(&invoice.status, fiat, invoice.expired),
+        )
     } else {
-        accounting.status
+        let presentation_status = presentation_status_for(
+            invoice.amount_sat,
+            events,
+            tolerance_sat,
+            &invoice.status,
+            preserve_prior_settlement,
+        );
+        let projected_status = if accounting.received_sat == 0 {
+            if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
+                "in_progress"
+            } else if invoice.status == "underpaid" {
+                "underpaid"
+            } else {
+                "unpaid"
+            }
+        } else {
+            accounting.status
+        };
+        (presentation_status, projected_status)
     };
     // Closing an invoice suppresses all future payment instructions but cannot
     // hide or discard later chain evidence. Preserve the lifecycle marker and
@@ -883,33 +894,32 @@ pub async fn apply_direct_observation_batch(
     batch: DirectObservationBatch<'_>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
-    apply_direct_observation_batch_with_optional_quote_attributions(pool, batch, &[], tolerances)
-        .await
+    apply_direct_observation_batch_with_optional_rate_candidate(pool, batch, None, tolerances).await
 }
 
-/// Quote-aware direct watcher writer. Every supplied mapping is validated
-/// against the same invoice, direct rail, and immutable offer identity before
-/// any observation/event row is changed. Missing mappings preserve the legacy
-/// NULL path; an existing attributed event is never rewritten or detached.
-pub async fn apply_direct_observation_batch_with_quote_attributions(
+/// Observation-path variant carrying a freshly validated pricer snapshot.
+/// The stable address never implies which quote UI the payer saw. If the
+/// durable first-seen boundary has no covering payer quote, this transaction
+/// persists a valuation-only snapshot before inserting the event.
+pub async fn apply_direct_observation_batch_with_rate_candidate(
     pool: &PgPool,
     batch: DirectObservationBatch<'_>,
-    quote_attributions: &[DirectObservationQuoteAttribution<'_>],
+    rate_candidate: &NewInvoiceQuoteVersion<'_>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
-    apply_direct_observation_batch_with_optional_quote_attributions(
+    apply_direct_observation_batch_with_optional_rate_candidate(
         pool,
         batch,
-        quote_attributions,
+        Some(rate_candidate),
         tolerances,
     )
     .await
 }
 
-async fn apply_direct_observation_batch_with_optional_quote_attributions(
+async fn apply_direct_observation_batch_with_optional_rate_candidate(
     pool: &PgPool,
     batch: DirectObservationBatch<'_>,
-    quote_attributions: &[DirectObservationQuoteAttribution<'_>],
+    rate_candidate: Option<&NewInvoiceQuoteVersion<'_>>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
     if batch.generation <= 0 {
@@ -919,19 +929,6 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
         return protocol_error("direct observation authority is invalid");
     }
     validate_observation_batch(batch.source, batch.observations)?;
-    let mut attributed_event_keys = HashSet::new();
-    for entry in quote_attributions {
-        if !attributed_event_keys.insert(entry.event_key) {
-            return protocol_error("direct event has duplicate quote attribution");
-        }
-        if !batch
-            .observations
-            .iter()
-            .any(|observation| observation.event_key == entry.event_key)
-        {
-            return protocol_error("quote attribution does not belong to this direct batch");
-        }
-    }
 
     let mut tx = pool.begin().await?;
     let offer_lock_key = super::invoice_lightning_lock_key(batch.invoice_id);
@@ -940,7 +937,8 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
         .execute(&mut *tx)
         .await?;
     let invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+        "SELECT amount_sat, pricing_mode, fiat_amount_minor, \
+                accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
@@ -950,19 +948,6 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| sqlx::Error::RowNotFound)?;
-
-    for entry in quote_attributions {
-        validate_invoice_quote_attribution(
-            &mut *tx,
-            batch.invoice_id,
-            entry.attribution,
-            batch.source.rail(),
-            "direct",
-            None,
-            None,
-        )
-        .await?;
-    }
 
     let head: Option<(i64, i64)> = sqlx::query_as(
         "SELECT issued_generation, applied_generation \
@@ -1021,16 +1006,41 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
             upsert_direct_observation_locked(&mut tx, &batch, observation).await?;
         changed |= observation_mutation.changed;
 
+        if invoice.pricing_mode == "fiat_fixed" {
+            let first_observed_at_unix_micros: i64 = sqlx::query_scalar(
+                "SELECT (EXTRACT(EPOCH FROM first_seen_at) * 1000000)::BIGINT \
+                   FROM invoice_payment_observations WHERE id = $1",
+            )
+            .bind(observation_mutation.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if let Some(candidate) = rate_candidate {
+                let captured = capture_direct_observation_candidate_locked(
+                    &mut tx,
+                    batch.invoice_id,
+                    observation_mutation.id,
+                    first_observed_at_unix_micros,
+                    candidate,
+                )
+                .await?;
+                if !captured {
+                    tracing::warn!(
+                        event = "invoice_late_direct_rate_unavailable",
+                        invoice_id = %batch.invoice_id,
+                        first_observed_at_unix_micros,
+                        "fresh pricer snapshot does not cover direct payment observation; retaining unvalued evidence"
+                    );
+                }
+            }
+        }
+
         let event_mutation = ensure_direct_event_locked(
             &mut tx,
             batch.invoice_id,
             batch.source,
             observation_mutation.id,
             observation,
-            quote_attributions
-                .iter()
-                .find(|entry| entry.event_key == observation.event_key)
-                .map(|entry| entry.attribution),
+            invoice.pricing_mode == "fiat_fixed",
         )
         .await?;
         changed |= event_mutation.changed;
@@ -1063,7 +1073,16 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
     }
 
     let projection_events = load_projection_events_locked(&mut tx, batch.invoice_id).await?;
-    let projection = reduce_projection(&invoice, &projection_events, tolerances);
+    let fiat_projection = if invoice.pricing_mode == "fiat_fixed" {
+        if invoice.fiat_amount_minor.is_none() {
+            return protocol_error("fiat-fixed invoice lacks immutable face amount");
+        }
+        Some(super::invoice_fiat_credit_projection(&mut *tx, batch.invoice_id).await?)
+    } else {
+        None
+    };
+    let projection =
+        reduce_projection_with_fiat(&invoice, &projection_events, tolerances, fiat_projection);
     let active_rails: Vec<String> = projection_events
         .iter()
         .filter(|event| {
@@ -1509,7 +1528,7 @@ async fn ensure_direct_event_locked(
     source: DirectPaymentSource,
     observation_id: Uuid,
     observation: &DirectOutputObservation<'_>,
-    attribution: Option<InvoiceQuoteAttribution>,
+    stamp_fiat_observation: bool,
 ) -> Result<EventMutation, sqlx::Error> {
     let stored = load_event_for_update(tx, observation.event_key).await?;
     let should_activate = observation
@@ -1531,14 +1550,7 @@ async fn ensure_direct_event_locked(
             .or(Some("not_confirmed"))
     };
     if let Some(stored) = stored {
-        validate_stored_event(
-            &stored,
-            invoice_id,
-            source,
-            observation_id,
-            observation,
-            attribution,
-        )?;
+        validate_stored_event(&stored, invoice_id, source, observation_id, observation)?;
         if stored.accounting_state == "superseded" || stored.superseded_by_event_id.is_some() {
             return protocol_error("a superseded direct event is terminal");
         }
@@ -1585,8 +1597,10 @@ async fn ensure_direct_event_locked(
                   invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      CASE WHEN $9 = 'active' THEN NOW() ELSE NULL END, \
-                     CASE WHEN $9 = 'active' THEN NULL ELSE NOW() END, $12, $13, $14, \
-                     CASE WHEN $13::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
+                     CASE WHEN $9 = 'active' THEN NULL ELSE NOW() END, $12, NULL, NULL, \
+                     CASE WHEN $13::BOOLEAN THEN ( \
+                         SELECT first_seen_at FROM invoice_payment_observations WHERE id = $11 \
+                     ) ELSE NULL END) \
              RETURNING id",
         )
         .bind(invoice_id)
@@ -1601,8 +1615,7 @@ async fn ensure_direct_event_locked(
         .bind(observation.verification.event_state())
         .bind(observation_id)
         .bind(desired_reason)
-        .bind(attribution.map(|attribution| attribution.quote_version_id))
-        .bind(attribution.map(|attribution| attribution.quote_offer_id))
+        .bind(stamp_fiat_observation)
         .fetch_one(&mut **tx)
         .await?;
         Ok(EventMutation {
@@ -1636,7 +1649,6 @@ fn validate_stored_event(
     source: DirectPaymentSource,
     observation_id: Uuid,
     observation: &DirectOutputObservation<'_>,
-    attribution: Option<InvoiceQuoteAttribution>,
 ) -> Result<(), sqlx::Error> {
     if stored.invoice_id != invoice_id
         || stored.rail != source.rail()
@@ -1647,10 +1659,8 @@ fn validate_stored_event(
         || stored.address.as_deref() != Some(observation.address)
         || stored.amount_sat != observation.amount_sat
         || stored.observation_id.is_some_and(|id| id != observation_id)
-        || attribution.is_some_and(|attribution| {
-            stored.invoice_quote_version_id != Some(attribution.quote_version_id)
-                || stored.invoice_quote_offer_id != Some(attribution.quote_offer_id)
-        })
+        || stored.invoice_quote_version_id.is_some()
+        || stored.invoice_quote_offer_id.is_some()
     {
         return protocol_error("direct accounting event immutable evidence mismatch");
     }
@@ -1815,7 +1825,8 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
         .execute(&mut **tx)
         .await?;
     let mut invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+        "SELECT amount_sat, pricing_mode, fiat_amount_minor, \
+                accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
@@ -1829,7 +1840,13 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
     invoice.swap_settlement_status = swap_settlement_status.to_owned();
 
     let projection_events = load_projection_events_locked(tx, invoice_id).await?;
-    let projection = reduce_projection(&invoice, &projection_events, tolerances);
+    let fiat_projection = if invoice.pricing_mode == "fiat_fixed" {
+        Some(super::invoice_fiat_credit_projection(&mut **tx, invoice_id).await?)
+    } else {
+        None
+    };
+    let projection =
+        reduce_projection_with_fiat(&invoice, &projection_events, tolerances, fiat_projection);
     let active_rails: Vec<String> = projection_events
         .iter()
         .filter(|event| {
@@ -1928,6 +1945,8 @@ mod tests {
     fn invoice() -> LockedInvoice {
         LockedInvoice {
             amount_sat: 100_000,
+            pricing_mode: "sat_fixed".into(),
+            fiat_amount_minor: None,
             accept_btc: true,
             accept_liquid: true,
             accept_ln: true,

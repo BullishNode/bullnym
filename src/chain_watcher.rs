@@ -119,6 +119,7 @@ struct ChainWatcherPollCtx<'a> {
     pool: &'a PgPool,
     backend: &'a (dyn UtxoBackend + Send + Sync),
     rate_limiter: &'a RateLimiter,
+    pricer: Option<&'a crate::pricer::PricerClient>,
     cancel: &'a CancellationToken,
 }
 
@@ -141,6 +142,7 @@ struct LiquidInvoiceObservationTarget<'a> {
     address: &'a str,
     script: &'a elements::Script,
     blinding_key_hex: &'a str,
+    fiat_currency: Option<&'a str>,
     finality_confirmations: u32,
 }
 
@@ -613,10 +615,12 @@ fn report_outcome(
 /// `rate_limiter` exposes a dedicated watcher-only Electrum bucket
 /// (`check_electrum_watcher`) so a callback storm cannot starve the
 /// watcher and vice-versa.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pool: PgPool,
     backend: Arc<dyn UtxoBackend + Send + Sync>,
     rate_limiter: Arc<RateLimiter>,
+    pricer: Arc<crate::pricer::PricerClient>,
     cancel: CancellationToken,
     cfg: ChainWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
@@ -640,6 +644,7 @@ pub async fn run(
                 pool: &pool,
                 backend: backend.as_ref(),
                 rate_limiter: rate_limiter.as_ref(),
+                pricer: Some(pricer.as_ref()),
                 cancel: &cancel,
             },
             &cfg,
@@ -683,6 +688,7 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch, false,
@@ -711,6 +717,7 @@ pub async fn run(
                             pool: &pool,
                             backend: backend.as_ref(),
                             rate_limiter: rate_limiter.as_ref(),
+                            pricer: Some(pricer.as_ref()),
                             cancel: &cancel,
                         },
                         &cfg,
@@ -725,6 +732,7 @@ pub async fn run(
                             pool: &pool,
                             backend: backend.as_ref(),
                             rate_limiter: rate_limiter.as_ref(),
+                            pricer: Some(pricer.as_ref()),
                             cancel: &cancel,
                         },
                         &cfg,
@@ -748,6 +756,7 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Historical, &reporter, &mut idle_epoch, false,
@@ -1039,7 +1048,7 @@ async fn poll_invoice_addresses(
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
-                    invoice_id = %invoice.id,
+                    invoice_id = %invoice.invoice_id,
                     "chain_watcher: invoice liquid_address parse failed: {e}"
                 );
                 let cursor = invoice.scan_cursor();
@@ -1047,7 +1056,7 @@ async fn poll_invoice_addresses(
                     tracing::warn!(
                         event = "liquid_watcher_lane_progress_write_failed",
                         lane = tier.label(),
-                        invoice_id = %invoice.id,
+                        invoice_id = %invoice.invoice_id,
                         isolated = true,
                         "chain_watcher: malformed invoice offset was not persisted: {e}"
                     );
@@ -1059,14 +1068,14 @@ async fn poll_invoice_addresses(
             }
         };
         let script = parsed.script_pubkey();
-
         match record_liquid_events_for_script(
             ctx,
             LiquidInvoiceObservationTarget {
-                invoice_id: invoice.id,
+                invoice_id: invoice.invoice_id,
                 address: &invoice.liquid_address,
                 script: &script,
                 blinding_key_hex: &invoice.liquid_blinding_key_hex,
+                fiat_currency: invoice.fiat_currency.as_deref(),
                 finality_confirmations: config.finality_confirmations,
             },
             config.tolerances,
@@ -1080,7 +1089,7 @@ async fn poll_invoice_addresses(
                     tracing::warn!(
                         event = "liquid_watcher_lane_progress_write_failed",
                         lane = tier.label(),
-                        invoice_id = %invoice.id,
+                        invoice_id = %invoice.invoice_id,
                         "chain_watcher: completed invoice offset was not persisted: {e}"
                     );
                     return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
@@ -1195,6 +1204,7 @@ async fn record_liquid_events_for_script(
         address,
         script,
         blinding_key_hex,
+        fiat_currency,
         finality_confirmations: liquid_finality_confirmations,
     } = target;
     if liquid_finality_confirmations == 0 {
@@ -1220,7 +1230,7 @@ async fn record_liquid_events_for_script(
         ));
     }
 
-    let known = list_liquid_direct_watch_evidence(ctx.pool, invoice_id).await?;
+    let known = list_liquid_direct_watch_evidence(ctx.pool, invoice_id, address).await?;
     if liquid_known_observation_count_is_hard_bound(known.len()) {
         tracing::warn!(
             event = "liquid_watcher_known_observation_bound_reached",
@@ -1425,18 +1435,55 @@ async fn record_liquid_events_for_script(
         .map(|output| output.as_direct_observation(address))
         .collect::<Vec<_>>();
     let observation_count = observations.len();
-    let apply_outcome = db::apply_direct_observation_batch(
-        ctx.pool,
-        db::DirectObservationBatch {
-            invoice_id,
-            source: db::DirectPaymentSource::Liquid,
-            authority: &snapshot.authority,
-            generation,
-            observations: &observations,
+    let batch = db::DirectObservationBatch {
+        invoice_id,
+        source: db::DirectPaymentSource::Liquid,
+        authority: &snapshot.authority,
+        generation,
+        observations: &observations,
+    };
+    let rate = match (ctx.pricer, fiat_currency) {
+        (Some(pricer), Some(currency)) => match pricer.get_rate(currency).await {
+            Ok(rate) => Some(rate),
+            Err(error) => {
+                tracing::warn!(
+                    event = "invoice_late_direct_pricer_unavailable",
+                    invoice_id = %invoice_id,
+                    currency,
+                    error = %error,
+                    "direct payment observation will remain unvalued unless a durable covering quote already exists"
+                );
+                None
+            }
         },
-        tolerances,
-    )
-    .await?;
+        _ => None,
+    };
+    let apply_outcome = if let Some(rate) = rate.as_ref() {
+        let rate_candidate = db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: rate.minor_per_btc,
+            rate_source: &rate.source,
+            rate_observed_at_unix: i64::try_from(rate.observed_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer observation timestamp exceeds storage".into())
+            })?,
+            rate_fetched_at_unix: i64::try_from(rate.fetched_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer fetch timestamp exceeds storage".into())
+            })?,
+            rate_fresh_until_unix: i64::try_from(rate.expires_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer freshness timestamp exceeds storage".into())
+            })?,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: i64::MAX,
+        };
+        db::apply_direct_observation_batch_with_rate_candidate(
+            ctx.pool,
+            batch,
+            &rate_candidate,
+            tolerances,
+        )
+        .await?
+    } else {
+        db::apply_direct_observation_batch(ctx.pool, batch, tolerances).await?
+    };
 
     let recorded = match apply_outcome {
         db::ApplyDirectObservationOutcome::Applied { changed: true } => observation_count,
@@ -1722,6 +1769,7 @@ fn reconcile_liquid_replacements(
 async fn list_liquid_direct_watch_evidence(
     pool: &PgPool,
     invoice_id: uuid::Uuid,
+    address: &str,
 ) -> Result<Vec<LiquidKnownObservation>, AppError> {
     sqlx::query_as(
         "SELECT event_key, txid, vout, address, amount_sat, asset_id, \
@@ -1730,11 +1778,13 @@ async fn list_liquid_direct_watch_evidence(
          FROM invoice_payment_observations \
          WHERE invoice_id = $1 \
            AND source = 'liquid_direct' \
+           AND address = $2 \
            AND last_seen_state <> 'superseded' \
          ORDER BY event_key \
-         LIMIT $2",
+         LIMIT $3",
     )
     .bind(invoice_id)
+    .bind(address)
     .bind((MAX_LIQUID_KNOWN_OBSERVATIONS + 1) as i64)
     .fetch_all(pool)
     .await
@@ -3125,6 +3175,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3187,6 +3238,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3228,6 +3280,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3289,6 +3342,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3330,6 +3384,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3377,6 +3432,7 @@ mod tests {
                 pool: &pool,
                 backend: &backend,
                 rate_limiter: &rate_limiter,
+                pricer: None,
                 cancel: &cancel,
             },
             &ChainWatcherConfig::default(),

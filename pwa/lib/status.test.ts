@@ -19,7 +19,7 @@ function makeStatus(overrides: Partial<InvoiceStatus> = {}): InvoiceStatus {
   return {
     status: 'unpaid',
     presentation_status: 'unpaid',
-    pricing_mode: 'fiat',
+    pricing_mode: 'fiat_fixed',
     settlement_status: 'none',
     amount_sat: 10_800,
     fiat_amount_minor: 500,
@@ -43,6 +43,7 @@ function makeStatus(overrides: Partial<InvoiceStatus> = {}): InvoiceStatus {
     accept_btc: true,
     accept_ln: true,
     accept_liquid: true,
+    quote_rail_availability: { lightning: true, liquid: true, bitcoin: true },
     ...overrides,
   }
 }

@@ -486,6 +486,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.pricer.max_freshness_secs,
         config.pricer.request_timeout_ms,
     );
+    let initialized_bitcoin_watcher =
+        initialized_bitcoin_watcher.map(|watcher| watcher.with_pricer(pricer_client.clone()));
     let pwa_shells = Arc::new(donation_render::PwaShells::load(&config.pwa.dist_dir));
 
     let listen_addr = config.listen.clone();
@@ -708,6 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _reverse_reconciler_task = reconciler::spawn(
             pool.clone(),
             state.boltz.clone(),
+            state.pricer.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
             state
@@ -793,6 +796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(backend) = state.utxo_backend.clone() {
             let pool = state.db.clone();
             let rl = rate_limiter.clone();
+            let pricer = state.pricer.clone();
             let cancel_watcher = cancel.clone();
             let watcher_cfg = chain_watcher::ChainWatcherConfig::from_rate_limit_config(
                 &config.rate_limit,
@@ -808,6 +812,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pool,
                     backend,
                     rl,
+                    pricer,
                     cancel_watcher,
                     watcher_cfg,
                     accounting_tolerances,
@@ -1011,6 +1016,10 @@ fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/invoices/:id/lightning",
                 post(invoice::fetch_lightning_offer),
+            )
+            .route(
+                "/api/v1/invoices/:id/quote",
+                post(invoice::payer_demand_quote).layer(DefaultBodyLimit::max(1024)),
             );
     }
 

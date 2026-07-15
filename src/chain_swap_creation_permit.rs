@@ -158,6 +158,16 @@ impl ChainSwapCreationPermit {
         }
         Ok(())
     }
+
+    /// Borrow the detached lock-owning session for the canonical provider-row
+    /// transaction.  Keeping quote serialization and the post-provider insert
+    /// on this exact session prevents a direct-payment reducer from changing
+    /// invoice eligibility between remote acceptance and durable attribution.
+    pub(crate) fn connection_mut(&mut self) -> &mut PgConnection {
+        self.connection
+            .as_mut()
+            .expect("a live creation permit always owns its connection")
+    }
 }
 
 impl fmt::Debug for ChainSwapCreationPermit {

@@ -66,6 +66,9 @@ pub enum InvoiceIntegrationTestHookPoint {
     ListAfterInvoiceRead,
     OfferBeforeCommit,
     ChainOfferBeforeRecoveryGate,
+    ProviderAttemptBeforeDispatch,
+    ProviderResponseBeforeCommit,
+    ProviderOfferAfterCommit,
 }
 
 #[derive(Debug)]
@@ -197,9 +200,7 @@ const LIST_LIMIT_MAX: i64 = 100;
 /// this cap prevents abandoned checkout invoices from refreshing forever.
 const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
-/// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
-/// audit-greppable.
-const SAT_PER_BTC: i64 = 100_000_000;
+const FIAT_QUOTE_WINDOW_SECS: i64 = 5 * 60;
 
 /// Per-field length caps for wallet-origin invoice fields.
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
@@ -442,6 +443,159 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
     }
 }
 
+pub(crate) async fn prefetch_provider_observation_rate(
+    state: &crate::AppState,
+    invoice_id: Uuid,
+    quote_version_id: Option<Uuid>,
+) -> Option<pricer::RateView> {
+    let quote_version_id = quote_version_id?;
+    let currency = match db::invoice_quote_currency(&state.db, invoice_id, quote_version_id).await {
+        Ok(Some(currency)) => currency,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(
+                event = "invoice_provider_observation_currency_failed",
+                invoice_id = %invoice_id,
+                quote_version_id = %quote_version_id,
+                error = %error,
+                "failed to load quote currency before provider observation"
+            );
+            return None;
+        }
+    };
+    match state.pricer.get_rate(&currency).await {
+        Ok(rate) => Some(rate),
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_provider_observation_rate_unavailable",
+                invoice_id = %invoice_id,
+                quote_version_id = %quote_version_id,
+                currency,
+                error = %error,
+                "provider status will persist without an invented fiat valuation"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn quote_candidate_from_rate(
+    rate: &pricer::RateView,
+) -> Option<db::NewInvoiceQuoteVersion<'_>> {
+    Some(db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: rate.minor_per_btc,
+        rate_source: &rate.source,
+        rate_observed_at_unix: i64::try_from(rate.observed_at_unix).ok()?,
+        rate_fetched_at_unix: i64::try_from(rate.fetched_at_unix).ok()?,
+        rate_fresh_until_unix: i64::try_from(rate.expires_at_unix).ok()?,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: i64::MAX,
+    })
+}
+
+pub(crate) async fn capture_late_quote_valuation_snapshot(
+    pool: &sqlx::PgPool,
+    pricer: &pricer::PricerClient,
+    observation: Option<db::PersistedInvoiceQuoteObservation>,
+) -> bool {
+    let Some(observation) = observation else {
+        return true;
+    };
+    let currency = match db::late_observation_valuation_status(
+        pool,
+        observation.invoice_id,
+        observation.instruction_quote_version_id,
+        observation.first_observed_at_unix_micros,
+    )
+    .await
+    {
+        Ok(db::LateObservationValuationStatus::OnTime)
+        | Ok(db::LateObservationValuationStatus::Ready(_)) => return true,
+        Ok(db::LateObservationValuationStatus::NeedsRate { fiat_currency }) => fiat_currency,
+        Err(error) => {
+            tracing::error!(
+                event = "invoice_late_valuation_context_failed",
+                invoice_id = %observation.invoice_id,
+                error = %error,
+                "failed to inspect durable provider first-observation evidence"
+            );
+            return false;
+        }
+    };
+    let rate = match pricer.get_rate(&currency).await {
+        Ok(rate) => rate,
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_late_valuation_rate_unavailable",
+                invoice_id = %observation.invoice_id,
+                currency,
+                error = %error,
+                "provider payment observation remains durably unvalued"
+            );
+            return false;
+        }
+    };
+    let timestamp = |value: u64, field: &'static str| match i64::try_from(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::error!(
+                event = "invoice_late_valuation_rate_timestamp_invalid",
+                invoice_id = %observation.invoice_id,
+                field,
+                "pricer timestamp exceeds durable storage range"
+            );
+            None
+        }
+    };
+    let Some(rate_observed_at_unix) = timestamp(rate.observed_at_unix, "observed_at") else {
+        return false;
+    };
+    let Some(rate_fetched_at_unix) = timestamp(rate.fetched_at_unix, "fetched_at") else {
+        return false;
+    };
+    let Some(rate_fresh_until_unix) = timestamp(rate.expires_at_unix, "fresh_until") else {
+        return false;
+    };
+    let candidate = db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: rate.minor_per_btc,
+        rate_source: &rate.source,
+        rate_observed_at_unix,
+        rate_fetched_at_unix,
+        rate_fresh_until_unix,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: i64::MAX,
+    };
+    match db::create_or_reuse_late_observation_valuation_quote(
+        pool,
+        observation.invoice_id,
+        observation.instruction_quote_version_id,
+        observation.first_observed_at_unix_micros,
+        &candidate,
+    )
+    .await
+    {
+        Ok(resolution) => {
+            tracing::info!(
+                event = "invoice_late_valuation_snapshot_ready",
+                invoice_id = %observation.invoice_id,
+                valuation_quote_version_id = %resolution.quote.id,
+                created = resolution.created,
+                "durable fresh rate now covers provider payment first observation"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_late_valuation_snapshot_failed",
+                invoice_id = %observation.invoice_id,
+                error = %error,
+                "provider payment observation remains durably unvalued"
+            );
+            false
+        }
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -529,7 +683,7 @@ pub async fn robots_txt() -> Response {
 /// `amount_sat` (sat-denominated) OR `(fiat_amount_minor, fiat_currency)`
 /// (fiat-denominated). Server rejects payloads that supply both or
 /// neither.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct CreateAnonymousRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
@@ -548,23 +702,27 @@ pub struct CreateAnonymousRequest {
 const MAX_INVOICE_NOTE_LEN: usize = 280;
 
 #[derive(Serialize)]
-pub struct CreateInvoiceResponse {
-    pub invoice_id: Uuid,
-    pub lightning_pr: String,
-    /// Exact BOLT11 principal paired with `lightning_pr`. Null when no
-    /// complete, validated fixed-checkout offer is available.
-    pub lightning_amount_sat: Option<i64>,
-    pub liquid_address: String,
-    /// Exact direct-Liquid amount paired with `liquid_address`.
-    pub liquid_amount_sat: Option<i64>,
-    pub bitcoin_chain_address: Option<String>,
-    pub bitcoin_chain_bip21: Option<String>,
-    /// Exact Bitcoin amount the payer must lock for the chain-swap rail.
-    /// This is the validated Boltz `user_lock_amount_sat`, which can be
-    /// greater than the merchant-facing invoice amount under payer-pays
-    /// pricing. It is present only with a complete chain-swap offer.
-    pub bitcoin_chain_amount_sat: Option<i64>,
-    pub expires_at_unix: i64,
+#[serde(tag = "pricing_mode", rename_all = "snake_case")]
+pub enum CreateInvoiceResponse {
+    /// Fiat checkout creation returns identity only. Payment instructions are
+    /// exclusively returned by the explicit selected-rail quote mutation.
+    FiatFixed {
+        invoice_id: Uuid,
+        expires_at_unix: i64,
+    },
+    /// Sat-fixed remains the current product behavior: Liquid is immediately
+    /// payable and provider-backed rails are independently best effort.
+    SatFixed {
+        invoice_id: Uuid,
+        lightning_pr: String,
+        lightning_amount_sat: Option<i64>,
+        liquid_address: String,
+        liquid_amount_sat: i64,
+        bitcoin_chain_address: Option<String>,
+        bitcoin_chain_bip21: Option<String>,
+        bitcoin_chain_amount_sat: Option<i64>,
+        expires_at_unix: i64,
+    },
 }
 
 /// POST /:nym/invoice — keyless Payment Page checkout (anonymous, unsigned).
@@ -681,7 +839,7 @@ async fn create_anonymous_for_kind(
         }
     }
 
-    let (amount_sat, fiat) = parse_create_request(&req, &state).await?;
+    let (amount_sat, fiat) = parse_create_request(&req, &state)?;
 
     // Optional note → invoice `memo` (private; merchant-only via the signed
     // list). Trim to treat whitespace-only as absent, and reject over-long
@@ -758,10 +916,11 @@ async fn create_anonymous_for_kind(
         public_slug: public_slug.as_deref(),
         npub_owner: &owner.npub,
         origin: "checkout",
-        fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),
-        fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
+        checkout_surface_kind: Some(kind),
+        fiat_amount_minor: fiat.as_ref().map(|(amt, _)| *amt),
+        fiat_currency: fiat.as_ref().map(|(_, cur)| cur.as_str()),
         amount_sat,
-        rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
+        rate_minor_per_btc: None,
         rate_lock_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
         memo: note,
         recipient_label: None,
@@ -781,34 +940,36 @@ async fn create_anonymous_for_kind(
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    let lightning_offer = match create_lightning_offer(
-        &state,
-        Some(&nym),
-        amount_sat as u64,
-        &invoice,
-    )
-    .await
-    {
-        Ok(offer) => Some(offer),
-        Err(e) => {
-            // Boltz's reverse-swap service can be transiently unavailable
-            // (e.g. 502 / timeout while Boltz is under load). Do NOT fail the
-            // whole checkout: a payable Liquid address is already allocated on
-            // this invoice, and the BTC chain offer below is likewise treated
-            // as best-effort. Keep the invoice and return an empty
-            // `lightning_pr`; the client requests the Lightning offer lazily
-            // via `POST /api/v1/invoices/:id/lightning` (fetch_lightning_offer)
-            // once Boltz recovers — the same path used for deep-link
-            // reconstruction. This keeps checkout working (Liquid + BTC rails)
-            // through a Boltz degradation instead of taking it down entirely.
-            tracing::warn!(
-                invoice_id = %invoice.id,
-                "eager Lightning offer unavailable; returning checkout invoice with Liquid rail, client will fetch the LN offer lazily: {e}",
-            );
-            None
+    // Fiat-fixed provider obligations are created only by the explicit
+    // selected-rail quote endpoint after its durable five-minute version
+    // exists. Sat-fixed checkout retains its current eager behavior.
+    let lightning_offer = if fiat.is_some() {
+        None
+    } else {
+        match create_lightning_offer(&state, Some(&nym), amount_sat as u64, &invoice).await {
+            Ok(offer) => Some(offer),
+            Err(e) => {
+                // Boltz's reverse-swap service can be transiently unavailable
+                // (e.g. 502 / timeout while Boltz is under load). Do NOT fail the
+                // whole checkout: a payable Liquid address is already allocated on
+                // this invoice, and the BTC chain offer below is likewise treated
+                // as best-effort. Keep the invoice and return an empty
+                // `lightning_pr`; the client requests the Lightning offer lazily
+                // via `POST /api/v1/invoices/:id/lightning` (fetch_lightning_offer)
+                // once Boltz recovers — the same path used for deep-link
+                // reconstruction. This keeps checkout working (Liquid + BTC rails)
+                // through a Boltz degradation instead of taking it down entirely.
+                tracing::warn!(
+                    invoice_id = %invoice.id,
+                    "eager Lightning offer unavailable; returning checkout invoice with Liquid rail, client will fetch the LN offer lazily: {e}",
+                );
+                None
+            }
         }
     };
-    let bitcoin_chain_offer =
+    let bitcoin_chain_offer = if fiat.is_some() {
+        None
+    } else {
         match create_bitcoin_chain_offer(&state, Some(&nym), amount_sat as u64, &invoice).await {
             Ok(offer) => offer,
             Err(e) => {
@@ -818,37 +979,51 @@ async fn create_anonymous_for_kind(
                 );
                 None
             }
-        };
+        }
+    };
 
-    Ok(Json(CreateInvoiceResponse {
-        invoice_id: invoice.id,
-        lightning_pr: lightning_offer
-            .as_ref()
-            .map(|offer| offer.pr.clone())
-            .unwrap_or_default(),
-        lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
-        liquid_address,
-        liquid_amount_sat: Some(amount_sat),
-        bitcoin_chain_address: bitcoin_chain_offer
-            .as_ref()
-            .map(|offer| offer.lockup_address.clone()),
-        bitcoin_chain_bip21: bitcoin_chain_offer
-            .as_ref()
-            .and_then(|offer| offer.lockup_bip21.clone()),
-        bitcoin_chain_amount_sat: bitcoin_chain_offer
-            .as_ref()
-            .map(|offer| offer.payer_amount_sat),
-        expires_at_unix: invoice.expires_at_unix,
-    }))
+    let response = if fiat.is_some() {
+        CreateInvoiceResponse::FiatFixed {
+            invoice_id: invoice.id,
+            expires_at_unix: invoice.expires_at_unix,
+        }
+    } else {
+        CreateInvoiceResponse::SatFixed {
+            invoice_id: invoice.id,
+            lightning_pr: lightning_offer
+                .as_ref()
+                .map(|offer| offer.pr.clone())
+                .unwrap_or_default(),
+            lightning_amount_sat: lightning_offer.as_ref().map(|offer| offer.payer_amount_sat),
+            liquid_address,
+            liquid_amount_sat: amount_sat,
+            bitcoin_chain_address: bitcoin_chain_offer
+                .as_ref()
+                .map(|offer| offer.lockup_address.clone()),
+            bitcoin_chain_bip21: bitcoin_chain_offer
+                .as_ref()
+                .and_then(|offer| offer.lockup_bip21.clone()),
+            bitcoin_chain_amount_sat: bitcoin_chain_offer
+                .as_ref()
+                .map(|offer| offer.payer_amount_sat),
+            expires_at_unix: invoice.expires_at_unix,
+        }
+    };
+    Ok(Json(response))
 }
 
-/// Validate the create-anonymous body and resolve the requested amount.
+/// Validate the create-anonymous body and preserve the requested denomination.
 ///
-/// Returns `(amount_sat, Option<(fiat_amount_minor, fiat_currency, rate_minor_per_btc)>)`.
-async fn parse_create_request(
+/// Fiat creation is intentionally independent of the live pricer. A fiat row
+/// persists only its immutable face value; the first explicit payer quote owns
+/// conversion and records the exact rate, freshness, and sat target in an
+/// immutable quote version.
+///
+/// Returns `(amount_sat, Option<(fiat_amount_minor, fiat_currency)>)`.
+fn parse_create_request(
     req: &CreateAnonymousRequest,
     state: &AppState,
-) -> Result<(i64, Option<(i32, String, i64)>), AppError> {
+) -> Result<(i64, Option<(i32, String)>), AppError> {
     let has_sat = req.amount_sat.is_some();
     let has_fiat = req.fiat_amount_minor.is_some() || req.fiat_currency.is_some();
 
@@ -903,46 +1078,7 @@ async fn parse_create_request(
         )));
     }
 
-    let rate = state.pricer.get_rate(&currency).await.map_err(|_| {
-        AppError::ServiceUnavailable("pricer unavailable for invoice creation".into())
-    })?;
-    if rate.last_known_rate {
-        // The pricer enforces this bound before returning cached data. Recheck
-        // the observation timestamp at the money boundary so future quote-
-        // version integration cannot accidentally rely on fetch time instead.
-        let age_secs = (unix_now() as u64).saturating_sub(rate.observed_at_unix);
-        if age_secs >= state.config.pricer.max_freshness_secs {
-            return Err(AppError::ServiceUnavailable(
-                "pricer rate is too stale; cannot create new invoice".into(),
-            ));
-        }
-        tracing::warn!(
-            currency = %currency,
-            age_secs,
-            "creating fiat invoice on last-known rate within grace window (pricer upstream degraded)"
-        );
-    }
-
-    let amount_sat = ((minor as i64) * SAT_PER_BTC) / rate.minor_per_btc;
-    if amount_sat <= 0 {
-        return Err(AppError::InvalidAmount(
-            "computed amount_sat <= 0 (rate too high or fiat amount too small)".into(),
-        ));
-    }
-    let min_sat = (state.config.limits.min_sendable_msat / 1000) as i64;
-    let max_sat = (state.config.limits.max_sendable_msat / 1000) as i64;
-    if amount_sat < min_sat {
-        return Err(AppError::InvalidAmount(format!(
-            "computed amount {amount_sat} sat below minimum {min_sat} sat"
-        )));
-    }
-    if amount_sat > max_sat {
-        return Err(AppError::InvalidAmount(format!(
-            "computed amount {amount_sat} sat above maximum {max_sat} sat"
-        )));
-    }
-
-    Ok((amount_sat, Some((minor, currency, rate.minor_per_btc))))
+    Ok((0, Some((minor, currency))))
 }
 
 // =====================================================================
@@ -1053,7 +1189,7 @@ struct PublicDirectPaymentAddresses<'a> {
 /// accepting direct Liquid. Authenticated merchant history keeps the raw
 /// stored values for reconciliation.
 fn public_direct_payment_addresses(inv: &db::Invoice) -> PublicDirectPaymentAddresses<'_> {
-    if invoice_payment_rails_are_payable(inv) {
+    if sat_fixed_payment_instructions_are_payable(inv) {
         PublicDirectPaymentAddresses {
             bitcoin: inv
                 .accept_btc
@@ -1070,6 +1206,13 @@ fn public_direct_payment_addresses(inv: &db::Invoice) -> PublicDirectPaymentAddr
             liquid: None,
         }
     }
+}
+
+/// Public status/render instruction fields are the current sat-fixed contract.
+/// Fiat-fixed callers must use the complete selected-rail quote response so an
+/// address or amount can never escape without its immutable version identity.
+fn sat_fixed_payment_instructions_are_payable(inv: &db::Invoice) -> bool {
+    inv.pricing_mode == "sat_fixed" && invoice_payment_rails_are_payable(inv)
 }
 
 /// Owns the PostgreSQL session that carries the lazy-offer advisory lock.
@@ -1235,10 +1378,13 @@ async fn render_invoice_template(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
-    let rails_payable = invoice_payment_rails_are_payable(&inv);
-    let lightning_offer =
-        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
-    let bitcoin_chain_offer = if rails_payable {
+    let sat_fixed_instructions_payable = sat_fixed_payment_instructions_are_payable(&inv);
+    let lightning_offer = if sat_fixed_instructions_payable {
+        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?
+    } else {
+        None
+    };
+    let bitcoin_chain_offer = if sat_fixed_instructions_payable {
         db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
             .await?
     } else {
@@ -1262,7 +1408,7 @@ async fn render_invoice_template(
     let direct_addresses = public_direct_payment_addresses(&inv);
     let liquid_amount_sat = direct_addresses
         .liquid
-        .filter(|_| rails_payable && remaining_sat > 0)
+        .filter(|_| sat_fixed_instructions_payable && remaining_sat > 0)
         .map(|_| remaining_sat);
     let tpl = InvoicePaymentTpl {
         nym,
@@ -1277,7 +1423,7 @@ async fn render_invoice_template(
             Some("unpaid" | "partial" | "payment_received" | "overpaid")
         ),
         settlement_status: &inv.settlement_status,
-        rails_payable,
+        rails_payable: sat_fixed_instructions_payable,
         amount_sat: inv.amount_sat,
         remaining_amount_sat: remaining_sat,
         fiat_display,
@@ -1356,6 +1502,9 @@ pub struct InvoiceStatusResponse {
     pub accept_btc: bool,
     pub accept_ln: bool,
     pub accept_liquid: bool,
+    /// Required object for fiat-fixed invoices and null for sat-fixed invoices.
+    /// This pure projection is the only browser authority for quote tabs.
+    pub quote_rail_availability: Option<PayerQuoteRailAvailability>,
 }
 
 pub async fn status(
@@ -1408,10 +1557,13 @@ pub async fn status(
         .await?
         .unwrap_or_else(|| inv.paid_amount_sat.unwrap_or(0));
     let remaining_sat = remaining_amount_from_received(&inv, received_sat);
-    let rails_payable = invoice_payment_rails_are_payable(&inv);
-    let lightning_offer =
-        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?;
-    let bitcoin_chain_offer = if rails_payable {
+    let sat_fixed_instructions_payable = sat_fixed_payment_instructions_are_payable(&inv);
+    let lightning_offer = if sat_fixed_instructions_payable {
+        latest_reusable_lightning_offer(&mut *snapshot, &inv, remaining_sat).await?
+    } else {
+        None
+    };
+    let bitcoin_chain_offer = if sat_fixed_instructions_payable {
         db::latest_payer_exposable_chain_swap_for_invoice(&mut *snapshot, inv.id, remaining_sat)
             .await?
     } else {
@@ -1448,8 +1600,9 @@ pub async fn status(
     let liquid_address = direct_addresses.liquid.map(str::to_owned);
     let liquid_amount_sat = liquid_address
         .as_ref()
-        .filter(|_| rails_payable && remaining_sat > 0)
+        .filter(|_| sat_fixed_instructions_payable && remaining_sat > 0)
         .map(|_| remaining_sat);
+    let quote_rail_availability = payer_quote_rail_availability(&inv);
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
@@ -1480,6 +1633,7 @@ pub async fn status(
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
+        quote_rail_availability,
     }))
 }
 
@@ -1491,6 +1645,287 @@ pub async fn status(
 pub struct LightningOfferResponse {
     pub pr: String,
     pub lightning_amount_sat: i64,
+}
+
+/// One explicit payer-selected rail.  Missing `rail` preserves the approved
+/// Lightning-default checkout behavior without making a GET manufacture a
+/// provider obligation.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PayerQuoteRail {
+    #[default]
+    Lightning,
+    Liquid,
+    Bitcoin,
+}
+
+impl PayerQuoteRail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lightning => "lightning",
+            Self::Liquid => "liquid",
+            Self::Bitcoin => "bitcoin",
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayerDemandQuoteRequest {
+    #[serde(default)]
+    pub rail: PayerQuoteRail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayerQuoteRailAvailability {
+    pub lightning: bool,
+    pub liquid: bool,
+    pub bitcoin: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FiatQuoteView {
+    pub quote_version_id: Uuid,
+    pub version_number: i32,
+    pub fiat_face_amount_minor: i32,
+    pub fiat_target_amount_minor: i32,
+    pub fiat_currency: String,
+    pub rate_minor_per_btc: i64,
+    pub rate_source: String,
+    pub rate_observed_at_unix: i64,
+    pub rate_fetched_at_unix: i64,
+    pub rate_fresh_until_unix: i64,
+    pub merchant_amount_sat: i64,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+}
+
+impl From<&db::InvoiceQuoteVersion> for FiatQuoteView {
+    fn from(quote: &db::InvoiceQuoteVersion) -> Self {
+        Self {
+            quote_version_id: quote.id,
+            version_number: quote.version_number,
+            fiat_face_amount_minor: quote.fiat_face_amount_minor,
+            fiat_target_amount_minor: quote.fiat_target_amount_minor,
+            fiat_currency: quote.fiat_currency.clone(),
+            rate_minor_per_btc: quote.rate_minor_per_btc,
+            rate_source: quote.rate_source.clone(),
+            rate_observed_at_unix: quote.rate_observed_at_unix,
+            rate_fetched_at_unix: quote.rate_fetched_at_unix,
+            rate_fresh_until_unix: quote.rate_fresh_until_unix,
+            merchant_amount_sat: quote.merchant_amount_sat,
+            created_at_unix: quote.created_at_unix,
+            expires_at_unix: quote.expires_at_unix,
+        }
+    }
+}
+
+/// A quote response contains exactly one complete selected-rail instruction.
+/// Serde's tagged enum prevents nullable address/amount/offer combinations.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VersionedPayerInstruction {
+    LiquidDirect {
+        address: String,
+        payer_amount_sat: i64,
+    },
+    BitcoinDirect {
+        address: String,
+        bip21: String,
+        payer_amount_sat: i64,
+    },
+    LightningBoltzReverse {
+        quote_offer_id: Uuid,
+        pr: String,
+        payer_amount_sat: i64,
+    },
+    BitcoinBoltzChain {
+        quote_offer_id: Uuid,
+        address: String,
+        bip21: String,
+        payer_amount_sat: i64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "pricing_mode", rename_all = "snake_case")]
+pub enum PayerDemandQuoteResponse {
+    FiatFixed {
+        invoice_id: Uuid,
+        selected_rail: PayerQuoteRail,
+        quote: FiatQuoteView,
+        instruction: VersionedPayerInstruction,
+    },
+}
+
+/// `POST /api/v1/invoices/:id/quote` is the sole payer-demand mutation
+/// boundary for versioned quotes.  Status/render/crawler GETs remain pure
+/// projections and never call this handler internally.
+pub async fn payer_demand_quote(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(request): Json<PayerDemandQuoteRequest>,
+) -> Result<Json<PayerDemandQuoteResponse>, AppError> {
+    check_payer_offer_rate_limit(&state, peer_opt, &headers, &id_str).await?;
+
+    let id = parse_invoice_id(&id_str)?;
+    let invoice = db::get_invoice_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+    if !invoice_payment_rails_are_payable(&invoice) {
+        return Err(AppError::InvalidAmount(format!(
+            "invoice is {} (not payable); no payer quote available",
+            invoice.status
+        )));
+    }
+    if invoice.pricing_mode != "fiat_fixed" {
+        return Err(AppError::InvalidAmount(
+            "sat-fixed invoices retain the remaining-aware status and Lightning offer flow".into(),
+        ));
+    }
+    validate_payer_quote_rail(&invoice, request.rail)?;
+    let quote = resolve_current_fiat_quote(&state, &invoice).await?;
+    let instruction =
+        versioned_instruction_for_rail(&state, &invoice, &quote, request.rail).await?;
+    let response = PayerDemandQuoteResponse::FiatFixed {
+        invoice_id: invoice.id,
+        selected_rail: request.rail,
+        quote: FiatQuoteView::from(&quote),
+        instruction,
+    };
+    Ok(Json(response))
+}
+
+fn payer_quote_rail_availability(invoice: &db::Invoice) -> Option<PayerQuoteRailAvailability> {
+    if invoice.pricing_mode != "fiat_fixed" {
+        return None;
+    }
+    let payable = invoice_payment_rails_are_payable(invoice);
+    let checkout_descriptor_surface = invoice.origin == "checkout" && invoice.nym_owner.is_some();
+    let wallet_direct_bitcoin =
+        invoice.origin == "wallet" && invoice.accept_btc && invoice.bitcoin_address.is_some();
+    Some(PayerQuoteRailAvailability {
+        lightning: payable && invoice.accept_ln,
+        liquid: payable
+            && invoice.accept_liquid
+            && invoice.liquid_address.is_some()
+            && invoice.liquid_blinding_key_hex.is_some(),
+        // Checkout/POS Bitcoin remains provider-backed and settles to Liquid.
+        // Wallet-origin Bitcoin pays the stable invoice address directly; its
+        // version-bound quote changes only the amount and BIP21 envelope.
+        bitcoin: payable
+            && (wallet_direct_bitcoin
+                || (checkout_descriptor_surface && invoice.liquid_address.is_some())),
+    })
+}
+
+fn validate_payer_quote_rail(invoice: &db::Invoice, rail: PayerQuoteRail) -> Result<(), AppError> {
+    let availability = payer_quote_rail_availability(invoice)
+        .ok_or_else(|| AppError::InvalidAmount("invoice does not support fiat quotes".into()))?;
+    match rail {
+        PayerQuoteRail::Lightning if !availability.lightning => Err(AppError::InvalidAmount(
+            "invoice does not accept Lightning".into(),
+        )),
+        PayerQuoteRail::Liquid if !availability.liquid => Err(AppError::InvalidAmount(
+            "invoice does not accept Liquid".into(),
+        )),
+        PayerQuoteRail::Bitcoin if !availability.bitcoin => Err(AppError::InvalidAmount(
+            "invoice does not accept Bitcoin".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+async fn check_payer_offer_rate_limit(
+    state: &AppState,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+    invoice_id: &str,
+) -> Result<(), AppError> {
+    let peer = peer_opt.map(|ConnectInfo(addr)| addr);
+    let ip = ip_whitelist::caller_ip(peer, headers, state.config.rate_limit.trust_forwarded_for);
+    let whitelisted = ip
+        .map(|address| state.ip_whitelist.contains(address))
+        .unwrap_or(false);
+    let certification_allowed = certification::allows_scope(
+        state,
+        CertificationScope::LiveMoneyOffer,
+        peer,
+        headers,
+        "invoice_payer_quote",
+        Some(invoice_id),
+    );
+    if !whitelisted && !certification_allowed {
+        if let Some(address) = ip {
+            state
+                .rate_limiter
+                .check_lightning_per_source(address)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_current_fiat_quote(
+    state: &AppState,
+    invoice: &db::Invoice,
+) -> Result<db::InvoiceQuoteVersion, AppError> {
+    if let Some(quote) = db::current_invoice_quote(&state.db, invoice.id).await? {
+        return Ok(quote);
+    }
+    if invoice.expires_at_unix < unix_now().saturating_add(FIAT_QUOTE_WINDOW_SECS) {
+        return Err(AppError::ServiceUnavailable(
+            "invoice lifetime cannot contain a complete five-minute quote".into(),
+        ));
+    }
+    let currency = invoice
+        .fiat_currency
+        .as_deref()
+        .ok_or_else(|| AppError::DbError("fiat-fixed invoice is missing its currency".into()))?;
+    let rate = state
+        .pricer
+        .get_rate(currency)
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("fresh fiat quote unavailable".into()))?;
+    if unix_now() as u64 >= rate.expires_at_unix {
+        return Err(AppError::ServiceUnavailable(
+            "fresh fiat quote unavailable".into(),
+        ));
+    }
+
+    let min_sat = (state.config.limits.min_sendable_msat / 1_000) as i64;
+    let max_sat = (state.config.limits.max_sendable_msat / 1_000) as i64;
+
+    let candidate = db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: rate.minor_per_btc,
+        rate_source: &rate.source,
+        rate_observed_at_unix: i64::try_from(rate.observed_at_unix)
+            .map_err(|_| AppError::DbError("rate observation time exceeds storage range".into()))?,
+        rate_fetched_at_unix: i64::try_from(rate.fetched_at_unix)
+            .map_err(|_| AppError::DbError("rate fetch time exceeds storage range".into()))?,
+        rate_fresh_until_unix: i64::try_from(rate.expires_at_unix)
+            .map_err(|_| AppError::DbError("rate expiry exceeds storage range".into()))?,
+        minimum_merchant_amount_sat: min_sat,
+        maximum_merchant_amount_sat: max_sat,
+    };
+    Ok(
+        db::create_or_reuse_current_invoice_quote(&state.db, invoice.id, &candidate)
+            .await?
+            .quote,
+    )
+}
+
+fn quote_offer_request_key(quote_id: Uuid, rail: PayerQuoteRail, kind: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"bullnym-invoice-quote-offer-v1\0");
+    hash.update(quote_id.as_bytes());
+    hash.update([0]);
+    hash.update(rail.as_str().as_bytes());
+    hash.update([0]);
+    hash.update(kind.as_bytes());
+    hex::encode(hash.finalize())
 }
 
 pub async fn fetch_lightning_offer(
@@ -1523,6 +1958,11 @@ pub async fn fetch_lightning_offer(
     let inv = db::get_invoice_by_id(&state.db, id)
         .await?
         .ok_or_else(|| AppError::InvoiceNotFound(id_str.clone()))?;
+    if inv.pricing_mode == "fiat_fixed" {
+        return Err(AppError::InvalidAmount(
+            "fiat-fixed invoices require the selected-rail quote endpoint".into(),
+        ));
+    }
     if !invoice_payment_rails_are_payable(&inv) {
         return Err(AppError::InvalidAmount(format!(
             "invoice is {} (not payable); no Lightning offer available",
@@ -1752,6 +2192,990 @@ async fn ensure_reusable_lightning_offer(
     Ok(Some(prepared.public_offer()))
 }
 
+async fn versioned_instruction_for_rail(
+    state: &AppState,
+    invoice: &db::Invoice,
+    quote: &db::InvoiceQuoteVersion,
+    rail: PayerQuoteRail,
+) -> Result<VersionedPayerInstruction, AppError> {
+    match rail {
+        PayerQuoteRail::Liquid => {
+            if !invoice.accept_liquid {
+                return Err(AppError::InvalidAmount(
+                    "invoice does not accept Liquid".into(),
+                ));
+            }
+            let address = invoice.liquid_address.clone().ok_or_else(|| {
+                AppError::DbError(
+                    "direct Liquid quote is missing its stable invoice address".into(),
+                )
+            })?;
+            Ok(VersionedPayerInstruction::LiquidDirect {
+                address,
+                payer_amount_sat: quote.merchant_amount_sat,
+            })
+        }
+        PayerQuoteRail::Lightning => {
+            if !invoice.accept_ln {
+                return Err(AppError::InvalidAmount(
+                    "invoice does not accept Lightning".into(),
+                ));
+            }
+            let (offer_id, offer) = ensure_versioned_lightning_offer(state, invoice, quote).await?;
+            Ok(VersionedPayerInstruction::LightningBoltzReverse {
+                quote_offer_id: offer_id,
+                pr: offer.pr,
+                payer_amount_sat: offer.payer_amount_sat,
+            })
+        }
+        PayerQuoteRail::Bitcoin => {
+            if invoice.origin == "wallet" {
+                if !invoice.accept_btc {
+                    return Err(AppError::InvalidAmount(
+                        "invoice does not accept Bitcoin".into(),
+                    ));
+                }
+                let address = invoice.bitcoin_address.clone().ok_or_else(|| {
+                    AppError::DbError(
+                        "direct Bitcoin quote is missing its stable invoice address".into(),
+                    )
+                })?;
+                let amount_sat = u64::try_from(quote.merchant_amount_sat).map_err(|_| {
+                    AppError::DbError("direct Bitcoin quote amount is invalid".into())
+                })?;
+                return Ok(VersionedPayerInstruction::BitcoinDirect {
+                    bip21: build_direct_bitcoin_bip21(&address, amount_sat),
+                    address,
+                    payer_amount_sat: quote.merchant_amount_sat,
+                });
+            }
+            let (offer_id, offer) =
+                ensure_versioned_bitcoin_chain_offer(state, invoice, quote).await?;
+            let bip21 = offer.lockup_bip21.ok_or_else(|| {
+                AppError::DbError("versioned Bitcoin offer is missing its BIP21".into())
+            })?;
+            Ok(VersionedPayerInstruction::BitcoinBoltzChain {
+                quote_offer_id: offer_id,
+                address: offer.lockup_address,
+                bip21,
+                payer_amount_sat: offer.payer_amount_sat,
+            })
+        }
+    }
+}
+
+/// Fiat quote-aware counterpart to the sat-fixed lazy Lightning helper. The durable
+/// quote exists before provider I/O; exact quote-offer identity and the swap
+/// row commit together before any BOLT11 is returned.
+async fn ensure_versioned_lightning_offer(
+    state: &AppState,
+    invoice: &db::Invoice,
+    requested_quote: &db::InvoiceQuoteVersion,
+) -> Result<(Uuid, LightningOffer), AppError> {
+    let lock_key = db::invoice_lightning_lock_key(invoice.id);
+    let mut pooled_connection = state
+        .db
+        .acquire()
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+        .bind(&lock_key)
+        .fetch_one(&mut *pooled_connection)
+        .await
+        .map_err(|error| AppError::DbError(error.to_string()))?;
+    if !acquired {
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote is changing; retry the payer quote request".into(),
+        ));
+    }
+    let mut connection = InvoiceOfferAdvisoryLock::new(pooled_connection, lock_key);
+
+    let current = db::get_invoice_by_id(&mut *connection, invoice.id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(invoice.id.to_string()))?;
+    let quote = db::current_invoice_quote(&mut *connection, invoice.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("invoice quote expired; refresh and retry".into())
+        })?;
+    if quote.id != requested_quote.id
+        || !invoice_payment_rails_are_payable(&current)
+        || !current.accept_ln
+    {
+        connection.unlock().await?;
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote changed; refresh and retry".into(),
+        ));
+    }
+
+    if let Some(persisted) =
+        db::invoice_quote_offer_for_rail(&mut *connection, current.id, quote.id, "lightning")
+            .await?
+    {
+        if persisted.offer_kind != "boltz_reverse"
+            || persisted.provider.as_deref() != Some("boltz")
+            || persisted.provider_attempt_id.is_none()
+        {
+            connection.unlock().await?;
+            return Err(AppError::DbError(
+                "persisted Lightning quote offer has invalid authority".into(),
+            ));
+        }
+        let instruction = db::lightning_pr_for_invoice_quote_offer(
+            &mut *connection,
+            current.id,
+            quote.id,
+            persisted.id,
+            persisted.provider_offer_id.as_deref().ok_or_else(|| {
+                AppError::DbError("persisted Lightning offer is missing provider identity".into())
+            })?,
+        )
+        .await?;
+        connection.unlock().await?;
+        let (pr, merchant_amount_sat) = instruction.ok_or_else(|| {
+            AppError::ServiceUnavailable(
+                "persisted Lightning quote offer is not currently payable".into(),
+            )
+        })?;
+        let validated = fixed_checkout_lightning_offer(pr, merchant_amount_sat);
+        if merchant_amount_sat != quote.merchant_amount_sat
+            || validated.as_ref().map(|offer| offer.payer_amount_sat)
+                != Some(persisted.payer_amount_sat)
+            || !validated
+                .as_ref()
+                .is_some_and(|offer| bolt11_is_reusable_at(&offer.pr, unix_now()))
+        {
+            return Err(AppError::ServiceUnavailable(
+                "persisted Lightning quote offer is not currently payable".into(),
+            ));
+        }
+        return Ok((persisted.id, validated.expect("validated above")));
+    }
+
+    // Never start a provider mutation so close to the immutable quote expiry
+    // that a bounded response cannot be durably attributed before exposure.
+    if quote.expires_at_unix
+        <= unix_now().saturating_add(i64::try_from(BOLT11_REFRESH_MARGIN_SECS).unwrap_or(120))
+    {
+        connection.unlock().await?;
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote is near expiry; refresh after the countdown".into(),
+        ));
+    }
+
+    let request_key = quote_offer_request_key(quote.id, PayerQuoteRail::Lightning, "boltz_reverse");
+    let existing_provider_attempt =
+        db::invoice_quote_provider_attempt(&mut *connection, quote.id, "lightning", &request_key)
+            .await?;
+    let merchant_amount_sat = u64::try_from(quote.merchant_amount_sat)
+        .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?;
+
+    let (
+        provider_attempt,
+        provider_create,
+        swap_key_index,
+        allocation_id,
+        claim_public_key_hex,
+        preimage_hash_hex,
+    ) = if let Some(attempt) = existing_provider_attempt {
+        if attempt.completed {
+            connection.unlock().await?;
+            return Err(AppError::DbError(
+                "completed Lightning provider attempt is missing its atomic offer".into(),
+            ));
+        }
+        let swap_key_index = u64::try_from(attempt.claim_child_index)
+            .map_err(|_| AppError::DbError("invalid persisted reverse child index".into()))?;
+        let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+        let claim_public_key_hex = derived_key.public_key_hex();
+        let preimage_hash_hex = derived_key.preimage_hash_hex();
+        let provider_create = state.boltz.restore_prepared_fixed_checkout_reverse_swap(
+            derived_key,
+            &attempt.request_authority_json,
+            &attempt.request_authority_sha256,
+        )?;
+        (
+            attempt.clone(),
+            provider_create,
+            swap_key_index,
+            attempt.claim_key_allocation_id,
+            claim_public_key_hex,
+            preimage_hash_hex,
+        )
+    } else {
+        state
+            .admission
+            .enforce(Rail::LightningReverse)
+            .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+        let swap_key_index = db::next_swap_key_index(&mut *connection)
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("swap key allocation failed: {error}"))
+            })?;
+        let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+        let claim_public_key_hex = derived_key.public_key_hex();
+        let preimage_hash_hex = derived_key.preimage_hash_hex();
+        let allocation_id = db::reserve_swap_key_allocation(
+            &mut *connection,
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: swap_key_index as i64,
+                purpose: db::SwapKeyPurpose::ReverseClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
+        .await
+        .map_err(|error| AppError::DbError(format!("swap key reservation failed: {error}")))?;
+        let provider_create =
+            prepare_lightning_provider_create(state, derived_key, merchant_amount_sat, &current)?;
+        let (request_authority_json, request_authority_sha256) =
+            provider_create.canonical_authority()?;
+        let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
+            &mut *connection,
+            &db::NewInvoiceQuoteProviderAttempt {
+                invoice_id: current.id,
+                quote_version_id: quote.id,
+                rail: "lightning",
+                request_key: &request_key,
+                operation: "fixed_checkout_reverse",
+                merchant_amount_sat: quote.merchant_amount_sat,
+                request_authority_json: &request_authority_json,
+                request_authority_sha256: &request_authority_sha256,
+                claim_key_allocation_id: allocation_id,
+                refund_key_allocation_id: None,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("provider attempt reservation failed: {error}"))
+        })?;
+        (
+            attempt,
+            provider_create,
+            swap_key_index,
+            allocation_id,
+            claim_public_key_hex,
+            preimage_hash_hex,
+        )
+    };
+
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
+    )
+    .await;
+    let owns_dispatch = db::record_invoice_quote_provider_dispatch(
+        &mut *connection,
+        provider_attempt.id,
+        &provider_attempt.request_authority_sha256,
+    )
+    .await?;
+    let provider_result = if owns_dispatch {
+        match state
+            .boltz
+            .submit_fixed_checkout_reverse_swap(provider_create)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "provider_outcome_unknown",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(error);
+            }
+        }
+    } else {
+        let claim_child_index = u32::try_from(swap_key_index)
+            .map_err(|_| AppError::DbError("reverse child index exceeds provider range".into()))?;
+        let response = match state
+            .boltz
+            .recover_reverse_create_response(claim_child_index)
+            .await
+        {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restore_absent",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Lightning provider outcome remains under integrity hold".into(),
+                ));
+            }
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restore_unavailable",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Lightning provider reconciliation is unavailable".into(),
+                ));
+            }
+        };
+        if response.invoice.is_none() {
+            db::record_invoice_quote_provider_integrity_hold(
+                &mut *connection,
+                provider_attempt.id,
+                "restored_response_incomplete",
+            )
+            .await?;
+            connection.unlock().await?;
+            return Err(AppError::ServiceUnavailable(
+                "restored Lightning obligation lacks a recoverable invoice".into(),
+            ));
+        }
+        match state
+            .boltz
+            .complete_fixed_checkout_reverse_swap(provider_create, response)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restored_response_invalid",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "restored Lightning provider response failed validation".into(),
+                ));
+            }
+        }
+    };
+    let prepared = prepared_lightning_offer_from_result(provider_result)?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    )
+    .await;
+
+    let mut tx = connection.begin().await?;
+    let resolution = db::record_or_reuse_invoice_quote_offer_in_tx(
+        &mut tx,
+        &db::NewInvoiceQuoteOffer {
+            invoice_id: current.id,
+            quote_version_id: quote.id,
+            rail: "lightning",
+            offer_kind: "boltz_reverse",
+            request_key: &request_key,
+            provider: Some("boltz"),
+            provider_offer_id: Some(&prepared.swap_id),
+            provider_attempt_id: Some(provider_attempt.id),
+            payer_amount_sat: prepared.payer_amount_sat,
+            expires_at_unix: quote.expires_at_unix,
+        },
+    )
+    .await?;
+    db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut tx,
+        &prepared.as_new_swap_record(
+            lightning_swap_nym(&current),
+            quote.merchant_amount_sat as u64,
+            current.id,
+            swap_key_index,
+            state.swap_key_root_fingerprint.as_str(),
+        ),
+        &db::ReverseSwapLineage {
+            allocation_id,
+            key_epoch: state.config.boltz.key_epoch,
+            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+            claim_public_key_hex: &claim_public_key_hex,
+            preimage_hash_hex: &preimage_hash_hex,
+        },
+        db::InvoiceQuoteAttribution {
+            quote_version_id: quote.id,
+            quote_offer_id: resolution.offer.id,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AppError::DbError(format!(
+            "failed to persist versioned Lightning offer {}: {error}",
+            prepared.swap_id
+        ))
+    })?;
+    db::record_invoice_quote_provider_completion(
+        &mut *tx,
+        provider_attempt.id,
+        resolution.offer.id,
+        &prepared.swap_id,
+        &prepared.provider_response_sha256,
+    )
+    .await?;
+    tx.commit().await?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    )
+    .await;
+    let still_current = db::current_invoice_quote(&mut *connection, current.id).await?;
+    if still_current.as_ref().map(|candidate| candidate.id) != Some(quote.id)
+        || quote.expires_at_unix <= unix_now()
+    {
+        connection.unlock().await?;
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote expired while creating the Lightning offer; refresh and retry".into(),
+        ));
+    }
+    connection.unlock().await?;
+    drop(connection);
+    if let Some(nym) = lightning_swap_nym(&current) {
+        db::touch_user_callback(&state.db, nym).await;
+    }
+    Ok((resolution.offer.id, prepared.public_offer()))
+}
+
+async fn ensure_versioned_bitcoin_chain_offer(
+    state: &AppState,
+    invoice: &db::Invoice,
+    requested_quote: &db::InvoiceQuoteVersion,
+) -> Result<(Uuid, BitcoinChainOffer), AppError> {
+    let liquid_address = invoice.liquid_address.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support Bitcoin-to-Liquid payment".into())
+    })?;
+    let merchant_liquid_destination = validators::canonical_liquid_mainnet_address(liquid_address)
+        .map_err(|error| {
+            AppError::BoltzError(format!(
+                "chain swap invoice has an invalid Liquid destination: {error}"
+            ))
+        })?;
+    let nym = invoice.nym_owner.as_deref().ok_or_else(|| {
+        AppError::InvalidAmount("invoice does not support a Bitcoin chain offer".into())
+    })?;
+
+    let mut lookup_connection = state.db.acquire().await?;
+    if let ReusableVersionedBitcoinOffer::Ready { offer_id, offer } =
+        reusable_versioned_bitcoin_chain_offer(&mut lookup_connection, invoice, requested_quote)
+            .await?
+    {
+        return Ok((offer_id, offer));
+    }
+    drop(lookup_connection);
+
+    state
+        .admission
+        .enforce(Rail::BitcoinChain)
+        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+    // Page/POS ownership and the recovery contract are permanent. Taking the
+    // separate Lightning Address product offline must close LNURL without
+    // disabling an already-enabled checkout surface's Bitcoin quote.
+    let owner = db::get_user_by_nym(&state.db, nym).await?.ok_or_else(|| {
+        AppError::ServiceUnavailable("Bitcoin recovery owner is unavailable".into())
+    })?;
+    if owner.npub != invoice.npub_owner {
+        return Err(AppError::DbError(
+            "Bitcoin recovery owner does not match invoice recipient".into(),
+        ));
+    }
+    let recovery_commitment =
+        db::select_current_recovery_address_commitment(&state.db, &owner.npub)
+            .await
+            .map_err(|error| {
+                AppError::DbError(format!(
+                    "failed to resolve chain-swap recovery commitment: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable("Bitcoin recovery commitment is unavailable".into())
+            })?;
+    let recovery_runtime = state.recovery_manifest_runtime_v1().ok_or_else(|| {
+        AppError::ServiceUnavailable("chain-swap recovery capability is unavailable".into())
+    })?;
+
+    let mut permit = ChainSwapCreationPermit::acquire(&state.db, recovery_runtime)
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "chain-swap creation boundary is unavailable: {error}"
+            ))
+        })?;
+
+    let invoice_lock_key = db::invoice_lightning_lock_key(invoice.id);
+    let invoice_lock_acquired: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+            .bind(&invoice_lock_key)
+            .fetch_one(permit.connection_mut())
+            .await
+            .map_err(|error| AppError::DbError(error.to_string()))?;
+    if !invoice_lock_acquired {
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote is changing; retry the Bitcoin offer request".into(),
+        ));
+    }
+
+    let current = db::get_invoice_by_id(permit.connection_mut(), invoice.id)
+        .await?
+        .ok_or_else(|| AppError::InvoiceNotFound(invoice.id.to_string()))?;
+    let quote = db::current_invoice_quote(permit.connection_mut(), invoice.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("invoice quote expired; refresh and retry".into())
+        })?;
+    if quote.id != requested_quote.id || !invoice_payment_rails_are_payable(&current) {
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote changed; refresh and retry".into(),
+        ));
+    }
+    match reusable_versioned_bitcoin_chain_offer(permit.connection_mut(), &current, &quote).await? {
+        ReusableVersionedBitcoinOffer::Ready { offer_id, offer } => {
+            permit.release().await.map_err(|error| {
+                AppError::DbError(format!(
+                    "chain-swap creation permit release failed: {error}"
+                ))
+            })?;
+            return Ok((offer_id, offer));
+        }
+        ReusableVersionedBitcoinOffer::ExistingNotExposable => {
+            return Err(AppError::ServiceUnavailable(
+                "persisted Bitcoin quote offer is not currently payer-exposable".into(),
+            ));
+        }
+        ReusableVersionedBitcoinOffer::Missing => {}
+    }
+    if quote.expires_at_unix <= unix_now().saturating_add(120) {
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote is near expiry; refresh after the countdown".into(),
+        ));
+    }
+
+    let request_key = quote_offer_request_key(quote.id, PayerQuoteRail::Bitcoin, "boltz_chain");
+    let existing_provider_attempt = db::invoice_quote_provider_attempt(
+        permit.connection_mut(),
+        quote.id,
+        "bitcoin",
+        &request_key,
+    )
+    .await?;
+    let merchant_amount_sat = u64::try_from(quote.merchant_amount_sat)
+        .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?;
+    let (
+        provider_attempt,
+        provider_create,
+        claim_key_index,
+        refund_key_index,
+        claim_allocation_id,
+        refund_allocation_id,
+    ) = if let Some(attempt) = existing_provider_attempt {
+        if attempt.completed {
+            return Err(AppError::DbError(
+                "completed Bitcoin provider attempt is missing its atomic offer".into(),
+            ));
+        }
+        let claim_key_index = u64::try_from(attempt.claim_child_index)
+            .map_err(|_| AppError::DbError("invalid persisted chain claim index".into()))?;
+        let refund_key_index = u64::try_from(attempt.refund_child_index.ok_or_else(|| {
+            AppError::DbError("persisted chain attempt lacks refund index".into())
+        })?)
+        .map_err(|_| AppError::DbError("invalid persisted chain refund index".into()))?;
+        let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
+        let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
+        let provider_create = state.boltz.restore_prepared_btc_to_lbtc_chain_swap(
+            claim_key,
+            refund_key,
+            &attempt.request_authority_json,
+            &attempt.request_authority_sha256,
+        )?;
+        (
+            attempt.clone(),
+            provider_create,
+            claim_key_index,
+            refund_key_index,
+            attempt.claim_key_allocation_id,
+            attempt.refund_key_allocation_id.ok_or_else(|| {
+                AppError::DbError("persisted chain attempt lacks refund allocation".into())
+            })?,
+        )
+    } else {
+        let claim_key_index = db::next_swap_key_index(permit.connection_mut())
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("chain claim key allocation failed: {error}"))
+            })?;
+        let refund_key_index = db::next_swap_key_index(permit.connection_mut())
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("chain refund key allocation failed: {error}"))
+            })?;
+        let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
+        let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
+        let claim_public_key_hex = claim_key.public_key_hex();
+        let refund_public_key_hex = refund_key.public_key_hex();
+        let preimage_hash_hex = claim_key.preimage_hash_hex();
+        let claim_allocation_id = db::reserve_swap_key_allocation(
+            permit.connection_mut(),
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: claim_key_index as i64,
+                purpose: db::SwapKeyPurpose::ChainClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("chain claim key reservation failed: {error}"))
+        })?;
+        let refund_allocation_id = db::reserve_swap_key_allocation(
+            permit.connection_mut(),
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: refund_key_index as i64,
+                purpose: db::SwapKeyPurpose::ChainRefund,
+                public_key_hex: &refund_public_key_hex,
+                preimage_hash_hex: None,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("chain refund key reservation failed: {error}"))
+        })?;
+        let provider_create = state
+            .boltz
+            .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
+            .await?;
+        let (request_authority_json, request_authority_sha256) =
+            provider_create.canonical_authority()?;
+        let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
+            permit.connection_mut(),
+            &db::NewInvoiceQuoteProviderAttempt {
+                invoice_id: current.id,
+                quote_version_id: quote.id,
+                rail: "bitcoin",
+                request_key: &request_key,
+                operation: "chain_create",
+                merchant_amount_sat: quote.merchant_amount_sat,
+                request_authority_json: &request_authority_json,
+                request_authority_sha256: &request_authority_sha256,
+                claim_key_allocation_id: claim_allocation_id,
+                refund_key_allocation_id: Some(refund_allocation_id),
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("provider attempt reservation failed: {error}"))
+        })?;
+        (
+            attempt,
+            provider_create,
+            claim_key_index,
+            refund_key_index,
+            claim_allocation_id,
+            refund_allocation_id,
+        )
+    };
+
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
+    )
+    .await;
+    let owns_dispatch = db::record_invoice_quote_provider_dispatch(
+        permit.connection_mut(),
+        provider_attempt.id,
+        &provider_attempt.request_authority_sha256,
+    )
+    .await?;
+    let provider_result = if owns_dispatch {
+        match state
+            .boltz
+            .submit_btc_to_lbtc_chain_swap(provider_create)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "provider_outcome_unknown",
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+    } else {
+        let claim_child_index = u32::try_from(claim_key_index)
+            .map_err(|_| AppError::DbError("chain claim index exceeds provider range".into()))?;
+        let refund_child_index = u32::try_from(refund_key_index)
+            .map_err(|_| AppError::DbError("chain refund index exceeds provider range".into()))?;
+        let response = match state
+            .boltz
+            .recover_chain_create_response(claim_child_index, refund_child_index)
+            .await
+        {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restore_absent",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Bitcoin provider outcome remains under integrity hold".into(),
+                ));
+            }
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restore_unavailable",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Bitcoin provider reconciliation is unavailable".into(),
+                ));
+            }
+        };
+        match state
+            .boltz
+            .complete_btc_to_lbtc_chain_swap(provider_create, response)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restored_response_invalid",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "restored Bitcoin provider response failed validation".into(),
+                ));
+            }
+        }
+    };
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    )
+    .await;
+    let public_url = invoice_public_url(
+        &state.config.domain,
+        current.nym_owner.as_deref(),
+        current.public_slug.as_deref(),
+        current.id,
+    );
+    let lockup_bip21 = build_bitcoin_chain_bip21(
+        &provider_result.lockup_address,
+        provider_result.user_lock_amount_sat,
+        &public_url,
+    );
+    let payer_amount_sat = i64::try_from(provider_result.user_lock_amount_sat)
+        .map_err(|_| AppError::BoltzError("Bitcoin payer amount exceeds storage range".into()))?;
+    let provider_response_sha256 = provider_result
+        .creation_terms
+        .creation_response_sha256
+        .clone();
+    let merchant_policy = crate::swap_manifest::MerchantPolicyReferencesV1::new(
+        current.id,
+        nym,
+        &merchant_liquid_destination,
+        Some((
+            recovery_commitment.commitment_id,
+            recovery_commitment.canonical_btc_address(),
+        )),
+    );
+    let prepared = crate::swap_manifest_persistence::prepare_created_chain_swap_persistence(
+        crate::swap_manifest_persistence::CreatedChainSwapPersistenceInput {
+            chain_swap: &provider_result,
+            lockup_bip21: &lockup_bip21,
+            lineage: crate::swap_manifest_persistence::CreatedChainSwapLineage {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                claim_allocation_id,
+                refund_allocation_id,
+                claim_child_index: claim_key_index as i64,
+                refund_child_index: refund_key_index as i64,
+            },
+            merchant_policy: &merchant_policy,
+            manifest_id: Uuid::new_v4(),
+        },
+    )
+    .map_err(|_| AppError::DbError("invalid chain-swap persistence evidence".into()))?;
+    let parts = prepared.coordinator_request_parts();
+    let creation_evidence = db::NewChainSwapCreationEvidence {
+        creation_terms: parts.creation_terms,
+        recovery_address_commitment_id: merchant_policy.emergency_bitcoin_commitment_id,
+    };
+    let mut tx = permit.connection_mut().begin().await?;
+    let (canonical, offer) = db::record_chain_swap_with_quote_offer_in_tx(
+        &mut tx,
+        &parts.swap,
+        &parts.lineage,
+        &creation_evidence,
+        &db::NewInvoiceQuoteOffer {
+            invoice_id: current.id,
+            quote_version_id: quote.id,
+            rail: "bitcoin",
+            offer_kind: "boltz_chain",
+            request_key: &request_key,
+            provider: Some("boltz"),
+            provider_offer_id: Some(&provider_result.swap_id),
+            provider_attempt_id: Some(provider_attempt.id),
+            payer_amount_sat,
+            expires_at_unix: quote.expires_at_unix,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AppError::DbError(format!(
+            "failed to persist versioned Bitcoin offer {}: {error}",
+            provider_result.swap_id
+        ))
+    })?;
+    db::record_invoice_quote_provider_completion(
+        &mut *tx,
+        provider_attempt.id,
+        offer.id,
+        &provider_result.swap_id,
+        &provider_response_sha256,
+    )
+    .await?;
+    tx.commit().await?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    )
+    .await;
+
+    match crate::swap_manifest_persistence::repair_oldest_manifestless_chain_swap(
+        &state.db,
+        recovery_runtime,
+    )
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(
+            "Bitcoin offer recovery manifest could not be delivered".into(),
+        )
+    })? {
+        crate::swap_manifest_persistence::ManifestlessChainSwapRepairOutcome::Repaired {
+            identity,
+        } if identity.chain_swap_id == canonical.id => {}
+        _ => {
+            return Err(AppError::DbError(
+                "Bitcoin offer recovery manifest repaired an unexpected obligation".into(),
+            ));
+        }
+    }
+
+    let still_current = db::current_invoice_quote(permit.connection_mut(), current.id).await?;
+    if still_current.as_ref().map(|candidate| candidate.id) != Some(quote.id)
+        || quote.expires_at_unix <= unix_now()
+    {
+        return Err(AppError::ServiceUnavailable(
+            "invoice quote expired while creating the Bitcoin offer; refresh and retry".into(),
+        ));
+    }
+    let exposed = db::payer_exposable_chain_swap_for_quote_offer(
+        permit.connection_mut(),
+        current.id,
+        quote.id,
+        offer.id,
+        &provider_result.swap_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::ServiceUnavailable("Bitcoin offer is not yet payer-exposable".into())
+    })?;
+    let payer_amount_sat = validated_payer_chain_amount_sat(
+        exposed.user_lock_amount_sat,
+        exposed.server_lock_amount_sat,
+    )
+    .ok_or_else(|| AppError::DbError("Bitcoin offer amount evidence is invalid".into()))?;
+    permit.release().await.map_err(|error| {
+        AppError::DbError(format!(
+            "chain-swap creation permit release failed: {error}"
+        ))
+    })?;
+    Ok((
+        offer.id,
+        BitcoinChainOffer {
+            lockup_address: exposed.lockup_address,
+            lockup_bip21: exposed.lockup_bip21,
+            payer_amount_sat,
+        },
+    ))
+}
+
+enum ReusableVersionedBitcoinOffer {
+    Missing,
+    ExistingNotExposable,
+    Ready {
+        offer_id: Uuid,
+        offer: BitcoinChainOffer,
+    },
+}
+
+async fn reusable_versioned_bitcoin_chain_offer(
+    executor: &mut sqlx::PgConnection,
+    invoice: &db::Invoice,
+    quote: &db::InvoiceQuoteVersion,
+) -> Result<ReusableVersionedBitcoinOffer, AppError> {
+    // The offer row is the durable idempotency authority. If it exists but its
+    // recovery manifest is not yet delivered, withhold the address and let the
+    // next permit acquisition repair it instead of creating another provider
+    // obligation.
+    let Some(offer) =
+        db::invoice_quote_offer_for_rail(&mut *executor, invoice.id, quote.id, "bitcoin").await?
+    else {
+        return Ok(ReusableVersionedBitcoinOffer::Missing);
+    };
+    if offer.offer_kind != "boltz_chain"
+        || offer.provider.as_deref() != Some("boltz")
+        || offer.provider_attempt_id.is_none()
+    {
+        return Err(AppError::DbError(
+            "persisted Bitcoin quote offer has invalid authority".into(),
+        ));
+    }
+    let exposed = db::payer_exposable_chain_swap_for_quote_offer(
+        &mut *executor,
+        invoice.id,
+        quote.id,
+        offer.id,
+        offer.provider_offer_id.as_deref().ok_or_else(|| {
+            AppError::DbError("persisted Bitcoin offer is missing provider identity".into())
+        })?,
+    )
+    .await?;
+    let Some(exposed) = exposed else {
+        return Ok(ReusableVersionedBitcoinOffer::ExistingNotExposable);
+    };
+    let payer_amount_sat = validated_payer_chain_amount_sat(
+        exposed.user_lock_amount_sat,
+        exposed.server_lock_amount_sat,
+    )
+    .ok_or_else(|| AppError::DbError("Bitcoin offer amount evidence is invalid".into()))?;
+    if exposed.server_lock_amount_sat != quote.merchant_amount_sat
+        || payer_amount_sat != offer.payer_amount_sat
+    {
+        return Err(AppError::DbError(
+            "persisted Bitcoin quote offer amount does not match its version".into(),
+        ));
+    }
+    Ok(ReusableVersionedBitcoinOffer::Ready {
+        offer_id: offer.id,
+        offer: BitcoinChainOffer {
+            lockup_address: exposed.lockup_address,
+            lockup_bip21: exposed.lockup_bip21,
+            payer_amount_sat,
+        },
+    })
+}
+
 /// Read-only counterpart to `ensure_reusable_lightning_offer`.
 ///
 /// Status polling must not create Boltz swaps. It may return the latest
@@ -1859,6 +3283,12 @@ fn build_bitcoin_chain_bip21(address: &str, amount_sat: u64, message: &str) -> S
     )
 }
 
+fn build_direct_bitcoin_bip21(address: &str, amount_sat: u64) -> String {
+    let whole_btc = amount_sat / 100_000_000;
+    let fractional_sat = amount_sat % 100_000_000;
+    format!("bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}")
+}
+
 fn percent_encode_query_value(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1879,6 +3309,7 @@ struct PreparedLightningOffer {
     preimage_hex: String,
     claim_key_hex: String,
     boltz_response_json: String,
+    provider_response_sha256: String,
 }
 
 impl PreparedLightningOffer {
@@ -1922,6 +3353,20 @@ async fn request_lightning_offer(
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<PreparedLightningOffer, AppError> {
+    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat, invoice)?;
+    let result = state
+        .boltz
+        .submit_fixed_checkout_reverse_swap(prepared)
+        .await?;
+    prepared_lightning_offer_from_result(result)
+}
+
+fn prepare_lightning_provider_create(
+    state: &AppState,
+    derived_key: crate::boltz::DerivedSwapKey,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<crate::boltz::PreparedFixedCheckoutReverseCreate, AppError> {
     let public_url = invoice_public_url(
         &state.config.domain,
         invoice.nym_owner.as_deref(),
@@ -1930,28 +3375,32 @@ async fn request_lightning_offer(
     );
     let boltz_description = boltz_invoice_description_for_url(&public_url);
 
-    let result = state
-        .boltz
-        .create_fixed_checkout_reverse_swap(
-            derived_key,
-            amount_sat,
-            boltz_description.description.as_deref(),
-            boltz_description.description_hash.as_deref(),
-        )
-        .await?;
+    state.boltz.prepare_fixed_checkout_reverse_swap(
+        derived_key,
+        amount_sat,
+        boltz_description.description.as_deref(),
+        boltz_description.description_hash.as_deref(),
+    )
+}
 
+fn prepared_lightning_offer_from_result(
+    result: crate::boltz::FixedCheckoutReverseSwapResult,
+) -> Result<PreparedLightningOffer, AppError> {
     let payer_amount_sat = i64::try_from(result.payer_amount_sat)
         .map_err(|_| AppError::BoltzError("fixed checkout payer amount exceeds i64".into()))?;
     let swap = result.swap;
+    let (boltz_response_json, provider_response_sha256) =
+        crate::canonical_json::canonical_json_and_sha256(&swap.boltz_response).map_err(
+            |error| AppError::BoltzError(format!("failed to canonicalize boltz response: {error}")),
+        )?;
     Ok(PreparedLightningOffer {
         swap_id: swap.swap_id,
         lightning_pr: swap.invoice,
         payer_amount_sat,
         preimage_hex: hex::encode(&swap.preimage),
         claim_key_hex: hex::encode(swap.claim_keypair.secret_bytes()),
-        boltz_response_json: serde_json::to_string(&swap.boltz_response).map_err(|e| {
-            AppError::BoltzError(format!("failed to serialize boltz response: {e}"))
-        })?,
+        boltz_response_json,
+        provider_response_sha256,
     })
 }
 
@@ -2476,7 +3925,8 @@ fn recovery_list_payload_fields() -> [&'static str; 0] {
 // POST /api/v1/invoices        (unlinked)
 // =====================================================================
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSignedRequest {
     pub npub: String,
     pub amount_sat: Option<i64>,
@@ -2486,7 +3936,7 @@ pub struct CreateSignedRequest {
     /// `recipient_name` on the wire; mapped to the `recipient_label`
     /// column in storage (no DB rename — defer to a v2 schema migration
     /// if ever needed).
-    #[serde(rename = "recipient_name", alias = "recipient_label")]
+    #[serde(rename = "recipient_name")]
     pub recipient_label: Option<String>,
     pub invoice_number: Option<String>,
     #[serde(default)]
@@ -2708,7 +4158,7 @@ async fn create_invoice_inner(
         // own request fields, not this anonymous shape.
         note: None,
     };
-    let (amount_sat, fiat) = parse_create_request(&anon_shape, state).await?;
+    let (amount_sat, fiat) = parse_create_request(&anon_shape, state)?;
 
     // Direct addresses are immediately present on the signed invoice, so all
     // requested direct rails must be observable before the row is published.
@@ -2739,10 +4189,11 @@ async fn create_invoice_inner(
         public_slug: None,
         npub_owner: &req.npub,
         origin: "wallet",
-        fiat_amount_minor: fiat.as_ref().map(|(amt, _, _)| *amt),
-        fiat_currency: fiat.as_ref().map(|(_, cur, _)| cur.as_str()),
+        checkout_surface_kind: None,
+        fiat_amount_minor: fiat.as_ref().map(|(amt, _)| *amt),
+        fiat_currency: fiat.as_ref().map(|(_, cur)| cur.as_str()),
         amount_sat,
-        rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
+        rate_minor_per_btc: None,
         rate_lock_secs: expires_in_secs,
         memo: None,
         recipient_label: req.recipient_label.as_deref(),
@@ -2758,7 +4209,10 @@ async fn create_invoice_inner(
     };
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
-    if invoice.accept_ln {
+    // Fiat-fixed invoices defer every provider obligation until an explicit
+    // selected-rail quote request has durably created/reused its version.
+    // Sat-fixed wallet invoices retain their current eager Lightning behavior.
+    if invoice.accept_ln && fiat.is_none() {
         if let Err(e) = create_lightning_offer(
             state,
             lightning_swap_nym(&invoice),

@@ -75,6 +75,7 @@ async fn main() {
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 100_000,

@@ -21,11 +21,19 @@
   let dataUrl = $state('')
 
   $effect(() => {
-    QRCode.toDataURL(value, {
+    const exactValue = value
+    let current = true
+    dataUrl = ''
+    QRCode.toDataURL(exactValue, {
       margin: 4,
       width: 300,
       color: { dark: '#000000', light: '#ffffff' },
-    }).then((next) => (dataUrl = next))
+    }).then((next) => {
+      if (current) dataUrl = next
+    })
+    return () => {
+      current = false
+    }
   })
 </script>
 

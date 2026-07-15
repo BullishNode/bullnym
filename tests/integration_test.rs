@@ -450,6 +450,10 @@ fn test_app(state: AppState) -> Router {
             post(invoice::fetch_lightning_offer),
         )
         .route(
+            "/api/v1/invoices/:id/quote",
+            post(invoice::payer_demand_quote),
+        )
+        .route(
             "/api/v1/invoices/recoverable",
             get(invoice::list_recoverable_signed),
         )
@@ -1063,6 +1067,64 @@ async fn spawn_counting_http_server() -> (String, Arc<AtomicUsize>, tokio::task:
     (format!("http://{address}"), calls, task)
 }
 
+async fn spawn_malformed_success_http_server(
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let body = br#"{"id":"provider-secret-must-not-log","unknownSecret":"redacted"}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
+async fn spawn_pricer_server(
+    minor_per_btc: i64,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let created_at = chrono::Utc::now().to_rfc3339();
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "element": {
+                        "fromCurrency": "BTC",
+                        "toCurrency": "USD",
+                        "priceCurrency": "USD",
+                        "indexPrice": minor_per_btc,
+                        "precision": 2,
+                        "createdAt": created_at,
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
 fn valid_reverse_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
     Builder::new()
         .push_opcode(OP_SIZE)
@@ -1612,13 +1674,32 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "061_invoice_quote_versions"
+        "062_invoice_quote_provider_attempts"
     );
 
     let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+
+    sqlx::query(
+        "ALTER TABLE invoice_quote_provider_attempts DISABLE TRIGGER \
+         invoice_quote_provider_attempts_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (mutable_attempt_status, mutable_attempt_body) = get_path(&app, "/ready").await;
+    assert_eq!(mutable_attempt_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_attempt_body["ready"], false);
+    sqlx::query(
+        "ALTER TABLE invoice_quote_provider_attempts ENABLE TRIGGER \
+         invoice_quote_provider_attempts_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
 
     // The permanent-name registry is incomplete if immutable ownership can be
     // released, even when its columns and uniqueness constraints remain.
@@ -1760,7 +1841,10 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["expected_schema_marker"], "061_invoice_quote_versions");
+    assert_eq!(
+        body["expected_schema_marker"],
+        "062_invoice_quote_provider_attempts"
+    );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -5855,7 +5939,7 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     cleanup_db(&pool).await;
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
-    config.boltz.api_url = boltz_url;
+    config.boltz.api_url = boltz_url.clone();
     let state = test_state_with_config(pool.clone(), config);
     state.admission.set_workers_enabled(false);
     let app = test_app(state);
@@ -11587,6 +11671,7 @@ async fn insert_test_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -11609,218 +11694,1358 @@ async fn insert_test_invoice(
     .unwrap()
 }
 
-#[tokio::test]
-async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution() {
-    let admin = test_pool().await;
-    cleanup_db(&admin).await;
-    let runtime = readiness_runtime_role_test_pool(&admin).await;
+async fn insert_fiat_quote_test_invoice(
+    pool: &PgPool,
+    suffix: &str,
+    accept_ln: bool,
+) -> pay_service::db::Invoice {
+    let npub = "7".repeat(64);
     let blinding_key = "11".repeat(32);
-    let npub_owner = "6".repeat(64);
-    let invoice = pay_service::db::insert_invoice(
-        &admin,
+    pay_service::db::insert_invoice(
+        pool,
         &pay_service::db::NewInvoice {
             nym_owner: None,
             public_slug: None,
-            npub_owner: &npub_owner,
+            npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
-            amount_sat: 10_000,
-            rate_minor_per_btc: Some(10_000_000),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
             recipient_label: None,
             public_description: None,
             invoice_number: None,
             accept_btc: false,
-            accept_ln: false,
+            accept_ln,
             accept_liquid: true,
             bitcoin_address: None,
-            liquid_address: Some(
-                "lq1q061quoteversionfixture000000000000000000000000000000000000000",
-            ),
+            liquid_address: Some(&format!("lq1quote{suffix}")),
             liquid_blinding_key_hex: Some(&blinding_key),
-            expires_in_secs: 30 * 24 * 60 * 60,
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn insert_fiat_direct_bitcoin_test_invoice(
+    pool: &PgPool,
+    bitcoin_address: &str,
+) -> pay_service::db::Invoice {
+    let npub = "8".repeat(64);
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "wallet",
+            checkout_surface_kind: None,
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 300,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: false,
+            accept_liquid: false,
+            bitcoin_address: Some(bitcoin_address),
+            liquid_address: None,
+            liquid_blinding_key_hex: None,
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "quotecreationoutage").await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "quotecreationoutage",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Face-only fiat creation",
+            description: "Conversion begins only at payer quote",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
         },
     )
     .await
     .unwrap();
-    let invoice_lifetime_secs = invoice.expires_at_unix - invoice.created_at_unix;
-    assert_eq!(invoice_lifetime_secs, 30 * 24 * 60 * 60);
 
-    let now = i64::try_from(auth_timestamp()).unwrap();
-    let candidate = pay_service::db::NewInvoiceQuoteVersion {
-        rate_minor_per_btc: 10_000_000,
-        rate_source: "bullbitcoin-pricer:indexPrice",
-        rate_observed_at_unix: now - 1,
-        rate_fetched_at_unix: now,
-        rate_fresh_until_unix: now + 300,
-        merchant_amount_sat: 10_000,
+    let (unavailable_pricer_url, unavailable_pricer_calls, unavailable_pricer_task) =
+        spawn_counting_http_server().await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let pricer_config = PricerConfig {
+        url: unavailable_pricer_url,
+        ..Default::default()
     };
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let create_app = test_app(state);
 
-    let mut tasks = Vec::new();
-    for _ in 0..8 {
-        let admin = admin.clone();
-        let candidate = candidate.clone();
-        tasks.push(tokio::spawn(async move {
-            pay_service::db::create_or_reuse_current_invoice_quote(&admin, invoice.id, &candidate)
-                .await
-                .unwrap()
+    let (create_status, create_body) = post_json(
+        &create_app,
+        "/quotecreationoutage/invoice",
+        json!({ "fiat_amount_minor": 1_000, "fiat_currency": "usd" }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body}");
+    assert_eq!(create_body["pricing_mode"], "fiat_fixed");
+    assert!(create_body["invoice_id"].is_string());
+    assert!(create_body.get("liquid_address").is_none(), "{create_body}");
+    assert!(create_body.get("lightning_pr").is_none(), "{create_body}");
+    assert_eq!(unavailable_pricer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    let invoice_id = Uuid::parse_str(create_body["invoice_id"].as_str().unwrap()).unwrap();
+    let stored: (String, i32, String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, amount_sat, \
+                rate_minor_per_btc \
+           FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("fiat_fixed".into(), 1_000, "USD".into(), 0, None));
+    let pre_quote_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pre_quote_rows, (0, 0, 0));
+
+    let (healthy_pricer_url, healthy_pricer_calls, healthy_pricer_task) =
+        spawn_pricer_server(10_000_000).await;
+    let mut quote_config = test_config();
+    quote_config.boltz.api_url = boltz_url;
+    let mut quote_state = test_state_with_config(pool.clone(), quote_config);
+    let healthy_pricer_config = PricerConfig {
+        url: healthy_pricer_url,
+        ..Default::default()
+    };
+    quote_state.pricer = Arc::new(PricerClient::new(healthy_pricer_config).unwrap());
+    let quote_app = test_app(quote_state);
+    let (quote_status, quote_body) = post_json(
+        &quote_app,
+        &format!("/api/v1/invoices/{invoice_id}/quote"),
+        json!({ "rail": "liquid" }),
+    )
+    .await;
+    assert_eq!(quote_status, StatusCode::OK, "{quote_body}");
+    assert_eq!(quote_body["quote"]["merchant_amount_sat"], 10_000);
+    assert_eq!(quote_body["quote"]["rate_minor_per_btc"], 10_000_000);
+    assert_eq!(quote_body["instruction"]["kind"], "liquid_direct");
+    assert_eq!(healthy_pricer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    let post_quote_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(post_quote_rows, (1, 0, 0));
+
+    unavailable_pricer_task.abort();
+    let _ = unavailable_pricer_task.await;
+    healthy_pricer_task.abort();
+    let _ = healthy_pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_quote_refuses_a_partial_window_before_rate_or_provider_work() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "shortlifetime", true).await;
+    // Pin the database clock to an integral second. Without this, flooring the
+    // stored TIMESTAMPTZ can occasionally turn a nominal 299-second remainder
+    // into the exact 300-second boundary that legitimately fits one window.
+    sqlx::query(
+        "UPDATE invoices \
+            SET expires_at = date_trunc('second', clock_timestamp()) \
+                           + INTERVAL '299 seconds' \
+          WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (pricer_url, pricer_calls, pricer_task) = spawn_counting_http_server().await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url;
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/quote", invoice.id),
+        json!({ "rail": "lightning" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable");
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (0, 0, 0));
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_liquid_quote_serializes_and_gets_never_mutate() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "serialized", false).await;
+    let chain_only_invoice = insert_fiat_quote_test_invoice(&pool, "chainavailable", true).await;
+    let chain_npub = create_test_user(&pool, "quotechainavailability").await;
+    sqlx::query(
+        "UPDATE invoices SET nym_owner = 'quotechainavailability', npub_owner = $2, \
+             accept_liquid = FALSE WHERE id = $1",
+    )
+    .bind(chain_only_invoice.id)
+    .bind(&chain_npub)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut state = test_state(pool.clone());
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+
+    for path in [
+        format!("/api/v1/invoices/{}/status", invoice.id),
+        format!("/invoice/{}", invoice.id),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            assert!(json["lightning_pr"].is_null());
+            assert!(json["liquid_address"].is_null());
+            assert!(json["liquid_amount_sat"].is_null());
+            assert_eq!(json["quote_rail_availability"]["lightning"], false);
+            assert_eq!(json["quote_rail_availability"]["liquid"], true);
+            assert_eq!(json["quote_rail_availability"]["bitcoin"], false);
+        }
+    }
+    let (availability_status, availability_body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/{}/status", chain_only_invoice.id),
+    )
+    .await;
+    assert_eq!(availability_status, StatusCode::OK, "{availability_body}");
+    assert_eq!(availability_body["accept_btc"], false);
+    assert_eq!(availability_body["accept_liquid"], false);
+    assert_eq!(
+        availability_body["quote_rail_availability"],
+        json!({ "lightning": true, "liquid": false, "bitcoin": false })
+    );
+    let availability_mutations: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(chain_only_invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(availability_mutations, (0, 0, 0, 0));
+    let counts_before: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts_before, (0, 0, 0, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 0);
+
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let mut requests = Vec::new();
+    for _ in 0..12 {
+        let app = app.clone();
+        let path = path.clone();
+        requests.push(tokio::spawn(async move {
+            post_json(&app, &path, json!({ "rail": "liquid" })).await
         }));
     }
-    let mut resolutions = Vec::new();
-    for task in tasks {
-        resolutions.push(task.await.unwrap());
+    let mut bodies = Vec::new();
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        bodies.push(body);
     }
-    assert_eq!(
-        resolutions
-            .iter()
-            .filter(|resolution| resolution.created)
-            .count(),
-        1
-    );
-    let quote = resolutions[0].quote.clone();
-    let quote_lifetime_secs = quote.expires_at_unix - quote.created_at_unix;
-    assert_eq!(quote_lifetime_secs, 300);
-    assert!(
-        quote_lifetime_secs < invoice_lifetime_secs,
-        "a five-minute quote must not inherit or extend the 30-day invoice lifetime"
-    );
-    assert!(resolutions.iter().all(|resolution| {
-        resolution.quote.id == quote.id
-            && resolution.quote.version_number == 1
-            && resolution.quote.expires_at_unix - resolution.quote.created_at_unix == 300
+    let quote_id = bodies[0]["quote"]["quote_version_id"].clone();
+    let stable_address = invoice.liquid_address.as_deref().unwrap();
+    assert!(bodies.iter().all(|body| {
+        body["pricing_mode"] == "fiat_fixed"
+            && body["selected_rail"] == "liquid"
+            && body["quote"]["quote_version_id"] == quote_id
+            && body["quote"]["version_number"] == 1
+            && body["quote"]["merchant_amount_sat"] == 10_000
+            && body["instruction"]["kind"] == "liquid_direct"
+            && body["instruction"].get("quote_offer_id").is_none()
+            && body["instruction"]["address"] == stable_address
+            && body["instruction"]["payer_amount_sat"] == 10_000
     }));
-    let quote_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1")
-            .bind(invoice.id)
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-    assert_eq!(quote_count, 1);
 
-    let first_request_key = "6".repeat(64);
-    let offer_candidate = pay_service::db::NewInvoiceQuoteOffer {
-        invoice_id: invoice.id,
-        quote_version_id: quote.id,
-        rail: "liquid",
-        offer_kind: "direct",
-        request_key: &first_request_key,
-        provider: None,
-        provider_offer_id: None,
-        payer_amount_sat: quote.merchant_amount_sat,
-        expires_at_unix: quote.expires_at_unix,
-    };
-    let first_offer =
-        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &offer_candidate)
-            .await
-            .unwrap();
-    let retry_offer =
-        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &offer_candidate)
-            .await
-            .unwrap();
-    assert!(first_offer.created);
-    assert!(!retry_offer.created);
-    assert_eq!(first_offer.offer, retry_offer.offer);
-
-    let conflicting_offer = pay_service::db::NewInvoiceQuoteOffer {
-        payer_amount_sat: quote.merchant_amount_sat + 1,
-        ..offer_candidate.clone()
-    };
-    assert!(matches!(
-        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &conflicting_offer).await,
-        Err(sqlx::Error::Protocol(_))
-    ));
-
-    let immutable = sqlx::query(
-        "UPDATE invoice_quote_versions SET merchant_amount_sat = merchant_amount_sat + 1 \
-         WHERE id = $1",
+    let counts_after: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
     )
-    .bind(quote.id)
-    .execute(&admin)
+    .bind(invoice.id)
+    .fetch_one(&pool)
     .await
-    .unwrap_err();
-    assert_eq!(
-        immutable
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("55000")
-    );
+    .unwrap();
+    assert_eq!(counts_after, (1, 0, 0, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
 
-    // Test ownership may advance the immutable clock solely to exercise the
-    // refresh boundary without sleeping for five minutes.
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_wallet_direct_bitcoin_quote_refreshes_over_one_address_without_provider_io() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_direct_bitcoin_test_invoice(
+        &pool,
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    )
+    .await;
+    let address = invoice.bitcoin_address.as_deref().unwrap();
+    let (provider_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+
+    let (rate_a_url, rate_a_calls, rate_a_task) = spawn_pricer_server(10_000_000).await;
+    let rate_a_config = PricerConfig {
+        url: rate_a_url,
+        ..Default::default()
+    };
+    let mut config_a = test_config();
+    config_a.boltz.api_url = provider_url.clone();
+    let mut state_a = test_state_with_config(pool.clone(), config_a);
+    state_a.pricer = Arc::new(PricerClient::new(rate_a_config).unwrap());
+    let app_a = test_app(state_a);
+
+    let (status_code, status_body) =
+        get_path(&app_a, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status_code, StatusCode::OK, "{status_body}");
+    assert_eq!(
+        status_body["quote_rail_availability"],
+        json!({ "lightning": false, "liquid": false, "bitcoin": true })
+    );
+    assert!(status_body["bitcoin_address"].is_null());
+    assert_eq!(rate_a_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    let quote_path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let (first_status, first) = post_json(&app_a, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(first["selected_rail"], "bitcoin");
+    assert_eq!(first["quote"]["version_number"], 1);
+    assert_eq!(first["quote"]["merchant_amount_sat"], 10_000);
+    assert_eq!(first["instruction"]["kind"], "bitcoin_direct");
+    assert_eq!(first["instruction"]["address"], address);
+    assert_eq!(first["instruction"]["payer_amount_sat"], 10_000);
+    assert_eq!(
+        first["instruction"]["bip21"],
+        format!("bitcoin:{address}?amount=0.00010000")
+    );
+    assert!(first["instruction"].get("quote_offer_id").is_none());
+    assert_eq!(rate_a_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
     sqlx::query(
         "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
          invoice_quote_versions_reject_update",
     )
-    .execute(&admin)
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "UPDATE invoice_quote_versions SET \
-             rate_observed_at = statement_timestamp() - INTERVAL '302 seconds', \
-             rate_fetched_at = statement_timestamp() - INTERVAL '301 seconds', \
-             rate_fresh_until = statement_timestamp() - INTERVAL '1 second', \
-             created_at = statement_timestamp() - INTERVAL '301 seconds', \
-             expires_at = statement_timestamp() - INTERVAL '1 second' \
-         WHERE id = $1",
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions SET \
+             rate_observed_at = boundary.now - INTERVAL '302 seconds', \
+             rate_fetched_at = boundary.now - INTERVAL '301 seconds', \
+             rate_fresh_until = boundary.now - INTERVAL '1 second', \
+             created_at = boundary.now - INTERVAL '301 seconds', \
+             expires_at = boundary.now - INTERVAL '1 second' \
+         FROM boundary WHERE invoice_id = $1",
     )
-    .bind(quote.id)
-    .execute(&admin)
+    .bind(invoice.id)
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
         "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
          invoice_quote_versions_reject_update",
     )
-    .execute(&admin)
+    .execute(&pool)
     .await
     .unwrap();
 
+    let (rate_b_url, rate_b_calls, rate_b_task) = spawn_pricer_server(20_000_000).await;
+    let rate_b_config = PricerConfig {
+        url: rate_b_url,
+        ..Default::default()
+    };
+    let mut config_b = test_config();
+    config_b.boltz.api_url = provider_url;
+    let mut state_b = test_state_with_config(pool.clone(), config_b);
+    state_b.pricer = Arc::new(PricerClient::new(rate_b_config).unwrap());
+    let app_b = test_app(state_b);
+    let (second_status, second) =
+        post_json(&app_b, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(second_status, StatusCode::OK, "{second}");
+    assert_eq!(second["quote"]["version_number"], 2);
+    assert_eq!(second["quote"]["merchant_amount_sat"], 5_000);
+    assert_eq!(second["instruction"]["kind"], "bitcoin_direct");
+    assert_eq!(second["instruction"]["address"], address);
+    assert_eq!(second["instruction"]["payer_amount_sat"], 5_000);
+    assert_eq!(
+        second["instruction"]["bip21"],
+        format!("bitcoin:{address}?amount=0.00005000")
+    );
+    assert_ne!(
+        first["quote"]["quote_version_id"],
+        second["quote"]["quote_version_id"]
+    );
+    let durable_rows: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable_rows, (2, 0, 0, 0));
+    assert_eq!(rate_b_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    rate_a_task.abort();
+    let _ = rate_a_task.await;
+    rate_b_task.abort();
+    let _ = rate_b_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_wallet_direct_bitcoin_watcher_values_on_time_late_and_unvalued_partials() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let invoice = insert_fiat_direct_bitcoin_test_invoice(&pool, address).await;
     let now = i64::try_from(auth_timestamp()).unwrap();
-    let second_candidate = pay_service::db::NewInvoiceQuoteVersion {
-        rate_minor_per_btc: 10_000_000,
-        rate_source: "bullbitcoin-pricer:indexPrice",
+    let quote_a = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        invoice.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:bitcoin-quote-a",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+
+    let txid_a = "91".repeat(32);
+    let event_key_a = format!("bitcoin_direct:{txid_a}:0");
+    let block_a = "92".repeat(32);
+    let first = pay_service::db::DirectOutputObservation {
+        event_key: &event_key_a,
+        txid: &txid_a,
+        vout: 0,
+        address,
+        amount_sat: 4_000,
+        asset_id: None,
+        confirmations: 1,
+        block_height: Some(930_001),
+        block_hash: Some(&block_a),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let generation_a = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "bitcoin-fiat-valuation-test",
+            generation: generation_a,
+            observations: std::slice::from_ref(&first),
+        },
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 99_000_000,
+            rate_source: "test:must-not-reprice-on-time-bitcoin",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let on_time: (Uuid, i64, Option<Uuid>, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT fiat_valuation_quote_version_id, fiat_credited_minor, \
+                invoice_quote_version_id, invoice_quote_offer_id, source \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&event_key_a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(on_time.0, quote_a.id);
+    assert_eq!(on_time.1, 400);
+    assert_eq!((on_time.2, on_time.3), (None, None));
+    assert_eq!(on_time.4, "bitcoin_direct");
+
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions SET \
+             rate_observed_at = boundary.now - INTERVAL '302 seconds', \
+             rate_fetched_at = boundary.now - INTERVAL '301 seconds', \
+             rate_fresh_until = boundary.now - INTERVAL '1 second', \
+             created_at = boundary.now - INTERVAL '301 seconds', \
+             expires_at = boundary.now - INTERVAL '1 second' \
+         FROM boundary WHERE id = $1",
+    )
+    .bind(quote_a.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let late_now = i64::try_from(auth_timestamp()).unwrap();
+    let txid_b = "93".repeat(32);
+    let event_key_b = format!("bitcoin_direct:{txid_b}:1");
+    let block_b = "94".repeat(32);
+    let second = pay_service::db::DirectOutputObservation {
+        event_key: &event_key_b,
+        txid: &txid_b,
+        vout: 1,
+        address,
+        amount_sat: 3_000,
+        asset_id: None,
+        confirmations: 1,
+        block_height: Some(930_002),
+        block_hash: Some(&block_b),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let generation_b = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "bitcoin-fiat-valuation-test",
+            generation: generation_b,
+            observations: std::slice::from_ref(&second),
+        },
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 20_000_000,
+            rate_source: "test:bitcoin-late-b",
+            rate_observed_at_unix: late_now - 1,
+            rate_fetched_at_unix: late_now,
+            rate_fresh_until_unix: late_now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let late: (Uuid, i64, i64, String, Option<Uuid>, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT fiat_valuation_quote_version_id, fiat_credited_minor, \
+                fiat_rate_minor_per_btc, fiat_credit_policy, \
+                invoice_quote_version_id, invoice_quote_offer_id, source \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&event_key_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(late.0, quote_a.id);
+    assert_eq!(late.1, 600);
+    assert_eq!(late.2, 20_000_000);
+    assert_eq!(late.3, "late_observation_rate_v1");
+    assert_eq!((late.4, late.5), (None, None));
+    assert_eq!(late.6, "bitcoin_direct");
+    let paid: (String, i64) = sqlx::query_as(
+        "SELECT i.status, \
+                (SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+                   FROM invoice_quote_active_fiat_projection WHERE invoice_id = i.id) \
+           FROM invoices i WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paid, ("paid".into(), 1_000));
+
+    let snapshot = pay_service::db::watcher_scan_snapshot(&pool).await.unwrap();
+    let page = pay_service::db::list_bitcoin_watcher_invoice_page(
+        &pool,
+        3_600,
+        3_600,
+        &snapshot,
+        pay_service::db::WatcherLane::Recent,
+        None,
+        None,
+        1_000,
+    )
+    .await
+    .unwrap();
+    let watcher_row = page.rows.iter().find(|row| row.id == invoice.id).unwrap();
+    assert_eq!(watcher_row.fiat_currency.as_deref(), Some("USD"));
+
+    let unresolved = insert_fiat_direct_bitcoin_test_invoice(
+        &pool,
+        "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+    )
+    .await;
+    let unresolved_quote = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        unresolved.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:bitcoin-unresolved",
+            rate_observed_at_unix: late_now - 1,
+            rate_fetched_at_unix: late_now,
+            rate_fresh_until_unix: late_now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions SET \
+             rate_observed_at = boundary.now - INTERVAL '302 seconds', \
+             rate_fetched_at = boundary.now - INTERVAL '301 seconds', \
+             created_at = boundary.now - INTERVAL '301 seconds', \
+             expires_at = boundary.now - INTERVAL '1 second', \
+             rate_fresh_until = boundary.now - INTERVAL '1 second' \
+         FROM boundary WHERE id = $1",
+    )
+    .bind(unresolved_quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let unresolved_txid = "95".repeat(32);
+    let unresolved_key = format!("bitcoin_direct:{unresolved_txid}:0");
+    let unresolved_block = "96".repeat(32);
+    let unresolved_observation = pay_service::db::DirectOutputObservation {
+        event_key: &unresolved_key,
+        txid: &unresolved_txid,
+        vout: 0,
+        address: unresolved.bitcoin_address.as_deref().unwrap(),
+        amount_sat: 1_000,
+        asset_id: None,
+        confirmations: 1,
+        block_height: Some(930_003),
+        block_hash: Some(&unresolved_block),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let unresolved_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        unresolved.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: unresolved.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "bitcoin-no-covering-rate-test",
+            generation: unresolved_generation,
+            observations: std::slice::from_ref(&unresolved_observation),
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let unvalued: (String, bool, bool, bool, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT i.status, e.quote_first_observed_at IS NOT NULL, \
+                e.fiat_valuation_quote_version_id IS NULL, \
+                e.fiat_credited_minor IS NULL, e.invoice_quote_version_id, \
+                e.invoice_quote_offer_id \
+           FROM invoices i JOIN invoice_payment_events e ON e.invoice_id = i.id \
+          WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(unresolved.id)
+    .bind(&unresolved_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unvalued,
+        ("in_progress".into(), true, true, true, None, None)
+    );
+    let unresolved_app = test_app(test_state(pool.clone()));
+    let (unresolved_status, unresolved_body) = get_path(
+        &unresolved_app,
+        &format!("/api/v1/invoices/{}/status", unresolved.id),
+    )
+    .await;
+    assert_eq!(unresolved_status, StatusCode::OK, "{unresolved_body}");
+    assert_eq!(unresolved_body["status"], "in_progress");
+    assert_eq!(
+        unresolved_body["bitcoin_direct_observations"][0]["txid"],
+        unresolved_txid
+    );
+    assert_eq!(
+        unresolved_body["bitcoin_direct_observations"][0]["amount_sat"],
+        1_000
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerfailure", true).await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+
+    let (failed_status, failed_body) = post_json(&app, &path, json!({ "rail": "lightning" })).await;
+    // Bullnym's legacy JSON error envelope intentionally uses HTTP 200; the
+    // stable `code` discriminates failure from the typed quote response.
+    assert_eq!(failed_status, StatusCode::OK, "{failed_body}");
+    assert_eq!(failed_body["code"], "BoltzError");
+    assert!(failed_body.get("instruction").is_none());
+    let safe_error = failed_body.to_string();
+    assert!(!safe_error.contains("provider-secret-must-not-log"));
+    let quote_after_failure: (Uuid, i32) = sqlx::query_as(
+        "SELECT id, version_number FROM invoice_quote_versions WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let provider_offers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(provider_offers, 0);
+    let recovery_rows: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_completions completion \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = completion.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recovery_rows, (1, 1, 1, 0));
+
+    // A fresh AppState models a process restart: the durable attempt, not an
+    // in-memory latch, must prevent a second remote obligation.
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = boltz_url;
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (retry_status, retry_body) =
+        post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(
+        retry_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{retry_body}"
+    );
+    assert_eq!(retry_body["code"], "ServiceUnavailable");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    let (liquid_status, liquid_body) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(liquid_status, StatusCode::OK, "{liquid_body}");
+    assert_eq!(
+        liquid_body["quote"]["quote_version_id"],
+        quote_after_failure.0.to_string()
+    );
+    assert_eq!(liquid_body["instruction"]["kind"], "liquid_direct");
+    assert_eq!(liquid_body["instruction"]["payer_amount_sat"], 10_000);
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (1, 0, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_provider_attempt_before_send_restarts_once_without_duplicate_obligation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerbeforesend", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
+    );
+    let pending_app = app.clone();
+    let pending_path = path.clone();
+    let pending = tokio::spawn(async move {
+        post_json(&pending_app, &pending_path, json!({ "rail": "lightning" })).await
+    });
+    hook.wait_until_reached().await;
+
+    let before_send: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before_send, (1, 0, 0));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    pending.abort();
+    hook.release();
+    let _ = pending.await;
+    drop(hook);
+
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = boltz_url;
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (status, body) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "BoltzError", "{body}");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let after_send: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_send, (1, 1, 1));
+
+    let (_, duplicate) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(duplicate["code"], "ServiceUnavailable", "{duplicate}");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn expired_versioned_provider_offer_is_retained_but_never_reexposed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerquoteexpiry", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "VERSIONED_QUOTE_EXPIRED_1",
+        10_073,
+        first_key_index,
+    )
+    .await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    );
+    let request_app = app.clone();
+    let request_path = path.clone();
+    let request = tokio::spawn(async move {
+        post_json(&request_app, &request_path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    hook.wait_until_reached().await;
+
+    // Move only the test clock boundary after the irreversible response and
+    // its exact lineage have committed but before the handler's final exposure
+    // gate. Production immutability remains enabled before the handler resumes.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions \
+            SET created_at = boundary.now - INTERVAL '5 minutes 1 second', \
+                expires_at = boundary.now - INTERVAL '1 second', \
+                rate_observed_at = boundary.now - INTERVAL '5 minutes 1 second', \
+                rate_fetched_at = boundary.now - INTERVAL '5 minutes 1 second' \
+           FROM boundary \
+          WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    hook.release();
+    let (status, body) = request.await.unwrap();
+    drop(hook);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable", "{body}");
+
+    let retained: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_completions completion \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = completion.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, (1, 1, 1, 1));
+
+    let (_, refreshed) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(refreshed["selected_rail"], "liquid", "{refreshed}");
+    assert_eq!(refreshed["quote"]["version_number"], 2, "{refreshed}");
+    assert_eq!(refreshed["instruction"]["kind"], "liquid_direct");
+    assert!(!refreshed.to_string().contains("VERSIONED_QUOTE_EXPIRED_1"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reverse_response_before_commit_restarts_into_hold_without_second_post() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerresponsecrash", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "VERSIONED_RESPONSE_CRASH_1",
+        10_073,
+        first_key_index,
+    )
+    .await;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    );
+    let request_app = app.clone();
+    let request_path = path.clone();
+    let request = tokio::spawn(async move {
+        post_json(&request_app, &request_path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    hook.wait_until_reached().await;
+
+    let crash_boundary: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(crash_boundary, (1, 1, 0, 0));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    request.abort();
+    hook.release();
+    let _ = request.await;
+    drop(hook);
+
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = provider.base_url.clone();
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (_, retry) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(retry["code"], "ServiceUnavailable", "{retry}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let holds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+          JOIN invoice_quote_provider_attempts attempt ON attempt.id = hold.provider_attempt_id \
+         WHERE attempt.invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(holds, 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_quote_rejects_sat_fixed_and_creates_no_fiat_version() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "satquotecurrent").await;
+    let invoice =
+        insert_test_invoice(&pool, "satquotecurrent", &npub, "lq1satquotecurrent", 3_600).await;
+    let app = test_app(test_state(pool.clone()));
+    let (status_before, status_body) =
+        get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status_before, StatusCode::OK, "{status_body}");
+    assert!(status_body["quote_rail_availability"].is_null());
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/quote", invoice.id),
+        json!({ "rail": "liquid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "InvalidAmount");
+    assert!(body.get("instruction").is_none());
+    assert!(body.get("quote").is_none());
+    let quote_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(quote_rows, 0);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_liquid_stable_address_values_each_partial_and_reorgs_without_repricing() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "stablepartials", false).await;
+    let stable_address = invoice.liquid_address.clone().unwrap();
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let quote_a = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        invoice.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:quote-a",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+
+    let txid_a = "a1".repeat(32);
+    let block_a = "b1".repeat(32);
+    let asset_id = "c1".repeat(32);
+    let event_key_a = format!("liquid_direct:{txid_a}:0");
+    let first = pay_service::db::DirectOutputObservation {
+        event_key: &event_key_a,
+        txid: &txid_a,
+        vout: 0,
+        address: &stable_address,
+        amount_sat: 4_000,
+        asset_id: Some(&asset_id),
+        confirmations: 1,
+        block_height: Some(910_001),
+        block_hash: Some(&block_a),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let generation_a = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    let unrelated_on_time_candidate = pay_service::db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: 99_000_000,
+        rate_source: "test:must-not-reprice-a",
         rate_observed_at_unix: now - 1,
         rate_fetched_at_unix: now,
         rate_fresh_until_unix: now + 300,
-        merchant_amount_sat: 10_000,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: 1_000_000,
     };
-    let second = pay_service::db::create_or_reuse_current_invoice_quote(
-        &admin,
-        invoice.id,
-        &second_candidate,
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "stable-address-test",
+            generation: generation_a,
+            observations: std::slice::from_ref(&first),
+        },
+        &unrelated_on_time_candidate,
+        pay_service::db::InvoiceAccountingTolerances::default(),
     )
     .await
     .unwrap();
-    assert!(second.created);
-    assert_eq!(second.quote.version_number, 2);
-    assert_ne!(second.quote.id, quote.id);
-
-    let second_request_key = "7".repeat(64);
-    let second_offer_candidate = pay_service::db::NewInvoiceQuoteOffer {
-        invoice_id: invoice.id,
-        quote_version_id: second.quote.id,
-        rail: "liquid",
-        offer_kind: "direct",
-        request_key: &second_request_key,
-        provider: None,
-        provider_offer_id: None,
-        payer_amount_sat: second.quote.merchant_amount_sat,
-        expires_at_unix: second.quote.expires_at_unix,
-    };
-    let second_offer =
-        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &second_offer_candidate)
+    let first_valuation: (Option<Uuid>, Option<Uuid>, Uuid, i64, String, bool, String) =
+        sqlx::query_as(
+            "SELECT e.invoice_quote_version_id, e.invoice_quote_offer_id, \
+                    e.fiat_valuation_quote_version_id, e.fiat_credited_minor, \
+                    e.fiat_credit_policy, e.quote_first_observed_at < q.expires_at, \
+                    e.address \
+               FROM invoice_payment_events e \
+               JOIN invoice_quote_versions q \
+                 ON q.id = e.fiat_valuation_quote_version_id \
+              WHERE e.event_key = $1",
+        )
+        .bind(&event_key_a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first_valuation.0, None);
+    assert_eq!(first_valuation.1, None);
+    assert_eq!(first_valuation.2, quote_a.id);
+    assert_eq!(first_valuation.3, 400);
+    assert_eq!(first_valuation.4, "quote_cumulative_saturation_v1");
+    assert!(first_valuation.5);
+    assert_eq!(first_valuation.6, stable_address);
+    let on_time_quote_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
             .await
-            .unwrap()
-            .offer;
+            .unwrap();
+    assert_eq!(on_time_quote_count, 1);
 
     sqlx::query(
         "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
          invoice_quote_versions_reject_update",
     )
-    .execute(&admin)
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
@@ -11832,97 +13057,577 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
              expires_at = statement_timestamp() - INTERVAL '1 second' \
          WHERE id = $1",
     )
-    .bind(second.quote.id)
-    .execute(&admin)
+    .bind(quote_a.id)
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
         "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
          invoice_quote_versions_reject_update",
     )
-    .execute(&admin)
+    .execute(&pool)
     .await
     .unwrap();
 
-    // An expired instruction remains attributable, but the undecided fiat
-    // credit stays NULL rather than silently applying either an old or new
-    // rate.
-    let event_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO invoice_payment_events ( \
-             id, invoice_id, rail, source, event_key, amount_sat, txid, vout, address, \
-             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at \
-         ) VALUES ($1, $2, 'liquid', 'liquid_direct', $3, $4, $5, 0, $6, $7, $8, \
-                   clock_timestamp())",
-    )
-    .bind(event_id)
-    .bind(invoice.id)
-    .bind(format!("liquid_direct:{}:0", "61".repeat(32)))
-    .bind(second.quote.merchant_amount_sat)
-    .bind("61".repeat(32))
-    .bind("lq1q061quoteversionfixture000000000000000000000000000000000000000")
-    .bind(second.quote.id)
-    .bind(second_offer.id)
-    .execute(&runtime)
-    .await
-    .unwrap();
-    let policy_neutral: (bool, bool, bool, bool) = sqlx::query_as(
-        "SELECT quote_first_observed_at > q.expires_at, \
-                e.fiat_credited_minor IS NULL, e.fiat_credit_policy IS NULL, \
-                e.fiat_valued_at IS NULL \
-           FROM invoice_payment_events e \
-           JOIN invoice_quote_versions q ON q.id = e.invoice_quote_version_id \
-          WHERE e.id = $1",
-    )
-    .bind(event_id)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    assert_eq!(policy_neutral, (true, true, true, true));
-
-    let valuation_before_decision = sqlx::query(
-        "UPDATE invoice_payment_events SET \
-             fiat_credited_minor = 1000, \
-             fiat_credit_policy = 'undecided_policy_v1', \
-             fiat_valued_at = clock_timestamp() \
-         WHERE id = $1",
-    )
-    .bind(event_id)
-    .execute(&admin)
-    .await
-    .unwrap_err();
-    assert_eq!(
-        valuation_before_decision
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("23514")
-    );
-
-    let blocked = pay_service::db::create_or_reuse_current_invoice_quote(
-        &admin,
+    let quote_b_now = i64::try_from(auth_timestamp()).unwrap();
+    let quote_b_candidate = pay_service::db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: 20_000_000,
+        rate_source: "test:late-b",
+        rate_observed_at_unix: quote_b_now - 1,
+        rate_fetched_at_unix: quote_b_now,
+        rate_fresh_until_unix: quote_b_now + 300,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: 1_000_000,
+    };
+    let txid_b = "a2".repeat(32);
+    let block_b = "b2".repeat(32);
+    let event_key_b = format!("liquid_direct:{txid_b}:1");
+    let second = pay_service::db::DirectOutputObservation {
+        event_key: &event_key_b,
+        txid: &txid_b,
+        vout: 1,
+        address: &stable_address,
+        amount_sat: 3_000,
+        asset_id: Some(&asset_id),
+        confirmations: 1,
+        block_height: Some(910_002),
+        block_hash: Some(&block_b),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let generation_b = pay_service::db::reserve_direct_observation_generation(
+        &pool,
         invoice.id,
-        &second_candidate,
+        pay_service::db::DirectPaymentSource::Liquid,
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "stable-address-test",
+            generation: generation_b,
+            observations: std::slice::from_ref(&second),
+        },
+        &quote_b_candidate,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+
+    type DirectPaymentValuationRow = (
+        Uuid,
+        i64,
+        String,
+        i64,
+        Option<Uuid>,
+        Option<Uuid>,
+        String,
+        i64,
+        String,
+        String,
+    );
+    let second_valuation: DirectPaymentValuationRow = sqlx::query_as(
+        "SELECT e.fiat_valuation_quote_version_id, e.fiat_credited_minor, \
+                e.fiat_credit_policy, e.fiat_rate_minor_per_btc, \
+                e.invoice_quote_version_id, e.invoice_quote_offer_id, e.address, \
+                e.accounting_sequence, e.accounting_state, \
+                e.quote_first_observed_at::TEXT \
+           FROM invoice_payment_events e WHERE e.event_key = $1",
+    )
+    .bind(&event_key_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(second_valuation.0, quote_a.id);
+    assert_eq!(second_valuation.1, 600);
+    assert_eq!(second_valuation.2, "late_observation_rate_v1");
+    assert_eq!(second_valuation.3, 20_000_000);
+    assert_eq!((second_valuation.4, second_valuation.5), (None, None));
+    assert_eq!(second_valuation.6, stable_address);
+    assert_eq!(second_valuation.8, "active");
+    let immutable_second = (
+        second_valuation.0,
+        second_valuation.1,
+        second_valuation.2.clone(),
+        second_valuation.3,
+        second_valuation.7,
+        second_valuation.9.clone(),
+    );
+    let quote_shape: (String, Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT quote_purpose, late_instruction_quote_version_id, \
+                late_observation_at = to_timestamp($2::NUMERIC / 1000000) \
+           FROM invoice_quote_versions \
+          WHERE id = $1",
+    )
+    .bind(second_valuation.0)
+    .bind(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (EXTRACT(EPOCH FROM first_seen_at) * 1000000)::BIGINT \
+               FROM invoice_payment_observations WHERE event_key = $1",
+        )
+        .bind(&event_key_b)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(quote_shape, ("late_valuation".into(), None, true));
+    let paid: (String, i64, i64) = sqlx::query_as(
+        "SELECT status, \
+                (SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+                   FROM invoice_quote_active_fiat_projection WHERE invoice_id = i.id), \
+                (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = i.id) \
+           FROM invoices i WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paid, ("paid".into(), 1_000, 0));
+
+    let regression = pay_service::db::DirectOutputObservation {
+        confirmations: 0,
+        block_height: None,
+        block_hash: None,
+        phase: pay_service::db::DirectObservationPhase::ResolutionPending(
+            pay_service::db::DirectRegressionReason::Reorged,
+        ),
+        ..second.clone()
+    };
+    let regression_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "stable-address-test",
+            generation: regression_generation,
+            observations: std::slice::from_ref(&regression),
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let regressed: (String, String, i64) = sqlx::query_as(
+        "SELECT i.status, e.accounting_state, \
+                (SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+                   FROM invoice_quote_active_fiat_projection WHERE invoice_id = i.id) \
+           FROM invoices i JOIN invoice_payment_events e ON e.invoice_id = i.id \
+          WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(regressed, ("partially_paid".into(), "inactive".into(), 400));
+
+    let reactivation_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "stable-address-test",
+            generation: reactivation_generation,
+            observations: std::slice::from_ref(&second),
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let reactivated: (String, Uuid, i64, String, i64, i64, String) = sqlx::query_as(
+        "SELECT i.status, e.fiat_valuation_quote_version_id, \
+                e.fiat_credited_minor, e.fiat_credit_policy, \
+                e.fiat_rate_minor_per_btc, \
+                e.accounting_sequence, e.quote_first_observed_at::TEXT \
+           FROM invoices i JOIN invoice_payment_events e ON e.invoice_id = i.id \
+          WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reactivated.0, "paid");
     assert_eq!(
-        blocked
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("55000")
+        (
+            reactivated.1,
+            reactivated.2,
+            reactivated.3,
+            reactivated.4,
+            reactivated.5,
+            reactivated.6,
+        ),
+        immutable_second
     );
 
-    let expired_offer_retry =
-        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &second_offer_candidate)
-            .await
-            .unwrap();
-    assert!(!expired_offer_retry.created);
-    assert_eq!(expired_offer_retry.offer.id, second_offer.id);
+    // The stable address remains evidence-bearing after sufficient payment.
+    // A later output reuses the still-covering valuation bucket, contributes
+    // no invented extra face credit, and makes overpayment explicit.
+    let txid_c = "a3".repeat(32);
+    let block_c = "b3".repeat(32);
+    let event_key_c = format!("liquid_direct:{txid_c}:2");
+    let third = pay_service::db::DirectOutputObservation {
+        event_key: &event_key_c,
+        txid: &txid_c,
+        vout: 2,
+        address: &stable_address,
+        amount_sat: 100,
+        asset_id: Some(&asset_id),
+        confirmations: 1,
+        block_height: Some(910_003),
+        block_hash: Some(&block_c),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let generation_c = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "stable-address-test",
+            generation: generation_c,
+            observations: std::slice::from_ref(&third),
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let overpaid: (String, Uuid, i64, Option<Uuid>, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT i.status, e.fiat_valuation_quote_version_id, \
+                e.fiat_credited_minor, e.invoice_quote_version_id, \
+                e.invoice_quote_offer_id, e.address \
+           FROM invoices i JOIN invoice_payment_events e ON e.invoice_id = i.id \
+          WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(invoice.id)
+    .bind(&event_key_c)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        overpaid,
+        (
+            "overpaid".into(),
+            second_valuation.0,
+            0,
+            None,
+            None,
+            stable_address
+        )
+    );
 
-    runtime.close().await;
-    cleanup_db(&admin).await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn direct_liquid_expiry_equality_is_late_and_stale_rate_stays_unvalued() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    async fn expire_quote_at_integer_boundary(pool: &PgPool, quote_id: Uuid) -> i64 {
+        sqlx::query(
+            "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+             invoice_quote_versions_reject_update",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH boundary AS ( \
+                 SELECT date_trunc('second', statement_timestamp()) - INTERVAL '1 second' AS at \
+             ) UPDATE invoice_quote_versions q SET \
+                 rate_observed_at = boundary.at - INTERVAL '301 seconds', \
+                 rate_fetched_at = boundary.at - INTERVAL '300 seconds', \
+                 rate_fresh_until = boundary.at + INTERVAL '5 minutes', \
+                 created_at = boundary.at - INTERVAL '5 minutes', \
+                 expires_at = boundary.at \
+             FROM boundary WHERE q.id = $1",
+        )
+        .bind(quote_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+             invoice_quote_versions_reject_update",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM expires_at)::BIGINT \
+               FROM invoice_quote_versions WHERE id = $1",
+        )
+        .bind(quote_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_observation_at_quote_expiry(
+        pool: &PgPool,
+        invoice_id: Uuid,
+        quote_id: Uuid,
+        address: &str,
+        txid: &str,
+        event_key: &str,
+        asset_id: &str,
+        block_hash: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO invoice_payment_observations ( \
+                 invoice_id, rail, source, event_key, txid, vout, address, amount_sat, \
+                 asset_id, confirmations, block_height, inclusion_block_hash, \
+                 last_seen_state, verification_state, lifecycle_version, \
+                 latest_successful_check_at, latest_check_authority, \
+                 last_applied_generation, first_seen_at \
+             ) SELECT $1, 'liquid', 'liquid_direct', $2, $3, 0, $4, 100, \
+                      $5, 1, 920001, $6, 'awaiting_confirmations', 'verified', 1, \
+                      clock_timestamp(), 'expiry-boundary-fixture', 0, q.expires_at \
+                 FROM invoice_quote_versions q WHERE q.id = $7",
+        )
+        .bind(invoice_id)
+        .bind(event_key)
+        .bind(txid)
+        .bind(address)
+        .bind(asset_id)
+        .bind(block_hash)
+        .bind(quote_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let cancelled = insert_fiat_quote_test_invoice(&pool, "equalitycancelled", false).await;
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let quote_a = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        cancelled.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:equality-a",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+    pay_service::db::cancel_invoice(&pool, cancelled.id)
+        .await
+        .unwrap();
+    let boundary = expire_quote_at_integer_boundary(&pool, quote_a.id).await;
+    let equality_txid = "d1".repeat(32);
+    let equality_key = format!("liquid_direct:{equality_txid}:0");
+    let asset_id = "d2".repeat(32);
+    let equality_block = "d3".repeat(32);
+    let stable_address = cancelled.liquid_address.clone().unwrap();
+    seed_observation_at_quote_expiry(
+        &pool,
+        cancelled.id,
+        quote_a.id,
+        &stable_address,
+        &equality_txid,
+        &equality_key,
+        &asset_id,
+        &equality_block,
+    )
+    .await;
+    let equality_observation = pay_service::db::DirectOutputObservation {
+        event_key: &equality_key,
+        txid: &equality_txid,
+        vout: 0,
+        address: &stable_address,
+        amount_sat: 100,
+        asset_id: Some(&asset_id),
+        confirmations: 1,
+        block_height: Some(920_001),
+        block_hash: Some(&equality_block),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let equality_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        cancelled.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: cancelled.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "expiry-boundary-test",
+            generation: equality_generation,
+            observations: std::slice::from_ref(&equality_observation),
+        },
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 20_000_000,
+            rate_source: "test:equality-b",
+            rate_observed_at_unix: boundary - 1,
+            rate_fetched_at_unix: boundary,
+            rate_fresh_until_unix: boundary + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let equality: (String, Uuid, i64, String, Option<Uuid>, Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT i.status, e.fiat_valuation_quote_version_id, \
+                    e.fiat_rate_minor_per_btc, e.fiat_credit_policy, \
+                    e.invoice_quote_version_id, e.invoice_quote_offer_id, \
+                    e.quote_first_observed_at = q.expires_at \
+               FROM invoices i \
+               JOIN invoice_payment_events e ON e.invoice_id = i.id \
+               JOIN invoice_quote_versions q ON q.id = $3 \
+              WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(cancelled.id)
+    .bind(&equality_key)
+    .bind(quote_a.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(equality.0, "cancelled");
+    assert_ne!(equality.1, quote_a.id);
+    assert_eq!(equality.2, 20_000_000);
+    assert_eq!(equality.3, "late_observation_rate_v1");
+    assert_eq!((equality.4, equality.5), (None, None));
+    assert!(equality.6);
+
+    let unresolved = insert_fiat_quote_test_invoice(&pool, "stalerate", false).await;
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let unresolved_quote = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        unresolved.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:stale-a",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+    let stale_boundary = expire_quote_at_integer_boundary(&pool, unresolved_quote.id).await;
+    let stale_txid = "e1".repeat(32);
+    let stale_key = format!("liquid_direct:{stale_txid}:0");
+    let stale_block = "e2".repeat(32);
+    let stale_address = unresolved.liquid_address.clone().unwrap();
+    seed_observation_at_quote_expiry(
+        &pool,
+        unresolved.id,
+        unresolved_quote.id,
+        &stale_address,
+        &stale_txid,
+        &stale_key,
+        &asset_id,
+        &stale_block,
+    )
+    .await;
+    let stale_observation = pay_service::db::DirectOutputObservation {
+        event_key: &stale_key,
+        txid: &stale_txid,
+        vout: 0,
+        address: &stale_address,
+        amount_sat: 100,
+        asset_id: Some(&asset_id),
+        confirmations: 1,
+        block_height: Some(920_001),
+        block_hash: Some(&stale_block),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Confirmed,
+        supersedes_event_key: None,
+    };
+    let stale_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        unresolved.id,
+        pay_service::db::DirectPaymentSource::Liquid,
+    )
+    .await
+    .unwrap();
+    pay_service::db::apply_direct_observation_batch_with_rate_candidate(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: unresolved.id,
+            source: pay_service::db::DirectPaymentSource::Liquid,
+            authority: "expiry-boundary-test",
+            generation: stale_generation,
+            observations: std::slice::from_ref(&stale_observation),
+        },
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 30_000_000,
+            rate_source: "test:future-fetch-must-not-apply",
+            rate_observed_at_unix: stale_boundary - 1,
+            rate_fetched_at_unix: stale_boundary + 1,
+            rate_fresh_until_unix: stale_boundary + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let unvalued: (String, bool, bool, bool, Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
+        "SELECT i.status, e.quote_first_observed_at IS NOT NULL, \
+                    e.fiat_valuation_quote_version_id IS NULL, \
+                    e.fiat_credited_minor IS NULL, e.invoice_quote_version_id, \
+                    e.invoice_quote_offer_id, \
+                    (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = i.id) \
+               FROM invoices i JOIN invoice_payment_events e ON e.invoice_id = i.id \
+              WHERE i.id = $1 AND e.event_key = $2",
+    )
+    .bind(unresolved.id)
+    .bind(&stale_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unvalued,
+        ("in_progress".into(), true, true, true, None, None, 1)
+    );
+
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]
@@ -11944,10 +13649,11 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
-            amount_sat: 10_000,
-            rate_minor_per_btc: Some(10_000_000),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
             recipient_label: None,
@@ -11974,7 +13680,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             rate_observed_at_unix: now - 1,
             rate_fetched_at_unix: now,
             rate_fresh_until_unix: now + 300,
-            merchant_amount_sat: 10_000,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
         },
     )
     .await
@@ -11982,16 +13689,121 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .quote;
     let reverse_provider_id = "PHASE7_ATTRIBUTION_REVERSE";
     let chain_provider_id = "PHASE7_ATTRIBUTION_CHAIN";
-    let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
+    let reverse_request_key = "a".repeat(64);
+    let chain_request_key = "b".repeat(64);
+    let request_authority_json = r#"{"kind":"phase7-attribution"}"#;
+    let request_authority_sha256 =
+        "01015ae3501c3a082ead6b0f4da92f978cde23ffd20848d30b86141ac75dc5ff";
+    let attempt_root = "7070707070707070";
+    let attempt_reverse_public = format!("02{}", "61".repeat(32));
+    let attempt_reverse_preimage = "62".repeat(32);
+    let attempt_chain_claim_public = format!("02{}", "63".repeat(32));
+    let attempt_chain_preimage = "64".repeat(32);
+    let attempt_chain_refund_public = format!("03{}", "65".repeat(32));
+    let attempt_reverse_allocation = pay_service::db::reserve_swap_key_allocation(
         &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_901,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &attempt_reverse_public,
+            preimage_hash_hex: Some(&attempt_reverse_preimage),
+        },
+    )
+    .await
+    .unwrap();
+    let attempt_chain_claim_allocation = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_902,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &attempt_chain_claim_public,
+            preimage_hash_hex: Some(&attempt_chain_preimage),
+        },
+    )
+    .await
+    .unwrap();
+    let attempt_chain_refund_allocation = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_903,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &attempt_chain_refund_public,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (reverse_attempt, _) = pay_service::db::record_or_reuse_invoice_quote_provider_attempt(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteProviderAttempt {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "lightning",
+            request_key: &reverse_request_key,
+            operation: "fixed_checkout_reverse",
+            merchant_amount_sat: quote.merchant_amount_sat,
+            request_authority_json,
+            request_authority_sha256,
+            claim_key_allocation_id: attempt_reverse_allocation,
+            refund_key_allocation_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (chain_attempt, _) = pay_service::db::record_or_reuse_invoice_quote_provider_attempt(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteProviderAttempt {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "bitcoin",
+            request_key: &chain_request_key,
+            operation: "chain_create",
+            merchant_amount_sat: quote.merchant_amount_sat,
+            request_authority_json,
+            request_authority_sha256,
+            claim_key_allocation_id: attempt_chain_claim_allocation,
+            refund_key_allocation_id: Some(attempt_chain_refund_allocation),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(pay_service::db::record_invoice_quote_provider_dispatch(
+        &pool,
+        reverse_attempt.id,
+        request_authority_sha256,
+    )
+    .await
+    .unwrap());
+    assert!(pay_service::db::record_invoice_quote_provider_dispatch(
+        &pool,
+        chain_attempt.id,
+        request_authority_sha256,
+    )
+    .await
+    .unwrap());
+
+    // Provider offers, obligations, and completion evidence share one commit.
+    let mut provider_tx = pool.begin().await.unwrap();
+    let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer_in_tx(
+        &mut provider_tx,
         &pay_service::db::NewInvoiceQuoteOffer {
             invoice_id: invoice.id,
             quote_version_id: quote.id,
             rail: "lightning",
             offer_kind: "boltz_reverse",
-            request_key: &"a".repeat(64),
+            request_key: &reverse_request_key,
             provider: Some("boltz"),
             provider_offer_id: Some(reverse_provider_id),
+            provider_attempt_id: Some(reverse_attempt.id),
             payer_amount_sat: 10_500,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -11999,34 +13811,18 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap()
     .offer;
-    let chain_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
-        &pool,
+    let chain_offer = pay_service::db::record_or_reuse_invoice_quote_offer_in_tx(
+        &mut provider_tx,
         &pay_service::db::NewInvoiceQuoteOffer {
             invoice_id: invoice.id,
             quote_version_id: quote.id,
             rail: "bitcoin",
             offer_kind: "boltz_chain",
-            request_key: &"b".repeat(64),
+            request_key: &chain_request_key,
             provider: Some("boltz"),
             provider_offer_id: Some(chain_provider_id),
+            provider_attempt_id: Some(chain_attempt.id),
             payer_amount_sat: 10_600,
-            expires_at_unix: quote.expires_at_unix,
-        },
-    )
-    .await
-    .unwrap()
-    .offer;
-    let direct_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
-        &pool,
-        &pay_service::db::NewInvoiceQuoteOffer {
-            invoice_id: invoice.id,
-            quote_version_id: quote.id,
-            rail: "bitcoin",
-            offer_kind: "direct",
-            request_key: &"c".repeat(64),
-            provider: None,
-            provider_offer_id: None,
-            payer_amount_sat: 10_000,
             expires_at_unix: quote.expires_at_unix,
         },
     )
@@ -12082,8 +13878,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         claim_public_key_hex: &reverse_public_key,
         preimage_hash_hex: &reverse_preimage_hash,
     };
-    let wrong_rail = pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    let wrong_rail = pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &reverse_swap,
         &reverse_lineage,
         chain_attribution,
@@ -12105,8 +13901,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         key_index: Some(61_001),
         root_fingerprint: Some(reverse_root),
     };
-    let wrong_provider = pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    let wrong_provider = pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &wrong_provider_swap,
         &reverse_lineage,
         reverse_attribution,
@@ -12114,25 +13910,23 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap_err();
     assert!(matches!(wrong_provider, sqlx::Error::Protocol(_)));
-    pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &reverse_swap,
         &reverse_lineage,
         reverse_attribution,
     )
     .await
     .unwrap();
-    let stored_reverse = pay_service::db::get_swap_by_boltz_id(&pool, reverse_provider_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (
-            stored_reverse.invoice_quote_version_id,
-            stored_reverse.invoice_quote_offer_id,
-        ),
-        (Some(quote.id), Some(reverse_offer.id))
-    );
+    pay_service::db::record_invoice_quote_provider_completion(
+        &mut *provider_tx,
+        reverse_attempt.id,
+        reverse_offer.id,
+        reverse_provider_id,
+        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    )
+    .await
+    .unwrap();
 
     let recovery_commitment_id =
         insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x77).await;
@@ -12203,9 +13997,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         creation_terms,
         recovery_address_commitment_id: Some(recovery_commitment_id),
     };
-    let chain_wrong_rail =
-        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
-            &pool,
+    let chain_wrong_rail = pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx(
+            &mut provider_tx,
             &chain_swap,
             &chain_lineage,
             &creation_evidence,
@@ -12214,9 +14007,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         .await
         .unwrap_err();
     assert!(matches!(chain_wrong_rail, sqlx::Error::Protocol(_)));
-    let stored_chain =
-        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
-            &pool,
+    let stored_chain = pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx(
+            &mut provider_tx,
             &chain_swap,
             &chain_lineage,
             &creation_evidence,
@@ -12230,6 +14022,34 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             stored_chain.invoice_quote_offer_id,
         ),
         (Some(quote.id), Some(chain_offer.id))
+    );
+    let chain_response_sha256 = stored_chain
+        .creation_terms
+        .as_ref()
+        .unwrap()
+        .creation_response_sha256
+        .clone();
+    pay_service::db::record_invoice_quote_provider_completion(
+        &mut *provider_tx,
+        chain_attempt.id,
+        chain_offer.id,
+        chain_provider_id,
+        &chain_response_sha256,
+    )
+    .await
+    .unwrap();
+    provider_tx.commit().await.unwrap();
+
+    let stored_reverse = pay_service::db::get_swap_by_boltz_id(&pool, reverse_provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            stored_reverse.invoice_quote_version_id,
+            stored_reverse.invoice_quote_offer_id,
+        ),
+        (Some(quote.id), Some(reverse_offer.id))
     );
 
     // Make all issued instructions genuinely expired without waiting five
@@ -12283,6 +14103,23 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
          invoice_quote_versions_reject_update",
     )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The provider obligation owns first-observation authority. Transition it
+    // after quote expiry so the accounting writer recovers an exact durable
+    // late-observation timestamp rather than guessing from handler time.
+    sqlx::query("UPDATE swap_records SET status = 'lockup_confirmed' WHERE boltz_swap_id = $1")
+        .bind(reverse_provider_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'server_lock_confirmed' \
+         WHERE boltz_swap_id = $1",
+    )
+    .bind(chain_provider_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -12407,185 +14244,6 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap();
     assert_eq!(chain_row, (Some(quote.id), Some(chain_offer.id)));
-
-    let direct_event_key = format!("bitcoin_direct:{}:0", "80".repeat(32));
-    let direct_txid = "80".repeat(32);
-    let direct_block_hash = "81".repeat(32);
-    let direct_observation = pay_service::db::DirectOutputObservation {
-        event_key: &direct_event_key,
-        txid: &direct_txid,
-        vout: 0,
-        address: bitcoin_address,
-        amount_sat: 100,
-        asset_id: None,
-        confirmations: 3,
-        block_height: Some(900_001),
-        block_hash: Some(&direct_block_hash),
-        verification: pay_service::db::DirectEvidenceVerification::Verified,
-        phase: pay_service::db::DirectObservationPhase::Finalized,
-        supersedes_event_key: None,
-    };
-    let generation = pay_service::db::reserve_direct_observation_generation(
-        &pool,
-        invoice.id,
-        pay_service::db::DirectPaymentSource::Bitcoin,
-    )
-    .await
-    .unwrap();
-    let direct_mapping = [pay_service::db::DirectObservationQuoteAttribution {
-        event_key: &direct_event_key,
-        attribution: pay_service::db::InvoiceQuoteAttribution {
-            quote_version_id: quote.id,
-            quote_offer_id: direct_offer.id,
-        },
-    }];
-    let applied = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
-        &pool,
-        pay_service::db::DirectObservationBatch {
-            invoice_id: invoice.id,
-            source: pay_service::db::DirectPaymentSource::Bitcoin,
-            authority: "phase7-attribution-test",
-            generation,
-            observations: std::slice::from_ref(&direct_observation),
-        },
-        &direct_mapping,
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        applied,
-        pay_service::db::ApplyDirectObservationOutcome::Applied { .. }
-    ));
-    let direct_row: (Option<Uuid>, Option<Uuid>, bool) = sqlx::query_as(
-        "SELECT invoice_quote_version_id, invoice_quote_offer_id, \
-                quote_first_observed_at > ( \
-                    SELECT expires_at FROM invoice_quote_offers WHERE id = $2 \
-                ) \
-           FROM invoice_payment_events WHERE event_key = $1",
-    )
-    .bind(&direct_event_key)
-    .bind(direct_offer.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(direct_row, (Some(quote.id), Some(direct_offer.id), true));
-    let retry = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
-        &pool,
-        pay_service::db::DirectObservationBatch {
-            invoice_id: invoice.id,
-            source: pay_service::db::DirectPaymentSource::Bitcoin,
-            authority: "phase7-attribution-test",
-            generation,
-            observations: std::slice::from_ref(&direct_observation),
-        },
-        &direct_mapping,
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        retry,
-        pay_service::db::ApplyDirectObservationOutcome::AlreadyApplied
-    );
-    let wrong_direct_mapping = [pay_service::db::DirectObservationQuoteAttribution {
-        event_key: &direct_event_key,
-        attribution: reverse_attribution,
-    }];
-    let wrong_direct = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
-        &pool,
-        pay_service::db::DirectObservationBatch {
-            invoice_id: invoice.id,
-            source: pay_service::db::DirectPaymentSource::Bitcoin,
-            authority: "phase7-attribution-test",
-            generation,
-            observations: std::slice::from_ref(&direct_observation),
-        },
-        &wrong_direct_mapping,
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(wrong_direct, sqlx::Error::Protocol(_)));
-
-    // A fresh sat-fixed invoice still uses the pre-061 NULL lineage shape.
-    let legacy_invoice = insert_test_btc_invoice(
-        &pool,
-        "phase7legacy",
-        &create_test_user(&pool, "phase7legacy").await,
-        "bc1qphase7legacyattribution000000000000000000000000000000000",
-    )
-    .await
-    .unwrap();
-    let legacy_event_key = format!("bitcoin_direct:{}:1", "82".repeat(32));
-    let legacy_txid = "82".repeat(32);
-    let legacy_block_hash = "83".repeat(32);
-    let legacy_observation = pay_service::db::DirectOutputObservation {
-        event_key: &legacy_event_key,
-        txid: &legacy_txid,
-        vout: 1,
-        address: "bc1qphase7legacyattribution000000000000000000000000000000000",
-        amount_sat: 1_000,
-        asset_id: None,
-        confirmations: 3,
-        block_height: Some(900_002),
-        block_hash: Some(&legacy_block_hash),
-        verification: pay_service::db::DirectEvidenceVerification::Verified,
-        phase: pay_service::db::DirectObservationPhase::Finalized,
-        supersedes_event_key: None,
-    };
-    let legacy_generation = pay_service::db::reserve_direct_observation_generation(
-        &pool,
-        legacy_invoice.id,
-        pay_service::db::DirectPaymentSource::Bitcoin,
-    )
-    .await
-    .unwrap();
-    let crossed_invoice_mapping = [pay_service::db::DirectObservationQuoteAttribution {
-        event_key: &legacy_event_key,
-        attribution: pay_service::db::InvoiceQuoteAttribution {
-            quote_version_id: quote.id,
-            quote_offer_id: direct_offer.id,
-        },
-    }];
-    let crossed_invoice = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
-        &pool,
-        pay_service::db::DirectObservationBatch {
-            invoice_id: legacy_invoice.id,
-            source: pay_service::db::DirectPaymentSource::Bitcoin,
-            authority: "phase7-legacy-test",
-            generation: legacy_generation,
-            observations: std::slice::from_ref(&legacy_observation),
-        },
-        &crossed_invoice_mapping,
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(crossed_invoice, sqlx::Error::Protocol(_)));
-    pay_service::db::apply_direct_observation_batch(
-        &pool,
-        pay_service::db::DirectObservationBatch {
-            invoice_id: legacy_invoice.id,
-            source: pay_service::db::DirectPaymentSource::Bitcoin,
-            authority: "phase7-legacy-test",
-            generation: legacy_generation,
-            observations: std::slice::from_ref(&legacy_observation),
-        },
-        pay_service::db::InvoiceAccountingTolerances::default(),
-    )
-    .await
-    .unwrap();
-    let legacy_row: (Option<Uuid>, Option<Uuid>, Option<String>) = sqlx::query_as(
-        "SELECT invoice_quote_version_id, invoice_quote_offer_id, \
-                quote_first_observed_at::TEXT \
-           FROM invoice_payment_events WHERE event_key = $1",
-    )
-    .bind(&legacy_event_key)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(legacy_row, (None, None, None));
 
     cleanup_db(&pool).await;
 }
@@ -12925,6 +14583,7 @@ async fn insert_test_btc_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -15470,6 +17129,7 @@ async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private()
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -15763,6 +17423,7 @@ async fn invoice_insert_rejects_reused_liquid_address() {
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -16615,6 +18276,7 @@ async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -16683,6 +18345,7 @@ async fn issue14_m5_direct_watcher_enforces_the_invoice_wide_tolerance() {
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -17811,6 +19474,7 @@ async fn stale_wallet_partial_stays_payable() {
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -29260,6 +30924,7 @@ async fn issue84_chain_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: i64::try_from(ISSUE84_CHAIN_AMOUNT_SAT).unwrap(),
@@ -29520,6 +31185,154 @@ async fn issue84_offline_page_owner_keeps_exactly_one_chain_offer_and_lnurl_stay
         1
     );
 
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn versioned_fiat_bitcoin_quote_uses_permanent_page_owner_while_lnurl_is_offline() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "fiatquoteofflinepage";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Offline LA fiat checkout",
+            description: "The permanent Page remains independently payable",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before Lightning Address deactivation");
+
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key).unwrap(),
+        u64::try_from(next_key + 1).unwrap(),
+        "Phase7OfflineFiatQuote1",
+    )
+    .await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
+    let app = test_app(state);
+
+    let (lnurl_status, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(lnurl_status, StatusCode::OK, "{unavailable}");
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let (create_status, created) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({ "fiat_amount_minor": 2_500, "fiat_currency": "USD" }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{created}");
+    assert_eq!(created["pricing_mode"], "fiat_fixed", "{created}");
+    let invoice_id = Uuid::parse_str(created["invoice_id"].as_str().unwrap()).unwrap();
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 0);
+
+    let quote_path = format!("/api/v1/invoices/{invoice_id}/quote");
+    let (quote_status, quote) = post_json(&app, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(quote_status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["selected_rail"], "bitcoin", "{quote}");
+    assert_eq!(quote["quote"]["merchant_amount_sat"], 25_000, "{quote}");
+    assert_eq!(
+        quote["instruction"]["kind"], "bitcoin_boltz_chain",
+        "{quote}"
+    );
+    assert!(
+        quote["instruction"]["quote_offer_id"].is_string(),
+        "{quote}"
+    );
+    assert!(quote["instruction"]["address"].is_string(), "{quote}");
+    assert!(quote["instruction"]["bip21"].is_string(), "{quote}");
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+
+    let durable: (i64, i64, i64, i64, Uuid, String) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1), \
+             recovery_address_commitment_id, boltz_swap_id \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable.0, 1);
+    assert_eq!(durable.1, 1);
+    assert_eq!(durable.2, 1);
+    assert_eq!(durable.3, 1);
+    assert_eq!(durable.4, recovery_commitment_id);
+    assert_eq!(durable.5, "Phase7OfflineFiatQuote1");
+
+    let provider_calls_before_retry = provider.calls.load(Ordering::SeqCst);
+    let (retry_status, retry) = post_json(&app, &quote_path, json!({ "rail": "bitcoin" })).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["quote"], quote["quote"]);
+    assert_eq!(retry["instruction"], quote["instruction"]);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        provider_calls_before_retry
+    );
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+    let retry_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_counts, (1, 1, 1));
+
+    let (_, still_unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(
+        still_unavailable["code"], "NymNotFound",
+        "{still_unavailable}"
+    );
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
     provider.shutdown().await;
     cleanup_db(&pool).await;
 }

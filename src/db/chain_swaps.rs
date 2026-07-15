@@ -7,8 +7,10 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
-    ClaimFailureOutcome, InvoiceQuoteAttribution, LiquidClaimFeeAuthority,
-    LiquidClaimFeeAuthorityRow,
+    capture_late_observation_candidate_locked, record_or_reuse_invoice_quote_offer_in_tx,
+    ClaimFailureOutcome, InvoiceQuoteAttribution, InvoiceQuoteOffer, LiquidClaimFeeAuthority,
+    LiquidClaimFeeAuthorityRow, NewInvoiceQuoteOffer, NewInvoiceQuoteVersion,
+    PersistedInvoiceQuoteObservation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +783,33 @@ pub async fn record_chain_swap_in_tx_with_quote_attribution(
     insert_chain_swap(&mut **tx, swap, None, None, Some(attribution)).await
 }
 
+/// Commit the immutable provider offer and canonical chain-swap row together
+/// on the invoice-locking connection. The offer must exist before the
+/// attribution foreign key can make the provider obligation durable.
+pub async fn record_chain_swap_with_quote_offer_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+    offer: &NewInvoiceQuoteOffer<'_>,
+) -> Result<(ChainSwapRecord, InvoiceQuoteOffer), sqlx::Error> {
+    let offer = record_or_reuse_invoice_quote_offer_in_tx(tx, offer)
+        .await?
+        .offer;
+    let chain_swap = insert_chain_swap(
+        &mut **tx,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+        Some(InvoiceQuoteAttribution {
+            quote_version_id: offer.quote_version_id,
+            quote_offer_id: offer.id,
+        }),
+    )
+    .await?;
+    Ok((chain_swap, offer))
+}
+
 async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     swap: &NewChainSwapRecord<'_>,
@@ -964,6 +993,50 @@ pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecut
     .await
 }
 
+/// Exact quote-scoped counterpart to the legacy invoice amount lookup. The
+/// immutable offer identity, canonical provider id, swap attribution, pending
+/// state, and delivered recovery manifest must all agree before exposure.
+pub async fn payer_exposable_chain_swap_for_quote_offer<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+    quote_version_id: Uuid,
+    quote_offer_id: Uuid,
+    provider_offer_id: &str,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
+         WHERE invoice_id = $1 \
+           AND invoice_quote_version_id = $2 \
+           AND invoice_quote_offer_id = $3 \
+           AND boltz_swap_id = $4 \
+           AND status = 'pending' \
+           AND EXISTS ( \
+                 SELECT 1 FROM invoice_quote_offers offer \
+                  WHERE offer.id = chain_swap_records.invoice_quote_offer_id \
+                    AND offer.quote_version_id = chain_swap_records.invoice_quote_version_id \
+                    AND offer.invoice_id = chain_swap_records.invoice_id \
+                    AND offer.rail = 'bitcoin' \
+                    AND offer.offer_kind = 'boltz_chain' \
+                    AND offer.provider = 'boltz' \
+                    AND offer.provider_offer_id = chain_swap_records.boltz_swap_id \
+           ) \
+           AND EXISTS ( \
+                 SELECT 1 FROM chain_swap_manifest_deliveries delivery \
+                  WHERE delivery.chain_swap_id = chain_swap_records.id \
+                    AND delivery.delivery_state = 'delivered' \
+           )"
+    ))
+    .bind(invoice_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
+    .bind(provider_offer_id)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Whether one complete issue-#80 chain-swap creation record lacks any
 /// migration-052 manifest-ledger obligation.
 ///
@@ -1067,6 +1140,17 @@ pub async fn apply_chain_swap_provider_status(
     id: Uuid,
     input: ChainSwapProviderStatusInput,
 ) -> Result<Option<ChainSwapProviderTransition>, sqlx::Error> {
+    apply_chain_swap_provider_status_with_late_valuation_candidate(pool, id, input, None).await
+}
+
+/// Provider reducer variant which atomically binds a pre-fetched covering rate
+/// to the exact first-observation timestamp stamped by the status transition.
+pub async fn apply_chain_swap_provider_status_with_late_valuation_candidate(
+    pool: &PgPool,
+    id: Uuid,
+    input: ChainSwapProviderStatusInput,
+    candidate: Option<&NewInvoiceQuoteVersion<'_>>,
+) -> Result<Option<ChainSwapProviderTransition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let Some(current) = get_chain_swap_by_id_for_update(&mut *tx, id).await? else {
         tx.commit().await?;
@@ -1098,6 +1182,33 @@ pub async fn apply_chain_swap_provider_status(
             return Err(sqlx::Error::Protocol(format!(
                 "locked chain swap disappeared during provider transition: {id}"
             )));
+        }
+    }
+
+    if let Some(candidate) = candidate {
+        let observation: Option<PersistedInvoiceQuoteObservation> = sqlx::query_as(
+            "SELECT invoice_id, \
+                    invoice_quote_version_id AS instruction_quote_version_id, \
+                    (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+                        AS first_observed_at_unix_micros \
+               FROM chain_swap_records \
+              WHERE id = $1 AND invoice_quote_version_id IS NOT NULL \
+                AND quote_payment_first_observed_at IS NOT NULL \
+              FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(observation) = observation {
+            let captured =
+                capture_late_observation_candidate_locked(&mut tx, observation, candidate).await?;
+            if !captured {
+                tracing::warn!(
+                    event = "invoice_chain_observation_rate_not_covering",
+                    chain_swap_id = %id,
+                    "provider status committed without fiat valuation because the pre-fetched rate did not cover exact first observation"
+                );
+            }
         }
     }
 

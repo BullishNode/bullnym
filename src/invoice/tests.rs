@@ -207,6 +207,49 @@ fn chain_bip21_formats_whole_bitcoin_without_rounding() {
 }
 
 #[test]
+fn direct_bitcoin_bip21_keeps_the_exact_merchant_output() {
+    assert_eq!(
+        build_direct_bitcoin_bip21("bc1qstable", 10_001),
+        "bitcoin:bc1qstable?amount=0.00010001"
+    );
+    assert_eq!(
+        build_direct_bitcoin_bip21("bc1qstable", 100_000_001),
+        "bitcoin:bc1qstable?amount=1.00000001"
+    );
+}
+
+#[test]
+fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed() {
+    let mut wallet = invoice_fixture();
+    wallet.pricing_mode = "fiat_fixed".to_string();
+    wallet.fiat_amount_minor = Some(1_000);
+    wallet.fiat_currency = Some("USD".to_string());
+    wallet.amount_sat = 0;
+    wallet.accept_ln = false;
+    wallet.accept_btc = true;
+    wallet.bitcoin_address = Some("bc1qstable".to_string());
+    assert_eq!(
+        payer_quote_rail_availability(&wallet).map(|rails| rails.bitcoin),
+        Some(true)
+    );
+
+    let mut checkout = invoice_fixture();
+    checkout.pricing_mode = "fiat_fixed".to_string();
+    checkout.fiat_amount_minor = Some(1_000);
+    checkout.fiat_currency = Some("USD".to_string());
+    checkout.amount_sat = 0;
+    checkout.accept_ln = false;
+    checkout.origin = "checkout".to_string();
+    checkout.accept_btc = false;
+    checkout.bitcoin_address = None;
+    checkout.liquid_address = Some("lq1merchant".to_string());
+    assert_eq!(
+        payer_quote_rail_availability(&checkout).map(|rails| rails.bitcoin),
+        Some(true)
+    );
+}
+
+#[test]
 fn public_chain_amount_requires_a_positive_non_decreasing_gross_up() {
     assert_eq!(
         validated_payer_chain_amount_sat(10_431, 10_000),
@@ -748,6 +791,41 @@ fn fiat_display_uses_zero_decimal_crc() {
     assert_eq!(format_fiat_major(12_345, "CRC"), "12345 CRC");
     assert_eq!(format_fiat_major(12_345, "COP"), "12345 COP");
     assert_eq!(format_fiat_major(12_345, "USD"), "123.45 USD");
+}
+
+#[test]
+fn signed_invoice_create_accepts_only_the_canonical_recipient_name_wire_key() {
+    let canonical = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_name": "Alice",
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    let parsed: CreateSignedRequest = serde_json::from_value(canonical).unwrap();
+    assert_eq!(parsed.recipient_label.as_deref(), Some("Alice"));
+
+    let legacy = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_label": "Alice",
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    let error = serde_json::from_value::<CreateSignedRequest>(legacy).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unknown field `recipient_label`"));
+
+    let extra = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_name": "Alice",
+        "unexpected": true,
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    assert!(serde_json::from_value::<CreateSignedRequest>(extra).is_err());
 }
 
 fn invoice_fixture() -> db::Invoice {

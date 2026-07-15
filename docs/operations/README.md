@@ -3,6 +3,7 @@
 - [Swap-key lineage and recovery](swap-key-lineage.md)
 - [Configuration](configuration.md)
 - [Deployment](deployment.md)
+- [Deployment certification preflight](deployment-certification.md)
 - [Monitoring](monitoring.md)
 - [Swap recovery runbook](runbooks/stuck-swaps.md)
 - [nginx example](nginx.conf.example)

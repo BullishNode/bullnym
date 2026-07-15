@@ -54,7 +54,7 @@ Additional create constraints:
 | `fiat_amount_minor` | `1..=1,000,000,000`; the converted sat amount must also fit the configured min/max. |
 | `fiat_currency` | Case-normalized by the server and present in `/api/v1/supported-currencies`. |
 | `public_description` | At most 1,000 bytes. |
-| `recipient_name` | At most 100 bytes. `recipient_label` is accepted as a compatibility alias on input. |
+| `recipient_name` | Required current wire key; at most 100 bytes. Unknown or legacy field names are rejected. |
 | `invoice_number` | At most 50 bytes. |
 | `expires_at_unix` | Omit for 30 days, or set between 60 seconds and 30 days in the future at processing time. |
 | addresses | Valid canonical Bitcoin mainnet addresses or confidential Liquid mainnet addresses. The signature commits to the raw submitted strings before server canonicalization. |
@@ -64,6 +64,29 @@ Omit address and blinding-key fields for disabled rails. Any address supplied
 in the JSON is validated, stored, and reserved in the global uniqueness table
 even when its corresponding `accept_*` flag is false. An unnecessary stale
 address can therefore cause a validation error or HTTP 409 conflict.
+
+### Fiat payer-demand quotes
+
+A fiat-fixed invoice stores only its immutable currency face value. It does
+not freeze a satoshi amount or create a provider obligation at invoice-create
+time. The payer explicitly requests one selected rail with
+`POST /api/v1/invoices/:id/quote`; Bullnym returns an immutable five-minute
+rate snapshot and a quote-bound payment instruction.
+
+Direct Liquid instructions always use the invoice's one stable settlement
+address. Quote refresh changes the amount and rate metadata, never the
+destination. Because an output to that address cannot prove which QR the payer
+scanned, Bullnym does not invent a direct quote-offer or instruction identity;
+it values each output independently from its exact durable first-observation
+time. Provider-backed Lightning and Bitcoin instructions, by contrast, bind
+their independently observable swap rows to one quote version and offer ID.
+
+Money first observed before the quote's exclusive expiry boundary keeps that
+quote rate only for the sats actually observed. Money first observed at or
+after expiry never reuses the expired rate. Bullnym records a separate,
+freshness-proven valuation snapshot covering the exact first-observation time,
+or retains the payment as unvalued/in-progress when no authoritative snapshot
+exists. It never guesses from a later unrelated market rate.
 
 Linked invoices render at `/:nym/i/:id`; `/invoice/:id` is a generic route that
 renders both linked and unlinked invoices. The nym-specific route verifies that

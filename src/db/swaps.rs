@@ -5,8 +5,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    mark_user_used, validate_invoice_quote_attribution, InvoiceQuoteAttribution,
-    LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow,
+    capture_late_observation_candidate_locked, mark_user_used, validate_invoice_quote_attribution,
+    InvoiceQuoteAttribution, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow,
+    NewInvoiceQuoteVersion, PersistedInvoiceQuoteObservation,
 };
 
 pub const CLAIM_IN_FLIGHT_LEASE: &str = "2 minutes";
@@ -463,18 +464,57 @@ pub async fn update_swap_status(
     status: SwapStatus,
     claim_txid: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE swap_records SET status = $2, claim_txid = COALESCE($3, claim_txid), \
-         updated_at = NOW() \
+    update_swap_status_with_late_valuation_candidate(pool, id, status, claim_txid, None).await
+}
+
+/// Provider-observation transition with an optional pre-fetched rate. The
+/// status trigger stamps exact first observation, and this same transaction
+/// persists a covering valuation-only quote before either fact commits.
+pub async fn update_swap_status_with_late_valuation_candidate(
+    pool: &PgPool,
+    id: Uuid,
+    status: SwapStatus,
+    claim_txid: Option<&str>,
+    candidate: Option<&NewInvoiceQuoteVersion<'_>>,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<Uuid>, Option<Uuid>, Option<i64>)> = sqlx::query_as(
+        "UPDATE swap_records \
+         SET status = $2, claim_txid = COALESCE($3, claim_txid), updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded') \
+         RETURNING invoice_id, invoice_quote_version_id, \
+                   (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT",
     )
     .bind(id)
     .bind(status.to_string())
     .bind(claim_txid)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected())
+    if let (Some(candidate), Some((Some(invoice_id), Some(quote_id), Some(first_observed)))) =
+        (candidate, row)
+    {
+        let captured = capture_late_observation_candidate_locked(
+            &mut tx,
+            PersistedInvoiceQuoteObservation {
+                invoice_id,
+                instruction_quote_version_id: quote_id,
+                first_observed_at_unix_micros: first_observed,
+            },
+            candidate,
+        )
+        .await?;
+        if !captured {
+            tracing::warn!(
+                event = "invoice_reverse_observation_rate_not_covering",
+                swap_id = %id,
+                "provider status committed without fiat valuation because the pre-fetched rate did not cover exact first observation"
+            );
+        }
+    }
+    let rows = u64::from(row.is_some());
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Set `cooperative_refused = TRUE` so the next claim attempt takes the
@@ -669,6 +709,7 @@ pub struct ReconcilerSwap {
     /// records a payment event against this invoice after merchant-side
     /// claim success. The reconciler only nudges claim retries.
     pub invoice_id: Option<Uuid>,
+    pub invoice_quote_version_id: Option<Uuid>,
 }
 
 /// Capture one process-local reconciliation epoch from the database clock.
@@ -694,6 +735,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
             nym: row.try_get("nym")?,
             amount_sat: row.try_get("amount_sat")?,
             invoice_id: row.try_get("invoice_id")?,
+            invoice_quote_version_id: row.try_get("invoice_quote_version_id")?,
         })
     }
 }
@@ -702,7 +744,7 @@ pub(crate) const REVERSE_RECONCILER_SCAN_SQL: &str = "WITH scan AS ( \
          SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
      ) \
      SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-            nym, amount_sat, invoice_id \
+            nym, amount_sat, invoice_id, invoice_quote_version_id \
      FROM swap_records, scan \
      WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
        AND updated_at <= scan.epoch - ($1 || ' seconds')::interval \
@@ -746,7 +788,7 @@ pub(crate) const REVERSE_SETTLEMENT_REPAIR_SCAN_SQL: &str = "WITH scan AS ( \
          SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
      ) \
      SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-            nym, amount_sat, invoice_id \
+            nym, amount_sat, invoice_id, invoice_quote_version_id \
      FROM swap_records s, scan \
      WHERE s.status = 'claimed' \
        AND s.invoice_id IS NOT NULL \

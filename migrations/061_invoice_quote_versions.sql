@@ -259,7 +259,7 @@ BEGIN
     NEW.created_at := write_now;
     NEW.expires_at := write_now + INTERVAL '5 minutes';
 
-    expected_merchant_amount := floor(
+    expected_merchant_amount := ceil(
         invoice_row.fiat_amount_minor::NUMERIC * 100000000::NUMERIC
         / NEW.rate_minor_per_btc::NUMERIC
     )::BIGINT;

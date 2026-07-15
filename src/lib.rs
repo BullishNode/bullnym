@@ -39,6 +39,7 @@ pub mod fee_decision_record;
 pub mod fee_policy;
 pub mod fee_refresh_cycle;
 pub mod fee_runtime;
+pub mod fiat_quote_credit;
 pub mod gc;
 pub mod invoice;
 pub mod ip_whitelist;

@@ -405,6 +405,12 @@ Public checkout surfaces:
 
 - server derives the Liquid address and blinding key from the selected surface
   descriptor.
+- each invoice has exactly one Liquid settlement destination. Fiat quote
+  refresh changes amount/rate metadata while preserving that destination.
+- direct outputs carry no guessed quote-offer lineage. Their exact durable
+  first-observation time selects an in-window quote or a freshness-proven
+  valuation snapshot, and that rate provenance is copied immutably to the
+  event.
 
 Invoices:
 
@@ -413,9 +419,9 @@ Invoices:
   Liquid is accepted
 - server validates the key matches the address
 
-Clients must use invoice-scoped Liquid addresses. Address reuse is a client
-hygiene issue, but server documentation and tests should make the expected
-usage clear.
+Clients must use invoice-scoped Liquid addresses. Address uniqueness across
+invoices remains enforced server-side; reuse across partial outputs and quote
+refreshes of the same invoice is deliberate.
 
 The Liquid watcher preserves signed Electrum height and canonical block
 identity, decodes and unblinds the exact matching L-BTC output, and retains a

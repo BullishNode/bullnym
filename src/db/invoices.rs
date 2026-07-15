@@ -98,6 +98,9 @@ pub struct NewInvoice<'a> {
     pub npub_owner: &'a str,
     /// 'checkout' or 'wallet'. Caller validates against the enum upstream.
     pub origin: &'a str,
+    /// Exact checkout descriptor/cursor namespace. Checkout creation uses it
+    /// to allocate the invoice's one stable Liquid settlement destination.
+    pub checkout_surface_kind: Option<&'a str>,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<&'a str>,
     pub amount_sat: i64,
@@ -140,7 +143,11 @@ pub struct InvoiceQuoteVersion {
     pub id: Uuid,
     pub invoice_id: Uuid,
     pub version_number: i32,
+    pub quote_purpose: String,
+    pub late_instruction_quote_version_id: Option<Uuid>,
+    pub late_observation_at_unix_micros: Option<i64>,
     pub fiat_face_amount_minor: i32,
+    pub fiat_target_amount_minor: i32,
     pub fiat_currency: String,
     pub rate_minor_per_btc: i64,
     pub rate_source: String,
@@ -153,7 +160,9 @@ pub struct InvoiceQuoteVersion {
 }
 
 const INVOICE_QUOTE_VERSION_COLUMNS: &str =
-    "id, invoice_id, version_number, fiat_face_amount_minor, fiat_currency, \
+    "id, invoice_id, version_number, quote_purpose, late_instruction_quote_version_id, \
+     (EXTRACT(EPOCH FROM late_observation_at) * 1000000)::BIGINT AS late_observation_at_unix_micros, \
+     fiat_face_amount_minor, fiat_target_amount_minor, fiat_currency, \
      rate_minor_per_btc, rate_source, \
      FLOOR(EXTRACT(EPOCH FROM rate_observed_at))::BIGINT AS rate_observed_at_unix, \
      FLOOR(EXTRACT(EPOCH FROM rate_fetched_at))::BIGINT AS rate_fetched_at_unix, \
@@ -169,15 +178,87 @@ pub struct NewInvoiceQuoteVersion<'a> {
     pub rate_observed_at_unix: i64,
     pub rate_fetched_at_unix: i64,
     pub rate_fresh_until_unix: i64,
-    /// Exact merchant-side sat target calculated from the durable fiat face
-    /// and this rate. Migration 061 independently verifies the conversion.
-    pub merchant_amount_sat: i64,
+    /// Runtime policy bounds applied after the locked remaining-fiat target is
+    /// converted at this candidate rate. They are not persisted evidence.
+    pub minimum_merchant_amount_sat: i64,
+    pub maximum_merchant_amount_sat: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceQuoteResolution {
     pub quote: InvoiceQuoteVersion,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateObservationValuationStatus {
+    /// The instruction quote itself owns this observation boundary.
+    OnTime,
+    /// A distinct durable quote snapshot already covers the late boundary.
+    Ready(InvoiceQuoteVersion),
+    /// No durable snapshot covers the boundary; an observer may ask the
+    /// pricer for this currency and retry with the returned candidate.
+    NeedsRate { fiat_currency: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct PersistedInvoiceQuoteObservation {
+    pub invoice_id: Uuid,
+    pub instruction_quote_version_id: Uuid,
+    pub first_observed_at_unix_micros: i64,
+}
+
+pub async fn reverse_swap_quote_observation(
+    pool: &PgPool,
+    swap_id: Uuid,
+) -> Result<Option<PersistedInvoiceQuoteObservation>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT invoice_id, \
+                invoice_quote_version_id AS instruction_quote_version_id, \
+                (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+                    AS first_observed_at_unix_micros \
+           FROM swap_records \
+          WHERE id = $1 AND invoice_id IS NOT NULL \
+            AND invoice_quote_version_id IS NOT NULL \
+            AND quote_payment_first_observed_at IS NOT NULL",
+    )
+    .bind(swap_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn chain_swap_quote_observation(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+) -> Result<Option<PersistedInvoiceQuoteObservation>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT invoice_id, \
+                invoice_quote_version_id AS instruction_quote_version_id, \
+                (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+                    AS first_observed_at_unix_micros \
+           FROM chain_swap_records \
+          WHERE id = $1 AND invoice_quote_version_id IS NOT NULL \
+            AND quote_payment_first_observed_at IS NOT NULL",
+    )
+    .bind(chain_swap_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn invoice_quote_currency(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    quote_version_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT fiat_currency FROM invoice_quote_versions \
+          WHERE id = $1 AND invoice_id = $2 \
+            AND quote_purpose = 'payer_instruction'",
+    )
+    .bind(quote_version_id)
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await
 }
 
 #[derive(sqlx::FromRow)]
@@ -187,7 +268,6 @@ struct InvoiceQuoteEligibilityRow {
     fiat_currency: Option<String>,
     status: String,
     presentation_status: Option<String>,
-    settlement_status: String,
     before_invoice_expiry: bool,
 }
 
@@ -205,6 +285,7 @@ pub struct InvoiceQuoteOffer {
     pub request_key: String,
     pub provider: Option<String>,
     pub provider_offer_id: Option<String>,
+    pub provider_attempt_id: Option<Uuid>,
     pub payer_amount_sat: i64,
     pub created_at_unix: i64,
     pub expires_at_unix: i64,
@@ -212,7 +293,7 @@ pub struct InvoiceQuoteOffer {
 
 const INVOICE_QUOTE_OFFER_COLUMNS: &str =
     "id, invoice_id, quote_version_id, rail, offer_kind, request_key, \
-     provider, provider_offer_id, payer_amount_sat, \
+     provider, provider_offer_id, provider_attempt_id, payer_amount_sat, \
      FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT AS created_at_unix, \
      FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT AS expires_at_unix";
 
@@ -225,6 +306,7 @@ pub struct NewInvoiceQuoteOffer<'a> {
     pub request_key: &'a str,
     pub provider: Option<&'a str>,
     pub provider_offer_id: Option<&'a str>,
+    pub provider_attempt_id: Option<Uuid>,
     pub payer_amount_sat: i64,
     pub expires_at_unix: i64,
 }
@@ -233,6 +315,22 @@ pub struct NewInvoiceQuoteOffer<'a> {
 pub struct InvoiceQuoteOfferResolution {
     pub offer: InvoiceQuoteOffer,
     pub created: bool,
+}
+
+fn invoice_quote_offer_matches_candidate(
+    offer: &InvoiceQuoteOffer,
+    candidate: &NewInvoiceQuoteOffer<'_>,
+) -> bool {
+    offer.invoice_id == candidate.invoice_id
+        && offer.quote_version_id == candidate.quote_version_id
+        && offer.rail == candidate.rail
+        && offer.offer_kind == candidate.offer_kind
+        && offer.request_key == candidate.request_key
+        && offer.provider.as_deref() == candidate.provider
+        && offer.provider_offer_id.as_deref() == candidate.provider_offer_id
+        && offer.provider_attempt_id == candidate.provider_attempt_id
+        && offer.payer_amount_sat == candidate.payer_amount_sat
+        && offer.expires_at_unix == candidate.expires_at_unix
 }
 
 /// Immutable identity of the exact quote and payer instruction that produced
@@ -380,12 +478,12 @@ pub async fn insert_invoice(
              public_description, invoice_number, \
              accept_btc, accept_ln, accept_liquid, \
              bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
-             public_slug, expires_at, presentation_status) \
+             public_slug, expires_at, presentation_status, checkout_surface_kind) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  NOW() + ($8 || ' seconds')::interval, $9, $10, \
                  $11, $12, $13, $14, $15, $16, $17, \
-                 CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
-                 $20, NOW() + ($19 || ' seconds')::interval, 'unpaid') \
+                 CASE WHEN $4::INTEGER IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
+                 $20, NOW() + ($19 || ' seconds')::interval, 'unpaid', $21) \
          RETURNING {INVOICE_COLUMNS}"
     ))
     .bind(invoice.nym_owner)
@@ -408,6 +506,7 @@ pub async fn insert_invoice(
     .bind(invoice.liquid_blinding_key_hex)
     .bind(invoice.expires_in_secs)
     .bind(invoice.public_slug)
+    .bind(invoice.checkout_surface_kind)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -443,9 +542,9 @@ pub async fn insert_invoice(
 /// response loss therefore returns the committed version rather than adding a
 /// second one.
 ///
-/// Migration 061 deliberately accepts new versions only before payment
-/// evidence exists. This keeps the undecided expired-quote fiat-credit policy
-/// out of the foundation while still allowing old attributed offers to settle.
+/// Fully valued active partial evidence is subtracted under the same lock, so
+/// the next version prices only the remaining fiat. Any unvalued event keeps
+/// the separate late-observation policy fail-closed.
 pub async fn create_or_reuse_current_invoice_quote(
     pool: &PgPool,
     invoice_id: Uuid,
@@ -456,7 +555,7 @@ pub async fn create_or_reuse_current_invoice_quote(
 
     let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
         "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
-                    presentation_status, settlement_status, \
+                    presentation_status, \
                     expires_at > clock_timestamp() AS before_invoice_expiry \
                FROM invoices WHERE id = $1 FOR UPDATE",
     )
@@ -469,9 +568,14 @@ pub async fn create_or_reuse_current_invoice_quote(
     if invoice_state.pricing_mode != "fiat_fixed"
         || invoice_state.fiat_amount_minor.is_none()
         || invoice_state.fiat_currency.is_none()
-        || invoice_state.status != "unpaid"
-        || invoice_state.presentation_status.as_deref() != Some("unpaid")
-        || invoice_state.settlement_status != "none"
+        || !matches!(
+            invoice_state.status.as_str(),
+            "unpaid" | "partially_paid" | "in_progress"
+        )
+        || !matches!(
+            invoice_state.presentation_status.as_deref(),
+            Some("unpaid" | "partial")
+        )
         || !invoice_state.before_invoice_expiry
     {
         return Err(sqlx::Error::Protocol(
@@ -482,7 +586,8 @@ pub async fn create_or_reuse_current_invoice_quote(
     if let Some(quote) = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
         "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
            FROM invoice_quote_versions \
-          WHERE invoice_id = $1 AND expires_at > clock_timestamp() \
+          WHERE invoice_id = $1 AND quote_purpose = 'payer_instruction' \
+            AND expires_at > clock_timestamp() \
           ORDER BY version_number DESC LIMIT 1"
     ))
     .bind(invoice_id)
@@ -496,22 +601,77 @@ pub async fn create_or_reuse_current_invoice_quote(
         });
     }
 
+    let unresolved_event_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM invoice_payment_events \
+              WHERE invoice_id = $1 \
+                AND (quote_first_observed_at IS NULL \
+                     OR fiat_credited_minor IS NULL \
+                     OR fiat_credit_policy IS NULL \
+                     OR fiat_valued_at IS NULL \
+                     OR (source NOT IN ('bitcoin_direct', 'liquid_direct') \
+                         AND (invoice_quote_version_id IS NULL \
+                              OR invoice_quote_offer_id IS NULL))) \
+         )",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if unresolved_event_exists {
+        return Err(sqlx::Error::Protocol(
+            "invoice has payment evidence awaiting fiat valuation policy".into(),
+        ));
+    }
+
+    let active_fiat_credit: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+           FROM invoice_quote_active_fiat_projection WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let face_minor = i64::from(invoice_state.fiat_amount_minor.expect("validated above"));
+    let fiat_target_amount_minor = face_minor
+        .checked_sub(active_fiat_credit)
+        .ok_or_else(|| sqlx::Error::Protocol("active fiat credit exceeds invoice face".into()))?;
+    if fiat_target_amount_minor <= 0 || fiat_target_amount_minor > face_minor {
+        return Err(sqlx::Error::Protocol(
+            "invoice has no valid remaining fiat target".into(),
+        ));
+    }
+    let merchant_amount_sat = crate::fiat_quote_credit::merchant_amount_sat_for_quote(
+        fiat_target_amount_minor,
+        candidate.rate_minor_per_btc,
+    )
+    .map_err(|error| sqlx::Error::Protocol(format!("invalid fiat quote terms: {error}")))?;
+    if merchant_amount_sat < candidate.minimum_merchant_amount_sat
+        || merchant_amount_sat > candidate.maximum_merchant_amount_sat
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "quoted amount {merchant_amount_sat} sat is outside {}..={}",
+            candidate.minimum_merchant_amount_sat, candidate.maximum_merchant_amount_sat
+        )));
+    }
+
     let quote = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
         "INSERT INTO invoice_quote_versions ( \
-             invoice_id, rate_minor_per_btc, rate_source, rate_observed_at, \
+             invoice_id, quote_purpose, fiat_target_amount_minor, rate_minor_per_btc, rate_source, rate_observed_at, \
              rate_fetched_at, rate_fresh_until, merchant_amount_sat \
          ) VALUES ( \
-             $1, $2, $3, to_timestamp($4), to_timestamp($5), \
-             to_timestamp($6), $7 \
+             $1, 'payer_instruction', $2, $3, $4, to_timestamp($5), to_timestamp($6), \
+             to_timestamp($7), $8 \
          ) RETURNING {INVOICE_QUOTE_VERSION_COLUMNS}"
     ))
     .bind(invoice_id)
+    .bind(i32::try_from(fiat_target_amount_minor).map_err(|_| {
+        sqlx::Error::Protocol("remaining fiat target exceeds storage range".into())
+    })?)
     .bind(candidate.rate_minor_per_btc)
     .bind(candidate.rate_source)
     .bind(candidate.rate_observed_at_unix)
     .bind(candidate.rate_fetched_at_unix)
     .bind(candidate.rate_fresh_until_unix)
-    .bind(candidate.merchant_amount_sat)
+    .bind(merchant_amount_sat)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -520,6 +680,448 @@ pub async fn create_or_reuse_current_invoice_quote(
         quote,
         created: true,
     })
+}
+
+pub(crate) async fn late_observation_valuation_status_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    instruction_quote_version_id: Uuid,
+    first_observed_at_unix_micros: i64,
+) -> Result<LateObservationValuationStatus, sqlx::Error> {
+    let instruction: Option<(String, bool, bool)> = sqlx::query_as(
+        "SELECT fiat_currency, \
+                to_timestamp($3::NUMERIC / 1000000) >= created_at \
+                    AND to_timestamp($3::NUMERIC / 1000000) \
+                        <= clock_timestamp() + INTERVAL '30 seconds', \
+                to_timestamp($3::NUMERIC / 1000000) < expires_at \
+           FROM invoice_quote_versions \
+          WHERE id = $1 AND invoice_id = $2 \
+            AND quote_purpose = 'payer_instruction' \
+          FOR SHARE",
+    )
+    .bind(instruction_quote_version_id)
+    .bind(invoice_id)
+    .bind(first_observed_at_unix_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((fiat_currency, valid_observation, on_time)) = instruction else {
+        return Err(sqlx::Error::Protocol(
+            "late valuation instruction quote does not belong to the invoice".into(),
+        ));
+    };
+    if !valid_observation {
+        return Err(sqlx::Error::Protocol(
+            "late valuation observation is outside the admissible clock boundary".into(),
+        ));
+    }
+    if on_time {
+        return Ok(LateObservationValuationStatus::OnTime);
+    }
+
+    let covering = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
+        "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
+           FROM invoice_quote_versions \
+          WHERE invoice_id = $1 AND id <> $2 \
+            AND rate_observed_at <= to_timestamp($3::NUMERIC / 1000000) \
+            AND rate_fetched_at <= to_timestamp($3::NUMERIC / 1000000) \
+            AND to_timestamp($3::NUMERIC / 1000000) < rate_fresh_until \
+            AND ( \
+                (quote_purpose = 'payer_instruction' \
+                 AND created_at <= to_timestamp($3::NUMERIC / 1000000) \
+                 AND rate_fetched_at <= to_timestamp($3::NUMERIC / 1000000) \
+                 AND to_timestamp($3::NUMERIC / 1000000) < expires_at) \
+                OR quote_purpose = 'late_valuation' \
+            ) \
+          ORDER BY (quote_purpose = 'payer_instruction') DESC, \
+                   created_at DESC, version_number DESC \
+          LIMIT 1 FOR SHARE"
+    ))
+    .bind(invoice_id)
+    .bind(instruction_quote_version_id)
+    .bind(first_observed_at_unix_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match covering {
+        Some(quote) => LateObservationValuationStatus::Ready(quote),
+        None => LateObservationValuationStatus::NeedsRate { fiat_currency },
+    })
+}
+
+/// Inspect one exact first-observation boundary without contacting a rate
+/// provider or mutating quote state. Observers call this before any optional
+/// pricer refresh, so on-time and already-covered late payments stay network
+/// free.
+pub async fn late_observation_valuation_status(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    instruction_quote_version_id: Uuid,
+    first_observed_at_unix_micros: i64,
+) -> Result<LateObservationValuationStatus, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, invoice_id).await?;
+    let status = late_observation_valuation_status_locked(
+        &mut tx,
+        invoice_id,
+        instruction_quote_version_id,
+        first_observed_at_unix_micros,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(status)
+}
+
+/// Persist or reuse a valuation-only quote for a late observation. The caller
+/// supplies a pricer snapshot only after the read-only status call reports
+/// `NeedsRate`. This function rechecks under the invoice lock, so concurrent
+/// observers and a concurrent payer refresh converge on one covering snapshot.
+pub(crate) async fn create_or_reuse_late_observation_valuation_quote_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    instruction_quote_version_id: Uuid,
+    first_observed_at_unix_micros: i64,
+    candidate: &NewInvoiceQuoteVersion<'_>,
+) -> Result<InvoiceQuoteResolution, sqlx::Error> {
+    lock_invoice_lightning_projection(tx, invoice_id).await?;
+    match late_observation_valuation_status_locked(
+        tx,
+        invoice_id,
+        instruction_quote_version_id,
+        first_observed_at_unix_micros,
+    )
+    .await?
+    {
+        LateObservationValuationStatus::Ready(quote) => {
+            return Ok(InvoiceQuoteResolution {
+                quote,
+                created: false,
+            });
+        }
+        LateObservationValuationStatus::OnTime => {
+            return Err(sqlx::Error::Protocol(
+                "on-time payment observation must use its instruction quote".into(),
+            ));
+        }
+        LateObservationValuationStatus::NeedsRate { .. } => {}
+    }
+
+    let observation_micros = i128::from(first_observed_at_unix_micros);
+    let observed_micros = i128::from(candidate.rate_observed_at_unix)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| sqlx::Error::Protocol("rate observation timestamp overflow".into()))?;
+    let fetched_micros = i128::from(candidate.rate_fetched_at_unix)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| sqlx::Error::Protocol("rate fetch timestamp overflow".into()))?;
+    let fresh_until_micros = i128::from(candidate.rate_fresh_until_unix)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| sqlx::Error::Protocol("rate freshness timestamp overflow".into()))?;
+    if observed_micros > observation_micros
+        || fetched_micros > observation_micros
+        || observation_micros >= fresh_until_micros
+    {
+        return Err(sqlx::Error::Protocol(
+            "pricer snapshot does not cover the payment first-observation boundary".into(),
+        ));
+    }
+
+    let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
+                presentation_status, \
+                expires_at > clock_timestamp() AS before_invoice_expiry \
+           FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if invoice_state.pricing_mode != "fiat_fixed"
+        || invoice_state.fiat_amount_minor.is_none()
+        || invoice_state.fiat_currency.is_none()
+    {
+        return Err(sqlx::Error::Protocol(
+            "invoice is not eligible for late fiat valuation".into(),
+        ));
+    }
+    let active_fiat_credit: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+           FROM invoice_quote_active_fiat_projection WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let face_minor = i64::from(invoice_state.fiat_amount_minor.expect("validated above"));
+    let mut fiat_target_amount_minor = face_minor
+        .checked_sub(active_fiat_credit)
+        .ok_or_else(|| sqlx::Error::Protocol("active fiat credit exceeds invoice face".into()))?;
+    if fiat_target_amount_minor <= 0 {
+        fiat_target_amount_minor = face_minor;
+    }
+    if fiat_target_amount_minor <= 0 || fiat_target_amount_minor > face_minor {
+        return Err(sqlx::Error::Protocol(
+            "invoice has no valid remaining fiat target for late valuation".into(),
+        ));
+    }
+    let merchant_amount_sat = crate::fiat_quote_credit::merchant_amount_sat_for_quote(
+        fiat_target_amount_minor,
+        candidate.rate_minor_per_btc,
+    )
+    .map_err(|error| sqlx::Error::Protocol(format!("invalid fiat quote terms: {error}")))?;
+    if merchant_amount_sat < candidate.minimum_merchant_amount_sat
+        || merchant_amount_sat > candidate.maximum_merchant_amount_sat
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "late valuation amount {merchant_amount_sat} sat is outside {}..={}",
+            candidate.minimum_merchant_amount_sat, candidate.maximum_merchant_amount_sat
+        )));
+    }
+
+    let quote =
+        sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
+            "INSERT INTO invoice_quote_versions ( \
+             invoice_id, quote_purpose, fiat_target_amount_minor, rate_minor_per_btc, \
+             rate_source, rate_observed_at, rate_fetched_at, rate_fresh_until, \
+             merchant_amount_sat, late_instruction_quote_version_id, late_observation_at \
+         ) VALUES ( \
+             $1, 'late_valuation', $2, $3, $4, to_timestamp($5), \
+             to_timestamp($6), to_timestamp($7), $8, $9, \
+             to_timestamp($10::NUMERIC / 1000000) \
+         ) RETURNING {INVOICE_QUOTE_VERSION_COLUMNS}"
+        ))
+        .bind(invoice_id)
+        .bind(i32::try_from(fiat_target_amount_minor).map_err(|_| {
+            sqlx::Error::Protocol("remaining fiat target exceeds storage range".into())
+        })?)
+        .bind(candidate.rate_minor_per_btc)
+        .bind(candidate.rate_source)
+        .bind(candidate.rate_observed_at_unix)
+        .bind(candidate.rate_fetched_at_unix)
+        .bind(candidate.rate_fresh_until_unix)
+        .bind(merchant_amount_sat)
+        .bind(instruction_quote_version_id)
+        .bind(first_observed_at_unix_micros)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(InvoiceQuoteResolution {
+        quote,
+        created: true,
+    })
+}
+
+/// Apply a pre-fetched candidate at the exact transaction which durably stamps
+/// first observation. A stale/non-covering candidate is a normal fail-closed
+/// outcome: the caller must still commit the payment observation itself.
+pub(crate) async fn capture_late_observation_candidate_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    observation: PersistedInvoiceQuoteObservation,
+    candidate: &NewInvoiceQuoteVersion<'_>,
+) -> Result<bool, sqlx::Error> {
+    match late_observation_valuation_status_locked(
+        tx,
+        observation.invoice_id,
+        observation.instruction_quote_version_id,
+        observation.first_observed_at_unix_micros,
+    )
+    .await?
+    {
+        LateObservationValuationStatus::OnTime | LateObservationValuationStatus::Ready(_) => {
+            Ok(true)
+        }
+        LateObservationValuationStatus::NeedsRate { .. } => {
+            let observation_micros = i128::from(observation.first_observed_at_unix_micros);
+            let observed_micros = i128::from(candidate.rate_observed_at_unix) * 1_000_000;
+            let fetched_micros = i128::from(candidate.rate_fetched_at_unix) * 1_000_000;
+            let fresh_until_micros = i128::from(candidate.rate_fresh_until_unix) * 1_000_000;
+            if observed_micros > observation_micros
+                || fetched_micros > observation_micros
+                || observation_micros >= fresh_until_micros
+            {
+                return Ok(false);
+            }
+            let still_fresh: bool =
+                sqlx::query_scalar("SELECT to_timestamp($1) > clock_timestamp()")
+                    .bind(candidate.rate_fresh_until_unix)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if !still_fresh {
+                return Ok(false);
+            }
+            create_or_reuse_late_observation_valuation_quote_locked(
+                tx,
+                observation.invoice_id,
+                observation.instruction_quote_version_id,
+                observation.first_observed_at_unix_micros,
+                candidate,
+            )
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
+/// Attach valuation authority to one direct-chain output without claiming the
+/// payer used any particular refreshed instruction. The stable invoice
+/// address plus the immutable observation row are the only direct lineage.
+/// A payer quote may value an observation inside its window; otherwise a
+/// fresh candidate must cover the exact durable first-seen boundary.
+pub(crate) async fn capture_direct_observation_candidate_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    observation_id: Uuid,
+    first_observed_at_unix_micros: i64,
+    candidate: &NewInvoiceQuoteVersion<'_>,
+) -> Result<bool, sqlx::Error> {
+    lock_invoice_lightning_projection(tx, invoice_id).await?;
+    let fiat_currency: Option<String> = sqlx::query_scalar(
+        "SELECT i.fiat_currency \
+           FROM invoices i \
+           JOIN invoice_payment_observations o ON o.invoice_id = i.id \
+          WHERE i.id = $1 AND i.pricing_mode = 'fiat_fixed' \
+            AND o.id = $2 \
+            AND o.source IN ('bitcoin_direct', 'liquid_direct') \
+            AND o.first_seen_at = to_timestamp($3::NUMERIC / 1000000) \
+            AND o.first_seen_at <= clock_timestamp() + INTERVAL '30 seconds' \
+            AND ( \
+                (o.rail = 'liquid' AND o.address = i.liquid_address) \
+                OR (o.rail = 'bitcoin' AND o.address = i.bitcoin_address) \
+            ) \
+          FOR SHARE OF i, o",
+    )
+    .bind(invoice_id)
+    .bind(observation_id)
+    .bind(first_observed_at_unix_micros)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    if fiat_currency.is_none() {
+        return Err(sqlx::Error::Protocol(
+            "direct fiat valuation lacks its stable-address observation authority".into(),
+        ));
+    }
+
+    let covering_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM invoice_quote_versions q \
+              WHERE q.invoice_id = $1 \
+                AND ( \
+                    (q.quote_purpose = 'payer_instruction' \
+                     AND q.created_at <= to_timestamp($2::NUMERIC / 1000000) \
+                     AND to_timestamp($2::NUMERIC / 1000000) < q.expires_at) \
+                    OR (q.quote_purpose = 'late_valuation' \
+                        AND q.rate_observed_at <= to_timestamp($2::NUMERIC / 1000000) \
+                        AND q.rate_fetched_at <= to_timestamp($2::NUMERIC / 1000000) \
+                        AND to_timestamp($2::NUMERIC / 1000000) < q.rate_fresh_until) \
+                ) \
+         )",
+    )
+    .bind(invoice_id)
+    .bind(first_observed_at_unix_micros)
+    .fetch_one(&mut **tx)
+    .await?;
+    if covering_exists {
+        return Ok(true);
+    }
+
+    let observation_micros = i128::from(first_observed_at_unix_micros);
+    let observed_micros = i128::from(candidate.rate_observed_at_unix) * 1_000_000;
+    let fetched_micros = i128::from(candidate.rate_fetched_at_unix) * 1_000_000;
+    let fresh_until_micros = i128::from(candidate.rate_fresh_until_unix) * 1_000_000;
+    if observed_micros > observation_micros
+        || fetched_micros > observation_micros
+        || observation_micros >= fresh_until_micros
+    {
+        return Ok(false);
+    }
+    let still_fresh: bool = sqlx::query_scalar("SELECT to_timestamp($1) > clock_timestamp()")
+        .bind(candidate.rate_fresh_until_unix)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !still_fresh {
+        return Ok(false);
+    }
+
+    let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
+                presentation_status, \
+                expires_at > clock_timestamp() AS before_invoice_expiry \
+           FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let face_minor = i64::from(invoice_state.fiat_amount_minor.ok_or_else(|| {
+        sqlx::Error::Protocol("direct fiat invoice is missing its face amount".into())
+    })?);
+    let active_fiat_credit: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+           FROM invoice_quote_active_fiat_projection WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut target_minor = face_minor
+        .checked_sub(active_fiat_credit)
+        .ok_or_else(|| sqlx::Error::Protocol("active fiat credit exceeds invoice face".into()))?;
+    if target_minor <= 0 {
+        target_minor = face_minor;
+    }
+    let merchant_amount_sat = crate::fiat_quote_credit::merchant_amount_sat_for_quote(
+        target_minor,
+        candidate.rate_minor_per_btc,
+    )
+    .map_err(|error| sqlx::Error::Protocol(format!("invalid fiat quote terms: {error}")))?;
+    if merchant_amount_sat < candidate.minimum_merchant_amount_sat
+        || merchant_amount_sat > candidate.maximum_merchant_amount_sat
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "direct valuation amount {merchant_amount_sat} sat is outside {}..={}",
+            candidate.minimum_merchant_amount_sat, candidate.maximum_merchant_amount_sat
+        )));
+    }
+
+    sqlx::query(
+        "INSERT INTO invoice_quote_versions ( \
+             invoice_id, quote_purpose, fiat_target_amount_minor, \
+             rate_minor_per_btc, rate_source, rate_observed_at, rate_fetched_at, \
+             rate_fresh_until, merchant_amount_sat, \
+             late_instruction_quote_version_id, late_observation_at \
+         ) VALUES ( \
+             $1, 'late_valuation', $2, $3, $4, to_timestamp($5), \
+             to_timestamp($6), to_timestamp($7), $8, NULL, \
+             to_timestamp($9::NUMERIC / 1000000) \
+         )",
+    )
+    .bind(invoice_id)
+    .bind(i32::try_from(target_minor).map_err(|_| {
+        sqlx::Error::Protocol("direct valuation target exceeds storage range".into())
+    })?)
+    .bind(candidate.rate_minor_per_btc)
+    .bind(candidate.rate_source)
+    .bind(candidate.rate_observed_at_unix)
+    .bind(candidate.rate_fetched_at_unix)
+    .bind(candidate.rate_fresh_until_unix)
+    .bind(merchant_amount_sat)
+    .bind(first_observed_at_unix_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+pub async fn create_or_reuse_late_observation_valuation_quote(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    instruction_quote_version_id: Uuid,
+    first_observed_at_unix_micros: i64,
+    candidate: &NewInvoiceQuoteVersion<'_>,
+) -> Result<InvoiceQuoteResolution, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let resolution = create_or_reuse_late_observation_valuation_quote_locked(
+        &mut tx,
+        invoice_id,
+        instruction_quote_version_id,
+        first_observed_at_unix_micros,
+        candidate,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(resolution)
 }
 
 /// Read-only current-quote lookup. It never fetches a rate or creates a
@@ -531,12 +1133,149 @@ pub async fn current_invoice_quote<'e, E: sqlx::PgExecutor<'e>>(
     sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
         "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
            FROM invoice_quote_versions \
-          WHERE invoice_id = $1 AND expires_at > clock_timestamp() \
+          WHERE invoice_id = $1 AND quote_purpose = 'payer_instruction' \
+            AND expires_at > clock_timestamp() \
           ORDER BY version_number DESC LIMIT 1"
     ))
     .bind(invoice_id)
     .fetch_optional(executor)
     .await
+}
+
+/// Recomputed fiat projection used by every payment reducer. Immutable event
+/// deltas remain audit evidence; current accounting and presentation are
+/// derived cumulatively per quote so split payments and reorgs are order-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct FiatInvoiceCreditProjection {
+    pub face_minor: i64,
+    pub active_credit_minor: i64,
+    pub presentation_credit_minor: i64,
+    pub active_overpaid: bool,
+    pub presentation_overpaid: bool,
+    pub unresolved_evidence: bool,
+}
+
+pub(crate) async fn invoice_fiat_credit_projection<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<FiatInvoiceCreditProjection, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "WITH per_quote AS ( \
+             SELECT q.id, p.active_fiat_credited_minor, \
+                    p.active_eligible_sat > q.merchant_amount_sat AS active_overpaid, \
+                    COALESCE(SUM(e.amount_sat) FILTER (WHERE \
+                        e.fiat_credited_minor IS NOT NULL \
+                        AND e.accounting_state <> 'superseded' \
+                        AND ( \
+                          e.accounting_state IN ('active', 'legacy_unverified') \
+                          OR (e.source IN ('bitcoin_direct', 'liquid_direct') \
+                              AND e.verification_state = 'verified' \
+                              AND o.last_seen_state = 'seen_unconfirmed') \
+                        ) \
+                    ), 0)::BIGINT AS presentation_eligible_sat, \
+                    q.fiat_target_amount_minor, q.merchant_amount_sat, \
+                    q.rate_minor_per_btc \
+               FROM invoice_quote_versions q \
+               JOIN invoice_quote_active_fiat_projection p \
+                 ON p.quote_version_id = q.id \
+          LEFT JOIN invoice_payment_events e \
+                 ON e.invoice_id = q.invoice_id \
+                AND e.fiat_valuation_quote_version_id = q.id \
+          LEFT JOIN invoice_payment_observations o ON o.id = e.observation_id \
+              WHERE q.invoice_id = $1 \
+           GROUP BY q.id, p.active_fiat_credited_minor, p.active_eligible_sat \
+         ), projected AS ( \
+             SELECT COALESCE(SUM(active_fiat_credited_minor), 0)::BIGINT \
+                        AS active_credit_minor, \
+                    COALESCE(SUM(invoice_quote_credit_for_sats( \
+                        fiat_target_amount_minor, merchant_amount_sat, \
+                        rate_minor_per_btc, presentation_eligible_sat \
+                    )), 0)::BIGINT AS presentation_credit_minor, \
+                    COALESCE(BOOL_OR(active_overpaid), FALSE) AS active_overpaid, \
+                    COALESCE(BOOL_OR( \
+                        presentation_eligible_sat > merchant_amount_sat \
+                    ), FALSE) AS presentation_overpaid \
+               FROM per_quote \
+         ) \
+         SELECT i.fiat_amount_minor::BIGINT AS face_minor, \
+                projected.active_credit_minor, projected.presentation_credit_minor, \
+                (projected.active_overpaid \
+                 OR projected.active_credit_minor > i.fiat_amount_minor) AS active_overpaid, \
+                (projected.presentation_overpaid \
+                 OR projected.presentation_credit_minor > i.fiat_amount_minor) \
+                    AS presentation_overpaid, \
+                EXISTS ( \
+                    SELECT 1 FROM invoice_payment_events e \
+                     WHERE e.invoice_id = i.id \
+                       AND (e.quote_first_observed_at IS NULL \
+                            OR e.fiat_credited_minor IS NULL \
+                            OR e.fiat_credit_policy IS NULL \
+                            OR e.fiat_valued_at IS NULL \
+                            OR (e.source NOT IN ('bitcoin_direct', 'liquid_direct') \
+                                AND (e.invoice_quote_version_id IS NULL \
+                                     OR e.invoice_quote_offer_id IS NULL))) \
+                ) AS unresolved_evidence \
+           FROM invoices i CROSS JOIN projected \
+          WHERE i.id = $1 AND i.pricing_mode = 'fiat_fixed' \
+            AND i.fiat_amount_minor IS NOT NULL",
+    )
+    .bind(invoice_id)
+    .fetch_one(executor)
+    .await
+}
+
+pub(crate) fn fiat_invoice_status(
+    prior_status: &str,
+    projection: FiatInvoiceCreditProjection,
+    expired: bool,
+) -> &'static str {
+    if prior_status == "cancelled" {
+        return "cancelled";
+    }
+    if prior_status == "expired" {
+        return "expired";
+    }
+    if projection.unresolved_evidence && projection.active_credit_minor < projection.face_minor {
+        return "in_progress";
+    }
+    if projection.active_credit_minor >= projection.face_minor {
+        if projection.active_overpaid {
+            "overpaid"
+        } else {
+            "paid"
+        }
+    } else if projection.active_credit_minor > 0 {
+        if expired {
+            "underpaid"
+        } else {
+            "partially_paid"
+        }
+    } else if projection.presentation_credit_minor > 0 {
+        "in_progress"
+    } else if expired {
+        "underpaid"
+    } else {
+        "unpaid"
+    }
+}
+
+pub(crate) fn fiat_invoice_presentation_status(
+    projection: FiatInvoiceCreditProjection,
+) -> &'static str {
+    if projection.presentation_credit_minor >= projection.face_minor {
+        if projection.presentation_overpaid {
+            "overpaid"
+        } else {
+            "payment_received"
+        }
+    } else if projection.presentation_credit_minor > 0 {
+        "partial"
+    } else {
+        "unpaid"
+    }
 }
 
 /// Persist or replay one already-created direct/provider offer identity. The
@@ -547,7 +1286,86 @@ pub async fn record_or_reuse_invoice_quote_offer(
     candidate: &NewInvoiceQuoteOffer<'_>,
 ) -> Result<InvoiceQuoteOfferResolution, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    lock_invoice_lightning_projection(&mut tx, candidate.invoice_id).await?;
+    let resolution = record_or_reuse_invoice_quote_offer_in_tx(&mut tx, candidate).await?;
+    tx.commit().await?;
+    Ok(resolution)
+}
+
+/// Exact immutable offer for one invoice/quote/rail. More than one row is a
+/// protocol violation rather than an arbitrary latest-wins choice.
+pub async fn invoice_quote_offer_for_rail<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+    quote_version_id: Uuid,
+    rail: &str,
+) -> Result<Option<InvoiceQuoteOffer>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
+        "SELECT {INVOICE_QUOTE_OFFER_COLUMNS} FROM invoice_quote_offers \
+          WHERE invoice_id = $1 AND quote_version_id = $2 AND rail = $3 \
+          ORDER BY created_at, id LIMIT 2"
+    ))
+    .bind(invoice_id)
+    .bind(quote_version_id)
+    .bind(rail)
+    .fetch_all(executor)
+    .await?;
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.into_iter().next()),
+        _ => Err(sqlx::Error::Protocol(format!(
+            "invoice quote has multiple {rail} payer offers"
+        ))),
+    }
+}
+
+/// Return the persisted BOLT11 only when the exact quote offer and canonical
+/// reverse-swap row still agree and remain unfunded/payable.
+pub async fn lightning_pr_for_invoice_quote_offer<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+    quote_version_id: Uuid,
+    quote_offer_id: Uuid,
+    provider_offer_id: &str,
+) -> Result<Option<(String, i64)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT swap.invoice, swap.amount_sat \
+           FROM swap_records swap \
+           JOIN invoice_quote_offers offer \
+             ON offer.id = swap.invoice_quote_offer_id \
+            AND offer.quote_version_id = swap.invoice_quote_version_id \
+            AND offer.invoice_id = swap.invoice_id \
+          WHERE swap.invoice_id = $1 \
+            AND swap.invoice_quote_version_id = $2 \
+            AND swap.invoice_quote_offer_id = $3 \
+            AND swap.boltz_swap_id = $4 \
+            AND swap.status = 'pending' \
+            AND offer.rail = 'lightning' \
+            AND offer.offer_kind = 'boltz_reverse' \
+            AND offer.provider = 'boltz' \
+            AND offer.provider_offer_id = swap.boltz_swap_id",
+    )
+    .bind(invoice_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
+    .bind(provider_offer_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Transaction-aware quote-offer persistence for provider paths that must
+/// commit the immutable offer identity and canonical swap attribution on the
+/// same invoice-locking connection.
+pub async fn record_or_reuse_invoice_quote_offer_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &NewInvoiceQuoteOffer<'_>,
+) -> Result<InvoiceQuoteOfferResolution, sqlx::Error> {
+    lock_invoice_lightning_projection(tx, candidate.invoice_id).await?;
 
     if let Some(offer) = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
         "SELECT {INVOICE_QUOTE_OFFER_COLUMNS} \
@@ -557,21 +1375,14 @@ pub async fn record_or_reuse_invoice_quote_offer(
     .bind(candidate.quote_version_id)
     .bind(candidate.rail)
     .bind(candidate.request_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     {
-        if offer.invoice_id != candidate.invoice_id
-            || offer.offer_kind != candidate.offer_kind
-            || offer.provider.as_deref() != candidate.provider
-            || offer.provider_offer_id.as_deref() != candidate.provider_offer_id
-            || offer.payer_amount_sat != candidate.payer_amount_sat
-            || offer.expires_at_unix != candidate.expires_at_unix
-        {
+        if !invoice_quote_offer_matches_candidate(&offer, candidate) {
             return Err(sqlx::Error::Protocol(
                 "invoice quote offer request key was replayed with different evidence".to_string(),
             ));
         }
-        tx.commit().await?;
         return Ok(InvoiceQuoteOfferResolution {
             offer,
             created: false,
@@ -581,13 +1392,9 @@ pub async fn record_or_reuse_invoice_quote_offer(
     let offer = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
         "INSERT INTO invoice_quote_offers ( \
              invoice_id, quote_version_id, rail, offer_kind, request_key, \
-             provider, provider_offer_id, payer_amount_sat, expires_at \
+             provider, provider_offer_id, provider_attempt_id, payer_amount_sat, expires_at \
          ) VALUES ( \
-             $1, $2, $3, $4, $5, $6, $7, $8, \
-             CASE WHEN $4 = 'direct' THEN ( \
-                 SELECT expires_at FROM invoice_quote_versions \
-                  WHERE id = $2 AND invoice_id = $1 \
-             ) ELSE to_timestamp($9) END \
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10) \
          ) \
          RETURNING {INVOICE_QUOTE_OFFER_COLUMNS}"
     ))
@@ -598,12 +1405,12 @@ pub async fn record_or_reuse_invoice_quote_offer(
     .bind(candidate.request_key)
     .bind(candidate.provider)
     .bind(candidate.provider_offer_id)
+    .bind(candidate.provider_attempt_id)
     .bind(candidate.payer_amount_sat)
     .bind(candidate.expires_at_unix)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(InvoiceQuoteOfferResolution {
         offer,
         created: true,
@@ -687,11 +1494,12 @@ pub async fn list_invoices_by_npub<'e, E: sqlx::PgExecutor<'e>>(
 /// completed range from deferred work without a count.
 const LIQUID_WATCHER_BATCH_SIZE: usize = 1_000;
 
-pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
-            GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
-            liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
-     FROM invoices \
-     WHERE ( \
+pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "WITH targets AS ( \
+       SELECT invoices.id, invoices.id AS invoice_id, liquid_address, \
+              GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
+              liquid_blinding_key_hex, created_at, fiat_currency \
+         FROM invoices \
+        WHERE ( \
              ( \
                (status IN ('unpaid', 'in_progress', 'partially_paid') \
                 OR (origin = 'checkout' AND status = 'underpaid')) \
@@ -713,10 +1521,14 @@ pub(crate) const LIQUID_WATCHER_PAGE_SQL: &str = "SELECT id, liquid_address, \
                     AND direct_event.superseded_by_event_id IS NULL \
              ) \
            ) \
-       AND accept_liquid = TRUE \
-       AND liquid_address IS NOT NULL \
-       AND liquid_blinding_key_hex IS NOT NULL \
-       AND created_at <= $2::timestamptz \
+          AND accept_liquid = TRUE \
+          AND liquid_address IS NOT NULL \
+          AND liquid_blinding_key_hex IS NOT NULL \
+     ) \
+     SELECT id, invoice_id, liquid_address, amount_sat, liquid_blinding_key_hex, fiat_currency, \
+            created_at::TEXT AS created_at_cursor \
+       FROM targets \
+      WHERE created_at <= $2::timestamptz \
        AND ( \
              $3::timestamptz IS NULL \
              OR (created_at, id) > ($3::timestamptz, $4::uuid) \
@@ -763,12 +1575,17 @@ pub(crate) const LIQUID_WATCHER_RECENT_PREDICATE_SQL: &str = "( \
 /// canonical priority predicate above or its exact negation. Eligibility
 /// deliberately matches the compatibility query so lifecycle closure cannot
 /// erase late-money or reorg obligations.
-pub(crate) const LIQUID_WATCHER_LANE_PAGE_SQL: &str = "SELECT id, liquid_address, \
-            GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
-            liquid_blinding_key_hex, created_at::TEXT AS created_at_cursor \
-     FROM invoices \
-     WHERE {eligible} \
-       AND {lane_predicate} \
+pub(crate) const LIQUID_WATCHER_LANE_PAGE_SQL: &str = "WITH targets AS ( \
+       SELECT invoices.id, invoices.id AS invoice_id, liquid_address, \
+              GREATEST(amount_sat - COALESCE(paid_amount_sat, 0), 0) AS amount_sat, \
+              liquid_blinding_key_hex, created_at, presentation_status, \
+              direct_settlement_status, fiat_currency \
+         FROM invoices WHERE {eligible} \
+     ) \
+     SELECT id, invoice_id, liquid_address, amount_sat, liquid_blinding_key_hex, fiat_currency, \
+            created_at::TEXT AS created_at_cursor \
+       FROM targets \
+      WHERE {lane_predicate} \
        AND created_at <= $2::timestamptz \
        AND ( \
              $4::timestamptz IS NULL \
@@ -781,7 +1598,10 @@ pub(crate) const LIQUID_WATCHER_LANE_PAGE_SQL: &str = "SELECT id, liquid_address
      ORDER BY created_at ASC, id ASC \
      LIMIT $8";
 
-pub(crate) const LIQUID_WATCHER_LANE_LAG_SQL: &str = "SELECT \
+pub(crate) const LIQUID_WATCHER_LANE_LAG_SQL: &str = "WITH targets AS ( \
+       SELECT invoices.id, created_at, presentation_status, direct_settlement_status \
+         FROM invoices WHERE {eligible} \
+     ) SELECT \
             COUNT(*)::BIGINT, \
             MIN(created_at)::TEXT, \
             COALESCE( \
@@ -793,9 +1613,8 @@ pub(crate) const LIQUID_WATCHER_LANE_LAG_SQL: &str = "SELECT \
                 ), \
                 0 \
             )::BIGINT \
-     FROM invoices \
-     WHERE {eligible} \
-       AND {lane_predicate} \
+     FROM targets \
+     WHERE {lane_predicate} \
        AND created_at <= $2::timestamptz";
 
 type LiquidWatcherInvoice = (Uuid, String, i64, String);
@@ -839,10 +1658,13 @@ impl WatcherScanEpoch {
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct LiquidWatcherInvoicePageRow {
+    /// The stable invoice id is the unique direct-Liquid scan target.
     pub id: Uuid,
+    pub invoice_id: Uuid,
     pub liquid_address: String,
     pub amount_sat: i64,
     pub liquid_blinding_key_hex: String,
+    pub fiat_currency: Option<String>,
     pub created_at_cursor: String,
 }
 
@@ -967,7 +1789,7 @@ pub async fn list_unpaid_invoices_with_liquid_address_batch(
         .into_iter()
         .map(|row| {
             (
-                row.id,
+                row.invoice_id,
                 row.liquid_address,
                 row.amount_sat,
                 row.liquid_blinding_key_hex,
@@ -1461,18 +2283,27 @@ pub async fn record_invoice_payment_with_quote_attribution(
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedProviderQuoteAttribution {
+    attribution: InvoiceQuoteAttribution,
+    first_observed_at_unix_micros: i64,
+}
+
+type PersistedProviderQuoteAttributionRow = (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<i64>);
+
 async fn persisted_provider_quote_attribution(
     tx: &mut Transaction<'_, Postgres>,
     invoice_id: Uuid,
     evidence: &InvoicePaymentEvidence<'_>,
-) -> Result<Option<InvoiceQuoteAttribution>, sqlx::Error> {
+) -> Result<Option<PersistedProviderQuoteAttribution>, sqlx::Error> {
     let Some(boltz_swap_id) = evidence.boltz_swap_id else {
         return Ok(None);
     };
-    let row: Option<(Option<Uuid>, Option<Uuid>, Option<Uuid>)> = match evidence.source {
+    let row: Option<PersistedProviderQuoteAttributionRow> = match evidence.source {
         "lightning_boltz_reverse" => {
             sqlx::query_as(
-                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id \
+                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id, \
+                        (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
                FROM swap_records WHERE boltz_swap_id = $1",
             )
             .bind(boltz_swap_id)
@@ -1481,7 +2312,8 @@ async fn persisted_provider_quote_attribution(
         }
         "bitcoin_boltz_chain" => {
             sqlx::query_as(
-                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id \
+                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id, \
+                        (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
                FROM chain_swap_records WHERE boltz_swap_id = $1",
             )
             .bind(boltz_swap_id)
@@ -1490,9 +2322,13 @@ async fn persisted_provider_quote_attribution(
         }
         _ => None,
     };
-    let Some((persisted_invoice_id, quote_version_id, quote_offer_id)) = row else {
-        // Compatibility writers historically accepted settlement evidence
-        // before a swap-row lookup was required. Keep that NULL path explicit.
+    let Some((
+        persisted_invoice_id,
+        quote_version_id,
+        quote_offer_id,
+        first_observed_at_unix_micros,
+    )) = row
+    else {
         return Ok(None);
     };
     if persisted_invoice_id != Some(invoice_id) {
@@ -1502,10 +2338,20 @@ async fn persisted_provider_quote_attribution(
     }
     match (quote_version_id, quote_offer_id) {
         (None, None) => Ok(None),
-        (Some(quote_version_id), Some(quote_offer_id)) => Ok(Some(InvoiceQuoteAttribution {
-            quote_version_id,
-            quote_offer_id,
-        })),
+        (Some(quote_version_id), Some(quote_offer_id)) => {
+            let first_observed_at_unix_micros = first_observed_at_unix_micros.ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "quote-attributed provider settlement lacks durable first-observed time".into(),
+                )
+            })?;
+            Ok(Some(PersistedProviderQuoteAttribution {
+                attribution: InvoiceQuoteAttribution {
+                    quote_version_id,
+                    quote_offer_id,
+                },
+                first_observed_at_unix_micros,
+            }))
+        }
         _ => Err(sqlx::Error::Protocol(
             "provider settlement swap has partial quote attribution".into(),
         )),
@@ -1560,15 +2406,27 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     let persisted_attribution =
         persisted_provider_quote_attribution(&mut tx, id, &evidence).await?;
     let attribution = match (requested_attribution, persisted_attribution) {
-        (Some(requested), Some(persisted)) if requested != persisted => {
+        (Some(requested), Some(persisted)) if requested != persisted.attribution => {
             return Err(sqlx::Error::Protocol(
                 "payment quote attribution conflicts with its persisted provider swap".into(),
             ));
         }
-        (Some(requested), _) => Some(requested),
-        (None, persisted) => persisted,
+        (Some(requested), Some(persisted)) => {
+            Some((requested, persisted.first_observed_at_unix_micros))
+        }
+        (Some(_), None) => {
+            return Err(sqlx::Error::Protocol(
+                "quote-attributed payment requires durable provider observation evidence".into(),
+            ));
+        }
+        (None, persisted) => persisted.map(|persisted| {
+            (
+                persisted.attribution,
+                persisted.first_observed_at_unix_micros,
+            )
+        }),
     };
-    if let Some(attribution) = attribution {
+    if let Some((attribution, _)) = attribution {
         let (rail, offer_kind, provider, provider_offer_id) = payment_offer_identity(&evidence);
         if evidence.rail != rail {
             return Err(sqlx::Error::Protocol(
@@ -1624,7 +2482,8 @@ async fn record_invoice_payment_with_optional_quote_attribution(
              boltz_swap_id, address, accounting_state, verification_state, \
              invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-                 CASE WHEN $12::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
+                 CASE WHEN $12::UUID IS NULL THEN NULL \
+                      ELSE to_timestamp($14::NUMERIC / 1000000) END) \
          ON CONFLICT (event_key) DO NOTHING \
          RETURNING id",
     )
@@ -1639,8 +2498,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(evidence.address)
     .bind(accounting_state)
     .bind(verification_state)
-    .bind(attribution.map(|attribution| attribution.quote_version_id))
-    .bind(attribution.map(|attribution| attribution.quote_offer_id))
+    .bind(attribution.map(|(attribution, _)| attribution.quote_version_id))
+    .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
+    .bind(attribution.map(|(_, first_observed_at_unix_micros)| first_observed_at_unix_micros))
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -1668,8 +2528,8 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         .bind(evidence.vout)
         .bind(evidence.boltz_swap_id)
         .bind(evidence.address)
-        .bind(attribution.map(|attribution| attribution.quote_version_id))
-        .bind(attribution.map(|attribution| attribution.quote_offer_id))
+        .bind(attribution.map(|(attribution, _)| attribution.quote_version_id))
+        .bind(attribution.map(|(attribution, _)| attribution.quote_offer_id))
         .fetch_optional(&mut *tx)
         .await?;
         existing.ok_or_else(|| {
@@ -1785,6 +2645,11 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
+    let fiat_projection = if inv.pricing_mode == "fiat_fixed" {
+        Some(invoice_fiat_credit_projection(&mut *tx, id).await?)
+    } else {
+        None
+    };
     let tolerance_sat = invoice_payment_tolerance_sat(
         inv.amount_sat,
         inv.accept_btc,
@@ -1792,11 +2657,16 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         inv.accept_ln,
         tolerances,
     );
-    let presentation_status = resolve_invoice_presentation_status(
-        &inv.status,
-        inv.amount_sat,
-        &presentation_events,
-        tolerance_sat,
+    let presentation_status = fiat_projection.map_or_else(
+        || {
+            resolve_invoice_presentation_status(
+                &inv.status,
+                inv.amount_sat,
+                &presentation_events,
+                tolerance_sat,
+            )
+        },
+        fiat_invoice_presentation_status,
     );
 
     let rails: Vec<(String,)> = sqlx::query_as(
@@ -1815,19 +2685,23 @@ async fn record_invoice_payment_with_optional_quote_attribution(
     };
 
     let expired = inv.expires_at_unix <= chrono_like_unix_now();
-    let new_status = match inv.status.as_str() {
-        // Cancellation/expiry close instructions but remain durable lifecycle
-        // markers after money lands. `presentation_status`, `paid_via`, and
-        // `paid_amount_sat` carry the honest payment projection.
-        "cancelled" => "cancelled",
-        "expired" => "expired",
-        _ => resolve_invoice_status(
-            &inv.status,
-            inv.amount_sat,
-            received_sat,
-            tolerance_sat,
-            expired,
-        ),
+    let new_status = if let Some(projection) = fiat_projection {
+        fiat_invoice_status(&inv.status, projection, expired)
+    } else {
+        match inv.status.as_str() {
+            // Cancellation/expiry close instructions but remain durable lifecycle
+            // markers after money lands. `presentation_status`, `paid_via`, and
+            // `paid_amount_sat` carry the honest payment projection.
+            "cancelled" => "cancelled",
+            "expired" => "expired",
+            _ => resolve_invoice_status(
+                &inv.status,
+                inv.amount_sat,
+                received_sat,
+                tolerance_sat,
+                expired,
+            ),
+        }
     };
     let payment_settlement_status =
         if matches!(presentation_status, "payment_received" | "overpaid") {
@@ -2701,6 +3575,9 @@ mod status_tests {
 
     #[test]
     fn liquid_watcher_keeps_all_live_direct_evidence_in_cohort() {
+        assert!(!LIQUID_WATCHER_PAGE_SQL.contains("invoice_quote_offers"));
+        assert!(!LIQUID_WATCHER_LANE_PAGE_SQL.contains("invoice_quote_offers"));
+        assert!(!LIQUID_WATCHER_LANE_LAG_SQL.contains("invoice_quote_offers"));
         assert!(LIQUID_WATCHER_PAGE_SQL.contains("OR status IN ('cancelled', 'expired')"));
         assert!(!LIQUID_WATCHER_PAGE_SQL.contains("status NOT IN ('cancelled', 'expired')"));
         assert!(LIQUID_WATCHER_PAGE_SQL
