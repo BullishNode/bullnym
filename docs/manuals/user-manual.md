@@ -17,9 +17,11 @@ baseline reported clean build
 `060_lnurl_private_comment_intents`, and permanent-name policy
 `permanent_names_v1`.
 
-The complete server/PWA behavior described below is the PR #177 release
-candidate at exact source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, expected
-schema `062_invoice_quote_provider_attempts`. It includes:
+The complete server/PWA behavior described below is merged release source
+`e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree
+`93f9f06f10d58520547a8d4d9ac85064c822fa07`, with expected schema
+`062_invoice_quote_provider_attempts`. It was reviewed at PR #177 head
+`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree. It includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
 - one stable Liquid destination per invoice and first-observation fiat
@@ -28,14 +30,14 @@ schema `062_invoice_quote_provider_attempts`. It includes:
 - product-correct Bitcoin behavior and durable provider recovery/holds;
 - permanent names, independent public products, and current-only APIs.
 
-At the time of writing, that candidate is not merged, installed, or
+At the time of writing, that release is merged but not installed or
 production-certified. Production may therefore still show the baseline's
-seven-day/single-conversion behavior. Treat the candidate contract as available
+seven-day/single-conversion behavior. Treat the merged contract as available
 only after `/version` reports the exact installed release with schema
 `062_invoice_quote_provider_attempts` and the release notes confirm successful
 certification. A pull request, documentation page, or database table alone is
-not deployment evidence. This candidate changes the server-hosted PWA; it does
-not include a mobile-wallet release.
+not deployment evidence. This merged release changes the server-hosted PWA; it
+does not include a mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -112,7 +114,7 @@ PoS stores receipt history in the local browser. Clearing browser data can
 erase that local list, but it does not change the server's invoice or payment
 records.
 
-In the release candidate, PoS shows this warning before it reveals a Bitcoin
+In the merged release, PoS shows this warning before it reveals a Bitcoin
 instruction or asks the provider to create one:
 
 > For in-person payments, Lightning network is recommended. Bitcoin on-chain
@@ -147,7 +149,7 @@ settlement need a merchant Liquid destination; direct Liquid also needs the
 matching blinding information. The merchant wallet should use invoice-scoped
 receive addresses and retain the keys needed to recognize and spend them.
 
-The release candidate defaults to 30 days and rejects a deadline more than
+The merged release defaults to 30 days and rejects a deadline more than
 30 days in the future. A shorter caller-selected deadline must be at least
 60 seconds in the future when the server processes it. A five-minute payer
 quote never extends that outer deadline.
@@ -158,7 +160,7 @@ A **sat-fixed** invoice asks for a fixed number of sats. Exchange-rate movement
 does not change its face amount.
 
 A **fiat-fixed** invoice asks for a fixed amount such as USD 25.00. In the
-release candidate, the merchant's exact fiat minor-unit amount and currency
+merged release, the merchant's exact fiat minor-unit amount and currency
 remain the invoice face value for up to 30 days. Invoice creation does not
 freeze a sat amount and does not create a provider obligation.
 
@@ -180,7 +182,7 @@ loading the page.
 One checkout invoice uses one concrete Liquid settlement destination. The
 address is not resolved again from mutable profile data during settlement.
 
-In the release candidate, that same Liquid address remains stable for the
+In the merged release, that same Liquid address remains stable for the
 entire outer invoice lifetime, up to 30 days, across partial payments and every
 five-minute quote refresh. Only the amount, valuation, QR, and copy payload
 change. Lightning and Payment Page/PoS Bitcoin provider swaps also settle to
@@ -230,7 +232,7 @@ If more arrives, the overpayment remains recorded. Bullnym does not
 automatically refund an overpayment. The merchant should compare the invoice,
 actual received value, rail, and settlement status before deciding what to do.
 
-For a release-candidate fiat invoice, each payment event receives fiat credit
+For a merged-release fiat invoice, each payment event receives fiat credit
 from its own authoritative rate evidence. Sats first durably observed before a
 quote expires keep that quote's rate, but only for the sats actually observed.
 An underpayment does not lock the old rate for the unpaid balance.
@@ -247,7 +249,7 @@ payment events.
 
 ## Quote expiry, stale QR codes, and repeated clicks
 
-Under the release-candidate contract, the invoice and its five-minute quote are
+Under the merged-release contract, the invoice and its five-minute quote are
 separate clocks. A copied Lightning invoice or Bitcoin swap instruction may
 expire before the 30-day outer invoice. Bullnym refuses to create a new quote
 when the outer invoice has less than a complete five-minute window remaining.
@@ -301,7 +303,7 @@ Archive has a different meaning:
 
 - archiving a Payment Page or PoS controls that public surface;
 - existing checkout invoices remain supervised;
-- archive is presentation-only; the release candidate does not define a
+- archive is presentation-only; the merged release does not define a
   separate public invoice-archive action.
 
 A late, partial, overpaid, failed, or reorged payment remains part of the
@@ -325,7 +327,7 @@ settlement, then safe wrong-amount renegotiation. Missing, delayed, or
 conflicting evidence waits or enters review; it must not trigger an eager
 Bitcoin transaction.
 
-The release candidate requires the complete current recovery contract before
+The merged release requires the complete current recovery contract before
 automatic recovery may contact the provider or either chain. Every recorded
 Bitcoin recovery transaction must also retain the exact fee evidence that
 authorized its construction. A missing or disputed contract, or incomplete
@@ -358,7 +360,7 @@ eventual payment.
 
 The server exposes a comment only after payment evidence exists and only in an
 authenticated merchant history request. The deployed baseline supports this
-private history API and the release candidate preserves it; whether a separate
+private history API and the merged release preserves it; whether a separate
 client release displays it depends on that client. Comments are not supposed
 to appear in public pages, anonymous status, Open Graph previews, provider
 descriptions, logs, or metric labels. Direct-Liquid comments fail closed rather
@@ -415,12 +417,14 @@ choosing two conflicting irreversible outcomes.
 
 ## Evidence sources
 
-Baseline behavior was checked against the deployed probe above. Candidate
+Baseline behavior was checked against the deployed probe above. Merged-release
 behavior was checked against Bullnym source and tests at
-`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, the product/API/architecture
-documents in this repository, and the locked completion-plan, rationale, and
-server/PWA gap-audit records maintained outside this repository.
+`e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head was
+`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree, plus the
+product/API/architecture documents in this repository and the locked
+completion-plan, rationale, and server/PWA gap-audit records maintained outside
+this repository.
 
 Source and test evidence do not prove deployment. The Operator Manual defines
 the exact release, schema, digest, readiness, and certification evidence needed
-before changing this manual's candidate status.
+before changing this manual's pending-deployment status.

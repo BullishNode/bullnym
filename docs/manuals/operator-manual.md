@@ -12,14 +12,15 @@ This revision deliberately separates source behavior from deployed behavior:
 | Label | Meaning |
 |---|---|
 | **Deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC. |
-| **Release candidate** | Implemented and tested at the exact source revision below, but not yet merged, installed, or production-certified. |
+| **Merged release source** | Implemented, tested, reviewed, and merged at the exact source revision below, but not yet installed or production-certified. |
 | **Deployed release** | Use this label only after the final merge commit, artifact and PWA digests, schema marker, running-process digest, and public certification all agree. |
 
 Exact revisions used for this manual:
 
 - deployed baseline: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
-- merged candidate base: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`;
-- PR #177 candidate: `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`.
+- reviewed PR #177 base: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`;
+- reviewed PR #177 head: `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`;
+- merged release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`.
 
 The baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -27,7 +28,8 @@ The baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 commit above, `build_dirty: false`, production mode, and
 `public_name_policy: permanent_names_v1`.
 
-PR #177 is the complete server/PWA release candidate described by this manual.
+Merged PR #177 is the complete server/PWA release source described by this
+manual.
 It combines a 30-day outer invoice lifetime with immutable five-minute
 payer-demand quotes, one stable direct-Liquid destination per invoice,
 first-observation fiat valuation, atomic PWA refresh, PoS Bitcoin risk
@@ -36,12 +38,12 @@ It also carries forward the current-only automatic-recovery and permanent-name
 contract from its merged base. It does not restore the tokenless LNURL callback,
 legacy Payment Page media fields, or legacy payout/surface modes.
 
-At the time of writing, the candidate is not a production capability. Its
-local Rust, PWA, migration, recovery, and certification fault gates are source
-evidence; final hosted CI, merge, fresh-database cutover, artifact installation,
-and post-install certification remain release operations. Until all of those
+At the time of writing, the merged release is not a production capability. Its
+local and hosted Rust, PWA, migration, recovery, and certification fault gates
+are source evidence; fresh-database cutover, artifact installation, and
+post-install certification remain release operations. Until all of those
 complete, a production result that still exposes the seven-day/single-conversion
-behavior is a candidate-not-deployed condition, not a regression in the
+behavior is a merged-but-not-deployed condition, not a regression in the
 baseline release.
 
 Before relying on this manual, repeat the provenance probes and compare the
@@ -185,7 +187,7 @@ Deployment principles:
    startup, non-money public surfaces, and logs before promotion.
 8. Observe at least one reconciler cycle after promotion.
 
-For the PR #177 candidate, the expected schema marker is exactly
+For the merged PR #177 release, the expected schema marker is exactly
 `062_invoice_quote_provider_attempts`. Run the read-only certification both
 against the staged release and after installation:
 
@@ -202,33 +204,32 @@ scripts/certify-deployment.py \
   --expected-schema-marker 062_invoice_quote_provider_attempts
 ```
 
-Supply the commit actually embedded in the candidate artifact. After merge,
-do not substitute the reviewed PR head when the release was built from a
-different merge commit. The preflight is deliberately read-only and cannot
-prove worker health, private rail admission, or a safe money journey; retain
-those as separate gates.
+Supply the commit actually embedded in the release artifact. Do not substitute
+the reviewed PR head for the merged release commit. The preflight is
+deliberately read-only and cannot prove worker health, private rail admission,
+or a safe money journey; retain those as separate gates.
 
 Migrations 050, 051, 053, 057, 059, and 060 have explicit stopped-writer or
 roll-forward constraints documented in `docs/operations/deployment.md`.
 Migrations 061 and 062 are privileged-owner migrations and must receive the
 reviewed `runtime_role` value. Migration 061 alone is only the immutable quote
-foundation. The matching schema-062 candidate activates the current-only
+foundation. The matching schema-062 release activates the current-only
 denomination rules, first-observation valuation, provider-attempt journals,
 runtime ACLs, and readiness boundary. Never infer product capability from a
 table's existence alone.
 
-At candidate source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, migrations
+At merged source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, migrations
 058 and 059 are current-only empty-state guards: they require all user, surface,
 invoice, swap, allocation, and returned-address history to be empty before
 creating the permanent-name registry and removing pre-launch fields. Migration
 062 likewise refuses to fabricate monetary authority for incompatible legacy
 fiat or quote rows. The deployed schema-060 marker does not prove any of these
-candidate boundaries. Do not apply rewritten migrations to an existing
+merged-release boundaries. Do not apply rewritten migrations to an existing
 database; use only the approved stopped-writer fresh-database cutover and exact
 complete migration sequence through `062_invoice_quote_provider_attempts`.
 
-Do not start the candidate against schema 061, and do not reopen traffic merely
-because schema 062 applied. Require the matching binary/PWA identity,
+Do not start the merged release against schema 061, and do not reopen traffic
+merely because schema 062 applied. Require the matching binary/PWA identity,
 `/health`, `/ready`, `/version`, worker starts, private admission evidence, and
 the read-only certification preflight. Once schema-062 quote or provider-attempt
 history exists, an older writer cannot safely interpret it; fix forward, or
@@ -296,7 +297,7 @@ Validate pair, currency, precision, positive finite rate, source,
 last-known-good observation may be used only within policy. When no trustworthy
 fresh rate exists, pause new fiat quote creation; do not guess.
 
-The schema-062 candidate keeps a fiat invoice's currency and minor-unit face
+The schema-062 release keeps a fiat invoice's currency and minor-unit face
 value as its only denomination authority; `amount_sat` remains zero. A payer
 explicitly selects one rail with `POST /api/v1/invoices/:id/quote`. Status and
 other GET requests are projections and must not allocate provider or monetary
@@ -370,8 +371,8 @@ completion together with the quote offer and swap. A process that finds a
 dispatched but incomplete attempt does not own another POST: it restores and
 validates the provider result, or writes a durable integrity hold.
 
-The candidate can reconstruct chain-create results only from validated Boltz
-xpub restore evidence matching the persisted request. The pinned reverse-swap
+The merged release can reconstruct chain-create results only from validated
+Boltz xpub restore evidence matching the persisted request. The pinned reverse-swap
 restore response does not carry the original BOLT11, so an ambiguous reverse
 create cannot be completed by guessing; it remains held. Treat
 `provider_outcome_unknown`, absent/unavailable restore, incomplete restored
@@ -651,8 +652,9 @@ The operational claims above were checked against `README.md`, `SECURITY.md`,
 files 045–062, server and DB integration tests, the architecture/API/product
 documents under `docs/`, the `bullnym-tests` README and recycler source, and the
 locked completion-plan, rationale, and server/PWA gap-audit records maintained
-outside this repository. Candidate-specific claims were checked at exact
-source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`.
+outside this repository. Merged-release-specific claims were checked at exact
+source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head
+was `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.
