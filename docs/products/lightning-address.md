@@ -55,6 +55,7 @@ index; descriptor rotation must be coordinated with in-flight payments.
 ## Online and offline availability
 
 Deleting a registration takes the Lightning Address offline for new payment
-instructions. Existing swaps remain claimable and must still settle. The nym
-remains permanently owned by the original owner; availability never changes
-name ownership.
+instructions. Observation of already-issued Liquid addresses remains live, and
+existing swaps remain claimable and must still settle. The nym remains
+permanently owned by the original owner; availability never changes name
+ownership or disables an independently enabled Payment Page/POS surface.

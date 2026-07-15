@@ -17,6 +17,8 @@ pub struct User {
     pub is_active: bool,
 }
 
+/// Resolve permanent nym ownership without consulting Lightning Address
+/// availability. Use `get_active_user_by_nym` for public LNURL/NIP-05 gates.
 pub async fn get_user_by_nym<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     nym: &str,
@@ -70,8 +72,8 @@ pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>,
 }
 
 /// Resolve permanent nym ownership without coupling it to Lightning Address
-/// availability. Page/POS management and routing remain available while the
-/// owner's LA row is offline.
+/// availability. Page/POS and signed invoice management remain available while
+/// the owner's LA row is offline.
 pub async fn get_user_by_npub_any(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT users.id, users.nym, users.npub, users.verification_npub, \

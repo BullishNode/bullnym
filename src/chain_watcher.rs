@@ -876,7 +876,8 @@ async fn poll_nym_phase(
         )
         .await
     } else {
-        // Idle ticks scan all active users (active + idle subsets).
+        // Idle ticks scan every watchable nym: active users plus offline rows
+        // that retain evidence of an already-issued address obligation.
         db::list_active_nyms_for_watcher_page(ctx.pool, snapshot, epoch.query_cursor()).await
     };
     let page = match page {
@@ -3336,7 +3337,7 @@ mod tests {
         assert!(epoch.begin_nym("gone".to_string(), TEST_DESCRIPTOR.to_string(), 0, 0));
         assert_eq!(epoch.query_cursor(), Some("gone"));
 
-        // The DB page is keyed after `gone`, so a deactivated/deleted current
+        // The DB page is keyed after `gone`, so a disappeared/purged current
         // nym is not present. Its frozen address still drains safely, then the
         // later row proceeds without a pin or skip.
         let outcome = poll_nyms(

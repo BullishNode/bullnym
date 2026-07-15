@@ -2191,24 +2191,28 @@ async fn create_bitcoin_chain_offer_with_faults(
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
 
-    let Some(active_owner) = db::get_active_user_by_nym(&state.db, nym_owner).await? else {
+    // Page/POS availability and its permanent recovery policy are independent
+    // of Lightning Address availability. Taking the LA product offline closes
+    // new public LNURL instructions, but must not strip Bitcoin from an
+    // otherwise-live merchant checkout.
+    let Some(owner) = db::get_user_by_nym(&state.db, nym_owner).await? else {
         tracing::warn!(
-            event = "chain_swap_offer_inactive_recovery_owner_refused",
+            event = "chain_swap_offer_recovery_owner_unavailable_refused",
             invoice_id = %invoice.id,
-            "refusing to create a chain-swap offer because its merchant identity is inactive"
+            "refusing to create a chain-swap offer because its permanent merchant owner is unavailable"
         );
         return Ok(None);
     };
-    if active_owner.npub != invoice.npub_owner {
+    if owner.npub != invoice.npub_owner {
         tracing::error!(
             event = "chain_swap_offer_recipient_identity_mismatch_refused",
             invoice_id = %invoice.id,
-            "refusing to create a chain-swap offer whose active nym and invoice recipient identities differ"
+            "refusing to create a chain-swap offer whose permanent nym owner and invoice recipient identities differ"
         );
         return Ok(None);
     }
     let Some(recovery_commitment) =
-        db::select_current_recovery_address_commitment(&state.db, &active_owner.npub)
+        db::select_current_recovery_address_commitment(&state.db, &owner.npub)
             .await
             .map_err(|error| {
                 AppError::DbError(format!(
@@ -2418,12 +2422,12 @@ pub async fn exercise_bitcoin_chain_offer_creation_with_faults(
 // offer — is identical.
 // =====================================================================
 
-/// Verify the signing npub owns `nym` AND the user row is currently
-/// active. Used by the linked create/cancel paths.
+/// Verify the signing npub permanently owns `nym`. Linked invoice management
+/// remains available while the separate Lightning Address product is offline.
 async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
-    let user = db::get_user_by_npub(&state.db, npub)
+    let user = db::get_user_by_npub_any(&state.db, npub)
         .await?
-        .ok_or_else(|| AppError::AuthError("no active registration for this key".into()))?;
+        .ok_or_else(|| AppError::AuthError("no permanent registration for this key".into()))?;
     if user.nym != nym {
         return Err(AppError::AuthError("signer does not own this nym".into()));
     }

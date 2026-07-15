@@ -617,6 +617,16 @@ fn sign_invoice_create_with_keypair(
     bitcoin_address: &str,
     expires_at_unix: i64,
 ) -> (String, u64) {
+    sign_invoice_create_for_nym_with_keypair(keypair, npub, "", bitcoin_address, expires_at_unix)
+}
+
+fn sign_invoice_create_for_nym_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    bitcoin_address: &str,
+    expires_at_unix: i64,
+) -> (String, u64) {
     let amount_sat = "1000";
     let fiat_amount_minor = "";
     let fiat_currency = "";
@@ -633,7 +643,7 @@ fn sign_invoice_create_with_keypair(
         keypair,
         "invoice-create",
         npub,
-        "",
+        nym,
         &[
             amount_sat,
             fiat_amount_minor,
@@ -14880,6 +14890,124 @@ async fn signed_invoice_list_is_auth_bound_and_npub_isolated() {
 }
 
 #[tokio::test]
+async fn signed_linked_invoice_management_uses_permanent_owner_while_lnurl_is_offline() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "offlineinvoicemgmt";
+    let (owner_npub, _, _, owner_keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    let (other_npub, _, _, other_keypair) =
+        sign_registration_with_keypair("offlineinvoiceother", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &owner_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&pool, "offlineinvoiceother", &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::deactivate_user(&pool, &owner_npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let bitcoin_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let request = |npub: &str, timestamp: u64, signature: &str| {
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": bitcoin_address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature,
+        })
+    };
+
+    // A valid signature from a different permanent owner cannot adopt the
+    // offline merchant's linked management surface or create any row.
+    let (other_signature, other_timestamp) = sign_invoice_create_for_nym_with_keypair(
+        &other_keypair,
+        &other_npub,
+        nym,
+        bitcoin_address,
+        expires_at_unix,
+    );
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/{nym}/invoices"),
+        request(&other_npub, other_timestamp, &other_signature),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "AuthError", "{body}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0,
+        "cross-owner create mutated invoices"
+    );
+
+    let (signature, timestamp) = sign_invoice_create_for_nym_with_keypair(
+        &owner_keypair,
+        &owner_npub,
+        nym,
+        bitcoin_address,
+        expires_at_unix,
+    );
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/{nym}/invoices"),
+        request(&owner_npub, timestamp, &signature),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let invoice_id = body["invoice_id"]
+        .as_str()
+        .expect("offline owner create returned invoice id");
+    let stored: (String, Option<String>, String) =
+        sqlx::query_as("SELECT npub_owner, nym_owner, status FROM invoices WHERE id = $1")
+            .bind(Uuid::parse_str(invoice_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        (owner_npub.clone(), Some(nym.into()), "unpaid".into())
+    );
+
+    let (cancel_signature, cancel_timestamp) =
+        sign_invoice_cancel_with_keypair(&owner_keypair, &owner_npub, nym, invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/{nym}/invoices/{invoice_id}"),
+        json!({
+            "npub": owner_npub,
+            "timestamp": cancel_timestamp,
+            "signature": cancel_signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled", "{body}");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn signed_invoice_cancel_is_owner_bound_and_idempotent() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -15779,6 +15907,132 @@ async fn liquid_outpoint_reservation_reuses_original_index_after_cursor_advances
             .await
             .unwrap();
     assert_eq!(reservations, 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn offline_after_liquid_instruction_keeps_observation_live_without_reopening_lnurl() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "offlineissuedliquid";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let issued_outpoint = format!("{}:0", "33".repeat(32));
+    let new_outpoint = format!("{}:1", "44".repeat(32));
+    let pubkey = "02".repeat(33);
+
+    let issued_index =
+        pay_service::db::allocate_outpoint_address(&pool, nym, &issued_outpoint, &pubkey)
+            .await
+            .unwrap();
+    assert_eq!(issued_index, 0);
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+
+    // The public product remains closed; deactivation is not silently undone
+    // by preserving an already-issued money obligation.
+    let app = test_app(test_state(pool.clone()));
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+    let (_, callback_unavailable) = get_path(
+        &app,
+        &format!("/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC"),
+    )
+    .await;
+    assert_eq!(
+        callback_unavailable["code"], "NymNotFound",
+        "{callback_unavailable}"
+    );
+
+    // The authenticated supervision surface remains owner-readable while the
+    // public payment-instruction surface stays closed.
+    let reservations_timestamp = auth_timestamp();
+    let reservations_message = format!("reservations:{nym}:{reservations_timestamp}");
+    let reservations_signature = sign_with_keypair(&keypair, reservations_message.as_bytes());
+    let (reservations_status, reservations_body) = get_path(
+        &app,
+        &format!(
+            "/api/reservations/{nym}?ts={reservations_timestamp}&sig={reservations_signature}&npub={npub}"
+        ),
+    )
+    .await;
+    assert_eq!(reservations_status, StatusCode::OK, "{reservations_body}");
+    assert_eq!(
+        reservations_body["reservations"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        reservations_body["reservations"][0]["outpoint"],
+        issued_outpoint
+    );
+    assert_eq!(reservations_body["next_addr_idx"], 0);
+
+    // The persisted reservation remains an idempotent obligation internally,
+    // while a new outpoint cannot allocate a fresh address after deactivation.
+    assert_eq!(
+        pay_service::db::allocate_outpoint_address(&pool, nym, &issued_outpoint, &pubkey)
+            .await
+            .unwrap(),
+        issued_index
+    );
+    let new_instruction_error =
+        pay_service::db::allocate_outpoint_address(&pool, nym, &new_outpoint, &pubkey)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(new_instruction_error, sqlx::Error::RowNotFound),
+        "unexpected new-instruction refusal: {new_instruction_error:?}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outpoint_addresses WHERE nym = $1",)
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "offline cache miss created a reservation"
+    );
+
+    let snapshot = pay_service::db::watcher_scan_snapshot(&pool).await.unwrap();
+    let historical = pay_service::db::list_active_nyms_for_watcher_page(&pool, &snapshot, None)
+        .await
+        .unwrap();
+    assert_eq!(historical.rows.len(), 1);
+    assert_eq!(historical.rows[0].nym, nym);
+    let recent =
+        pay_service::db::list_recently_active_nyms_for_watcher_page(&pool, 3_600, &snapshot, None)
+            .await
+            .unwrap();
+    assert!(
+        recent.rows.is_empty(),
+        "no callback was recorded in this fixture"
+    );
+
+    assert_eq!(
+        pay_service::db::mark_reservations_fulfilled_at_idx(&pool, nym, issued_index as u32,)
+            .await
+            .unwrap(),
+        1
+    );
+    pay_service::db::advance_next_addr_idx(&pool, nym, issued_index as u32)
+        .await
+        .unwrap();
+    let observed: (i32, bool, bool) = sqlx::query_as(
+        "SELECT users.next_addr_idx, users.is_active, outpoint_addresses.fulfilled \
+           FROM users JOIN outpoint_addresses USING (nym) \
+          WHERE users.nym = $1 AND outpoint_addresses.outpoint = $2",
+    )
+    .bind(nym)
+    .bind(&issued_outpoint)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observed, (1, false, true));
 
     cleanup_db(&pool).await;
 }
@@ -29007,7 +29261,7 @@ async fn issue84_persist_recovery_commitment(
 }
 
 #[tokio::test]
-async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() {
+async fn issue84_chain_offer_owner_mismatch_or_missing_commitment_has_zero_mutation() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let nym = "issue84missing";
@@ -29066,7 +29320,7 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
         .await
         .unwrap()
         .unwrap();
-    let inactive = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+    let offline_without_commitment = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
         Some(nym),
         ISSUE84_CHAIN_AMOUNT_SAT,
@@ -29074,7 +29328,10 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
     )
     .await
     .unwrap();
-    assert!(inactive.is_none());
+    assert!(
+        offline_without_commitment.is_none(),
+        "product deactivation must not bypass the still-missing recovery contract"
+    );
 
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&pool)
@@ -29108,6 +29365,127 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
 
     provider_task.abort();
     let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_offline_page_owner_keeps_exactly_one_chain_offer_and_lnurl_stays_closed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84offlinepage";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Offline LA checkout",
+            description: "The permanent Page and recovery contract stay online",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: false,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Anonymous checkout attempts Lightning first. Its expected 404 consumes
+    // one reserved reverse key before the independent chain path starts.
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key + 1).unwrap(),
+        u64::try_from(next_key + 2).unwrap(),
+        "Issue84OfflinePage1",
+    )
+    .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
+    let retry_state = state.clone();
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+    let app = test_app(state);
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({"amount_sat": ISSUE84_CHAIN_AMOUNT_SAT}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lockup_address = body["bitcoin_chain_address"]
+        .as_str()
+        .expect("offline Page checkout retained its Bitcoin chain offer")
+        .to_string();
+    assert!(body["bitcoin_chain_bip21"].is_string(), "{body}");
+    let invoice_id = Uuid::parse_str(body["invoice_id"].as_str().unwrap()).unwrap();
+    let recorded: (i64, Uuid, String, String) = sqlx::query_as(
+        "SELECT COUNT(*) OVER (), recovery_address_commitment_id, nym, lockup_address \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.0, 1);
+    assert_eq!(recorded.1, recovery_commitment_id);
+    assert_eq!(recorded.2, nym);
+    assert_eq!(recorded.3, lockup_address);
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    // Re-enter the exact production boundary with the same invoice. Durable
+    // discovery returns the existing offer before any owner/provider mutation.
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let provider_calls_before_retry = provider.calls.load(Ordering::SeqCst);
+    let retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &retry_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("durable offline Page offer disappeared on retry");
+    assert_eq!(retry.0, lockup_address);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        provider_calls_before_retry
+    );
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    provider.shutdown().await;
     cleanup_db(&pool).await;
 }
 

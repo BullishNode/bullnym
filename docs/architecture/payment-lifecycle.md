@@ -445,10 +445,12 @@ Requirements:
 Lightning Address:
 
 - taking the Lightning Address offline stops new payment instructions
-- existing swaps must still settle
+- existing swaps and descriptor addresses remain observed and must still settle
 
 Payment Page and POS:
 
+- Lightning Address availability does not change permanent ownership or take
+  an enabled surface, signed invoice management, or its recovery policy offline
 - archiving the surface stops new sessions
 - existing sessions expire naturally
 - no separate user-facing cancellation required initially

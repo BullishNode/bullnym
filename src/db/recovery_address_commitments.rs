@@ -247,7 +247,10 @@ pub async fn persist_recovery_address_commitment(
         .execute(&mut *tx)
         .await?;
 
-    // Admission is re-checked under the same transaction lock even for exact
+    // Registering or rotating a policy is new setup admission and remains
+    // active-only. Reading an already-registered permanent policy below is
+    // deliberately independent of product availability. Admission is
+    // re-checked under the same transaction lock even for exact registration
     // retries. FOR UPDATE conflicts with lifecycle deactivation so the two
     // operations have one database-defined order. Route checks are only an
     // optimization; persistence owns the invariant.
@@ -327,9 +330,11 @@ pub async fn persist_recovery_address_commitment(
     Ok(commitment)
 }
 
-/// Select the latest immutable commitment for a merchant identity. The generic
-/// executor lets future swap creation use the same transaction that inserts
-/// its eventual commitment reference.
+/// Select the latest immutable commitment for a merchant identity. Selection
+/// deliberately does not depend on Lightning Address `is_active`: an existing
+/// recovery policy remains permanent supervision state while that product is
+/// offline. The generic executor lets future swap creation use the same
+/// transaction that inserts its eventual commitment reference.
 pub async fn select_current_recovery_address_commitment<'e, E>(
     executor: E,
     npub: &str,
