@@ -161,6 +161,42 @@ impl CurrentFeeSnapshot {
             .map_err(|error| policy_error(FeeRail::Liquid, generation, error))
     }
 
+    /// Re-evaluate only the explicitly restored Bitcoin LKG evidence. Runtime
+    /// admission uses this while a newer live observation is awaiting durable
+    /// acceptance; the unpublished live value must neither close admission
+    /// when a valid durable predecessor exists nor become construction
+    /// authority before persistence succeeds.
+    pub(crate) fn read_bitcoin_last_known_good(
+        &self,
+        policy: &BitcoinFeePolicy,
+        now_unix: u64,
+    ) -> Result<CurrentBitcoinFee, CurrentFeeSnapshotError> {
+        let (generation, _, last_known_good) = read_rail(&self.bitcoin, FeeRail::Bitcoin)?;
+        policy
+            .decide_typed(None, last_known_good.as_ref(), now_unix)
+            .map(|decision| CurrentBitcoinFee {
+                generation,
+                decision,
+            })
+            .map_err(|error| policy_error(FeeRail::Bitcoin, generation, error))
+    }
+
+    /// Liquid counterpart to [`Self::read_bitcoin_last_known_good`].
+    pub(crate) fn read_liquid_last_known_good(
+        &self,
+        policy: &LiquidFeePolicy,
+        now_unix: u64,
+    ) -> Result<CurrentLiquidFee, CurrentFeeSnapshotError> {
+        let (generation, _, last_known_good) = read_rail(&self.liquid, FeeRail::Liquid)?;
+        policy
+            .decide_typed(None, last_known_good.as_ref(), now_unix)
+            .map(|decision| CurrentLiquidFee {
+                generation,
+                decision,
+            })
+            .map_err(|error| policy_error(FeeRail::Liquid, generation, error))
+    }
+
     /// Return the current Bitcoin live decision that is eligible to cross the
     /// persistence boundary. Restored LKG is deliberately excluded: reading a
     /// persisted row must never refresh its lifetime by persisting it again.
@@ -731,6 +767,76 @@ mod tests {
         assert!(snapshot
             .accepted_bitcoin_for_persistence(&bitcoin_policy, 10_100)
             .is_err());
+    }
+
+    #[test]
+    fn explicit_lkg_reads_ignore_unpublished_live_values_and_reapply_freshness() {
+        let snapshot = CurrentFeeSnapshot::new();
+        let bitcoin_policy = BitcoinFeePolicy::default();
+        let liquid_policy = LiquidFeePolicy::default();
+        snapshot
+            .restore_bitcoin_last_known_good(bitcoin_lkg(2.0, 10_000, "persisted-bitcoin"))
+            .unwrap();
+        snapshot
+            .restore_liquid_last_known_good(liquid_lkg(0.2, 10_000, "persisted-liquid"))
+            .unwrap();
+        snapshot
+            .update_bitcoin(bitcoin(7.0, 10_030, "pending-bitcoin"))
+            .unwrap();
+        snapshot
+            .update_liquid(liquid(0.7, 10_030, "pending-liquid"))
+            .unwrap();
+
+        assert_eq!(
+            snapshot
+                .read_bitcoin(&bitcoin_policy, 10_030)
+                .unwrap()
+                .decision()
+                .rate(),
+            rate(7.0)
+        );
+        let bitcoin_lkg = snapshot
+            .read_bitcoin_last_known_good(&bitcoin_policy, 10_030)
+            .unwrap();
+        assert_eq!(bitcoin_lkg.decision().rate(), rate(2.0));
+        assert_eq!(
+            bitcoin_lkg.decision().source(),
+            FeeObservationSource::BitcoinLastKnownGood
+        );
+
+        assert_eq!(
+            snapshot
+                .read_liquid(&liquid_policy, 10_030)
+                .unwrap()
+                .decision()
+                .rate(),
+            rate(0.7)
+        );
+        let liquid_lkg = snapshot
+            .read_liquid_last_known_good(&liquid_policy, 10_030)
+            .unwrap();
+        assert_eq!(liquid_lkg.decision().rate(), rate(0.2));
+        assert_eq!(
+            liquid_lkg.decision().source(),
+            FeeObservationSource::LiquidLastKnownGood
+        );
+
+        let bitcoin_stale_at = 10_001 + bitcoin_policy.last_known_good_max_age_secs();
+        let liquid_stale_at = 10_001 + liquid_policy.last_known_good_max_age_secs();
+        assert_eq!(
+            snapshot
+                .read_bitcoin_last_known_good(&bitcoin_policy, bitcoin_stale_at)
+                .unwrap_err()
+                .reason(),
+            Some(CurrentFeeUnavailableReason::Stale)
+        );
+        assert_eq!(
+            snapshot
+                .read_liquid_last_known_good(&liquid_policy, liquid_stale_at)
+                .unwrap_err()
+                .reason(),
+            Some(CurrentFeeUnavailableReason::Stale)
+        );
     }
 
     #[test]
