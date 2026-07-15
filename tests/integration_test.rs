@@ -11797,8 +11797,10 @@ async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() 
     let mut config = test_config();
     config.boltz.api_url = boltz_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = unavailable_pricer_url;
+    let pricer_config = PricerConfig {
+        url: unavailable_pricer_url,
+        ..Default::default()
+    };
     state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
     let create_app = test_app(state);
 
@@ -11844,8 +11846,10 @@ async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() 
     let mut quote_config = test_config();
     quote_config.boltz.api_url = boltz_url;
     let mut quote_state = test_state_with_config(pool.clone(), quote_config);
-    let mut healthy_pricer_config = PricerConfig::default();
-    healthy_pricer_config.url = healthy_pricer_url;
+    let healthy_pricer_config = PricerConfig {
+        url: healthy_pricer_url,
+        ..Default::default()
+    };
     quote_state.pricer = Arc::new(PricerClient::new(healthy_pricer_config).unwrap());
     let quote_app = test_app(quote_state);
     let (quote_status, quote_body) = post_json(
@@ -11898,8 +11902,10 @@ async fn payer_quote_refuses_a_partial_window_before_rate_or_provider_work() {
 
     let (pricer_url, pricer_calls, pricer_task) = spawn_counting_http_server().await;
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut config = test_config();
     config.boltz.api_url = boltz_url;
     let mut state = test_state_with_config(pool.clone(), config);
@@ -11953,8 +11959,10 @@ async fn payer_demand_liquid_quote_serializes_and_gets_never_mutate() {
     .await
     .unwrap();
     let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut state = test_state(pool.clone());
     state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
     let app = test_app(state);
@@ -12078,8 +12086,10 @@ async fn fiat_wallet_direct_bitcoin_quote_refreshes_over_one_address_without_pro
     let (provider_url, provider_calls, provider_task) = spawn_counting_http_server().await;
 
     let (rate_a_url, rate_a_calls, rate_a_task) = spawn_pricer_server(10_000_000).await;
-    let mut rate_a_config = PricerConfig::default();
-    rate_a_config.url = rate_a_url;
+    let rate_a_config = PricerConfig {
+        url: rate_a_url,
+        ..Default::default()
+    };
     let mut config_a = test_config();
     config_a.boltz.api_url = provider_url.clone();
     let mut state_a = test_state_with_config(pool.clone(), config_a);
@@ -12144,8 +12154,10 @@ async fn fiat_wallet_direct_bitcoin_quote_refreshes_over_one_address_without_pro
     .unwrap();
 
     let (rate_b_url, rate_b_calls, rate_b_task) = spawn_pricer_server(20_000_000).await;
-    let mut rate_b_config = PricerConfig::default();
-    rate_b_config.url = rate_b_url;
+    let rate_b_config = PricerConfig {
+        url: rate_b_url,
+        ..Default::default()
+    };
     let mut config_b = test_config();
     config_b.boltz.api_url = provider_url;
     let mut state_b = test_state_with_config(pool.clone(), config_b);
@@ -12525,8 +12537,10 @@ async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail()
     let invoice = insert_fiat_quote_test_invoice(&pool, "providerfailure", true).await;
     let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
     let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut config = test_config();
     config.boltz.api_url = boltz_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
@@ -12626,8 +12640,10 @@ async fn payer_provider_attempt_before_send_restarts_once_without_duplicate_obli
     let invoice = insert_fiat_quote_test_invoice(&pool, "providerbeforesend", true).await;
     let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
     let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut config = test_config();
     config.boltz.api_url = boltz_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
@@ -12719,8 +12735,10 @@ async fn expired_versioned_provider_offer_is_retained_but_never_reexposed() {
         first_key_index,
     )
     .await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
@@ -12819,8 +12837,10 @@ async fn reverse_response_before_commit_restarts_into_hold_without_second_post()
         first_key_index,
     )
     .await;
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
@@ -13094,7 +13114,7 @@ async fn direct_liquid_stable_address_values_each_partial_and_reorgs_without_rep
     .await
     .unwrap();
 
-    let second_valuation: (
+    type DirectPaymentValuationRow = (
         Uuid,
         i64,
         String,
@@ -13105,7 +13125,8 @@ async fn direct_liquid_stable_address_values_each_partial_and_reorgs_without_rep
         i64,
         String,
         String,
-    ) = sqlx::query_as(
+    );
+    let second_valuation: DirectPaymentValuationRow = sqlx::query_as(
         "SELECT e.fiat_valuation_quote_version_id, e.fiat_credited_minor, \
                 e.fiat_credit_policy, e.fiat_rate_minor_per_btc, \
                 e.invoice_quote_version_id, e.invoice_quote_offer_id, e.address, \
@@ -13367,6 +13388,7 @@ async fn direct_liquid_expiry_equality_is_late_and_stale_rate_stays_unvalued() {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn seed_observation_at_quote_expiry(
         pool: &PgPool,
         invoice_id: Uuid,
@@ -31214,8 +31236,10 @@ async fn versioned_fiat_bitcoin_quote_uses_permanent_page_owner_while_lnurl_is_o
     let mut config = test_config();
     config.boltz.api_url = provider.base_url.clone();
     let mut state = test_state_with_config(pool.clone(), config);
-    let mut pricer_config = PricerConfig::default();
-    pricer_config.url = pricer_url;
+    let pricer_config = PricerConfig {
+        url: pricer_url,
+        ..Default::default()
+    };
     state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
     state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
     let app = test_app(state);

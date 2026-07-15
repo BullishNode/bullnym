@@ -2289,6 +2289,8 @@ struct PersistedProviderQuoteAttribution {
     first_observed_at_unix_micros: i64,
 }
 
+type PersistedProviderQuoteAttributionRow = (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<i64>);
+
 async fn persisted_provider_quote_attribution(
     tx: &mut Transaction<'_, Postgres>,
     invoice_id: Uuid,
@@ -2297,8 +2299,7 @@ async fn persisted_provider_quote_attribution(
     let Some(boltz_swap_id) = evidence.boltz_swap_id else {
         return Ok(None);
     };
-    let row: Option<(Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<i64>)> = match evidence.source
-    {
+    let row: Option<PersistedProviderQuoteAttributionRow> = match evidence.source {
         "lightning_boltz_reverse" => {
             sqlx::query_as(
                 "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id, \

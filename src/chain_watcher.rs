@@ -615,6 +615,7 @@ fn report_outcome(
 /// `rate_limiter` exposes a dedicated watcher-only Electrum bucket
 /// (`check_electrum_watcher`) so a callback storm cannot starve the
 /// watcher and vice-versa.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pool: PgPool,
     backend: Arc<dyn UtxoBackend + Send + Sync>,

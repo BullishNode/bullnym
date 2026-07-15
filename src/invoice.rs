@@ -202,9 +202,6 @@ const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
 const FIAT_QUOTE_WINDOW_SECS: i64 = 5 * 60;
 
-/// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
-/// audit-greppable.
-
 /// Per-field length caps for wallet-origin invoice fields.
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
 const RECIPIENT_LABEL_MAX: usize = 100;

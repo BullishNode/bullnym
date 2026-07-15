@@ -1816,6 +1816,7 @@ async fn run_one_chain_tick(
     Ok(recovery_outcome.merge(ordinary_outcome))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pool: &PgPool,
     boltz: &crate::boltz::BoltzService,
