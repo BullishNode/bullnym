@@ -1205,7 +1205,7 @@ async fn run_settlement_repair_tick(
     // Only recently-claimed rows: a stuck flip is repaired within a tick or
     // two, after which the event exists and the row drops out of the query.
     // The window covers the maximum invoice lifetime.
-    const REPAIR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+    const REPAIR_MAX_AGE_SECS: u64 = invoice::INVOICE_LIFETIME_SECS as u64;
     let tolerances = db::InvoiceAccountingTolerances::from(&state.config.invoice_accounting);
     let merchant_policy = match merchant_settlement_finality_policy(state) {
         Ok(policy) => policy,

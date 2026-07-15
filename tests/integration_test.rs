@@ -11385,11 +11385,13 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
                 "lq1q061quoteversionfixture000000000000000000000000000000000000000",
             ),
             liquid_blinding_key_hex: Some(&blinding_key),
-            expires_in_secs: 3_600,
+            expires_in_secs: 30 * 24 * 60 * 60,
         },
     )
     .await
     .unwrap();
+    let invoice_lifetime_secs = invoice.expires_at_unix - invoice.created_at_unix;
+    assert_eq!(invoice_lifetime_secs, 30 * 24 * 60 * 60);
 
     let now = i64::try_from(auth_timestamp()).unwrap();
     let candidate = pay_service::db::NewInvoiceQuoteVersion {
@@ -11423,6 +11425,12 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         1
     );
     let quote = resolutions[0].quote.clone();
+    let quote_lifetime_secs = quote.expires_at_unix - quote.created_at_unix;
+    assert_eq!(quote_lifetime_secs, 300);
+    assert!(
+        quote_lifetime_secs < invoice_lifetime_secs,
+        "a five-minute quote must not inherit or extend the 30-day invoice lifetime"
+    );
     assert!(resolutions.iter().all(|resolution| {
         resolution.quote.id == quote.id
             && resolution.quote.version_number == 1
@@ -14656,12 +14664,65 @@ async fn signed_invoice_create_defaults_expiry_when_omitted() {
     .await
     .unwrap();
     assert!(
-        expires_at_unix >= before + 7 * 24 * 60 * 60 - 2,
+        expires_at_unix >= before + 30 * 24 * 60 * 60 - 2,
         "expires_at_unix={expires_at_unix}, before={before}"
     );
     assert!(
-        expires_at_unix <= before + 7 * 24 * 60 * 60 + 2,
+        expires_at_unix <= before + 30 * 24 * 60 * 60 + 2,
         "expires_at_unix={expires_at_unix}, before={before}"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn signed_invoice_create_rejects_expiry_beyond_thirty_days() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let (npub, _, _, keypair) = sign_registration_with_keypair("invoiceexpirycap", TEST_DESCRIPTOR);
+    let address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    let expires_at_unix = auth_timestamp() as i64 + 30 * 24 * 60 * 60 + 60;
+    let (signature, timestamp) =
+        sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/invoices",
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "InvalidAmount", "{body}");
+    assert_eq!(
+        body["reason"], "expires_at_unix beyond 2592000s cap",
+        "{body}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0,
+        "an over-limit invoice must not be persisted"
     );
 
     cleanup_db(&pool).await;
@@ -14947,7 +15008,7 @@ async fn cancelled_invoice_records_late_boltz_settlement_once() {
     assert_eq!(
         pay_service::db::list_claimed_swaps_missing_lightning_event(
             &pool,
-            7 * 24 * 60 * 60,
+            30 * 24 * 60 * 60,
             repair_epoch_micros,
             None,
             10,
@@ -14972,7 +15033,7 @@ async fn cancelled_invoice_records_late_boltz_settlement_once() {
     assert!(
         pay_service::db::list_claimed_swaps_missing_lightning_event(
             &pool,
-            7 * 24 * 60 * 60,
+            30 * 24 * 60 * 60,
             repair_epoch_micros,
             None,
             10,

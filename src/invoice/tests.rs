@@ -83,8 +83,11 @@ fn action_constants_distinct() {
 }
 
 #[test]
-fn checkout_outer_expiry_is_seven_days() {
-    assert_eq!(CHECKOUT_DEFAULT_EXPIRES_SECS, 7 * 24 * 60 * 60);
+fn wallet_and_checkout_outer_expiry_are_thirty_days() {
+    let thirty_days = 30 * 24 * 60 * 60;
+    assert_eq!(INVOICE_LIFETIME_SECS, thirty_days);
+    assert_eq!(MAX_WALLET_EXPIRES_SECS, thirty_days);
+    assert_eq!(CHECKOUT_DEFAULT_EXPIRES_SECS, thirty_days);
 }
 
 #[test]

@@ -178,21 +178,26 @@ pub const ACTION_CANCEL: &str = "invoice-cancel";
 pub const ACTION_LIST: &str = "invoice-list";
 pub const ACTION_RECOVERY_LIST: &str = "invoice-recovery-list";
 
-/// Hard upper bound and default for wallet-origin invoice expiry (7 days).
+/// Exact outer lifetime shared by wallet-origin and checkout invoices.
+/// Short-lived payer quotes and provider instructions keep their independent
+/// expiry windows and must never extend this deadline.
+pub(crate) const INVOICE_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Hard upper bound and default for wallet-origin invoice expiry (30 days).
 /// Clients may omit `expires_at_unix`; the server then uses this default.
 /// When a client does request an expiry, the server still caps it here so
 /// a runaway or malicious client cannot pin a row indefinitely or refresh
 /// Boltz offers forever.
-const MAX_WALLET_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
+const MAX_WALLET_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
 /// Default cap on `list_invoices.pageSize`. Mobile can request a smaller
 /// page size; never larger.
 const LIST_LIMIT_MAX: i64 = 100;
 
-/// Default outer expiry for checkout-origin invoices. Individual Boltz
+/// Exact outer expiry for checkout-origin invoices. Individual Boltz
 /// BOLT11s may expire sooner and are refreshed while the invoice is live;
 /// this cap prevents abandoned checkout invoices from refreshing forever.
-const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
+const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
 /// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
 /// audit-greppable.
@@ -2666,7 +2671,7 @@ async fn create_invoice_inner(
         None
     };
 
-    // Outer expiry window: now+60s to now+7d. Omitted expiry defaults to
+    // Outer expiry window: now+60s to now+30d. Omitted expiry defaults to
     // the server cap; the signed payload uses an empty expiry field in that
     // case, so clients do not need to know server time to create an invoice.
     let now = unix_now();
