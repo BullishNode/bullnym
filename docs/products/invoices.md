@@ -25,6 +25,17 @@ The mobile client supplies accepted rails, amount, metadata, expiry, and
 concrete recipient addresses for Bitcoin and/or Liquid. The server validates
 the request, creates the invoice, and may create an initial Lightning offer.
 
+## Lifetime and quote windows
+
+Every checkout invoice has an exact 30-day outer lifetime. A wallet-origin
+invoice also defaults to 30 days when `expires_at_unix` is omitted and may
+choose an earlier deadline, but never one beyond 30 days from processing.
+
+The outer invoice deadline is independent of payer instructions. Versioned
+fiat quotes expire after exactly five minutes, and BOLT11/provider instructions
+may have their own shorter validity. Refreshing or replacing one of those
+instructions never extends the invoice's 30-day deadline.
+
 ## Listing
 
 `GET /api/v1/invoices?npub=...` is signed with `invoice-list`. It returns

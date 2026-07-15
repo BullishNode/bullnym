@@ -52,7 +52,7 @@ Additional create constraints:
 | `public_description` | At most 1,000 bytes. |
 | `recipient_name` | At most 100 bytes. `recipient_label` is accepted as a compatibility alias on input. |
 | `invoice_number` | At most 50 bytes. |
-| `expires_at_unix` | Omit for seven days, or set between 60 seconds and seven days in the future at processing time. |
+| `expires_at_unix` | Omit for 30 days, or set between 60 seconds and 30 days in the future at processing time. |
 | addresses | Valid canonical Bitcoin mainnet addresses or confidential Liquid mainnet addresses. The signature commits to the raw submitted strings before server canonicalization. |
 | `liquid_blinding_key_hex` | Required and checked against the address only when `accept_liquid` is true. |
 

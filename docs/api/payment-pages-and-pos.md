@@ -165,11 +165,11 @@ Response:
   "bitcoin_chain_address": "bc1...",
   "bitcoin_chain_bip21": "bitcoin:bc1...?amount=0.0001",
   "bitcoin_chain_amount_sat": 10000,
-  "expires_at_unix": 1760604800
+  "expires_at_unix": 1762592000
 }
 ```
 
-Checkout invoices have a fixed outer lifetime of seven days. The example
+Checkout invoices have a fixed outer lifetime of 30 days. The example
 `expires_at_unix` is illustrative; clients must use the returned value. Every
 payload and typed amount is adopted or withdrawn as one instruction.
 `lightning_amount_sat` is the exact BOLT11 principal and includes the
