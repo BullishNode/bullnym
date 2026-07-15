@@ -22,11 +22,9 @@
 //! the `nym_or_empty` slot driving the linked vs unlinked branch.
 //!
 //! Status-poll and Lightning lazy-fetch helpers remain shared across linked
-//! and unlinked invoices via `id`-only paths. The former Liquid
-//! lazy-allocation route is retained only as an explicit 410:
+//! and unlinked invoices via `id`-only paths:
 //!    - `GET  /api/v1/invoices/<id>/status`
 //!    - `POST /api/v1/invoices/<id>/lightning`
-//!    - `POST /api/v1/invoices/<id>/liquid`  → 410 Gone (wallet supplies addr at create time)
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -2403,31 +2401,6 @@ pub async fn exercise_bitcoin_chain_offer_creation_with_faults(
     )
     .await?
     .map(|offer| (offer.lockup_address, offer.lockup_bip21)))
-}
-
-// =====================================================================
-// POST /api/v1/invoices/:id/liquid — DEPRECATED (returns 410 Gone)
-//
-// Wallet-origin invoices supply the Liquid address at create time. See
-// docs/compatibility-ledger.md for this route's removal policy.
-// =====================================================================
-
-pub async fn fetch_liquid_offer(
-    State(_state): State<AppState>,
-    Path(_id_str): Path<String>,
-) -> Result<Response, AppError> {
-    let mut resp = (
-        StatusCode::GONE,
-        "POST /api/v1/invoices/<id>/liquid is deprecated. Wallet supplies the \
-         Liquid address at invoice-create time."
-            .to_string(),
-    )
-        .into_response();
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    Ok(resp)
 }
 
 // =====================================================================

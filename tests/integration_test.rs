@@ -1527,6 +1527,31 @@ async fn delete_json_path(app: &Router, uri: &str, body: Value) -> (StatusCode, 
 }
 
 #[tokio::test]
+async fn retired_liquid_offer_route_is_absent_while_status_remains_current() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let invoice_id = Uuid::new_v4();
+
+    let (retired_status, retired_body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{invoice_id}/liquid"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(retired_status, StatusCode::NOT_FOUND);
+    assert_eq!(retired_body, Value::Null);
+
+    let (status_status, status_body) =
+        get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
+    assert_eq!(status_status, StatusCode::OK);
+    assert_eq!(status_body["status"], "ERROR");
+    assert_eq!(status_body["code"], "InvoiceNotFound");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn readiness_rejects_schema_before_latest_migration() {
     let admin = test_pool().await;
     cleanup_db(&admin).await;
