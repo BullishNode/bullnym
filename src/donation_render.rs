@@ -45,7 +45,6 @@ struct DonationPageTpl<'a> {
     header: &'a str,
     description: &'a str,
     social_meta: String,
-    avatar_url: Option<String>,
     display_currency: &'a str,
     website: Option<&'a str>,
     twitter: Option<&'a str>,
@@ -98,7 +97,6 @@ struct PwaConfigView<'a> {
     currency: &'a str,
     header: &'a str,
     description: &'a str,
-    avatar_url: Option<&'a str>,
     website: Option<&'a str>,
     twitter: Option<&'a str>,
     instagram: Option<&'a str>,
@@ -399,14 +397,6 @@ fn social_meta_tags(header: &str, description: &str, public_url: &str, image_url
     )
 }
 
-/// The historical nym-keyed avatar path is overwritten in place on upload, so
-/// the source-image digest must participate in the URL. Keep the stable path
-/// for installed Page/POS compatibility while making each uploaded image a
-/// distinct browser/shared-cache key.
-fn nym_avatar_url(domain: &str, nym: &str, source_sha256: &str) -> String {
-    format!("https://{domain}/img/{nym}/avatar.webp?v={source_sha256}")
-}
-
 async fn stored_generated_og_url(
     image_root: &str,
     domain: &str,
@@ -690,42 +680,25 @@ async fn manifest_alias_for_kind(
 /// surface is served at (which drives the PWA manifest link + start URL) and
 /// whether the nym is allowed to appear in the served page:
 /// - `PublicBase::Nym` → served at `/<nym>` (Payment Page) or `/<nym>/pos`;
-///   the nym appears in config/images (installed-PWA back-compat).
+///   the nym appears in config (installed-PWA back-compat).
 /// - `PublicBase::Alias` → served at `/a/<slug>`; the nym is scrubbed from the
-///   embedded config, image URLs (served by content hash), and manifest.
+///   embedded config and manifest.
 ///
 /// The POS shell is selected when the row is the POS surface OR carries the
 /// legacy `pos_mode` toggle.
 async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase<'_>) -> Response {
     let domain = &state.config.domain;
 
-    // Derive the public path, the client-storage key, the (optional) nym for
-    // the embedded config, and legacy image URLs — all in one place so the
-    // nym-scrub is total for the alias branch. Generated OG images are always
-    // content-addressed and therefore never contain a nym in their URL.
-    let (base_path, page_key, config_nym, avatar_url, legacy_og_url) = match base {
+    // Derive the public path, the client-storage key, and the optional nym for
+    // the embedded config in one place so the alias branch stays nym-free.
+    // Generated OG images are content-addressed and never contain a nym.
+    let (base_path, page_key, config_nym) = match base {
         PublicBase::Nym { nym, base_path } => (
             base_path.to_string(),
             nym.to_string(),
             Some(nym.to_string()),
-            page.avatar_sha256
-                .as_ref()
-                .map(|hash| nym_avatar_url(domain, nym, hash)),
-            page.og_sha256
-                .as_ref()
-                .map(|hash| format!("https://{domain}/img/{nym}/og.jpg?v={hash}")),
         ),
-        PublicBase::Alias { slug, base_path } => (
-            base_path.to_string(),
-            slug.to_string(),
-            None,
-            page.avatar_sha256
-                .as_ref()
-                .map(|hash| format!("https://{domain}/img/_h/{hash}.webp")),
-            page.og_sha256
-                .as_ref()
-                .map(|hash| format!("https://{domain}/img/_h/{hash}.jpg")),
-        ),
+        PublicBase::Alias { slug, base_path } => (base_path.to_string(), slug.to_string(), None),
     };
     let public_url = format!("https://{domain}{base_path}");
     // POS shell for either the dedicated POS row or a legacy pos_mode page.
@@ -746,11 +719,8 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
             )
             .await
             .unwrap_or_else(|| og_image::fallback_url(domain, false)),
-            // Untouched legacy rows keep their historical card until the
-            // reconciler publishes the first generated image.
-            (None, None) => legacy_og_url.unwrap_or_else(|| og_image::fallback_url(domain, false)),
-            // Any partial/failed generated state must never advertise a
-            // missing path or fall back to stale merchant-uploaded artwork.
+            // Missing, partial, or failed generated state always uses the
+            // permanent branded fallback until reconciliation succeeds.
             _ => og_image::fallback_url(domain, false),
         }
     } else {
@@ -770,7 +740,6 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
     let supported_currencies = state.pricer.supported_currencies().to_vec();
 
     if let Some(shell) = state.pwa_shells.shell_for(is_pos).await {
-        let avatar_url_ref = avatar_url.as_deref();
         let mode = if is_pos { "pos" } else { "donation" };
         let config = PwaConfigView {
             nym: config_nym.as_deref(),
@@ -780,7 +749,6 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
             currency: &page.display_currency,
             header: &page.header,
             description: &page.description,
-            avatar_url: avatar_url_ref,
             website: page.website.as_deref(),
             twitter: page.twitter.as_deref(),
             instagram: page.instagram.as_deref(),
@@ -802,7 +770,6 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
         header: &page.header,
         description: &page.description,
         social_meta,
-        avatar_url,
         display_currency: &page.display_currency,
         website: page.website.as_deref(),
         twitter: page.twitter.as_deref(),

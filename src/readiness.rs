@@ -2214,6 +2214,12 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                   AND table_name = 'donation_pages' \
                   AND column_name = 'generated_og_retry_after' \
             ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name IN ('avatar_sha256', 'og_sha256') \
+            ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.tables \
                 WHERE table_schema = 'public' \

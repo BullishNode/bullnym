@@ -168,9 +168,6 @@
     <div class="mx-auto flex h-[100dvh] max-w-4xl flex-col overflow-hidden">
       <section class="flex min-h-0 flex-1 flex-col overflow-hidden px-5 py-3 sm:px-8 sm:py-5">
         <header class="mb-3 flex shrink-0 flex-col items-center gap-2 text-center sm:mb-5">
-          {#if config.avatar_url}
-            <img src={config.avatar_url} alt="" class="h-14 w-14 rounded-full object-cover" />
-          {/if}
           <div>
             <h1 class="font-display text-3xl uppercase tracking-display leading-none">
               {config.header || config.page_key}

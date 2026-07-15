@@ -62,7 +62,9 @@ fn security_headers_keep_donation_csp_tight() {
         "noindex, nofollow, noarchive"
     );
     assert_eq!(
-        resp.headers().get(header::CACHE_CONTROL).expect("cache header"),
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .expect("cache header"),
         "public, max-age=60, s-maxage=60, stale-while-revalidate=300"
     );
 }
@@ -87,7 +89,7 @@ fn security_headers_allow_https_connects_for_pos_csp() {
 
 #[test]
 fn live_template_renders_social_preview_metadata() {
-    let og_url = "https://bullpay.ca/img/alice/og.jpg?v=abcd";
+    let og_url = "https://bullpay.ca/og/fallback-live-v1.jpg";
     let tpl = DonationPageTpl {
         invoice_base: "/alice".to_string(),
         header: "Alice Store",
@@ -98,7 +100,6 @@ fn live_template_renders_social_preview_metadata() {
             "https://bullpay.ca/alice",
             og_url,
         ),
-        avatar_url: None,
         display_currency: "CAD",
         website: None,
         twitter: None,
@@ -146,9 +147,7 @@ fn archived_template_renders_unavailable_social_preview_metadata() {
 
     let html = tpl.render().expect("archived template renders");
     assert!(html.contains(r#"<title>Page unavailable</title>"#));
-    assert!(html.contains(
-        r#"<link rel="canonical" href="https://bullpay.ca/a/alices-shop">"#
-    ));
+    assert!(html.contains(r#"<link rel="canonical" href="https://bullpay.ca/a/alices-shop">"#));
     assert!(html.contains(
         r#"<meta property="og:image" content="https://bullpay.ca/og/fallback-unavailable-v1.jpg">"#
     ));
@@ -193,8 +192,6 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         next_addr_idx: 0,
         header: "   ".to_string(),
         description: "Description".to_string(),
-        avatar_sha256: None,
-        og_sha256: None,
         generated_og_key: None,
         generated_og_template_version: None,
         alias: None,
@@ -230,8 +227,6 @@ fn web_manifest_uses_header_for_name() {
         next_addr_idx: 0,
         header: "Alice Coffee Counter".to_string(),
         description: "Description".to_string(),
-        avatar_sha256: None,
-        og_sha256: None,
         generated_og_key: None,
         generated_og_template_version: None,
         alias: None,
@@ -262,7 +257,6 @@ fn pwa_shell_injects_config_and_og_placeholders() {
         currency: "USD",
         header: "Alice & Sons",
         description: r#"Coffee "now""#,
-        avatar_url: Some("https://bullpay.ca/img/alice/avatar.webp"),
         website: Some("https://alice.example"),
         twitter: Some("alice"),
         instagram: None,
@@ -276,7 +270,7 @@ fn pwa_shell_injects_config_and_og_placeholders() {
         shell,
         &config,
         "https://bullpay.ca/alice",
-        "https://bullpay.ca/img/alice/og.jpg?v=a&b",
+        "https://bullpay.ca/og/fallback-live-v1.jpg?x=a&b",
         "/alice/manifest.webmanifest",
     )
     .expect("injects shell");
@@ -289,13 +283,12 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     );
     assert!(html.contains(r#"<link rel="manifest" href="/alice/manifest.webmanifest">"#));
     assert!(html.contains(r#""mode":"pos""#));
-    assert!(html.contains(r#""avatar_url":"https://bullpay.ca/img/alice/avatar.webp""#));
     assert!(html.contains(r#"<meta property="og:title" content="Alice &amp; Sons">"#));
     assert!(html.contains("<title>Alice &amp; Sons</title>"));
     assert!(!html.contains("<title>bullnym</title>"));
     assert!(html.contains(r#"<meta property="og:description" content="Coffee &quot;now&quot;">"#));
     assert!(html.contains(
-        r#"<meta property="og:image" content="https://bullpay.ca/img/alice/og.jpg?v=a&amp;b">"#
+        r#"<meta property="og:image" content="https://bullpay.ca/og/fallback-live-v1.jpg?x=a&amp;b">"#
     ));
     assert!(
         html.find(r#"<meta property="og:image""#)
@@ -306,26 +299,6 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     assert!(!html.contains("<!-- BULLNYM_CONFIG -->"));
     assert!(!html.contains("<!-- BULLNYM_MANIFEST -->"));
     assert!(!html.contains("<!-- BULLNYM_OG -->"));
-}
-
-#[test]
-fn nym_avatar_url_uses_source_digest_as_cache_key() {
-    let first = nym_avatar_url("bullpay.ca", "alice", &"11".repeat(32));
-    let replacement = nym_avatar_url("bullpay.ca", "alice", &"22".repeat(32));
-
-    assert_eq!(
-        first,
-        format!(
-            "https://bullpay.ca/img/alice/avatar.webp?v={}",
-            "11".repeat(32)
-        )
-    );
-    assert_ne!(first, replacement);
-    assert_eq!(
-        first.split('?').next(),
-        replacement.split('?').next(),
-        "the historical nym-keyed image path remains compatible"
-    );
 }
 
 #[test]
@@ -342,7 +315,6 @@ fn pwa_shell_escapes_manifest_href_attr() {
         currency: "USD",
         header: "Header",
         description: "Description",
-        avatar_url: None,
         website: None,
         twitter: None,
         instagram: None,
@@ -375,7 +347,6 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         currency: "USD",
         header: "</script><script>alert(1)</script>",
         description: "Fresh coffee",
-        avatar_url: None,
         website: None,
         twitter: None,
         instagram: None,
@@ -484,8 +455,6 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
         currency: "USD",
         header: "Alice's Shop",
         description: "Fresh coffee",
-        // Alias image URLs are content-addressed (no nym in the path).
-        avatar_url: Some("https://bullpay.ca/img/_h/deadbeef.webp"),
         website: None,
         twitter: None,
         instagram: None,
@@ -509,10 +478,6 @@ fn alias_config_omits_nym_and_carries_invoice_base() {
     );
     assert_eq!(json["invoice_base"], "/a/alices-shop");
     assert_eq!(json["page_key"], "alices-shop");
-    assert_eq!(
-        json["avatar_url"],
-        "https://bullpay.ca/img/_h/deadbeef.webp"
-    );
 }
 
 #[test]
@@ -527,7 +492,6 @@ fn nym_config_still_carries_nym_and_invoice_base() {
         currency: "USD",
         header: "Alice",
         description: "d",
-        avatar_url: None,
         website: None,
         twitter: None,
         instagram: None,
@@ -561,8 +525,6 @@ fn web_manifest_fallback_uses_provided_name_not_nym() {
         next_addr_idx: 0,
         header: "   ".to_string(),
         description: "d".to_string(),
-        avatar_sha256: None,
-        og_sha256: None,
         generated_og_key: None,
         generated_og_template_version: None,
         alias: Some("alices-shop".to_string()),

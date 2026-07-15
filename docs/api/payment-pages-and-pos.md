@@ -61,8 +61,6 @@ Response is a `DonationPageView`:
   "pos_mode": false,
   "enabled": true,
   "is_archived": false,
-  "avatar_sha256": null,
-  "og_sha256": null,
   "alias": "alices-shop",
   "public_url": "https://pay.example.com/a/alices-shop"
 }
@@ -89,8 +87,9 @@ Archival never mutates permanent nym/alias ownership or the other surface.
 Page/POS management and checkout remain authorized while the owner's Lightning
 Address is offline.
 
-Bullnym does not provide an image-upload API. `avatar_sha256` and `og_sha256`
-in a `DonationPageView` are legacy read-only fields for previously stored media.
+Payment Page appearance is defined by its text and links. Bullnym does not
+provide a merchant-media upload endpoint or media-hash response fields;
+social-preview images are generated and branded by the server.
 
 ## Public surface and checkout routes
 

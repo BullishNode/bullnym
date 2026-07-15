@@ -690,88 +690,30 @@ fn default_pwa_dist_dir() -> String {
     DEFAULT_PWA_DIST_DIR.to_string()
 }
 
-// --- Donation page image pipeline ---
+// --- Payment Page generated social cards ---
 
 const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
-const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
-const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 5_000;
-const DEFAULT_DONATION_IMAGE_MAX_PIXELS: u64 = 12_000_000;
-const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
-const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
-const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DonationConfig {
-    /// Filesystem root for image storage. Generated social cards are written
-    /// below `<image_root_path>/og/`; historical merchant media may also live
-    /// below this root. nginx serves it directly at `location ^~ /img/`. The
+    /// Filesystem root for server-generated social cards. Cards are written
+    /// below `<image_root_path>/og/` and served by nginx at `/img/og/`. The
     /// directory must be writable by pay-service and readable by nginx.
     #[serde(default = "default_donation_image_root")]
     pub image_root_path: String,
-    /// Hard cap on incoming image bytes. Enforced via per-route
-    /// `DefaultBodyLimit` BEFORE the multipart parser runs — bytes never
-    /// enter memory beyond this.
-    #[serde(default = "default_donation_image_max_bytes")]
-    pub image_max_bytes: usize,
-    /// Reject images whose decoded dimensions exceed this in either
-    /// axis. Configured output dimensions must also fit this bound.
-    /// Image-bomb defense: read the header dimensions first (cheap), reject
-    /// before allocating the full pixel buffer. The default is intentionally
-    /// below large-camera panoramas because decode memory grows with pixels,
-    /// not upload bytes.
-    #[serde(default = "default_donation_image_max_dimension")]
-    pub image_max_dimension: u32,
-    /// Reject images whose decoded pixel area exceeds this value before
-    /// allocating the full pixel buffer. Configured output pixel areas must
-    /// also fit this bound.
-    #[serde(default = "default_donation_image_max_pixels")]
-    pub image_max_pixels: u64,
-    /// Output size for resized avatar (square).
-    #[serde(default = "default_donation_avatar_size")]
-    pub avatar_size: u32,
-    /// Output size for resized OG image (1200×630 is the Twitter/Facebook
-    /// summary_large_image standard).
-    #[serde(default = "default_donation_og_width")]
-    pub og_width: u32,
-    #[serde(default = "default_donation_og_height")]
-    pub og_height: u32,
 }
 
 impl Default for DonationConfig {
     fn default() -> Self {
         Self {
             image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
-            image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
-            image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
-            image_max_pixels: DEFAULT_DONATION_IMAGE_MAX_PIXELS,
-            avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
-            og_width: DEFAULT_DONATION_OG_WIDTH,
-            og_height: DEFAULT_DONATION_OG_HEIGHT,
         }
     }
 }
 
 fn default_donation_image_root() -> String {
     DEFAULT_DONATION_IMAGE_ROOT.to_string()
-}
-fn default_donation_image_max_bytes() -> usize {
-    DEFAULT_DONATION_IMAGE_MAX_BYTES
-}
-fn default_donation_image_max_dimension() -> u32 {
-    DEFAULT_DONATION_IMAGE_MAX_DIMENSION
-}
-fn default_donation_image_max_pixels() -> u64 {
-    DEFAULT_DONATION_IMAGE_MAX_PIXELS
-}
-fn default_donation_avatar_size() -> u32 {
-    DEFAULT_DONATION_AVATAR_SIZE
-}
-fn default_donation_og_width() -> u32 {
-    DEFAULT_DONATION_OG_WIDTH
-}
-fn default_donation_og_height() -> u32 {
-    DEFAULT_DONATION_OG_HEIGHT
 }
 
 const DEFAULT_POOL_SIZE: u32 = 10;
@@ -1170,18 +1112,6 @@ pub struct RateLimitConfig {
     #[serde(default = "default_donation_manifest_rate_window_secs")]
     pub donation_manifest_rate_window_secs: u32,
 
-    // --- Donation page image upload ---
-    /// Per-npub upload rate-limit on `POST /donation-page/image`. Tight
-    /// because a real user uploads avatar + OG once per session, not
-    /// many times per hour.
-    #[serde(default = "default_donation_image_uploads_per_npub_per_hour")]
-    pub donation_image_uploads_per_npub_per_hour: u32,
-    /// Per-source upload rate-limit. Defense-in-depth against IP-rotated
-    /// abuse — stops one IP from uploading to many npubs in quick
-    /// succession.
-    #[serde(default = "default_donation_image_uploads_per_source_per_min")]
-    pub donation_image_uploads_per_source_per_min: u32,
-
     /// Per-source rate-limit on public invoice status polling.
     #[serde(default = "default_invoice_status_per_source_per_min")]
     pub invoice_status_per_source_per_min: u32,
@@ -1245,10 +1175,6 @@ impl Default for RateLimitConfig {
             donation_html_rate_window_secs: default_donation_html_rate_window_secs(),
             donation_manifest_rate_limit: default_donation_manifest_rate_limit(),
             donation_manifest_rate_window_secs: default_donation_manifest_rate_window_secs(),
-            donation_image_uploads_per_npub_per_hour:
-                default_donation_image_uploads_per_npub_per_hour(),
-            donation_image_uploads_per_source_per_min:
-                default_donation_image_uploads_per_source_per_min(),
             invoice_status_per_source_per_min: default_invoice_status_per_source_per_min(),
             invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
             invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
@@ -1414,15 +1340,6 @@ fn default_donation_manifest_rate_limit() -> u32 {
 }
 fn default_donation_manifest_rate_window_secs() -> u32 {
     default_donation_html_rate_window_secs()
-}
-/// 6/h per npub: a real user uploads avatar + OG once per setup; six is
-/// generous headroom for retries and accidental re-uploads.
-fn default_donation_image_uploads_per_npub_per_hour() -> u32 {
-    6
-}
-/// 3/min per source: defense-in-depth against IP-rotated abuse.
-fn default_donation_image_uploads_per_source_per_min() -> u32 {
-    3
 }
 /// 60/min: invoice payment pages poll status during an active session.
 fn default_invoice_status_per_source_per_min() -> u32 {
@@ -1740,7 +1657,6 @@ impl Config {
         if self.pwa.dist_dir.trim().is_empty() {
             return Err("pwa.dist_dir must be non-empty".into());
         }
-        validate_donation_image_dimensions(&self.donation)?;
         require_positive(
             "bitcoin_watcher.active_tick_secs",
             self.bitcoin_watcher.active_tick_secs,
@@ -1828,38 +1744,6 @@ fn require_positive(name: &str, value: u64) -> Result<(), Box<dyn std::error::Er
 
 fn require_positive_u32(name: &str, value: u32) -> Result<(), Box<dyn std::error::Error>> {
     require_positive(name, u64::from(value))
-}
-
-fn validate_donation_image_dimensions(
-    config: &DonationConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    require_positive_u32("donation.image_max_dimension", config.image_max_dimension)?;
-    require_positive("donation.image_max_pixels", config.image_max_pixels)?;
-
-    for (name, dimension) in [
-        ("donation.avatar_size", config.avatar_size),
-        ("donation.og_width", config.og_width),
-        ("donation.og_height", config.og_height),
-    ] {
-        require_positive_u32(name, dimension)?;
-        if dimension > config.image_max_dimension {
-            return Err(format!("{name} must be <= donation.image_max_dimension").into());
-        }
-    }
-
-    let avatar_pixels = u64::from(config.avatar_size) * u64::from(config.avatar_size);
-    if avatar_pixels > config.image_max_pixels {
-        return Err("donation.avatar_size squared must be <= donation.image_max_pixels".into());
-    }
-
-    let og_pixels = u64::from(config.og_width) * u64::from(config.og_height);
-    if og_pixels > config.image_max_pixels {
-        return Err(
-            "donation.og_width * donation.og_height must be <= donation.image_max_pixels".into(),
-        );
-    }
-
-    Ok(())
 }
 
 fn validate_http_endpoint(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {

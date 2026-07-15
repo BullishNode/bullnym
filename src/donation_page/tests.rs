@@ -119,37 +119,6 @@ fn v2_archive_message_byte_exact_contract() {
     assert_eq!(msg, expected, "v2 archive byte order regression");
 }
 
-#[test]
-fn v2_image_message_byte_exact_contract() {
-    let npub = "cd".repeat(32);
-    let timestamp: u64 = 1_700_000_000;
-    let sha256_hex = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
-    let msg = crate::auth::build_la_v2_message(
-        ACTION_IMAGE,
-        &npub,
-        "alice",
-        &["avatar", sha256_hex],
-        timestamp,
-    );
-
-    let mut expected: Vec<u8> = Vec::new();
-    expected.extend_from_slice(b"bullpay-la-v2");
-    expected.push(0);
-    expected.extend_from_slice(b"donation-page-image");
-    expected.push(0);
-    expected.extend_from_slice(npub.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"alice");
-    expected.push(0);
-    expected.extend_from_slice(b"avatar");
-    expected.push(0);
-    expected.extend_from_slice(sha256_hex.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"1700000000");
-
-    assert_eq!(msg, expected, "v2 image byte order regression");
-}
-
 fn make_req() -> SaveDonationPageRequest {
     SaveDonationPageRequest {
         nym: "alice".to_string(),

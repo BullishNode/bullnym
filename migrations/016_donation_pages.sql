@@ -11,8 +11,6 @@ CREATE TABLE donation_pages (
                         ON UPDATE CASCADE ON DELETE CASCADE,
     header              TEXT NOT NULL CHECK (length(header) <= 80),
     description         TEXT NOT NULL CHECK (length(description) <= 280),
-    avatar_sha256       TEXT,
-    og_sha256           TEXT,
     display_currency    TEXT NOT NULL
                         CHECK (display_currency IN
                             ('USD','CAD','EUR','CRC','MXN','ARS','COP','INR')),

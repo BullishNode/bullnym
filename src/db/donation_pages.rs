@@ -24,10 +24,7 @@ pub struct DonationPage {
     pub next_addr_idx: i32,
     pub header: String,
     pub description: String,
-    pub avatar_sha256: Option<String>,
-    pub og_sha256: Option<String>,
-    /// Server-generated, content-addressed social card. This is deliberately
-    /// separate from `og_sha256`, the hash of a historical merchant upload.
+    /// Server-generated, content-addressed social card.
     pub generated_og_key: Option<String>,
     pub generated_og_template_version: Option<i32>,
     /// Owner-level permanent public slug shared by Payment Page and POS.
@@ -83,8 +80,7 @@ impl From<sqlx::Error> for UpsertDonationPageError {
 
 /// Insert-or-update a donation page row. Mobile sends the full page config on
 /// every save (PUT semantics). Update path clears `archived_at` so a re-save
-/// after archive un-archives. Image hashes (`avatar_sha256`, `og_sha256`) are
-/// owned by `POST /donation-page/image`.
+/// after archive un-archives.
 pub async fn upsert_donation_page(
     pool: &PgPool,
     page: &UpsertDonationPage<'_>,
@@ -245,49 +241,6 @@ pub async fn archive_donation_page(
     Ok(row)
 }
 
-/// Update the avatar or og image hash for a nym's donation page. Used by
-/// `POST /donation-page/image` after the resized WebP has been atomically
-/// written to disk. `kind_column` is one of `"avatar_sha256"` or
-/// `"og_sha256"`; the allowlist is repeated here because SQL identifiers
-/// cannot be parameterized.
-pub async fn update_donation_page_image_hash(
-    pool: &PgPool,
-    nym: &str,
-    kind: &str,
-    image_column: &str,
-    new_sha256: &str,
-) -> Result<Option<DonationPage>, sqlx::Error> {
-    let sql = match image_column {
-        "avatar_sha256" => {
-            "UPDATE donation_pages SET avatar_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2"
-        }
-        "og_sha256" => {
-            "UPDATE donation_pages SET og_sha256 = $3, updated_at = now() \
-             WHERE nym = $1 AND kind = $2"
-        }
-        _ => {
-            return Err(sqlx::Error::Protocol(format!(
-                "invalid image kind column: {image_column}"
-            )))
-        }
-    };
-    let mut tx = pool.begin().await?;
-    let updated = sqlx::query(sql)
-        .bind(nym)
-        .bind(kind)
-        .bind(new_sha256)
-        .execute(&mut *tx)
-        .await?;
-    if updated.rows_affected() == 0 {
-        tx.rollback().await?;
-        return Ok(None);
-    }
-    let row = get_donation_page_by_nym_with(&mut *tx, nym, kind).await?;
-    tx.commit().await?;
-    Ok(row)
-}
-
 pub async fn get_donation_page_by_nym(
     pool: &PgPool,
     nym: &str,
@@ -306,7 +259,7 @@ where
 {
     sqlx::query_as::<_, DonationPage>(
         "SELECT donation_pages.nym, donation_pages.kind, donation_pages.header, \
-                donation_pages.description, donation_pages.avatar_sha256, donation_pages.og_sha256, \
+                donation_pages.description, \
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \
@@ -341,7 +294,7 @@ pub async fn get_donation_page_by_alias(
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "SELECT donation_pages.nym, donation_pages.kind, donation_pages.header, \
-                donation_pages.description, donation_pages.avatar_sha256, donation_pages.og_sha256, \
+                donation_pages.description, \
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \

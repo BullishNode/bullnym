@@ -3769,6 +3769,49 @@ async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap
 // --- Registration tests ---
 
 #[tokio::test]
+async fn payment_page_schema_keeps_generated_cards_without_legacy_media_hashes() {
+    let pool = test_pool().await;
+
+    let legacy_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name IN ('avatar_sha256', 'og_sha256')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_column_count, 0);
+
+    let generated_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name IN ( \
+                'generated_og_key', \
+                'generated_og_template_version', \
+                'generated_og_failure_count', \
+                'generated_og_retry_after' \
+            ) \
+          ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generated_columns,
+        vec![
+            "generated_og_failure_count",
+            "generated_og_key",
+            "generated_og_retry_after",
+            "generated_og_template_version",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn donation_page_upsert_round_trips_pos_mode() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -4086,6 +4129,8 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["nym"], nym);
+    assert!(body.get("avatar_sha256").is_none());
+    assert!(body.get("og_sha256").is_none());
 
     let row =
         pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)

@@ -13,7 +13,6 @@ current implementation.
 - [007 Public checkout allocation and rate limits](007-donation-page-allocation-and-rate-limits.md)
 - [008 BTCPay and SamRock pairing](008-btcpay-and-samrock-pairing.md)
 - [009 Payment coordination trust boundary](009-payment-coordination-trust-boundary.md)
-- [010 Legacy media is read-only](010-legacy-media-read-only.md)
 - [Template](template.md)
 
 Statuses are `Proposed`, `Accepted`, `Superseded`, or `Deprecated`. Records that
