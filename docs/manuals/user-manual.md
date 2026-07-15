@@ -18,7 +18,7 @@ baseline reported clean build
 `permanent_names_v1`.
 
 The complete server/PWA behavior described below is the PR #177 release
-candidate at exact source `fa0003d95ce42620dbb217e4bbc70257959503e0`, expected
+candidate at exact source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, expected
 schema `062_invoice_quote_provider_attempts`. It includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
@@ -417,7 +417,7 @@ choosing two conflicting irreversible outcomes.
 
 Baseline behavior was checked against the deployed probe above. Candidate
 behavior was checked against Bullnym source and tests at
-`fa0003d95ce42620dbb217e4bbc70257959503e0`, the product/API/architecture
+`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, the product/API/architecture
 documents in this repository, and the locked completion-plan, rationale, and
 server/PWA gap-audit records maintained outside this repository.
 

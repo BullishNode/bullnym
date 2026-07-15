@@ -19,7 +19,7 @@ Exact revisions used for this manual:
 
 - deployed baseline: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
 - merged candidate base: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`;
-- PR #177 candidate: `fa0003d95ce42620dbb217e4bbc70257959503e0`, tree `ea0f3cc80bb50ac2e87085cd31fa64c3259eaea8`, expected schema `062_invoice_quote_provider_attempts`.
+- PR #177 candidate: `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`.
 
 The baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -217,7 +217,7 @@ denomination rules, first-observation valuation, provider-attempt journals,
 runtime ACLs, and readiness boundary. Never infer product capability from a
 table's existence alone.
 
-At candidate source `fa0003d95ce42620dbb217e4bbc70257959503e0`, migrations
+At candidate source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, migrations
 058 and 059 are current-only empty-state guards: they require all user, surface,
 invoice, swap, allocation, and returned-address history to be empty before
 creating the permanent-name registry and removing pre-launch fields. Migration
@@ -652,7 +652,7 @@ files 045–062, server and DB integration tests, the architecture/API/product
 documents under `docs/`, the `bullnym-tests` README and recycler source, and the
 locked completion-plan, rationale, and server/PWA gap-audit records maintained
 outside this repository. Candidate-specific claims were checked at exact
-source `fa0003d95ce42620dbb217e4bbc70257959503e0`.
+source `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.
