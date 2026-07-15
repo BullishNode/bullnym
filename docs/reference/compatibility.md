@@ -24,7 +24,7 @@ policy inline.
   one optional permanent npub-level slug shared by Payment Page and POS,
   served at `/a/<alias>` and `/a/<alias>/pos`.
 - Compatibility behavior: `alias` is the sole optional trailing signed field,
-  appended after the required `pos_mode`, `ct_descriptor`, and `kind`. A client
+  appended after the required `ct_descriptor` and `kind`. A client
   that omits it signs the current fixed field list. Omitted/null preserves the
   claim; `""` is signed but rejected
   as `DonationPageInvalid`; a first valid value claims permanently; the same
@@ -39,16 +39,3 @@ policy inline.
   keeping it terminal and optional preserves that explicit product choice.
 - Removal condition: none. Omission is a permanent no-op, not an
   ownership-state transition.
-
-## Legacy Payment Page media hashes
-
-- Current fields: `avatar_sha256` and `og_sha256` in Payment Page responses and
-  their backing database columns/configuration.
-- Compatibility behavior: existing values may be returned as read-only data.
-  Bullnym does not accept image uploads and new clients must not depend on these
-  fields being populated.
-- Compatibility reason: older rows and clients may still reference stored
-  hashes even though the upload feature was removed.
-- Removal condition: production database and traffic audits prove no supported
-  client or retained row needs the fields, followed by a reviewed data and file
-  migration. Do not remove them based only on source-code search.

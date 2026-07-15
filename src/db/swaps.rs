@@ -130,6 +130,9 @@ pub async fn max_persisted_reverse_key_index(
 }
 
 pub async fn allocate_address_index(pool: &PgPool, nym: &str) -> Result<Option<i32>, sqlx::Error> {
+    // This allocates a new Lightning Address instruction and therefore stays
+    // coupled to product availability. Existing recorded swaps are claimed by
+    // obligation-keyed queries that do not apply this admission predicate.
     let row: Option<(i32,)> = sqlx::query_as(
         "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
          WHERE nym = $1 AND is_active = TRUE \

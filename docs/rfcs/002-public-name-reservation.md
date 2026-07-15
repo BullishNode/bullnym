@@ -1,14 +1,23 @@
 # Public Name Reservation Policy: Nyms and Aliases
 
+> [!WARNING]
+> **Historical / superseded.** This document is not implementation or rollout
+> guidance. Name-level deactivation/reactivation, grandfathered claims,
+> multi-owner migration choices, and tombstones described below are not part of
+> the current ownership model. Product availability is separate: the permanent
+> owner may bring the same Lightning Address online again without reclaiming or
+> changing its name. The authoritative design is
+> [RFC-003](003-permanent-public-names.md); current wire behavior is documented
+> in [Nyms and discovery](../api/nyms-and-discovery.md) and
+> [Payment Page and POS](../api/payment-pages-and-pos.md).
+
 - Status: Superseded by RFC-003
 - Owner: Unassigned
 - Affected repositories: `bullnym`, `bullbitcoin-mobile`
 - Last updated: 2026-07-11
 
-This is a historical research/design record. Its active/inactive alias and
-mutable-clear alternatives are not implementation guidance. The accepted
-insert-only canonical/tombstone cutover decision is
-[RFC-003](003-permanent-public-names.md).
+This is a historical research/design record. Its alternatives are retained
+only to explain the discussion that preceded RFC-003.
 
 This document preserves the product discussion, external research, current-code
 audit, preferred direction, implementation outline, and remaining decisions for

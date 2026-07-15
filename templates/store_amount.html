@@ -33,11 +33,6 @@
         }
         main { max-width: 480px; margin: 0 auto; padding: 16px; }
         header { text-align: center; margin-bottom: 16px; }
-        .avatar {
-            width: 96px; height: 96px; border-radius: 50%;
-            object-fit: cover; margin-bottom: 12px;
-            border: 2px solid var(--border);
-        }
         h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
         .description {
             color: var(--muted); font-size: 14px;
@@ -104,7 +99,6 @@
 <body>
     <main>
         <header>
-            {% match avatar_url %}{% when Some with (url) %}<img class="avatar" src="{{ url }}" alt="{{ header }}">{% when None %}{% endmatch %}
             <h1>{{ header }}</h1>
             <p class="description">{{ description }}</p>
             <div class="social">

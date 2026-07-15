@@ -919,7 +919,6 @@ fn build_router(state: AppState) -> Router {
                 "/lnurlp/callback/:nym/:comment_intent",
                 get(lnurl::callback_with_comment_intent),
             )
-            .route("/lnurlp/callback/:nym", get(lnurl::callback))
             .route("/register", post(registration::register))
             .route("/register", put(registration::update_registration))
             .route(

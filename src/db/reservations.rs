@@ -53,7 +53,8 @@ pub async fn count_unfulfilled_reservations(pool: &PgPool, nym: &str) -> Result<
 }
 
 /// Idempotent allocation: returns the cached addr_index if `(nym, outpoint)`
-/// was seen before; otherwise reads the user's CURRENT `next_addr_idx`,
+/// was seen before even after product deactivation; otherwise reads the active
+/// user's CURRENT `next_addr_idx`,
 /// inserts a new `outpoint_addresses` row using that value (informational),
 /// and returns it. Does NOT advance `users.next_addr_idx` — that's done
 /// asynchronously by the chain watcher when an address is observed paid.
@@ -81,7 +82,8 @@ pub async fn allocate_outpoint_address(
         return Ok(idx);
     }
 
-    // Read current next_addr_idx (no increment — chain watcher advances it).
+    // A cache miss is a new public instruction and remains active-only. Read
+    // current next_addr_idx (no increment — chain watcher advances it).
     let (current_idx,): (i32,) = sqlx::query_as(
         "SELECT next_addr_idx FROM users \
          WHERE nym = $1 AND is_active = TRUE",

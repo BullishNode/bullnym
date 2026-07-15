@@ -25,8 +25,6 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::image_pipeline;
-
 pub const WIDTH: u32 = 1200;
 pub const HEIGHT: u32 = 630;
 /// Bump whenever layout, colors, logo bytes, fonts, or encoding changes. Old
@@ -276,7 +274,7 @@ pub async fn publish(
         // holds the sole permit until it actually finishes.
         let _permit = permit;
         let bytes = render_jpeg(&title, &description)?;
-        image_pipeline::atomic_write(&render_path, &bytes)
+        atomic_write_generated(&render_path, &bytes)
             .map_err(|e| OgImageError::new(format!("write {}: {e}", render_path.display())))
     })
     .await
@@ -286,6 +284,29 @@ pub async fn publish(
         key,
         template_version: TEMPLATE_VERSION,
     })
+}
+
+/// Durably publish one immutable generated card without exposing a partial
+/// file to nginx. Concurrent renders use distinct temporary paths; the final
+/// rename is atomic and the last identical writer wins harmlessly.
+fn atomic_write_generated(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = final_path.with_extension(format!("jpg.tmp.{}", uuid::Uuid::new_v4()));
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = fs::rename(&tmp_path, final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn render_jpeg(title: &str, description: &str) -> Result<Vec<u8>, OgImageError> {

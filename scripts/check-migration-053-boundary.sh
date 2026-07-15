@@ -1555,240 +1555,30 @@ if [[ "$require_migration_058" == "1" && "$require_migration_059" != "1" ]]; the
     clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
       --quiet --tuples-only --no-align <<'SQL'
 SELECT (
-    COALESCE((
-        SELECT array_agg(
-                   format(
-                       '%s:%s:%s',
-                       attribute.attname,
-                       format_type(attribute.atttypid, attribute.atttypmod),
-                       CASE WHEN attribute.attnotnull THEN 'NO' ELSE 'YES' END
-                   )
-                   ORDER BY attribute.attnum
-               ) = ARRAY[
-                   'owner_npub:text:NO',
-                   'candidate_nyms:text[]:NO',
-                   'active_nym:text:YES',
-                   'canonical_nym:text:YES',
-                   'candidate_aliases:text[]:NO',
-                   'canonical_alias:text:YES',
-                   'resolved:boolean:NO'
-               ]::TEXT[]
-          FROM pg_attribute attribute
-         WHERE attribute.attrelid =
-                   'public.public_name_migration_choices'::REGCLASS
-           AND attribute.attnum > 0
-           AND NOT attribute.attisdropped
-    ), FALSE)
-    AND NOT EXISTS (
-        SELECT 1
-          FROM (VALUES
-              ('public_name_migration_choices_pkey', 'p'),
-              ('public_name_choices_nyms_nonempty_check', 'c'),
-              ('public_name_choices_active_candidate_check', 'c'),
-              ('public_name_choices_nym_candidate_check', 'c'),
-              ('public_name_choices_alias_candidate_check', 'c'),
-              ('public_name_choices_active_canonical_check', 'c'),
-              ('public_name_choices_resolution_complete_check', 'c')
-          ) required(constraint_name, constraint_type)
-         WHERE NOT EXISTS (
-             SELECT 1
-               FROM pg_constraint constraint_info
-              WHERE constraint_info.conrelid =
-                        'public.public_name_migration_choices'::REGCLASS
-                AND constraint_info.conname = required.constraint_name
-                AND constraint_info.contype = required.constraint_type::"char"
-                AND constraint_info.convalidated
-         )
-    )
+    NOT EXISTS (SELECT 1 FROM users)
+    AND NOT EXISTS (SELECT 1 FROM donation_pages)
+    AND NOT EXISTS (SELECT 1 FROM invoices)
+    AND NOT EXISTS (SELECT 1 FROM swap_records)
+    AND NOT EXISTS (SELECT 1 FROM chain_swap_records)
+    AND NOT EXISTS (SELECT 1 FROM outpoint_addresses)
+    AND NOT EXISTS (SELECT 1 FROM swap_key_allocations)
+    AND NOT EXISTS (SELECT 1 FROM swap_key_legacy_high_water)
+    AND NOT EXISTS (SELECT 1 FROM recovery_address_commitments)
+    AND NOT EXISTS (SELECT 1 FROM rate_limit_events)
+    AND NOT EXISTS (SELECT 1 FROM nym_access_events)
+    AND NOT EXISTS (SELECT 1 FROM processed_webhook_events)
+    AND NOT EXISTS (SELECT 1 FROM watcher_lane_progress)
+    AND NOT EXISTS (SELECT 1 FROM fee_last_known_good_observations)
+    AND to_regclass('public.public_names') IS NULL
+    AND to_regclass('public.public_name_migration_choices') IS NULL
+    AND to_regclass('public.public_name_migration_merchant_communications') IS NULL
     AND EXISTS (
         SELECT 1
-          FROM pg_trigger trigger_info
-          JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid
-          JOIN pg_namespace function_namespace
-            ON function_namespace.oid = function_info.pronamespace
-         WHERE trigger_info.tgrelid =
-                   'public.public_name_migration_choices'::REGCLASS
-           AND trigger_info.tgname = 'public_name_migration_choices_guard'
-           AND trigger_info.tgtype = 27
-           AND NOT trigger_info.tgisinternal
-           AND trigger_info.tgenabled = 'O'
-           AND function_namespace.nspname = 'public'
-           AND function_info.proname = 'guard_public_name_migration_choice'
-           AND function_info.pronargs = 0
-    )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_class relation
-          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-         WHERE namespace.nspname = 'public'
-           AND relation.relname = 'public_name_migration_choices'
-           AND relation.relkind = 'r'
-           AND pg_get_userbyid(relation.relowner) <> current_user
-           AND NOT pg_has_role(
-               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
-           )
-           AND NOT pg_has_role(
-               current_user, pg_get_userbyid(relation.relowner), 'SET'
-           )
-           AND NOT has_table_privilege(current_user, relation.oid, 'SELECT')
-           AND NOT has_table_privilege(current_user, relation.oid, 'INSERT')
-           AND NOT has_table_privilege(current_user, relation.oid, 'UPDATE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
-           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM aclexplode(COALESCE(
-                     relation.relacl, acldefault('r', relation.relowner)
-                 )) acl
-                WHERE acl.grantee = 0
-           )
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM pg_attribute attribute
-                WHERE attribute.attrelid = relation.oid
-                  AND attribute.attnum > 0
-                  AND NOT attribute.attisdropped
-                  AND attribute.attacl IS NOT NULL
-           )
-    )
-    AND COALESCE((
-        SELECT array_agg(
-                   format(
-                       '%s:%s',
-                       attribute.attname,
-                       format_type(attribute.atttypid, attribute.atttypmod)
-                   )
-                   ORDER BY attribute.attnum
-               ) = ARRAY[
-                   'owner_npub:text',
-                   'canonical_nym:text',
-                   'canonical_alias:text',
-                   'surface_nym:text',
-                   'surface_kind:text',
-                   'previous_alias:text',
-                   'previous_public_name:text',
-                   'surface_enabled:boolean',
-                   'surface_archived:boolean'
-               ]::TEXT[]
-          FROM pg_attribute attribute
-         WHERE attribute.attrelid =
-                   'public.public_name_migration_merchant_communications'::REGCLASS
-           AND attribute.attnum > 0
-           AND NOT attribute.attisdropped
-    ), FALSE)
-    AND EXISTS (
-        SELECT 1
-          FROM pg_class relation
-          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-         WHERE namespace.nspname = 'public'
-           AND relation.relname =
-               'public_name_migration_merchant_communications'
-           AND relation.relkind = 'v'
-           AND pg_get_userbyid(relation.relowner) <> current_user
-           AND NOT pg_has_role(
-               current_user, pg_get_userbyid(relation.relowner), 'USAGE'
-           )
-           AND NOT pg_has_role(
-               current_user, pg_get_userbyid(relation.relowner), 'SET'
-           )
-           AND NOT has_table_privilege(current_user, relation.oid, 'SELECT')
-           AND NOT has_table_privilege(current_user, relation.oid, 'INSERT')
-           AND NOT has_table_privilege(current_user, relation.oid, 'UPDATE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'DELETE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'TRUNCATE')
-           AND NOT has_table_privilege(current_user, relation.oid, 'REFERENCES')
-           AND NOT has_table_privilege(current_user, relation.oid, 'TRIGGER')
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM aclexplode(COALESCE(
-                     relation.relacl, acldefault('r', relation.relowner)
-                 )) acl
-                WHERE acl.grantee = 0
-           )
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM pg_attribute attribute
-                WHERE attribute.attrelid = relation.oid
-                  AND attribute.attnum > 0
-                  AND NOT attribute.attisdropped
-                  AND attribute.attacl IS NOT NULL
-           )
-    )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_proc function_info
-          JOIN pg_namespace namespace
-            ON namespace.oid = function_info.pronamespace
-         WHERE namespace.nspname = 'public'
-           AND function_info.proname = 'guard_public_name_migration_choice'
-           AND function_info.pronargs = 0
-           AND function_info.prokind = 'f'
-           AND function_info.prorettype = 'trigger'::REGTYPE
-           AND position(
-               'IF TG_OP = ''DELETE'' THEN'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'NEW.owner_npub IS DISTINCT FROM OLD.owner_npub'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'NEW.candidate_nyms IS DISTINCT FROM OLD.candidate_nyms'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'NEW.active_nym IS DISTINCT FROM OLD.active_nym'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'NEW.candidate_aliases IS DISTINCT FROM OLD.candidate_aliases'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'public-name migration candidate snapshot is immutable'
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'ERRCODE = ''23000'''
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND position(
-               'CONSTRAINT = ''public_name_migration_snapshot_immutable'''
-               IN pg_get_functiondef(function_info.oid)
-           ) > 0
-           AND pg_get_userbyid(function_info.proowner) <> current_user
-           AND NOT pg_has_role(
-               current_user,
-               pg_get_userbyid(function_info.proowner),
-               'USAGE'
-           )
-           AND NOT pg_has_role(
-               current_user,
-               pg_get_userbyid(function_info.proowner),
-               'SET'
-           )
-           AND NOT has_function_privilege(
-               current_user, function_info.oid, 'EXECUTE'
-           )
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM aclexplode(COALESCE(
-                     function_info.proacl,
-                     acldefault('f', function_info.proowner)
-                 )) acl
-                WHERE acl.grantee = 0
-                  AND acl.privilege_type = 'EXECUTE'
-           )
-    )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_attribute attribute
-         WHERE attribute.attrelid = 'public.donation_pages'::REGCLASS
-           AND attribute.attname = 'alias'
-           AND attribute.attnum > 0
-           AND NOT attribute.attisdropped
+          FROM pg_attribute
+         WHERE attrelid = 'public.donation_pages'::REGCLASS
+           AND attname = 'alias'
+           AND attnum > 0
+           AND NOT attisdropped
     )
     AND EXISTS (
         SELECT 1
@@ -1814,16 +1604,14 @@ SELECT (
            AND pg_get_expr(index_info.indpred, index_info.indrelid)
                IN ('(alias IS NOT NULL)', 'alias IS NOT NULL')
     )
-    AND to_regclass('public.public_names') IS NULL
 )::INT;
 SQL
   )"
   [[ "$migration_058_ready" == "1" ]] || {
-    echo "migration-058 boundary: candidate snapshot, review view, guard, owner, or ACL invariant failed" >&2
+    echo "migration-058 boundary: empty-state cutover invariant failed" >&2
     exit 1
   }
 fi
-
 if [[ "$require_migration_059" == "1" ]]; then
   migration_059_registry_ready="$(
     clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
@@ -1838,9 +1626,7 @@ SELECT (
                    'name:text:NO',
                    'owner_npub:text:NO',
                    'kind:text:NO',
-                   'canonical:boolean:NO',
-                   'claimed_at:timestamp with time zone:NO',
-                   'grandfathered:boolean:NO'
+                   'claimed_at:timestamp with time zone:NO'
                ]::TEXT[]
           FROM information_schema.columns
          WHERE table_schema = 'public'
@@ -1852,9 +1638,10 @@ SELECT (
               ('public_names_pkey', 'p'),
               ('public_names_kind_check', 'c'),
               ('public_names_claimed_at_check', 'c'),
-              ('public_names_new_name_shape_check', 'c'),
-              ('public_names_new_owner_shape_check', 'c'),
-              ('public_names_name_kind_key', 'u')
+              ('public_names_name_shape_check', 'c'),
+              ('public_names_owner_shape_check', 'c'),
+              ('public_names_shared_namespace_key', 'u'),
+              ('public_names_owner_kind_lifetime_key', 'u')
           ) required(constraint_name, constraint_type)
          WHERE NOT EXISTS (
              SELECT 1
@@ -1867,65 +1654,6 @@ SELECT (
                 AND constraint_info.convalidated
          )
     )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_index index_info
-          JOIN pg_class index_relation
-            ON index_relation.oid = index_info.indexrelid
-         WHERE index_info.indrelid = 'public.public_names'::REGCLASS
-           AND index_relation.relname =
-               'public_names_one_canonical_kind_per_owner_idx'
-           AND index_info.indisunique
-           AND index_info.indisvalid
-           AND index_info.indisready
-           AND index_info.indnkeyatts = 2
-           AND index_info.indnatts = 2
-           AND ARRAY(
-               SELECT attribute.attname::TEXT
-                 FROM unnest(index_info.indkey) WITH ORDINALITY
-                      AS key_column(attnum, position)
-                 JOIN pg_attribute attribute
-                   ON attribute.attrelid = index_info.indrelid
-                  AND attribute.attnum = key_column.attnum
-                ORDER BY key_column.position
-           ) = ARRAY['owner_npub', 'kind']::TEXT[]
-           AND pg_get_expr(index_info.indpred, index_info.indrelid) = 'canonical'
-    )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_index index_info
-          JOIN pg_class index_relation
-            ON index_relation.oid = index_info.indexrelid
-         WHERE index_info.indrelid = 'public.users'::REGCLASS
-           AND index_relation.relname = 'users_npub_active_key'
-           AND index_info.indisunique
-           AND index_info.indisvalid
-           AND index_info.indisready
-           AND index_info.indnkeyatts = 1
-           AND index_info.indnatts = 1
-           AND ARRAY(
-               SELECT attribute.attname::TEXT
-                 FROM unnest(index_info.indkey) WITH ORDINALITY
-                      AS key_column(attnum, position)
-                 JOIN pg_attribute attribute
-                   ON attribute.attrelid = index_info.indrelid
-                  AND attribute.attnum = key_column.attnum
-                ORDER BY key_column.position
-           ) = ARRAY['npub']::TEXT[]
-           AND pg_get_expr(index_info.indpred, index_info.indrelid)
-               IN ('is_active', '(is_active = true)')
-    )
-    AND NOT EXISTS (
-        SELECT 1
-          FROM public_names
-         WHERE NOT canonical AND NOT grandfathered
-    )
-    AND NOT EXISTS (
-        SELECT owner_npub, kind
-          FROM public_names
-         GROUP BY owner_npub, kind
-        HAVING COUNT(*) FILTER (WHERE canonical) <> 1
-    )
     AND NOT EXISTS (
         SELECT 1
           FROM public_names AS aliases
@@ -1935,7 +1663,17 @@ SELECT (
                  FROM public_names AS nyms
                 WHERE nyms.owner_npub = aliases.owner_npub
                   AND nyms.kind = 'nym'
-                  AND nyms.canonical
+           )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM users
+         WHERE NOT EXISTS (
+               SELECT 1
+                 FROM public_names
+                WHERE public_names.name = users.nym
+                  AND public_names.owner_npub = users.npub
+                  AND public_names.kind = 'nym'
            )
     )
     AND NOT EXISTS (
@@ -2004,13 +1742,7 @@ SELECT (
         current_user, 'public.public_names', 'id', 'INSERT'
     )
     AND NOT has_column_privilege(
-        current_user, 'public.public_names', 'canonical', 'INSERT'
-    )
-    AND NOT has_column_privilege(
         current_user, 'public.public_names', 'claimed_at', 'INSERT'
-    )
-    AND NOT has_column_privilege(
-        current_user, 'public.public_names', 'grandfathered', 'INSERT'
     )
     AND NOT EXISTS (
         SELECT 1
@@ -2026,14 +1758,14 @@ SELECT (
     )
     AND NOT EXISTS (
         SELECT 1
-          FROM pg_attribute attribute,
-               LATERAL aclexplode(COALESCE(
-                   attribute.attacl,
-                   acldefault('c', (
-                       SELECT relowner FROM pg_class
-                        WHERE oid = attribute.attrelid
-                   ))
-               )) acl
+          FROM pg_attribute attribute
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+              attribute.attacl,
+              acldefault('c', (
+                  SELECT relowner FROM pg_class
+                   WHERE oid = attribute.attrelid
+              ))
+          )) acl
          WHERE attribute.attrelid = 'public.public_names'::REGCLASS
            AND attribute.attnum > 0
            AND NOT attribute.attisdropped
@@ -2087,7 +1819,7 @@ SELECT (
 SQL
   )"
   [[ "$migration_059_registry_ready" == "1" ]] || {
-    echo "migration-059 boundary: immutable registry, owner, or ACL invariant failed" >&2
+    echo "migration-059 boundary: current permanent-name registry, owner, or ACL invariant failed" >&2
     exit 1
   }
 fi
@@ -2097,11 +1829,19 @@ if [[ "$require_migration_059" == "1" ]]; then
     clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
       --quiet --tuples-only --no-align <<'SQL'
 SELECT (
-    NOT EXISTS (
+    EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'donation_pages'
+           AND column_name = 'ct_descriptor'
+           AND is_nullable = 'NO'
+    )
+    AND NOT EXISTS (
         SELECT 1
           FROM pg_attribute
          WHERE attrelid = to_regclass('public.donation_pages')
-           AND attname = 'alias'
+           AND attname IN ('alias', 'pos_mode')
            AND attnum > 0
            AND NOT attisdropped
     )
@@ -2110,7 +1850,7 @@ SELECT (
 SQL
   )"
   [[ "$migration_059_ready" == "1" ]] || {
-    echo "migration-059 boundary: mutable per-surface alias authority remains" >&2
+    echo "migration-059 boundary: obsolete surface authority or nullable descriptor remains" >&2
     exit 1
   }
 fi

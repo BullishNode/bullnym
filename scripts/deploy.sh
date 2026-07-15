@@ -447,12 +447,12 @@ if [[ -f "$REPO/migrations/058_permanent_public_names.sql" \
   if ! migration_058_boundary_ready; then
     cat >&2 <<'EOF'
 deployment refused before build: migration 058 is absent or its exact immutable public-name boundary could not be verified.
-Stop every database writer and apply migration 058 with
---set runtime_role=bullnym_app as the distinct privileged schema owner. Review
-public_name_migration_choices, explicitly resolve every fully-offline multi-nym
-or multi-alias owner, and capture the A10 merchant-communication view. Keep
-writers stopped until migration 059 completes; never alter candidate arrays to
-force the boundary.
+Stop every database writer, retain the documented pre-reset backup, and verify
+that the fresh production database contains no users, surfaces, invoices,
+swaps, allocations, returned-address history, or stale public-name objects.
+Apply migration 058 with --set runtime_role=bullnym_app as the distinct
+privileged schema owner. Keep writers stopped until migration 059 completes;
+never bypass the empty-state refusal.
 EOF
     exit 1
   fi
@@ -461,16 +461,14 @@ if [[ -f "$REPO/migrations/059_remove_surface_alias.sql" ]]; then
   if ! migration_059_boundary_ready; then
     cat >&2 <<'EOF'
 deployment refused before build: migration 059 is absent or mutable per-surface alias authority remains.
-Keep payservice and every database writer stopped, take the documented backup,
-then prove the exact migration-058 boundary. If it is absent, apply migration
-058 with --set runtime_role=bullnym_app as the privileged schema owner. Review
-its exact candidate snapshot and merchant-communication view, explicitly
-resolve every ambiguous canonical choice, and capture the review evidence.
-Only then apply migration 059 with the same owner and runtime-role binding. It
-revalidates both candidate sets, snapshots fallback Page descriptors/cursors,
-preserves canonical names and tombstones, and only then removes the old alias
-column. Never apply 059 directly from schema 057 or bypass an unresolved,
-drift, snapshot, or review refusal.
+Keep payservice and every database writer stopped. Retain the documented final
+pre-reset backup, reset production to an empty database, and apply the complete
+migration sequence with --set runtime_role=bullnym_app as the distinct
+privileged schema owner. Migrations 058 and 059 each revalidate the empty-state
+boundary; 059 then creates the current five-column permanent-name registry,
+requires surface descriptors, and removes the pre-launch alias/pos_mode
+columns. Never bypass a nonempty-state, obsolete-object, descriptor, owner, or
+runtime-ACL refusal.
 EOF
     exit 1
   fi

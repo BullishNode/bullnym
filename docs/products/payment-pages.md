@@ -17,9 +17,8 @@ nym. Management actions use:
 
 The row stores display text, display currency, links, enabled/archive state, a
 required Liquid CT descriptor, an independent address cursor, and the current
-generated social-card key/template version. Legacy media hashes may be returned
-for old rows, but Bullnym no longer accepts image uploads and clients must treat
-those fields as read-only compatibility data.
+generated social-card key/template version. Merchant-uploaded media and media
+hash response fields are not part of the current contract.
 
 ## Social previews
 

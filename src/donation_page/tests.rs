@@ -12,18 +12,16 @@ fn save_payload_fields_fixed_order() {
         "alice",
         "alice_ig",
         "1",
-        "0",
         TEST_DESCRIPTOR,
         "payment_page",
         None,
     );
-    assert_eq!(fields.len(), 10);
+    assert_eq!(fields.len(), 9);
     assert_eq!(fields[0], "Alice's Coffee");
     assert_eq!(fields[2], "USD");
     assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], "0");
-    assert_eq!(fields[8], TEST_DESCRIPTOR);
-    assert_eq!(fields[9], "payment_page");
+    assert_eq!(fields[7], TEST_DESCRIPTOR);
+    assert_eq!(fields[8], "payment_page");
 }
 
 #[test]
@@ -37,15 +35,13 @@ fn save_payload_fields_kind_is_trailing_after_descriptor() {
         "alice",
         "alice_ig",
         "1",
-        "0",
         TEST_DESCRIPTOR,
         "pos",
         None,
     );
-    assert_eq!(fields.len(), 10);
-    assert_eq!(fields[7], "0");
-    assert_eq!(fields[8], TEST_DESCRIPTOR);
-    assert_eq!(fields[9], "pos");
+    assert_eq!(fields.len(), 9);
+    assert_eq!(fields[7], TEST_DESCRIPTOR);
+    assert_eq!(fields[8], "pos");
 }
 
 /// Byte-exact contract test for the v2 signing protocol.
@@ -63,7 +59,6 @@ fn v2_save_message_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
-        "0",
         TEST_DESCRIPTOR,
         "payment_page",
         None,
@@ -88,7 +83,7 @@ fn v2_save_message_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 14);
+    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 13);
 }
 
 #[test]
@@ -119,37 +114,6 @@ fn v2_archive_message_byte_exact_contract() {
     assert_eq!(msg, expected, "v2 archive byte order regression");
 }
 
-#[test]
-fn v2_image_message_byte_exact_contract() {
-    let npub = "cd".repeat(32);
-    let timestamp: u64 = 1_700_000_000;
-    let sha256_hex = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
-    let msg = crate::auth::build_la_v2_message(
-        ACTION_IMAGE,
-        &npub,
-        "alice",
-        &["avatar", sha256_hex],
-        timestamp,
-    );
-
-    let mut expected: Vec<u8> = Vec::new();
-    expected.extend_from_slice(b"bullpay-la-v2");
-    expected.push(0);
-    expected.extend_from_slice(b"donation-page-image");
-    expected.push(0);
-    expected.extend_from_slice(npub.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"alice");
-    expected.push(0);
-    expected.extend_from_slice(b"avatar");
-    expected.push(0);
-    expected.extend_from_slice(sha256_hex.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"1700000000");
-
-    assert_eq!(msg, expected, "v2 image byte order regression");
-}
-
 fn make_req() -> SaveDonationPageRequest {
     SaveDonationPageRequest {
         nym: "alice".to_string(),
@@ -161,7 +125,6 @@ fn make_req() -> SaveDonationPageRequest {
         website: Some("https://example.com".to_string()),
         twitter: Some("alice".to_string()),
         instagram: Some("alice.ig".to_string()),
-        pos_mode: false,
         enabled: true,
         kind: db::KIND_PAYMENT_PAGE.to_string(),
         alias: None,
@@ -328,18 +291,17 @@ fn save_payload_fields_alias_is_trailing_after_kind() {
         "alice",
         "alice_ig",
         "1",
-        "0",
         TEST_DESCRIPTOR,
         "pos",
         Some("alices-shop"),
     );
-    assert_eq!(fields.len(), 11);
-    assert_eq!(fields[9], "pos");
-    assert_eq!(fields[10], "alices-shop");
+    assert_eq!(fields.len(), 10);
+    assert_eq!(fields[8], "pos");
+    assert_eq!(fields[9], "alices-shop");
 }
 
-/// Byte-exact contract for a save message carrying an alias (11 payload
-/// fields → 15 NUL separators). Mobile's `buildSavePayloadFields` must append
+/// Byte-exact contract for a save message carrying an alias (10 payload
+/// fields → 14 NUL separators). Mobile's `buildSavePayloadFields` must append
 /// alias in lockstep.
 #[test]
 fn v2_save_message_with_alias_byte_exact_contract() {
@@ -351,7 +313,6 @@ fn v2_save_message_with_alias_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
-        "0",
         TEST_DESCRIPTOR,
         "payment_page",
         Some("alices-shop"),
@@ -376,7 +337,7 @@ fn v2_save_message_with_alias_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 alias byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 15);
+    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 14);
 }
 
 #[test]
@@ -405,17 +366,11 @@ fn alias_regex_rejects_invalid_slugs() {
 #[test]
 fn alias_blocklist_rejects_reserved_surface_and_brand_values() {
     // Surface-related tokens and brand names remain reserved public names.
-    for s in [
-        "0",
-        "1",
-        "pos",
-        "bull",
-        "bullbitcoin",
-        "bull-bitcoin",
-        "bullpay",
-    ] {
+    for s in ["pos", "bull", "bullbitcoin", "bull-bitcoin", "bullpay"] {
         assert!(reserved_nyms::is_reserved_alias(s), "should reserve {s:?}");
     }
+    assert!(!reserved_nyms::is_reserved_alias("0"));
+    assert!(!reserved_nyms::is_reserved_alias("1"));
     // A normal merchant slug is allowed.
     assert!(!reserved_nyms::is_reserved_alias("alices-shop"));
 }

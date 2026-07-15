@@ -47,23 +47,13 @@ pub fn is_reserved(nym: &str) -> bool {
 }
 
 /// Alias-specific reservations for the `/a/<alias>` slug namespace, layered on
-/// top of `RESERVED_NYMS` (route hygiene). Two groups:
-///
-/// - `"0"` / `"1"`: load-bearing for the signed-payload trailing-field trick.
-///   They are the `pos_mode` value domain, so an alias equal to either would
-///   let a captured legacy save message (whose sole trailing signed field was
-///   `pos_mode`) be byte-identical to a new alias-claiming message. Blocking
-///   them keeps the alias value domain disjoint from `pos_mode`. See
-///   `donation_page.rs` and `docs/compatibility-ledger.md`.
-/// - Brand/impersonation names, to stop a merchant publishing a link that
-///   looks first-party.
+/// top of `RESERVED_NYMS` (route hygiene). Brand/impersonation names stop a
+/// merchant publishing a link that looks first-party.
 ///
 /// (`"pos"`, `"payment_page"` are covered elsewhere — `"pos"` is in
 /// `RESERVED_NYMS`, `"payment_page"` fails the alias charset via its
 /// underscore — which also keeps the alias domain disjoint from `kind`.)
 pub const RESERVED_ALIASES: &[&str] = &[
-    "0",
-    "1",
     "bullbitcoin",
     "bull-bitcoin",
     "bullpay",

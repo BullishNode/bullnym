@@ -1,8 +1,6 @@
 -- Server-owned Open Graph previews for Payment Pages.
---
--- `og_sha256` remains the hash of a historical merchant upload. Generated
--- images use a separate content-addressed key so old data and old social-card
--- URLs remain valid during the migration.
+-- Images use a content-addressed key derived from the current Page content
+-- and template version.
 
 ALTER TABLE donation_pages
     ADD COLUMN generated_og_key TEXT

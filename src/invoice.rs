@@ -745,39 +745,9 @@ async fn create_anonymous_for_kind(
         .await?
         {
             Some((address, index, descriptor)) => (address, index, descriptor),
-            // Legacy Payment Page rows created before the descriptor split have
-            // no page descriptor; fall back to the nym's Lightning Address
-            // descriptor/cursor so those pages keep settling.
-            //
-            // Defense-in-depth (KR-1): only for a nym with NO POS surface. A
-            // nym that also runs POS lives in the descriptor-split world, so a
-            // Payment Page checkout with a missing page descriptor is a
-            // misconfiguration, not a legacy row — refuse rather than silently
-            // settle it to the shared Lightning Address cursor and risk mixing
-            // the POS and LA rails.
-            None if kind == db::KIND_PAYMENT_PAGE => {
-                if db::get_donation_page_by_nym(&state.db, &nym, db::KIND_POS)
-                    .await?
-                    .is_some()
-                {
-                    return Err(AppError::DonationPageNotFound(nym.clone()));
-                }
-                let (address, index) = db::allocate_next_liquid_for_permanent_nym(
-                    &state.db,
-                    &nym,
-                    |ct_descriptor, idx| {
-                        descriptor::derive_address(ct_descriptor, idx)
-                            .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
-                    },
-                )
-                .await?
-                .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
-                (address, index, owner.ct_descriptor.clone())
-            }
-            // The POS surface must carry its own descriptor (enforced at save).
-            // If allocation failed the row is misconfigured; hard-fail rather
-            // than fall back to the Lightning Address cursor — POS receipts
-            // must never settle to the LA wallet (KR-1).
+            // Every Page/POS surface owns its descriptor and cursor. Missing or
+            // unavailable surface allocation is never redirected through the
+            // owner's independently configured Lightning Address wallet.
             None => return Err(AppError::DonationPageNotFound(nym.clone())),
         };
     let liquid_blinding_key_hex =
@@ -2191,24 +2161,28 @@ async fn create_bitcoin_chain_offer_with_faults(
         .enforce(Rail::BitcoinChain)
         .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
 
-    let Some(active_owner) = db::get_active_user_by_nym(&state.db, nym_owner).await? else {
+    // Page/POS availability and its permanent recovery policy are independent
+    // of Lightning Address availability. Taking the LA product offline closes
+    // new public LNURL instructions, but must not strip Bitcoin from an
+    // otherwise-live merchant checkout.
+    let Some(owner) = db::get_user_by_nym(&state.db, nym_owner).await? else {
         tracing::warn!(
-            event = "chain_swap_offer_inactive_recovery_owner_refused",
+            event = "chain_swap_offer_recovery_owner_unavailable_refused",
             invoice_id = %invoice.id,
-            "refusing to create a chain-swap offer because its merchant identity is inactive"
+            "refusing to create a chain-swap offer because its permanent merchant owner is unavailable"
         );
         return Ok(None);
     };
-    if active_owner.npub != invoice.npub_owner {
+    if owner.npub != invoice.npub_owner {
         tracing::error!(
             event = "chain_swap_offer_recipient_identity_mismatch_refused",
             invoice_id = %invoice.id,
-            "refusing to create a chain-swap offer whose active nym and invoice recipient identities differ"
+            "refusing to create a chain-swap offer whose permanent nym owner and invoice recipient identities differ"
         );
         return Ok(None);
     }
     let Some(recovery_commitment) =
-        db::select_current_recovery_address_commitment(&state.db, &active_owner.npub)
+        db::select_current_recovery_address_commitment(&state.db, &owner.npub)
             .await
             .map_err(|error| {
                 AppError::DbError(format!(
@@ -2418,12 +2392,12 @@ pub async fn exercise_bitcoin_chain_offer_creation_with_faults(
 // offer — is identical.
 // =====================================================================
 
-/// Verify the signing npub owns `nym` AND the user row is currently
-/// active. Used by the linked create/cancel paths.
+/// Verify the signing npub permanently owns `nym`. Linked invoice management
+/// remains available while the separate Lightning Address product is offline.
 async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
-    let user = db::get_user_by_npub(&state.db, npub)
+    let user = db::get_user_by_npub_any(&state.db, npub)
         .await?
-        .ok_or_else(|| AppError::AuthError("no active registration for this key".into()))?;
+        .ok_or_else(|| AppError::AuthError("no permanent registration for this key".into()))?;
     if user.nym != nym {
         return Err(AppError::AuthError("signer does not own this nym".into()));
     }

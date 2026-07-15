@@ -13,18 +13,20 @@ VALUES ('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
         'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
         'smokedonate', '$DESC')
 ON CONFLICT DO NOTHING;
-INSERT INTO donation_pages (nym, header, description, display_currency, enabled, pos_mode)
-VALUES ('smokedonate', 'Smoke Test', 'donation smoke', 'USD', true, false)
-ON CONFLICT (nym) DO UPDATE SET enabled = true, pos_mode = false, archived_at = NULL;
+INSERT INTO donation_pages
+    (nym, kind, ct_descriptor, header, description, display_currency, enabled)
+VALUES ('smokedonate', 'payment_page', '$DESC', 'Smoke Test', 'donation smoke', 'USD', true)
+ON CONFLICT (nym, kind) DO UPDATE SET enabled = true, archived_at = NULL;
 
 INSERT INTO users (npub, verification_npub, nym, ct_descriptor)
 VALUES ('ffe2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6ffe2',
         'ffe2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6ffe2',
         'smokepos', '$DESC')
 ON CONFLICT DO NOTHING;
-INSERT INTO donation_pages (nym, header, description, display_currency, enabled, pos_mode)
-VALUES ('smokepos', 'Smoke POS', 'pos smoke', 'CRC', true, true)
-ON CONFLICT (nym) DO UPDATE SET enabled = true, pos_mode = true, archived_at = NULL;
+INSERT INTO donation_pages
+    (nym, kind, ct_descriptor, header, description, display_currency, enabled)
+VALUES ('smokepos', 'pos', '$DESC', 'Smoke POS', 'pos smoke', 'CRC', true)
+ON CONFLICT (nym, kind) DO UPDATE SET enabled = true, archived_at = NULL;
 
-SELECT nym, display_currency, pos_mode FROM donation_pages WHERE nym LIKE 'smoke%';
+SELECT nym, kind, display_currency FROM donation_pages WHERE nym LIKE 'smoke%';
 SQL

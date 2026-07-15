@@ -374,10 +374,13 @@ fn truncate_to_nym_watcher_batch<T>(rows: &mut Vec<T>, limit: usize) -> bool {
     has_more
 }
 
-/// Deterministic page through all enabled nyms that existed at `snapshot`.
+/// Deterministic page through all watchable nyms that existed at `snapshot`.
 /// The process-local caller retains the same snapshot and `nym` cursor until
 /// the epoch completes, so a permanently full first page cannot starve later
-/// rows and newly-created users wait for the next epoch.
+/// rows and newly-created users wait for the next epoch. Deactivation closes
+/// new Lightning Address instructions; it does not erase addresses already
+/// issued from the retained descriptor. Purge clears the descriptor and thus
+/// removes the row from this set.
 pub async fn list_active_nyms_for_watcher_page(
     pool: &PgPool,
     snapshot: &str,
@@ -386,7 +389,9 @@ pub async fn list_active_nyms_for_watcher_page(
     let mut rows = sqlx::query_as::<_, ActiveNymForWatcher>(
         "SELECT nym, ct_descriptor, next_addr_idx \
          FROM users \
-         WHERE is_active = TRUE \
+         WHERE (is_active = TRUE \
+                OR (ct_descriptor <> '' \
+                    AND (last_callback_at IS NOT NULL OR has_been_used = TRUE))) \
            AND created_at <= $1::timestamptz \
            AND ($2::text IS NULL OR nym > $2::text) \
          ORDER BY nym ASC \
@@ -401,10 +406,12 @@ pub async fn list_active_nyms_for_watcher_page(
     Ok(ActiveNymWatcherPage { rows, has_more })
 }
 
-/// Deterministic page through the active tier. Both the activity-window
+/// Deterministic page through the active recent-callback tier. Both the activity-window
 /// cutoff and the maximum callback timestamp are anchored to the epoch's
 /// PostgreSQL snapshot: activity occurring after the cutoff waits for the
-/// next epoch instead of changing membership between pages.
+/// next epoch instead of changing membership between pages. Offline obligations
+/// remain in the historical watchable tier without adding an unindexed scan of
+/// every inactive row to each fast tick.
 pub async fn list_recently_active_nyms_for_watcher_page(
     pool: &PgPool,
     active_window_secs: u32,
@@ -436,7 +443,11 @@ pub async fn list_active_nyms_for_watcher(
     pool: &PgPool,
 ) -> Result<Vec<ActiveNymForWatcher>, sqlx::Error> {
     let rows: Vec<(String, String, i32)> = sqlx::query_as(
-        "SELECT nym, ct_descriptor, next_addr_idx FROM users WHERE is_active = TRUE",
+        "SELECT nym, ct_descriptor, next_addr_idx \
+           FROM users \
+          WHERE is_active = TRUE \
+             OR (ct_descriptor <> '' \
+                 AND (last_callback_at IS NOT NULL OR has_been_used = TRUE))",
     )
     .fetch_all(pool)
     .await?;
@@ -450,10 +461,11 @@ pub async fn list_active_nyms_for_watcher(
         .collect())
 }
 
-/// Watcher's "active" set: users whose `last_callback_at` is within the
+/// Watcher's active recent set: users whose `last_callback_at` is within the
 /// last `active_window_secs`. This is the hot list scanned every fast
 /// tick. Bounded in size by real callback traffic, not by the size of
-/// the `users` table.
+/// the `users` table. Product deactivation moves retained obligations to the
+/// historical watchable tier instead of ending observation.
 pub async fn list_recently_active_nyms_for_watcher(
     pool: &PgPool,
     active_window_secs: u32,
@@ -496,7 +508,9 @@ pub async fn touch_user_callback(pool: &PgPool, nym: &str) {
 /// already advanced beyond it. Idempotent under concurrent observations:
 /// the `next_addr_idx <= observed_idx` guard ensures this update is a no-op
 /// when the row has already moved on (e.g. due to a request handler
-/// allocation racing with the watcher).
+/// allocation racing with the watcher). This remains live after product
+/// deactivation for an already-issued address; a purge clears the descriptor
+/// and prevents any later cursor mutation.
 pub async fn advance_next_addr_idx(
     pool: &PgPool,
     nym: &str,
@@ -510,7 +524,7 @@ pub async fn advance_next_addr_idx(
     })?;
     sqlx::query(
         "UPDATE users SET next_addr_idx = $2 \
-         WHERE nym = $1 AND is_active = TRUE AND next_addr_idx <= $3",
+         WHERE nym = $1 AND ct_descriptor <> '' AND next_addr_idx <= $3",
     )
     .bind(nym)
     .bind(next_addr_idx)
@@ -697,8 +711,8 @@ mod tests {
         assert!(epoch.begin_nym("gone".to_string(), "descriptor".to_string(), 1, 10));
 
         // The caller may retire a malformed nym immediately. A disappeared or
-        // deactivated nym instead remains safely bounded in memory and reaches
-        // this same state after its frozen range drains.
+        // purged nym instead remains safely bounded in memory and reaches this
+        // same state after its frozen range drains.
         epoch.finish_current_nym();
         assert!(epoch.current().is_none());
         assert_eq!(epoch.cursor(), Some("gone"));

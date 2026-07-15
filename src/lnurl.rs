@@ -712,16 +712,6 @@ async fn create_lightning_swap(
     Ok((resp, swap_id))
 }
 
-pub async fn callback(
-    State(state): State<AppState>,
-    Path(nym): Path<String>,
-    peer_opt: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    Query(params): Query<CallbackParams>,
-) -> Result<axum::response::Response, AppError> {
-    callback_inner(state, nym, None, peer_opt, headers, params).await
-}
-
 pub async fn callback_with_comment_intent(
     State(state): State<AppState>,
     Path((nym, comment_intent_token)): Path<(String, String)>,
@@ -729,21 +719,15 @@ pub async fn callback_with_comment_intent(
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Result<axum::response::Response, AppError> {
-    callback_inner(
-        state,
-        nym,
-        Some(comment_intent_token),
-        peer_opt,
-        headers,
-        params,
-    )
-    .await
+    let comment_intent_key = LnurlCommentIntentKey::from_callback_token(&comment_intent_token)
+        .map_err(|_| AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
+    callback_inner(state, nym, comment_intent_key, peer_opt, headers, params).await
 }
 
 async fn callback_inner(
     state: AppState,
     nym: String,
-    comment_intent_token: Option<String>,
+    comment_intent_key: LnurlCommentIntentKey,
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     mut params: CallbackParams,
@@ -776,16 +760,10 @@ async fn callback_inner(
 
     let payer_comment = LnurlPayerComment::from_optional(params.comment.take())
         .map_err(comment_validation_error)?;
-    let requested_comment = payer_comment
-        .map(|comment| -> Result<RequestedLnurlComment, AppError> {
-            let token = comment_intent_token
-                .as_deref()
-                .ok_or(AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
-            let key = LnurlCommentIntentKey::from_callback_token(token)
-                .map_err(|_| AppError::InvalidComment(COMMENT_INTENT_REQUIRED))?;
-            Ok(RequestedLnurlComment { key, comment })
-        })
-        .transpose()?;
+    let requested_comment = payer_comment.map(|comment| RequestedLnurlComment {
+        key: comment_intent_key,
+        comment,
+    });
 
     // --- Caller IP + whitelist ---
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());

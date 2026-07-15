@@ -20,7 +20,6 @@ export interface BullnymConfig {
   currency: string
   header: string
   description: string
-  avatar_url: string | null
   website: string | null
   twitter: string | null
   instagram: string | null
@@ -43,7 +42,6 @@ const FALLBACK: BullnymConfig = {
   currency: 'USD',
   header: '',
   description: '',
-  avatar_url: null,
   website: null,
   twitter: null,
   instagram: null,

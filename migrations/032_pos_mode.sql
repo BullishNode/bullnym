@@ -1,2 +1,3 @@
-ALTER TABLE donation_pages
-    ADD COLUMN pos_mode BOOLEAN NOT NULL DEFAULT FALSE;
+-- Historical migration slot retained so deployed migration numbering stays
+-- contiguous. Surface selection is owned exclusively by donation_pages.kind;
+-- the pre-production pos_mode compatibility column was removed before launch.

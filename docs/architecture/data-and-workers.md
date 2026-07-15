@@ -8,7 +8,7 @@ Postgres is Bullnym's source of truth. Migrations are plain SQL under
 | Table | Ownership | Purpose |
 |---|---|---|
 | `users` | Permanent nym / Lightning Address availability | One row per nym. Stores owner `npub`, public `verification_npub`, Lightning Address descriptor, availability status, and Lightning Address cursor. |
-| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, legacy read-only media hashes, descriptor, address cursor, alias, and archive state. |
+| `donation_pages` | Public payment surfaces | One row per `(nym, kind)`, where `kind` is `payment_page` or `pos`. Stores display content, generated social-card key/version/retry state, descriptor, address cursor, alias, and archive state. |
 | `invoices` | Payment sessions | Stores checkout sessions and wallet-origin invoices, accepted rails, settlement addresses, pricing, status, expiry, and cumulative paid amount. |
 | `invoice_payment_events` | Accounting | Idempotent payment evidence keyed by rail-specific event keys, with explicit countable/inactive/superseded state and stable accounting order. |
 | `invoice_payment_observations` | Non-accounting evidence | Durable exact Bitcoin and Liquid direct-output identity, confirmation, block, verification, and lifecycle evidence written by both live watchers. |

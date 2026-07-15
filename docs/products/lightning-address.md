@@ -19,8 +19,7 @@ The descriptor is stored in `users.ct_descriptor` and uses
 1. Sender wallet resolves `nym@domain` to `/.well-known/lnurlp/:nym`.
 2. Bullnym returns LNURL metadata and supported payment methods.
 3. Sender calls the complete opaque `/lnurlp/callback/:nym/:comment_intent`
-   URL returned by metadata. The tokenless route remains a no-comment
-   compatibility path.
+   URL returned by metadata, including for no-comment payments.
 4. Bullnym returns either:
    - a BOLT11 invoice backed by a Boltz reverse swap, or
    - a LUD-22 direct Liquid address if the sender proves Liquid UTXO ownership.
@@ -55,6 +54,7 @@ index; descriptor rotation must be coordinated with in-flight payments.
 ## Online and offline availability
 
 Deleting a registration takes the Lightning Address offline for new payment
-instructions. Existing swaps remain claimable and must still settle. The nym
-remains permanently owned by the original owner; availability never changes
-name ownership.
+instructions. Observation of already-issued Liquid addresses remains live, and
+existing swaps remain claimable and must still settle. The nym remains
+permanently owned by the original owner; availability never changes name
+ownership or disables an independently enabled Payment Page/POS surface.

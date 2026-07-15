@@ -40,7 +40,6 @@ pub mod fee_policy;
 pub mod fee_refresh_cycle;
 pub mod fee_runtime;
 pub mod gc;
-pub mod image_pipeline;
 pub mod invoice;
 pub mod ip_whitelist;
 pub mod liquid_fee_adapter;

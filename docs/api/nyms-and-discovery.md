@@ -25,9 +25,9 @@ extension and use Lightning.
 ## `GET /lnurlp/callback/:nym/:comment_intent`
 
 Use the complete opaque callback URL returned by metadata. The final path
-component gives an exact retry the same private intent identity. The legacy
-`/lnurlp/callback/:nym` route remains available for no-comment payments, but
-fails closed if a `comment` is supplied.
+component gives an exact retry the same private intent identity and is required
+even when the request has no comment. Bullnym does not expose a tokenless
+callback route.
 
 Common query fields:
 
@@ -215,9 +215,9 @@ Public and rate-limited. A successful response is:
 }
 ```
 
-`nym` is always the canonical permanent nym. `lightning_address_online`
+`nym` is always the permanent nym. `lightning_address_online`
 reports only Lightning Address availability; it does not describe nym or alias
-ownership. `alias` is the canonical permanent owner alias, or `null` when none
+ownership. `alias` is the permanent owner alias, or `null` when none
 has ever been claimed. Clients must require
 `public_name_policy == "permanent_names_v1"` before enabling permanent-name or
 alias UX. `quota` is the authoritative permanent-nym ownership quota. Because
@@ -231,8 +231,9 @@ action with the route nym in the nym slot and zero payload fields, as defined
 in [Authentication](authentication.md). Returns
 `{ "reservations": [{ "outpoint", "addr_index", "fulfilled" }],
 "next_addr_idx": 42 }`. This is an owner diagnostics API, not a
-payment-status API. It remains available to the authenticated permanent owner
-while Lightning Address is offline. GC can delete an unfulfilled reservation after its TTL even
-though expiry is not exposed in this view. Deletion releases pending-state
-capacity; it does not rewind `next_addr_idx`. A later proof creates a new mapping
-at whatever descriptor index is current then.
+payment-status API. Permanent ownership keeps this read available when the
+individual Lightning Address is offline, while public metadata/callbacks and
+new reservations remain unavailable. GC can delete an unfulfilled reservation
+after its TTL even though expiry is not exposed in this view. Deletion releases
+pending-state capacity; it does not rewind `next_addr_idx`. A later proof
+creates a new mapping at whatever descriptor index is current then.

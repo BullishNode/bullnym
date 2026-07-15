@@ -34,8 +34,8 @@ The callback remains an HTTP GET. All requests include:
 | `payment_method` | optional comma-separated string | Include `L-BTC` to request direct Liquid. Omit it for Lightning. |
 
 The callback path contains the opaque per-metadata intent token. Clients must
-retain the complete URL across an exact callback retry. Bullnym rejects a
-comment sent to the legacy tokenless route, or together with `L-BTC`, rather
+retain the complete URL across an exact callback retry; there is no tokenless
+callback route. Bullnym rejects a comment sent together with `L-BTC` rather
 than accepting text it cannot durably associate with that rail.
 
 A public client requesting `L-BTC` also supplies every Approach B proof field:

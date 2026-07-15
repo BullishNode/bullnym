@@ -4,6 +4,10 @@
 
 `POST /api/v1/:nym/invoices` creates a nym-linked invoice.
 `POST /api/v1/invoices` creates an unlinked invoice; sign with an empty nym.
+Linked create and cancel authorize the nym's permanent owner, so merchant
+invoice management remains available while that owner's separate Lightning
+Address product is offline. This does not reopen public LNURL metadata or
+callbacks.
 
 ```json
 {

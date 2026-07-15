@@ -49,45 +49,35 @@ Name ownership and product availability are separate:
 The alias belongs to the npub, not a donation_pages row. A save that loses a
 concurrent claim race must not mutate its Page/POS row.
 
-## Database authority and historical cutover
+## Database authority and empty-state cutover
 
-Migration 058 snapshots every owner's historical nym and alias candidates in
-`public_name_migration_choices` while writers are stopped. Alias history is
-the union of current/archived surfaces and exactly owner-verified invoice
-slugs, so old alias invoice routes keep their ownership proof. Single
-candidates resolve automatically. An existing active nym is the required
-canonical nym; fully-offline multi-nym and multi-alias owners require explicit
-operator choices. Candidate arrays are immutable, completion is
-schema-constrained, and the companion view reports merchant URLs that change
-to a canonical alias.
+Bullnym has no production users at this boundary, so migration 058 is a strict
+empty-state guard rather than a historical compatibility mechanism. With all
+writers stopped, it locks and requires `users`, surfaces, invoices, swaps,
+allocations, and returned-address history to be empty. It creates no choice,
+backfill, mapping, or communication-report state.
 
-Migration 059 locks the sources, compares both candidate sets and the active
-nym with the snapshot, and aborts on drift or incomplete resolution. It
-backfills every historical name into `public_names`: selected names are
-canonical and every other historical name is an owner-bound non-payable
-tombstone. Typed historical nym/alias collisions are preserved while every new
-claim still uses one shared namespace. Before removing the older mutable
-`donation_pages.alias` column, it snapshots each real legacy Payment Page
-descriptor dependency and advances its surface cursor to the greater of its
-old surface and user cursors.
+Migration 059 repeats that locked empty-state proof, creates `public_names`
+from scratch, makes every Page/POS descriptor mandatory, and removes the
+pre-launch mutable surface `alias` and `pos_mode` fields. It never infers a
+name, owner, payout wallet, or invoice relationship from old rows. Any nonempty
+source requires the documented fresh database reset before the migration can
+proceed.
 
 Database constraints and triggers enforce:
 
-- shared nym/alias uniqueness for every new claim;
-- typed preservation of historical cross-kind collisions;
-- at most one canonical claim of each kind per owner;
-- permanent owner binding for every historical tombstone;
+- one shared nym/alias namespace;
+- exactly one nym and at most one alias per owner;
 - an alias requires the same owner to have a nym;
 - database-owned claim timestamps;
-- rejection of ownership/canonical UPDATEs and ordinary DELETEs;
-- rejection of any attempt to make a noncanonical nym an active Lightning
-  Address.
+- rejection of every name UPDATE and DELETE;
+- an exact owner-matched permanent nym for every `users` row.
 
 ## Rollout
 
-Apply 058 as the privileged schema owner while every writer is stopped, resolve
-and record all choices, capture the merchant communication report, validate a
-fresh backup, and apply 059 in the same stopped-writer window. Verify the
-read-only boundary through the runtime role, then deploy the matching binary.
-Crossing 059 disables automatic binary rollback. Mobile changes are delivered
-only through the separately owned stacked mobile branches/PRs.
+Stop every writer, retain a final pre-reset backup for audit, reset the
+production database, and apply the full migration sequence as the privileged
+schema owner with the runtime role supplied to role-aware migrations. Verify
+the read-only boundary through the runtime role, then deploy the matching
+binary. Crossing 059 disables automatic binary rollback. Mobile changes are
+delivered only through the separately owned stacked mobile branches/PRs.

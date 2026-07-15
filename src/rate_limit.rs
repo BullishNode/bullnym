@@ -286,39 +286,6 @@ impl RateLimiter {
         )
     }
 
-    /// Per-npub rate-limit on `POST /donation-page/image`. A real user
-    /// uploads avatar + OG once per session; six per hour is generous.
-    /// Atomic Postgres path (cross-replica consistent) since uploads are
-    /// low-volume and signature-verified.
-    pub async fn check_donation_image_uploads_per_npub(
-        &self,
-        npub_hex: &str,
-    ) -> Result<(), AppError> {
-        let bucket = format!("donation_image_npub:{npub_hex}");
-        self.atomic_sliding_window_check(
-            &bucket,
-            self.cfg.donation_image_uploads_per_npub_per_hour,
-            3600,
-            AppError::RateLimitedSender,
-        )
-        .await
-    }
-
-    /// Per-source rate-limit on image uploads. In-memory bucket; hot path
-    /// before the more expensive npub check.
-    pub async fn check_donation_image_uploads_per_source(
-        &self,
-        ip: IpAddr,
-    ) -> Result<(), AppError> {
-        let bucket = format!("donation_image_src:{}", source_key(ip));
-        self.inmem_sliding_check(
-            &bucket,
-            self.cfg.donation_image_uploads_per_source_per_min,
-            60,
-            AppError::RateLimitedSender,
-        )
-    }
-
     /// Per-source rate-limit on anonymous `POST /<nym>/invoice`.
     /// Each success path creates a real invoice + Boltz reverse-swap; page
     /// refreshes hit the existing invoice URL and don't re-fire.

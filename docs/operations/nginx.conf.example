@@ -10,16 +10,16 @@ server {
     set_real_ip_from 100.64.0.2;
     real_ip_header X-Forwarded-For;
 
-    # Must match donation.image_root_path. Generated filenames are immutable
-    # and content-addressed; serve them directly rather than proxying via Rust.
+    # Must match donation.image_root_path. Generated social-card filenames are
+    # immutable and content-addressed; serve them directly rather than proxying
+    # via Rust.
     # In a multi-host deployment, use shared storage or ensure every serving
     # host runs the OG verification/reconciliation worker against its local root.
-    location ^~ /img/ {
-        alias /opt/payservice/data/images/;
+    location ^~ /img/og/ {
+        alias /opt/payservice/data/images/og/;
         limit_req zone=bullnym_static burst=60 nodelay;
         types {
             image/jpeg jpg jpeg;
-            image/webp webp;
         }
         default_type application/octet-stream;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
@@ -38,7 +38,7 @@ server {
     }
 
     # Permanent branded OG fallbacks are embedded in the Bullnym binary. Keep
-    # this separate from /img/, which is host-local generated-image storage.
+    # this separate from /img/og/, which is host-local generated-image storage.
     location ^~ /og/ {
         limit_req zone=bullnym_static burst=60 nodelay;
         proxy_pass http://127.0.0.1:8080;
@@ -101,5 +101,5 @@ server {
 
 # Validate with `nginx -t`, then verify /health, /ready, /version, /sw.js,
 # /pwa-assets/, /og/fallback-live-v1.jpg, a generated social card, a
-# manifest route, a Payment Page, and a POS route. Bullnym does not accept
-# image uploads; the /img location is read-only application output.
+# manifest route, a Payment Page, and a POS route. The /img/og location is
+# read-only application output.

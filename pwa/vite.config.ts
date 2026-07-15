@@ -56,7 +56,7 @@ function bullnymServiceWorkerPrecache(): Plugin {
 }
 
 // Two entry points, one workspace. The Rust server picks the shell to
-// serve based on donation_pages.pos_mode and injects the config JSON in
+// serve based on donation_pages.kind and injects the config JSON in
 // place of the <!-- BULLNYM_CONFIG --> placeholder.
 //
 // base is /pwa-assets/ so hashed assets resolve regardless of which

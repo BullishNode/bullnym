@@ -401,7 +401,6 @@ fn test_app(state: AppState) -> Router {
             "/lnurlp/callback/:nym/:comment_intent",
             get(lnurl::callback_with_comment_intent),
         )
-        .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/donation-page", put(donation_page::save))
         .route("/donation-page/:nym", get(donation_page::get))
         .route(
@@ -617,6 +616,16 @@ fn sign_invoice_create_with_keypair(
     bitcoin_address: &str,
     expires_at_unix: i64,
 ) -> (String, u64) {
+    sign_invoice_create_for_nym_with_keypair(keypair, npub, "", bitcoin_address, expires_at_unix)
+}
+
+fn sign_invoice_create_for_nym_with_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    bitcoin_address: &str,
+    expires_at_unix: i64,
+) -> (String, u64) {
     let amount_sat = "1000";
     let fiat_amount_minor = "";
     let fiat_currency = "";
@@ -633,7 +642,7 @@ fn sign_invoice_create_with_keypair(
         keypair,
         "invoice-create",
         npub,
-        "",
+        nym,
         &[
             amount_sat,
             fiat_amount_minor,
@@ -732,7 +741,6 @@ struct DonationSaveSignFields<'a> {
     twitter: &'a str,
     instagram: &'a str,
     enabled: bool,
-    pos_mode: bool,
     ct_descriptor: &'a str,
     kind: &'a str,
     alias: Option<&'a str>,
@@ -745,7 +753,6 @@ fn sign_donation_page_save_with_keypair(
     save: DonationSaveSignFields<'_>,
 ) -> (String, u64) {
     let enabled_str = if save.enabled { "1" } else { "0" };
-    let pos_mode_str = if save.pos_mode { "1" } else { "0" };
     let mut fields = vec![
         save.header,
         save.description,
@@ -754,7 +761,6 @@ fn sign_donation_page_save_with_keypair(
         save.twitter,
         save.instagram,
         enabled_str,
-        pos_mode_str,
         save.ct_descriptor,
         save.kind,
     ];
@@ -766,6 +772,27 @@ fn sign_donation_page_save_with_keypair(
 
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
+
+fn test_descriptor_with_blinding_key(byte: u8) -> String {
+    let body = TEST_DESCRIPTOR
+        .split_once('#')
+        .expect("test descriptor checksum")
+        .0
+        .replacen(
+            "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023",
+            &hex::encode([byte; 32]),
+            1,
+        );
+    let checksum = elements_miniscript::descriptor::checksum::desc_checksum(&body)
+        .expect("test descriptor checksum generation");
+    format!("{body}#{checksum}")
+}
+const TEST_LNURL_COMMENT_INTENT_TOKEN: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn test_lnurl_callback_path(nym: &str) -> String {
+    format!("/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}")
+}
 
 async fn cleanup_db(pool: &PgPool) {
     // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
@@ -1219,7 +1246,6 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -1594,8 +1620,8 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
 
-    // Migration 058 is incomplete if immutable ownership can be released,
-    // even when the registry columns and uniqueness constraints remain.
+    // The permanent-name registry is incomplete if immutable ownership can be
+    // released, even when its columns and uniqueness constraints remain.
     sqlx::query("ALTER TABLE public_names DISABLE TRIGGER public_names_reject_mutation")
         .execute(&admin)
         .await
@@ -3754,7 +3780,62 @@ async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap
 // --- Registration tests ---
 
 #[tokio::test]
-async fn donation_page_upsert_round_trips_pos_mode() {
+async fn payment_page_schema_enforces_current_surface_contract() {
+    let pool = test_pool().await;
+
+    let legacy_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name IN ('avatar_sha256', 'og_sha256', 'alias', 'pos_mode')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_column_count, 0);
+
+    let descriptor_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name = 'ct_descriptor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(descriptor_nullable, "NO");
+
+    let generated_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name IN ( \
+                'generated_og_key', \
+                'generated_og_template_version', \
+                'generated_og_failure_count', \
+                'generated_og_retry_after' \
+            ) \
+          ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generated_columns,
+        vec![
+            "generated_og_failure_count",
+            "generated_og_key",
+            "generated_og_retry_after",
+            "generated_og_template_version",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn donation_page_upsert_round_trips_independent_kinds() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     create_test_user(&pool, "posround").await;
@@ -3765,13 +3846,12 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             nym: "posround",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: TEST_DESCRIPTOR,
-            header: "POS Store",
-            description: "Counter checkout",
+            header: "Donation Store",
+            description: "Tip jar",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: true,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3779,7 +3859,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     )
     .await
     .unwrap();
-    assert!(row.pos_mode);
+    assert_eq!(row.kind, pay_service::db::KIND_PAYMENT_PAGE);
 
     let fetched = pay_service::db::get_donation_page_by_nym(
         &pool,
@@ -3789,13 +3869,13 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     .await
     .unwrap()
     .unwrap();
-    assert!(fetched.pos_mode);
+    assert_eq!(fetched.kind, pay_service::db::KIND_PAYMENT_PAGE);
 
     let row = pay_service::db::upsert_donation_page(
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
-            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            kind: pay_service::db::KIND_POS,
             ct_descriptor: TEST_DESCRIPTOR,
             header: "Donation Store",
             description: "Tip jar",
@@ -3803,7 +3883,6 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             website: Some("https://example.com"),
             twitter: Some("posround"),
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3811,7 +3890,13 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     )
     .await
     .unwrap();
-    assert!(!row.pos_mode);
+    assert_eq!(row.kind, pay_service::db::KIND_POS);
+    let surface_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM donation_pages WHERE nym = 'posround'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(surface_count, 2);
 
     cleanup_db(&pool).await;
 }
@@ -3834,7 +3919,6 @@ async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3911,7 +3995,6 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3932,7 +4015,6 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4044,7 +4126,6 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4061,7 +4142,6 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             "header": "Persist despite preview failure",
             "description": "Payments must not depend on social image storage.",
             "display_currency": "USD",
-            "pos_mode": false,
             "enabled": true,
             "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
@@ -4071,6 +4151,8 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["nym"], nym);
+    assert!(body.get("avatar_sha256").is_none());
+    assert!(body.get("og_sha256").is_none());
 
     let row =
         pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
@@ -4104,7 +4186,6 @@ async fn og_key_attaches_only_to_the_matching_persisted_page_content() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4200,7 +4281,6 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -4285,7 +4365,6 @@ async fn donation_page_save_requires_current_signed_fields() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4302,7 +4381,6 @@ async fn donation_page_save_requires_current_signed_fields() {
             "description": "Current clients sign every required field",
             "display_currency": "USD",
             "enabled": true,
-            "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
             "signature": signature,
         }),
@@ -4343,7 +4421,6 @@ async fn donation_page_archive_requires_signed_kind() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -4399,7 +4476,7 @@ async fn donation_page_archive_requires_signed_kind() {
 }
 
 #[tokio::test]
-async fn donation_page_save_new_payload_round_trips_pos_mode() {
+async fn donation_page_save_rejects_legacy_pos_mode_field() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -4414,14 +4491,13 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
         &npub,
         nym,
         DonationSaveSignFields {
-            header: "New POS",
-            description: "New clients sign pos_mode",
+            header: "Current Page",
+            description: "Current clients sign kind only",
             display_currency: "USD",
             website: "https://example.com",
             twitter: "posnew",
             instagram: "pos.new",
             enabled: true,
-            pos_mode: true,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4434,8 +4510,8 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             "nym": nym,
             "npub": npub,
             "ct_descriptor": TEST_DESCRIPTOR,
-            "header": "New POS",
-            "description": "New clients sign pos_mode",
+            "header": "Current Page",
+            "description": "Current clients sign kind only",
             "display_currency": "USD",
             "website": "https://example.com",
             "twitter": "posnew",
@@ -4448,16 +4524,15 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["pos_mode"], true);
-
-    let row =
-        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-            .await
-            .unwrap()
-            .unwrap();
-    assert!(row.pos_mode);
-    assert_eq!(row.website.as_deref(), Some("https://example.com"));
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(pay_service::db::get_donation_page_by_nym(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE
+    )
+    .await
+    .unwrap()
+    .is_none());
 
     cleanup_db(&pool).await;
 }
@@ -4486,7 +4561,6 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4498,7 +4572,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice Page", "description": "Tip jar", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "payment_page",
+            "enabled": true, "kind": "payment_page",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -4519,7 +4593,6 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: "pos",
             alias: None,
@@ -4531,7 +4604,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice POS", "description": "Counter", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "pos",
+            "enabled": true, "kind": "pos",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -4585,7 +4658,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(alias),
@@ -4597,7 +4669,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared Page", "description": "Permanent alias Page",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4621,7 +4693,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_POS,
             alias: Some(alias),
@@ -4633,7 +4704,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared POS", "description": "Permanent alias POS",
-            "display_currency": "CRC", "pos_mode": false, "enabled": true,
+            "display_currency": "CRC", "enabled": true,
             "kind": "pos", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4669,7 +4740,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some("different-shop"),
@@ -4681,7 +4751,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Not Commit", "description": "Rejected rename",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": "different-shop",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4709,7 +4779,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(""),
@@ -4721,7 +4790,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Still Not Commit", "description": "Empty is not a clear",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": "",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4750,7 +4819,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some(alias),
@@ -4795,8 +4863,35 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
     assert_eq!(status, StatusCode::OK, "{pos_manifest:?}");
     assert_eq!(pos_manifest["start_url"], "/a/shared-shop/pos");
 
+    let page_descriptor = test_descriptor_with_blinding_key(0x11);
+    let pos_descriptor = test_descriptor_with_blinding_key(0x22);
+    sqlx::query("UPDATE users SET next_addr_idx = 3 WHERE npub = $1")
+        .bind(&npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 7 \
+          WHERE nym = $1 AND kind = 'payment_page'",
+    )
+    .bind(nym)
+    .bind(&page_descriptor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 13 \
+          WHERE nym = $1 AND kind = 'pos'",
+    )
+    .bind(nym)
+    .bind(&pos_descriptor)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // Lightning Address availability is independent: taking it offline does
-    // not remove the alias or either surface route.
+    // not remove the alias or either surface route. Checkout must allocate
+    // only from the selected surface descriptor/cursor.
     sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1")
         .bind(&npub)
         .execute(&pool)
@@ -4810,19 +4905,41 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         get_text_path(&app, "/a/shared-shop/pos").await.0,
         StatusCode::OK
     );
-    let (status, offline_checkout) = post_json(
+    let (status, offline_page_checkout) = post_json(
+        &app,
+        "/a/shared-shop/invoice",
+        json!({ "amount_sat": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{offline_page_checkout:?}");
+    assert_eq!(
+        offline_page_checkout["liquid_address"],
+        pay_service::descriptor::derive_address(&page_descriptor, 7).unwrap()
+    );
+    let (status, offline_pos_checkout) = post_json(
         &app,
         "/a/shared-shop/pos/invoice",
         json!({ "amount_sat": 1_000 }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{offline_checkout:?}");
-    assert!(
-        offline_checkout["liquid_address"]
-            .as_str()
-            .is_some_and(|address| !address.is_empty()),
-        "offline Lightning Address must not disable POS checkout"
+    assert_eq!(status, StatusCode::OK, "{offline_pos_checkout:?}");
+    assert_eq!(
+        offline_pos_checkout["liquid_address"],
+        pay_service::descriptor::derive_address(&pos_descriptor, 13).unwrap()
     );
+    let cursors: (i32, i32, i32) = sqlx::query_as(
+        "SELECT users.next_addr_idx, \
+                (SELECT next_addr_idx FROM donation_pages \
+                  WHERE nym = $1 AND kind = 'payment_page'), \
+                (SELECT next_addr_idx FROM donation_pages \
+                  WHERE nym = $1 AND kind = 'pos') \
+           FROM users WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cursors, (3, 8, 14));
 
     // Archiving only Page preserves the permanent claim and live POS route.
     pay_service::db::archive_donation_page(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
@@ -4864,7 +4981,6 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("page-choice"),
@@ -4879,7 +4995,6 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("pos-choice"),
@@ -4908,10 +5023,10 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
     .fetch_one(&pool)
     .await
     .unwrap();
-    let canonical_alias: String = sqlx::query_scalar(
+    let permanent_alias: String = sqlx::query_scalar(
         "SELECT name FROM public_names WHERE kind = 'alias' AND owner_npub = ( \
              SELECT npub FROM users WHERE nym = 'aliasrace' \
-         ) AND canonical",
+         )",
     )
     .fetch_one(&pool)
     .await
@@ -4922,7 +5037,7 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
             .await
             .unwrap();
     assert_eq!(claims, 1);
-    assert_eq!(owned_alias, canonical_alias);
+    assert_eq!(owned_alias, permanent_alias);
     assert_eq!(
         surfaces, 1,
         "losing alias claim must not mutate its surface"
@@ -4956,7 +5071,6 @@ async fn pos_save_without_descriptor_is_rejected() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: "pos",
             alias: None,
@@ -4968,7 +5082,7 @@ async fn pos_save_without_descriptor_is_rejected() {
         json!({
             "nym": nym, "npub": npub,
             "header": "No Desc POS", "description": "Missing wallet", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "pos",
+            "enabled": true, "kind": "pos",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -5008,7 +5122,6 @@ async fn donation_page_save_without_kind_is_rejected() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -5020,7 +5133,7 @@ async fn donation_page_save_without_kind_is_rejected() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Current", "description": "Kind is required", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "timestamp": ts, "signature": sig,
+            "enabled": true, "timestamp": ts, "signature": sig,
         }),
     )
     .await;
@@ -5067,7 +5180,6 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -5122,12 +5234,9 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
 }
 
 #[tokio::test]
-async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
-    // A misconfigured POS row (enabled, no descriptor) must make POS checkout
-    // hard-fail rather than fall back to the Lightning Address cursor (KR-1).
+async fn surface_schema_rejects_missing_descriptor() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let app = test_app(test_state(pool.clone()));
     let nym = "posnofb";
     let (npub, _, _) = sign_registration(nym, TEST_DESCRIPTOR);
     pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
@@ -5139,23 +5248,22 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
         .await
         .unwrap();
 
-    // Save would reject a descriptor-less POS row; insert it directly to
-    // exercise the checkout branch's hard-fail.
-    sqlx::query(
+    let error = sqlx::query(
         "INSERT INTO donation_pages \
-            (nym, kind, ct_descriptor, header, description, display_currency, pos_mode, enabled) \
-         VALUES ($1, 'pos', NULL, 'Broken POS', 'No wallet', 'USD', FALSE, TRUE)",
+            (nym, kind, ct_descriptor, header, description, display_currency, enabled) \
+         VALUES ($1, 'pos', NULL, 'Broken POS', 'No wallet', 'USD', TRUE)",
     )
     .bind(nym)
     .execute(&pool)
     .await
-    .unwrap();
-
-    let (status, body) =
-        post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ERROR");
-    assert_eq!(body["code"], "DonationPageNotFound");
+    .expect_err("ct_descriptor is a current required surface invariant");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("23502")
+    );
 
     // The Lightning Address cursor was never advanced — no leak.
     let la_idx: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
@@ -8232,16 +8340,54 @@ async fn callback_rejects_invalid_amounts() {
     .await;
 
     // Below minimum (default 100k msat = 100 sats)
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=1000").await;
+    let (_, body) = get_path(
+        &app,
+        &format!("{}?amount=1000", test_lnurl_callback_path("amtuser")),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     // Not divisible by 1000
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=100500").await;
+    let (_, body) = get_path(
+        &app,
+        &format!("{}?amount=100500", test_lnurl_callback_path("amtuser")),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     // Above maximum
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=99000000000000").await;
+    let (_, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=99000000000000",
+            test_lnurl_callback_path("amtuser")
+        ),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn callback_requires_current_intent_token_route() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "badintenttoken").await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (retired_status, retired_body) =
+        get_path(&app, "/lnurlp/callback/badintenttoken?amount=100000").await;
+    assert_eq!(retired_status, StatusCode::NOT_FOUND, "{retired_body:?}");
+    assert_eq!(retired_body, Value::Null);
+
+    let (status, body) = get_path(
+        &app,
+        "/lnurlp/callback/badintenttoken/not-canonical?amount=100000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["code"], "InvalidComment");
 
     cleanup_db(&pool).await;
 }
@@ -8289,15 +8435,6 @@ async fn lnurl_comment_callback_persists_binds_and_replays_one_private_lightning
     assert_eq!(over_limit_status, StatusCode::OK, "{over_limit_body}");
     assert_eq!(over_limit_body["code"], "InvalidComment");
     assert!(!over_limit_body.to_string().contains(&over_limit));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-
-    let (legacy_status, legacy_body) = get_path(
-        &app,
-        &format!("/lnurlp/callback/{nym}?amount=100000&comment=private"),
-    )
-    .await;
-    assert_eq!(legacy_status, StatusCode::OK, "{legacy_body}");
-    assert_eq!(legacy_body["code"], "InvalidComment");
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
     let (liquid_status, liquid_body) = get_path(
@@ -8499,7 +8636,14 @@ async fn m11_fresh_provider_range_is_cached_and_callback_revalidates_before_muta
         .provider_limits()
         .record_successful_refresh(Some(test_reverse_pair(500, 1_500)), Instant::now());
     let before = m11_creation_mutation_snapshot(&pool).await;
-    let (status, body) = get_path(&app, "/lnurlp/callback/m11freshlimits?amount=250000").await;
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=250000",
+            test_lnurl_callback_path("m11freshlimits")
+        ),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -8708,7 +8852,14 @@ async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let (status, body) = get_path(&app, "/lnurlp/callback/admissionclosed?amount=100000").await;
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=100000",
+            test_lnurl_callback_path("admissionclosed")
+        ),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["status"], "ERROR");
@@ -8900,7 +9051,10 @@ async fn whitelisted_liquid_admission_failure_does_not_fallback_to_lightning() {
 
     let (status, body) = get_path_from(
         &app,
-        "/lnurlp/callback/liquidclosed?amount=100000&payment_method=L-BTC",
+        &format!(
+            "{}?amount=100000&payment_method=L-BTC",
+            test_lnurl_callback_path("liquidclosed")
+        ),
         "127.0.0.1:42000".parse().unwrap(),
     )
     .await;
@@ -8938,7 +9092,6 @@ async fn healthy_direct_liquid_checkout_omits_closed_swap_rails() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -9027,7 +9180,6 @@ async fn certification_invoice_scope_does_not_bypass_closed_admission() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -10161,7 +10313,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (cached_pubkey, cached_sig) = sign_proof(&cached_key, &cached_outpoint);
     let proof_blinder = "01".repeat(32);
     let cached_replay_path = format!(
-        "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
     );
     let (status, body) = get_path_from(&app, &cached_replay_path, caller).await;
 
@@ -10243,7 +10395,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={mismatched_pubkey}&sig={mismatched_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={mismatched_pubkey}&sig={mismatched_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
@@ -10282,7 +10434,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={uncached_outpoint}&pubkey={uncached_pubkey}&sig={uncached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={uncached_outpoint}&pubkey={uncached_pubkey}&sig={uncached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
@@ -10384,7 +10536,7 @@ async fn failed_lightning_fallback_returns_original_liquid_throttle_without_retr
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={proof_outpoint}&pubkey={proof_pubkey}&sig={proof_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={proof_outpoint}&pubkey={proof_pubkey}&sig={proof_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
@@ -14880,6 +15032,124 @@ async fn signed_invoice_list_is_auth_bound_and_npub_isolated() {
 }
 
 #[tokio::test]
+async fn signed_linked_invoice_management_uses_permanent_owner_while_lnurl_is_offline() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let nym = "offlineinvoicemgmt";
+    let (owner_npub, _, _, owner_keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    let (other_npub, _, _, other_keypair) =
+        sign_registration_with_keypair("offlineinvoiceother", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &owner_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::create_user(&pool, "offlineinvoiceother", &other_npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    pay_service::db::deactivate_user(&pool, &owner_npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let bitcoin_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let request = |npub: &str, timestamp: u64, signature: &str| {
+        json!({
+            "npub": npub,
+            "amount_sat": 1000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "public_description": null,
+            "recipient_name": null,
+            "invoice_number": null,
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": bitcoin_address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature,
+        })
+    };
+
+    // A valid signature from a different permanent owner cannot adopt the
+    // offline merchant's linked management surface or create any row.
+    let (other_signature, other_timestamp) = sign_invoice_create_for_nym_with_keypair(
+        &other_keypair,
+        &other_npub,
+        nym,
+        bitcoin_address,
+        expires_at_unix,
+    );
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/{nym}/invoices"),
+        request(&other_npub, other_timestamp, &other_signature),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "AuthError", "{body}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0,
+        "cross-owner create mutated invoices"
+    );
+
+    let (signature, timestamp) = sign_invoice_create_for_nym_with_keypair(
+        &owner_keypair,
+        &owner_npub,
+        nym,
+        bitcoin_address,
+        expires_at_unix,
+    );
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/{nym}/invoices"),
+        request(&owner_npub, timestamp, &signature),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let invoice_id = body["invoice_id"]
+        .as_str()
+        .expect("offline owner create returned invoice id");
+    let stored: (String, Option<String>, String) =
+        sqlx::query_as("SELECT npub_owner, nym_owner, status FROM invoices WHERE id = $1")
+            .bind(Uuid::parse_str(invoice_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        (owner_npub.clone(), Some(nym.into()), "unpaid".into())
+    );
+
+    let (cancel_signature, cancel_timestamp) =
+        sign_invoice_cancel_with_keypair(&owner_keypair, &owner_npub, nym, invoice_id);
+    let (status, body) = delete_json_path(
+        &app,
+        &format!("/api/v1/{nym}/invoices/{invoice_id}"),
+        json!({
+            "npub": owner_npub,
+            "timestamp": cancel_timestamp,
+            "signature": cancel_signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled", "{body}");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn signed_invoice_cancel_is_owner_bound_and_idempotent() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -15779,6 +16049,134 @@ async fn liquid_outpoint_reservation_reuses_original_index_after_cursor_advances
             .await
             .unwrap();
     assert_eq!(reservations, 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn offline_after_liquid_instruction_keeps_observation_live_without_reopening_lnurl() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "offlineissuedliquid";
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let issued_outpoint = format!("{}:0", "33".repeat(32));
+    let new_outpoint = format!("{}:1", "44".repeat(32));
+    let pubkey = "02".repeat(33);
+
+    let issued_index =
+        pay_service::db::allocate_outpoint_address(&pool, nym, &issued_outpoint, &pubkey)
+            .await
+            .unwrap();
+    assert_eq!(issued_index, 0);
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+
+    // The public product remains closed; deactivation is not silently undone
+    // by preserving an already-issued money obligation.
+    let app = test_app(test_state(pool.clone()));
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+    let (_, callback_unavailable) = get_path(
+        &app,
+        &format!(
+            "{}?amount=100000&payment_method=L-BTC",
+            test_lnurl_callback_path(nym)
+        ),
+    )
+    .await;
+    assert_eq!(
+        callback_unavailable["code"], "NymNotFound",
+        "{callback_unavailable}"
+    );
+
+    // The authenticated supervision surface remains owner-readable while the
+    // public payment-instruction surface stays closed.
+    let reservations_uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        nym,
+        nym,
+        auth_timestamp(),
+    );
+    let (reservations_status, reservations_body) = get_path(&app, &reservations_uri).await;
+    assert_eq!(reservations_status, StatusCode::OK, "{reservations_body}");
+    assert_eq!(
+        reservations_body["reservations"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        reservations_body["reservations"][0]["outpoint"],
+        issued_outpoint
+    );
+    assert_eq!(reservations_body["next_addr_idx"], 0);
+
+    // The persisted reservation remains an idempotent obligation internally,
+    // while a new outpoint cannot allocate a fresh address after deactivation.
+    assert_eq!(
+        pay_service::db::allocate_outpoint_address(&pool, nym, &issued_outpoint, &pubkey)
+            .await
+            .unwrap(),
+        issued_index
+    );
+    let new_instruction_error =
+        pay_service::db::allocate_outpoint_address(&pool, nym, &new_outpoint, &pubkey)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(new_instruction_error, sqlx::Error::RowNotFound),
+        "unexpected new-instruction refusal: {new_instruction_error:?}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outpoint_addresses WHERE nym = $1",)
+            .bind(nym)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "offline cache miss created a reservation"
+    );
+
+    let snapshot = pay_service::db::watcher_scan_snapshot(&pool).await.unwrap();
+    let historical = pay_service::db::list_active_nyms_for_watcher_page(&pool, &snapshot, None)
+        .await
+        .unwrap();
+    assert_eq!(historical.rows.len(), 1);
+    assert_eq!(historical.rows[0].nym, nym);
+    let recent =
+        pay_service::db::list_recently_active_nyms_for_watcher_page(&pool, 3_600, &snapshot, None)
+            .await
+            .unwrap();
+    assert!(
+        recent.rows.is_empty(),
+        "no callback was recorded in this fixture"
+    );
+
+    assert_eq!(
+        pay_service::db::mark_reservations_fulfilled_at_idx(&pool, nym, issued_index as u32,)
+            .await
+            .unwrap(),
+        1
+    );
+    pay_service::db::advance_next_addr_idx(&pool, nym, issued_index as u32)
+        .await
+        .unwrap();
+    let observed: (i32, bool, bool) = sqlx::query_as(
+        "SELECT users.next_addr_idx, users.is_active, outpoint_addresses.fulfilled \
+           FROM users JOIN outpoint_addresses USING (nym) \
+          WHERE users.nym = $1 AND outpoint_addresses.outpoint = $2",
+    )
+    .bind(nym)
+    .bind(&issued_outpoint)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observed, (1, false, true));
 
     cleanup_db(&pool).await;
 }
@@ -20863,7 +21261,6 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
                 website: None,
                 twitter: None,
                 instagram: None,
-                pos_mode: false,
                 enabled: true,
                 generated_og_template_version: None,
                 alias: None,
@@ -21009,7 +21406,7 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
 }
 
 #[tokio::test]
-async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availability() {
+async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availability() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -21082,7 +21479,7 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
     pay_service::db::deactivate_user(&pool, &npub)
         .await
         .unwrap()
-        .expect("active canonical nym");
+        .expect("active permanent nym");
 
     let (offline_status, offline_with_alias) = get_path(&app, &lookup_uri).await;
     assert_eq!(offline_status, StatusCode::OK);
@@ -21185,113 +21582,6 @@ async fn permanent_nym_contract_shared_namespace_and_cross_owner_race() {
             .await
             .unwrap();
     assert_eq!((shared_claims, shared_users), (1, 1));
-
-    cleanup_db(&pool).await;
-}
-
-#[tokio::test]
-async fn grandfathered_tombstones_verify_history_but_never_drive_live_routes() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-
-    let (npub, _, _) = sign_registration("canonical-owner", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "canonical-owner", &npub, TEST_DESCRIPTOR)
-        .await
-        .unwrap();
-
-    // Model the exact rows migration 059 is allowed to create before its
-    // runtime insert trigger exists. Test-only replication role is local to
-    // this transaction and leaves every declarative constraint enabled.
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL session_replication_role = replica")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO public_names \
-             (name, owner_npub, kind, canonical, grandfathered) \
-         VALUES \
-             ('historical-tombstone', $1, 'nym', FALSE, TRUE), \
-             ('historical-alias', $1, 'alias', FALSE, TRUE)",
-    )
-    .bind(&npub)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO users (nym, npub, ct_descriptor, is_active) \
-         VALUES ('historical-tombstone', $1, 'historical-descriptor', FALSE)",
-    )
-    .bind(&npub)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO donation_pages \
-             (nym, kind, ct_descriptor, header, description, \
-              display_currency, enabled) \
-         VALUES \
-             ('historical-tombstone', 'payment_page', \
-              'historical-descriptor', 'Historical', 'Tombstone surface', \
-              'USD', TRUE)",
-    )
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-
-    let owner = pay_service::db::get_user_by_npub_any(&pool, &npub)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(owner.nym, "canonical-owner");
-    assert_eq!(
-        pay_service::db::count_permanent_nyms_by_npub(&pool, &npub)
-            .await
-            .unwrap(),
-        1,
-        "compatibility quota counts the one canonical product identity"
-    );
-
-    assert!(
-        pay_service::db::get_donation_page_by_nym(
-            &pool,
-            "historical-tombstone",
-            pay_service::db::KIND_PAYMENT_PAGE,
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "a tombstone nym must never select a payable surface"
-    );
-    assert!(
-        pay_service::db::get_donation_page_by_alias(
-            &pool,
-            "historical-alias",
-            pay_service::db::KIND_PAYMENT_PAGE,
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "a tombstone alias must never select a payable surface"
-    );
-    assert!(
-        pay_service::db::alias_owns_nym(&pool, "historical-alias", "historical-tombstone",)
-            .await
-            .unwrap(),
-        "typed tombstones remain authoritative for old invoice verification"
-    );
-
-    let activation =
-        sqlx::query("UPDATE users SET is_active = TRUE WHERE nym = 'historical-tombstone'")
-            .execute(&pool)
-            .await
-            .expect_err("a tombstone must not become an active Lightning Address");
-    assert!(matches!(
-        activation,
-        sqlx::Error::Database(ref error)
-            if error.constraint() == Some("users_active_nym_must_be_canonical")
-    ));
 
     cleanup_db(&pool).await;
 }
@@ -29007,7 +29297,7 @@ async fn issue84_persist_recovery_commitment(
 }
 
 #[tokio::test]
-async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() {
+async fn issue84_chain_offer_owner_mismatch_or_missing_commitment_has_zero_mutation() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let nym = "issue84missing";
@@ -29066,7 +29356,7 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
         .await
         .unwrap()
         .unwrap();
-    let inactive = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+    let offline_without_commitment = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
         &state,
         Some(nym),
         ISSUE84_CHAIN_AMOUNT_SAT,
@@ -29074,7 +29364,10 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
     )
     .await
     .unwrap();
-    assert!(inactive.is_none());
+    assert!(
+        offline_without_commitment.is_none(),
+        "product deactivation must not bypass the still-missing recovery contract"
+    );
 
     assert_eq!(
         pay_service::db::swap_key_seq_next_value(&pool)
@@ -29108,6 +29401,126 @@ async fn issue84_chain_offer_missing_or_inactive_commitment_has_zero_mutation() 
 
     provider_task.abort();
     let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn issue84_offline_page_owner_keeps_exactly_one_chain_offer_and_lnurl_stays_closed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "issue84offlinepage";
+    let (npub, keypair) = issue84_test_merchant(&pool, nym).await;
+    let recovery_commitment_id = issue84_persist_recovery_commitment(
+        &pool,
+        &keypair,
+        &npub,
+        RECOVERY_COMMITMENT_P2WPKH,
+        auth_timestamp(),
+    )
+    .await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Offline LA checkout",
+            description: "The permanent Page and recovery contract stay online",
+            display_currency: "BTC",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Anonymous checkout attempts Lightning first. Its expected 404 consumes
+    // one reserved reverse key before the independent chain path starts.
+    let next_key = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap();
+    let provider = spawn_issue84_chain_provider(
+        u64::try_from(next_key + 1).unwrap(),
+        u64::try_from(next_key + 2).unwrap(),
+        "Issue84OfflinePage1",
+    )
+    .await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.recovery_manifest_runtime_v1 = Some(in_memory_recovery_manifest_runtime());
+    let retry_state = state.clone();
+
+    pay_service::db::deactivate_user(&pool, &npub)
+        .await
+        .unwrap()
+        .expect("owner was active before product deactivation");
+    let app = test_app(state);
+    let (_, unavailable) = get_path(&app, &format!("/.well-known/lnurlp/{nym}")).await;
+    assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({"amount_sat": ISSUE84_CHAIN_AMOUNT_SAT}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lockup_address = body["bitcoin_chain_address"]
+        .as_str()
+        .expect("offline Page checkout retained its Bitcoin chain offer")
+        .to_string();
+    assert!(body["bitcoin_chain_bip21"].is_string(), "{body}");
+    let invoice_id = Uuid::parse_str(body["invoice_id"].as_str().unwrap()).unwrap();
+    let recorded: (i64, Uuid, String, String) = sqlx::query_as(
+        "SELECT COUNT(*) OVER (), recovery_address_commitment_id, nym, lockup_address \
+           FROM chain_swap_records WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.0, 1);
+    assert_eq!(recorded.1, recovery_commitment_id);
+    assert_eq!(recorded.2, nym);
+    assert_eq!(recorded.3, lockup_address);
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+
+    // Re-enter the exact production boundary with the same invoice. Durable
+    // discovery returns the existing offer before any owner/provider mutation.
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let provider_calls_before_retry = provider.calls.load(Ordering::SeqCst);
+    let retry = pay_service::invoice::exercise_bitcoin_chain_offer_creation(
+        &retry_state,
+        Some(nym),
+        ISSUE84_CHAIN_AMOUNT_SAT,
+        &invoice,
+    )
+    .await
+    .unwrap()
+    .expect("durable offline Page offer disappeared on retry");
+    assert_eq!(retry.0, lockup_address);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        provider_calls_before_retry
+    );
+    assert_eq!(provider.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chain_swap_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    provider.shutdown().await;
     cleanup_db(&pool).await;
 }
 
@@ -30705,7 +31118,6 @@ async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
