@@ -684,6 +684,7 @@ pub async fn robots_txt() -> Response {
 /// (fiat-denominated). Server rejects payloads that supply both or
 /// neither.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAnonymousRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
@@ -697,8 +698,9 @@ pub struct CreateAnonymousRequest {
     pub note: Option<String>,
 }
 
-/// `memo` column cap (migration 019: `length(memo) <= 280`). Validated here so
-/// an over-long note returns a clean error instead of a DB constraint failure.
+/// `memo` column cap (migration 019: `length(memo) <= 280`). PostgreSQL counts
+/// characters rather than UTF-8 bytes, so request validation must do the same.
+/// Validating here returns a clean error instead of a DB constraint failure.
 const MAX_INVOICE_NOTE_LEN: usize = 280;
 
 #[derive(Serialize)]
@@ -846,7 +848,7 @@ async fn create_anonymous_for_kind(
     // notes before the insert hits the column CHECK.
     let note = req.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(note) = note {
-        if note.len() > MAX_INVOICE_NOTE_LEN {
+        if note.chars().count() > MAX_INVOICE_NOTE_LEN {
             return Err(AppError::InvalidAmount(format!(
                 "note too long (max {MAX_INVOICE_NOTE_LEN} chars)"
             )));

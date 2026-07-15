@@ -11810,6 +11810,140 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
 }
 
 #[tokio::test]
+async fn anonymous_checkout_json_contract_rejects_unknown_fields_before_mutation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "strictcheckoutjson";
+    create_test_user(&pool, nym).await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Strict checkout JSON",
+            description: "Only the current checkout contract is accepted",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+
+    let mutation_snapshot = || async {
+        sqlx::query_as::<_, (i64, i32, i64, i64, i64)>(
+            "SELECT \
+                 (SELECT COUNT(*) FROM invoices), \
+                 (SELECT next_addr_idx FROM donation_pages \
+                   WHERE nym = $1 AND kind = 'payment_page'), \
+                 (SELECT COUNT(*) FROM swap_key_allocations), \
+                 (SELECT COUNT(*) FROM swap_records), \
+                 (SELECT COUNT(*) FROM chain_swap_records)",
+        )
+        .bind(nym)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let pristine = mutation_snapshot().await;
+
+    for unknown in [
+        "recipient_label",
+        "recipient_name",
+        "public_description",
+        "invoice_number",
+        "unexpected",
+    ] {
+        let mut payload = json!({ "amount_sat": 1_000 });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert(unknown.to_string(), json!("forbidden"));
+        let (status, body) = post_json(&app, &format!("/{nym}/invoice"), payload).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown field {unknown} was not rejected: {body:?}"
+        );
+        assert_eq!(
+            mutation_snapshot().await,
+            pristine,
+            "unknown field {unknown} reached a mutating handler path"
+        );
+    }
+
+    let too_long_note = "é".repeat(281);
+    assert_eq!(too_long_note.chars().count(), 281);
+    assert_eq!(too_long_note.len(), 562);
+    let (status, body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({
+            "fiat_amount_minor": 1_000,
+            "fiat_currency": "USD",
+            "note": too_long_note
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["code"], "InvalidAmount", "{body:?}");
+    assert_eq!(body["reason"], "note too long (max 280 chars)", "{body:?}");
+    assert_eq!(
+        mutation_snapshot().await,
+        pristine,
+        "a 281-character note mutated checkout state"
+    );
+
+    let max_note = "é".repeat(280);
+    assert_eq!(max_note.chars().count(), 280);
+    assert_eq!(max_note.len(), 560);
+    let (status, fiat_body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({
+            "fiat_amount_minor": 1_000,
+            "fiat_currency": "USD",
+            "note": max_note
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fiat_body:?}");
+    assert_eq!(fiat_body["pricing_mode"], "fiat_fixed", "{fiat_body:?}");
+    let fiat_invoice_id = Uuid::parse_str(fiat_body["invoice_id"].as_str().unwrap()).unwrap();
+    let stored_note: Option<String> = sqlx::query_scalar("SELECT memo FROM invoices WHERE id = $1")
+        .bind(fiat_invoice_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored_note.as_deref(), Some(max_note.as_str()));
+
+    let (status, sat_body) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({ "amount_sat": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sat_body:?}");
+    assert_eq!(sat_body["pricing_mode"], "sat_fixed", "{sat_body:?}");
+    assert_eq!(sat_body["liquid_amount_sat"], 1_000, "{sat_body:?}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn fiat_checkout_private_note_survives_pricer_outage_and_first_quote_owns_conversion() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
