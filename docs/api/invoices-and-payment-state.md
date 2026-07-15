@@ -217,6 +217,15 @@ are. Treat invoice URLs as shareable secrets.
 }
 ```
 
+For a fiat-fixed invoice that has not received its first explicit payer-demand
+quote, `rate_minor_per_btc` is `null` and `rate_locks_until_unix` is exactly
+`0`. Zero means that no invoice-level rate lock exists; it is not an expired
+quote timestamp. The selected-rail quote response owns the actual immutable
+rate and its five-minute expiry. A sat-fixed invoice also has a null rate, but
+retains `rate_locks_until_unix == expires_at_unix` as its never-refresh
+sentinel. Clients must distinguish these cases by `pricing_mode`, not by the
+nullable rate alone.
+
 `lightning_pr`/`lightning_amount_sat`,
 `liquid_address`/`liquid_amount_sat`, `bitcoin_address`, and the
 `bitcoin_chain_address`/`bitcoin_chain_bip21`/`bitcoin_chain_amount_sat`

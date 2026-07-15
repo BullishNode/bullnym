@@ -17,11 +17,10 @@ baseline reported clean build
 `060_lnurl_private_comment_intents`, and permanent-name policy
 `permanent_names_v1`.
 
-The complete server/PWA behavior described below is current release source
-`e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree
-`93f9f06f10d58520547a8d4d9ac85064c822fa07`, with expected schema
-`062_invoice_quote_provider_attempts`. It was reviewed at PR #177 head
-`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree. It includes:
+The complete server/PWA behavior described below is now deployed release
+source `0f459fff770d4eef24e7858b7c546e652846ed08`, tree
+`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, with expected schema
+`063_checkout_private_memo`. It includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
 - one stable Liquid destination per invoice and first-observation fiat
@@ -30,33 +29,46 @@ The complete server/PWA behavior described below is current release source
 - product-correct Bitcoin behavior and durable provider recovery/holds;
 - permanent names, independent public products, and current-only APIs.
 
-At 2026-07-15 08:03 UTC, the server completed a fresh schema-062 cutover and
-installed that exact release. The installed and running binary SHA-256 was
-`21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
-the server-hosted PWA content SHA-256 was
+The server first completed its schema-062 cutover at 2026-07-15 08:03 UTC.
+PRs #179 and #180 then supplied schema `063_checkout_private_memo`, the
+fee-refresh handoff fix, strict anonymous checkout input, and Unicode-character
+note validation. The stopped-writer migration and verified schema-063 artifact
+were installed at 18:03 UTC. Public and loopback health, readiness, version,
+binary, release record, PWA, and database/schema checks agreed, followed by
+three good Bitcoin and three good Liquid fee-refresh observations with no
+admission closure.
+
+The first schema-063 no-funds run stopped before any live-money gate when a
+fiat invoice with no quote exposed its outer deadline as if it were a rate
+lock. The accompanying startup work also found legitimate allocator-only
+recovery lineage was treated too strictly. PR #182 corrects both without
+weakening the unsafe cases. Before the payer requests a quote, a fiat invoice
+now has no locked rate and reports a zero rate-lock sentinel. Sat-fixed
+invoices still use their outer
+deadline as the sentinel. Startup recovery can recognize legitimate
+allocator-only reverse/orphan history, while provider-ahead, missing/local-
+behind lineage, chain-inventory, and witness disagreements remain fail-closed.
+
+At 2026-07-15 19:01 UTC, the server reran migration 063 as already applied and
+installed the exact current source above. The installed and running binary
+SHA-256 is
+`4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`;
+the active release-record SHA-256 is
+`7fd67f488b3e334636259423162b344c754cc8059787bc729d6aa7a374bf8cf7`;
+the server-hosted PWA content SHA-256 is
 `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`.
-Public `/health`, `/ready`, and `/version` probes matched the installed commit
-and schema.
+Public `/version` matched the current commit, clean production build, schema,
+and permanent-name policy. Startup recovery was consistent, and another three
+Bitcoin and three Liquid fee-refresh observations passed without a bad sample
+or admission closure.
 
-The read-only deployment certification passed, and the current recovery
-generation reconciled with all-zero startup counts. On the exact deployed
-restart, direct Bitcoin, reverse Lightning, direct Liquid, and Bitcoin chain
-swap admission all opened after their normal startup checks. This is a point-
-in-time result, not a promise that every method will always remain available:
-`/ready` does not report every rail, and a rail closes if its own safety
-foundation degrades. Use only the methods the current page offers. The
-schema-062 no-funds smoke later failed when a valid private Page checkout note
-reached an obsolete database constraint; the funds gate stayed closed and no
-funds moved. The bounded live-money journey was therefore not started.
-
-PRs #179 and #180 merge schema `063_checkout_private_memo`, the fee-refresh
-handoff fix, strict anonymous checkout input, and Unicode-character note
-validation. Final exact main is
-`f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree
-`8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`, with terminal-green exact-main
-CI and a verified hosted release artifact. This is source/release behavior
-only; this manual does not call it deployed or certified. This release line
-changes the server-hosted PWA; it does not include a mobile-wallet release.
+This proves the current server deployment identity and observed readiness; it
+does not complete the two payment-journey certificates. Their explicit status
+is `PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
+`PENDING_FINAL_LIVE_CERTIFICATION`. A rail can still close whenever its own
+safety foundation degrades, so use only methods the current page offers. This
+release changes the server-hosted PWA; it does not include a mobile-wallet
+release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -444,18 +456,20 @@ choosing two conflicting irreversible outcomes.
 
 Historical baseline behavior was checked against the first deployed probe
 above. Current-release behavior was checked against Bullnym source and tests at
-`e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head was
-`01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree, plus the
+`0f459fff770d4eef24e7858b7c546e652846ed08`, tree
+`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, plus the
 product/API/architecture documents in this repository and the locked
-completion-plan, rationale, and server/PWA gap-audit records maintained outside
-this repository.
+completion-plan, rationale, server/PWA gap-audit, and schema-063 cutover records
+maintained outside this repository.
 
-The later public probes, artifact digests, and read-only certification prove
-deployment identity and public readiness. Exact deployed startup evidence also
-proved the current recovery generation and observed all four private rails
-open on that restart. The Operator Manual records that evidence and its
-limits. The schema-062 no-funds smoke failure and its zero-funds boundary are
-recorded there. Merged schema-063 source/release behavior was checked at final
-exact main `f91cc7d1438079e8eca8c018ed3d64487f4264cf`; the schema-063 no-funds
-rerun and bounded live-money journey remain separate outstanding certification
-work.
+The historical read-only certification proves the schema-062 deployment
+identity at its observed time. The later schema-063 cutover records, public
+probes, and artifact digests separately prove the current deployment identity
+and public readiness. Exact hotfix startup evidence reported a consistent
+recovery pass; the Operator Manual records that evidence and its limits. The
+schema-062 and first schema-063 no-funds failures and their closed funds
+boundaries are recorded there. Migration, artifact, running process, public
+version, startup recovery, and repeated fee-cycle evidence prove the current
+schema-063 deployment. The only outstanding journey fields are
+`PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
+`PENDING_FINAL_LIVE_CERTIFICATION`.

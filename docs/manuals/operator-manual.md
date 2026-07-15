@@ -7,33 +7,36 @@ integrity gates.
 
 ## Evidence and release status
 
-This revision deliberately separates source, installation, and certification
-evidence:
+This revision deliberately separates source, installation, and journey
+certification evidence:
 
 | Label | Meaning |
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
 | **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
-| **Merged schema-063 release source** | PRs #179 and #180 are merged in exact `main`; exact-main CI and the hosted release artifact are verified. This label is source/release evidence only: it does not assert deployment, migration, or production behavior. |
-| **Journey-certified production release** | Use this label only after the schema-063 release identity and migration are deployed and both the no-funds smoke and bounded live-money journeys pass. That evidence does not yet exist in this revision. |
+| **Deployed schema-063 release** | Migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves deployment identity and readiness at the observed times, not the unfinished payment journeys. |
+| **Journey-certified production release** | Use this label only after the final schema-063 no-funds smoke and bounded live-money journey pass and certification authority is removed. Those two results remain explicit placeholders below. |
 
 Exact revisions used for this manual:
 
 - historical deployed baseline: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
 - reviewed PR #177 base: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`;
 - reviewed PR #177 head: `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`;
-- installed release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`;
-- installed binary SHA-256: `21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
-- installed PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
-- active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`;
+- schema-062 release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`;
+- schema-062 binary SHA-256: `21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
+- schema-062 active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`;
 - passed deployment-certification report SHA-256: `3586ad4a4d7c98975ec8a5a3460ca51c97cfa1030356473a7ded30f5165bc799`;
-- merged schema-063 source: PR #179 merge `fe36a8d1701416222a30670000978075b0b58196`, followed by final PR #180 merge `f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree `8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`;
-- final exact-main CI: run `29407076211`, terminal success at 2026-07-15 10:33:38 UTC;
-- hosted schema-063 binary SHA-256: `2ab891a3c372cf5f619c0a702beb099bd5b80f447f571d2fb66c1c2a3a3c9a5b`;
-- hosted schema-063 release-record SHA-256: `652819a2c8a4e8812b1c8722b742aba200a8cee33ade69697b72fcb35b92de56`;
-- hosted schema-063 PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
+- first schema-063 release: PR #179 merge `fe36a8d1701416222a30670000978075b0b58196`, followed by PR #180 merge `f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree `8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`;
+- first schema-063 exact-main CI: run `29407076211`, terminal success at 2026-07-15 10:33:38 UTC;
+- first schema-063 deployed binary SHA-256: `2ab891a3c372cf5f619c0a702beb099bd5b80f447f571d2fb66c1c2a3a3c9a5b`;
+- first schema-063 deployed release-record SHA-256: `652819a2c8a4e8812b1c8722b742aba200a8cee33ade69697b72fcb35b92de56`;
+- current production source: PR #182 merge `0f459fff770d4eef24e7858b7c546e652846ed08`, tree `b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, expected schema `063_checkout_private_memo`;
+- current installed and running binary SHA-256: `4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`;
+- current active release-record SHA-256: `7fd67f488b3e334636259423162b344c754cc8059787bc729d6aa7a374bf8cf7`;
+- current PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
+- certification harness source: `65f46fa70fa41cd99f291a54af0970d5304a72cb`, clean, simulator SHA-256 `663613f01315390d1a59cdb179ccfcfd0def238635a2cc2d1c5b7a9984d3ecdd`;
 - protected production configuration SHA-256 after the test-certification
-  allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`.
+  allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`; the forward deploy verified that configuration and the runtime environment were byte-preserved.
 
 The historical baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -95,9 +98,62 @@ nor a reason to close admission when that exact durable predecessor remains
 valid. Missing, stale, unauthorized, or inconsistent durable evidence still
 closes admission. PR #180 then made the anonymous checkout JSON contract
 strict and aligned the 280-character note boundary with PostgreSQL Unicode
-character semantics. Both changes are merged and exact-main CI is green; this
-documentation revision does not claim they are deployed, migrated, or
-production-certified.
+character semantics.
+
+At 2026-07-15 17:55 UTC, the stopped writer captured the final schema-062
+backup: 33 public tables, 66 public rows, dump SHA-256
+`c2c84ff8fada68395839b9d558a391d0e3f413f83e781ab0c834a3c8767d5b4b`,
+and backup-manifest SHA-256
+`8c588d9efd2de4a0b928fb6dc43accff4f0a14e8145c6415e46051b3b5152c12`.
+Migration 063 was then applied from exact migration SHA-256
+`576855ef56613084769170082acca3322741a4187435117c04655818bafedd85`;
+the permission catalog remained exact at
+`8c33727be388cca894c4a5e9eeeb9757beb132b3ea421fe2b783e833a9a074c5`.
+At 18:03 UTC the qualified installer activated exact `f91cc7d...`. The strict
+18:03–18:04 UTC read-only APP/TEST/DB/public audit matched source, binary,
+running process, release record, PWA, schema, health, readiness, and public
+version. Three Bitcoin and three Liquid fee-refresh observations then passed
+with zero bad samples and zero admission closures.
+
+The first schema-063 no-funds attempt stopped and kept its funds boundary
+closed when an unquoted fiat invoice projected its outer deadline as a rate
+lock instead of the required zero sentinel. The accompanying startup work also
+found that legitimate allocator-only reverse/orphan lineage was classified too
+strictly. PR #182 fixes only those two production-observed boundaries. An
+unquoted fiat invoice now reports `rate_minor_per_btc: null` and
+`rate_locks_until_unix: 0`; sat-fixed invoices retain their outer deadline as
+the sentinel. Recovery accepts allocator-only lineage only when chain-record
+coverage is exact and the active-root provider/local high-water relation is not
+provider-ahead. Missing local lineage, local-behind evidence, provider-ahead
+state, unsafe chain inventory, and witness disagreement still fail closed.
+
+At 2026-07-15 19:01 UTC, the qualified forward installer reran migration 063
+as `already_applied`, fast-forwarded production from `f91cc7d...` to exact
+`0f459fff...`, and activated the current verified artifact above. Startup
+reported one consistent recovery pass, zero inconsistent passes, and zero
+unavailable passes. Public `/version` reported exact `0f459fff...`, clean
+production mode, schema `063_checkout_private_memo`, and permanent-name policy.
+Three further Bitcoin and three Liquid fee-refresh observations passed with
+zero bad samples and zero admission closures. This is deployed and ready
+server evidence; it is not yet a completed payment-journey certificate.
+
+The only deliberately unresolved evidence fields in this revision are:
+
+- final no-funds schema-063 result: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
+- final bounded live-money/recycler result: `PENDING_FINAL_LIVE_CERTIFICATION`.
+
+Deployment provenance is bound to the private cutover records by SHA-256:
+
+- schema-062 backup result: `03bd3e456fe14511e60fb78a3656d7a92c332549e688524346c16e69764764c5`;
+- schema-063 migration result: `8d2e74b52a6a1d6d44136e9f9fe8ea95e689b9d0d9b820617b35867accabe9d8`;
+- first schema-063 install result: `4801ffd3eed9ec234ef4339612cc8d81e82f9f2b9fb58c2032a3d35dbcb796df`;
+- first schema-063 read-only VM audit: `647495c4aeae5440231fd027e142df4b10cad3e9a55263f3520a89a83f1e62da`;
+- upgraded TEST source/artifact result: `2070413969a10d8f77688d2e4395473889fc07e7bac80f079e00e36eadea4473`;
+- TEST offline certification precheck: `c748b1f7a9ba5af889adcfd28d4d2640b116a8068ac58d7727fce8ce630ecb1a`;
+- pre-hotfix APP/TEST/DB/public audit: `4a26ceadd14391a4d231f002692a800ef33f0c9761ca2523b45778c2069a877b`;
+- exact hotfix forward-deploy result: `dbf3ff77f22efd5c1b25081f00f488c618db3a192a79924eaa63abe4fc92a457`;
+- post-deploy public version response: `c006511c9e347ef0a70b5dc609411e39f0931dda42e8f292d388ac7311fa88bf`;
+- each repeated post-install fee-cycle result: `254fbf35f7640a25ec1f81690b72e5de2a2f8130855bba0bfbd58e709ff69b8a`.
 
 Do not infer current rail availability from `/ready` or from this manual;
 inspect the current per-rail admission state.
@@ -272,11 +328,13 @@ It moved no funds, called no provider, and made only public `GET` requests to
 `/version`, `/health`, and `/ready`. Treat it as deployment-identity and public-
 readiness evidence, not as schema-062 smoke or live-money certification.
 
-PR #179 changes the candidate marker to exactly
-`063_checkout_private_memo`. After that change has an authoritative merged
-release identity, use the actual merged commit, artifact digest, PWA digest,
-and this schema marker for both staged and installed certification. Never reuse
-the schema-062 certification report as proof of the schema-063 candidate.
+The current production marker is exactly `063_checkout_private_memo`. Use
+current merged commit `0f459fff770d4eef24e7858b7c546e652846ed08`, artifact
+digest `4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`,
+PWA digest `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`,
+and this schema marker for installed identity checks. Never reuse the
+schema-062 certification report as proof of the current release, and never
+substitute deployment identity for either pending journey result.
 
 The production configuration supports a narrowly scoped certification bypass
 for exactly one allowlisted source, the TEST VM, and exactly these five scopes:
@@ -475,8 +533,10 @@ Validate pair, currency, precision, positive finite rate, source,
 last-known-good observation may be used only within policy. When no trustworthy
 fresh rate exists, pause new fiat quote creation; do not guess.
 
-The schema-062 release keeps a fiat invoice's currency and minor-unit face
-value as its only denomination authority; `amount_sat` remains zero. A payer
+The current schema-063 release keeps a fiat invoice's currency and minor-unit
+face value as its only denomination authority; `amount_sat` remains zero. Until
+the first quote, `rate_minor_per_btc` remains null and
+`rate_locks_until_unix` is the zero no-lock sentinel. A payer
 explicitly selects one rail with `POST /api/v1/invoices/:id/quote`. Status and
 other GET requests are projections and must not allocate provider or monetary
 state. A successful request creates or reuses one immutable rate snapshot with
@@ -776,12 +836,15 @@ produced misleading local failure telemetry. Do not re-enable it until a
 reviewed replacement exists. The schema-062 no-funds smoke failed at its first
 fiat Payment Page invoice because the obsolete checkout-metadata constraint
 rejected a valid private note. Its preceding no-funds stages passed, its funds
-gate remained closed, and it moved no funds. PRs #179 and #180 carry the merged,
-exact-main-CI-verified schema-063 remediation, but a hosted release is not a
-production rerun. The schema-063
-no-funds smoke and bounded live-money journey remain outstanding; neither the
-disabled timer nor the passed schema-062 read-only deployment certification
-substitutes for them.
+gate remained closed, and it moved no funds. PRs #179 and #180 supplied the
+first schema-063 deployment. The first schema-063 no-funds attempt then found
+the pre-quote projection and allocator-only startup-lineage defects described
+above, still before the live-money gate. PR #182 and the upgraded harness are
+now deployed/staged respectively, but the final outcomes remain
+`PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
+`PENDING_FINAL_LIVE_CERTIFICATION`. Neither the disabled timer, deployment
+identity, offline precheck, nor the earlier schema-062 certification
+substitutes for those two final results.
 
 Current harness commands include:
 
@@ -855,11 +918,14 @@ source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head
 was `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree.
 
 Schema-063 source claims were checked against migration 063, the fee-runtime
-changes, and strict anonymous checkout handling at final exact main
-`f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree
-`8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`. Exact-main CI and the hosted
-release record are verified. These remain source/release claims until
-deployment, migration, and journey evidence are recorded.
+changes, strict anonymous checkout handling, pre-quote projection, and recovery
+shadow audit at current exact main
+`0f459fff770d4eef24e7858b7c546e652846ed08`, tree
+`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`. The hosted release record,
+stopped-writer migration, exact artifact install, public version, startup
+recovery, configuration preservation, and repeated fee cycles are observed
+deployment evidence. The two explicit certification placeholders above remain
+the only journey claims not yet recorded.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.
