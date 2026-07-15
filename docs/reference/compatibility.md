@@ -18,83 +18,27 @@ policy inline.
   never consumed their own nostr.json.
 - Removal condition: none — opt-in is the intended long-term contract.
 
-## Donation Page Descriptor
-
-- Current field: `ct_descriptor` on signed `PUT /donation-page` requests.
-- Compatibility behavior: if omitted or empty, the server preserves the
-  existing page descriptor; checkout falls back to the nym's Lightning Address
-  descriptor when no page descriptor exists.
-- Compatibility reason: Get Paid now uses a page-specific deterministic
-  descriptor with an independent address cursor, while older clients only knew
-  about the nym descriptor.
-- Removal condition: every supported client supplies the page descriptor before
-  enabling checkout, and legacy donation pages have been migrated or archived.
-
-## Donation Page POS Mode
-
-- Current field: `pos_mode` on signed `PUT /donation-page` requests.
-- Compatibility behavior: if omitted, the server verifies the legacy signed
-  field list without `pos_mode`, preserves the existing page mode on update,
-  and defaults to `false` on first insert.
-- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
-  before POS mode existed, so requiring the field would reject otherwise valid
-  page updates from those clients.
-- Removal condition: all supported Bull Wallet builds include `pos_mode` in
-  the signed donation-page payload, and legacy saves without it are no longer
-  accepted by the API contract.
-
-## Donation Page Kind (surface discriminator)
-
-- Current field: `kind` on signed `PUT /donation-page` (save) and
-  `DELETE /donation-page` (archive) requests, and as the `?kind=` query on
-  `GET /donation-page/:nym`. Accepted values: `payment_page`, `pos`.
-- Compatibility behavior (save): `kind` is an optional trailing signed field
-  appended AFTER `ct_descriptor`. If omitted, the server verifies the legacy
-  signed field list without it and writes the `payment_page` surface. `kind`
-  is enum-validated before signature verification; a `pos` save additionally
-  requires `ct_descriptor`.
-- Compatibility behavior (archive): `kind` is the sole optional trailing signed
-  field. If omitted, the legacy empty field list is verified and the
-  `payment_page` row is archived.
-- Compatibility behavior (read): `?kind=` defaults to `payment_page`.
-- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
-  and archives before the Payment Page / POS split, so requiring the field
-  would reject otherwise valid requests. Keeping `kind` trailing and optional
-  preserves those signatures (the same maneuver as `pos_mode`).
-- Removal condition: all supported Bull Wallet builds include `kind` in the
-  signed donation-page payloads, and legacy requests without it are no longer
-  accepted by the API contract.
-
 ## Donation Page Alias (public URL slug)
 
 - Current field: `alias` on signed `PUT /donation-page` save requests. It is
   one optional permanent npub-level slug shared by Payment Page and POS,
   served at `/a/<alias>` and `/a/<alias>/pos`.
-- Compatibility behavior: `alias` is the NEWEST optional trailing signed field,
-  appended AFTER `kind` (order: `pos_mode?`, `ct_descriptor?`, `kind?`,
-  `alias?`). Any client that omits it verifies against the older byte layout,
-  which stays a strict prefix of the new one, so shipped Bull Wallet signatures
-  keep verifying. Omitted/null preserves the claim; `""` is signed but rejected
+- Compatibility behavior: `alias` is the sole optional trailing signed field,
+  appended after the required `pos_mode`, `ct_descriptor`, and `kind`. A client
+  that omits it signs the current fixed field list. Omitted/null preserves the
+  claim; `""` is signed but rejected
   as `DonationPageInvalid`; a first valid value claims permanently; the same
   owner/value is idempotent. A different value returns 409
   `AliasAlreadyAssigned`; a shared nym/alias collision returns 409 `NameTaken`.
 - Storage/availability behavior: the claim lives only in `public_names`, never
   on a Page/POS row. Archiving either surface or taking the Lightning Address
   offline does not change the claim, the other surface, or owner authorization.
-- Confusion guard (load-bearing): `alias` is validated BEFORE signature
-  verification and its value domain is kept provably disjoint from the other
-  optional trailing fields, so a captured legacy message whose sole trailing
-  signed field was `pos_mode`/`ct_descriptor`/`kind` can never be byte-identical
-  to a new alias-claiming message. Specifically: the alias charset
-  (`[a-z0-9-]`, no leading/trailing hyphen) excludes `payment_page` (underscore)
-  and CT descriptors (parentheses/commas), and the reserved-alias blocklist
-  rejects `0`/`1` (the `pos_mode` domain) and `pos` (a `kind` value). See
-  `reserved_nyms::is_reserved_alias` and `donation_page::save`.
-- Compatibility reason: shipped Bull Wallet builds signed donation-page saves
-  before aliases existed; keeping `alias` trailing and optional preserves those
-  signatures (the same maneuver as `pos_mode` and `kind`).
-- Removal condition: none for omission support while older signed clients are
-  accepted. Omission is a permanent no-op, not an ownership-state transition.
+- Validation: `alias` is validated before signature verification. Its charset
+  and reserved-name policy remain part of the permanent-name contract.
+- Compatibility reason: clients may manage surfaces without claiming an alias;
+  keeping it terminal and optional preserves that explicit product choice.
+- Removal condition: none. Omission is a permanent no-op, not an
+  ownership-state transition.
 
 ## Legacy Payment Page media hashes
 

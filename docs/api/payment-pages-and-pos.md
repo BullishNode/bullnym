@@ -14,6 +14,7 @@ Creates or updates one surface:
   "website": "https://example.com",
   "twitter": "alice",
   "instagram": null,
+  "pos_mode": false,
   "enabled": true,
   "kind": "payment_page",
   "ct_descriptor": "ct(...)#checksum",
@@ -27,16 +28,16 @@ Options and implications:
 
 | Field | Wire/update semantics | Consequence |
 |---|---|---|
-| `kind` | Non-null `payment_page` or `pos`; omitted/null defaults to `payment_page` and is not appended to the signature. | Selects an independent row, descriptor, and public workflow. Both rows derive the owner's one optional permanent alias. Explicitly send it in new clients. |
+| `kind` | Required `payment_page` or `pos`; always appended to the signature after `ct_descriptor`. | Selects an independent row, descriptor, and public workflow. Both rows derive the owner's one optional permanent alias. |
 | `header` | Required, 1-80 UTF-8 bytes. | Replaces the stored value on every save. |
-| `description` | Required JSON string. Payment Page saves require 1-120 user-perceived Unicode characters and at most 512 UTF-8 bytes, including when `kind` is omitted and therefore defaults to `payment_page`. POS keeps the optional 0-280-byte contract. | Replaces the stored short description and the text rendered into social-preview metadata/images. Omission is a framework deserialization error. |
+| `description` | Required JSON string. Payment Page saves require 1-120 user-perceived Unicode characters and at most 512 UTF-8 bytes. POS keeps the optional 0-280-byte contract. | Replaces the stored short description and the text rendered into social-preview metadata/images. Omission is a framework deserialization error. |
 | `display_currency` | Required canonical uppercase supported code. | Replaces the stored value and controls display/fiat checkout; fetch supported currencies first. |
 | `website` | HTTPS URL up to 200 UTF-8 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored website. |
 | `twitter` | ASCII letters/digits/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
 | `instagram` | ASCII letters/digits/dot/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
 | `enabled` | Required boolean; signed as `1` or `0`. | False retains configuration but public payment use is disabled. It is not archival deletion. |
-| `ct_descriptor` | Non-empty descriptor replaces it; omitted/null/empty preserves it on update. POS creation requires non-empty; Payment Page creation may omit it and fall back to the permanent nym descriptor even while the Lightning Address is offline. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. Empty string is appended to the signature even though storage preserves the descriptor. |
-| `pos_mode` | Legacy non-null boolean; omitted/null preserves it on update and is not appended to the signature. | New integrations should use `kind`; sending it changes the signed bytes. |
+| `ct_descriptor` | Required non-empty valid descriptor; always signed and replaces the stored surface descriptor. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. |
+| `pos_mode` | Required boolean; always signed as `1` or `0` before `ct_descriptor`. | Replaces the stored value. Surface selection remains controlled by `kind`. |
 | `alias` omitted/null | Preserve the permanent owner-level claim; no trailing signed field. | Maintains old-client compatibility without creating a synthetic alias. |
 | `alias: ""` | Append the empty terminal signed field, then reject with `DonationPageInvalid`. | Empty is never a clear/release operation. |
 | non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different value from the same owner returns `AliasAlreadyAssigned` with `details.alias` set to the owner's permanent alias; a name owned by anyone else returns `NameTaken` without ownership details. |
@@ -80,10 +81,10 @@ enforces availability.
 
 ## `DELETE /donation-page`
 
-Body: `nym`, `npub`, optional `kind`, `timestamp`, `signature`. Archival is a
-soft delete of only the selected surface. Omitted `kind` archives the Payment
-Page for legacy compatibility. The nym and other surface are unaffected. A
-later successful save of that `(nym, kind)` automatically unarchives it.
+Body: `nym`, `npub`, required signed `kind`, `timestamp`, `signature`. Archival
+is a soft delete of only the selected surface. The nym and other surface are
+unaffected. A later successful save of that `(nym, kind)` automatically
+unarchives it.
 Archival never mutates permanent nym/alias ownership or the other surface.
 Page/POS management and checkout remain authorized while the owner's Lightning
 Address is offline.

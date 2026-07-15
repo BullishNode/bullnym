@@ -10,7 +10,7 @@ field_1 NUL ... field_n NUL timestamp_decimal
 There is no trailing NUL after the timestamp. Strings are UTF-8, absent
 fixed-position optionals are empty strings, and the timestamp must be within
 300 seconds of server time. Boolean encoding is endpoint-specific: surface
-fields (`enabled` and legacy `pos_mode`) use `"1"`/`"0"`, while the three
+fields (`enabled` and `pos_mode`) use `"1"`/`"0"`, while the three
 invoice-creation acceptance fields use `"true"`/`"false"`. The 64-byte Schnorr
 signature is lowercase or uppercase hex in the JSON `signature` field except
 for recovery-address registration, whose evidence-preserving v1 contract
@@ -35,8 +35,8 @@ unlinked invoice operations it is the empty string.
 | register | `register` | `ct_descriptor`, then `verification_npub` only when its JSON value is non-null |
 | update registration | `update` | `ct_descriptor` |
 | take Lightning Address offline/purge | `delete` or `purge` | none |
-| save surface | `donation-page-save` | `header`, `description`, `display_currency`, `website_or_empty`, `twitter_or_empty`, `instagram_or_empty`, `enabled`; then each of `pos_mode`, `ct_descriptor`, `kind`, `alias` only when its JSON value is non-null (`alias: ""` is non-null and is signed) |
-| archive surface | `donation-page-archive` | `kind` only when its JSON value is non-null |
+| save surface | `donation-page-save` | `header`, `description`, `display_currency`, `website_or_empty`, `twitter_or_empty`, `instagram_or_empty`, `enabled`, required `pos_mode`, required `ct_descriptor`, required `kind`; then `alias` only when its JSON value is non-null (`alias: ""` is non-null and is signed) |
+| archive surface | `donation-page-archive` | required `kind` |
 | create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, `public_description`, `recipient_name`, `invoice_number`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
@@ -46,8 +46,8 @@ unlinked invoice operations it is the empty string.
 | look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |
 
 Invoice optionals always occupy their fixed signing position as `""`. Amounts
-and timestamps use decimal strings. This distinction from the surface API's
-append-only compatibility fields is critical.
+and timestamps use decimal strings. Surface social fields similarly occupy
+fixed empty-string positions; only the terminal alias is omitted when absent.
 
 Reservation inspection is the sole legacy signing exception. Sign the
 SHA-256 digest of UTF-8 `reservations:<nym>:<ts>` and send it as `sig`.

@@ -56,9 +56,7 @@ static INSTAGRAM_HANDLE_REGEX: LazyLock<Regex> =
 /// Alias slug charset — mirrors NYM_REGEX (`registration.rs`): 1-32 chars,
 /// lowercase letters, digits, and interior hyphens, with no leading or
 /// trailing hyphen. Kept in sync with that rule so aliases and nyms share the
-/// same URL-safe shape. Underscore is intentionally excluded (which is also
-/// what keeps `payment_page` from ever validating as an alias — see the
-/// signed-field confusion guard).
+/// same URL-safe shape. Underscore is intentionally excluded.
 static ALIAS_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,30}[a-z0-9])$").unwrap());
 
@@ -68,8 +66,7 @@ static ALIAS_REGEX: LazyLock<Regex> =
 pub struct SaveDonationPageRequest {
     pub nym: String,
     pub npub: String,
-    #[serde(default)]
-    pub ct_descriptor: Option<String>,
+    pub ct_descriptor: String,
     pub header: String,
     pub description: String,
     pub display_currency: String,
@@ -79,20 +76,13 @@ pub struct SaveDonationPageRequest {
     pub twitter: Option<String>,
     #[serde(default)]
     pub instagram: Option<String>,
-    #[serde(default)]
-    pub pos_mode: Option<bool>,
+    pub pos_mode: bool,
     pub enabled: bool,
-    /// Surface discriminator: `payment_page` (default when omitted) or `pos`.
-    /// Optional and trailing in the signed payload so legacy clients that
-    /// omit it verify against the pre-POS byte layout. See
-    /// `docs/compatibility-ledger.md`.
-    #[serde(default)]
-    pub kind: Option<String>,
+    /// Surface discriminator: `payment_page` or `pos`.
+    pub kind: String,
     /// Optional permanent owner-level public slug, shared by Page and POS.
-    /// It is the NEWEST trailing
-    /// field in the signed payload (after `kind`), so any client that omits it
-    /// verifies against the older byte layout. Omission preserves the claim,
-    /// an empty value is invalid, and a non-empty value claims it once.
+    /// It is the terminal signed field after `kind`. Omission preserves the
+    /// claim, an empty value is invalid, and a non-empty value claims it once.
     /// See `docs/compatibility-ledger.md`.
     #[serde(default)]
     pub alias: Option<String>,
@@ -104,11 +94,8 @@ pub struct SaveDonationPageRequest {
 pub struct ArchiveDonationPageRequest {
     pub nym: String,
     pub npub: String,
-    /// Surface to archive: `payment_page` (default) or `pos`. Optional and
-    /// trailing in the signed payload; legacy clients omit it and archive the
-    /// Payment Page row.
-    #[serde(default)]
-    pub kind: Option<String>,
+    /// Surface to archive: `payment_page` or `pos`.
+    pub kind: String,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -197,9 +184,7 @@ fn validate_lengths(
             "display_currency is not supported; fetch /api/v1/supported-currencies".to_string(),
         ));
     }
-    if let Some(ct_descriptor) = req.ct_descriptor.as_deref().filter(|s| !s.is_empty()) {
-        descriptor::validate_descriptor(ct_descriptor, max_descriptor_len)?;
-    }
+    descriptor::validate_descriptor(&req.ct_descriptor, max_descriptor_len)?;
     if let Some(w) = &req.website {
         if w.len() > MAX_SOCIAL_LINK_LEN {
             return Err(AppError::DonationPageInvalid(
@@ -253,8 +238,7 @@ fn validate_description_for_kind(
         }
     } else if req.description.len() > MAX_LEGACY_DESCRIPTION_BYTES {
         // POS retains its optional description contract. Payment Page uses the
-        // same approved 120-character contract whether `kind` is explicit or
-        // omitted; historical-client compatibility is not a product target.
+        // same approved 120-character contract for every Payment Page save.
         return Err(AppError::DonationPageInvalid(format!(
             "description must be at most {MAX_LEGACY_DESCRIPTION_BYTES} UTF-8 bytes"
         )));
@@ -268,17 +252,12 @@ fn validate_description_for_kind(
 ///
 /// The order MUST stay in lockstep with the mobile
 /// (`donation_page_constants.dart::buildSavePayloadFields`).
-/// Optional fields that are absent become empty strings (NOT skipped) so the
-/// number and order of NUL separators is invariant to which fields are set.
-/// `pos_mode`, `ct_descriptor`, `kind`, and `alias` are optional trailing
-/// fields for shipped Bull Wallet compatibility; each is appended only when the
-/// client sent it, so a legacy client that omits them verifies against the
-/// older byte layout. `alias` is the newest field and MUST stay last (after
-/// `kind`). Its validated value domain is kept disjoint from the other
-/// trailing fields (see the save handler) so a captured legacy message can
-/// never be replayed as an alias claim. See `docs/compatibility-ledger.md`.
+/// Optional social fields that are absent become empty strings (NOT skipped)
+/// so their NUL-separated positions remain stable. `pos_mode`,
+/// `ct_descriptor`, and `kind` are required signed fields. `alias` is the sole
+/// optional trailing field and MUST stay last.
 // The positional list is the signed wire contract; grouping it into a struct
-// would obscure the byte-exact legacy field order this helper exists to test.
+// would obscure the byte-exact field order this helper exists to test.
 #[allow(clippy::too_many_arguments)]
 fn save_payload_fields<'a>(
     header: &'a str,
@@ -288,9 +267,9 @@ fn save_payload_fields<'a>(
     twitter: &'a str,
     instagram: &'a str,
     enabled_str: &'a str,
-    pos_mode_str: Option<&'a str>,
-    ct_descriptor: Option<&'a str>,
-    kind: Option<&'a str>,
+    pos_mode_str: &'a str,
+    ct_descriptor: &'a str,
+    kind: &'a str,
     alias: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut fields = vec![
@@ -301,16 +280,10 @@ fn save_payload_fields<'a>(
         twitter,
         instagram,
         enabled_str,
+        pos_mode_str,
+        ct_descriptor,
+        kind,
     ];
-    if let Some(pos_mode_str) = pos_mode_str {
-        fields.push(pos_mode_str);
-    }
-    if let Some(ct_descriptor) = ct_descriptor {
-        fields.push(ct_descriptor);
-    }
-    if let Some(kind) = kind {
-        fields.push(kind);
-    }
     if let Some(alias) = alias {
         fields.push(alias);
     }
@@ -356,26 +329,15 @@ pub async fn save(
     // Cheap input validation BEFORE signature verification.
     validate_lengths(&req, &state.pricer, state.config.limits.max_descriptor_len)?;
 
-    // Resolve and enum-validate the surface kind BEFORE signature verification
-    // so the trailing signed field can never be confused with another value
-    // (KR-3). Omitted => the Payment Page surface, matching the legacy
-    // single-row contract.
-    let kind = match req.kind.as_deref() {
-        None => db::KIND_PAYMENT_PAGE,
-        Some(k) => db::normalize_kind(k).ok_or_else(|| {
-            AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
-        })?,
-    };
+    // Enum-validate the required signed surface discriminator before
+    // signature verification.
+    let kind = db::normalize_kind(&req.kind).ok_or_else(|| {
+        AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
+    })?;
 
     validate_description_for_kind(&req, kind)?;
 
-    // Validate the alias slug BEFORE signature verification, alongside `kind`,
-    // so the newest trailing signed field's value domain is provably disjoint
-    // from the other optional trailing fields — pos_mode {"0","1"}, kind
-    // {"pos","payment_page"}, and ct_descriptor (parenthesised) — and a
-    // captured legacy message can't be replayed as an alias claim (KR-3).
-    // Charset excludes "payment_page" (underscore) and descriptors; the
-    // reserved-alias blocklist rejects "0"/"1"/"pos" and brand names.
+    // Validate the optional terminal alias before signature verification.
     //
     // The alias is a permanent insert-only owner claim. Omission is a no-op;
     // empty is never a clear operation.
@@ -403,33 +365,13 @@ pub async fn save(
         }
     };
 
-    // A POS surface owns its own wallet (idx 103), so it MUST carry a
-    // descriptor. Without one, anonymous checkout on the POS branch has
-    // nothing to settle to; the POS branch deliberately has no
-    // Lightning-Address cursor fallback, so it would hard-fail at allocation.
-    // Reject at save time — there are no legacy POS clients to grandfather
-    // (KR-1).
-    if kind == db::KIND_POS
-        && req
-            .ct_descriptor
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .is_none()
-    {
-        return Err(AppError::DonationPageInvalid(
-            "a POS surface requires ct_descriptor".to_string(),
-        ));
-    }
-
     // Build the signed payload and verify the Schnorr sig. The exact byte
     // sequence here MUST match the mobile's signing helper.
     let website = req.website.as_deref().unwrap_or("");
     let twitter = req.twitter.as_deref().unwrap_or("");
     let instagram = req.instagram.as_deref().unwrap_or("");
     let enabled_str = if req.enabled { "1" } else { "0" };
-    let pos_mode_str = req
-        .pos_mode
-        .map(|pos_mode| if pos_mode { "1" } else { "0" });
+    let pos_mode_str = if req.pos_mode { "1" } else { "0" };
     let fields = save_payload_fields(
         &req.header,
         &req.description,
@@ -439,8 +381,8 @@ pub async fn save(
         instagram,
         enabled_str,
         pos_mode_str,
-        req.ct_descriptor.as_deref(),
-        req.kind.as_deref(),
+        &req.ct_descriptor,
+        &req.kind,
         req.alias.as_deref(),
     );
     auth::verify_la_v2(
@@ -459,7 +401,7 @@ pub async fn save(
     // enabling pos_mode on the Payment Page row when a separate POS row
     // already exists (Q5). New clients use `kind` and stop sending pos_mode.
     if kind == db::KIND_PAYMENT_PAGE
-        && req.pos_mode == Some(true)
+        && req.pos_mode
         && db::get_donation_page_by_nym(&state.db, &req.nym, db::KIND_POS)
             .await?
             .is_some()
@@ -479,7 +421,7 @@ pub async fn save(
         &db::UpsertDonationPage {
             nym: &req.nym,
             kind,
-            ct_descriptor: req.ct_descriptor.as_deref().filter(|s| !s.is_empty()),
+            ct_descriptor: &req.ct_descriptor,
             header: &req.header,
             description: &req.description,
             display_currency: &req.display_currency,
@@ -623,20 +565,10 @@ pub async fn archive(
         }
     }
 
-    // Resolve + enum-validate kind before signature verification. Omitted =>
-    // Payment Page (legacy behavior). `kind` is the sole optional-trailing
-    // signed field for archive, so an old client that omits it verifies
-    // against the pre-POS empty field list.
-    let kind = match req.kind.as_deref() {
-        None => db::KIND_PAYMENT_PAGE,
-        Some(k) => db::normalize_kind(k).ok_or_else(|| {
-            AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
-        })?,
-    };
-    let archive_fields: Vec<&str> = match req.kind.as_deref() {
-        Some(k) => vec![k],
-        None => vec![],
-    };
+    let kind = db::normalize_kind(&req.kind).ok_or_else(|| {
+        AppError::DonationPageInvalid("kind must be 'payment_page' or 'pos'".to_string())
+    })?;
+    let archive_fields = [&req.kind[..]];
     auth::verify_la_v2(
         ACTION_ARCHIVE,
         &req.npub,

@@ -32,8 +32,8 @@ or linked/unlinked invoice scopes.
 | `register` | `npub` | `nym`, Lightning Address `ct_descriptor`, optional `verification_npub`. |
 | `update` | `npub` | Replacement Lightning Address `ct_descriptor`. |
 | `delete` | `npub` | Take the current Lightning Address offline without changing nym ownership. |
-| `donation-page-save` | `npub` | Surface fields, display currency, links, optional `pos_mode`, optional `ct_descriptor`, optional `kind`. |
-| `donation-page-archive` | `npub` | Archive a surface. Optional `kind` defaults to `payment_page`. |
+| `donation-page-save` | `npub` | Surface fields, display currency, links, required `pos_mode`, required `ct_descriptor`, and required `kind`; optional terminal alias. |
+| `donation-page-archive` | `npub` | Required surface `kind`. |
 | `invoice-create` | `npub` | Amount, accepted rails, recipient-supplied addresses, metadata, expiry. |
 | `invoice-cancel` | `npub` | Invoice id. |
 | `invoice-list` | `npub` | List filters and pagination. |
@@ -43,10 +43,9 @@ or linked/unlinked invoice scopes.
 `users.ct_descriptor` is the Lightning Address descriptor. It is used for
 LNURL Lightning claims and LUD-22 Liquid address allocation.
 
-`donation_pages.ct_descriptor` is scoped by `(nym, kind)`. Payment Page
-checkout uses `kind = 'payment_page'` with legacy fallback to
-`users.ct_descriptor`. POS checkout uses `kind = 'pos'` and requires its own
-descriptor. Each row has its own `donation_pages.next_addr_idx` cursor.
+`donation_pages.ct_descriptor` is required and scoped by `(nym, kind)`.
+Payment Page checkout uses `kind = 'payment_page'`; POS checkout uses
+`kind = 'pos'`. Each row has its own `donation_pages.next_addr_idx` cursor.
 
 Wallet-origin invoices do not require server-stored descriptors. The mobile
 client supplies concrete Bitcoin and/or Liquid settlement addresses at invoice

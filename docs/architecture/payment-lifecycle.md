@@ -107,10 +107,8 @@ Lightning Address:
 
 Public checkout surfaces:
 
-- Payment Page derives a Liquid address from the Payment Page CT descriptor
-  when present, otherwise from the permanent nym's CT descriptor for legacy
-  pages.
-- POS derives a Liquid address from the POS CT descriptor and has no fallback.
+- Payment Page derives a Liquid address from its required CT descriptor.
+- POS derives a Liquid address from its required CT descriptor.
 - Lightning reverse swaps claim to that session Liquid address.
 - Direct Liquid pays that session Liquid address.
 - BTC-to-LBTC chain swaps claim to that session Liquid address.
@@ -404,7 +402,7 @@ systems.
 Public checkout surfaces:
 
 - server derives the Liquid address and blinding key from the selected surface
-  descriptor; legacy Payment Pages may fall back to the nym descriptor.
+  descriptor.
 
 Invoices:
 

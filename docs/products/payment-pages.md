@@ -15,8 +15,8 @@ nym. Management actions use:
 - `donation-page-save`
 - `donation-page-archive`
 
-The row stores display text, display currency, links, enabled/archive state, an
-optional Liquid CT descriptor, an independent address cursor, and the current
+The row stores display text, display currency, links, enabled/archive state, a
+required Liquid CT descriptor, an independent address cursor, and the current
 generated social-card key/template version. Legacy media hashes may be returned
 for old rows, but Bullnym no longer accepts image uploads and clients must treat
 those fields as read-only compatibility data.
@@ -30,9 +30,7 @@ Bull Bitcoin logo and visual frame are fixed in every generated image.
 
 Payment Pages use the short-description contract defined by the
 [Payment Page API](../api/payment-pages-and-pos.md): 1–120 user-perceived
-Unicode characters and at most 512 UTF-8 bytes. Because an omitted `kind`
-selects `payment_page`, the same contract applies whether the caller sends the
-kind explicitly or relies on that default.
+Unicode characters and at most 512 UTF-8 bytes.
 
 Generated files are immutable and content-addressed under
 `/img/og/v<template-version>/<content-key>.jpg`. A save commits Page content
@@ -47,12 +45,10 @@ link-preview crawlers.
 
 ## Descriptor Use
 
-Current clients save a Payment Page `ct_descriptor`. Checkout derives the
-session Liquid address from this descriptor and advances
-`donation_pages.next_addr_idx`.
-
-Legacy Payment Pages without a descriptor fall back to the nym's Lightning
-Address descriptor and cursor. POS does not have this fallback.
+Every save carries a Payment Page `ct_descriptor`. Checkout derives the session
+Liquid address from this descriptor and advances
+`donation_pages.next_addr_idx`. Payment Page and POS never borrow the
+Lightning Address descriptor or cursor.
 
 Rendering `GET /:nym` does not allocate a Liquid address. Allocation happens
 when the payer creates a checkout invoice with `POST /:nym/invoice`.

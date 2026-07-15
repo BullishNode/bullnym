@@ -32,10 +32,8 @@ reports a positive confirmation height; mempool-only history may be evicted.
 
 `donation_pages.next_addr_idx` belongs to public checkout surfaces. It is
 advanced when `POST /:nym/invoice` or `POST /:nym/pos/invoice` creates a
-checkout invoice and the selected `(nym, kind)` row has a `ct_descriptor`.
-Plain page render does not advance it. Legacy Payment Pages without a
-descriptor use the nym descriptor and cursor until migrated. POS requires its
-own descriptor.
+checkout invoice. The selected `(nym, kind)` row always supplies its own
+`ct_descriptor`. Plain page render does not advance the cursor.
 
 Wallet-origin invoices store concrete addresses and do not advance either
 descriptor cursor.
@@ -44,7 +42,7 @@ descriptor cursor.
 
 | Origin | Created by | Routes | Settlement addresses |
 |---|---|---|---|
-| `checkout` | Anonymous payer from a Payment Page or POS | `POST /:nym/invoice`, `POST /:nym/pos/invoice`, `/:nym/i/:id` | Derived from the selected surface descriptor, with legacy nym fallback only for Payment Pages. |
+| `checkout` | Anonymous payer from a Payment Page or POS | `POST /:nym/invoice`, `POST /:nym/pos/invoice`, `/:nym/i/:id` | Derived from the selected surface descriptor. |
 | `wallet` | Recipient mobile client | `/api/v1/:nym/invoices`, `/api/v1/invoices` | Supplied by the client at creation time. |
 
 Both origins share status projection, payment accounting, Lightning offer

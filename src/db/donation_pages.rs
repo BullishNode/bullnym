@@ -1,8 +1,7 @@
 use sqlx::{Executor, PgPool, Postgres};
 
-/// Surface discriminator for a donation_pages row. `payment_page` is the
-/// default (and the shape every legacy single-row nym carries); `pos` is the
-/// separate Point-of-Sale surface with its own descriptor + cursor.
+/// Surface discriminator for a donation_pages row. `payment_page` and `pos`
+/// are separate surfaces with independent descriptors and cursors.
 pub const KIND_PAYMENT_PAGE: &str = "payment_page";
 pub const KIND_POS: &str = "pos";
 
@@ -51,14 +50,14 @@ pub struct UpsertDonationPage<'a> {
     /// Surface kind for this row. Callers pass a canonical value from
     /// `normalize_kind`; the (nym, kind) pair is the conflict target.
     pub kind: &'a str,
-    pub ct_descriptor: Option<&'a str>,
+    pub ct_descriptor: &'a str,
     pub header: &'a str,
     pub description: &'a str,
     pub display_currency: &'a str,
     pub website: Option<&'a str>,
     pub twitter: Option<&'a str>,
     pub instagram: Option<&'a str>,
-    pub pos_mode: Option<bool>,
+    pub pos_mode: bool,
     pub enabled: bool,
     /// The target renderer version for this content. A missing key with a
     /// present version selects the branded fallback while post-commit
@@ -141,17 +140,17 @@ pub async fn upsert_donation_page(
             (nym, kind, ct_descriptor, header, description, display_currency, \
              website, twitter, instagram, pos_mode, enabled, \
              generated_og_key, generated_og_template_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE), $11, \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                  NULL, $12) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
-             ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
+             ct_descriptor = EXCLUDED.ct_descriptor, \
              header = EXCLUDED.header, \
              description = EXCLUDED.description, \
              display_currency = EXCLUDED.display_currency, \
              website = EXCLUDED.website, \
              twitter = EXCLUDED.twitter, \
              instagram = EXCLUDED.instagram, \
-             pos_mode = COALESCE($10, donation_pages.pos_mode), \
+             pos_mode = EXCLUDED.pos_mode, \
              enabled = EXCLUDED.enabled, \
              generated_og_key = CASE \
                  WHEN donation_pages.header = EXCLUDED.header \
