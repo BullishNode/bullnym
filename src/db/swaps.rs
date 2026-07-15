@@ -788,7 +788,7 @@ pub(crate) const REVERSE_SETTLEMENT_REPAIR_SCAN_SQL: &str = "WITH scan AS ( \
          SELECT to_timestamp($2::double precision / 1000000.0) AS epoch \
      ) \
      SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
-            nym, amount_sat, invoice_id \
+            nym, amount_sat, invoice_id, invoice_quote_version_id \
      FROM swap_records s, scan \
      WHERE s.status = 'claimed' \
        AND s.invoice_id IS NOT NULL \
