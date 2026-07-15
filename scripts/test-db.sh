@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=60
+EXPECTED_MIGRATION_COUNT=61
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "060_lnurl_private_comment_intents.sql" ]] \
-  || die "unexpected migration-060 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "061_invoice_quote_versions.sql" ]] \
+  || die "unexpected migration-061 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -349,7 +349,8 @@ apply_migrations() {
        || "$base" == "057_chain_swap_cooperative_signing_operations" \
        || "$base" == "058_permanent_public_names" \
        || "$base" == "059_remove_surface_alias" \
-       || "$base" == "060_lnurl_private_comment_intents" ]]; then
+       || "$base" == "060_lnurl_private_comment_intents" \
+       || "$base" == "061_invoice_quote_versions" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

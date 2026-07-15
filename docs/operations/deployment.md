@@ -187,6 +187,23 @@ reviewed transaction, re-run the 059 boundary probe, and retain the audit
 record. Never use the hatch for rename, release, canonical selection, account
 closure, or to force a migration precondition.
 
+## Migration 061 versioned fiat quote foundation
+
+Apply `061_invoice_quote_versions.sql` as the privileged schema owner with
+`--set runtime_role=bullnym_app`. It adds immutable five-minute fiat quote
+versions and version-bound payer-offer identities, plus nullable attribution on
+reverse swaps, chain swaps, and invoice payment events. Existing rows remain
+unattributed; the migration never reconstructs missing rate/source evidence or
+deletes an old instruction.
+
+This migration is intentionally not the runtime quote-refresh cutover. It does
+not make a read-only page/status request create a provider swap, does not change
+the invoice lifetime, and refuses a new quote after payment evidence until the
+focused expired-quote fiat valuation policy is selected and wired. A payment
+event may still reference an expired quote/offer with its first-observed time
+while all fiat-credit fields remain NULL, preserving the evidence without
+guessing the accounting result.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

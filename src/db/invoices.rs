@@ -132,6 +132,109 @@ pub struct NewInvoice<'a> {
     pub expires_in_secs: i64,
 }
 
+/// Immutable five-minute fiat conversion snapshot.  Provider instructions are
+/// separate [`InvoiceQuoteOffer`] rows so creating/reusing this version never
+/// performs a network mutation.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct InvoiceQuoteVersion {
+    pub id: Uuid,
+    pub invoice_id: Uuid,
+    pub version_number: i32,
+    pub fiat_face_amount_minor: i32,
+    pub fiat_currency: String,
+    pub rate_minor_per_btc: i64,
+    pub rate_source: String,
+    pub rate_observed_at_unix: i64,
+    pub rate_fetched_at_unix: i64,
+    pub rate_fresh_until_unix: i64,
+    pub merchant_amount_sat: i64,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+}
+
+const INVOICE_QUOTE_VERSION_COLUMNS: &str =
+    "id, invoice_id, version_number, fiat_face_amount_minor, fiat_currency, \
+     rate_minor_per_btc, rate_source, \
+     FLOOR(EXTRACT(EPOCH FROM rate_observed_at))::BIGINT AS rate_observed_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM rate_fetched_at))::BIGINT AS rate_fetched_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM rate_fresh_until))::BIGINT AS rate_fresh_until_unix, \
+     merchant_amount_sat, \
+     FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT AS created_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT AS expires_at_unix";
+
+#[derive(Debug, Clone)]
+pub struct NewInvoiceQuoteVersion<'a> {
+    pub rate_minor_per_btc: i64,
+    pub rate_source: &'a str,
+    pub rate_observed_at_unix: i64,
+    pub rate_fetched_at_unix: i64,
+    pub rate_fresh_until_unix: i64,
+    /// Exact merchant-side sat target calculated from the durable fiat face
+    /// and this rate. Migration 061 independently verifies the conversion.
+    pub merchant_amount_sat: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceQuoteResolution {
+    pub quote: InvoiceQuoteVersion,
+    pub created: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct InvoiceQuoteEligibilityRow {
+    pricing_mode: String,
+    fiat_amount_minor: Option<i32>,
+    fiat_currency: Option<String>,
+    status: String,
+    presentation_status: Option<String>,
+    settlement_status: String,
+    before_invoice_expiry: bool,
+}
+
+/// One immutable payer instruction identity within a quote version.  Direct
+/// instructions and provider-backed instructions use the same attribution
+/// shape; this function only persists already-known evidence and never calls a
+/// provider.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct InvoiceQuoteOffer {
+    pub id: Uuid,
+    pub invoice_id: Uuid,
+    pub quote_version_id: Uuid,
+    pub rail: String,
+    pub offer_kind: String,
+    pub request_key: String,
+    pub provider: Option<String>,
+    pub provider_offer_id: Option<String>,
+    pub payer_amount_sat: i64,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+}
+
+const INVOICE_QUOTE_OFFER_COLUMNS: &str =
+    "id, invoice_id, quote_version_id, rail, offer_kind, request_key, \
+     provider, provider_offer_id, payer_amount_sat, \
+     FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT AS created_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT AS expires_at_unix";
+
+#[derive(Debug, Clone)]
+pub struct NewInvoiceQuoteOffer<'a> {
+    pub invoice_id: Uuid,
+    pub quote_version_id: Uuid,
+    pub rail: &'a str,
+    pub offer_kind: &'a str,
+    pub request_key: &'a str,
+    pub provider: Option<&'a str>,
+    pub provider_offer_id: Option<&'a str>,
+    pub payer_amount_sat: i64,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceQuoteOfferResolution {
+    pub offer: InvoiceQuoteOffer,
+    pub created: bool,
+}
+
 /// Exact server-owned value used by `presentation_status` and payable top-up
 /// instructions. Active/legacy accounting events contribute, as do verified
 /// provisional direct observations. Superseded or unverified evidence never
@@ -274,6 +377,179 @@ pub async fn insert_invoice(
 
     tx.commit().await?;
     Ok(inserted)
+}
+
+/// Return the invoice's current quote or create exactly one new five-minute
+/// version. The invoice projection advisory lock and row lock serialize every
+/// caller, including payment reducers and payer-offer creation. A retry after
+/// response loss therefore returns the committed version rather than adding a
+/// second one.
+///
+/// Migration 061 deliberately accepts new versions only before payment
+/// evidence exists. This keeps the undecided expired-quote fiat-credit policy
+/// out of the foundation while still allowing old attributed offers to settle.
+pub async fn create_or_reuse_current_invoice_quote(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    candidate: &NewInvoiceQuoteVersion<'_>,
+) -> Result<InvoiceQuoteResolution, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, invoice_id).await?;
+
+    let invoice_state = sqlx::query_as::<_, InvoiceQuoteEligibilityRow>(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, status, \
+                    presentation_status, settlement_status, \
+                    expires_at > clock_timestamp() AS before_invoice_expiry \
+               FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invoice_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(invoice_state) = invoice_state else {
+        return Err(sqlx::Error::RowNotFound);
+    };
+    if invoice_state.pricing_mode != "fiat_fixed"
+        || invoice_state.fiat_amount_minor.is_none()
+        || invoice_state.fiat_currency.is_none()
+        || invoice_state.status != "unpaid"
+        || invoice_state.presentation_status.as_deref() != Some("unpaid")
+        || invoice_state.settlement_status != "none"
+        || !invoice_state.before_invoice_expiry
+    {
+        return Err(sqlx::Error::Protocol(
+            "invoice is not eligible for a current fiat quote".to_string(),
+        ));
+    }
+
+    if let Some(quote) = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
+        "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
+           FROM invoice_quote_versions \
+          WHERE invoice_id = $1 AND expires_at > clock_timestamp() \
+          ORDER BY version_number DESC LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        tx.commit().await?;
+        return Ok(InvoiceQuoteResolution {
+            quote,
+            created: false,
+        });
+    }
+
+    let quote = sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
+        "INSERT INTO invoice_quote_versions ( \
+             invoice_id, rate_minor_per_btc, rate_source, rate_observed_at, \
+             rate_fetched_at, rate_fresh_until, merchant_amount_sat \
+         ) VALUES ( \
+             $1, $2, $3, to_timestamp($4), to_timestamp($5), \
+             to_timestamp($6), $7 \
+         ) RETURNING {INVOICE_QUOTE_VERSION_COLUMNS}"
+    ))
+    .bind(invoice_id)
+    .bind(candidate.rate_minor_per_btc)
+    .bind(candidate.rate_source)
+    .bind(candidate.rate_observed_at_unix)
+    .bind(candidate.rate_fetched_at_unix)
+    .bind(candidate.rate_fresh_until_unix)
+    .bind(candidate.merchant_amount_sat)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(InvoiceQuoteResolution {
+        quote,
+        created: true,
+    })
+}
+
+/// Read-only current-quote lookup. It never fetches a rate or creates a
+/// provider offer, making it safe for status polls and crawlers.
+pub async fn current_invoice_quote<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    invoice_id: Uuid,
+) -> Result<Option<InvoiceQuoteVersion>, sqlx::Error> {
+    sqlx::query_as::<_, InvoiceQuoteVersion>(&format!(
+        "SELECT {INVOICE_QUOTE_VERSION_COLUMNS} \
+           FROM invoice_quote_versions \
+          WHERE invoice_id = $1 AND expires_at > clock_timestamp() \
+          ORDER BY version_number DESC LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Persist or replay one already-created direct/provider offer identity. The
+/// caller-supplied request key is scoped to `(quote, rail)`; an exact retry
+/// returns the original row and a conflicting retry fails closed.
+pub async fn record_or_reuse_invoice_quote_offer(
+    pool: &PgPool,
+    candidate: &NewInvoiceQuoteOffer<'_>,
+) -> Result<InvoiceQuoteOfferResolution, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_invoice_lightning_projection(&mut tx, candidate.invoice_id).await?;
+
+    if let Some(offer) = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
+        "SELECT {INVOICE_QUOTE_OFFER_COLUMNS} \
+           FROM invoice_quote_offers \
+          WHERE quote_version_id = $1 AND rail = $2 AND request_key = $3"
+    ))
+    .bind(candidate.quote_version_id)
+    .bind(candidate.rail)
+    .bind(candidate.request_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        if offer.invoice_id != candidate.invoice_id
+            || offer.offer_kind != candidate.offer_kind
+            || offer.provider.as_deref() != candidate.provider
+            || offer.provider_offer_id.as_deref() != candidate.provider_offer_id
+            || offer.payer_amount_sat != candidate.payer_amount_sat
+            || offer.expires_at_unix != candidate.expires_at_unix
+        {
+            return Err(sqlx::Error::Protocol(
+                "invoice quote offer request key was replayed with different evidence".to_string(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok(InvoiceQuoteOfferResolution {
+            offer,
+            created: false,
+        });
+    }
+
+    let offer = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
+        "INSERT INTO invoice_quote_offers ( \
+             invoice_id, quote_version_id, rail, offer_kind, request_key, \
+             provider, provider_offer_id, payer_amount_sat, expires_at \
+         ) VALUES ( \
+             $1, $2, $3, $4, $5, $6, $7, $8, \
+             CASE WHEN $4 = 'direct' THEN ( \
+                 SELECT expires_at FROM invoice_quote_versions \
+                  WHERE id = $2 AND invoice_id = $1 \
+             ) ELSE to_timestamp($9) END \
+         ) \
+         RETURNING {INVOICE_QUOTE_OFFER_COLUMNS}"
+    ))
+    .bind(candidate.invoice_id)
+    .bind(candidate.quote_version_id)
+    .bind(candidate.rail)
+    .bind(candidate.offer_kind)
+    .bind(candidate.request_key)
+    .bind(candidate.provider)
+    .bind(candidate.provider_offer_id)
+    .bind(candidate.payer_amount_sat)
+    .bind(candidate.expires_at_unix)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(InvoiceQuoteOfferResolution {
+        offer,
+        created: true,
+    })
 }
 
 pub async fn get_invoice_by_id<'e, E: sqlx::PgExecutor<'e>>(

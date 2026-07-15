@@ -764,6 +764,13 @@ fn sign_donation_page_save_with_keypair(
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
 
 async fn cleanup_db(pool: &PgPool) {
+    // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
+    // events. The disposable database owner truncates the entire attribution
+    // family solely for per-test isolation.
+    sqlx::query("TRUNCATE invoice_quote_offers, invoice_quote_versions CASCADE")
+        .execute(pool)
+        .await
+        .ok();
     // Private comment intents reject ordinary DELETE and deliberately outlive
     // their source user/swap rows. The disposable database owner truncates the
     // ledger solely for per-test isolation.
@@ -1550,7 +1557,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "060_lnurl_private_comment_intents"
+        "061_invoice_quote_versions"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -1656,6 +1663,28 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(mutable_terms_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(mutable_terms_body["ready"], false);
 
+    // Migration 061 is not present merely because its tables exist: payer
+    // history must remain immutable before the binary can advertise the new
+    // schema marker.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (mutable_quote_status, mutable_quote_body) = get_path(&app, "/ready").await;
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert_eq!(mutable_quote_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_quote_body["ready"], false);
+
     let app = test_app(test_state(runtime));
     let (restored_status, restored_body) = get_path(&app, "/ready").await;
     assert_eq!(restored_status, StatusCode::OK, "body: {restored_body}");
@@ -1676,10 +1705,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(
-        body["expected_schema_marker"],
-        "060_lnurl_private_comment_intents"
-    );
+    assert_eq!(body["expected_schema_marker"], "061_invoice_quote_versions");
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -11326,6 +11352,314 @@ async fn insert_test_invoice(
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let blinding_key = "11".repeat(32);
+    let npub_owner = "6".repeat(64);
+    let invoice = pay_service::db::insert_invoice(
+        &admin,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &npub_owner,
+            origin: "wallet",
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 10_000,
+            rate_minor_per_btc: Some(10_000_000),
+            rate_lock_secs: 300,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(
+                "lq1q061quoteversionfixture000000000000000000000000000000000000000",
+            ),
+            liquid_blinding_key_hex: Some(&blinding_key),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let candidate = pay_service::db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: 10_000_000,
+        rate_source: "bullbitcoin-pricer:indexPrice",
+        rate_observed_at_unix: now - 1,
+        rate_fetched_at_unix: now,
+        rate_fresh_until_unix: now + 300,
+        merchant_amount_sat: 10_000,
+    };
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let admin = admin.clone();
+        let candidate = candidate.clone();
+        tasks.push(tokio::spawn(async move {
+            pay_service::db::create_or_reuse_current_invoice_quote(&admin, invoice.id, &candidate)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut resolutions = Vec::new();
+    for task in tasks {
+        resolutions.push(task.await.unwrap());
+    }
+    assert_eq!(
+        resolutions
+            .iter()
+            .filter(|resolution| resolution.created)
+            .count(),
+        1
+    );
+    let quote = resolutions[0].quote.clone();
+    assert!(resolutions.iter().all(|resolution| {
+        resolution.quote.id == quote.id
+            && resolution.quote.version_number == 1
+            && resolution.quote.expires_at_unix - resolution.quote.created_at_unix == 300
+    }));
+    let quote_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(quote_count, 1);
+
+    let first_request_key = "6".repeat(64);
+    let offer_candidate = pay_service::db::NewInvoiceQuoteOffer {
+        invoice_id: invoice.id,
+        quote_version_id: quote.id,
+        rail: "liquid",
+        offer_kind: "direct",
+        request_key: &first_request_key,
+        provider: None,
+        provider_offer_id: None,
+        payer_amount_sat: quote.merchant_amount_sat,
+        expires_at_unix: quote.expires_at_unix,
+    };
+    let first_offer =
+        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &offer_candidate)
+            .await
+            .unwrap();
+    let retry_offer =
+        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &offer_candidate)
+            .await
+            .unwrap();
+    assert!(first_offer.created);
+    assert!(!retry_offer.created);
+    assert_eq!(first_offer.offer, retry_offer.offer);
+
+    let conflicting_offer = pay_service::db::NewInvoiceQuoteOffer {
+        payer_amount_sat: quote.merchant_amount_sat + 1,
+        ..offer_candidate.clone()
+    };
+    assert!(matches!(
+        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &conflicting_offer).await,
+        Err(sqlx::Error::Protocol(_))
+    ));
+
+    let immutable = sqlx::query(
+        "UPDATE invoice_quote_versions SET merchant_amount_sat = merchant_amount_sat + 1 \
+         WHERE id = $1",
+    )
+    .bind(quote.id)
+    .execute(&admin)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        immutable
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    // Test ownership may advance the immutable clock solely to exercise the
+    // refresh boundary without sleeping for five minutes.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_quote_versions SET \
+             rate_observed_at = statement_timestamp() - INTERVAL '302 seconds', \
+             rate_fetched_at = statement_timestamp() - INTERVAL '301 seconds', \
+             rate_fresh_until = statement_timestamp() - INTERVAL '1 second', \
+             created_at = statement_timestamp() - INTERVAL '301 seconds', \
+             expires_at = statement_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(quote.id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let second_candidate = pay_service::db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: 10_000_000,
+        rate_source: "bullbitcoin-pricer:indexPrice",
+        rate_observed_at_unix: now - 1,
+        rate_fetched_at_unix: now,
+        rate_fresh_until_unix: now + 300,
+        merchant_amount_sat: 10_000,
+    };
+    let second = pay_service::db::create_or_reuse_current_invoice_quote(
+        &admin,
+        invoice.id,
+        &second_candidate,
+    )
+    .await
+    .unwrap();
+    assert!(second.created);
+    assert_eq!(second.quote.version_number, 2);
+    assert_ne!(second.quote.id, quote.id);
+
+    let second_request_key = "7".repeat(64);
+    let second_offer_candidate = pay_service::db::NewInvoiceQuoteOffer {
+        invoice_id: invoice.id,
+        quote_version_id: second.quote.id,
+        rail: "liquid",
+        offer_kind: "direct",
+        request_key: &second_request_key,
+        provider: None,
+        provider_offer_id: None,
+        payer_amount_sat: second.quote.merchant_amount_sat,
+        expires_at_unix: second.quote.expires_at_unix,
+    };
+    let second_offer =
+        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &second_offer_candidate)
+            .await
+            .unwrap()
+            .offer;
+
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_quote_versions SET \
+             rate_observed_at = statement_timestamp() - INTERVAL '302 seconds', \
+             rate_fetched_at = statement_timestamp() - INTERVAL '301 seconds', \
+             rate_fresh_until = statement_timestamp() - INTERVAL '1 second', \
+             created_at = statement_timestamp() - INTERVAL '301 seconds', \
+             expires_at = statement_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(second.quote.id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    // An expired instruction remains attributable, but the undecided fiat
+    // credit stays NULL rather than silently applying either an old or new
+    // rate.
+    let event_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoice_payment_events ( \
+             id, invoice_id, rail, source, event_key, amount_sat, txid, vout, address, \
+             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at \
+         ) VALUES ($1, $2, 'liquid', 'liquid_direct', $3, $4, $5, 0, $6, $7, $8, \
+                   clock_timestamp())",
+    )
+    .bind(event_id)
+    .bind(invoice.id)
+    .bind(format!("liquid_direct:{}:0", "61".repeat(32)))
+    .bind(second.quote.merchant_amount_sat)
+    .bind("61".repeat(32))
+    .bind("lq1q061quoteversionfixture000000000000000000000000000000000000000")
+    .bind(second.quote.id)
+    .bind(second_offer.id)
+    .execute(&runtime)
+    .await
+    .unwrap();
+    let policy_neutral: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT quote_first_observed_at > q.expires_at, \
+                e.fiat_credited_minor IS NULL, e.fiat_credit_policy IS NULL, \
+                e.fiat_valued_at IS NULL \
+           FROM invoice_payment_events e \
+           JOIN invoice_quote_versions q ON q.id = e.invoice_quote_version_id \
+          WHERE e.id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(policy_neutral, (true, true, true, true));
+
+    let valuation_before_decision = sqlx::query(
+        "UPDATE invoice_payment_events SET \
+             fiat_credited_minor = 1000, \
+             fiat_credit_policy = 'undecided_policy_v1', \
+             fiat_valued_at = clock_timestamp() \
+         WHERE id = $1",
+    )
+    .bind(event_id)
+    .execute(&admin)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        valuation_before_decision
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    let blocked = pay_service::db::create_or_reuse_current_invoice_quote(
+        &admin,
+        invoice.id,
+        &second_candidate,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        blocked
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    let expired_offer_retry =
+        pay_service::db::record_or_reuse_invoice_quote_offer(&admin, &second_offer_candidate)
+            .await
+            .unwrap();
+    assert!(!expired_offer_retry.created);
+    assert_eq!(expired_offer_retry.offer.id, second_offer.id);
+
+    runtime.close().await;
+    cleanup_db(&admin).await;
 }
 
 #[tokio::test]
