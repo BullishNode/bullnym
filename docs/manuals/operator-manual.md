@@ -185,11 +185,26 @@ Its verified deployment digests are:
 - final active PR #185 release-record SHA-256:
   `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`.
 
-The deliberately unresolved evidence fields in this revision are:
+The final journey evidence and deliberately unresolved cleanup field in this
+revision are:
 
-- final no-funds schema-063 result: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
-- final bounded live-Liquid/recycler result:
-  `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
+- final no-funds schema-063 result: run
+  `nofunds-c026691-20260715T213857Z` passed 12/12 with zero sats spent and
+  zero broadcasts; log SHA-256
+  `390d99c5541314f97913f262995a98dda5d0bb0dcf06eadfd7f6ae25748f5ec0`
+  and report SHA-256
+  `ab827e5124ea627c4176012cdafd17df8db0a2b3cf746864674788c0e0c78366`;
+- final bounded live-Liquid/recycler result: successful run
+  `live-liquid-c026691-fee400-20260715T220456Z` paid 500 sats by direct
+  Liquid, incurred a 326-sat forward fee and a 191-sat recycler fee within
+  the 1,800-sat cap, returned the principal, and left an aggregate wallet
+  delta of exactly 517 sats; report SHA-256
+  `f77577f1b2d91cdfd6708c8e6586af972d51bc913bec8a3e39a3dfec1aabaf67`
+  and log SHA-256
+  `b866387eb6de4f9ca1f78af47f5dd52c853431aa0bb3a24904c918a8a46315aa`.
+  The preceding 250-sat cap refusal occurred before payment preparation and
+  before any broadcast, so it was a preflight refusal rather than a failed
+  payment;
 - certification-authority removal and final APP/TEST/DB audit:
   `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
 
@@ -920,12 +935,24 @@ harness staged. Later zero-spend runs exposed the rounded timestamp projection
 fixed by installed PR #183, then the direct-payment grace/projection defect and
 fixed-checkout Boltz response compatibility fixed by merged PR #185. Every
 failed run kept its spend and broadcast boundary at zero; it is defect evidence,
-not a passing certificate. The final PR #185 outcomes remain
-`PENDING_FINAL_NO_FUNDS_CERTIFICATION`,
-`PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`, and
+not a passing certificate. Final PR #185 run
+`nofunds-c026691-20260715T213857Z` subsequently passed 12/12 with zero sats
+spent and zero broadcasts; its log SHA-256 is
+`390d99c5541314f97913f262995a98dda5d0bb0dcf06eadfd7f6ae25748f5ec0`
+and its report SHA-256 is
+`ab827e5124ea627c4176012cdafd17df8db0a2b3cf746864674788c0e0c78366`.
+Successful run `live-liquid-c026691-fee400-20260715T220456Z` then paid 500
+sats by direct Liquid, incurred a 326-sat forward fee and a 191-sat recycler
+fee within its 1,800-sat cap, returned the principal, and left an aggregate
+wallet delta of exactly 517 sats; its report SHA-256 is
+`f77577f1b2d91cdfd6708c8e6586af972d51bc913bec8a3e39a3dfec1aabaf67`
+and its log SHA-256 is
+`b866387eb6de4f9ca1f78af47f5dd52c853431aa0bb3a24904c918a8a46315aa`.
+The earlier 250-sat cap refusal occurred before payment preparation and before
+any broadcast, so it was not a failed payment. Certification cleanup remains
 `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`. Neither the disabled timer, merge
 status, deployment identity, offline precheck, nor the earlier schema-062
-certification substitutes for those results.
+certification substitutes for these recorded results.
 
 Current harness commands include:
 
@@ -1006,10 +1033,9 @@ fixed-checkout-only Boltz compatibility boundary at current exact main
 `203abc2352b7d06819e383b56c91b99f113633eb`. The hosted release record,
 stopped-writer migration, exact artifact installs, public version, startup
 recovery, configuration preservation, and repeated fee cycles are observed
-deployment evidence only through the recorded PR #183 installation. PR #185
-merge status is source evidence, not deployment evidence. Its final artifact,
-release record, no-funds journey, live-Liquid/recycler journey, and
-certification cleanup/audit remain the explicit placeholders above.
+deployment evidence. PR #185's final artifact, release record, no-funds
+journey, and live-Liquid/recycler journey are recorded explicitly above;
+certification cleanup/audit remains the sole explicit placeholder.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.

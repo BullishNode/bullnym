@@ -81,16 +81,29 @@ path and fills it from the immutable request amount; a present mismatch, null,
 duplicate, or otherwise malformed value still fails closed, and ordinary
 reverse-swap responses remain strict.
 
-The final PR #185 deployment identity is complete; journey and cleanup evidence
-remain deliberately incomplete:
+The final PR #185 deployment identity and bounded journey evidence are
+complete; certification cleanup remains deliberately incomplete:
 
 - deployed binary/artifact SHA-256:
   `eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`;
 - active release-record SHA-256:
   `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`;
-- zero-spend/no-funds journey: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
-- bounded live-Liquid and recycler journey:
-  `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
+- zero-spend/no-funds journey: run
+  `nofunds-c026691-20260715T213857Z` passed 12/12 with zero sats spent and
+  zero broadcasts; log SHA-256
+  `390d99c5541314f97913f262995a98dda5d0bb0dcf06eadfd7f6ae25748f5ec0`
+  and report SHA-256
+  `ab827e5124ea627c4176012cdafd17df8db0a2b3cf746864674788c0e0c78366`;
+- bounded live-Liquid and recycler journey: successful run
+  `live-liquid-c026691-fee400-20260715T220456Z` paid 500 sats by direct
+  Liquid, incurred a 326-sat forward fee and a 191-sat recycler fee within
+  its 1,800-sat cap, returned the principal, and produced an aggregate wallet
+  delta of exactly 517 sats; report SHA-256
+  `f77577f1b2d91cdfd6708c8e6586af972d51bc913bec8a3e39a3dfec1aabaf67`
+  and log SHA-256
+  `b866387eb6de4f9ca1f78af47f5dd52c853431aa0bb3a24904c918a8a46315aa`.
+  An earlier 250-sat-cap check refused before payment preparation and before
+  any broadcast, so it was a preflight refusal, not a failed payment;
 - certification-authority cleanup and final audit:
   `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
 
@@ -501,9 +514,10 @@ identity at its observed time. The later schema-063 cutover records, public
 probes, and artifact digests separately prove each recorded deployment identity
 and public-readiness observation through installed PR #185. Exact hotfix
 startup evidence reported a consistent recovery pass; the Operator Manual
-records that evidence and its limits. The schema-062 and schema-063 no-funds
-failures and their closed funds boundaries are recorded there. PR #185's exact
-artifact and active release record are recorded above. Its no-funds journey,
-bounded live-Liquid/recycler journey, and certification cleanup/audit remain
-the conspicuous `PENDING_FINAL_*` fields in the release-status section; none may
-be inferred from deployment identity.
+records that evidence and its limits. The schema-062 and earlier schema-063
+no-funds failures and their closed funds boundaries are recorded there. PR
+#185's exact artifact, active release record, passing no-funds journey, and
+bounded live-Liquid/recycler journey are recorded above. Certification
+cleanup/audit remains the conspicuous `PENDING_FINAL_*` field in the
+release-status section and may not be inferred from deployment identity or the
+passing journeys.
