@@ -11,27 +11,36 @@ a payment. Never send a second payment just because a page is slow to update.
 ## What is available now
 
 This manual was checked against the public service at
-`https://pay2.bull-wallet.com` on 2026-07-15 08:06 UTC. The deployed
-server reported clean build
+`https://pay2.bull-wallet.com` on 2026-07-15 at 08:06 and 09:10 UTC. The last
+healthy deployed server reported clean build
 `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, schema
 `062_invoice_quote_provider_attempts`, and permanent-name policy
 `permanent_names_v1`.
 
-The public deployment now matches the source-main revision used for this
-manual:
+The public service then became unreachable at 09:21 UTC and remained
+connection-refused through the 10:06 UTC check. The behaviors below describe
+the last verified deployed release, but the service itself was not available
+at the end of this evidence window.
+
+Source main advanced during the outage to
+`fe36a8d1701416222a30670000978075b0b58196`, schema 063, with fixes intended to
+unblock fiat checkout and stable fee admission. That hotfix is not deployment
+verified while `/version` and `/ready` are unreachable.
 
 | Behavior | Status at the time of writing |
 |---|---|
-| Permanent nym ownership, independent Lightning Address/Page/PoS availability, private Lightning payer comments, automatic recovery supervision | Deployed |
-| 30-day invoice outer lifetime, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` |
-| Five-minute payer-demand fiat quotes, observation-time fiat credit, durable provider attribution, atomic browser refresh, and PoS Bitcoin warning | Deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` |
+| Permanent nym ownership, independent Lightning Address/Page/PoS availability, private Lightning payer comments, automatic recovery supervision | Last verified deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`; public service unavailable at the final probe |
+| 30-day invoice outer lifetime, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Last verified deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`; public service unavailable at the final probe |
+| Five-minute payer-demand fiat quotes, observation-time fiat credit, durable provider attribution, atomic browser refresh, and PoS Bitcoin warning | Release contract deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`; fiat checkout/admission hotfix on main is not deployment verified |
 
-Production now uses a maximum 30-day invoice lifetime. A fiat invoice keeps its
+The last verified production release uses a maximum 30-day invoice lifetime. A
+fiat invoice keeps its
 merchant face value while each payer instruction uses an explicit five-minute
 quote. A specific rail can still be unavailable when its admission or
 dependency gate is closed.
 
-Sections marked **Current behavior** describe this deployed contract.
+Sections marked **Current behavior** describe that last verified deployed
+contract, not proof that the public service is presently reachable.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -379,7 +388,7 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Current behavior was checked against the deployed probe above, Bullnym source
-and tests at `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, the product/API/
+and tests through `fe36a8d1701416222a30670000978075b0b58196`, the product/API/
 architecture documents in this repository, and these read-only authority
 records:
 
@@ -387,6 +396,8 @@ records:
 - `/home/francis/bull-bitcoin-workspace/bullnym-rationale-review-record.md`;
 - `/home/francis/bull-bitcoin-workspace/server-pwa-locked-plan-gap-audit-20260715.md`.
 
-The public version, schema marker, readiness response, and source revision now
-agree on the complete quote/PWA/PoS release. Individual rails can still close
-admission when their required dependencies or safety evidence are unavailable.
+The last healthy public version, schema marker, and readiness response agreed
+on the complete quote/PWA/PoS release at `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`.
+The later main hotfix is not a deployed fact while public provenance remains
+unreachable. Individual rails can also close admission when their required
+dependencies or safety evidence are unavailable.

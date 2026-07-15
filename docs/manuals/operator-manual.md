@@ -11,28 +11,38 @@ This revision deliberately separates three kinds of evidence:
 
 | Label | Meaning |
 |---|---|
-| **Deployed** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 08:06 UTC. |
+| **Deployed** | Last verified by healthy read-only probes of `https://pay2.bull-wallet.com` at 2026-07-15 08:06 and 09:10 UTC. |
 | **Main only** | Merged in the Bullnym source snapshot below, but not present on the deployed SHA. |
 | **Locked / branch only** | Required by the locked product plan or implemented on an unmerged branch. It is not an available production feature. |
 
 Exact revisions used for this manual:
 
-- deployed Bullnym: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, clean build, schema `062_invoice_quote_provider_attempts`;
-- source authority inspected: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, schema `062_invoice_quote_provider_attempts`.
+- last verified deployed Bullnym: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, clean build, schema `062_invoice_quote_provider_attempts`;
+- source authority inspected: `fe36a8d1701416222a30670000978075b0b58196`, tree `1489239cd96ee7554ff8837991c1a17945f718b9`, schema `063_checkout_private_memo`.
 
-The public probe returned `200` for `/health`, `/ready`, `/version`,
+The healthy public probes returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
 `/ready` reported database and schema healthy. `/version` reported the deployed
 commit above, `build_dirty: false`, production mode, and
 `public_name_policy: permanent_names_v1`.
 
-The deployed SHA now matches source main and includes the immutable quote
-schema, 30-day outer invoice lifetime, full five-minute payer-demand quote
-flow, observation-time valuation, durable provider attribution/recovery,
-atomic PWA refresh, and PoS Bitcoin warning. Exact release provenance and
-schema readiness establish that these capabilities are deployed; individual
-rail availability remains subject to its normal admission and dependency
-gates.
+Public `/version`, `/health`, and `/ready` then became unreachable at 09:21 UTC
+and remained TCP connection-refused through the 10:06 UTC probe. The last
+healthy deployed identity therefore remains the revision above; do not infer
+the installed SHA or schema while the provenance endpoints are unavailable.
+
+The last verified deployed SHA includes the immutable quote schema, 30-day
+outer invoice lifetime, full five-minute payer-demand quote flow,
+observation-time valuation, durable provider attribution/recovery, atomic PWA
+refresh, and PoS Bitcoin warning. Exact release provenance and schema readiness
+established that release contract; individual rail availability remains
+subject to its normal admission and dependency gates.
+
+Source main advanced during that outage to
+`fe36a8d1701416222a30670000978075b0b58196`. It adds schema 063 for the private
+checkout memo and fixes durable fee authority during refresh to unblock fiat
+checkout and stable fee admission. This hotfix is **main only** until a healthy
+public `/version` and `/ready` prove the matching deployed commit and schema.
 
 Main also contains a current-only automatic-recovery hardening merged in
 `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now
@@ -210,10 +220,10 @@ release provenance and certification record match that complete release.
 At source `746444166a41f2a42faa8bc0615c423150ac3c6f`, migrations 058 and 059
 are current-only empty-state guards: they require all user, surface, invoice,
 swap, allocation, and returned-address history to be empty before creating the
-permanent-name registry and removing pre-launch fields. Production now reports
-the matching schema-062 boundary healthy. Do not apply rewritten migrations to
-an existing database; use only the approved fresh-database cutover and exact
-release migration sequence.
+permanent-name registry and removing pre-launch fields. The last healthy
+production probe reported the matching schema-062 boundary. Do not apply
+rewritten migrations to an existing database; use only the approved
+fresh-database cutover and exact release migration sequence.
 
 The locked program permits a fresh-database cutover because the product has no
 users, but that is an exceptional release decision, not routine maintenance.
@@ -569,7 +579,7 @@ start another transfer merely because the command timed out.
 
 The operational claims above were checked against `README.md`, `SECURITY.md`,
 `config.toml`, `src/config.rs`, `src/main.rs`, `src/readiness.rs`, migration
-files 045–062, server and DB integration tests, the architecture/API/product
+files 045–063, server and DB integration tests, the architecture/API/product
 documents under `docs/`, the `bullnym-tests` README and recycler source, and the
 three read-only authority records:
 
