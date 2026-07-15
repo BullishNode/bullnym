@@ -14944,6 +14944,158 @@ async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
 }
 
 #[tokio::test]
+async fn issue14_m5_direct_watcher_enforces_the_invoice_wide_tolerance() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "m5directtolerance").await;
+    let liquid_blinding_key_hex = "22".repeat(32);
+    let invoice = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some("m5directtolerance"),
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "checkout",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 60,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_address: Some("bc1qissue14m5directtolerance"),
+            liquid_address: Some("lq1issue14m5directtolerance"),
+            liquid_blinding_key_hex: Some(&liquid_blinding_key_hex),
+            expires_in_secs: 60,
+        },
+    )
+    .await
+    .unwrap();
+    let tolerances = pay_service::db::InvoiceAccountingTolerances {
+        btc_sat: 300,
+        liquid_sat: 60,
+        lightning_sat: 1,
+        payment_grace_secs: 0,
+    };
+    let first_txid = "abababababababababababababababababababababababababababababababab";
+    let first_event_key = format!("bitcoin_direct:{first_txid}:0");
+    let first_observations = [bitcoin_lifecycle_observation(
+        &first_event_key,
+        first_txid,
+        0,
+        "bc1qissue14m5directtolerance",
+        995,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let first_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let first_outcome = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "m5-invoice-wide-tolerance",
+            generation: first_generation,
+            observations: &first_observations,
+        },
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let partial = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.status, "partially_paid");
+    assert_eq!(partial.presentation_status.as_deref(), Some("partial"));
+    assert_eq!(partial.direct_settlement_status, "pending");
+    assert_eq!(partial.paid_amount_sat, Some(995));
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["payment_tolerance_sat"], 1);
+    assert_eq!(body["status"], "partially_paid");
+    assert_eq!(body["presentation_status"], "partial");
+    assert_eq!(body["remaining_amount_sat"], 5);
+    assert_eq!(body["paid_amount_sat"], 995);
+
+    let boundary_txid = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    let boundary_event_key = format!("bitcoin_direct:{boundary_txid}:0");
+    let boundary_observations = [bitcoin_lifecycle_observation(
+        &boundary_event_key,
+        boundary_txid,
+        0,
+        "bc1qissue14m5directtolerance",
+        4,
+        1,
+        pay_service::db::DirectObservationPhase::Confirmed,
+        None,
+    )];
+    let boundary_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let boundary_outcome = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "m5-invoice-wide-tolerance",
+            generation: boundary_generation,
+            observations: &boundary_observations,
+        },
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        boundary_outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let accepted = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.status, "paid");
+    assert_eq!(
+        accepted.presentation_status.as_deref(),
+        Some("payment_received")
+    );
+    assert_eq!(accepted.direct_settlement_status, "pending");
+    assert_eq!(accepted.paid_amount_sat, Some(999));
+    let (status, body) = get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["payment_tolerance_sat"], 1);
+    assert_eq!(body["status"], "paid");
+    assert_eq!(body["presentation_status"], "payment_received");
+    assert_eq!(body["remaining_amount_sat"], 1);
+    assert_eq!(body["paid_amount_sat"], 999);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn boltz_liquid_payout_does_not_double_count_lightning_invoice_payment() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;

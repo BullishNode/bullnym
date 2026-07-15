@@ -405,7 +405,6 @@ pub async fn list_bitcoin_direct_watch_evidence(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AccountingReplayEvent {
-    rail: &'static str,
     amount_sat: i64,
     sequence: i64,
 }
@@ -419,6 +418,9 @@ struct AccountingProjection {
 #[derive(Debug, sqlx::FromRow)]
 struct LockedInvoice {
     amount_sat: i64,
+    accept_btc: bool,
+    accept_liquid: bool,
+    accept_ln: bool,
     status: String,
     presentation_status: Option<String>,
     direct_settlement_status: String,
@@ -552,26 +554,20 @@ struct ReducedProjection {
 
 fn replay_accounting(
     amount_sat: i64,
+    prior_status: &str,
+    prior_received_sat: Option<i64>,
     expired: bool,
     mut events: Vec<AccountingReplayEvent>,
-    tolerances: InvoiceAccountingTolerances,
+    tolerance_sat: i64,
 ) -> AccountingProjection {
     events.sort_by_key(|event| event.sequence);
     let mut status = if expired { "underpaid" } else { "unpaid" };
     let mut received_sat = 0_i64;
     for event in events {
         received_sat = received_sat.saturating_add(event.amount_sat);
-        let configured_tolerance = match event.rail {
-            "bitcoin" => tolerances.btc_sat,
-            "liquid" => tolerances.liquid_sat,
-            "lightning" => tolerances.lightning_sat,
-            _ => 0,
-        }
-        .max(0);
-        let tolerance_sat = configured_tolerance.min((amount_sat / 100).max(1));
         let computed = if received_sat > amount_sat {
             "overpaid"
-        } else if amount_sat.saturating_sub(received_sat) <= tolerance_sat {
+        } else if amount_sat.saturating_sub(received_sat) <= tolerance_sat.max(0) {
             "paid"
         } else if status == "underpaid" || expired {
             "underpaid"
@@ -585,6 +581,20 @@ fn replay_accounting(
                 computed
             };
     }
+    // Preserve rollout stickiness only while positive countable evidence is
+    // still present. A conflict, eviction, or reorg that removes every active
+    // event must remain able to demote the projection through the existing
+    // resolution-pending path.
+    if prior_received_sat.is_some_and(|prior| prior > 0 && received_sat >= prior)
+        && matches!(prior_status, "paid" | "overpaid")
+        && !matches!(status, "paid" | "overpaid")
+    {
+        status = if prior_status == "overpaid" {
+            "overpaid"
+        } else {
+            "paid"
+        };
+    }
     AccountingProjection {
         status,
         received_sat,
@@ -594,7 +604,9 @@ fn replay_accounting(
 fn presentation_status_for(
     amount_sat: i64,
     events: &[ProjectionEvent],
-    tolerances: InvoiceAccountingTolerances,
+    tolerance_sat: i64,
+    prior_accounting_status: &str,
+    preserve_prior_settlement: bool,
 ) -> &'static str {
     let replay_events = events
         .iter()
@@ -615,21 +627,34 @@ fn presentation_status_for(
                 && matches!(event.observation_state.as_deref(), Some("seen_unconfirmed"))
         })
         .map(|event| AccountingReplayEvent {
-            rail: match event.rail.as_str() {
-                "bitcoin" => "bitcoin",
-                "liquid" => "liquid",
-                "lightning" => "lightning",
-                _ => "unknown",
-            },
             amount_sat: event.amount_sat,
             sequence: event.accounting_sequence,
         })
         .collect();
-    match replay_accounting(amount_sat, false, replay_events, tolerances).status {
+    let status = match replay_accounting(
+        amount_sat,
+        "unpaid",
+        None,
+        false,
+        replay_events,
+        tolerance_sat,
+    )
+    .status
+    {
         "partially_paid" | "underpaid" => "partial",
         "paid" => "payment_received",
         "overpaid" => "overpaid",
         _ => "unpaid",
+    };
+    if preserve_prior_settlement && prior_accounting_status == "overpaid" && status != "overpaid" {
+        "overpaid"
+    } else if preserve_prior_settlement
+        && prior_accounting_status == "paid"
+        && !matches!(status, "payment_received" | "overpaid")
+    {
+        "payment_received"
+    } else {
+        status
     }
 }
 
@@ -706,6 +731,13 @@ fn reduce_projection(
     events: &[ProjectionEvent],
     tolerances: InvoiceAccountingTolerances,
 ) -> ReducedProjection {
+    let tolerance_sat = super::invoice_payment_tolerance_sat(
+        invoice.amount_sat,
+        invoice.accept_btc,
+        invoice.accept_liquid,
+        invoice.accept_ln,
+        tolerances,
+    );
     let accounting_events = events
         .iter()
         .filter(|event| {
@@ -715,25 +747,31 @@ fn reduce_projection(
             )
         })
         .map(|event| AccountingReplayEvent {
-            rail: match event.rail.as_str() {
-                "bitcoin" => "bitcoin",
-                "liquid" => "liquid",
-                "lightning" => "lightning",
-                _ => "unknown",
-            },
             amount_sat: event.amount_sat,
             sequence: event.accounting_sequence,
         })
         .collect();
     let accounting = replay_accounting(
         invoice.amount_sat,
+        &invoice.status,
+        invoice.paid_amount_sat,
         invoice.expired,
         accounting_events,
-        tolerances,
+        tolerance_sat,
     );
+    let preserve_prior_settlement = matches!(invoice.status.as_str(), "paid" | "overpaid")
+        && invoice
+            .paid_amount_sat
+            .is_some_and(|prior| prior > 0 && accounting.received_sat >= prior);
     let direct_settlement_status =
         direct_settlement_status_for(events, &invoice.direct_settlement_status);
-    let presentation_status = presentation_status_for(invoice.amount_sat, events, tolerances);
+    let presentation_status = presentation_status_for(
+        invoice.amount_sat,
+        events,
+        tolerance_sat,
+        &invoice.status,
+        preserve_prior_settlement,
+    );
     let projected_status = if accounting.received_sat == 0 {
         if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
             "in_progress"
@@ -846,7 +884,8 @@ pub async fn apply_direct_observation_batch(
         .execute(&mut *tx)
         .await?;
     let invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, status, presentation_status, \
+        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+                status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
          FROM invoices WHERE id = $1 FOR UPDATE",
@@ -1685,7 +1724,8 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
         .execute(&mut **tx)
         .await?;
     let mut invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, status, presentation_status, \
+        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+                status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
          FROM invoices WHERE id = $1 FOR UPDATE",
@@ -1797,6 +1837,9 @@ mod tests {
     fn invoice() -> LockedInvoice {
         LockedInvoice {
             amount_sat: 100_000,
+            accept_btc: true,
+            accept_liquid: true,
+            accept_ln: true,
             status: "unpaid".into(),
             presentation_status: Some("unpaid".into()),
             direct_settlement_status: "none".into(),
@@ -1853,29 +1896,87 @@ mod tests {
     }
 
     #[test]
-    fn accounting_replay_is_stable_by_sequence_and_preserves_per_rail_tolerance() {
+    fn accounting_replay_is_stable_by_sequence_under_one_invoice_tolerance() {
         let events = vec![
             AccountingReplayEvent {
-                rail: "liquid",
                 amount_sat: 150,
                 sequence: 2,
             },
             AccountingReplayEvent {
-                rail: "bitcoin",
                 amount_sat: 99_750,
                 sequence: 1,
             },
         ];
-        let projection = replay_accounting(100_000, false, events, tolerances());
-        assert_eq!(projection.status, "paid");
+        let projection = replay_accounting(100_000, "unpaid", None, false, events, 1);
+        assert_eq!(projection.status, "partially_paid");
         assert_eq!(projection.received_sat, 99_900);
     }
 
     #[test]
     fn replay_without_active_events_has_no_accounting_value() {
-        let projection = replay_accounting(100_000, false, Vec::new(), tolerances());
+        let projection = replay_accounting(100_000, "paid", Some(99_999), false, Vec::new(), 1);
         assert_eq!(projection.status, "unpaid");
         assert_eq!(projection.received_sat, 0);
+    }
+
+    #[test]
+    fn stricter_invoice_tolerance_preserves_paid_with_positive_countable_evidence() {
+        let mut invoice = invoice();
+        invoice.amount_sat = 1_000;
+        invoice.status = "paid".into();
+        invoice.presentation_status = Some("payment_received".into());
+        invoice.paid_via = Some("bitcoin".into());
+        invoice.paid_amount_sat = Some(995);
+
+        let projection = reduce_projection(
+            &invoice,
+            &[projection_event("active", "awaiting_confirmations", 995)],
+            tolerances(),
+        );
+        assert_eq!(projection.status, "paid");
+        assert_eq!(projection.presentation_status, "payment_received");
+        assert_eq!(projection.direct_settlement_status, "pending");
+        assert_eq!(projection.received_sat, 995);
+    }
+
+    #[test]
+    fn paid_stickiness_does_not_mask_direct_evidence_invalidation() {
+        let mut invoice = invoice();
+        invoice.amount_sat = 1_000;
+        invoice.status = "paid".into();
+        invoice.presentation_status = Some("payment_received".into());
+        invoice.paid_via = Some("bitcoin".into());
+        invoice.paid_amount_sat = Some(995);
+
+        let projection = reduce_projection(
+            &invoice,
+            &[projection_event("inactive", "resolution_pending", 995)],
+            tolerances(),
+        );
+        assert_eq!(projection.status, "in_progress");
+        assert_eq!(projection.presentation_status, "unpaid");
+        assert_eq!(projection.direct_settlement_status, "resolution_pending");
+        assert_eq!(projection.received_sat, 0);
+    }
+
+    #[test]
+    fn paid_stickiness_does_not_mask_a_reduced_active_total() {
+        let mut invoice = invoice();
+        invoice.amount_sat = 1_000;
+        invoice.status = "paid".into();
+        invoice.presentation_status = Some("payment_received".into());
+        invoice.paid_via = Some("bitcoin".into());
+        invoice.paid_amount_sat = Some(995);
+
+        let projection = reduce_projection(
+            &invoice,
+            &[projection_event("active", "awaiting_confirmations", 1)],
+            tolerances(),
+        );
+        assert_eq!(projection.status, "partially_paid");
+        assert_eq!(projection.presentation_status, "partial");
+        assert_eq!(projection.direct_settlement_status, "pending");
+        assert_eq!(projection.received_sat, 1);
     }
 
     #[test]
