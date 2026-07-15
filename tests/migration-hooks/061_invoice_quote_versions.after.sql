@@ -37,11 +37,11 @@ INSERT INTO invoice_quote_versions (
     merchant_amount_sat
 ) VALUES (
     '61000000-0000-0000-0000-000000000001',
-    10000000, 'bullbitcoin-pricer:indexPrice',
+    30000000, 'bullbitcoin-pricer:indexPrice',
     clock_timestamp() - INTERVAL '1 second',
     clock_timestamp(),
     clock_timestamp() + INTERVAL '5 minutes',
-    10000
+    3334
 );
 
 COMMIT;
@@ -60,7 +60,7 @@ BEGIN
     IF quote_row.version_number <> 1
        OR quote_row.fiat_face_amount_minor <> 1000
        OR quote_row.fiat_currency <> 'USD'
-       OR quote_row.merchant_amount_sat <> 10000
+       OR quote_row.merchant_amount_sat <> 3334
        OR quote_row.expires_at <> quote_row.created_at + INTERVAL '5 minutes' THEN
         RAISE EXCEPTION 'migration 061 database-owned quote snapshot is incorrect';
     END IF;

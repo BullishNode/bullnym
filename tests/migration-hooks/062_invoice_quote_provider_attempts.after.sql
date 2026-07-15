@@ -27,11 +27,11 @@ INSERT INTO invoice_quote_versions (
 ) VALUES (
     '62000000-0000-0000-0000-000000000001',
     'payer_instruction',
-    10000000, 'bullbitcoin-pricer:indexPrice',
+    30000000, 'bullbitcoin-pricer:indexPrice',
     clock_timestamp() - INTERVAL '1 second',
     clock_timestamp(),
     clock_timestamp() + INTERVAL '5 minutes',
-    10000
+    3334
 );
 COMMIT;
 
@@ -84,9 +84,9 @@ BEGIN
            AND fiat_face_amount_minor = 1000
            AND fiat_target_amount_minor = 1000
            AND quote_purpose = 'payer_instruction'
-           AND merchant_amount_sat = 10000
-    ) OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 9999) <> 999
-       OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 10000) <> 1000
+           AND merchant_amount_sat = 3334
+    ) OR invoice_quote_credit_for_sats(1000, 3334, 30000000, 3333) <> 999
+       OR invoice_quote_credit_for_sats(1000, 3334, 30000000, 3334) <> 1000
     THEN
         RAISE EXCEPTION 'migration 062 remaining-face/credit policy is incorrect';
     END IF;

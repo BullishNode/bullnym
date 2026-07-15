@@ -154,7 +154,8 @@ pub fn project_fiat_quote_credit_minor(
 }
 
 /// Derive the immutable merchant-side satoshi target for a fiat quote using
-/// the same checked floor conversion validated by Policy C.
+/// a checked ceiling conversion. Partial credit remains floor-valued, but the
+/// merchant target must cover the full fiat face value before saturation.
 pub fn merchant_amount_sat_for_quote(
     fiat_target_minor: i64,
     rate_minor_per_btc: i64,
@@ -168,8 +169,15 @@ pub fn merchant_amount_sat_for_quote(
     let fiat_scaled = i128::from(fiat_target_minor)
         .checked_mul(SATOSHIS_PER_BTC)
         .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
-    let expected = fiat_scaled
-        .checked_div(i128::from(rate_minor_per_btc))
+    let rate = i128::from(rate_minor_per_btc);
+    let quotient = fiat_scaled
+        .checked_div(rate)
+        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
+    let remainder = fiat_scaled
+        .checked_rem(rate)
+        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
+    let expected = quotient
+        .checked_add(i128::from(remainder != 0))
         .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
     let expected = i64::try_from(expected).map_err(|_| FiatQuoteCreditError::ArithmeticOverflow)?;
     if expected <= 0 {
@@ -266,12 +274,10 @@ mod tests {
     }
 
     #[test]
-    fn merchant_target_uses_the_policy_floor_conversion() {
-        assert_eq!(merchant_amount_sat_for_quote(1_000, 30_000_000), Ok(3_333));
-        assert_eq!(
-            merchant_amount_sat_for_quote(1, i64::MAX),
-            Err(FiatQuoteCreditError::NonPositiveMerchantAmount)
-        );
+    fn merchant_target_uses_a_checked_ceiling_conversion() {
+        assert_eq!(merchant_amount_sat_for_quote(1_000, 30_000_000), Ok(3_334));
+        assert_eq!(merchant_amount_sat_for_quote(1_000, 10_000_000), Ok(10_000));
+        assert_eq!(merchant_amount_sat_for_quote(1, i64::MAX), Ok(1));
     }
 
     #[test]
@@ -279,9 +285,9 @@ mod tests {
         let just_below = calculate_fiat_quote_credit(FiatQuoteCreditInput {
             fiat_target_minor: 1_000,
             rate_minor_per_btc: 30_000_000,
-            merchant_amount_sat: 3_333,
+            merchant_amount_sat: 3_334,
             prior_cumulative_eligible_merchant_sat: 0,
-            cumulative_eligible_merchant_sat: 3_332,
+            cumulative_eligible_merchant_sat: 3_333,
         })
         .unwrap();
         assert_eq!(just_below.cumulative_credit_minor, 999);
@@ -289,13 +295,30 @@ mod tests {
         let at_target = calculate_fiat_quote_credit(FiatQuoteCreditInput {
             fiat_target_minor: 1_000,
             rate_minor_per_btc: 30_000_000,
-            merchant_amount_sat: 3_333,
-            prior_cumulative_eligible_merchant_sat: 3_332,
-            cumulative_eligible_merchant_sat: 3_333,
+            merchant_amount_sat: 3_334,
+            prior_cumulative_eligible_merchant_sat: 3_333,
+            cumulative_eligible_merchant_sat: 3_334,
         })
         .unwrap();
         assert_eq!(at_target.cumulative_credit_minor, 1_000);
         assert_eq!(at_target.event_credit_delta_minor, 1);
+    }
+
+    #[test]
+    fn floor_target_is_rejected_for_a_non_integral_quote() {
+        assert_eq!(
+            calculate_fiat_quote_credit(FiatQuoteCreditInput {
+                fiat_target_minor: 1_000,
+                rate_minor_per_btc: 30_000_000,
+                merchant_amount_sat: 3_333,
+                prior_cumulative_eligible_merchant_sat: 0,
+                cumulative_eligible_merchant_sat: 0,
+            }),
+            Err(FiatQuoteCreditError::MerchantAmountMismatch {
+                expected: 3_334,
+                actual: 3_333,
+            })
+        );
     }
 
     #[test]
