@@ -38,14 +38,16 @@ the server-hosted PWA content SHA-256 was
 Public `/health`, `/ready`, and `/version` probes matched the installed commit
 and schema.
 
-Installation is not the same as final production certification. At the time of
-writing, recovery-generation reconciliation, private rail admission, and the
-final bounded production journeys remain pending. In particular, the Payment
-Page or PoS Bitcoin option may remain unavailable while Bitcoin chain-swap
-recovery evidence is reconciled; `/ready` does not promise that every payment
-rail is open. Use only the payment methods the current page actually offers and
-do not infer availability from this manual. This release changes the
-server-hosted PWA; it does not include a mobile-wallet release.
+The read-only deployment certification passed, and the current recovery
+generation reconciled with all-zero startup counts. On the exact deployed
+restart, direct Bitcoin, reverse Lightning, direct Liquid, and Bitcoin chain
+swap admission all opened after their normal startup checks. This is a point-
+in-time result, not a promise that every method will always remain available:
+`/ready` does not report every rail, and a rail closes if its own safety
+foundation degrades. Use only the methods the current page offers. The
+schema-062 no-funds smoke and bounded live-money journey outcomes remain
+pending. This release changes the server-hosted PWA; it does not include a
+mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -433,7 +435,9 @@ product/API/architecture documents in this repository and the locked
 completion-plan, rationale, and server/PWA gap-audit records maintained outside
 this repository.
 
-The later public probes and artifact digests prove installation, not final rail
-certification. The Operator Manual defines the separate recovery, admission,
-and bounded journey evidence required before describing this release as fully
-certified.
+The later public probes, artifact digests, and read-only certification prove
+deployment identity and public readiness. Exact deployed startup evidence also
+proved the current recovery generation and observed all four private rails
+open on that restart. The Operator Manual records that evidence and its
+limits. The schema-062 no-funds smoke and bounded live-money journeys remain
+separate pending certification work.

@@ -13,8 +13,8 @@ evidence:
 | Label | Meaning |
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
-| **Installed schema-062 release** | The exact merged artifact, PWA, release record, running process, and fresh schema agree, but final certification and private rail admission are separate pending gates. |
-| **Certified production release** | Use this label only after installation identity, startup recovery evidence, private admission, and the final public and bounded money-journey certification all agree. |
+| **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
+| **Journey-certified production release** | Use this label only after the schema-062 no-funds smoke and bounded live-money journeys also pass. Those journey outcomes remain pending. |
 
 Exact revisions used for this manual:
 
@@ -24,7 +24,10 @@ Exact revisions used for this manual:
 - installed release source: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, expected schema `062_invoice_quote_provider_attempts`;
 - installed binary SHA-256: `21628acc96d20475662898bbed851a48b4762c5d2b70b92ecc08910c46cd4873`;
 - installed PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
-- active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`.
+- active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`;
+- passed deployment-certification report SHA-256: `3586ad4a4d7c98975ec8a5a3460ca51c97cfa1030356473a7ded30f5165bc799`;
+- protected production configuration SHA-256 after the test-certification
+  allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`.
 
 The historical baseline public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -51,13 +54,16 @@ It also carries forward the current-only automatic-recovery and permanent-name
 contract from its merged base. It does not restore the tokenless LNURL callback,
 legacy Payment Page media fields, or legacy payout/surface modes.
 
-Those facts prove cutover and installation, not full production certification.
-At the time of writing, the independent recovery-witness generation still must
-be separated from the retired database generation and reconciled against the
-active Boltz xpub before Bitcoin chain-swap admission can be certified. Final
-public certification, private per-rail admission evidence, and bounded
-money-journey evidence remain pending. Do not describe Bitcoin chain-swap
-admission as open merely because `/ready` is healthy.
+At 2026-07-15 08:34 UTC, the new recovery generation reconciled with exact
+all-zero startup counts. After the normal transient `startup_pending` state,
+the exact deployed process opened `direct_bitcoin`, `lightning_reverse`,
+`direct_liquid`, and `bitcoin_chain`, each with an empty reason-code set. A
+separate read-only deployment certification also passed. These facts resolve
+the recovery-generation, deployment-identity, and private-admission gates for
+that restart; they do not make rail availability permanent. The schema-062
+no-funds smoke and bounded live-money journey outcomes remain pending. Do not
+infer current rail availability from `/ready` or from this manual; inspect the
+current per-rail admission state.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the immutable release record. Do not infer deployment from a pull
@@ -222,6 +228,29 @@ the reviewed PR head for the merged release commit. The preflight is
 deliberately read-only and cannot prove worker health, private rail admission,
 or a safe money journey; retain those as separate gates.
 
+For the installed cutover, this certification completed in `read_only` mode
+with status `passed`. Its restricted report has SHA-256
+`3586ad4a4d7c98975ec8a5a3460ca51c97cfa1030356473a7ded30f5165bc799`.
+It moved no funds, called no provider, and made only public `GET` requests to
+`/version`, `/health`, and `/ready`. Treat it as deployment-identity and public-
+readiness evidence, not as schema-062 smoke or live-money certification.
+
+The production configuration supports a narrowly scoped certification bypass
+for exactly one allowlisted source, the TEST VM, and exactly these five scopes:
+
+- `registration_setup`;
+- `metadata_lookup`;
+- `invoice_create`;
+- `invoice_status`;
+- `live_money_offer`.
+
+The signed TEST-VM preflight proved the source, credential, configured scopes,
+and requested scopes agreed with no missing scope. This bypass is separate
+from the general production IP-rate-limit policy and does not bypass readiness,
+private money admission, recovery, integrity holds, or value limits. Never
+record the credential, its derivative values, or secret-bearing configuration
+content in a manual, log, report, command line, or ticket.
+
 Migrations 050, 051, 053, 057, 059, and 060 have explicit stopped-writer or
 roll-forward constraints documented in `docs/operations/deployment.md`.
 Migrations 061 and 062 are privileged-owner migrations and must receive the
@@ -292,12 +321,12 @@ Those authenticated manifests reference merchant, invoice, Liquid-address, and
 recovery-commitment rows that intentionally do not exist in the fresh database;
 startup therefore fails closed instead of fabricating them.
 
-Preserve the snapshotted namespace as an immutable retired generation. Point
-the current runtime at a newly provisioned empty bucket or prefix with the
-required versioning, retention, and least-privilege credentials. The entire
-physical bucket need not be empty: the loader reads only the configured
-`<prefix>/v1` namespace. Do not delete retained evidence or bypass retention to
-force an empty result.
+The retired namespace remains preserved as immutable evidence. The current
+runtime now uses the nonsecret generation prefix
+`bullnym/schema062-e17c465-g1`; its scoped inventory contained zero objects.
+The physical bucket does not need to be empty because the loader reads only the
+configured `<prefix>/v1` namespace. Do not delete retained evidence or bypass
+retention to force an empty result.
 
 An empty witness namespace is necessary but not sufficient. Startup also
 validates the Boltz restore set for the xpub derived from `SWAP_MNEMONIC`. For a
@@ -306,14 +335,42 @@ current generation: zero witness manifests, zero local swap/recovery inventory,
 and a validated provider response with no records and restore index `-1`. If
 the retired provider records remain visible under the existing xpub, rotate the
 mnemonic before accepting current-generation money; keep the old mnemonic in
-the restricted retired recovery set. Prefer new witness encryption/signing
-material and credentials as a generation boundary as well.
+the restricted retired recovery set. New witness encryption/signing material
+and credentials can make a generation boundary clearer. For this empty-prefix
+cutover, the existing signing and encryption keys were retained after the
+scoped inventory and provider restore both proved empty; key reuse is not a
+substitute for that proof.
 
-Only a source-free `startup_provider_recovery_consistent` event whose manifest,
-provider, local, reconstruction, delivery, and chain-observation counts are all
-zero proves the empty-generation startup condition. A healthy `/ready` does
-not. Keep Bitcoin chain-swap admission closed until this evidence and all other
-rail foundations agree.
+The one-shot auxiliary validator used during the cutover has SHA-256
+`d104a24e2b8cc1aa7b78592d1b0b72cb6643ef13cef0a7db11578bd88cf56f5a`.
+It parsed the protected runtime with the installed source, listed only the
+active prefix, and used the exact release's Boltz restore adapter. It emitted
+only nonsecret identity and count evidence. This locally built validator is
+supporting evidence, not the deployed release artifact or the sole admission
+authority.
+
+The authoritative deployed `startup_provider_recovery_consistent` event at
+2026-07-15 08:34 UTC reported exact zero values for every recovery field:
+
+- `repaired_obligation_count`, `reconstructed_chain_swap_count`, and
+  `reconstructed_delivery_count`;
+- `manifest_count`, `provider_record_count`, `provider_chain_record_count`,
+  `local_record_count`, and `local_chain_inventory_count`;
+- `current_v1_chain_record_count`, `complete_legacy_chain_record_count`, and
+  `chain_observation_count`;
+- `chain_missing_manifest_count`, `chain_unconfirmed_manifest_count`,
+  `chain_confirmed_manifest_count`, `chain_spent_manifest_count`,
+  `chain_conflicting_manifest_count`, and
+  `chain_amount_mismatch_manifest_count`.
+
+The active-prefix inventory independently reported zero witness objects and
+zero provider records with no provider maximum child index. After this event,
+the same exact restart observed `direct_bitcoin`, `lightning_reverse`,
+`direct_liquid`, and `bitcoin_chain` transition open with empty reason-code
+sets. The event was reproduced on a later restart. These observations prove
+empty-generation startup and private admission at those instants; a healthy
+`/ready` alone does not, and any rail can close again when its foundations
+degrade.
 
 Rollback principles:
 
@@ -655,6 +712,13 @@ testing, inventory every simulator-controlled wallet balance without printing
 secrets, set an aggregate sat budget, verify the destination is simulator
 controlled, and prove the recycler can recover each funded actor wallet. Stop
 if those conditions are not true.
+
+The obsolete TEST-VM `bw-bullnym-health-test.timer` is disabled and inactive.
+Its referenced script was missing, so it made no Bullnym request and only
+produced misleading local failure telemetry. Do not re-enable it until a
+reviewed replacement exists. The schema-062 no-funds smoke and bounded
+live-money journey outcomes are still pending; neither the disabled timer nor
+the passed read-only deployment certification substitutes for them.
 
 Current harness commands include:
 
