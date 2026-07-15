@@ -16083,7 +16083,10 @@ async fn offline_after_liquid_instruction_keeps_observation_live_without_reopeni
     assert_eq!(unavailable["code"], "NymNotFound", "{unavailable}");
     let (_, callback_unavailable) = get_path(
         &app,
-        &format!("/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC"),
+        &format!(
+            "{}?amount=100000&payment_method=L-BTC",
+            test_lnurl_callback_path(nym)
+        ),
     )
     .await;
     assert_eq!(
