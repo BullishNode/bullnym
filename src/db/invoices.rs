@@ -15,9 +15,10 @@ use uuid::Uuid;
 // Timestamp columns are NOT read into Rust structs as DateTime values —
 // the workspace deliberately avoids the chrono/time sqlx feature flag.
 // Instead, projections expose timestamps as `BIGINT` Unix epoch seconds
-// via `EXTRACT(EPOCH FROM col)::BIGINT AS col_unix`. SQL boolean
-// expressions (`expires_at < NOW()` etc.) handle every comparison
-// server-side.
+// via `FLOOR(EXTRACT(EPOCH FROM col))::BIGINT AS col_unix`. PostgreSQL rounds
+// a direct floating-point-to-BIGINT cast, which can advertise a deadline one
+// second later than the stored instant. SQL boolean expressions
+// (`expires_at < NOW()` etc.) handle every comparison server-side.
 // =====================================================================
 
 #[derive(Debug, sqlx::FromRow)]
@@ -80,15 +81,15 @@ const INVOICE_COLUMNS: &str =
      pricing_mode, settlement_status, presentation_status, \
      direct_settlement_status, swap_settlement_status, \
      direct_payment_projection_version, liquid_blinding_key_hex, \
-     EXTRACT(EPOCH FROM created_at)::BIGINT       AS created_at_unix, \
-     EXTRACT(EPOCH FROM expires_at)::BIGINT       AS expires_at_unix, \
-     EXTRACT(EPOCH FROM rate_locked_at)::BIGINT   AS rate_locked_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT     AS created_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT     AS expires_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM rate_locked_at))::BIGINT AS rate_locked_at_unix, \
      CASE \
          WHEN pricing_mode = 'fiat_fixed' AND rate_minor_per_btc IS NULL THEN 0 \
-         ELSE EXTRACT(EPOCH FROM rate_locks_until)::BIGINT \
+         ELSE FLOOR(EXTRACT(EPOCH FROM rate_locks_until))::BIGINT \
      END AS rate_locks_until_unix, \
-     EXTRACT(EPOCH FROM paid_at)::BIGINT          AS paid_at_unix, \
-     EXTRACT(EPOCH FROM cancelled_at)::BIGINT     AS cancelled_at_unix";
+     FLOOR(EXTRACT(EPOCH FROM paid_at))::BIGINT        AS paid_at_unix, \
+     FLOOR(EXTRACT(EPOCH FROM cancelled_at))::BIGINT   AS cancelled_at_unix";
 
 pub struct NewInvoice<'a> {
     /// Merchant payment-page nym, or `None` for unlinked (wallet-only) invoices.

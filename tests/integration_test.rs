@@ -12189,7 +12189,28 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
         .unwrap(),
     );
 
-    for invoice_id in fiat_invoice_ids {
+    for (index, invoice_id) in fiat_invoice_ids.into_iter().enumerate() {
+        let expected_expiry = if index == 0 {
+            Some(
+                sqlx::query_scalar::<_, i64>(
+                    "UPDATE invoices \
+                        SET expires_at = fixture.deadline, \
+                            rate_locks_until = fixture.deadline \
+                       FROM ( \
+                         SELECT date_trunc('second', clock_timestamp()) \
+                                + INTERVAL '3599.9 seconds' AS deadline \
+                       ) fixture \
+                      WHERE invoices.id = $1 \
+                  RETURNING FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT",
+                )
+                .bind(invoice_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         let raw: (String, Option<i64>, i64, i64) = sqlx::query_as(
             "SELECT pricing_mode, rate_minor_per_btc, \
                     EXTRACT(EPOCH FROM rate_locks_until)::BIGINT, \
@@ -12209,6 +12230,17 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
             .unwrap()
             .expect("projected invoice");
         assert_eq!(projected.rate_locks_until_unix, 0);
+        if let Some(expected_expiry) = expected_expiry {
+            assert_eq!(
+                projected.expires_at_unix, expected_expiry,
+                "Unix projections must floor fractional database timestamps instead of rounding the deadline up"
+            );
+            assert_eq!(
+                raw.3,
+                expected_expiry + 1,
+                "regression fixture must exercise PostgreSQL's rounding BIGINT cast"
+            );
+        }
 
         let (status, body) = get_path(&app, &format!("/api/v1/invoices/{invoice_id}/status")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
