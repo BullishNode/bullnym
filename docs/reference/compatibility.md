@@ -16,15 +16,6 @@ policy inline.
   `BOLTZ_WEBHOOK_URL_SECRET`, and all in-flight swaps created before the
   secret rollout have either settled or expired.
 
-## Invoice Liquid Offer Route
-
-- Compatibility route: `POST /api/v1/invoices/:id/liquid`
-- Current behavior: returns `410 Gone`.
-- Compatibility reason: wallet-origin invoices now supply Liquid addresses at
-  create time, but old clients should receive an actionable response instead
-  of a generic 404.
-- Removal condition: mobile/API clients no longer call this route.
-
 ## Registration Lookup Quota Fields
 
 - Current field: `quota`

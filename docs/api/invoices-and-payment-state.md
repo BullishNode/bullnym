@@ -289,12 +289,6 @@ normal HTTP `200` `InvalidAmount` error envelope. Do not treat lock contention
 as invoice expiry, and do not retry either response from cached state alone.
 The integration suite exercises the offer-lock contention response.
 
-## `POST /api/v1/invoices/:id/liquid`
-
-Always returns `410 Gone`. Wallet-origin invoices must supply their Liquid
-address at creation; checkout invoices already have one. Remove calls to this
-route rather than retrying it.
-
 ## Polling and expiry
 
 Use bounded polling with backoff and stop only when the combined presentation
