@@ -98,6 +98,13 @@ mod local_chain_swap_recovery_snapshot;
 
 // --- Test infrastructure ---
 
+const TEST_BOLTZ_WEBHOOK_CURRENT_SECRET: &str = "current-webhook-secret-0123456789abcdef";
+const TEST_BOLTZ_WEBHOOK_PREVIOUS_SECRET: &str = "previous-webhook-secret-0123456789abcdef";
+const TEST_BOLTZ_WEBHOOK_CURRENT_PATH: &str =
+    "/webhook/boltz/current-webhook-secret-0123456789abcdef";
+const TEST_BOLTZ_WEBHOOK_PREVIOUS_PATH: &str =
+    "/webhook/boltz/previous-webhook-secret-0123456789abcdef";
+
 #[derive(Clone, Default)]
 struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -285,8 +292,8 @@ fn test_config() -> Config {
         invoice_accounting: InvoiceAccountingConfig::default(),
         database_url: String::new(),
         swap_mnemonic: String::new(),
-        boltz_webhook_url_secret: String::new(),
-        boltz_webhook_url_secret_previous: String::new(),
+        boltz_webhook_url_secret: TEST_BOLTZ_WEBHOOK_CURRENT_SECRET.to_string(),
+        boltz_webhook_url_secret_previous: TEST_BOLTZ_WEBHOOK_PREVIOUS_SECRET.to_string(),
     }
 }
 
@@ -456,7 +463,7 @@ fn test_app(state: AppState) -> Router {
         .route("/invoice/:id", get(invoice::render_unlinked_payment))
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
-        .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
+        .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .with_state(state)
 }
 
@@ -5516,6 +5523,48 @@ async fn concurrent_address_allocation_no_duplicates() {
 // --- Webhook parsing ---
 
 #[tokio::test]
+async fn boltz_webhook_router_accepts_rotation_pair_and_retires_bare_path() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    for (path, swap_id) in [
+        (TEST_BOLTZ_WEBHOOK_CURRENT_PATH, "CURRENT_SECRET_DELIVERY"),
+        (TEST_BOLTZ_WEBHOOK_PREVIOUS_PATH, "PREVIOUS_SECRET_DELIVERY"),
+    ] {
+        let (status, body) = post_json(
+            &app,
+            path,
+            json!({
+                "event": "swap.update",
+                "data": {"id": swap_id, "status": "transaction.mempool"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+
+    let payload = json!({
+        "event": "swap.update",
+        "data": {"id": "REJECTED_SECRET_DELIVERY", "status": "transaction.mempool"}
+    });
+    let (wrong_status, wrong_body) = post_json(
+        &app,
+        "/webhook/boltz/not-a-configured-secret",
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(wrong_status, StatusCode::NOT_FOUND, "{wrong_body}");
+    assert_eq!(wrong_body, Value::Null);
+
+    let (bare_status, bare_body) = post_json(&app, "/webhook/boltz", payload).await;
+    assert_eq!(bare_status, StatusCode::NOT_FOUND, "{bare_body}");
+    assert_eq!(bare_body, Value::Null);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn webhook_parses_boltz_envelope() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -5525,7 +5574,7 @@ async fn webhook_parses_boltz_envelope() {
     // swap we never created or already purged.
     let (status, body) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "nonexistent", "status": "transaction.mempool"}
@@ -5545,7 +5594,12 @@ async fn issue30_webhook_rejects_malformed_payload_with_retryable_status() {
 
     // A malformed delivery must retain the structured AppError contract while
     // returning non-2xx so Boltz retries instead of treating it as handled.
-    let (status, body) = post_json(&app, "/webhook/boltz", json!({"id": "x", "status": "y"})).await;
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({"id": "x", "status": "y"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "ERROR");
     assert_eq!(body["code"], "ClaimError");
@@ -5603,7 +5657,7 @@ async fn webhook_skips_terminal_swaps() {
     // Webhook should be silently accepted (not trigger a re-claim)
     let (status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "FAKE_CLAIMED", "status": "transaction.confirmed"}
@@ -5655,7 +5709,7 @@ async fn settled_webhook_schedules_unclaimed_reverse_recovery() {
 
     let (status, body) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {
@@ -5725,7 +5779,7 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
         Duration::from_secs(2),
         post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {
@@ -6862,7 +6916,7 @@ async fn webhook_advances_chain_swap_records() {
 
     let (status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_WEBHOOK_1", "status": "transaction.server.confirmed"}
@@ -6999,7 +7053,8 @@ async fn issue88_scripted_webhook_disorder_and_poll_errors_converge_idempotently
     let mut stable_updated_at = None;
     for (index, delivery) in deliveries.into_iter().enumerate() {
         tokio::time::sleep(delivery.delay).await;
-        let (status, body) = post_json(&app, "/webhook/boltz", delivery.payload).await;
+        let (status, body) =
+            post_json(&app, TEST_BOLTZ_WEBHOOK_CURRENT_PATH, delivery.payload).await;
         assert_eq!(status, StatusCode::OK, "delivery {index}: {body}");
         let observed = pay_service::db::get_chain_swap_by_id(&pool, row.id)
             .await
@@ -7447,7 +7502,7 @@ async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
 
         let (failure_first_status, failure_first_body) = post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {"id": "CHAIN_PROJECTION_ORDER_1", "status": failure_status}
@@ -7481,7 +7536,7 @@ async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
 
         let (user_after_failure_status, user_after_failure_body) = post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {
@@ -7535,7 +7590,7 @@ async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
         .unwrap();
         let (retry_status, retry_body) = post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {
@@ -7584,7 +7639,7 @@ async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
 
         let (user_first_status, user_first_body) = post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {
@@ -7601,7 +7656,7 @@ async fn issue30_failure_hints_observe_and_user_lock_projection_converges() {
         );
         let (failure_after_user_status, failure_after_user_body) = post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {"id": "CHAIN_PROJECTION_ORDER_1", "status": failure_status}
@@ -7685,7 +7740,7 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
 
     let (failed_status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.failed"}
@@ -7710,7 +7765,7 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
         .unwrap();
     let (server_status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.server.confirmed"}
@@ -7748,7 +7803,7 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
 
     let (repeat_status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.server.confirmed"}
@@ -7772,7 +7827,7 @@ async fn issue30_chain_webhook_ignores_permanent_dedup_and_redrives_late_server_
 
     let (reordered_failure_status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_REDRIVE_1", "status": "transaction.lockupFailed"}
@@ -7836,7 +7891,7 @@ async fn issue30_cancelled_chain_transition_can_retry_the_identical_evidence() {
         Duration::from_millis(100),
         post_json(
             &app,
-            "/webhook/boltz",
+            TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
             json!({
                 "event": "swap.update",
                 "data": {"id": "CHAIN_RETRY_1", "status": "transaction.confirmed"}
@@ -7865,7 +7920,7 @@ async fn issue30_cancelled_chain_transition_can_retry_the_identical_evidence() {
 
     let (retry_status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_RETRY_1", "status": "transaction.confirmed"}
@@ -8138,7 +8193,7 @@ async fn webhook_skips_terminal_chain_swap_records() {
 
     let (status, _) = post_json(
         &app,
-        "/webhook/boltz",
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
         json!({
             "event": "swap.update",
             "data": {"id": "CHAIN_TERMINAL_1", "status": "transaction.refunded"}

@@ -8,8 +8,7 @@
 | `GET /version` | Public compatibility fields: service/crate/Bullnym revision, dirty state, runtime mode, expected schema marker, and `public_name_policy: permanent_names_v1` | Use for rollout preflight and support reports. Full verified Boltz, toolchain, target, profile, and PWA provenance remains operator-only through `pay-service --build-info` and startup logs. |
 | `GET /robots.txt` | Indexing policy | Privacy aid, not access control. |
 | `GET /certification/preflight?scopes=...` | Certification readiness | Test-harness endpoint; not end-user authentication. |
-| `POST /webhook/boltz/:secret` | Boltz status delivery | Operator integration. Path secret is sensitive and may appear in proxy logs. |
-| `POST /webhook/boltz` | Legacy/development webhook | Rejected when a webhook URL secret is configured. Do not deploy as the production target. |
+| `POST /webhook/boltz/:secret` | Boltz status delivery | Authenticated operator integration. The current and configured previous rotation secrets are accepted; wrong secrets and the bare `/webhook/boltz` path return 404. Path secrets are sensitive and may appear in proxy logs. |
 
 Certification scopes are comma-separated values from `registration_setup`,
 `metadata_lookup`, `invoice_create`, `invoice_status`, and `live_money_offer`.

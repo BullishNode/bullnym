@@ -301,20 +301,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Boltz does not HMAC-sign webhook deliveries; the only viable
-    // authenticator is the URL itself. Compatibility details live in
-    // docs/compatibility-ledger.md.
-    let webhook_url = if config.boltz_webhook_url_secret.is_empty() {
-        tracing::warn!(
-            "BOLTZ_WEBHOOK_URL_SECRET unset — registering unauthenticated webhook URL (DEV ONLY)"
-        );
-        format!("https://{}/webhook/boltz", config.domain)
-    } else {
-        format!(
-            "https://{}/webhook/boltz/{}",
-            config.domain, config.boltz_webhook_url_secret
-        )
-    };
+    // Boltz does not HMAC-sign webhook deliveries; every registered callback
+    // therefore carries the required URL-path secret. Config validation rejects
+    // an absent or empty secret in every runtime mode before startup reaches
+    // this point.
+    let webhook_url = format!(
+        "https://{}/webhook/boltz/{}",
+        config.domain, config.boltz_webhook_url_secret
+    );
     let boltz_service = boltz::BoltzService::new(
         &config.boltz.api_url,
         swap_master_key,
@@ -327,11 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "boltz service initialized ({}) webhook=https://{}/webhook/boltz/{}",
             config.boltz.api_url,
             config.domain,
-            if config.boltz_webhook_url_secret.is_empty() {
-                "<unauthenticated>"
-            } else {
-                "<redacted>"
-            }
+            "<redacted>"
         );
     } else {
         tracing::error!(
@@ -916,9 +906,7 @@ fn build_router(state: AppState) -> Router {
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/sw.js", get(donation_render::service_worker))
         .route("/qr.svg", get(qr::generate))
-        // See docs/compatibility-ledger.md for webhook compatibility policy.
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
-        .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
         .route("/ready", get(readiness::ready))
         .route("/version", get(version::version))

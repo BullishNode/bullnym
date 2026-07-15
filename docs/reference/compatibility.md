@@ -4,18 +4,6 @@ This file tracks compatibility surfaces that intentionally remain in the
 server. Code comments should point here instead of restating full removal
 policy inline.
 
-## Boltz Webhook URL
-
-- Current path: `/webhook/boltz/:secret`
-- Compatibility path: `/webhook/boltz`
-- Compatibility reason: dev and older deployments may not configure
-  `BOLTZ_WEBHOOK_URL_SECRET`.
-- Safety behavior: when `boltz_webhook_url_secret` is configured, the
-  unauthenticated path refuses requests.
-- Removal condition: all deployed environments set
-  `BOLTZ_WEBHOOK_URL_SECRET`, and all in-flight swaps created before the
-  secret rollout have either settled or expired.
-
 ## Registration Lookup Quota Fields
 
 - Current field: `quota`

@@ -1636,8 +1636,8 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         config.swap_mnemonic = std::env::var("SWAP_MNEMONIC")
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
-        config.boltz_webhook_url_secret =
-            std::env::var("BOLTZ_WEBHOOK_URL_SECRET").unwrap_or_default();
+        config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
+            .map_err(|_| "BOLTZ_WEBHOOK_URL_SECRET environment variable is required")?;
         config.boltz_webhook_url_secret_previous =
             std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
 
@@ -1669,6 +1669,9 @@ impl Config {
             return Err("pool_size must be > 0".into());
         }
         validate_http_endpoint("boltz.api_url", &self.boltz.api_url)?;
+        if self.boltz_webhook_url_secret.is_empty() {
+            return Err("BOLTZ_WEBHOOK_URL_SECRET must be non-empty".into());
+        }
         validate_webhook_secret("BOLTZ_WEBHOOK_URL_SECRET", &self.boltz_webhook_url_secret)?;
         validate_webhook_secret(
             "BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS",
@@ -1799,11 +1802,6 @@ impl Config {
         &self,
         allow_public_listen: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.boltz_webhook_url_secret.is_empty() {
-            return Err(
-                "BOLTZ_WEBHOOK_URL_SECRET must be set when BULLNYM_RUNTIME_MODE=production".into(),
-            );
-        }
         let host = domain_host(&self.domain)?;
         let loopback_ip = host
             .trim_matches(|character| matches!(character, '[' | ']'))
