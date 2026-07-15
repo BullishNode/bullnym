@@ -17,10 +17,12 @@ baseline reported clean build
 `060_lnurl_private_comment_intents`, and permanent-name policy
 `permanent_names_v1`.
 
-The complete server/PWA behavior described below is now deployed release
-source `0f459fff770d4eef24e7858b7c546e652846ed08`, tree
-`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, with expected schema
-`063_checkout_private_memo`. It includes:
+The complete server/PWA behavior described below is current merged source
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
+`203abc2352b7d06819e383b56c91b99f113633eb`, with expected schema
+`063_checkout_private_memo`. This source has merged, but this manual does not
+yet claim that its final artifact is installed or journey-certified. It
+includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
 - one stable Liquid destination per invoice and first-observation fiat
@@ -50,25 +52,48 @@ allocator-only reverse/orphan history, while provider-ahead, missing/local-
 behind lineage, chain-inventory, and witness disagreements remain fail-closed.
 
 At 2026-07-15 19:01 UTC, the server reran migration 063 as already applied and
-installed the exact current source above. The installed and running binary
-SHA-256 is
-`4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`;
-the active release-record SHA-256 is
-`7fd67f488b3e334636259423162b344c754cc8059787bc729d6aa7a374bf8cf7`;
-the server-hosted PWA content SHA-256 is
+installed PR #182 source `0f459fff770d4eef24e7858b7c546e652846ed08`.
+PR #183 then corrected the Unix timestamp projection exposed by the next
+no-funds run. PostgreSQL can round a fractional epoch when it is cast directly
+to an integer, which could advertise an exclusive deadline one second later
+than the stored instant. PR #183 floors every projected invoice timestamp.
+The most recently verified installed production source before the final PR
+#185 promotion is PR #183 merge
+`71203f082b8f09c7f257bc1cd53ba981f71924f2`, tree
+`3b5ce89b2e205f724f1969866534feba3e7e43c4`. Its installed and running
+binary SHA-256 is
+`d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`;
+its active release-record SHA-256 is
+`f43abde09473e24f7ef55a96bd1c0fdb64510c5e3fd2b3b12cfa914a58ba88f5`;
+and its server-hosted PWA content SHA-256 is
 `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`.
-Public `/version` matched the current commit, clean production build, schema,
-and permanent-name policy. Startup recovery was consistent, and another three
-Bitcoin and three Liquid fee-refresh observations passed without a bad sample
-or admission closure.
 
-This proves the current server deployment identity and observed readiness; it
-does not complete the two payment-journey certificates. Their explicit status
-is `PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
-`PENDING_FINAL_LIVE_CERTIFICATION`. A rail can still close whenever its own
-safety foundation degrades, so use only methods the current page offers. This
-release changes the server-hosted PWA; it does not include a mobile-wallet
-release.
+The subsequent zero-spend production run exposed two more server boundaries,
+both fixed in merged PR #185. First, a direct-payment watcher used the raw
+outer expiry instead of the configured payment-grace deadline. On an
+evidence-free fiat invoice it could also project `underpaid`, even though no
+positive payment existed. Current merged source keeps an evidence-free invoice
+`unpaid` during payment grace, moves it to `expired` after grace, and reserves
+`underpaid` for positive partial credit. Second, the live fixed-checkout Boltz
+response omitted `onchainAmount` after accepting that exact amount in the
+request. Current merged source accepts only that omission on the fixed-checkout
+path and fills it from the immutable request amount; a present mismatch, null,
+duplicate, or otherwise malformed value still fails closed, and ordinary
+reverse-swap responses remain strict.
+
+The final PR #185 production evidence remains deliberately incomplete:
+
+- deployed binary/artifact SHA-256: `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
+- active release-record SHA-256: `PENDING_FINAL_RELEASE_RECORD_SHA256`;
+- zero-spend/no-funds journey: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
+- bounded live-Liquid and recycler journey:
+  `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
+- certification-authority cleanup and final audit:
+  `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
+
+A rail can still close whenever its own safety foundation degrades, so use only
+methods the current page offers. The work described here is server/PWA source;
+it does not include a mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -265,6 +290,12 @@ shows a remaining balance. A small configured tolerance can count a slight
 shortfall as paid; the server owns that calculation. Do not calculate it from
 the screen yourself.
 
+The outer invoice deadline closes new instructions, while the server's bounded
+payment-grace window lets already-sent direct payments finish observation. An
+invoice with no payment evidence remains `unpaid` during that grace and becomes
+`expired`, not `underpaid`, after grace. `Underpaid` requires positive partial
+credit; the label is never synthesized merely because time passed.
+
 If more arrives, the overpayment remains recorded. Bullnym does not
 automatically refund an overpayment. The merchant should compare the invoice,
 actual received value, rail, and settlement status before deciding what to do.
@@ -455,21 +486,21 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Historical baseline behavior was checked against the first deployed probe
-above. Current-release behavior was checked against Bullnym source and tests at
-`0f459fff770d4eef24e7858b7c546e652846ed08`, tree
-`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, plus the
+above. Current merged behavior was checked against Bullnym source and tests at
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
+`203abc2352b7d06819e383b56c91b99f113633eb`, plus the
 product/API/architecture documents in this repository and the locked
 completion-plan, rationale, server/PWA gap-audit, and schema-063 cutover records
 maintained outside this repository.
 
 The historical read-only certification proves the schema-062 deployment
 identity at its observed time. The later schema-063 cutover records, public
-probes, and artifact digests separately prove the current deployment identity
-and public readiness. Exact hotfix startup evidence reported a consistent
-recovery pass; the Operator Manual records that evidence and its limits. The
-schema-062 and first schema-063 no-funds failures and their closed funds
-boundaries are recorded there. Migration, artifact, running process, public
-version, startup recovery, and repeated fee-cycle evidence prove the current
-schema-063 deployment. The only outstanding journey fields are
-`PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
-`PENDING_FINAL_LIVE_CERTIFICATION`.
+probes, and artifact digests separately prove each recorded deployment identity
+and public-readiness observation through installed PR #183. Exact hotfix
+startup evidence reported a consistent recovery pass; the Operator Manual
+records that evidence and its limits. The schema-062 and schema-063 no-funds
+failures and their closed funds boundaries are recorded there. Merged PR #185
+source is newer than that installed evidence. Its final artifact, release
+record, no-funds journey, bounded live-Liquid/recycler journey, and
+certification cleanup/audit remain the conspicuous `PENDING_FINAL_*` fields in
+the release-status section; none may be inferred from merge status.

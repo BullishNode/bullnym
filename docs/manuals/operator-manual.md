@@ -14,8 +14,9 @@ certification evidence:
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
 | **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
-| **Deployed schema-063 release** | Migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves deployment identity and readiness at the observed times, not the unfinished payment journeys. |
-| **Journey-certified production release** | Use this label only after the final schema-063 no-funds smoke and bounded live-money journey pass and certification authority is removed. Those two results remain explicit placeholders below. |
+| **Verified installed schema-063 release** | Through PR #183, migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves that deployment identity and readiness at the observed times, not the unfinished payment journeys. |
+| **Current merged source** | PR #185 exact main contains the final runtime fixes described below. A merge and green source tests are not evidence that its artifact is installed, running, or journey-certified. |
+| **Journey-certified production release** | Use this label only after the final PR #185 artifact and release record are verified, the schema-063 no-funds smoke and bounded live-Liquid/recycler journey pass, and certification authority is removed with a clean final audit. Those results remain explicit placeholders below. |
 
 Exact revisions used for this manual:
 
@@ -30,10 +31,14 @@ Exact revisions used for this manual:
 - first schema-063 exact-main CI: run `29407076211`, terminal success at 2026-07-15 10:33:38 UTC;
 - first schema-063 deployed binary SHA-256: `2ab891a3c372cf5f619c0a702beb099bd5b80f447f571d2fb66c1c2a3a3c9a5b`;
 - first schema-063 deployed release-record SHA-256: `652819a2c8a4e8812b1c8722b742aba200a8cee33ade69697b72fcb35b92de56`;
-- current production source: PR #182 merge `0f459fff770d4eef24e7858b7c546e652846ed08`, tree `b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`, expected schema `063_checkout_private_memo`;
-- current installed and running binary SHA-256: `4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`;
-- current active release-record SHA-256: `7fd67f488b3e334636259423162b344c754cc8059787bc729d6aa7a374bf8cf7`;
-- current PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
+- prior schema-063 production source: PR #182 merge `0f459fff770d4eef24e7858b7c546e652846ed08`, tree `b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`;
+- most recently verified installed production source: PR #183 merge `71203f082b8f09c7f257bc1cd53ba981f71924f2`, tree `3b5ce89b2e205f724f1969866534feba3e7e43c4`, expected schema `063_checkout_private_memo`;
+- most recently verified installed and running binary SHA-256: `d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`;
+- most recently verified active release-record SHA-256: `f43abde09473e24f7ef55a96bd1c0fdb64510c5e3fd2b3b12cfa914a58ba88f5`;
+- most recently verified PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
+- current merged source awaiting final deployment evidence: PR #185 merge `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree `203abc2352b7d06819e383b56c91b99f113633eb`, expected schema `063_checkout_private_memo`;
+- final deployed PR #185 artifact SHA-256: `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
+- final active PR #185 release-record SHA-256: `PENDING_FINAL_RELEASE_RECORD_SHA256`;
 - certification harness source: `65f46fa70fa41cd99f291a54af0970d5304a72cb`, clean, simulator SHA-256 `663613f01315390d1a59cdb179ccfcfd0def238635a2cc2d1c5b7a9984d3ecdd`;
 - protected production configuration SHA-256 after the test-certification
   allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`; the forward deploy verified that configuration and the runtime environment were byte-preserved.
@@ -129,18 +134,60 @@ state, unsafe chain inventory, and witness disagreement still fail closed.
 
 At 2026-07-15 19:01 UTC, the qualified forward installer reran migration 063
 as `already_applied`, fast-forwarded production from `f91cc7d...` to exact
-`0f459fff...`, and activated the current verified artifact above. Startup
+`0f459fff...`, and activated that verified artifact. Startup
 reported one consistent recovery pass, zero inconsistent passes, and zero
 unavailable passes. Public `/version` reported exact `0f459fff...`, clean
 production mode, schema `063_checkout_private_memo`, and permanent-name policy.
 Three further Bitcoin and three Liquid fee-refresh observations passed with
-zero bad samples and zero admission closures. This is deployed and ready
-server evidence; it is not yet a completed payment-journey certificate.
+zero bad samples and zero admission closures.
+
+The next zero-spend run found a timestamp-contract defect before any funds
+gate. PostgreSQL's direct floating-point epoch-to-`BIGINT` cast rounded some
+fractional timestamps, so the API could advertise an exclusive deadline one
+second later than the stored instant used by database comparisons. PR #183
+replaced those projections with an explicit floor. Its exact merge
+`71203f082b8f09c7f257bc1cd53ba981f71924f2` is the most recently verified
+installed production source recorded above. This evidence establishes that
+installation identity; it is not a final journey certificate.
+
+The subsequent zero-spend run passed its earlier stages and then exposed the
+first of two boundaries fixed by PR #185. The direct-payment watcher compared
+the raw invoice expiry to `NOW()` while the rest of the accounting policy
+allows a configured payment-grace interval. An empty post-expiry scan of an
+evidence-free fiat invoice could therefore synthesize `underpaid` with null
+paid fields and fail the database constraint, repeatedly preventing the batch
+from advancing. Current merged source binds the exact grace interval in both
+locked direct-payment projections and the legacy recorder. With no payment
+evidence the invoice remains `unpaid` during grace and becomes `expired` after
+grace; `underpaid` remains reserved for positive partial credit.
+
+Production provider evidence also showed that the live fixed-checkout Boltz
+create endpoint can accept the exact request `onchainAmount` and `pairHash` but
+omit `onchainAmount` from its successful response. The pinned generic SDK type
+required the echo and rejected that otherwise complete response. PR #185 adds
+a fixed-checkout-only typed compatibility envelope: an omitted amount is
+normalized from the immutable request authority. If the provider does return
+the field, it must exactly match; explicit null, duplicate known fields,
+malformed values, and request/response mismatches still fail closed. The
+ordinary reverse-swap decoder remains strict, and no response can replace the
+persisted request amount or pair hash.
+
+PR #185 is merged at exact main
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
+`203abc2352b7d06819e383b56c91b99f113633eb`. This manual does not yet claim
+that its artifact is installed, running, or journey-certified.
 
 The only deliberately unresolved evidence fields in this revision are:
 
+- final deployed PR #185 binary/artifact SHA-256:
+  `PENDING_FINAL_DEPLOYED_ARTIFACT_SHA256`;
+- final active PR #185 release-record SHA-256:
+  `PENDING_FINAL_RELEASE_RECORD_SHA256`;
 - final no-funds schema-063 result: `PENDING_FINAL_NO_FUNDS_CERTIFICATION`;
-- final bounded live-money/recycler result: `PENDING_FINAL_LIVE_CERTIFICATION`.
+- final bounded live-Liquid/recycler result:
+  `PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`;
+- certification-authority removal and final APP/TEST/DB audit:
+  `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
 
 Deployment provenance is bound to the private cutover records by SHA-256:
 
@@ -328,13 +375,17 @@ It moved no funds, called no provider, and made only public `GET` requests to
 `/version`, `/health`, and `/ready`. Treat it as deployment-identity and public-
 readiness evidence, not as schema-062 smoke or live-money certification.
 
-The current production marker is exactly `063_checkout_private_memo`. Use
-current merged commit `0f459fff770d4eef24e7858b7c546e652846ed08`, artifact
-digest `4be66861075736d68a279358839b625290e140044edac173e0901dab850708e3`,
+The production marker is exactly `063_checkout_private_memo`. The most recently
+verified installed identity is PR #183 merge
+`71203f082b8f09c7f257bc1cd53ba981f71924f2`, artifact digest
+`d486bc2c311299c533c99f3005fe88a96ec36b77cda96f1652bbdf56914b97dc`,
 PWA digest `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`,
-and this schema marker for installed identity checks. Never reuse the
-schema-062 certification report as proof of the current release, and never
-substitute deployment identity for either pending journey result.
+and this schema marker. Current merged source is newer PR #185 exact main
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`; use its final artifact and release
+record only after the two corresponding `PENDING_FINAL_*` digests are replaced
+with observed values. Never reuse the schema-062 certification report as proof
+of the current release, and never substitute merge or deployment identity for
+a pending journey result.
 
 The production configuration supports a narrowly scoped certification bypass
 for exactly one allowlisted source, the TEST VM, and exactly these five scopes:
@@ -533,7 +584,7 @@ Validate pair, currency, precision, positive finite rate, source,
 last-known-good observation may be used only within policy. When no trustworthy
 fresh rate exists, pause new fiat quote creation; do not guess.
 
-The current schema-063 release keeps a fiat invoice's currency and minor-unit
+Current merged schema-063 source keeps a fiat invoice's currency and minor-unit
 face value as its only denomination authority; `amount_sat` remains zero. Until
 the first quote, `rate_minor_per_btc` remains null and
 `rate_locks_until_unix` is the zero no-lock sentinel. A payer
@@ -545,6 +596,12 @@ snapshot. The PWA retires every displayed instruction at the exclusive expiry,
 disables QR/copy while replacement is pending, rejects late responses from a
 retired version, and publishes the replacement amount, cost, QR, and copy value
 as one unit.
+
+All projected Unix invoice timestamps use
+`FLOOR(EXTRACT(EPOCH FROM value))::BIGINT`. A direct cast can round a fractional
+PostgreSQL timestamp up by one second and contradict the exclusive database
+deadline. Do not replace the explicit floor or certify a deadline from a
+rounded projection.
 
 Instruction authority differs by product and rail:
 
@@ -564,6 +621,13 @@ snapshot that covered that observation boundary. If no such snapshot can be
 made, retain the payment and observation as visible but unvalued/in-progress;
 do not borrow a later rate. Reorg or replay changes active accounting state,
 not the immutable event valuation evidence.
+
+Direct-payment lifecycle projection uses the configured payment-grace interval,
+not the raw outer invoice expiry. Every locked reducer read and the legacy
+payment recorder must use the same grace boundary. Evidence-free fiat state is
+`unpaid` during grace and `expired` after it; only positive partial credit can
+be `underpaid`. A direct observation batch that cannot persist this coherent
+projection must fail and retry without advancing its applied generation.
 
 Transaction fees are construction-time authority, not the public Bullnym
 `/api/v1/rate` endpoint:
@@ -615,6 +679,15 @@ records the one-way dispatch boundary before the POST, and commits provider
 completion together with the quote offer and swap. A process that finds a
 dispatched but incomplete attempt does not own another POST: it restores and
 validates the provider result, or writes a durable integrity hold.
+
+For the fixed-checkout reverse-create path only, live Boltz may omit
+`onchainAmount` from a successful response after accepting the exact amount and
+`pairHash` in the request. Current merged source normalizes only an absent
+response field from the immutable request amount. A present amount must match
+exactly; explicit null, duplicate known fields, malformed values, and mismatches
+are protocol failures. Do not broaden this compatibility rule to ordinary
+reverse creation, infer an amount from other response fields, or weaken the
+persisted request/pair contract.
 
 The merged release can reconstruct chain-create results only from validated
 Boltz xpub restore evidence matching the persisted request. The pinned reverse-swap
@@ -839,12 +912,17 @@ rejected a valid private note. Its preceding no-funds stages passed, its funds
 gate remained closed, and it moved no funds. PRs #179 and #180 supplied the
 first schema-063 deployment. The first schema-063 no-funds attempt then found
 the pre-quote projection and allocator-only startup-lineage defects described
-above, still before the live-money gate. PR #182 and the upgraded harness are
-now deployed/staged respectively, but the final outcomes remain
-`PENDING_FINAL_NO_FUNDS_CERTIFICATION` and
-`PENDING_FINAL_LIVE_CERTIFICATION`. Neither the disabled timer, deployment
-identity, offline precheck, nor the earlier schema-062 certification
-substitutes for those two final results.
+above, still before the live-money gate. PR #182 was deployed and the upgraded
+harness staged. Later zero-spend runs exposed the rounded timestamp projection
+fixed by installed PR #183, then the direct-payment grace/projection defect and
+fixed-checkout Boltz response compatibility fixed by merged PR #185. Every
+failed run kept its spend and broadcast boundary at zero; it is defect evidence,
+not a passing certificate. The final PR #185 outcomes remain
+`PENDING_FINAL_NO_FUNDS_CERTIFICATION`,
+`PENDING_FINAL_LIVE_LIQUID_RECYCLER_CERTIFICATION`, and
+`PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`. Neither the disabled timer, merge
+status, deployment identity, offline precheck, nor the earlier schema-062
+certification substitutes for those results.
 
 Current harness commands include:
 
@@ -919,13 +997,16 @@ was `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree.
 
 Schema-063 source claims were checked against migration 063, the fee-runtime
 changes, strict anonymous checkout handling, pre-quote projection, and recovery
-shadow audit at current exact main
-`0f459fff770d4eef24e7858b7c546e652846ed08`, tree
-`b0996999265fddaba1e3c5335aecf1ae7a6a4ed2`. The hosted release record,
-stopped-writer migration, exact artifact install, public version, startup
+shadow audit, explicit epoch flooring, direct-payment grace projection, and the
+fixed-checkout-only Boltz compatibility boundary at current exact main
+`c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
+`203abc2352b7d06819e383b56c91b99f113633eb`. The hosted release record,
+stopped-writer migration, exact artifact installs, public version, startup
 recovery, configuration preservation, and repeated fee cycles are observed
-deployment evidence. The two explicit certification placeholders above remain
-the only journey claims not yet recorded.
+deployment evidence only through the recorded PR #183 installation. PR #185
+merge status is source evidence, not deployment evidence. Its final artifact,
+release record, no-funds journey, live-Liquid/recycler journey, and
+certification cleanup/audit remain the explicit placeholders above.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.
