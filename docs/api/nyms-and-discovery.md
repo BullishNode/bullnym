@@ -139,9 +139,10 @@ payment, status, settlement, or recovery limits.
 ```
 
 Nyms allow lowercase ASCII letters, digits, and internal hyphens. Reserved
-route/product names are rejected. A key may have only one active nym and a
-configured lifetime quota (default deployment value: three). Deactivation does
-not restore quota. Registering a formerly owned nym reactivates it.
+route/product names are rejected. A key permanently owns exactly one nym. This
+cap is a product and database invariant, not an operator-configurable limit.
+Deactivation does not free the name or another slot. Registering the same
+formerly owned nym reactivates it.
 
 Response (`201`):
 
@@ -150,7 +151,7 @@ Response (`201`):
   "nym": "alice",
   "lightning_address": "alice@pay.example.com",
   "nip05": "alice@pay.example.com",
-  "quota": { "used": 1, "cap": 3, "remaining": 2 }
+  "quota": { "used": 1, "cap": 1, "remaining": 0 }
 }
 ```
 
@@ -194,7 +195,7 @@ payments but preserves history and allows reactivation. `purge: true` uses the
 flight. Purge never makes the nym claimable by another identity and does not
 restore lifetime quota.
 
-Response: `{ "quota": { "used": 2, "cap": 3, "remaining": 1 } }`.
+Response: `{ "quota": { "used": 1, "cap": 1, "remaining": 0 } }`.
 
 ## `GET /register/lookup?npub=<64-hex>`
 

@@ -80,7 +80,7 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 ```json
 { "details": { "nym": "alice", "domain": "pay.example.com" } }
 { "details": { "alias": "coffee" } }
-{ "details": { "quota": { "used": 3, "cap": 3, "remaining": 0 } } }
+{ "details": { "quota": { "used": 1, "cap": 1, "remaining": 0 } } }
 { "details": { "pending_count": 2 } }
 { "details": { "min_sat": 1000 } }
 ```

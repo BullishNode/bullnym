@@ -361,6 +361,21 @@ enable = true
 }
 
 #[test]
+fn permanent_nym_cap_is_not_operator_configurable() {
+    for configured_cap in [1, 3] {
+        let input = format!("max_lifetime_nyms_per_npub = {configured_cap}");
+        let error = toml::from_str::<LimitsConfig>(&input)
+            .expect_err("the permanent-name invariant must not be configurable")
+            .to_string();
+
+        assert!(
+            error.contains("unknown field `max_lifetime_nyms_per_npub`"),
+            "unexpected parse error for cap {configured_cap}: {error}"
+        );
+    }
+}
+
+#[test]
 fn checked_in_config_keeps_legacy_alias_compatibility() {
     let parsed: Config = toml::from_str(include_str!("../../config.toml")).unwrap();
 

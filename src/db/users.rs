@@ -243,7 +243,6 @@ pub async fn register_user_atomic(
     nym: &str,
     ct_descriptor: &str,
     verification_npub: Option<&str>,
-    _legacy_cap: i64,
     max_active_users: i64,
 ) -> Result<RegisterOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
