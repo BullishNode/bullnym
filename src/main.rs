@@ -1020,10 +1020,6 @@ fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/invoices/:id/quote",
                 post(invoice::payer_demand_quote).layer(DefaultBodyLimit::max(1024)),
-            )
-            .route(
-                "/api/v1/invoices/:id/liquid",
-                post(invoice::fetch_liquid_offer),
             );
     }
 
