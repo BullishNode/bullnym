@@ -18,6 +18,7 @@ use boltz_client::swaps::boltz::{
     CreateReverseResponse, GetChainPairsResponse, GetReversePairsResponse, GetSwapResponse,
     HeightResponse,
 };
+use sha2::{Digest, Sha256};
 
 use crate::boltz::{ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
 
@@ -138,7 +139,7 @@ impl BoltzTransport for HttpBoltzTransport {
             "pairHash".into(),
             serde_json::Value::String(pair_hash.to_owned()),
         );
-        let response = self
+        let mut response = self
             .quote_client
             .post(format!(
                 "{}/swap/reverse",
@@ -150,18 +151,62 @@ impl BoltzTransport for HttpBoltzTransport {
             .await
             .map_err(|error| BoltzClientError::HTTP(error.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .json::<serde_json::Value>()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({ "error": "invalid provider error" }));
-            return Err(BoltzClientError::HTTPStatusNotSuccess(status, body));
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 128 && value.is_ascii())
+            .unwrap_or("<missing-or-invalid>")
+            .to_owned();
+        const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| BoltzClientError::HTTP(error.to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(BoltzClientError::Protocol(format!(
+                    "fixed-checkout reverse response exceeded {MAX_RESPONSE_BYTES} bytes: status={status} content_type={content_type}"
+                )));
+            }
+            body.extend_from_slice(&chunk);
         }
-        response.json().await.map_err(|error| {
-            BoltzClientError::Protocol(format!(
-                "fixed-checkout reverse response was invalid: {error}"
-            ))
-        })
+        let body_sha256 = hex::encode(Sha256::digest(&body));
+        let (safe_keys, unknown_key_count) = safe_reverse_response_keys(&body);
+        if !status.is_success() {
+            return Err(BoltzClientError::HTTPStatusNotSuccess(
+                status,
+                serde_json::json!({
+                    "error": "fixed-checkout reverse provider returned non-success",
+                    "contentType": content_type,
+                    "bodySize": body.len(),
+                    "bodySha256": body_sha256,
+                    "safeTopLevelKeys": safe_keys,
+                    "unknownTopLevelKeyCount": unknown_key_count,
+                }),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&body);
+        serde_path_to_error::deserialize::<_, CreateReverseResponse>(&mut deserializer).map_err(
+            |error| {
+                let inner = error.inner();
+                let serde_error = match inner.classify() {
+                    serde_json::error::Category::Io => "io",
+                    serde_json::error::Category::Syntax => "syntax",
+                    serde_json::error::Category::Data => "data",
+                    serde_json::error::Category::Eof => "eof",
+                };
+                let path = safe_serde_path(&error.path().to_string());
+                BoltzClientError::Protocol(format!(
+                    "fixed-checkout reverse response was invalid: status={status} content_type={content_type} body_size={} body_sha256={body_sha256} serde_path={path} serde_error={serde_error}@{}:{} safe_top_level_keys=[{}] unknown_top_level_key_count={unknown_key_count}",
+                    body.len(),
+                    inner.line(),
+                    inner.column(),
+                    safe_keys.join(","),
+                ))
+            },
+        )
     }
 
     async fn create_chain(
@@ -213,6 +258,45 @@ impl BoltzTransport for HttpBoltzTransport {
                 terminal_evidence_sha256: None,
             })?;
         Ok(BoltzQuoteHttpResponse { status, body })
+    }
+}
+
+fn safe_reverse_response_keys(body: &[u8]) -> (Vec<&'static str>, usize) {
+    const ALLOWED: &[&str] = &[
+        "id",
+        "invoice",
+        "swapTree",
+        "lockupAddress",
+        "refundPublicKey",
+        "timeoutBlockHeight",
+        "onchainAmount",
+        "blindingKey",
+    ];
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(body) else {
+        return (Vec::new(), 0);
+    };
+    let mut found: Vec<_> = ALLOWED
+        .iter()
+        .copied()
+        .filter(|key| object.contains_key(*key))
+        .collect();
+    found.sort_unstable();
+    let unknown = object.len().saturating_sub(found.len());
+    (found, unknown)
+}
+
+fn safe_serde_path(path: &str) -> String {
+    if path.is_empty() {
+        return "<root>".into();
+    }
+    if path.len() <= 128
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._[]".contains(&byte))
+    {
+        path.to_owned()
+    } else {
+        "<redacted>".into()
     }
 }
 
@@ -292,15 +376,26 @@ pub enum ScriptedBoltzCall {
     GetReversePairs,
     GetChainPairs,
     GetHeight,
-    CreateReverse { amount_sat: Option<u64> },
+    CreateReverse {
+        amount_sat: Option<u64>,
+    },
     CreateFixedCheckoutReverse {
         onchain_amount_sat: u64,
         pair_hash: String,
     },
-    CreateChain { server_lock_amount_sat: Option<u64> },
-    GetSwap { swap_id: String },
-    Quote { swap_id: String },
-    AcceptQuote { swap_id: String, amount_sat: u64 },
+    CreateChain {
+        server_lock_amount_sat: Option<u64>,
+    },
+    GetSwap {
+        swap_id: String,
+    },
+    Quote {
+        swap_id: String,
+    },
+    AcceptQuote {
+        swap_id: String,
+        amount_sat: u64,
+    },
 }
 
 /// Thread-safe one-shot script used by restart tests and worker harnesses.
@@ -435,9 +530,9 @@ impl BoltzTransport for ScriptedBoltzTransport {
             } if expected_amount == onchain_amount_sat && expected_hash == pair_hash => {
                 (*result).map_err(ScriptedBoltzError::into_client_error)
             }
-            ScriptedBoltzStep::CreateFixedCheckoutReverse { .. } => Err(
-                BoltzClientError::Generic("scripted fixed-checkout request mismatch".into()),
-            ),
+            ScriptedBoltzStep::CreateFixedCheckoutReverse { .. } => Err(BoltzClientError::Generic(
+                "scripted fixed-checkout request mismatch".into(),
+            )),
             _ => unreachable!("step kind checked"),
         }
     }
@@ -583,5 +678,26 @@ impl ScriptedBoltzWebhookPlan {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod response_diagnostic_tests {
+    use super::{safe_reverse_response_keys, safe_serde_path};
+
+    #[test]
+    fn response_diagnostics_never_copy_provider_values_or_unknown_key_names() {
+        let body = br#"{"id":"secret-value","swapTree":{},"secret-in-key-name":"secret"}"#;
+        let (keys, unknown) = safe_reverse_response_keys(body);
+        assert_eq!(keys, vec!["id", "swapTree"]);
+        assert_eq!(unknown, 1);
+        assert!(!format!("{keys:?}").contains("secret"));
+    }
+
+    #[test]
+    fn serde_paths_are_bounded_to_safe_field_syntax() {
+        assert_eq!(safe_serde_path("swapTree.claimLeaf"), "swapTree.claimLeaf");
+        assert_eq!(safe_serde_path("field\nsecret"), "<redacted>");
+        assert_eq!(safe_serde_path(&"a".repeat(129)), "<redacted>");
     }
 }

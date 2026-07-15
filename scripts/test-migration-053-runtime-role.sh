@@ -299,7 +299,8 @@ scripts/check-migration-058-boundary.sh \
 for later_migration in \
   migrations/059_remove_surface_alias.sql \
   migrations/060_lnurl_private_comment_intents.sql \
-  migrations/061_invoice_quote_versions.sql; do
+  migrations/061_invoice_quote_versions.sql \
+  migrations/062_invoice_quote_provider_attempts.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \

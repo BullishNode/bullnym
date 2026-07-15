@@ -1492,14 +1492,22 @@ async fn invoice_quote_foundation_invariants_present(
         "SELECT COALESCE(( \
             to_regclass('public.invoice_quote_versions') IS NOT NULL \
             AND to_regclass('public.invoice_quote_offers') IS NOT NULL \
+            AND to_regclass('public.invoice_quote_provider_attempts') IS NOT NULL \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
+                    ('invoices', 'invoices_pricing_amount_authority_check', 'c'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_pkey', 'p'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_invoice_number_key', 'u'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_window_check', 'c'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_pkey', 'p'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_request_key', 'u'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_quote_invoice_fkey', 'f'), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_pkey', 'p'), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_identity_key', 'u'), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_quote_invoice_fkey', 'f'), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_shape_check', 'c'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_provider_attempt_shape_check', 'c'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_provider_attempt_fkey', 'f'), \
                     ('swap_records', 'swap_records_invoice_quote_shape_check', 'c'), \
                     ('swap_records', 'swap_records_invoice_quote_offer_fkey', 'f'), \
                     ('chain_swap_records', 'chain_swap_records_invoice_quote_shape_check', 'c'), \
@@ -1532,6 +1540,14 @@ async fn invoice_quote_foundation_invariants_present(
                      'reject_invoice_quote_offer_mutation', 19), \
                     ('invoice_quote_offers', 'invoice_quote_offers_reject_delete', \
                      'reject_invoice_quote_offer_mutation', 11), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_enforce_insert', \
+                     'enforce_invoice_quote_provider_attempt_insert', 7), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_reject_update', \
+                     'reject_invoice_quote_provider_attempt_mutation', 19), \
+                    ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_reject_delete', \
+                     'reject_invoice_quote_provider_attempt_mutation', 11), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_enforce_attempt_binding', \
+                     'enforce_invoice_quote_offer_attempt_binding', 7), \
                     ('swap_records', 'swap_records_guard_quote_attribution', \
                      'guard_swap_quote_attribution', 19), \
                     ('chain_swap_records', 'chain_swap_records_guard_quote_attribution', \
@@ -1596,6 +1612,13 @@ async fn invoice_quote_foundation_invariants_present(
             AND NOT has_table_privilege(current_user, 'public.invoice_quote_offers', 'DELETE') \
             AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'request_key', 'INSERT') \
             AND NOT has_column_privilege(current_user, 'public.invoice_quote_offers', 'created_at', 'INSERT') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'provider_attempt_id', 'INSERT') \
+            AND has_table_privilege(current_user, 'public.invoice_quote_provider_attempts', 'SELECT') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_provider_attempts', 'UPDATE') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_provider_attempts', 'DELETE') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_provider_attempts', 'TRUNCATE') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_provider_attempts', 'request_key', 'INSERT') \
+            AND NOT has_column_privilege(current_user, 'public.invoice_quote_provider_attempts', 'created_at', 'INSERT') \
             AND NOT EXISTS ( \
                 SELECT 1 FROM pg_class relation \
                 CROSS JOIN LATERAL aclexplode(COALESCE( \
@@ -1603,7 +1626,8 @@ async fn invoice_quote_foundation_invariants_present(
                 )) acl \
                 WHERE relation.oid IN ( \
                     to_regclass('public.invoice_quote_versions'), \
-                    to_regclass('public.invoice_quote_offers') \
+                    to_regclass('public.invoice_quote_offers'), \
+                    to_regclass('public.invoice_quote_provider_attempts') \
                 ) AND acl.grantee = 0 \
             ) \
         ), FALSE)"

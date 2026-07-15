@@ -205,6 +205,7 @@ pub struct InvoiceQuoteOffer {
     pub request_key: String,
     pub provider: Option<String>,
     pub provider_offer_id: Option<String>,
+    pub provider_attempt_id: Option<Uuid>,
     pub payer_amount_sat: i64,
     pub created_at_unix: i64,
     pub expires_at_unix: i64,
@@ -212,7 +213,7 @@ pub struct InvoiceQuoteOffer {
 
 const INVOICE_QUOTE_OFFER_COLUMNS: &str =
     "id, invoice_id, quote_version_id, rail, offer_kind, request_key, \
-     provider, provider_offer_id, payer_amount_sat, \
+     provider, provider_offer_id, provider_attempt_id, payer_amount_sat, \
      FLOOR(EXTRACT(EPOCH FROM created_at))::BIGINT AS created_at_unix, \
      FLOOR(EXTRACT(EPOCH FROM expires_at))::BIGINT AS expires_at_unix";
 
@@ -225,6 +226,7 @@ pub struct NewInvoiceQuoteOffer<'a> {
     pub request_key: &'a str,
     pub provider: Option<&'a str>,
     pub provider_offer_id: Option<&'a str>,
+    pub provider_attempt_id: Option<Uuid>,
     pub payer_amount_sat: i64,
     pub expires_at_unix: i64,
 }
@@ -384,7 +386,7 @@ pub async fn insert_invoice(
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
                  NOW() + ($8 || ' seconds')::interval, $9, $10, \
                  $11, $12, $13, $14, $15, $16, $17, \
-                 CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
+                 CASE WHEN $4::INTEGER IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
                  $20, NOW() + ($19 || ' seconds')::interval, 'unpaid') \
          RETURNING {INVOICE_COLUMNS}"
     ))
@@ -547,7 +549,19 @@ pub async fn record_or_reuse_invoice_quote_offer(
     candidate: &NewInvoiceQuoteOffer<'_>,
 ) -> Result<InvoiceQuoteOfferResolution, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    lock_invoice_lightning_projection(&mut tx, candidate.invoice_id).await?;
+    let resolution = record_or_reuse_invoice_quote_offer_in_tx(&mut tx, candidate).await?;
+    tx.commit().await?;
+    Ok(resolution)
+}
+
+/// Transaction-aware quote-offer persistence for provider paths that must
+/// commit the immutable offer identity and canonical swap attribution on the
+/// same invoice-locking connection.
+pub async fn record_or_reuse_invoice_quote_offer_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &NewInvoiceQuoteOffer<'_>,
+) -> Result<InvoiceQuoteOfferResolution, sqlx::Error> {
+    lock_invoice_lightning_projection(tx, candidate.invoice_id).await?;
 
     if let Some(offer) = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
         "SELECT {INVOICE_QUOTE_OFFER_COLUMNS} \
@@ -557,13 +571,14 @@ pub async fn record_or_reuse_invoice_quote_offer(
     .bind(candidate.quote_version_id)
     .bind(candidate.rail)
     .bind(candidate.request_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     {
         if offer.invoice_id != candidate.invoice_id
             || offer.offer_kind != candidate.offer_kind
             || offer.provider.as_deref() != candidate.provider
             || offer.provider_offer_id.as_deref() != candidate.provider_offer_id
+            || offer.provider_attempt_id != candidate.provider_attempt_id
             || offer.payer_amount_sat != candidate.payer_amount_sat
             || offer.expires_at_unix != candidate.expires_at_unix
         {
@@ -571,7 +586,6 @@ pub async fn record_or_reuse_invoice_quote_offer(
                 "invoice quote offer request key was replayed with different evidence".to_string(),
             ));
         }
-        tx.commit().await?;
         return Ok(InvoiceQuoteOfferResolution {
             offer,
             created: false,
@@ -581,13 +595,13 @@ pub async fn record_or_reuse_invoice_quote_offer(
     let offer = sqlx::query_as::<_, InvoiceQuoteOffer>(&format!(
         "INSERT INTO invoice_quote_offers ( \
              invoice_id, quote_version_id, rail, offer_kind, request_key, \
-             provider, provider_offer_id, payer_amount_sat, expires_at \
+             provider, provider_offer_id, provider_attempt_id, payer_amount_sat, expires_at \
          ) VALUES ( \
-             $1, $2, $3, $4, $5, $6, $7, $8, \
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, \
              CASE WHEN $4 = 'direct' THEN ( \
                  SELECT expires_at FROM invoice_quote_versions \
                   WHERE id = $2 AND invoice_id = $1 \
-             ) ELSE to_timestamp($9) END \
+             ) ELSE to_timestamp($10) END \
          ) \
          RETURNING {INVOICE_QUOTE_OFFER_COLUMNS}"
     ))
@@ -598,12 +612,12 @@ pub async fn record_or_reuse_invoice_quote_offer(
     .bind(candidate.request_key)
     .bind(candidate.provider)
     .bind(candidate.provider_offer_id)
+    .bind(candidate.provider_attempt_id)
     .bind(candidate.payer_amount_sat)
     .bind(candidate.expires_at_unix)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(InvoiceQuoteOfferResolution {
         offer,
         created: true,

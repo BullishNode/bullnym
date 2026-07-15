@@ -450,6 +450,10 @@ fn test_app(state: AppState) -> Router {
             post(invoice::fetch_lightning_offer),
         )
         .route(
+            "/api/v1/invoices/:id/quote",
+            post(invoice::payer_demand_quote),
+        )
+        .route(
             "/api/v1/invoices/recoverable",
             get(invoice::list_recoverable_signed),
         )
@@ -1063,6 +1067,64 @@ async fn spawn_counting_http_server() -> (String, Arc<AtomicUsize>, tokio::task:
     (format!("http://{address}"), calls, task)
 }
 
+async fn spawn_malformed_success_http_server(
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let body = br#"{"id":"provider-secret-must-not-log","unknownSecret":"redacted"}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
+async fn spawn_pricer_server(
+    minor_per_btc: i64,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let created_at = chrono::Utc::now().to_rfc3339();
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "element": {
+                        "fromCurrency": "BTC",
+                        "toCurrency": "USD",
+                        "priceCurrency": "USD",
+                        "indexPrice": minor_per_btc,
+                        "precision": 2,
+                        "createdAt": created_at,
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
 fn valid_reverse_claim_script(hashlock: hash160::Hash, receiver: &BoltzPublicKey) -> ScriptBuf {
     Builder::new()
         .push_opcode(OP_SIZE)
@@ -1612,13 +1674,32 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "061_invoice_quote_versions"
+        "062_invoice_quote_provider_attempts"
     );
 
     let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+
+    sqlx::query(
+        "ALTER TABLE invoice_quote_provider_attempts DISABLE TRIGGER \
+         invoice_quote_provider_attempts_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (mutable_attempt_status, mutable_attempt_body) = get_path(&app, "/ready").await;
+    assert_eq!(mutable_attempt_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_attempt_body["ready"], false);
+    sqlx::query(
+        "ALTER TABLE invoice_quote_provider_attempts ENABLE TRIGGER \
+         invoice_quote_provider_attempts_reject_update",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
 
     // The permanent-name registry is incomplete if immutable ownership can be
     // released, even when its columns and uniqueness constraints remain.
@@ -1760,7 +1841,10 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["expected_schema_marker"], "061_invoice_quote_versions");
+    assert_eq!(
+        body["expected_schema_marker"],
+        "062_invoice_quote_provider_attempts"
+    );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -5855,7 +5939,7 @@ async fn closed_admission_still_schedules_funded_reverse_swap_claim() {
     cleanup_db(&pool).await;
     let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
     let mut config = test_config();
-    config.boltz.api_url = boltz_url;
+    config.boltz.api_url = boltz_url.clone();
     let state = test_state_with_config(pool.clone(), config);
     state.admission.set_workers_enabled(false);
     let app = test_app(state);
@@ -11609,6 +11693,405 @@ async fn insert_test_invoice(
     .unwrap()
 }
 
+async fn insert_fiat_quote_test_invoice(
+    pool: &PgPool,
+    suffix: &str,
+    accept_ln: bool,
+) -> pay_service::db::Invoice {
+    let npub = "7".repeat(64);
+    let blinding_key = "11".repeat(32);
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "wallet",
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
+            rate_lock_secs: 300,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(&format!("lq1quote{suffix}")),
+            liquid_blinding_key_hex: Some(&blinding_key),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "quotecreationoutage").await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym: "quotecreationoutage",
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: Some(TEST_DESCRIPTOR),
+            header: "Face-only fiat creation",
+            description: "Conversion begins only at payer quote",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            pos_mode: Some(false),
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (unavailable_pricer_url, unavailable_pricer_calls, unavailable_pricer_task) =
+        spawn_counting_http_server().await;
+    let (boltz_url, provider_calls, provider_task) = spawn_counting_http_server().await;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = unavailable_pricer_url;
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let create_app = test_app(state);
+
+    let (create_status, create_body) = post_json(
+        &create_app,
+        "/quotecreationoutage/invoice",
+        json!({ "fiat_amount_minor": 1_000, "fiat_currency": "usd" }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{create_body}");
+    assert_eq!(create_body["pricing_mode"], "fiat_fixed");
+    assert!(create_body["invoice_id"].is_string());
+    assert!(create_body.get("liquid_address").is_none(), "{create_body}");
+    assert!(create_body.get("lightning_pr").is_none(), "{create_body}");
+    assert_eq!(unavailable_pricer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    let invoice_id = Uuid::parse_str(create_body["invoice_id"].as_str().unwrap()).unwrap();
+    let stored: (String, i32, String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT pricing_mode, fiat_amount_minor, fiat_currency, amount_sat, \
+                rate_minor_per_btc \
+           FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("fiat_fixed".into(), 1_000, "USD".into(), 0, None));
+    let pre_quote_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pre_quote_rows, (0, 0, 0));
+
+    let (healthy_pricer_url, healthy_pricer_calls, healthy_pricer_task) =
+        spawn_pricer_server(10_000_000).await;
+    let mut quote_config = test_config();
+    quote_config.boltz.api_url = boltz_url;
+    let mut quote_state = test_state_with_config(pool.clone(), quote_config);
+    let mut healthy_pricer_config = PricerConfig::default();
+    healthy_pricer_config.url = healthy_pricer_url;
+    quote_state.pricer = Arc::new(PricerClient::new(healthy_pricer_config).unwrap());
+    let quote_app = test_app(quote_state);
+    let (quote_status, quote_body) = post_json(
+        &quote_app,
+        &format!("/api/v1/invoices/{invoice_id}/quote"),
+        json!({ "rail": "liquid" }),
+    )
+    .await;
+    assert_eq!(quote_status, StatusCode::OK, "{quote_body}");
+    assert_eq!(quote_body["quote"]["merchant_amount_sat"], 10_000);
+    assert_eq!(quote_body["quote"]["rate_minor_per_btc"], 10_000_000);
+    assert_eq!(quote_body["instruction"]["kind"], "liquid_direct");
+    assert_eq!(healthy_pricer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    let post_quote_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1)",
+    )
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(post_quote_rows, (1, 1, 0));
+
+    unavailable_pricer_task.abort();
+    let _ = unavailable_pricer_task.await;
+    healthy_pricer_task.abort();
+    let _ = healthy_pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_liquid_quote_serializes_and_gets_never_mutate() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "serialized", false).await;
+    let chain_only_invoice = insert_fiat_quote_test_invoice(&pool, "chainavailable", true).await;
+    let chain_npub = create_test_user(&pool, "quotechainavailability").await;
+    sqlx::query(
+        "UPDATE invoices SET nym_owner = 'quotechainavailability', npub_owner = $2, \
+             accept_liquid = FALSE WHERE id = $1",
+    )
+    .bind(chain_only_invoice.id)
+    .bind(&chain_npub)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    let mut state = test_state(pool.clone());
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+
+    for path in [
+        format!("/api/v1/invoices/{}/status", invoice.id),
+        format!("/invoice/{}", invoice.id),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            assert!(json["lightning_pr"].is_null());
+            assert!(json["liquid_address"].is_null());
+            assert!(json["liquid_amount_sat"].is_null());
+            assert_eq!(json["quote_rail_availability"]["lightning"], false);
+            assert_eq!(json["quote_rail_availability"]["liquid"], true);
+            assert_eq!(json["quote_rail_availability"]["bitcoin"], false);
+        }
+    }
+    let (availability_status, availability_body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/{}/status", chain_only_invoice.id),
+    )
+    .await;
+    assert_eq!(availability_status, StatusCode::OK, "{availability_body}");
+    assert_eq!(availability_body["accept_btc"], false);
+    assert_eq!(availability_body["accept_liquid"], false);
+    assert_eq!(
+        availability_body["quote_rail_availability"],
+        json!({ "lightning": true, "liquid": false, "bitcoin": true })
+    );
+    let availability_mutations: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(chain_only_invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(availability_mutations, (0, 0, 0, 0));
+    let counts_before: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts_before, (0, 0, 0, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 0);
+
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let mut requests = Vec::new();
+    for _ in 0..12 {
+        let app = app.clone();
+        let path = path.clone();
+        requests.push(tokio::spawn(async move {
+            post_json(&app, &path, json!({ "rail": "liquid" })).await
+        }));
+    }
+    let mut bodies = Vec::new();
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        bodies.push(body);
+    }
+    let quote_id = bodies[0]["quote"]["quote_version_id"].clone();
+    let offer_id = bodies[0]["instruction"]["quote_offer_id"].clone();
+    assert!(bodies.iter().all(|body| {
+        body["pricing_mode"] == "fiat_fixed"
+            && body["selected_rail"] == "liquid"
+            && body["quote"]["quote_version_id"] == quote_id
+            && body["quote"]["version_number"] == 1
+            && body["quote"]["merchant_amount_sat"] == 10_000
+            && body["instruction"]["kind"] == "liquid_direct"
+            && body["instruction"]["quote_offer_id"] == offer_id
+            && body["instruction"]["payer_amount_sat"] == 10_000
+    }));
+
+    let counts_after: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM chain_swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts_after, (1, 1, 0, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerfailure", true).await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+
+    let (failed_status, failed_body) = post_json(&app, &path, json!({ "rail": "lightning" })).await;
+    // Bullnym's legacy JSON error envelope intentionally uses HTTP 200; the
+    // stable `code` discriminates failure from the typed quote response.
+    assert_eq!(failed_status, StatusCode::OK, "{failed_body}");
+    assert_eq!(failed_body["code"], "BoltzError");
+    assert!(failed_body.get("instruction").is_none());
+    let safe_error = failed_body.to_string();
+    assert!(!safe_error.contains("provider-secret-must-not-log"));
+    let quote_after_failure: (Uuid, i32) = sqlx::query_as(
+        "SELECT id, version_number FROM invoice_quote_versions WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let provider_offers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(provider_offers, 0);
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts, 1);
+
+    // A fresh AppState models a process restart: the durable attempt, not an
+    // in-memory latch, must prevent a second remote obligation.
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = boltz_url;
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (retry_status, retry_body) =
+        post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+    assert_eq!(retry_body["code"], "ServiceUnavailable");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    let (liquid_status, liquid_body) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(liquid_status, StatusCode::OK, "{liquid_body}");
+    assert_eq!(
+        liquid_body["quote"]["quote_version_id"],
+        quote_after_failure.0.to_string()
+    );
+    assert_eq!(liquid_body["instruction"]["kind"], "liquid_direct");
+    assert_eq!(liquid_body["instruction"]["payer_amount_sat"], 10_000);
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (1, 1, 0));
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_demand_quote_rejects_sat_fixed_and_creates_no_fiat_version() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "satquotecurrent").await;
+    let invoice =
+        insert_test_invoice(&pool, "satquotecurrent", &npub, "lq1satquotecurrent", 3_600).await;
+    let app = test_app(test_state(pool.clone()));
+    let (status_before, status_body) =
+        get_path(&app, &format!("/api/v1/invoices/{}/status", invoice.id)).await;
+    assert_eq!(status_before, StatusCode::OK, "{status_body}");
+    assert!(status_body["quote_rail_availability"].is_null());
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/invoices/{}/quote", invoice.id),
+        json!({ "rail": "liquid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "InvalidAmount");
+    assert!(body.get("instruction").is_none());
+    assert!(body.get("quote").is_none());
+    let quote_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1")
+            .bind(invoice.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(quote_rows, 0);
+    cleanup_db(&pool).await;
+}
+
 #[tokio::test]
 async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution() {
     let admin = test_pool().await;
@@ -11625,8 +12108,8 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
             origin: "wallet",
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
-            amount_sat: 10_000,
-            rate_minor_per_btc: Some(10_000_000),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
             recipient_label: None,
@@ -11708,6 +12191,7 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         request_key: &first_request_key,
         provider: None,
         provider_offer_id: None,
+        provider_attempt_id: None,
         payer_amount_sat: quote.merchant_amount_sat,
         expires_at_unix: quote.expires_at_unix,
     };
@@ -11807,6 +12291,7 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         request_key: &second_request_key,
         provider: None,
         provider_offer_id: None,
+        provider_attempt_id: None,
         payer_amount_sat: second.quote.merchant_amount_sat,
         expires_at_unix: second.quote.expires_at_unix,
     };

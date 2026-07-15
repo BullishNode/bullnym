@@ -7,8 +7,8 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
-    ClaimFailureOutcome, InvoiceQuoteAttribution, LiquidClaimFeeAuthority,
-    LiquidClaimFeeAuthorityRow,
+    record_or_reuse_invoice_quote_offer_in_tx, ClaimFailureOutcome, InvoiceQuoteAttribution,
+    InvoiceQuoteOffer, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow, NewInvoiceQuoteOffer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,6 +779,33 @@ pub async fn record_chain_swap_in_tx_with_quote_attribution(
     attribution: InvoiceQuoteAttribution,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
     insert_chain_swap(&mut **tx, swap, None, None, Some(attribution)).await
+}
+
+/// Commit the immutable provider offer and canonical chain-swap row together
+/// on the invoice-locking connection. The offer must exist before the
+/// attribution foreign key can make the provider obligation durable.
+pub async fn record_chain_swap_with_quote_offer_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+    offer: &NewInvoiceQuoteOffer<'_>,
+) -> Result<(ChainSwapRecord, InvoiceQuoteOffer), sqlx::Error> {
+    let offer = record_or_reuse_invoice_quote_offer_in_tx(tx, offer)
+        .await?
+        .offer;
+    let chain_swap = insert_chain_swap(
+        &mut **tx,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+        Some(InvoiceQuoteAttribution {
+            quote_version_id: offer.quote_version_id,
+            quote_offer_id: offer.id,
+        }),
+    )
+    .await?;
+    Ok((chain_swap, offer))
 }
 
 async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(

@@ -2834,6 +2834,7 @@ dependencies = [
  "secp256k1 0.32.0-beta.2",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "sqlx",
  "subtle",
