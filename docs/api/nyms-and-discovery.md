@@ -231,7 +231,8 @@ action with the route nym in the nym slot and zero payload fields, as defined
 in [Authentication](authentication.md). Returns
 `{ "reservations": [{ "outpoint", "addr_index", "fulfilled" }],
 "next_addr_idx": 42 }`. This is an owner diagnostics API, not a
-payment-status API. GC can delete an unfulfilled reservation after its TTL even
+payment-status API. It remains available to the authenticated permanent owner
+while Lightning Address is offline. GC can delete an unfulfilled reservation after its TTL even
 though expiry is not exposed in this view. Deletion releases pending-state
 capacity; it does not rewind `next_addr_idx`. A later proof creates a new mapping
 at whatever descriptor index is current then.

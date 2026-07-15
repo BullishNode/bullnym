@@ -15608,6 +15608,40 @@ async fn reservation_list_v2_accepts_current_contract() {
 }
 
 #[tokio::test]
+async fn reservation_list_v2_remains_available_while_lightning_address_is_offline() {
+    let nym = "reservationlistoffline";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let outpoint = "55".repeat(32);
+    let pubkey = "03".repeat(33);
+
+    let index = pay_service::db::allocate_outpoint_address(&pool, nym, &outpoint, &pubkey)
+        .await
+        .unwrap();
+    assert_eq!(index, 0);
+    sqlx::query("UPDATE users SET is_active = FALSE, next_addr_idx = 9 WHERE nym = $1")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        nym,
+        nym,
+        auth_timestamp(),
+    );
+    let (status, body) = get_path(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["next_addr_idx"], 9);
+    assert_eq!(body["reservations"][0]["outpoint"], outpoint);
+    assert_eq!(body["reservations"][0]["addr_index"], 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn reservation_list_v2_rejects_wrong_action() {
     let nym = "reservationlistaction";
     let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;

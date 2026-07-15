@@ -501,7 +501,10 @@ pub async fn list_reservations(
     )?;
 
     // Bind to the nym owner on record.
-    let user = db::get_active_user_by_nym(&state.db, &nym)
+    // Permanent nym ownership survives taking the Lightning Address product
+    // offline. Reservation inspection is an authenticated owner operation, so
+    // product availability must not hide the owner's durable cursor/history.
+    let user = db::get_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::NymNotFound(nym.clone()))?;
     if user.npub != params.npub {
