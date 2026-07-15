@@ -11,28 +11,27 @@ a payment. Never send a second payment just because a page is slow to update.
 ## What is available now
 
 This manual was checked against the public service at
-`https://pay2.bull-wallet.com` on 2026-07-15 04:23–04:26 UTC. The deployed
+`https://pay2.bull-wallet.com` on 2026-07-15 08:06 UTC. The deployed
 server reported clean build
-`512fb32b9fec31702b1260314427df4420f8e27c`, schema
-`060_lnurl_private_comment_intents`, and permanent-name policy
+`e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, schema
+`062_invoice_quote_provider_attempts`, and permanent-name policy
 `permanent_names_v1`.
 
-The server source has moved ahead of production. This matters for invoice
-lifetimes and fiat quotes:
+The public deployment now matches the source-main revision used for this
+manual:
 
 | Behavior | Status at the time of writing |
 |---|---|
 | Permanent nym ownership, independent Lightning Address/Page/PoS availability, private Lightning payer comments, automatic recovery supervision | Deployed |
-| 30-day invoice outer lifetime, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Merged in source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, not deployed |
-| Five-minute payer-demand fiat quotes, observation-time fiat credit, durable provider attribution, atomic browser refresh, and PoS Bitcoin warning | Merged in source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, not deployed |
+| 30-day invoice outer lifetime, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` |
+| Five-minute payer-demand fiat quotes, observation-time fiat credit, durable provider attribution, atomic browser refresh, and PoS Bitcoin warning | Deployed in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` |
 
-Production still uses a maximum seven-day invoice lifetime and converts a fiat
-price once when an invoice is created. Do not expect a five-minute quote
-countdown or 30-day deadline until `/version` and release notes confirm that the
-complete quote release is deployed.
+Production now uses a maximum 30-day invoice lifetime. A fiat invoice keeps its
+merchant face value while each payer instruction uses an explicit five-minute
+quote. A specific rail can still be unavailable when its admission or
+dependency gate is closed.
 
-Sections marked **Main-only behavior** explain the merged source contract without
-pretending it is live.
+Sections marked **Current behavior** describe this deployed contract.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -109,16 +108,16 @@ PoS stores receipt history in the local browser. Clearing browser data can
 erase that local list, but it does not change the server's invoice or payment
 records.
 
-**Main-only behavior:** Before PoS reveals a Bitcoin instruction, it will show
+**Current behavior:** Before PoS reveals a Bitcoin instruction, it shows
 this warning:
 
 > For in-person payments, Lightning network is recommended. Bitcoin on-chain
 > payments can be cancelled by the sender for up to a few hours, and should not
 > be considered safe until confirmed.
 
-The button will read **I understand**. This warning is not present on the
-deployed SHA, so merchants must currently apply their own confirmation policy
-for in-person Bitcoin payments.
+The button reads **I understand**. This acknowledgement does not make an
+unconfirmed Bitcoin payment safe; merchants must still apply their own
+confirmation policy for in-person payments.
 
 ## Creating an invoice
 
@@ -141,40 +140,33 @@ settlement need a merchant Liquid destination; direct Liquid also needs the
 matching blinding information. The merchant wallet should use invoice-scoped
 receive addresses and retain the keys needed to recognize and spend them.
 
-The deployed server defaults to seven days and rejects a deadline later than
-seven days. Source main changes that outer limit to 30 days, but production has
-not adopted it yet.
+The deployed server defaults to 30 days and rejects a deadline later than 30
+days.
 
 ## Sat-fixed and fiat-fixed invoices
 
 A **sat-fixed** invoice asks for a fixed number of sats. Exchange-rate movement
 does not change its face amount.
 
-A **fiat-fixed** invoice asks for a fixed amount such as USD 25.00. On the
-deployed server, that fiat amount is converted once at invoice creation and the
-resulting sat amount stays fixed for the invoice's seven-day life. This is the
-older behavior and creates exchange-rate exposure.
-
-**Main-only behavior:** The merchant's fiat minor-unit amount and currency
-will remain the face value for a 30-day invoice. A payer-facing conversion will
-last five minutes. Reloads inside that window will reuse the same quote. After
+A **fiat-fixed** invoice asks for a fixed amount such as USD 25.00. The
+merchant's fiat minor-unit amount and currency remain the face value for the
+30-day invoice. A payer-facing conversion
+lasts five minutes. Reloads inside that window will reuse the same quote. After
 expiry, an explicit payer-demand refresh will replace the amount, cost
 breakdown, QR, copy text, Lightning invoice, and Bitcoin URI together.
 
 A read-only page load, status request, crawler, or background timer must not
-create a provider obligation. The full five-minute behavior is not available
-until the quote runtime and browser changes are deployed together.
+create a provider obligation. The current release deploys the quote runtime and
+browser changes together.
 
 ## Stable Liquid invoice address
 
 One checkout invoice uses one concrete Liquid settlement destination. The
 address is not resolved again from mutable profile data during settlement.
 
-**Main-only behavior:** The same Liquid address will remain stable for the
+**Current behavior:** The same Liquid address remains stable for the
 entire 30-day invoice across partial payments and every five-minute quote
-refresh. Only the amount, valuation, QR, and copy payload change. The deployed
-server has no quote refresh, so the across-refresh guarantee cannot yet be
-exercised in production.
+refresh. Only the amount, valuation, QR, and copy payload change.
 
 Always compare the whole current instruction, not only the address. A familiar
 address does not prove that a copied amount or old QR still has a valid rate.
@@ -214,24 +206,23 @@ If more arrives, the overpayment remains recorded. Bullnym does not
 automatically refund an overpayment. The merchant should compare the invoice,
 actual received value, rail, and settlement status before deciding what to do.
 
-**Main-only behavior for fiat:** Each payment event receives fiat credit from
+**Current behavior for fiat:** Each payment event receives fiat credit from
 its own authoritative rate evidence. Sats first durably observed before a quote
 expires keep that quote's rate, but only for the sats actually observed. An
 underpayment does not lock the old rate for the unpaid balance.
 
-Sats first observed at or after expiry will require a trustworthy rate snapshot
+Sats first observed at or after expiry require a trustworthy rate snapshot
 covering the observation time. If none exists, the money remains visible but
 unvalued and cannot complete the invoice. Bullnym will not guess with a later
-unrelated market rate. This accounting is not deployed yet.
+unrelated market rate.
 
 ## Quote expiry, stale QR codes, and repeated clicks
 
-On the deployed server, fiat is converted once and there is no five-minute
-quote refresh. The invoice and provider payment instructions can still have
+The invoice, five-minute fiat quote, and provider payment instructions can have
 different expiry times. A copied Lightning invoice or Bitcoin swap instruction
 may expire before the outer invoice.
 
-When the five-minute quote system ships:
+With the current five-minute quote system:
 
 - do not pay a QR after its countdown expires;
 - wait until the page replaces every instruction field;
@@ -305,11 +296,11 @@ settlement, then safe wrong-amount renegotiation. Missing, delayed, or
 conflicting evidence waits or enters review; it must not trigger an eager
 Bitcoin transaction.
 
-Newer source code, not yet deployed, tightens this rule: automatic recovery
-must have the complete current recovery contract before it may contact the
-provider or either chain. Every recorded Bitcoin recovery transaction must
-also retain the fee evidence that authorized its construction. A missing or
-disputed contract, or incomplete transaction authority, stays on hold rather
+The deployed recovery path must have the complete current recovery contract
+before it may contact the provider or either chain. Every recorded Bitcoin
+recovery transaction must also retain the fee evidence that authorized its
+construction. A missing or disputed contract, or incomplete transaction
+authority, stays on hold rather
 than using an older compatibility path.
 
 On wallet restore, verify that the committed address belongs to the restored
@@ -396,6 +387,6 @@ records:
 - `/home/francis/bull-bitcoin-workspace/bullnym-rationale-review-record.md`;
 - `/home/francis/bull-bitcoin-workspace/server-pwa-locked-plan-gap-audit-20260715.md`.
 
-The complete quote/PWA/PoS implementation is present on source main. That is
-implementation evidence only, not proof that the feature is deployed or
-available on the public service.
+The public version, schema marker, readiness response, and source revision now
+agree on the complete quote/PWA/PoS release. Individual rails can still close
+admission when their required dependencies or safety evidence are unavailable.

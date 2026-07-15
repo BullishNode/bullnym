@@ -11,13 +11,13 @@ This revision deliberately separates three kinds of evidence:
 
 | Label | Meaning |
 |---|---|
-| **Deployed** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC. |
+| **Deployed** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 08:06 UTC. |
 | **Main only** | Merged in the Bullnym source snapshot below, but not present on the deployed SHA. |
 | **Locked / branch only** | Required by the locked product plan or implemented on an unmerged branch. It is not an available production feature. |
 
 Exact revisions used for this manual:
 
-- deployed Bullnym: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
+- deployed Bullnym: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, clean build, schema `062_invoice_quote_provider_attempts`;
 - source authority inspected: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, schema `062_invoice_quote_provider_attempts`.
 
 The public probe returned `200` for `/health`, `/ready`, `/version`,
@@ -26,14 +26,13 @@ The public probe returned `200` for `/health`, `/ready`, `/version`,
 commit above, `build_dirty: false`, production mode, and
 `public_name_policy: permanent_names_v1`.
 
-The deployed SHA still has a seven-day invoice cap, converts fiat once when an
-invoice is created, has no versioned quote schema, and has no PoS Bitcoin risk
-dialog. Main has the immutable quote schema, 30-day outer lifetime, full
-five-minute payer-demand quote flow, observation-time valuation, durable
-provider attribution/recovery, atomic PWA refresh, and PoS warning. Those
-changes merged in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` but are not
-deployed. They are therefore **main only** and production
-**capability-blocked**, not production failures.
+The deployed SHA now matches source main and includes the immutable quote
+schema, 30-day outer invoice lifetime, full five-minute payer-demand quote
+flow, observation-time valuation, durable provider attribution/recovery,
+atomic PWA refresh, and PoS Bitcoin warning. Exact release provenance and
+schema readiness establish that these capabilities are deployed; individual
+rail availability remains subject to its normal admission and dependency
+gates.
 
 Main also contains a current-only automatic-recovery hardening merged in
 `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now
@@ -42,7 +41,7 @@ recovery-address commitment. A missing or disputed contract stops before
 provider or chain calls and enters an integrity/readiness hold. Every persisted
 Bitcoin recovery attempt must also retain complete construction-time fee
 authority; incomplete authority cannot construct or replay transaction bytes.
-This hardening is **main only**, not present on the deployed SHA above.
+This hardening is present on the deployed SHA above.
 
 Main now also enforces the current-only public identity surface merged in
 `746444166a41f2a42faa8bc0615c423150ac3c6f`. It preserves permanent ownership
@@ -50,7 +49,7 @@ and offline supervision while removing pre-launch compatibility paths,
 including the tokenless LNURL callback, legacy Payment Page media fields, and
 legacy payout/surface modes. Migrations 058 and 059 now require a proven empty
 database at this cutover rather than inferring ownership from historical rows.
-These changes are **main only** and are not present on the deployed SHA.
+These changes are present on the deployed SHA.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the release record. A newer deployment can change the labels above.
@@ -211,10 +210,10 @@ release provenance and certification record match that complete release.
 At source `746444166a41f2a42faa8bc0615c423150ac3c6f`, migrations 058 and 059
 are current-only empty-state guards: they require all user, surface, invoice,
 swap, allocation, and returned-address history to be empty before creating the
-permanent-name registry and removing pre-launch fields. The deployed schema-060
-marker does not prove that production ran these newer migration contents. Do
-not apply rewritten migrations to an existing database; use only the approved
-fresh-database cutover and exact release migration sequence.
+permanent-name registry and removing pre-launch fields. Production now reports
+the matching schema-062 boundary healthy. Do not apply rewritten migrations to
+an existing database; use only the approved fresh-database cutover and exact
+release migration sequence.
 
 The locked program permits a fresh-database cutover because the product has no
 users, but that is an exceptional release decision, not routine maintenance.
