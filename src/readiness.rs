@@ -1210,6 +1210,7 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         || !chain_swap_cooperative_signing_invariants_present(pool).await?
         || !permanent_public_name_invariants_present(pool).await?
         || !lnurl_private_comment_invariants_present(pool).await?
+        || !invoice_quote_foundation_invariants_present(pool).await?
     {
         return Ok(false);
     }
@@ -1512,6 +1513,133 @@ async fn lnurl_private_comment_invariants_present(
                  WHERE relation.oid = to_regclass('public.lnurl_comment_intents') \
                    AND acl.grantee = 0 \
             )",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+async fn invoice_quote_foundation_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(( \
+            to_regclass('public.invoice_quote_versions') IS NOT NULL \
+            AND to_regclass('public.invoice_quote_offers') IS NOT NULL \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('invoice_quote_versions', 'invoice_quote_versions_pkey', 'p'), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_invoice_number_key', 'u'), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_window_check', 'c'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_pkey', 'p'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_request_key', 'u'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_quote_invoice_fkey', 'f'), \
+                    ('swap_records', 'swap_records_invoice_quote_shape_check', 'c'), \
+                    ('swap_records', 'swap_records_invoice_quote_offer_fkey', 'f'), \
+                    ('chain_swap_records', 'chain_swap_records_invoice_quote_shape_check', 'c'), \
+                    ('chain_swap_records', 'chain_swap_records_invoice_quote_offer_fkey', 'f'), \
+                    ('invoice_payment_events', 'invoice_payment_events_quote_attribution_shape_check', 'c'), \
+                    ('invoice_payment_events', 'invoice_payment_events_fiat_valuation_deferred_check', 'c'), \
+                    ('invoice_payment_events', 'invoice_payment_events_quote_offer_fkey', 'f') \
+                ) required(table_name, constraint_name, constraint_type) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM pg_constraint constraint_info \
+                     WHERE constraint_info.conrelid = \
+                               to_regclass('public.' || required.table_name) \
+                       AND constraint_info.conname = required.constraint_name \
+                       AND constraint_info.contype = required.constraint_type::\"char\" \
+                       AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('invoice_quote_versions', 'invoice_quote_versions_enforce_insert', \
+                     'enforce_invoice_quote_version_insert', 7), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_reject_update', \
+                     'reject_invoice_quote_version_mutation', 19), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_reject_delete', \
+                     'reject_invoice_quote_version_mutation', 11), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_enforce_insert', \
+                     'enforce_invoice_quote_offer_insert', 7), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_reject_update', \
+                     'reject_invoice_quote_offer_mutation', 19), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_reject_delete', \
+                     'reject_invoice_quote_offer_mutation', 11), \
+                    ('swap_records', 'swap_records_guard_quote_attribution', \
+                     'guard_swap_quote_attribution', 19), \
+                    ('chain_swap_records', 'chain_swap_records_guard_quote_attribution', \
+                     'guard_swap_quote_attribution', 19), \
+                    ('invoice_payment_events', 'invoice_payment_events_guard_quote_attribution', \
+                     'guard_invoice_payment_quote_attribution', 23) \
+                ) required(table_name, trigger_name, function_name, trigger_type) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM pg_trigger trigger_info \
+                      JOIN pg_proc function_info ON function_info.oid = trigger_info.tgfoid \
+                     WHERE trigger_info.tgrelid = \
+                               to_regclass('public.' || required.table_name) \
+                       AND trigger_info.tgname = required.trigger_name \
+                       AND function_info.proname = required.function_name \
+                       AND trigger_info.tgtype = required.trigger_type::SMALLINT \
+                       AND NOT trigger_info.tgisinternal \
+                       AND trigger_info.tgenabled = 'O' \
+                 ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('swap_records', 'invoice_quote_version_id'), \
+                    ('swap_records', 'invoice_quote_offer_id'), \
+                    ('chain_swap_records', 'invoice_quote_version_id'), \
+                    ('chain_swap_records', 'invoice_quote_offer_id'), \
+                    ('invoice_payment_events', 'invoice_quote_version_id'), \
+                    ('invoice_payment_events', 'invoice_quote_offer_id'), \
+                    ('invoice_payment_events', 'quote_first_observed_at'), \
+                    ('invoice_payment_events', 'fiat_credited_minor'), \
+                    ('invoice_payment_events', 'fiat_credit_policy'), \
+                    ('invoice_payment_events', 'fiat_valued_at') \
+                ) required(table_name, column_name) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM information_schema.columns \
+                     WHERE table_schema = 'public' \
+                       AND information_schema.columns.table_name = required.table_name \
+                       AND information_schema.columns.column_name = required.column_name \
+                 ) \
+            ) \
+            AND pg_get_userbyid(( \
+                SELECT relowner FROM pg_class \
+                 WHERE oid = to_regclass('public.invoice_quote_versions') \
+            )) <> current_user \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(( \
+                SELECT relowner FROM pg_class \
+                 WHERE oid = to_regclass('public.invoice_quote_versions') \
+            )), 'USAGE') \
+            AND NOT pg_has_role(current_user, pg_get_userbyid(( \
+                SELECT relowner FROM pg_class \
+                 WHERE oid = to_regclass('public.invoice_quote_versions') \
+            )), 'SET') \
+            AND has_table_privilege(current_user, 'public.invoice_quote_versions', 'SELECT') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_versions', 'UPDATE') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_versions', 'DELETE') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_versions', 'TRUNCATE') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'invoice_id', 'INSERT') \
+            AND NOT has_column_privilege(current_user, 'public.invoice_quote_versions', 'version_number', 'INSERT') \
+            AND NOT has_column_privilege(current_user, 'public.invoice_quote_versions', 'created_at', 'INSERT') \
+            AND has_table_privilege(current_user, 'public.invoice_quote_offers', 'SELECT') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_offers', 'UPDATE') \
+            AND NOT has_table_privilege(current_user, 'public.invoice_quote_offers', 'DELETE') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'request_key', 'INSERT') \
+            AND NOT has_column_privilege(current_user, 'public.invoice_quote_offers', 'created_at', 'INSERT') \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM pg_class relation \
+                CROSS JOIN LATERAL aclexplode(COALESCE( \
+                    relation.relacl, acldefault('r', relation.relowner) \
+                )) acl \
+                WHERE relation.oid IN ( \
+                    to_regclass('public.invoice_quote_versions'), \
+                    to_regclass('public.invoice_quote_offers') \
+                ) AND acl.grantee = 0 \
+            ) \
+        ), FALSE)"
     )
     .fetch_one(pool)
     .await
