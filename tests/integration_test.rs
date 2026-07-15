@@ -438,6 +438,10 @@ fn test_app(state: AppState) -> Router {
             axum::routing::delete(registration::delete_registration),
         )
         .route("/register/lookup", get(registration::lookup_by_npub))
+        .route(
+            "/api/reservations/:nym",
+            get(registration::list_reservations),
+        )
         .route("/api/v1/:nym/invoices", post(invoice::create_signed_linked))
         .route("/api/v1/invoices", post(invoice::create_signed_unlinked))
         .route("/api/v1/invoices", get(invoice::list_signed))
@@ -10841,6 +10845,30 @@ async fn create_test_user(pool: &PgPool, nym: &str) -> String {
     npub
 }
 
+async fn reservation_list_test_fixture(nym: &str) -> (PgPool, Router, String, Keypair) {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) = sign_registration_with_keypair(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let app = test_app(test_state(pool.clone()));
+    (pool, app, npub, keypair)
+}
+
+fn reservation_list_uri(
+    keypair: &Keypair,
+    action: &str,
+    npub: &str,
+    signed_nym: &str,
+    route_nym: &str,
+    timestamp: u64,
+) -> String {
+    let signature =
+        sign_la_action_with_timestamp(keypair, action, npub, signed_nym, &[], timestamp);
+    format!("/api/reservations/{route_nym}?npub={npub}&timestamp={timestamp}&signature={signature}")
+}
+
 fn lnurl_comment_history_uri(
     keypair: &Keypair,
     npub: &str,
@@ -15527,6 +15555,172 @@ async fn checkout_liquid_allocator_skips_addresses_already_assigned_to_invoices(
         .await
         .unwrap();
     assert_eq!(next_idx, 2);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_accepts_current_contract() {
+    let nym = "reservationlistcurrent";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let outpoint = "44".repeat(32);
+    let pubkey = "02".repeat(33);
+
+    let index = pay_service::db::allocate_outpoint_address(&pool, nym, &outpoint, &pubkey)
+        .await
+        .unwrap();
+    assert_eq!(index, 0);
+    assert_eq!(
+        pay_service::db::mark_reservations_fulfilled_at_idx(&pool, nym, index as u32)
+            .await
+            .unwrap(),
+        1,
+    );
+    sqlx::query("UPDATE users SET next_addr_idx = 7 WHERE nym = $1")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        nym,
+        nym,
+        auth_timestamp(),
+    );
+    let (status, body) = get_path(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "reservations": [{
+                "outpoint": outpoint,
+                "addr_index": 0,
+                "fulfilled": true,
+            }],
+            "next_addr_idx": 7,
+        }),
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_remains_available_while_lightning_address_is_offline() {
+    let nym = "reservationlistoffline";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let outpoint = "55".repeat(32);
+    let pubkey = "03".repeat(33);
+
+    let index = pay_service::db::allocate_outpoint_address(&pool, nym, &outpoint, &pubkey)
+        .await
+        .unwrap();
+    assert_eq!(index, 0);
+    sqlx::query("UPDATE users SET is_active = FALSE, next_addr_idx = 9 WHERE nym = $1")
+        .bind(nym)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        nym,
+        nym,
+        auth_timestamp(),
+    );
+    let (status, body) = get_path(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["next_addr_idx"], 9);
+    assert_eq!(body["reservations"][0]["outpoint"], outpoint);
+    assert_eq!(body["reservations"][0]["addr_index"], 0);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_rejects_wrong_action() {
+    let nym = "reservationlistaction";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let uri = reservation_list_uri(&keypair, "invoice-list", &npub, nym, nym, auth_timestamp());
+
+    assert_eq!(get_path(&app, &uri).await.0, StatusCode::UNAUTHORIZED);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_rejects_wrong_nym() {
+    let owned_nym = "reservationlistowned";
+    let other_nym = "reservationlistother";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(owned_nym).await;
+    let _other_npub = create_test_user(&pool, other_nym).await;
+
+    let replayed_uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        owned_nym,
+        other_nym,
+        auth_timestamp(),
+    );
+    assert_eq!(
+        get_path(&app, &replayed_uri).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the route nym must be covered by the signature",
+    );
+
+    let foreign_owner_uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        other_nym,
+        other_nym,
+        auth_timestamp(),
+    );
+    assert_eq!(
+        get_path(&app, &foreign_owner_uri).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a valid signature must not inspect another owner's nym",
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_rejects_stale_timestamp() {
+    let nym = "reservationliststale";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let timestamp = auth_timestamp().saturating_sub(pay_service::auth::LA_AUTH_TS_WINDOW_SECS + 1);
+    let uri = reservation_list_uri(&keypair, "reservation-list", &npub, nym, nym, timestamp);
+
+    assert_eq!(get_path(&app, &uri).await.0, StatusCode::UNAUTHORIZED);
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reservation_list_v2_rejects_legacy_query_fields() {
+    let nym = "reservationlistlegacy";
+    let (pool, app, npub, keypair) = reservation_list_test_fixture(nym).await;
+    let timestamp = auth_timestamp();
+    let signature =
+        sign_la_action_with_timestamp(&keypair, "reservation-list", &npub, nym, &[], timestamp);
+    let legacy_only = format!("/api/reservations/{nym}?npub={npub}&ts={timestamp}&sig={signature}");
+    assert_eq!(
+        get_text_path(&app, &legacy_only).await.0,
+        StatusCode::BAD_REQUEST,
+    );
+
+    let mixed = format!(
+        "/api/reservations/{nym}?npub={npub}&timestamp={timestamp}&signature={signature}&ts={timestamp}&sig={signature}"
+    );
+    assert_eq!(
+        get_text_path(&app, &mixed).await.0,
+        StatusCode::BAD_REQUEST,
+        "strict decoding must reject legacy fields even when current fields are present",
+    );
 
     cleanup_db(&pool).await;
 }
