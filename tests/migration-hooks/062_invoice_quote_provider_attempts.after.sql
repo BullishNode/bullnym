@@ -1,6 +1,21 @@
 -- Exercise the new face-only fiat invoice shape. The invoice carries no
 -- mutable/current conversion; the immutable quote owns the exact rate and sat
 -- target.
+CREATE TEMPORARY TABLE migration_062_nullable_offer_probe (
+    id UUID NOT NULL,
+    provider_attempt_id UUID,
+    provider_offer_id TEXT
+);
+CREATE CONSTRAINT TRIGGER migration_062_nullable_offer_probe_completion
+AFTER INSERT ON migration_062_nullable_offer_probe
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION require_invoice_quote_provider_completion();
+INSERT INTO migration_062_nullable_offer_probe (
+    id, provider_attempt_id, provider_offer_id
+) VALUES (
+    '62000000-0000-0000-0000-000000000000', NULL, NULL
+);
+
 INSERT INTO invoices (
     id, nym_owner, npub_owner, origin,
     fiat_amount_minor, fiat_currency, amount_sat, rate_minor_per_btc,
@@ -48,14 +63,22 @@ BEGIN;
 SET LOCAL ROLE bullnym_app;
 INSERT INTO invoice_quote_provider_attempts (
     invoice_id, quote_version_id, rail, request_key, provider, operation,
-    merchant_amount_sat, claim_key_allocation_id, refund_key_allocation_id
+    merchant_amount_sat, request_authority_json, request_authority_sha256,
+    claim_key_allocation_id, refund_key_allocation_id
 )
 SELECT q.invoice_id, q.id, 'lightning', repeat('a', 64), 'boltz',
-       'fixed_checkout_reverse', q.merchant_amount_sat,
+       'fixed_checkout_reverse', q.merchant_amount_sat, '{"kind":"test"}',
+       '12aaed84d588265b7ffe1b482a573a47e271256da638c627b78b38b4606fd1ba',
        '62000000-0000-0000-0000-000000000002'::UUID, NULL
   FROM invoice_quote_versions q
  WHERE q.invoice_id = '62000000-0000-0000-0000-000000000001'
 ;
+INSERT INTO invoice_quote_provider_dispatches (
+    provider_attempt_id, request_authority_sha256
+)
+SELECT id, request_authority_sha256
+  FROM invoice_quote_provider_attempts
+ WHERE invoice_id = '62000000-0000-0000-0000-000000000001';
 COMMIT;
 
 DO $$
@@ -93,9 +116,17 @@ BEGIN
     IF (SELECT count(*) FROM invoice_quote_provider_attempts) <> 1 THEN
         RAISE EXCEPTION 'migration 062 did not retain one exact provider intent';
     END IF;
+    IF (SELECT count(*) FROM invoice_quote_provider_dispatches) <> 1 THEN
+        RAISE EXCEPTION 'migration 062 did not retain one exact provider dispatch';
+    END IF;
     BEGIN
         UPDATE invoice_quote_provider_attempts SET rail = 'bitcoin';
         RAISE EXCEPTION 'migration 062 allowed intent mutation';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN NULL;
+    END;
+    BEGIN
+        DELETE FROM invoice_quote_provider_dispatches;
+        RAISE EXCEPTION 'migration 062 allowed dispatch deletion';
     EXCEPTION WHEN object_not_in_prerequisite_state THEN NULL;
     END;
     SELECT oid INTO STRICT runtime_role_oid FROM pg_roles WHERE rolname = 'bullnym_app';
@@ -109,6 +140,14 @@ BEGIN
        OR has_table_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'DELETE')
        OR has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'created_at', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'invoice_id', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'request_authority_json', 'INSERT')
+       OR NOT has_table_privilege('bullnym_app', 'invoice_quote_provider_dispatches', 'SELECT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_provider_dispatches', 'provider_attempt_id', 'INSERT')
+       OR has_column_privilege('bullnym_app', 'invoice_quote_provider_dispatches', 'dispatched_at', 'INSERT')
+       OR has_table_privilege('bullnym_app', 'invoice_quote_provider_dispatches', 'UPDATE')
+       OR has_table_privilege('bullnym_app', 'invoice_quote_provider_dispatches', 'DELETE')
+       OR NOT has_table_privilege('bullnym_app', 'invoice_quote_provider_completions', 'SELECT')
+       OR NOT has_table_privilege('bullnym_app', 'invoice_quote_provider_integrity_holds', 'SELECT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'fiat_target_amount_minor', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'quote_purpose', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'late_instruction_quote_version_id', 'INSERT')

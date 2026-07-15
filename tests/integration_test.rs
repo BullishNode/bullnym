@@ -12556,14 +12556,24 @@ async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail()
             .await
             .unwrap();
     assert_eq!(provider_offers, 0);
-    let attempts: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1",
+    let recovery_rows: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_completions completion \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = completion.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
     )
     .bind(invoice.id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(attempts, 1);
+    assert_eq!(recovery_rows, (1, 1, 1, 0));
 
     // A fresh AppState models a process restart: the durable attempt, not an
     // in-memory latch, must prevent a second remote obligation.
@@ -12572,7 +12582,11 @@ async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail()
     let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
     let (retry_status, retry_body) =
         post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
-    assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+    assert_eq!(
+        retry_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{retry_body}"
+    );
     assert_eq!(retry_body["code"], "ServiceUnavailable");
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
 
@@ -12602,6 +12616,270 @@ async fn payer_demand_provider_failure_preserves_quote_and_healthy_direct_rail()
     let _ = pricer_task.await;
     provider_task.abort();
     let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn payer_provider_attempt_before_send_restarts_once_without_duplicate_obligation() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerbeforesend", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let (boltz_url, provider_calls, provider_task) = spawn_malformed_success_http_server().await;
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    let mut config = test_config();
+    config.boltz.api_url = boltz_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
+    );
+    let pending_app = app.clone();
+    let pending_path = path.clone();
+    let pending = tokio::spawn(async move {
+        post_json(&pending_app, &pending_path, json!({ "rail": "lightning" })).await
+    });
+    hook.wait_until_reached().await;
+
+    let before_send: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before_send, (1, 0, 0));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+    pending.abort();
+    hook.release();
+    let _ = pending.await;
+    drop(hook);
+
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = boltz_url;
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (status, body) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "BoltzError", "{body}");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let after_send: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+                JOIN invoice_quote_provider_attempts attempt \
+                  ON attempt.id = hold.provider_attempt_id \
+               WHERE attempt.invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_send, (1, 1, 1));
+
+    let (_, duplicate) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(duplicate["code"], "ServiceUnavailable", "{duplicate}");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn expired_versioned_provider_offer_is_retained_but_never_reexposed() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerquoteexpiry", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "VERSIONED_QUOTE_EXPIRED_1",
+        10_073,
+        first_key_index,
+    )
+    .await;
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    );
+    let request_app = app.clone();
+    let request_path = path.clone();
+    let request = tokio::spawn(async move {
+        post_json(&request_app, &request_path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    hook.wait_until_reached().await;
+
+    // Move only the test clock boundary after the irreversible response and
+    // its exact lineage have committed but before the handler's final exposure
+    // gate. Production immutability remains enabled before the handler resumes.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH boundary AS (SELECT clock_timestamp() AS now) \
+         UPDATE invoice_quote_versions \
+            SET created_at = boundary.now - INTERVAL '5 minutes 1 second', \
+                expires_at = boundary.now - INTERVAL '1 second', \
+                rate_observed_at = boundary.now - INTERVAL '5 minutes 1 second', \
+                rate_fetched_at = boundary.now - INTERVAL '5 minutes 1 second' \
+           FROM boundary \
+          WHERE invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    hook.release();
+    let (status, body) = request.await.unwrap();
+    drop(hook);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ServiceUnavailable", "{body}");
+
+    let retained: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_completions completion \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = completion.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, (1, 1, 1, 1));
+
+    let (_, refreshed) = post_json(&app, &path, json!({ "rail": "liquid" })).await;
+    assert_eq!(refreshed["selected_rail"], "liquid", "{refreshed}");
+    assert_eq!(refreshed["quote"]["version_number"], 2, "{refreshed}");
+    assert_eq!(refreshed["instruction"]["kind"], "liquid_direct");
+    assert!(!refreshed.to_string().contains("VERSIONED_QUOTE_EXPIRED_1"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn reverse_response_before_commit_restarts_into_hold_without_second_post() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let invoice = insert_fiat_quote_test_invoice(&pool, "providerresponsecrash", true).await;
+    let (pricer_url, _, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider = spawn_successful_reverse_barrier_server(
+        "VERSIONED_RESPONSE_CRASH_1",
+        10_073,
+        first_key_index,
+    )
+    .await;
+    let mut pricer_config = PricerConfig::default();
+    pricer_config.url = pricer_url;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(PricerClient::new(pricer_config).unwrap());
+    let app = test_app(state);
+    let path = format!("/api/v1/invoices/{}/quote", invoice.id);
+    let hook = invoice::install_invoice_integration_test_hook(
+        invoice::InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    );
+    let request_app = app.clone();
+    let request_path = path.clone();
+    let request = tokio::spawn(async move {
+        post_json(&request_app, &request_path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    hook.wait_until_reached().await;
+
+    let crash_boundary: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM invoice_quote_provider_attempts WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_provider_dispatches dispatch \
+                JOIN invoice_quote_provider_attempts attempt ON attempt.id = dispatch.provider_attempt_id \
+               WHERE attempt.invoice_id = $1), \
+             (SELECT COUNT(*) FROM invoice_quote_offers WHERE invoice_id = $1), \
+             (SELECT COUNT(*) FROM swap_records WHERE invoice_id = $1)",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(crash_boundary, (1, 1, 0, 0));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    request.abort();
+    hook.release();
+    let _ = request.await;
+    drop(hook);
+
+    let mut retry_config = test_config();
+    retry_config.boltz.api_url = provider.base_url.clone();
+    let retry_app = test_app(test_state_with_config(pool.clone(), retry_config));
+    let (_, retry) = post_json(&retry_app, &path, json!({ "rail": "lightning" })).await;
+    assert_eq!(retry["code"], "ServiceUnavailable", "{retry}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let holds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_quote_provider_integrity_holds hold \
+          JOIN invoice_quote_provider_attempts attempt ON attempt.id = hold.provider_attempt_id \
+         WHERE attempt.invoice_id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(holds, 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
     cleanup_db(&pool).await;
 }
 

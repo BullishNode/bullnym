@@ -66,6 +66,9 @@ pub enum InvoiceIntegrationTestHookPoint {
     ListAfterInvoiceRead,
     OfferBeforeCommit,
     ChainOfferBeforeRecoveryGate,
+    ProviderAttemptBeforeDispatch,
+    ProviderResponseBeforeCommit,
+    ProviderOfferAfterCommit,
 }
 
 #[derive(Debug)]
@@ -2364,64 +2367,202 @@ async fn ensure_versioned_lightning_offer(
     }
 
     let request_key = quote_offer_request_key(quote.id, PayerQuoteRail::Lightning, "boltz_reverse");
-    if db::invoice_quote_provider_attempt(&mut *connection, quote.id, "lightning", &request_key)
-        .await?
-        .is_some()
-    {
-        connection.unlock().await?;
-        return Err(AppError::ServiceUnavailable(
-            "a prior Lightning provider attempt has an unknown outcome; reconciliation is required"
-                .into(),
-        ));
-    }
+    let existing_provider_attempt =
+        db::invoice_quote_provider_attempt(&mut *connection, quote.id, "lightning", &request_key)
+            .await?;
+    let merchant_amount_sat = u64::try_from(quote.merchant_amount_sat)
+        .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?;
 
-    state
-        .admission
-        .enforce(Rail::LightningReverse)
-        .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
-    let swap_key_index = db::next_swap_key_index(&mut *connection)
+    let (
+        provider_attempt,
+        provider_create,
+        swap_key_index,
+        allocation_id,
+        claim_public_key_hex,
+        preimage_hash_hex,
+    ) = if let Some(attempt) = existing_provider_attempt {
+        if attempt.completed {
+            connection.unlock().await?;
+            return Err(AppError::DbError(
+                "completed Lightning provider attempt is missing its atomic offer".into(),
+            ));
+        }
+        let swap_key_index = u64::try_from(attempt.claim_child_index)
+            .map_err(|_| AppError::DbError("invalid persisted reverse child index".into()))?;
+        let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+        let claim_public_key_hex = derived_key.public_key_hex();
+        let preimage_hash_hex = derived_key.preimage_hash_hex();
+        let provider_create = state.boltz.restore_prepared_fixed_checkout_reverse_swap(
+            derived_key,
+            &attempt.request_authority_json,
+            &attempt.request_authority_sha256,
+        )?;
+        (
+            attempt.clone(),
+            provider_create,
+            swap_key_index,
+            attempt.claim_key_allocation_id,
+            claim_public_key_hex,
+            preimage_hash_hex,
+        )
+    } else {
+        state
+            .admission
+            .enforce(Rail::LightningReverse)
+            .map_err(|_| AppError::MoneyAdmissionUnavailable)?;
+        let swap_key_index = db::next_swap_key_index(&mut *connection)
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("swap key allocation failed: {error}"))
+            })?;
+        let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
+        let claim_public_key_hex = derived_key.public_key_hex();
+        let preimage_hash_hex = derived_key.preimage_hash_hex();
+        let allocation_id = db::reserve_swap_key_allocation(
+            &mut *connection,
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: swap_key_index as i64,
+                purpose: db::SwapKeyPurpose::ReverseClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
         .await
-        .map_err(|error| AppError::BoltzError(format!("swap key allocation failed: {error}")))?;
-    let derived_key = state.boltz.derive_swap_key(swap_key_index)?;
-    let claim_public_key_hex = derived_key.public_key_hex();
-    let preimage_hash_hex = derived_key.preimage_hash_hex();
-    let allocation_id = db::reserve_swap_key_allocation(
-        &mut *connection,
-        &db::NewSwapKeyAllocation {
-            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            child_index: swap_key_index as i64,
-            purpose: db::SwapKeyPurpose::ReverseClaim,
-            public_key_hex: &claim_public_key_hex,
-            preimage_hash_hex: Some(&preimage_hash_hex),
-        },
+        .map_err(|error| AppError::DbError(format!("swap key reservation failed: {error}")))?;
+        let provider_create =
+            prepare_lightning_provider_create(state, derived_key, merchant_amount_sat, &current)?;
+        let (request_authority_json, request_authority_sha256) =
+            provider_create.canonical_authority()?;
+        let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
+            &mut *connection,
+            &db::NewInvoiceQuoteProviderAttempt {
+                invoice_id: current.id,
+                quote_version_id: quote.id,
+                rail: "lightning",
+                request_key: &request_key,
+                operation: "fixed_checkout_reverse",
+                merchant_amount_sat: quote.merchant_amount_sat,
+                request_authority_json: &request_authority_json,
+                request_authority_sha256: &request_authority_sha256,
+                claim_key_allocation_id: allocation_id,
+                refund_key_allocation_id: None,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("provider attempt reservation failed: {error}"))
+        })?;
+        (
+            attempt,
+            provider_create,
+            swap_key_index,
+            allocation_id,
+            claim_public_key_hex,
+            preimage_hash_hex,
+        )
+    };
+
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
     )
-    .await
-    .map_err(|error| AppError::DbError(format!("swap key reservation failed: {error}")))?;
-    let (provider_attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
+    .await;
+    let owns_dispatch = db::record_invoice_quote_provider_dispatch(
         &mut *connection,
-        &db::NewInvoiceQuoteProviderAttempt {
-            invoice_id: current.id,
-            quote_version_id: quote.id,
-            rail: "lightning",
-            request_key: &request_key,
-            operation: "fixed_checkout_reverse",
-            merchant_amount_sat: quote.merchant_amount_sat,
-            claim_key_allocation_id: allocation_id,
-            refund_key_allocation_id: None,
-        },
-    )
-    .await
-    .map_err(|error| AppError::DbError(format!("provider attempt reservation failed: {error}")))?;
-    let prepared = request_lightning_offer(
-        state,
-        derived_key,
-        u64::try_from(quote.merchant_amount_sat)
-            .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?,
-        &current,
+        provider_attempt.id,
+        &provider_attempt.request_authority_sha256,
     )
     .await?;
+    let provider_result = if owns_dispatch {
+        match state
+            .boltz
+            .submit_fixed_checkout_reverse_swap(provider_create)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "provider_outcome_unknown",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(error);
+            }
+        }
+    } else {
+        let claim_child_index = u32::try_from(swap_key_index)
+            .map_err(|_| AppError::DbError("reverse child index exceeds provider range".into()))?;
+        let response = match state
+            .boltz
+            .recover_reverse_create_response(claim_child_index)
+            .await
+        {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restore_absent",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Lightning provider outcome remains under integrity hold".into(),
+                ));
+            }
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restore_unavailable",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Lightning provider reconciliation is unavailable".into(),
+                ));
+            }
+        };
+        if response.invoice.is_none() {
+            db::record_invoice_quote_provider_integrity_hold(
+                &mut *connection,
+                provider_attempt.id,
+                "restored_response_incomplete",
+            )
+            .await?;
+            connection.unlock().await?;
+            return Err(AppError::ServiceUnavailable(
+                "restored Lightning obligation lacks a recoverable invoice".into(),
+            ));
+        }
+        match state
+            .boltz
+            .complete_fixed_checkout_reverse_swap(provider_create, response)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    &mut *connection,
+                    provider_attempt.id,
+                    "restored_response_invalid",
+                )
+                .await?;
+                connection.unlock().await?;
+                return Err(AppError::ServiceUnavailable(
+                    "restored Lightning provider response failed validation".into(),
+                ));
+            }
+        }
+    };
+    let prepared = prepared_lightning_offer_from_result(provider_result)?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    )
+    .await;
 
     let mut tx = connection.begin().await?;
     let resolution = db::record_or_reuse_invoice_quote_offer_in_tx(
@@ -2468,7 +2609,19 @@ async fn ensure_versioned_lightning_offer(
             prepared.swap_id
         ))
     })?;
+    db::record_invoice_quote_provider_completion(
+        &mut *tx,
+        provider_attempt.id,
+        resolution.offer.id,
+        &prepared.swap_id,
+        &prepared.provider_response_sha256,
+    )
+    .await?;
     tx.commit().await?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    )
+    .await;
     let still_current = db::current_invoice_quote(&mut *connection, current.id).await?;
     if still_current.as_ref().map(|candidate| candidate.id) != Some(quote.id)
         || quote.expires_at_unix <= unix_now()
@@ -2599,90 +2752,218 @@ async fn ensure_versioned_bitcoin_chain_offer(
     }
 
     let request_key = quote_offer_request_key(quote.id, PayerQuoteRail::Bitcoin, "boltz_chain");
-    if db::invoice_quote_provider_attempt(
+    let existing_provider_attempt = db::invoice_quote_provider_attempt(
         permit.connection_mut(),
         quote.id,
         "bitcoin",
         &request_key,
     )
-    .await?
-    .is_some()
-    {
-        return Err(AppError::ServiceUnavailable(
-            "a prior Bitcoin provider attempt has an unknown outcome; reconciliation is required"
-                .into(),
-        ));
-    }
-
-    let claim_key_index = db::next_swap_key_index(permit.connection_mut())
-        .await
-        .map_err(|error| {
-            AppError::BoltzError(format!("chain claim key allocation failed: {error}"))
-        })?;
-    let refund_key_index = db::next_swap_key_index(permit.connection_mut())
-        .await
-        .map_err(|error| {
-            AppError::BoltzError(format!("chain refund key allocation failed: {error}"))
-        })?;
-    let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
-    let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
-    let claim_public_key_hex = claim_key.public_key_hex();
-    let refund_public_key_hex = refund_key.public_key_hex();
-    let preimage_hash_hex = claim_key.preimage_hash_hex();
-    let claim_allocation_id = db::reserve_swap_key_allocation(
-        permit.connection_mut(),
-        &db::NewSwapKeyAllocation {
-            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            child_index: claim_key_index as i64,
-            purpose: db::SwapKeyPurpose::ChainClaim,
-            public_key_hex: &claim_public_key_hex,
-            preimage_hash_hex: Some(&preimage_hash_hex),
-        },
-    )
-    .await
-    .map_err(|error| AppError::DbError(format!("chain claim key reservation failed: {error}")))?;
-    let refund_allocation_id = db::reserve_swap_key_allocation(
-        permit.connection_mut(),
-        &db::NewSwapKeyAllocation {
-            root_fingerprint: state.swap_key_root_fingerprint.as_str(),
-            key_epoch: state.config.boltz.key_epoch,
-            derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
-            child_index: refund_key_index as i64,
-            purpose: db::SwapKeyPurpose::ChainRefund,
-            public_key_hex: &refund_public_key_hex,
-            preimage_hash_hex: None,
-        },
-    )
-    .await
-    .map_err(|error| AppError::DbError(format!("chain refund key reservation failed: {error}")))?;
-
-    let (provider_attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
-        permit.connection_mut(),
-        &db::NewInvoiceQuoteProviderAttempt {
-            invoice_id: current.id,
-            quote_version_id: quote.id,
-            rail: "bitcoin",
-            request_key: &request_key,
-            operation: "chain_create",
-            merchant_amount_sat: quote.merchant_amount_sat,
-            claim_key_allocation_id: claim_allocation_id,
-            refund_key_allocation_id: Some(refund_allocation_id),
-        },
-    )
-    .await
-    .map_err(|error| AppError::DbError(format!("provider attempt reservation failed: {error}")))?;
-
-    let provider_result = state
-        .boltz
-        .create_btc_to_lbtc_chain_swap(
+    .await?;
+    let merchant_amount_sat = u64::try_from(quote.merchant_amount_sat)
+        .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?;
+    let (
+        provider_attempt,
+        provider_create,
+        claim_key_index,
+        refund_key_index,
+        claim_allocation_id,
+        refund_allocation_id,
+    ) = if let Some(attempt) = existing_provider_attempt {
+        if attempt.completed {
+            return Err(AppError::DbError(
+                "completed Bitcoin provider attempt is missing its atomic offer".into(),
+            ));
+        }
+        let claim_key_index = u64::try_from(attempt.claim_child_index)
+            .map_err(|_| AppError::DbError("invalid persisted chain claim index".into()))?;
+        let refund_key_index = u64::try_from(attempt.refund_child_index.ok_or_else(|| {
+            AppError::DbError("persisted chain attempt lacks refund index".into())
+        })?)
+        .map_err(|_| AppError::DbError("invalid persisted chain refund index".into()))?;
+        let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
+        let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
+        let provider_create = state.boltz.restore_prepared_btc_to_lbtc_chain_swap(
             claim_key,
             refund_key,
-            u64::try_from(quote.merchant_amount_sat)
-                .map_err(|_| AppError::InvalidAmount("invalid quoted amount".into()))?,
+            &attempt.request_authority_json,
+            &attempt.request_authority_sha256,
+        )?;
+        (
+            attempt.clone(),
+            provider_create,
+            claim_key_index,
+            refund_key_index,
+            attempt.claim_key_allocation_id,
+            attempt.refund_key_allocation_id.ok_or_else(|| {
+                AppError::DbError("persisted chain attempt lacks refund allocation".into())
+            })?,
         )
-        .await?;
+    } else {
+        let claim_key_index = db::next_swap_key_index(permit.connection_mut())
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("chain claim key allocation failed: {error}"))
+            })?;
+        let refund_key_index = db::next_swap_key_index(permit.connection_mut())
+            .await
+            .map_err(|error| {
+                AppError::BoltzError(format!("chain refund key allocation failed: {error}"))
+            })?;
+        let claim_key = state.boltz.derive_swap_key(claim_key_index)?;
+        let refund_key = state.boltz.derive_swap_key(refund_key_index)?;
+        let claim_public_key_hex = claim_key.public_key_hex();
+        let refund_public_key_hex = refund_key.public_key_hex();
+        let preimage_hash_hex = claim_key.preimage_hash_hex();
+        let claim_allocation_id = db::reserve_swap_key_allocation(
+            permit.connection_mut(),
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: claim_key_index as i64,
+                purpose: db::SwapKeyPurpose::ChainClaim,
+                public_key_hex: &claim_public_key_hex,
+                preimage_hash_hex: Some(&preimage_hash_hex),
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("chain claim key reservation failed: {error}"))
+        })?;
+        let refund_allocation_id = db::reserve_swap_key_allocation(
+            permit.connection_mut(),
+            &db::NewSwapKeyAllocation {
+                root_fingerprint: state.swap_key_root_fingerprint.as_str(),
+                key_epoch: state.config.boltz.key_epoch,
+                derivation_scheme_version: db::DERIVATION_SCHEME_VERSION,
+                child_index: refund_key_index as i64,
+                purpose: db::SwapKeyPurpose::ChainRefund,
+                public_key_hex: &refund_public_key_hex,
+                preimage_hash_hex: None,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("chain refund key reservation failed: {error}"))
+        })?;
+        let provider_create = state
+            .boltz
+            .prepare_btc_to_lbtc_chain_swap(claim_key, refund_key, merchant_amount_sat)
+            .await?;
+        let (request_authority_json, request_authority_sha256) =
+            provider_create.canonical_authority()?;
+        let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
+            permit.connection_mut(),
+            &db::NewInvoiceQuoteProviderAttempt {
+                invoice_id: current.id,
+                quote_version_id: quote.id,
+                rail: "bitcoin",
+                request_key: &request_key,
+                operation: "chain_create",
+                merchant_amount_sat: quote.merchant_amount_sat,
+                request_authority_json: &request_authority_json,
+                request_authority_sha256: &request_authority_sha256,
+                claim_key_allocation_id: claim_allocation_id,
+                refund_key_allocation_id: Some(refund_allocation_id),
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::DbError(format!("provider attempt reservation failed: {error}"))
+        })?;
+        (
+            attempt,
+            provider_create,
+            claim_key_index,
+            refund_key_index,
+            claim_allocation_id,
+            refund_allocation_id,
+        )
+    };
+
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderAttemptBeforeDispatch,
+    )
+    .await;
+    let owns_dispatch = db::record_invoice_quote_provider_dispatch(
+        permit.connection_mut(),
+        provider_attempt.id,
+        &provider_attempt.request_authority_sha256,
+    )
+    .await?;
+    let provider_result = if owns_dispatch {
+        match state
+            .boltz
+            .submit_btc_to_lbtc_chain_swap(provider_create)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "provider_outcome_unknown",
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+    } else {
+        let claim_child_index = u32::try_from(claim_key_index)
+            .map_err(|_| AppError::DbError("chain claim index exceeds provider range".into()))?;
+        let refund_child_index = u32::try_from(refund_key_index)
+            .map_err(|_| AppError::DbError("chain refund index exceeds provider range".into()))?;
+        let response = match state
+            .boltz
+            .recover_chain_create_response(claim_child_index, refund_child_index)
+            .await
+        {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restore_absent",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Bitcoin provider outcome remains under integrity hold".into(),
+                ));
+            }
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restore_unavailable",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "Bitcoin provider reconciliation is unavailable".into(),
+                ));
+            }
+        };
+        match state
+            .boltz
+            .complete_btc_to_lbtc_chain_swap(provider_create, response)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                db::record_invoice_quote_provider_integrity_hold(
+                    permit.connection_mut(),
+                    provider_attempt.id,
+                    "restored_response_invalid",
+                )
+                .await?;
+                return Err(AppError::ServiceUnavailable(
+                    "restored Bitcoin provider response failed validation".into(),
+                ));
+            }
+        }
+    };
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderResponseBeforeCommit,
+    )
+    .await;
     let public_url = invoice_public_url(
         &state.config.domain,
         current.nym_owner.as_deref(),
@@ -2696,6 +2977,10 @@ async fn ensure_versioned_bitcoin_chain_offer(
     );
     let payer_amount_sat = i64::try_from(provider_result.user_lock_amount_sat)
         .map_err(|_| AppError::BoltzError("Bitcoin payer amount exceeds storage range".into()))?;
+    let provider_response_sha256 = provider_result
+        .creation_terms
+        .creation_response_sha256
+        .clone();
     let merchant_policy = crate::swap_manifest::MerchantPolicyReferencesV1::new(
         current.id,
         nym,
@@ -2754,7 +3039,19 @@ async fn ensure_versioned_bitcoin_chain_offer(
             provider_result.swap_id
         ))
     })?;
+    db::record_invoice_quote_provider_completion(
+        &mut *tx,
+        provider_attempt.id,
+        offer.id,
+        &provider_result.swap_id,
+        &provider_response_sha256,
+    )
+    .await?;
     tx.commit().await?;
+    pause_at_invoice_integration_test_hook(
+        InvoiceIntegrationTestHookPoint::ProviderOfferAfterCommit,
+    )
+    .await;
 
     match crate::swap_manifest_persistence::repair_oldest_manifestless_chain_swap(
         &state.db,
@@ -3014,6 +3311,7 @@ struct PreparedLightningOffer {
     preimage_hex: String,
     claim_key_hex: String,
     boltz_response_json: String,
+    provider_response_sha256: String,
 }
 
 impl PreparedLightningOffer {
@@ -3057,6 +3355,20 @@ async fn request_lightning_offer(
     amount_sat: u64,
     invoice: &db::Invoice,
 ) -> Result<PreparedLightningOffer, AppError> {
+    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat, invoice)?;
+    let result = state
+        .boltz
+        .submit_fixed_checkout_reverse_swap(prepared)
+        .await?;
+    prepared_lightning_offer_from_result(result)
+}
+
+fn prepare_lightning_provider_create(
+    state: &AppState,
+    derived_key: crate::boltz::DerivedSwapKey,
+    amount_sat: u64,
+    invoice: &db::Invoice,
+) -> Result<crate::boltz::PreparedFixedCheckoutReverseCreate, AppError> {
     let public_url = invoice_public_url(
         &state.config.domain,
         invoice.nym_owner.as_deref(),
@@ -3065,28 +3377,32 @@ async fn request_lightning_offer(
     );
     let boltz_description = boltz_invoice_description_for_url(&public_url);
 
-    let result = state
-        .boltz
-        .create_fixed_checkout_reverse_swap(
-            derived_key,
-            amount_sat,
-            boltz_description.description.as_deref(),
-            boltz_description.description_hash.as_deref(),
-        )
-        .await?;
+    state.boltz.prepare_fixed_checkout_reverse_swap(
+        derived_key,
+        amount_sat,
+        boltz_description.description.as_deref(),
+        boltz_description.description_hash.as_deref(),
+    )
+}
 
+fn prepared_lightning_offer_from_result(
+    result: crate::boltz::FixedCheckoutReverseSwapResult,
+) -> Result<PreparedLightningOffer, AppError> {
     let payer_amount_sat = i64::try_from(result.payer_amount_sat)
         .map_err(|_| AppError::BoltzError("fixed checkout payer amount exceeds i64".into()))?;
     let swap = result.swap;
+    let (boltz_response_json, provider_response_sha256) =
+        crate::canonical_json::canonical_json_and_sha256(&swap.boltz_response).map_err(
+            |error| AppError::BoltzError(format!("failed to canonicalize boltz response: {error}")),
+        )?;
     Ok(PreparedLightningOffer {
         swap_id: swap.swap_id,
         lightning_pr: swap.invoice,
         payer_amount_sat,
         preimage_hex: hex::encode(&swap.preimage),
         claim_key_hex: hex::encode(swap.claim_keypair.secret_bytes()),
-        boltz_response_json: serde_json::to_string(&swap.boltz_response).map_err(|e| {
-            AppError::BoltzError(format!("failed to serialize boltz response: {e}"))
-        })?,
+        boltz_response_json,
+        provider_response_sha256,
     })
 }
 

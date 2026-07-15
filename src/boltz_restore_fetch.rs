@@ -181,6 +181,36 @@ impl BoltzRestoreFetcher {
         &self,
         swap_master_key: &SwapMasterKey,
     ) -> Result<ValidatedBoltzRestoreSet, BoltzRestoreFetchError> {
+        let (records, index) = self.fetch_records_and_index(swap_master_key).await?;
+        let validated = validate_restore_records(swap_master_key, &records)
+            .map_err(|_| BoltzRestoreFetchError::InvalidRecords)?;
+        validated
+            .validate_reported_high_water(&index)
+            .map_err(|_| BoltzRestoreFetchError::SummaryMismatch)?;
+        Ok(validated)
+    }
+
+    /// Return the exact pinned records only after the complete list and its
+    /// high-water summary pass the same offline validation used at startup.
+    /// Provider-create recovery needs the response fields to reconstruct a
+    /// lost create response; callers must still select an exact reserved key.
+    pub async fn fetch_validated_records(
+        &self,
+        swap_master_key: &SwapMasterKey,
+    ) -> Result<Vec<SwapRestoreResponse>, BoltzRestoreFetchError> {
+        let (records, index) = self.fetch_records_and_index(swap_master_key).await?;
+        let validated = validate_restore_records(swap_master_key, &records)
+            .map_err(|_| BoltzRestoreFetchError::InvalidRecords)?;
+        validated
+            .validate_reported_high_water(&index)
+            .map_err(|_| BoltzRestoreFetchError::SummaryMismatch)?;
+        Ok(records)
+    }
+
+    async fn fetch_records_and_index(
+        &self,
+        swap_master_key: &SwapMasterKey,
+    ) -> Result<(Vec<SwapRestoreResponse>, SwapRestoreIndexResponse), BoltzRestoreFetchError> {
         let xpub = swap_master_key.get_master_xpub().to_string();
         let request = RestoreRequest::for_swap_account_xpub(&xpub);
 
@@ -201,12 +231,7 @@ impl BoltzRestoreFetcher {
             )
             .await?;
 
-        let validated = validate_restore_records(swap_master_key, &records)
-            .map_err(|_| BoltzRestoreFetchError::InvalidRecords)?;
-        validated
-            .validate_reported_high_water(&index)
-            .map_err(|_| BoltzRestoreFetchError::SummaryMismatch)?;
-        Ok(validated)
+        Ok((records, index))
     }
 
     fn build(

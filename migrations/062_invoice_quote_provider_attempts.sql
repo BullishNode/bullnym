@@ -841,6 +841,8 @@ CREATE TABLE invoice_quote_provider_attempts (
     provider TEXT NOT NULL,
     operation TEXT NOT NULL,
     merchant_amount_sat BIGINT NOT NULL,
+    request_authority_json TEXT NOT NULL,
+    request_authority_sha256 TEXT NOT NULL,
     claim_key_allocation_id UUID NOT NULL REFERENCES swap_key_allocations(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     refund_key_allocation_id UUID REFERENCES swap_key_allocations(id)
@@ -851,6 +853,14 @@ CREATE TABLE invoice_quote_provider_attempts (
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT invoice_quote_provider_attempts_request_key_check CHECK
         (request_key ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT invoice_quote_provider_attempts_authority_check CHECK (
+        octet_length(request_authority_json) BETWEEN 2 AND 65536
+        AND request_authority_json IS JSON OBJECT
+        AND request_authority_sha256 ~ '^[0-9a-f]{64}$'
+        AND request_authority_sha256 = encode(
+            digest(convert_to(request_authority_json, 'UTF8'), 'sha256'), 'hex'
+        )
+    ),
     CONSTRAINT invoice_quote_provider_attempts_identity_key UNIQUE
         (quote_version_id, rail, request_key),
     CONSTRAINT invoice_quote_provider_attempts_offer_binding_key UNIQUE
@@ -866,6 +876,59 @@ CREATE TABLE invoice_quote_provider_attempts (
             OR
             (rail = 'bitcoin' AND operation = 'chain_create'
              AND refund_key_allocation_id IS NOT NULL)
+        )
+    )
+);
+
+-- An append-only dispatch boundary closes the dangerous ambiguity between a
+-- durable request and an irreversible POST. Only an attempt with no dispatch
+-- row may be sent. Once this row exists, restart must reconcile through the
+-- provider's validated xpub restore contract and may never blindly resend.
+CREATE TABLE invoice_quote_provider_dispatches (
+    provider_attempt_id UUID PRIMARY KEY REFERENCES invoice_quote_provider_attempts(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    request_authority_sha256 TEXT NOT NULL,
+    dispatched_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT invoice_quote_provider_dispatches_digest_check CHECK
+        (request_authority_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+-- A completion is committed in the same transaction as the exact quote offer
+-- and swap lineage. The provider response digest lets audits distinguish an
+-- exact replay from an unrelated provider object without retaining a second
+-- mutable copy of response data.
+CREATE TABLE invoice_quote_provider_completions (
+    provider_attempt_id UUID PRIMARY KEY REFERENCES invoice_quote_provider_attempts(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    quote_offer_id UUID NOT NULL UNIQUE REFERENCES invoice_quote_offers(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    provider_offer_id TEXT NOT NULL,
+    provider_response_sha256 TEXT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT invoice_quote_provider_completions_provider_id_check CHECK (
+        provider_offer_id = btrim(provider_offer_id)
+        AND octet_length(provider_offer_id) BETWEEN 1 AND 255
+    ),
+    CONSTRAINT invoice_quote_provider_completions_digest_check CHECK
+        (provider_response_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+-- Negative restore evidence never authorizes a retry. Retain the first fixed,
+-- low-cardinality reason so operators can repair the evidence boundary while
+-- the possible obligation remains quarantined.
+CREATE TABLE invoice_quote_provider_integrity_holds (
+    provider_attempt_id UUID PRIMARY KEY REFERENCES invoice_quote_provider_attempts(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    reason TEXT NOT NULL,
+    held_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT invoice_quote_provider_integrity_holds_reason_check CHECK (
+        reason IN (
+            'provider_outcome_unknown',
+            'restore_unavailable',
+            'restore_absent',
+            'restore_ambiguous',
+            'restored_response_incomplete',
+            'restored_response_invalid'
         )
     )
 );
@@ -951,6 +1014,125 @@ CREATE TRIGGER invoice_quote_provider_attempts_reject_delete
 BEFORE DELETE ON invoice_quote_provider_attempts FOR EACH ROW
 EXECUTE FUNCTION reject_invoice_quote_provider_attempt_mutation();
 
+CREATE FUNCTION enforce_invoice_quote_provider_dispatch_insert() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM invoice_quote_provider_attempts attempt
+         WHERE attempt.id = NEW.provider_attempt_id
+           AND attempt.request_authority_sha256 = NEW.request_authority_sha256
+    ) THEN
+        RAISE EXCEPTION 'provider dispatch does not match its canonical request authority'
+            USING ERRCODE = '23514';
+    END IF;
+    NEW.dispatched_at := clock_timestamp();
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION enforce_invoice_quote_provider_completion_insert() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM invoice_quote_provider_dispatches dispatch
+          JOIN invoice_quote_offers offer
+            ON offer.id = NEW.quote_offer_id
+           AND offer.provider_attempt_id = NEW.provider_attempt_id
+           AND offer.provider_offer_id = NEW.provider_offer_id
+         WHERE dispatch.provider_attempt_id = NEW.provider_attempt_id
+           AND (
+               (
+                   offer.rail = 'lightning'
+                   AND EXISTS (
+                       SELECT 1 FROM swap_records swap
+                        WHERE swap.boltz_swap_id = NEW.provider_offer_id
+                          AND swap.invoice_quote_offer_id = NEW.quote_offer_id
+                          AND NEW.provider_response_sha256 = encode(
+                              digest(convert_to(swap.boltz_response_json, 'UTF8'), 'sha256'),
+                              'hex'
+                          )
+                   )
+               ) OR (
+                   offer.rail = 'bitcoin'
+                   AND EXISTS (
+                       SELECT 1 FROM chain_swap_records chain_swap
+                        WHERE chain_swap.boltz_swap_id = NEW.provider_offer_id
+                          AND chain_swap.invoice_quote_offer_id = NEW.quote_offer_id
+                          AND chain_swap.creation_response_sha256 =
+                              NEW.provider_response_sha256
+                   )
+               )
+           )
+    ) THEN
+        RAISE EXCEPTION 'provider completion lacks its dispatch and exact offer lineage'
+            USING ERRCODE = '23514';
+    END IF;
+    NEW.completed_at := clock_timestamp();
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION enforce_invoice_quote_provider_hold_insert() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM invoice_quote_provider_dispatches
+         WHERE provider_attempt_id = NEW.provider_attempt_id
+    ) OR EXISTS (
+        SELECT 1 FROM invoice_quote_provider_completions
+         WHERE provider_attempt_id = NEW.provider_attempt_id
+    ) THEN
+        RAISE EXCEPTION 'provider integrity hold lacks an unresolved dispatch'
+            USING ERRCODE = '23514';
+    END IF;
+    NEW.held_at := clock_timestamp();
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION require_invoice_quote_provider_completion() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.provider_attempt_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM invoice_quote_provider_completions completion
+         WHERE completion.provider_attempt_id = NEW.provider_attempt_id
+           AND completion.quote_offer_id = NEW.id
+           AND completion.provider_offer_id = NEW.provider_offer_id
+    ) THEN
+        RAISE EXCEPTION 'provider quote offer and completion must commit atomically'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER invoice_quote_provider_dispatches_enforce_insert
+BEFORE INSERT ON invoice_quote_provider_dispatches FOR EACH ROW
+EXECUTE FUNCTION enforce_invoice_quote_provider_dispatch_insert();
+CREATE TRIGGER invoice_quote_provider_completions_enforce_insert
+BEFORE INSERT ON invoice_quote_provider_completions FOR EACH ROW
+EXECUTE FUNCTION enforce_invoice_quote_provider_completion_insert();
+CREATE TRIGGER invoice_quote_provider_integrity_holds_enforce_insert
+BEFORE INSERT ON invoice_quote_provider_integrity_holds FOR EACH ROW
+EXECUTE FUNCTION enforce_invoice_quote_provider_hold_insert();
+CREATE CONSTRAINT TRIGGER invoice_quote_offers_require_provider_completion
+AFTER INSERT ON invoice_quote_offers DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION require_invoice_quote_provider_completion();
+
+CREATE TRIGGER invoice_quote_provider_dispatches_reject_update
+BEFORE UPDATE OR DELETE ON invoice_quote_provider_dispatches FOR EACH ROW
+EXECUTE FUNCTION reject_invoice_quote_provider_attempt_mutation();
+CREATE TRIGGER invoice_quote_provider_completions_reject_update
+BEFORE UPDATE OR DELETE ON invoice_quote_provider_completions FOR EACH ROW
+EXECUTE FUNCTION reject_invoice_quote_provider_attempt_mutation();
+CREATE TRIGGER invoice_quote_provider_integrity_holds_reject_update
+BEFORE UPDATE OR DELETE ON invoice_quote_provider_integrity_holds FOR EACH ROW
+EXECUTE FUNCTION reject_invoice_quote_provider_attempt_mutation();
+
 DO $$
 DECLARE runtime_role_name TEXT := current_setting('bullnym.migration_runtime_role');
 BEGIN
@@ -971,9 +1153,21 @@ BEGIN
     EXECUTE format('REVOKE ALL ON TABLE invoice_quote_provider_attempts FROM %I', runtime_role_name);
     EXECUTE format('GRANT SELECT ON TABLE invoice_quote_provider_attempts TO %I', runtime_role_name);
     EXECUTE format(
-        'GRANT INSERT (invoice_id, quote_version_id, rail, request_key, provider, operation, merchant_amount_sat, claim_key_allocation_id, refund_key_allocation_id) ON TABLE invoice_quote_provider_attempts TO %I',
+        'GRANT INSERT (invoice_id, quote_version_id, rail, request_key, provider, operation, merchant_amount_sat, request_authority_json, request_authority_sha256, claim_key_allocation_id, refund_key_allocation_id) ON TABLE invoice_quote_provider_attempts TO %I',
         runtime_role_name
     );
+    REVOKE ALL ON TABLE invoice_quote_provider_dispatches FROM PUBLIC;
+    REVOKE ALL ON TABLE invoice_quote_provider_completions FROM PUBLIC;
+    REVOKE ALL ON TABLE invoice_quote_provider_integrity_holds FROM PUBLIC;
+    EXECUTE format('REVOKE ALL ON TABLE invoice_quote_provider_dispatches FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON TABLE invoice_quote_provider_completions FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON TABLE invoice_quote_provider_integrity_holds FROM %I', runtime_role_name);
+    EXECUTE format('GRANT SELECT ON TABLE invoice_quote_provider_dispatches TO %I', runtime_role_name);
+    EXECUTE format('GRANT INSERT (provider_attempt_id, request_authority_sha256) ON TABLE invoice_quote_provider_dispatches TO %I', runtime_role_name);
+    EXECUTE format('GRANT SELECT ON TABLE invoice_quote_provider_completions TO %I', runtime_role_name);
+    EXECUTE format('GRANT INSERT (provider_attempt_id, quote_offer_id, provider_offer_id, provider_response_sha256) ON TABLE invoice_quote_provider_completions TO %I', runtime_role_name);
+    EXECUTE format('GRANT SELECT ON TABLE invoice_quote_provider_integrity_holds TO %I', runtime_role_name);
+    EXECUTE format('GRANT INSERT (provider_attempt_id, reason) ON TABLE invoice_quote_provider_integrity_holds TO %I', runtime_role_name);
     EXECUTE format(
         'GRANT INSERT (provider_attempt_id) ON TABLE invoice_quote_offers TO %I',
         runtime_role_name
@@ -983,6 +1177,10 @@ BEGIN
     REVOKE ALL ON FUNCTION enforce_invoice_quote_offer_attempt_binding() FROM PUBLIC;
     REVOKE ALL ON FUNCTION invoice_quote_credit_for_sats(INTEGER, BIGINT, BIGINT, BIGINT) FROM PUBLIC;
     REVOKE ALL ON FUNCTION stamp_quote_payment_first_observed() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_dispatch_insert() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_completion_insert() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_hold_insert() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION require_invoice_quote_provider_completion() FROM PUBLIC;
     EXECUTE format(
         'GRANT EXECUTE ON FUNCTION invoice_quote_credit_for_sats(INTEGER, BIGINT, BIGINT, BIGINT) TO %I',
         runtime_role_name
@@ -991,6 +1189,10 @@ BEGIN
     EXECUTE format('REVOKE ALL ON FUNCTION reject_invoice_quote_provider_attempt_mutation() FROM %I', runtime_role_name);
     EXECUTE format('REVOKE ALL ON FUNCTION enforce_invoice_quote_offer_attempt_binding() FROM %I', runtime_role_name);
     EXECUTE format('REVOKE ALL ON FUNCTION stamp_quote_payment_first_observed() FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_dispatch_insert() FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_completion_insert() FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON FUNCTION enforce_invoice_quote_provider_hold_insert() FROM %I', runtime_role_name);
+    EXECUTE format('REVOKE ALL ON FUNCTION require_invoice_quote_provider_completion() FROM %I', runtime_role_name);
 END
 $$;
 

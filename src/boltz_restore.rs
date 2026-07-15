@@ -276,7 +276,7 @@ fn validate_reverse_record(
     }
     validate_claim_details(record, claim, LIQUID_LEAF_VERSION, true)?;
 
-    let amount = claim
+    claim
         .amount
         .filter(|amount| *amount > 0)
         .ok_or_else(|| invalid_error(record, "reverse claim amount is missing or zero"))?;
@@ -304,16 +304,7 @@ fn validate_reverse_record(
         &server_public_key,
         claim.timeout_block_height,
     )?;
-    let reconstructed = CreateReverseResponse {
-        id: record.id.clone(),
-        invoice: None,
-        swap_tree: claim.tree.clone(),
-        lockup_address: claim.lockup_address.clone(),
-        refund_public_key: server_public_key,
-        timeout_block_height: claim.timeout_block_height,
-        onchain_amount: amount,
-        blinding_key: claim.blinding_key.clone(),
-    };
+    let reconstructed = reconstruct_reverse_creation_response(record)?;
     reconstructed
         .validate(
             &preimage,
@@ -398,11 +389,7 @@ fn validate_chain_record(
         refund.timeout_block_height,
     )?;
 
-    let reconstructed = CreateChainResponse {
-        id: record.id.clone(),
-        claim_details: restore_claim_to_chain_details(record, claim)?,
-        lockup_details: restore_refund_to_chain_details(record, refund)?,
-    };
+    let reconstructed = reconstruct_chain_creation_response(record)?;
     reconstructed
         .validate(
             &PublicKey::new(claim_keypair.public_key()),
@@ -423,6 +410,54 @@ fn validate_chain_record(
         status: record.status.clone(),
         created_at: record.created_at,
         keys: vec![claim_key, refund_key],
+    })
+}
+
+/// Reconstruct the typed create response only from one restore record whose
+/// complete set has passed [`validate_restore_records`]. The caller must still
+/// validate it against its independently persisted request authority.
+pub(crate) fn reconstruct_reverse_creation_response(
+    record: &SwapRestoreResponse,
+) -> Result<CreateReverseResponse, BoltzRestoreValidationError> {
+    let claim = record
+        .claim_details
+        .as_ref()
+        .ok_or_else(|| invalid_error(record, "reverse claim details are missing"))?;
+    let amount = claim
+        .amount
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| invalid_error(record, "reverse claim amount is missing or zero"))?;
+    Ok(CreateReverseResponse {
+        id: record.id.clone(),
+        // The currently pinned boltz-client restore contract does not decode
+        // the provider's reverse invoice. Recovery can positively identify
+        // the obligation but cannot safely expose it without that BOLT11.
+        invoice: None,
+        swap_tree: claim.tree.clone(),
+        lockup_address: claim.lockup_address.clone(),
+        refund_public_key: parse_public_key(record, &claim.server_public_key)?,
+        timeout_block_height: claim.timeout_block_height,
+        onchain_amount: amount,
+        blinding_key: claim.blinding_key.clone(),
+    })
+}
+
+/// Chain counterpart to [`reconstruct_reverse_creation_response`].
+pub(crate) fn reconstruct_chain_creation_response(
+    record: &SwapRestoreResponse,
+) -> Result<CreateChainResponse, BoltzRestoreValidationError> {
+    let claim = record
+        .claim_details
+        .as_ref()
+        .ok_or_else(|| invalid_error(record, "chain claim details are missing"))?;
+    let refund = record
+        .refund_details
+        .as_ref()
+        .ok_or_else(|| invalid_error(record, "chain refund details are missing"))?;
+    Ok(CreateChainResponse {
+        id: record.id.clone(),
+        claim_details: restore_claim_to_chain_details(record, claim)?,
+        lockup_details: restore_refund_to_chain_details(record, refund)?,
     })
 }
 
@@ -626,11 +661,10 @@ fn restore_claim_to_chain_details(
         lockup_address: details.lockup_address.clone(),
         server_public_key: parse_public_key(record, &details.server_public_key)?,
         timeout_block_height: details.timeout_block_height,
-        // Boltz's restore contract makes this field optional, and
-        // `CreateChainResponse::validate` does not use it to bind the script or
-        // address. Recovery amounts come from signed/local evidence, never this
-        // provider response, so do not promote it into authority here.
-        amount: 0,
+        // Retain the optional provider observation for an exact cross-check by
+        // provider-create recovery. It is not monetary authority on its own;
+        // callers still bind it to their canonical pre-network request.
+        amount: details.amount.unwrap_or(0),
         blinding_key: details.blinding_key.clone(),
         refund_address: None,
         claim_address: None,

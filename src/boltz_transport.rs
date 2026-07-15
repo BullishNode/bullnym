@@ -16,8 +16,9 @@ use boltz_client::error::Error as BoltzClientError;
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateChainRequest, CreateChainResponse, CreateReverseRequest,
     CreateReverseResponse, GetChainPairsResponse, GetReversePairsResponse, GetSwapResponse,
-    HeightResponse,
+    HeightResponse, SwapRestoreResponse,
 };
+use boltz_client::util::secrets::SwapMasterKey;
 use sha2::{Digest, Sha256};
 
 use crate::boltz::{ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
@@ -61,6 +62,13 @@ pub trait BoltzTransport: Send + Sync {
         request: CreateChainRequest,
     ) -> Result<CreateChainResponse, BoltzClientError>;
     async fn get_swap(&self, swap_id: &str) -> Result<GetSwapResponse, BoltzClientError>;
+    /// Fetch the bounded, high-water-checked xpub restore set. This is a
+    /// positive reconciliation boundary, never proof that an absent create
+    /// request was not accepted.
+    async fn restore_swaps(
+        &self,
+        swap_master_key: &SwapMasterKey,
+    ) -> Result<Vec<SwapRestoreResponse>, BoltzClientError>;
     async fn quote_request(
         &self,
         swap_id: &str,
@@ -73,6 +81,7 @@ pub struct HttpBoltzTransport {
     api: BoltzApiClientV2,
     base_url: String,
     quote_client: reqwest::Client,
+    restore_fetcher: Option<crate::boltz_restore_fetch::BoltzRestoreFetcher>,
 }
 
 impl HttpBoltzTransport {
@@ -90,6 +99,7 @@ impl HttpBoltzTransport {
             api,
             base_url: base_url.to_owned(),
             quote_client,
+            restore_fetcher: crate::boltz_restore_fetch::BoltzRestoreFetcher::new(base_url).ok(),
         })
     }
 }
@@ -220,6 +230,19 @@ impl BoltzTransport for HttpBoltzTransport {
         self.api.get_swap(swap_id).await
     }
 
+    async fn restore_swaps(
+        &self,
+        swap_master_key: &SwapMasterKey,
+    ) -> Result<Vec<SwapRestoreResponse>, BoltzClientError> {
+        let fetcher = self.restore_fetcher.as_ref().ok_or_else(|| {
+            BoltzClientError::Generic("Boltz restore transport is unavailable".into())
+        })?;
+        fetcher
+            .fetch_validated_records(swap_master_key)
+            .await
+            .map_err(|_| BoltzClientError::Generic("Boltz restore reconciliation failed".into()))
+    }
+
     async fn quote_request(
         &self,
         swap_id: &str,
@@ -343,6 +366,7 @@ pub enum ScriptedBoltzStep {
         swap_id: String,
         result: Result<GetSwapResponse, ScriptedBoltzError>,
     },
+    RestoreSwaps(Box<Result<Vec<SwapRestoreResponse>, ScriptedBoltzError>>),
     Quote {
         swap_id: String,
         result: Result<BoltzQuoteHttpResponse, ChainSwapQuoteProviderError>,
@@ -364,6 +388,7 @@ impl ScriptedBoltzStep {
             Self::CreateFixedCheckoutReverse { .. } => "create_fixed_checkout_reverse",
             Self::CreateChain(_) => "create_chain",
             Self::GetSwap { .. } => "get_swap",
+            Self::RestoreSwaps(_) => "restore_swaps",
             Self::Quote { .. } => "quote",
             Self::AcceptQuote { .. } => "accept_quote",
         }
@@ -389,6 +414,7 @@ pub enum ScriptedBoltzCall {
     GetSwap {
         swap_id: String,
     },
+    RestoreSwaps,
     Quote {
         swap_id: String,
     },
@@ -564,6 +590,19 @@ impl BoltzTransport for ScriptedBoltzTransport {
             ScriptedBoltzStep::GetSwap { .. } => Err(BoltzClientError::Generic(
                 "scripted get_swap identity mismatch".into(),
             )),
+            _ => unreachable!("step kind checked"),
+        }
+    }
+
+    async fn restore_swaps(
+        &self,
+        _swap_master_key: &SwapMasterKey,
+    ) -> Result<Vec<SwapRestoreResponse>, BoltzClientError> {
+        self.record(ScriptedBoltzCall::RestoreSwaps);
+        match self.next("restore_swaps")? {
+            ScriptedBoltzStep::RestoreSwaps(result) => {
+                (*result).map_err(ScriptedBoltzError::into_client_error)
+            }
             _ => unreachable!("step kind checked"),
         }
     }
