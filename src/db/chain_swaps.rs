@@ -6,7 +6,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::{ClaimFailureOutcome, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow};
+use super::{
+    ClaimFailureOutcome, InvoiceQuoteAttribution, LiquidClaimFeeAuthority,
+    LiquidClaimFeeAuthorityRow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSwapStatus {
@@ -484,6 +487,11 @@ pub struct ChainSwapLineage<'a> {
 pub struct ChainSwapRecord {
     pub id: Uuid,
     pub invoice_id: Uuid,
+    /// Exact immutable five-minute Bitcoin/Boltz quote and offer identity.
+    /// Both values remain NULL for legacy rows and are present together for
+    /// quote-aware chain swaps.
+    pub invoice_quote_version_id: Option<Uuid>,
+    pub invoice_quote_offer_id: Option<Uuid>,
     pub nym: Option<String>,
     pub boltz_swap_id: String,
     pub from_chain: String,
@@ -582,7 +590,8 @@ mod creation_integrity_tests {
 }
 
 const CHAIN_SWAP_RECORD_COLUMNS: &str =
-    "id, invoice_id, nym, boltz_swap_id, from_chain, to_chain, \
+    "id, invoice_id, invoice_quote_version_id, invoice_quote_offer_id, \
+     nym, boltz_swap_id, from_chain, to_chain, \
      lockup_address, lockup_bip21, user_lock_amount_sat, server_lock_amount_sat, \
      preimage_hex, claim_key_hex, refund_key_hex, boltz_response_json, status, claim_txid, \
      claim_tx_hex, claim_actual_fee_sat, claim_actual_fee_rate_sat_vb, \
@@ -643,7 +652,7 @@ pub async fn record_chain_swap(
     pool: &PgPool,
     swap: &NewChainSwapRecord<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, None, None).await
+    insert_chain_swap(pool, swap, None, None, None).await
 }
 
 pub async fn record_chain_swap_with_lineage(
@@ -651,7 +660,7 @@ pub async fn record_chain_swap_with_lineage(
     swap: &NewChainSwapRecord<'_>,
     lineage: &ChainSwapLineage<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, Some(lineage), None).await
+    insert_chain_swap(pool, swap, Some(lineage), None, None).await
 }
 
 /// Legacy migration-051 insertion API. It carries complete provider creation
@@ -668,7 +677,7 @@ pub async fn record_chain_swap_with_lineage_and_creation_terms(
         creation_terms: *creation_terms,
         recovery_address_commitment_id: None,
     };
-    insert_chain_swap(pool, swap, Some(lineage), Some(&evidence)).await
+    insert_chain_swap(pool, swap, Some(lineage), Some(&evidence), None).await
 }
 
 /// Persist a fully validated post-053 chain swap and its exact recovery-policy
@@ -680,7 +689,27 @@ pub async fn record_chain_swap_with_lineage_and_creation_evidence(
     lineage: &ChainSwapLineage<'_>,
     creation_evidence: &NewChainSwapCreationEvidence<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(pool, swap, Some(lineage), Some(creation_evidence)).await
+    insert_chain_swap(pool, swap, Some(lineage), Some(creation_evidence), None).await
+}
+
+/// Persist a canonical chain swap with the exact Bitcoin/Boltz quote offer
+/// that created it. The offer identity is checked atomically without an expiry
+/// filter, so copied expired instructions remain durable obligations.
+pub async fn record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
+    pool: &PgPool,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(
+        pool,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+        Some(attribution),
+    )
+    .await
 }
 
 /// Transaction-aware counterpart to
@@ -695,7 +724,7 @@ pub async fn record_chain_swap_with_lineage_and_creation_terms_in_tx(
         creation_terms: *creation_terms,
         recovery_address_commitment_id: None,
     };
-    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(&evidence)).await
+    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(&evidence), None).await
 }
 
 /// Transaction-aware post-053 insertion API carrying the exact immutable
@@ -706,14 +735,50 @@ pub async fn record_chain_swap_with_lineage_and_creation_evidence_in_tx(
     lineage: &ChainSwapLineage<'_>,
     creation_evidence: &NewChainSwapCreationEvidence<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(&mut **tx, swap, Some(lineage), Some(creation_evidence)).await
+    insert_chain_swap(
+        &mut **tx,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+        None,
+    )
+    .await
+}
+
+/// Transaction-aware canonical quote-attributed chain-swap insert.
+pub async fn record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    lineage: &ChainSwapLineage<'_>,
+    creation_evidence: &NewChainSwapCreationEvidence<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(
+        &mut **tx,
+        swap,
+        Some(lineage),
+        Some(creation_evidence),
+        Some(attribution),
+    )
+    .await
 }
 
 pub async fn record_chain_swap_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     swap: &NewChainSwapRecord<'_>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
-    insert_chain_swap(&mut **tx, swap, None, None).await
+    insert_chain_swap(&mut **tx, swap, None, None, None).await
+}
+
+/// Test/compatibility-shaped transaction API. Production quote-aware chain
+/// swaps should also carry lineage and complete creation evidence through
+/// [`record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx`].
+pub async fn record_chain_swap_in_tx_with_quote_attribution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    swap: &NewChainSwapRecord<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<ChainSwapRecord, sqlx::Error> {
+    insert_chain_swap(&mut **tx, swap, None, None, Some(attribution)).await
 }
 
 async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
@@ -721,6 +786,7 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     swap: &NewChainSwapRecord<'_>,
     lineage: Option<&ChainSwapLineage<'_>>,
     creation_evidence: Option<&NewChainSwapCreationEvidence<'_>>,
+    attribution: Option<InvoiceQuoteAttribution>,
 ) -> Result<ChainSwapRecord, sqlx::Error> {
     let creation_terms = creation_evidence.map(|evidence| &evidence.creation_terms);
     sqlx::query_as::<_, ChainSwapRecord>(&format!(
@@ -736,10 +802,21 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
               liquid_claim_script_sha256, liquid_refund_script_sha256, \
               btc_timeout_height, liquid_timeout_height, btc_network, liquid_network, \
               liquid_asset_id, merchant_liquid_destination, \
-              merchant_emergency_btc_address, recovery_address_commitment_id) \
-         VALUES ($1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+              merchant_emergency_btc_address, recovery_address_commitment_id, \
+              invoice_quote_version_id, invoice_quote_offer_id) \
+         SELECT $1, $2, $3, 'BTC', 'L-BTC', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
                  $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                 $30, $31, $32, $33, $34, $35, $36) \
+                 $30, $31, $32, $33, $34, $35, $36, $37, $38 \
+          WHERE $37::UUID IS NULL OR EXISTS ( \
+                SELECT 1 FROM invoice_quote_offers offer \
+                 WHERE offer.id = $38 \
+                   AND offer.quote_version_id = $37 \
+                   AND offer.invoice_id = $1 \
+                   AND offer.rail = 'bitcoin' \
+                   AND offer.offer_kind = 'boltz_chain' \
+                   AND offer.provider = 'boltz' \
+                   AND offer.provider_offer_id = $3 \
+          ) \
          RETURNING {CHAIN_SWAP_RECORD_COLUMNS}"
     ))
     .bind(swap.invoice_id)
@@ -778,8 +855,16 @@ async fn insert_chain_swap<'e, E: sqlx::PgExecutor<'e>>(
     .bind(creation_terms.map(|terms| terms.merchant_liquid_destination))
     .bind(creation_terms.and_then(|terms| terms.merchant_emergency_btc_address))
     .bind(creation_evidence.and_then(|evidence| evidence.recovery_address_commitment_id))
-    .fetch_one(executor)
-    .await
+    .bind(attribution.map(|attribution| attribution.quote_version_id))
+    .bind(attribution.map(|attribution| attribution.quote_offer_id))
+    .fetch_optional(executor)
+    .await?
+    .ok_or_else(|| {
+        sqlx::Error::Protocol(
+            "chain swap quote attribution does not match invoice/bitcoin/Boltz offer identity"
+                .into(),
+        )
+    })
 }
 
 pub async fn get_chain_swap_by_boltz_id(

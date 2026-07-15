@@ -4,7 +4,10 @@ use std::str::FromStr;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::{mark_user_used, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow};
+use super::{
+    mark_user_used, validate_invoice_quote_attribution, InvoiceQuoteAttribution,
+    LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow,
+};
 
 pub const CLAIM_IN_FLIGHT_LEASE: &str = "2 minutes";
 
@@ -171,7 +174,7 @@ pub struct ReverseSwapLineage<'a> {
 
 pub async fn record_swap(pool: &PgPool, swap: &NewSwapRecord<'_>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    insert_swap_in_tx(&mut tx, swap, None).await?;
+    insert_swap_in_tx(&mut tx, swap, None, None).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -182,7 +185,22 @@ pub async fn record_swap_with_lineage(
     lineage: &ReverseSwapLineage<'_>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    insert_swap_in_tx(&mut tx, swap, Some(lineage)).await?;
+    insert_swap_in_tx(&mut tx, swap, Some(lineage), None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Quote-aware reverse-swap persistence. The exact Lightning/Boltz payer
+/// offer is validated in the insert transaction and stored immutably beside
+/// the provider obligation. Expired offers remain valid attribution targets.
+pub async fn record_swap_with_lineage_and_quote_attribution(
+    pool: &PgPool,
+    swap: &NewSwapRecord<'_>,
+    lineage: &ReverseSwapLineage<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    insert_swap_in_tx(&mut tx, swap, Some(lineage), Some(attribution)).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -195,7 +213,7 @@ pub async fn record_swap_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     swap: &NewSwapRecord<'_>,
 ) -> Result<(), sqlx::Error> {
-    insert_swap_in_tx(tx, swap, None).await
+    insert_swap_in_tx(tx, swap, None, None).await
 }
 
 pub async fn record_swap_in_tx_with_lineage(
@@ -203,22 +221,63 @@ pub async fn record_swap_in_tx_with_lineage(
     swap: &NewSwapRecord<'_>,
     lineage: &ReverseSwapLineage<'_>,
 ) -> Result<(), sqlx::Error> {
-    insert_swap_in_tx(tx, swap, Some(lineage)).await
+    insert_swap_in_tx(tx, swap, Some(lineage), None).await
+}
+
+/// Transaction-aware quote-attributed counterpart used by lazy offer
+/// creation while it owns the invoice serialization boundary.
+pub async fn record_swap_in_tx_with_lineage_and_quote_attribution(
+    tx: &mut Transaction<'_, Postgres>,
+    swap: &NewSwapRecord<'_>,
+    lineage: &ReverseSwapLineage<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<(), sqlx::Error> {
+    insert_swap_in_tx(tx, swap, Some(lineage), Some(attribution)).await
+}
+
+/// Test/compatibility-shaped transaction API. Production quote-aware reverse
+/// swaps should carry key lineage through
+/// [`record_swap_in_tx_with_lineage_and_quote_attribution`].
+pub async fn record_swap_in_tx_with_quote_attribution(
+    tx: &mut Transaction<'_, Postgres>,
+    swap: &NewSwapRecord<'_>,
+    attribution: InvoiceQuoteAttribution,
+) -> Result<(), sqlx::Error> {
+    insert_swap_in_tx(tx, swap, None, Some(attribution)).await
 }
 
 async fn insert_swap_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     swap: &NewSwapRecord<'_>,
     lineage: Option<&ReverseSwapLineage<'_>>,
+    attribution: Option<InvoiceQuoteAttribution>,
 ) -> Result<(), sqlx::Error> {
+    if let Some(attribution) = attribution {
+        let invoice_id = swap.invoice_id.ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "quote-attributed reverse swap requires an invoice identity".into(),
+            )
+        })?;
+        validate_invoice_quote_attribution(
+            &mut **tx,
+            invoice_id,
+            attribution,
+            "lightning",
+            "boltz_reverse",
+            Some("boltz"),
+            Some(swap.boltz_swap_id),
+        )
+        .await?;
+    }
     sqlx::query(
         "INSERT INTO swap_records \
          (nym, boltz_swap_id, address, address_index, amount_sat, invoice, \
           preimage_hex, claim_key_hex, boltz_response_json, status, invoice_id, \
           key_index, root_fingerprint, key_allocation_id, key_epoch, \
-          derivation_scheme_version, claim_public_key_hex, preimage_hash_hex) \
+          derivation_scheme_version, claim_public_key_hex, preimage_hash_hex, \
+          invoice_quote_version_id, invoice_quote_offer_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12, \
-                 $13, $14, $15, $16, $17)",
+                 $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(swap.nym)
     .bind(swap.boltz_swap_id)
@@ -237,6 +296,8 @@ async fn insert_swap_in_tx(
     .bind(lineage.map(|lineage| lineage.derivation_scheme_version))
     .bind(lineage.map(|lineage| lineage.claim_public_key_hex))
     .bind(lineage.map(|lineage| lineage.preimage_hash_hex))
+    .bind(attribution.map(|attribution| attribution.quote_version_id))
+    .bind(attribution.map(|attribution| attribution.quote_offer_id))
     .execute(&mut **tx)
     .await?;
     if let Some(nym) = swap.nym {
@@ -311,6 +372,11 @@ pub struct SwapRecord {
     /// merchant-side claim succeeds. NULL for LNURL Lightning Address
     /// swaps and for non-invoice rows.
     pub invoice_id: Option<Uuid>,
+    /// Exact immutable five-minute quote/offer lineage. Both values are NULL
+    /// for pre-061 and non-invoice rows, or both are present for quote-aware
+    /// invoice swaps.
+    pub invoice_quote_version_id: Option<Uuid>,
+    pub invoice_quote_offer_id: Option<Uuid>,
     // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
     // columns in the schema but intentionally NOT read into this struct.
     // Reading TIMESTAMPTZ requires the `time` or `chrono` sqlx feature
@@ -344,7 +410,8 @@ const SWAP_RECORD_COLUMNS: &str =
      claim_fee_decision_policy_floor_sat_vb, \
      claim_fee_decision_policy_cap_sat_vb, claim_fee_decision_policy_version, \
      claim_path, claim_attempts, \
-     last_claim_error, cooperative_refused, invoice_id";
+     last_claim_error, cooperative_refused, invoice_id, \
+     invoice_quote_version_id, invoice_quote_offer_id";
 
 pub async fn get_swap_by_boltz_id(
     pool: &PgPool,

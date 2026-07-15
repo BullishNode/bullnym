@@ -1584,12 +1584,48 @@ async fn record_event(
 ) -> Result<(), MerchantSettlementRepositoryError> {
     let vout = i32::try_from(intent.vout)
         .map_err(|_| MerchantSettlementRepositoryError::InvalidCommand)?;
+    let attribution: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT chain_swap.invoice_quote_version_id, \
+                chain_swap.invoice_quote_offer_id \
+           FROM chain_swap_records chain_swap \
+          WHERE chain_swap.id = $1 \
+            AND chain_swap.invoice_id = $2 \
+            AND chain_swap.boltz_swap_id = $3 \
+            AND ( \
+              (chain_swap.invoice_quote_version_id IS NULL \
+               AND chain_swap.invoice_quote_offer_id IS NULL) \
+              OR EXISTS ( \
+                SELECT 1 FROM invoice_quote_offers offer \
+                 WHERE offer.id = chain_swap.invoice_quote_offer_id \
+                   AND offer.quote_version_id = chain_swap.invoice_quote_version_id \
+                   AND offer.invoice_id = chain_swap.invoice_id \
+                   AND offer.rail = 'bitcoin' \
+                   AND offer.offer_kind = 'boltz_chain' \
+                   AND offer.provider = 'boltz' \
+                   AND offer.provider_offer_id = chain_swap.boltz_swap_id \
+              ) \
+            )",
+    )
+    .bind(intent.chain_swap_id)
+    .bind(intent.invoice_id)
+    .bind(&intent.boltz_swap_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((quote_version_id, quote_offer_id)) = attribution else {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    };
+    if quote_version_id.is_some() != quote_offer_id.is_some() {
+        return Err(MerchantSettlementRepositoryError::ImmutableIdentityConflict);
+    }
     sqlx::query(
         "INSERT INTO invoice_payment_events (\
              invoice_id, rail, source, event_key, amount_sat, txid, vout, boltz_swap_id, address, \
              accounting_state, verification_state, deactivated_at, deactivation_reason, \
-             merchant_settlement_family_key, merchant_chain_swap_id, merchant_settlement_finalized\
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'inactive','verified',NOW(),'not_confirmed',$10,$11,FALSE) \
+             merchant_settlement_family_key, merchant_chain_swap_id, merchant_settlement_finalized, \
+             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at\
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'inactive','verified',NOW(),'not_confirmed', \
+                   $10,$11,FALSE,$12,$13, \
+                   CASE WHEN $12::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
          ON CONFLICT (event_key) DO NOTHING",
     )
     .bind(intent.invoice_id)
@@ -1603,12 +1639,16 @@ async fn record_event(
     .bind(&intent.destination_address)
     .bind(intent.identity.family_key())
     .bind(intent.chain_swap_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
     .execute(&mut **tx)
     .await?;
     let exact: Option<bool> = sqlx::query_scalar(
         "SELECT invoice_id = $2 AND rail = $3 AND source = $4 AND amount_sat = $5 \
                 AND txid = $6 AND vout = $7 AND boltz_swap_id = $8 AND address = $9 \
                 AND merchant_settlement_family_key = $10 AND merchant_chain_swap_id = $11 \
+                AND invoice_quote_version_id IS NOT DISTINCT FROM $12::UUID \
+                AND invoice_quote_offer_id IS NOT DISTINCT FROM $13::UUID \
            FROM invoice_payment_events WHERE event_key = $1 FOR UPDATE",
     )
     .bind(intent.identity.event_key())
@@ -1622,6 +1662,8 @@ async fn record_event(
     .bind(&intent.destination_address)
     .bind(intent.identity.family_key())
     .bind(intent.chain_swap_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
     .fetch_optional(&mut **tx)
     .await?;
     if exact != Some(true) {

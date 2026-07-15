@@ -11663,6 +11663,671 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
 }
 
 #[tokio::test]
+async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+
+    let npub = "71".repeat(32);
+    let liquid_address = "lq1qphase7attributionmerchant000000000000000000000000000000000000000";
+    let bitcoin_address = "bc1qphase7attributionmerchant0000000000000000000000000000000";
+    let blinding_key = "72".repeat(32);
+    pay_service::db::create_user(&pool, "phase7attribution", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let invoice = pay_service::db::insert_invoice(
+        &pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: None,
+            public_slug: None,
+            npub_owner: &npub,
+            origin: "wallet",
+            fiat_amount_minor: Some(1_000),
+            fiat_currency: Some("USD"),
+            amount_sat: 10_000,
+            rate_minor_per_btc: Some(10_000_000),
+            rate_lock_secs: 300,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: true,
+            accept_ln: true,
+            accept_liquid: true,
+            bitcoin_address: Some(bitcoin_address),
+            liquid_address: Some(liquid_address),
+            liquid_blinding_key_hex: Some(&blinding_key),
+            expires_in_secs: 3_600,
+        },
+    )
+    .await
+    .unwrap();
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let quote = pay_service::db::create_or_reuse_current_invoice_quote(
+        &pool,
+        invoice.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "bullbitcoin-pricer:indexPrice",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            merchant_amount_sat: 10_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+    let reverse_provider_id = "PHASE7_ATTRIBUTION_REVERSE";
+    let chain_provider_id = "PHASE7_ATTRIBUTION_CHAIN";
+    let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteOffer {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "lightning",
+            offer_kind: "boltz_reverse",
+            request_key: &"a".repeat(64),
+            provider: Some("boltz"),
+            provider_offer_id: Some(reverse_provider_id),
+            payer_amount_sat: 10_500,
+            expires_at_unix: quote.expires_at_unix,
+        },
+    )
+    .await
+    .unwrap()
+    .offer;
+    let chain_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteOffer {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "bitcoin",
+            offer_kind: "boltz_chain",
+            request_key: &"b".repeat(64),
+            provider: Some("boltz"),
+            provider_offer_id: Some(chain_provider_id),
+            payer_amount_sat: 10_600,
+            expires_at_unix: quote.expires_at_unix,
+        },
+    )
+    .await
+    .unwrap()
+    .offer;
+    let direct_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteOffer {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "bitcoin",
+            offer_kind: "direct",
+            request_key: &"c".repeat(64),
+            provider: None,
+            provider_offer_id: None,
+            payer_amount_sat: 10_000,
+            expires_at_unix: quote.expires_at_unix,
+        },
+    )
+    .await
+    .unwrap()
+    .offer;
+    let reverse_attribution = pay_service::db::InvoiceQuoteAttribution {
+        quote_version_id: quote.id,
+        quote_offer_id: reverse_offer.id,
+    };
+    let chain_attribution = pay_service::db::InvoiceQuoteAttribution {
+        quote_version_id: quote.id,
+        quote_offer_id: chain_offer.id,
+    };
+
+    let reverse_root = "7171717171717171";
+    let reverse_public_key = format!("02{}", "73".repeat(32));
+    let reverse_preimage_hash = "74".repeat(32);
+    let reverse_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: reverse_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_001,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &reverse_public_key,
+            preimage_hash_hex: Some(&reverse_preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let reverse_preimage = "75".repeat(32);
+    let reverse_claim_key = "76".repeat(32);
+    let reverse_swap = pay_service::db::NewSwapRecord {
+        nym: None,
+        boltz_swap_id: reverse_provider_id,
+        address: Some(liquid_address),
+        address_index: None,
+        amount_sat: 10_000,
+        invoice: "lnbc-phase7-attribution",
+        preimage_hex: &reverse_preimage,
+        claim_key_hex: &reverse_claim_key,
+        boltz_response_json: "{}",
+        invoice_id: Some(invoice.id),
+        key_index: Some(61_001),
+        root_fingerprint: Some(reverse_root),
+    };
+    let reverse_lineage = pay_service::db::ReverseSwapLineage {
+        allocation_id: reverse_allocation_id,
+        key_epoch: 1,
+        derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+        claim_public_key_hex: &reverse_public_key,
+        preimage_hash_hex: &reverse_preimage_hash,
+    };
+    let wrong_rail = pay_service::db::record_swap_with_lineage_and_quote_attribution(
+        &pool,
+        &reverse_swap,
+        &reverse_lineage,
+        chain_attribution,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(wrong_rail, sqlx::Error::Protocol(_)));
+    let wrong_provider_swap = pay_service::db::NewSwapRecord {
+        nym: None,
+        boltz_swap_id: "PHASE7_ATTRIBUTION_WRONG_PROVIDER",
+        address: Some(liquid_address),
+        address_index: None,
+        amount_sat: 10_000,
+        invoice: "lnbc-phase7-attribution-wrong-provider",
+        preimage_hex: &reverse_preimage,
+        claim_key_hex: &reverse_claim_key,
+        boltz_response_json: "{}",
+        invoice_id: Some(invoice.id),
+        key_index: Some(61_001),
+        root_fingerprint: Some(reverse_root),
+    };
+    let wrong_provider = pay_service::db::record_swap_with_lineage_and_quote_attribution(
+        &pool,
+        &wrong_provider_swap,
+        &reverse_lineage,
+        reverse_attribution,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(wrong_provider, sqlx::Error::Protocol(_)));
+    pay_service::db::record_swap_with_lineage_and_quote_attribution(
+        &pool,
+        &reverse_swap,
+        &reverse_lineage,
+        reverse_attribution,
+    )
+    .await
+    .unwrap();
+    let stored_reverse = pay_service::db::get_swap_by_boltz_id(&pool, reverse_provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            stored_reverse.invoice_quote_version_id,
+            stored_reverse.invoice_quote_offer_id,
+        ),
+        (Some(quote.id), Some(reverse_offer.id))
+    );
+
+    let recovery_commitment_id =
+        insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x77).await;
+    let chain_root = "7272727272727272";
+    let chain_claim_public = format!("02{}", "78".repeat(32));
+    let chain_refund_public = format!("03{}", "79".repeat(32));
+    let chain_preimage_hash = "7a".repeat(32);
+    let chain_claim_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_101,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &chain_claim_public,
+            preimage_hash_hex: Some(&chain_preimage_hash),
+        },
+    )
+    .await
+    .unwrap();
+    let chain_refund_allocation_id = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: chain_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_102,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &chain_refund_public,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let chain_preimage = "7b".repeat(32);
+    let chain_claim_key = "7c".repeat(32);
+    let chain_refund_key = "7d".repeat(32);
+    let chain_swap = pay_service::db::NewChainSwapRecord {
+        invoice_id: invoice.id,
+        nym: None,
+        boltz_swap_id: chain_provider_id,
+        lockup_address: "bc1qphase7attributionlockup000000000000000000000000000000000",
+        lockup_bip21: None,
+        user_lock_amount_sat: 10_600,
+        server_lock_amount_sat: 10_000,
+        preimage_hex: &chain_preimage,
+        claim_key_hex: &chain_claim_key,
+        refund_key_hex: &chain_refund_key,
+        boltz_response_json: "{}",
+        claim_key_index: Some(61_101),
+        refund_key_index: Some(61_102),
+        root_fingerprint: Some(chain_root),
+    };
+    let chain_lineage = pay_service::db::ChainSwapLineage {
+        claim_allocation_id: chain_claim_allocation_id,
+        refund_allocation_id: chain_refund_allocation_id,
+        key_epoch: 1,
+        derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+        claim_public_key_hex: &chain_claim_public,
+        refund_public_key_hex: &chain_refund_public,
+        preimage_hash_hex: &chain_preimage_hash,
+    };
+    let mut creation_terms = valid_chain_swap_creation_terms_fixture();
+    creation_terms.merchant_liquid_destination = liquid_address;
+    creation_terms.merchant_emergency_btc_address = Some(RECOVERY_COMMITMENT_P2WPKH);
+    let creation_evidence = pay_service::db::NewChainSwapCreationEvidence {
+        creation_terms,
+        recovery_address_commitment_id: Some(recovery_commitment_id),
+    };
+    let chain_wrong_rail =
+        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
+            &pool,
+            &chain_swap,
+            &chain_lineage,
+            &creation_evidence,
+            reverse_attribution,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(chain_wrong_rail, sqlx::Error::Protocol(_)));
+    let stored_chain =
+        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
+            &pool,
+            &chain_swap,
+            &chain_lineage,
+            &creation_evidence,
+            chain_attribution,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            stored_chain.invoice_quote_version_id,
+            stored_chain.invoice_quote_offer_id,
+        ),
+        (Some(quote.id), Some(chain_offer.id))
+    );
+
+    // Make all issued instructions genuinely expired without waiting five
+    // minutes. Test ownership may advance immutable clocks solely to prove
+    // that settlement validation deliberately has no expiry predicate.
+    sqlx::query(
+        "ALTER TABLE invoice_quote_offers DISABLE TRIGGER \
+         invoice_quote_offers_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_quote_offers SET \
+             created_at = statement_timestamp() - INTERVAL '301 seconds', \
+             expires_at = statement_timestamp() - INTERVAL '1 second' \
+         WHERE quote_version_id = $1",
+    )
+    .bind(quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_offers ENABLE TRIGGER \
+         invoice_quote_offers_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions DISABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_quote_versions SET \
+             rate_observed_at = statement_timestamp() - INTERVAL '302 seconds', \
+             rate_fetched_at = statement_timestamp() - INTERVAL '301 seconds', \
+             rate_fresh_until = statement_timestamp() - INTERVAL '1 second', \
+             created_at = statement_timestamp() - INTERVAL '301 seconds', \
+             expires_at = statement_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(quote.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE invoice_quote_versions ENABLE TRIGGER \
+         invoice_quote_versions_reject_update",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let reverse_event_key = format!("lightning_boltz_reverse:{reverse_provider_id}");
+    let reverse_txid = "7e".repeat(32);
+    let reverse_evidence = pay_service::db::InvoicePaymentEvidence {
+        rail: "lightning",
+        source: "lightning_boltz_reverse",
+        event_key: &reverse_event_key,
+        amount_sat: 10_000,
+        txid: Some(&reverse_txid),
+        vout: None,
+        boltz_swap_id: Some(reverse_provider_id),
+        address: None,
+    };
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            &pool,
+            invoice.id,
+            reverse_evidence,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let reverse_retry = pay_service::db::InvoicePaymentEvidence {
+        rail: "lightning",
+        source: "lightning_boltz_reverse",
+        event_key: &reverse_event_key,
+        amount_sat: 10_000,
+        txid: Some(&reverse_txid),
+        vout: None,
+        boltz_swap_id: Some(reverse_provider_id),
+        address: None,
+    };
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            &pool,
+            invoice.id,
+            reverse_retry,
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let reverse_row: (Option<Uuid>, Option<Uuid>, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT invoice_quote_version_id, invoice_quote_offer_id, \
+                quote_first_observed_at > ( \
+                    SELECT expires_at FROM invoice_quote_offers WHERE id = $2 \
+                ), fiat_credited_minor IS NULL, fiat_credit_policy IS NULL, \
+                fiat_valued_at IS NULL \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&reverse_event_key)
+    .bind(reverse_offer.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reverse_row,
+        (
+            Some(quote.id),
+            Some(reverse_offer.id),
+            true,
+            true,
+            true,
+            true,
+        )
+    );
+
+    let crossed_retry = pay_service::db::record_invoice_payment_with_quote_attribution(
+        &pool,
+        invoice.id,
+        pay_service::db::InvoicePaymentEvidence {
+            rail: "lightning",
+            source: "lightning_boltz_reverse",
+            event_key: &reverse_event_key,
+            amount_sat: 10_000,
+            txid: Some(&reverse_txid),
+            vout: None,
+            boltz_swap_id: Some(reverse_provider_id),
+            address: None,
+        },
+        chain_attribution,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(crossed_retry, sqlx::Error::Protocol(_)));
+
+    let chain_event_key = format!("bitcoin_boltz_chain:{chain_provider_id}");
+    let chain_txid = "7f".repeat(32);
+    assert_eq!(
+        pay_service::db::record_invoice_payment(
+            &pool,
+            invoice.id,
+            pay_service::db::InvoicePaymentEvidence {
+                rail: "bitcoin",
+                source: "bitcoin_boltz_chain",
+                event_key: &chain_event_key,
+                amount_sat: 10_000,
+                txid: Some(&chain_txid),
+                vout: None,
+                boltz_swap_id: Some(chain_provider_id),
+                address: None,
+            },
+            pay_service::db::InvoiceAccountingTolerances::default(),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let chain_row: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT invoice_quote_version_id, invoice_quote_offer_id \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&chain_event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(chain_row, (Some(quote.id), Some(chain_offer.id)));
+
+    let direct_event_key = format!("bitcoin_direct:{}:0", "80".repeat(32));
+    let direct_txid = "80".repeat(32);
+    let direct_block_hash = "81".repeat(32);
+    let direct_observation = pay_service::db::DirectOutputObservation {
+        event_key: &direct_event_key,
+        txid: &direct_txid,
+        vout: 0,
+        address: bitcoin_address,
+        amount_sat: 100,
+        asset_id: None,
+        confirmations: 3,
+        block_height: Some(900_001),
+        block_hash: Some(&direct_block_hash),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Finalized,
+        supersedes_event_key: None,
+    };
+    let generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let direct_mapping = [pay_service::db::DirectObservationQuoteAttribution {
+        event_key: &direct_event_key,
+        attribution: pay_service::db::InvoiceQuoteAttribution {
+            quote_version_id: quote.id,
+            quote_offer_id: direct_offer.id,
+        },
+    }];
+    let applied = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "phase7-attribution-test",
+            generation,
+            observations: std::slice::from_ref(&direct_observation),
+        },
+        &direct_mapping,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        applied,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { .. }
+    ));
+    let direct_row: (Option<Uuid>, Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT invoice_quote_version_id, invoice_quote_offer_id, \
+                quote_first_observed_at > ( \
+                    SELECT expires_at FROM invoice_quote_offers WHERE id = $2 \
+                ) \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&direct_event_key)
+    .bind(direct_offer.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(direct_row, (Some(quote.id), Some(direct_offer.id), true));
+    let retry = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "phase7-attribution-test",
+            generation,
+            observations: std::slice::from_ref(&direct_observation),
+        },
+        &direct_mapping,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        retry,
+        pay_service::db::ApplyDirectObservationOutcome::AlreadyApplied
+    );
+    let wrong_direct_mapping = [pay_service::db::DirectObservationQuoteAttribution {
+        event_key: &direct_event_key,
+        attribution: reverse_attribution,
+    }];
+    let wrong_direct = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "phase7-attribution-test",
+            generation,
+            observations: std::slice::from_ref(&direct_observation),
+        },
+        &wrong_direct_mapping,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(wrong_direct, sqlx::Error::Protocol(_)));
+
+    // A fresh sat-fixed invoice still uses the pre-061 NULL lineage shape.
+    let legacy_invoice = insert_test_btc_invoice(
+        &pool,
+        "phase7legacy",
+        &create_test_user(&pool, "phase7legacy").await,
+        "bc1qphase7legacyattribution000000000000000000000000000000000",
+    )
+    .await
+    .unwrap();
+    let legacy_event_key = format!("bitcoin_direct:{}:1", "82".repeat(32));
+    let legacy_txid = "82".repeat(32);
+    let legacy_block_hash = "83".repeat(32);
+    let legacy_observation = pay_service::db::DirectOutputObservation {
+        event_key: &legacy_event_key,
+        txid: &legacy_txid,
+        vout: 1,
+        address: "bc1qphase7legacyattribution000000000000000000000000000000000",
+        amount_sat: 1_000,
+        asset_id: None,
+        confirmations: 3,
+        block_height: Some(900_002),
+        block_hash: Some(&legacy_block_hash),
+        verification: pay_service::db::DirectEvidenceVerification::Verified,
+        phase: pay_service::db::DirectObservationPhase::Finalized,
+        supersedes_event_key: None,
+    };
+    let legacy_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        legacy_invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let crossed_invoice_mapping = [pay_service::db::DirectObservationQuoteAttribution {
+        event_key: &legacy_event_key,
+        attribution: pay_service::db::InvoiceQuoteAttribution {
+            quote_version_id: quote.id,
+            quote_offer_id: direct_offer.id,
+        },
+    }];
+    let crossed_invoice = pay_service::db::apply_direct_observation_batch_with_quote_attributions(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: legacy_invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "phase7-legacy-test",
+            generation: legacy_generation,
+            observations: std::slice::from_ref(&legacy_observation),
+        },
+        &crossed_invoice_mapping,
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(crossed_invoice, sqlx::Error::Protocol(_)));
+    pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: legacy_invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "phase7-legacy-test",
+            generation: legacy_generation,
+            observations: std::slice::from_ref(&legacy_observation),
+        },
+        pay_service::db::InvoiceAccountingTolerances::default(),
+    )
+    .await
+    .unwrap();
+    let legacy_row: (Option<Uuid>, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT invoice_quote_version_id, invoice_quote_offer_id, \
+                quote_first_observed_at::TEXT \
+           FROM invoice_payment_events WHERE event_key = $1",
+    )
+    .bind(&legacy_event_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_row, (None, None, None));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn registration_lifecycle_keeps_address_index_monotonic() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
