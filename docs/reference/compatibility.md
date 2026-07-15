@@ -16,15 +16,6 @@ policy inline.
   `BOLTZ_WEBHOOK_URL_SECRET`, and all in-flight swaps created before the
   secret rollout have either settled or expired.
 
-## Boltz Webhook Env Var
-
-- Current env var: `BOLTZ_WEBHOOK_URL_SECRET`
-- Compatibility env var: `BOLTZ_WEBHOOK_SECRET`
-- Compatibility reason: older configs used the HMAC-oriented name before the
-  server switched to URL-path authentication.
-- Removal condition: deployed secrets and runbooks no longer reference
-  `BOLTZ_WEBHOOK_SECRET`.
-
 ## Invoice Liquid Offer Route
 
 - Compatibility route: `POST /api/v1/invoices/:id/liquid`
@@ -33,14 +24,6 @@ policy inline.
   create time, but old clients should receive an actionable response instead
   of a generic 404.
 - Removal condition: mobile/API clients no longer call this route.
-
-## Invoice Status Rate-Limit Key
-
-- Current key: `invoice_status_per_source_per_min`
-- Compatibility key: `donation_status_per_source_per_min`
-- Compatibility reason: existing deployed TOML may still use the old
-  donation-era key.
-- Removal condition: deployed configs have migrated to the current key.
 
 ## Registration Lookup Quota Fields
 

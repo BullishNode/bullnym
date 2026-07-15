@@ -1,20 +1,8 @@
 use super::*;
 
 #[test]
-fn electrum_urls_legacy_single_field_only() {
-    let cfg = ElectrumConfig {
-        liquid_url: Some("a.example:50001".to_string()),
-        liquid_urls: vec![],
-        cache_ttl_secs: 0,
-        cache_max_entries: 0,
-    };
-    assert_eq!(cfg.urls(), vec!["ssl://a.example:50001".to_string()]);
-}
-
-#[test]
 fn electrum_urls_list_field_only() {
     let cfg = ElectrumConfig {
-        liquid_url: None,
         liquid_urls: vec!["a:1".to_string(), "b:2".to_string()],
         cache_ttl_secs: 0,
         cache_max_entries: 0,
@@ -26,26 +14,13 @@ fn electrum_urls_list_field_only() {
 }
 
 #[test]
-fn electrum_urls_both_fields_dedup_legacy_first() {
-    let cfg = ElectrumConfig {
-        liquid_url: Some("primary:1".to_string()),
-        liquid_urls: vec!["primary:1".to_string(), "secondary:2".to_string()],
-        cache_ttl_secs: 0,
-        cache_max_entries: 0,
-    };
-    assert_eq!(
-        cfg.urls(),
-        vec![
-            "ssl://primary:1".to_string(),
-            "ssl://secondary:2".to_string()
-        ]
-    );
+fn electrum_rejects_legacy_single_url_key() {
+    assert!(toml::from_str::<ElectrumConfig>("liquid_url = \"legacy.example:50001\"").is_err());
 }
 
 #[test]
 fn electrum_urls_falls_back_to_default() {
     let cfg = ElectrumConfig {
-        liquid_url: None,
         liquid_urls: vec![],
         cache_ttl_secs: 0,
         cache_max_entries: 0,
@@ -57,7 +32,6 @@ fn electrum_urls_falls_back_to_default() {
 #[test]
 fn electrum_urls_skips_empty_strings() {
     let cfg = ElectrumConfig {
-        liquid_url: Some(String::new()),
         liquid_urls: vec![String::new(), "a:1".to_string()],
         cache_ttl_secs: 0,
         cache_max_entries: 0,
@@ -68,7 +42,6 @@ fn electrum_urls_skips_empty_strings() {
 #[test]
 fn electrum_urls_preserves_explicit_scheme() {
     let cfg = ElectrumConfig {
-        liquid_url: None,
         liquid_urls: vec![
             "tcp://localhost:50001".to_string(),
             "ssl://example:995".to_string(),
@@ -90,14 +63,14 @@ fn explicit_electrum_validation_does_not_let_failovers_hide_invalid_config() {
     let mut cfg = ElectrumConfig::default();
     assert!(cfg.explicit_urls_valid());
 
-    cfg.liquid_url = Some("not-an-electrum-endpoint".to_string());
+    cfg.liquid_urls = vec!["not-an-electrum-endpoint".to_string()];
     assert!(!cfg.explicit_urls_valid());
     assert!(!cfg.urls_with_builtin_failover().is_empty());
 
-    cfg.liquid_url = Some("http://example.com:50002".to_string());
+    cfg.liquid_urls = vec!["http://example.com:50002".to_string()];
     assert!(!cfg.explicit_urls_valid());
 
-    cfg.liquid_url = Some("ssl://::1:50002".to_string());
+    cfg.liquid_urls = vec!["ssl://::1:50002".to_string()];
     assert!(!cfg.explicit_urls_valid());
 
     for invalid in [
@@ -110,12 +83,14 @@ fn explicit_electrum_validation_does_not_let_failovers_hide_invalid_config() {
         "ssl://host:50002/path",
         "ssl://host:50002?query=1",
     ] {
-        cfg.liquid_url = Some(invalid.to_string());
+        cfg.liquid_urls = vec![invalid.to_string()];
         assert!(!cfg.explicit_urls_valid(), "accepted {invalid}");
     }
 
-    cfg.liquid_url = Some("tcp://127.0.0.1:50001".to_string());
-    cfg.liquid_urls = vec!["ssl://[::1]:50002".to_string()];
+    cfg.liquid_urls = vec![
+        "tcp://127.0.0.1:50001".to_string(),
+        "ssl://[::1]:50002".to_string(),
+    ];
     assert!(cfg.explicit_urls_valid());
 }
 
@@ -149,23 +124,21 @@ fn rate_limit_invoice_status_uses_current_key() {
 }
 
 #[test]
-fn rate_limit_invoice_status_accepts_legacy_key() {
-    let cfg: RateLimitConfig = toml::from_str("donation_status_per_source_per_min = 43").unwrap();
-
-    assert_eq!(cfg.invoice_status_per_source_per_min, 43);
+fn rate_limit_invoice_status_rejects_legacy_key() {
+    assert!(toml::from_str::<RateLimitConfig>("donation_status_per_source_per_min = 43").is_err());
 }
 
 #[test]
-fn api_rate_limit_accepts_current_and_legacy_keys() {
+fn api_rate_limit_accepts_only_current_keys() {
     let current: RateLimitConfig =
         toml::from_str("api_rate_limit = 41\napi_rate_window_secs = 71").unwrap();
     assert_eq!(current.api_rate_limit, 41);
     assert_eq!(current.api_rate_window_secs, 71);
 
-    let legacy: RateLimitConfig =
-        toml::from_str("metadata_rate_limit = 42\nmetadata_rate_window_secs = 72").unwrap();
-    assert_eq!(legacy.api_rate_limit, 42);
-    assert_eq!(legacy.api_rate_window_secs, 72);
+    assert!(toml::from_str::<RateLimitConfig>(
+        "metadata_rate_limit = 42\nmetadata_rate_window_secs = 72"
+    )
+    .is_err());
 }
 
 #[test]
@@ -376,7 +349,7 @@ fn permanent_nym_cap_is_not_operator_configurable() {
 }
 
 #[test]
-fn checked_in_config_keeps_legacy_alias_compatibility() {
+fn checked_in_config_uses_only_current_keys() {
     let parsed: Config = toml::from_str(include_str!("../../config.toml")).unwrap();
 
     assert_eq!(parsed.rate_limit.api_rate_limit, 30);
@@ -976,8 +949,7 @@ fn workers_default_enabled() {
 #[test]
 fn electrum_urls_with_builtin_failover_appends_and_dedups() {
     let cfg = ElectrumConfig {
-        liquid_url: Some("ssl://les.bullbitcoin.com:995".to_string()),
-        liquid_urls: vec![],
+        liquid_urls: vec!["ssl://les.bullbitcoin.com:995".to_string()],
         cache_ttl_secs: 0,
         cache_max_entries: 0,
     };
@@ -989,8 +961,7 @@ fn electrum_urls_with_builtin_failover_appends_and_dedups() {
         ]
     );
     let cfg2 = ElectrumConfig {
-        liquid_url: Some("ssl://my-node:50002".to_string()),
-        liquid_urls: vec![],
+        liquid_urls: vec!["ssl://my-node:50002".to_string()],
         cache_ttl_secs: 0,
         cache_max_entries: 0,
     };
