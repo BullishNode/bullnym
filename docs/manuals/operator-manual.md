@@ -371,6 +371,73 @@ transaction. Query only the affected invoice and swap rows and preserve the
 result as restricted incident evidence. Use the maintained
 `docs/operations/runbooks/stuck-swaps.md`; do not improvise state-changing SQL.
 
+After opening the approved protected read-only database connection, set the
+invoice UUID as a local `psql` variable and capture a bounded snapshot:
+
+```sql
+\set invoice_id '00000000-0000-0000-0000-000000000000'
+
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+
+SELECT id, status, presentation_status, settlement_status,
+       paid_via, paid_amount_sat, expires_at
+  FROM invoices
+ WHERE id = :'invoice_id';
+
+SELECT rail, event_key, amount_sat, accounting_state, created_at
+  FROM invoice_payment_events
+ WHERE invoice_id = :'invoice_id'
+ ORDER BY created_at, event_key;
+
+SELECT rail, source, txid, vout, amount_sat, confirmations,
+       last_seen_state, first_seen_at, last_seen_at
+  FROM invoice_payment_observations
+ WHERE invoice_id = :'invoice_id'
+ ORDER BY first_seen_at, event_key;
+
+SELECT id, boltz_swap_id, status, claim_txid,
+       next_claim_attempt_at, next_slow_attempt_at, updated_at
+  FROM swap_records
+ WHERE invoice_id = :'invoice_id'
+ ORDER BY created_at, id;
+
+SELECT id, boltz_swap_id, status, claim_txid, refund_txid,
+       next_claim_attempt_at, next_slow_attempt_at, updated_at
+  FROM chain_swap_records
+ WHERE invoice_id = :'invoice_id'
+ ORDER BY created_at, id;
+
+SELECT attempt.chain_swap_id, attempt.purpose, attempt.txid,
+       attempt.status, attempt.broadcast_attempts,
+       attempt.first_broadcast_attempt_at, attempt.confirmed_at,
+       attempt.finalized_at, attempt.integrity_hold_at,
+       attempt.updated_at
+  FROM chain_swap_tx_attempts AS attempt
+  JOIN chain_swap_records AS swap ON swap.id = attempt.chain_swap_id
+ WHERE swap.invoice_id = :'invoice_id'
+ ORDER BY attempt.constructed_at, attempt.id;
+
+ROLLBACK;
+```
+
+This snapshot intentionally omits raw transaction bytes, addresses, comments,
+signatures, descriptors, and provider payloads. Retrieve those only into a
+restricted incident artifact when they are necessary. Never use an application
+runtime connection as a reason to grant new diagnostic privileges.
+
+The persisted watcher rotation can be inspected without treating it as worker
+health:
+
+```sql
+SELECT worker, lane, cursor_created_at, cursor_invoice_id, updated_at
+  FROM watcher_lane_progress
+ ORDER BY worker, lane;
+```
+
+Compare that rotation evidence to current-process startup/cycle logs. A recent
+cursor timestamp does not prove that the current process completed a healthy
+full lane traversal.
+
 ## Test suites, soak, and real-money acceptance
 
 Use layers rather than one “all tests” result:
