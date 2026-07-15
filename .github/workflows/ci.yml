@@ -25,6 +25,20 @@ jobs:
           toolchain: 1.92.0
           components: clippy,rustfmt
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: pwa/package-lock.json
+
+      - name: Test and reproduce the PWA
+        working-directory: pwa
+        run: |
+          npm ci
+          npm test
+          npm run check
+          npm run check:dist
+
       - name: Prove release pin failure modes
         run: |
           scripts/test-release-provenance.sh
