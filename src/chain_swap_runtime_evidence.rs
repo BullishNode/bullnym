@@ -751,6 +751,20 @@ pub async fn collect_automatic_fallback_evidence_under_lock(
     let committed_destination =
         collect_exact_recovery_destination(conn, swap, recovery_attempt, &mut evidence).await?;
 
+    // A missing, dangling, wrong-owner, wrong-version, or address-mismatched
+    // recovery commitment is an integrity failure, not a historical runtime
+    // mode. Stop before either chain authority is contacted; callers surface
+    // this packet as an integrity/readiness hold.
+    if committed_destination.is_none() {
+        return Ok(CollectedAutomaticFallbackEvidence {
+            evidence,
+            committed_destination,
+            exact_sources: Vec::new(),
+            bitcoin_timeout_height: None,
+            dependencies_available: false,
+        });
+    }
+
     let primary_target = delivery.and_then(|delivery| {
         let expected_amount_sat = u64::try_from(swap.user_lock_amount_sat).ok()?;
         PrimaryBitcoinSourceTargetV1::try_new(

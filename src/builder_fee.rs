@@ -5,6 +5,7 @@
 //! the caller keeps provenance/freshness metadata for persistence once the
 //! corresponding attempt schemas exist.
 
+use crate::fee_decision_record::FeeDecisionRecord;
 use crate::fee_policy::{BitcoinFeeDecision, LiquidFeeDecision, SatPerVbyte};
 
 /// The Liquid rate portion of an upstream policy decision.
@@ -36,6 +37,12 @@ impl BitcoinBuilderFeeDecision {
 impl From<&BitcoinFeeDecision> for BitcoinBuilderFeeDecision {
     fn from(decision: &BitcoinFeeDecision) -> Self {
         Self(decision.rate())
+    }
+}
+
+impl From<&FeeDecisionRecord> for BitcoinBuilderFeeDecision {
+    fn from(record: &FeeDecisionRecord) -> Self {
+        Self(record.rate())
     }
 }
 
