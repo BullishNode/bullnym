@@ -18,7 +18,7 @@ This revision deliberately separates three kinds of evidence:
 Exact revisions used for this manual:
 
 - deployed Bullnym: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
-- source authority inspected: `94da6220a14b058adbf296854b966e497f276911`, tree `b9b0ffc99039e84c7bdc7ac72c44ea6e629b087f`, schema 061;
+- source authority inspected: `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`, tree `070e5fa660615aa66736084955abeb05106f7fce`, schema 061;
 - unmerged quote/valuation runtime: `f6275b6b97064fd7572e3d04e0450d0b9e21d244`;
 - unmerged cumulative fiat-credit policy: `5d4670178029c35c08b34c7e9f802922a7c57095`;
 - unmerged atomic quote PWA: `d6be7bc60f17d530b6f69f6b572cbb8a25ce9128`;
@@ -36,6 +36,14 @@ dialog. Main has the immutable quote schema foundation and 30-day outer
 lifetime, but those changes are not deployed. The full five-minute payer-demand
 quote flow, observation-time valuation, atomic PWA refresh, and PoS warning are
 therefore **capability-blocked**, not production failures.
+
+Main also contains a current-only automatic-recovery hardening merged in
+`9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now
+requires the complete immutable creation packet, the exact current
+recovery-address commitment, and complete construction-time fee authority.
+Missing or disputed authority stops before provider or chain calls and enters
+an integrity/readiness hold. This hardening is **main only**, not present on the
+deployed SHA above.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the release record. A newer deployment can change the labels above.
