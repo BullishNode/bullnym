@@ -1674,13 +1674,59 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "062_invoice_quote_provider_attempts"
+        "063_checkout_private_memo"
     );
 
     let app = test_app(test_state(runtime.clone()));
     let (current_status, current_body) = get_path(&app, "/ready").await;
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
+
+    // The schema marker includes the exact Page/POS private-note contract.
+    // Restoring migration 021's obsolete memo refusal must close readiness
+    // even though the constraint retains the same public name.
+    sqlx::query(
+        "ALTER TABLE invoices \
+             DROP CONSTRAINT invoices_checkout_no_metadata_chk, \
+             ADD CONSTRAINT invoices_checkout_no_metadata_chk CHECK ( \
+                 origin = 'wallet' OR ( \
+                     memo IS NULL \
+                     AND recipient_label IS NULL \
+                     AND public_description IS NULL \
+                     AND invoice_number IS NULL \
+                 ) \
+             )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (obsolete_checkout_status, obsolete_checkout_body) = get_path(&app, "/ready").await;
+    assert_eq!(obsolete_checkout_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(obsolete_checkout_body["ready"], false);
+
+    sqlx::query(
+        "ALTER TABLE invoices \
+             DROP CONSTRAINT invoices_checkout_no_metadata_chk, \
+             ADD CONSTRAINT invoices_checkout_no_metadata_chk CHECK ( \
+                 origin = 'wallet' OR ( \
+                     recipient_label IS NULL \
+                     AND public_description IS NULL \
+                     AND invoice_number IS NULL \
+                 ) \
+             )",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (restored_checkout_status, restored_checkout_body) = get_path(&app, "/ready").await;
+    assert_eq!(
+        restored_checkout_status,
+        StatusCode::OK,
+        "body: {restored_checkout_body}"
+    );
+    assert_eq!(restored_checkout_body["ready"], true);
 
     sqlx::query(
         "ALTER TABLE invoice_quote_provider_attempts DISABLE TRIGGER \
@@ -1841,10 +1887,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(
-        body["expected_schema_marker"],
-        "062_invoice_quote_provider_attempts"
-    );
+    assert_eq!(body["expected_schema_marker"], "063_checkout_private_memo");
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -11767,7 +11810,7 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
 }
 
 #[tokio::test]
-async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() {
+async fn fiat_checkout_private_note_survives_pricer_outage_and_first_quote_owns_conversion() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     create_test_user(&pool, "quotecreationoutage").await;
@@ -11807,7 +11850,11 @@ async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() 
     let (create_status, create_body) = post_json(
         &create_app,
         "/quotecreationoutage/invoice",
-        json!({ "fiat_amount_minor": 1_000, "fiat_currency": "usd" }),
+        json!({
+            "fiat_amount_minor": 1_000,
+            "fiat_currency": "usd",
+            "note": "  private checkout note  "
+        }),
     )
     .await;
     assert_eq!(create_status, StatusCode::OK, "{create_body}");
@@ -11819,16 +11866,26 @@ async fn fiat_creation_survives_pricer_outage_and_first_quote_owns_conversion() 
     assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
 
     let invoice_id = Uuid::parse_str(create_body["invoice_id"].as_str().unwrap()).unwrap();
-    let stored: (String, i32, String, i64, Option<i64>) = sqlx::query_as(
+    let stored: (String, i32, String, i64, Option<i64>, Option<String>) = sqlx::query_as(
         "SELECT pricing_mode, fiat_amount_minor, fiat_currency, amount_sat, \
-                rate_minor_per_btc \
+                rate_minor_per_btc, memo \
            FROM invoices WHERE id = $1",
     )
     .bind(invoice_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(stored, ("fiat_fixed".into(), 1_000, "USD".into(), 0, None));
+    assert_eq!(
+        stored,
+        (
+            "fiat_fixed".into(),
+            1_000,
+            "USD".into(),
+            0,
+            None,
+            Some("private checkout note".into())
+        )
+    );
     let pre_quote_rows: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
              (SELECT COUNT(*) FROM invoice_quote_versions WHERE invoice_id = $1), \

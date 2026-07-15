@@ -9,6 +9,11 @@ use crate::AppState;
 
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+const EXPECTED_CHECKOUT_METADATA_EXPRESSION: &str = concat!(
+    "origin='wallet'::textORrecipient_labelISNULLAND",
+    "public_descriptionISNULLANDinvoice_numberISNULL"
+);
+
 const EXPECTED_MERCHANT_SETTLEMENT_FEE_SHAPE_EXPRESSION: &str = concat!(
     "num_nonnulls(fee_decision_purpose,fee_decision_rail,fee_decision_target,",
     "fee_decision_source,fee_decision_rate_sat_vb,fee_decision_quoted_at_unix,",
@@ -1169,6 +1174,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     if !schema_marker_present(pool).await?
+        || !checkout_private_memo_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
         || !merchant_settlement_trigger_invariants_present(pool).await?
@@ -1302,6 +1308,31 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn checkout_private_memo_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(( \
+            SELECT regexp_replace( \
+                       pg_get_expr( \
+                           constraint_info.conbin, \
+                           constraint_info.conrelid, \
+                           TRUE \
+                       ), \
+                       '[[:space:]]+', '', 'g' \
+                   ) = $1 \
+              FROM pg_constraint constraint_info \
+             WHERE constraint_info.conrelid = \
+                       to_regclass('public.invoices') \
+               AND constraint_info.conname = \
+                       'invoices_checkout_no_metadata_chk' \
+               AND constraint_info.contype = 'c' \
+               AND constraint_info.convalidated \
+        ), FALSE)",
+    )
+    .bind(EXPECTED_CHECKOUT_METADATA_EXPRESSION)
+    .fetch_one(pool)
+    .await
 }
 
 async fn merchant_settlement_privileges_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
