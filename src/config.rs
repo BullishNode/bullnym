@@ -54,8 +54,7 @@ pub struct Config {
     /// at swap creation time; the handler matches the path segment in
     /// constant time.
     ///
-    /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. See
-    /// docs/compatibility-ledger.md for fallback and rotation policy.
+    /// Sourced only from `BOLTZ_WEBHOOK_URL_SECRET`.
     #[serde(skip)]
     pub boltz_webhook_url_secret: String,
     /// Optional previous URL secret. Accepted in addition to
@@ -1087,14 +1086,10 @@ pub struct RateLimitConfig {
     // --- General API + metadata enumeration gates ---
     /// Cheap per-source gate used before signature verification or
     /// database-heavy reads. Covers public metadata, Payment Page management,
-    /// and signed invoice management. 0 disables. The legacy `metadata_*`
-    /// keys remain accepted so existing deployments do not need a flag day.
-    #[serde(default = "default_api_rate_limit", alias = "metadata_rate_limit")]
+    /// and signed invoice management. 0 disables.
+    #[serde(default = "default_api_rate_limit")]
     pub api_rate_limit: u32,
-    #[serde(
-        default = "default_api_rate_window_secs",
-        alias = "metadata_rate_window_secs"
-    )]
+    #[serde(default = "default_api_rate_window_secs")]
     pub api_rate_window_secs: u32,
 
     /// Per-source cap for the public supported-currency and rate endpoints.
@@ -1188,10 +1183,7 @@ pub struct RateLimitConfig {
     pub donation_image_uploads_per_source_per_min: u32,
 
     /// Per-source rate-limit on public invoice status polling.
-    #[serde(
-        default = "default_invoice_status_per_source_per_min",
-        alias = "donation_status_per_source_per_min"
-    )]
+    #[serde(default = "default_invoice_status_per_source_per_min")]
     pub invoice_status_per_source_per_min: u32,
 
     // --- Invoices ---
@@ -1454,10 +1446,6 @@ fn default_invoice_create_per_npub_per_hour() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElectrumConfig {
-    /// Single Liquid Electrum server URL (deprecated; use `liquid_urls`).
-    /// Kept for backwards-compat with existing deployed configs.
-    #[serde(default)]
-    pub liquid_url: Option<String>,
     /// Ordered list of Liquid Electrum server URLs. Tried in order on every
     /// reconnect; rotate on transport failure to survive single-server outages.
     #[serde(default)]
@@ -1471,7 +1459,6 @@ pub struct ElectrumConfig {
 impl Default for ElectrumConfig {
     fn default() -> Self {
         Self {
-            liquid_url: None,
             liquid_urls: vec![default_liquid_electrum_url()],
             cache_ttl_secs: default_electrum_cache_ttl(),
             cache_max_entries: default_electrum_cache_max(),
@@ -1484,28 +1471,18 @@ impl ElectrumConfig {
     /// An invalid explicit value is a rail-scoped admission failure even when
     /// a built-in endpoint can keep existing obligations recoverable.
     pub fn explicit_urls_valid(&self) -> bool {
-        self.liquid_url
-            .as_deref()
-            .is_none_or(valid_electrum_endpoint)
-            && self
-                .liquid_urls
-                .iter()
-                .all(|url| valid_electrum_endpoint(url))
+        self.liquid_urls
+            .iter()
+            .all(|url| valid_electrum_endpoint(url))
     }
 
-    /// Resolve the configured URLs into a single ordered list, accepting
-    /// either the legacy single-string field or the new list field (or both).
+    /// Resolve the configured URLs into one ordered, deduplicated list.
     /// URLs without an explicit `ssl://` or `tcp://` scheme are normalized to
     /// `ssl://` — every public Liquid Electrum server we know of uses TLS, so
     /// a bare `host:port` was the source of a long-standing PF outage where
     /// `electrum-client` defaulted to plain TCP against a TLS port.
     pub fn urls(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        if let Some(u) = &self.liquid_url {
-            if !u.is_empty() {
-                out.push(normalize_electrum_url(u));
-            }
-        }
         for u in &self.liquid_urls {
             if u.is_empty() {
                 continue;
@@ -1659,10 +1636,8 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         config.swap_mnemonic = std::env::var("SWAP_MNEMONIC")
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
-        // See docs/compatibility-ledger.md for the env-var fallback.
-        config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
-            .or_else(|_| std::env::var("BOLTZ_WEBHOOK_SECRET"))
-            .unwrap_or_default();
+        config.boltz_webhook_url_secret =
+            std::env::var("BOLTZ_WEBHOOK_URL_SECRET").unwrap_or_default();
         config.boltz_webhook_url_secret_previous =
             std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
 

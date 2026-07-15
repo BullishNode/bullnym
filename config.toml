@@ -21,7 +21,7 @@ max_sendable_msat = 25000000000
 
 [electrum]
 # Bull's own Liquid Electrum — has been more reliable than Blockstream's.
-liquid_url = "les.bullbitcoin.com:995"
+liquid_urls = ["les.bullbitcoin.com:995"]
 
 [bitcoin_watcher]
 # Direct Bitcoin accounting starts at one confirmation. This threshold controls
@@ -78,8 +78,8 @@ max_active_users                              = 100000
 # 30/min/IP is plenty for legitimate paying clients (which fetch metadata
 # once per payment, plus an occasional NIP-05 verification). The distinct-
 # nyms cap throttles slow-drip enumeration.
-metadata_rate_limit                           = 30
-metadata_rate_window_secs                     = 60
+api_rate_limit                                = 30
+api_rate_window_secs                          = 60
 metadata_distinct_nyms_per_ip_limit           = 20
 metadata_distinct_nyms_per_ip_window_secs     = 3600
 lookup_distinct_npubs_per_ip_limit            = 20
