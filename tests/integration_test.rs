@@ -11810,6 +11810,108 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
 }
 
 #[tokio::test]
+async fn unfunded_fiat_direct_bitcoin_empty_scan_respects_payment_grace_and_constraint() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let tolerances = pay_service::db::InvoiceAccountingTolerances::default();
+    let invoice = insert_fiat_direct_bitcoin_test_invoice(
+        &pool,
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    )
+    .await;
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(invoice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let outcome = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "expired-unfunded-empty-scan-test",
+            generation,
+            observations: &[],
+        },
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: false }
+    );
+
+    let after_scan = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_scan.status, "unpaid");
+    assert!(after_scan.paid_via.is_none());
+    assert!(after_scan.paid_amount_sat.is_none());
+
+    sqlx::query(
+        "UPDATE invoices SET \
+             expires_at = NOW() - ($2 || ' seconds')::interval \
+         WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .bind(i64::try_from(tolerances.payment_grace_secs).unwrap() + 1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let post_grace_generation = pay_service::db::reserve_direct_observation_generation(
+        &pool,
+        invoice.id,
+        pay_service::db::DirectPaymentSource::Bitcoin,
+    )
+    .await
+    .unwrap();
+    let post_grace = pay_service::db::apply_direct_observation_batch(
+        &pool,
+        pay_service::db::DirectObservationBatch {
+            invoice_id: invoice.id,
+            source: pay_service::db::DirectPaymentSource::Bitcoin,
+            authority: "expired-unfunded-empty-scan-test",
+            generation: post_grace_generation,
+            observations: &[],
+        },
+        tolerances,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        post_grace,
+        pay_service::db::ApplyDirectObservationOutcome::Applied { changed: true }
+    );
+
+    let terminal = pay_service::db::get_invoice_by_id(&pool, invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, "expired");
+    assert!(terminal.paid_via.is_none());
+    assert!(terminal.paid_amount_sat.is_none());
+    assert_eq!(
+        pay_service::db::expire_invoices_past_deadline(&pool, 0)
+            .await
+            .unwrap(),
+        0,
+        "the reducer already published the evidence-free terminal state"
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn anonymous_checkout_json_contract_rejects_unknown_fields_before_mutation() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -20757,7 +20859,7 @@ async fn expired_partial_payment_becomes_underpaid() {
             0,
             "lq1eventunderpaid",
         ),
-        pay_service::db::InvoiceAccountingTolerances::default(),
+        direct_lifecycle_tolerances(),
     )
     .await
     .unwrap();

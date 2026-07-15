@@ -929,6 +929,8 @@ async fn apply_direct_observation_batch_with_optional_rate_candidate(
         return protocol_error("direct observation authority is invalid");
     }
     validate_observation_batch(batch.source, batch.observations)?;
+    let payment_grace_secs = i64::try_from(tolerances.payment_grace_secs)
+        .map_err(|_| sqlx::Error::Protocol("payment grace exceeds database range".into()))?;
 
     let mut tx = pool.begin().await?;
     let offer_lock_key = super::invoice_lightning_lock_key(batch.invoice_id);
@@ -941,10 +943,12 @@ async fn apply_direct_observation_batch_with_optional_rate_candidate(
                 accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
-                paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
+                paid_via, paid_amount_sat, \
+                expires_at <= NOW() - ($2 || ' seconds')::interval AS expired \
          FROM invoices WHERE id = $1 FOR UPDATE",
     )
     .bind(batch.invoice_id)
+    .bind(payment_grace_secs)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| sqlx::Error::RowNotFound)?;
@@ -1818,6 +1822,8 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
     if !matches!(swap_settlement_status, "pending" | "settled") {
         return protocol_error("merchant settlement projection status is invalid");
     }
+    let payment_grace_secs = i64::try_from(tolerances.payment_grace_secs)
+        .map_err(|_| sqlx::Error::Protocol("payment grace exceeds database range".into()))?;
 
     let offer_lock_key = super::invoice_lightning_lock_key(invoice_id);
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
@@ -1829,10 +1835,12 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
                 accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
-                paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
+                paid_via, paid_amount_sat, \
+                expires_at <= NOW() - ($2 || ' seconds')::interval AS expired \
          FROM invoices WHERE id = $1 FOR UPDATE",
     )
     .bind(invoice_id)
+    .bind(payment_grace_secs)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(sqlx::Error::RowNotFound)?;

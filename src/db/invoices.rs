@@ -1260,7 +1260,9 @@ pub(crate) fn fiat_invoice_status(
     } else if projection.presentation_credit_minor > 0 {
         "in_progress"
     } else if expired {
-        "underpaid"
+        // Crossing the payment deadline without payment evidence expires the
+        // invoice; `underpaid` is reserved for a positive short payment.
+        "expired"
     } else {
         "unpaid"
     }
@@ -1279,6 +1281,46 @@ pub(crate) fn fiat_invoice_presentation_status(
         "partial"
     } else {
         "unpaid"
+    }
+}
+
+#[cfg(test)]
+mod fiat_invoice_projection_tests {
+    use super::{fiat_invoice_status, FiatInvoiceCreditProjection};
+
+    fn projection(active_credit_minor: i64) -> FiatInvoiceCreditProjection {
+        FiatInvoiceCreditProjection {
+            face_minor: 1_000,
+            active_credit_minor,
+            presentation_credit_minor: active_credit_minor,
+            active_overpaid: false,
+            presentation_overpaid: false,
+            unresolved_evidence: false,
+        }
+    }
+
+    #[test]
+    fn within_grace_without_payment_stays_unpaid() {
+        assert_eq!(
+            fiat_invoice_status("unpaid", projection(0), false),
+            "unpaid"
+        );
+    }
+
+    #[test]
+    fn payment_deadline_without_payment_expires_instead_of_becoming_underpaid() {
+        assert_eq!(
+            fiat_invoice_status("unpaid", projection(0), true),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn expiry_with_partial_credit_remains_underpaid() {
+        assert_eq!(
+            fiat_invoice_status("partially_paid", projection(400), true),
+            "underpaid"
+        );
     }
 }
 
@@ -2688,7 +2730,9 @@ async fn record_invoice_payment_with_optional_quote_attribution(
         "mixed"
     };
 
-    let expired = inv.expires_at_unix <= chrono_like_unix_now();
+    let payment_grace_secs = i64::try_from(tolerances.payment_grace_secs)
+        .map_err(|_| sqlx::Error::Protocol("payment grace exceeds database range".into()))?;
+    let expired = inv.expires_at_unix <= chrono_like_unix_now().saturating_sub(payment_grace_secs);
     let new_status = if let Some(projection) = fiat_projection {
         fiat_invoice_status(&inv.status, projection, expired)
     } else {
