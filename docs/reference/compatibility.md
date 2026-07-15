@@ -4,27 +4,6 @@ This file tracks compatibility surfaces that intentionally remain in the
 server. Code comments should point here instead of restating full removal
 policy inline.
 
-## Registration Lookup Quota Fields
-
-- Current field: `quota`
-- Compatibility fields: `lifetime_nyms_used`, `lifetime_nyms_cap`
-- Compatibility reason: older mobile clients read quota values from the flat
-  fields.
-- Removal condition: mobile versions that read `quota.used` and `quota.cap`
-  have reached the agreed adoption threshold.
-
-## Registration Lookup Availability Field
-
-- Current field: `lightning_address_online`.
-- Compatibility field: `active`.
-- Compatibility reason: older mobile clients used `active` for registration
-  availability before permanent name ownership was separated from Lightning
-  Address product state.
-- Safety behavior: both fields are populated from the same database boolean
-  and must always be equal. Neither field describes nym or alias ownership.
-- Removal condition: supported clients read `lightning_address_online` and no
-  longer interpret `active` as name availability.
-
 ## Registration Verification Npub
 
 - Current field: `verification_npub` (optional).

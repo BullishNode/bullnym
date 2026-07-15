@@ -86,9 +86,8 @@ pub struct RegisterRequest {
     pub timestamp: u64,
 }
 
-/// Compatibility view retained on register/lookup/delete responses. Permanent
-/// names make the authoritative cap exactly one; current clients can continue
-/// decoding the existing fields without interpreting an offline nym as free.
+/// Authoritative permanent-name ownership quota returned by registration
+/// create, lookup, and delete operations.
 #[derive(Serialize, Clone, Copy)]
 pub struct QuotaView {
     pub used: i64,
@@ -260,7 +259,7 @@ pub async fn register(
     } else {
         None
     };
-    let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
+    let used = db::count_permanent_nyms_by_npub(&state.db, &req.npub).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -391,7 +390,7 @@ pub async fn delete_registration(
         tracing::info!("deactivated registration for {}", user.nym);
     }
 
-    let used = db::count_lifetime_nyms_by_npub(&state.db, &req.npub).await?;
+    let used = db::count_permanent_nyms_by_npub(&state.db, &req.npub).await?;
     Ok(Json(DeleteResponse {
         quota: QuotaView::new(used),
     }))
@@ -409,21 +408,11 @@ pub struct LookupResponse {
     /// The owner's canonical permanent nym, independent of Lightning Address
     /// availability.
     pub nym: String,
-    /// Compatibility view of `lightning_address_online`.
-    pub active: bool,
     pub lightning_address_online: bool,
     /// The one canonical permanent owner alias, when it has been claimed.
     pub alias: Option<String>,
     pub public_name_policy: &'static str,
     pub quota: QuotaView,
-    /// Compatibility list. The canonical nym is present while its Lightning
-    /// Address is offline and absent while online.
-    pub previous_nyms: Vec<db::PreviousNym>,
-    /// Compatibility field. New clients MUST read `quota.used`; see
-    /// docs/compatibility-ledger.md for removal policy.
-    pub lifetime_nyms_used: i64,
-    /// Compatibility field. New clients MUST read `quota.cap`.
-    pub lifetime_nyms_cap: i64,
 }
 
 /// GET /register/lookup?npub=<hex> — check if an npub has a registration
@@ -460,17 +449,12 @@ pub async fn lookup_by_npub(
     let status = db::lookup_status_by_npub(&state.db, &params.npub)
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration for this key".to_string()))?;
-    let online = status.lightning_address_online;
     Ok(Json(LookupResponse {
         nym: status.canonical_nym,
-        active: online,
-        lightning_address_online: online,
+        lightning_address_online: status.lightning_address_online,
         alias: status.canonical_alias,
         public_name_policy: PUBLIC_NAME_POLICY,
         quota: QuotaView::new(status.used),
-        previous_nyms: status.previous_nyms,
-        lifetime_nyms_used: status.used,
-        lifetime_nyms_cap: PERMANENT_NYM_CAP,
     }))
 }
 
