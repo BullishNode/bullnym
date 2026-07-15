@@ -14,7 +14,8 @@ evidence:
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
 | **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
-| **Journey-certified production release** | Use this label only after the schema-062 no-funds smoke and bounded live-money journeys also pass. Those journey outcomes remain pending. |
+| **Schema-063 hotfix candidate** | PR #179 proposes the checkout-private-memo constraint and fee-runtime persistence-handoff fixes described below. This label is source evidence only: it does not assert merge, CI success, deployment, migration, or production behavior. |
+| **Journey-certified production release** | Use this label only after the schema-063 release identity and migration are deployed and both the no-funds smoke and bounded live-money journeys pass. That evidence does not yet exist in this revision. |
 
 Exact revisions used for this manual:
 
@@ -26,6 +27,7 @@ Exact revisions used for this manual:
 - installed PWA content SHA-256: `c193bf22ed5b7fbc0e0463cd8ea90b4154fdad660a77ea74ec0b6ec1e526d09c`;
 - active release-record SHA-256: `326dd87cbcd9fb1092acf9e2c193c1649920cb032a6c1cb780dc7e7f2d2c4163`;
 - passed deployment-certification report SHA-256: `3586ad4a4d7c98975ec8a5a3460ca51c97cfa1030356473a7ded30f5165bc799`;
+- observed PR #179 candidate head: `47005c63291d9e37567ae93b70f7dd6e2e273f59`, tree `1489239cd96ee7554ff8837991c1a17945f718b9`, based on the installed release source above; its production release identity and artifact digests remain pending;
 - protected production configuration SHA-256 after the test-certification
   allowlist change: `1a9dbaf5c85ea1bbec0db81f8ccbedce1166c74ac78fd44a597e4fadf2f98385`.
 
@@ -60,10 +62,38 @@ the exact deployed process opened `direct_bitcoin`, `lightning_reverse`,
 `direct_liquid`, and `bitcoin_chain`, each with an empty reason-code set. A
 separate read-only deployment certification also passed. These facts resolve
 the recovery-generation, deployment-identity, and private-admission gates for
-that restart; they do not make rail availability permanent. The schema-062
-no-funds smoke and bounded live-money journey outcomes remain pending. Do not
-infer current rail availability from `/ready` or from this manual; inspect the
-current per-rail admission state.
+that restart; they do not make rail availability permanent.
+
+The subsequent schema-062 no-funds smoke kept its funds gate closed, set its
+maximum spend and broadcast count to zero, and passed its setup, metadata, and
+registration stages. It then failed its first fiat Payment Page invoice at
+stage S62-03 with `InternalError`. Production evidence identified the cause as
+the `invoices_checkout_no_metadata_chk` database constraint rejecting the
+valid private checkout note. No provider mutation, callback, broadcast, or
+funds movement occurred. This is a failed journey, not a pending or passing
+one, and the bounded live-money journey was not started.
+
+The same post-deployment observation also found brief private-rail admission
+closures during normal fee refresh. A new in-memory live snapshot generation
+could become visible before its PostgreSQL persistence completed, so readiness
+compared that pending generation with the prior persisted generation and
+closed until persistence caught up. This was fail-closed, but it was an
+availability defect rather than evidence that the fee sources were stale.
+
+PR #179 proposes both remediations. Migration
+`063_checkout_private_memo` replaces the obsolete constraint so Page and PoS
+checkout can persist a private `memo`, while `recipient_label`,
+`public_description`, and `invoice_number` remain wallet-only. Its fee-runtime
+change keeps only the prior fresh, source-authorized, explicitly restored
+durable last-known-good decision eligible while a newer live generation awaits
+durable acceptance. The pending live value is neither construction authority
+nor a reason to close admission when that exact durable predecessor remains
+valid. Missing, stale, unauthorized, or inconsistent durable evidence still
+closes admission. In this documentation revision PR #179 is not claimed as
+merged, deployed, migrated, or production-certified.
+
+Do not infer current rail availability from `/ready` or from this manual;
+inspect the current per-rail admission state.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the immutable release record. Do not infer deployment from a pull
@@ -235,6 +265,12 @@ It moved no funds, called no provider, and made only public `GET` requests to
 `/version`, `/health`, and `/ready`. Treat it as deployment-identity and public-
 readiness evidence, not as schema-062 smoke or live-money certification.
 
+PR #179 changes the candidate marker to exactly
+`063_checkout_private_memo`. After that change has an authoritative merged
+release identity, use the actual merged commit, artifact digest, PWA digest,
+and this schema marker for both staged and installed certification. Never reuse
+the schema-062 certification report as proof of the schema-063 candidate.
+
 The production configuration supports a narrowly scoped certification bypass
 for exactly one allowlisted source, the TEST VM, and exactly these five scopes:
 
@@ -259,6 +295,13 @@ foundation. The matching schema-062 release activates the current-only
 denomination rules, first-observation valuation, provider-attempt journals,
 runtime ACLs, and readiness boundary. Never infer product capability from a
 table's existence alone.
+
+Migration 063 is a fix-forward replacement of
+`invoices_checkout_no_metadata_chk`. Apply it with the schema owner while the
+application writer is stopped. The exact resulting constraint permits checkout
+`memo` but still requires checkout `recipient_label`, `public_description`, and
+`invoice_number` to be null. Schema-063 readiness verifies the constraint body;
+merely retaining the old constraint name does not satisfy readiness.
 
 At installed source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, migrations
 058 and 059 are current-only empty-state guards: they require all user, surface,
@@ -466,6 +509,13 @@ Transaction fees are construction-time authority, not the public Bullnym
   `"1"`, also in sat/vByte.
 - Try compatible live sources, then only a recent persisted same-rail
   last-known-good observation. If none is valid, wait.
+- A newly fetched live observation that is still awaiting durable acceptance
+  is not construction authority. During that persistence handoff, PR #179's
+  candidate runtime may continue only on the explicitly restored predecessor
+  when its durable authorization, source, rail, bounds, and freshness still
+  agree. It never substitutes the pending live value or
+  refreshes the predecessor's lifetime. If that durable predecessor is absent,
+  stale, unauthorized, or inconsistent, admission closes.
 - Bounds reject unsafe quotes; they never become substitute fee rates.
 - Persist source, observation time, rate, policy, and actual constructed fee.
   Never mutate already-journaled transaction bytes because the market moved.
@@ -716,9 +766,14 @@ if those conditions are not true.
 The obsolete TEST-VM `bw-bullnym-health-test.timer` is disabled and inactive.
 Its referenced script was missing, so it made no Bullnym request and only
 produced misleading local failure telemetry. Do not re-enable it until a
-reviewed replacement exists. The schema-062 no-funds smoke and bounded
-live-money journey outcomes are still pending; neither the disabled timer nor
-the passed read-only deployment certification substitutes for them.
+reviewed replacement exists. The schema-062 no-funds smoke failed at its first
+fiat Payment Page invoice because the obsolete checkout-metadata constraint
+rejected a valid private note. Its preceding no-funds stages passed, its funds
+gate remained closed, and it moved no funds. PR #179 carries a source-level
+schema-063 remediation, but a source patch is not a rerun. The schema-063
+no-funds smoke and bounded live-money journey remain outstanding; neither the
+disabled timer nor the passed schema-062 read-only deployment certification
+substitutes for them.
 
 Current harness commands include:
 
@@ -790,6 +845,13 @@ locked completion-plan, rationale, and server/PWA gap-audit records maintained
 outside this repository. Merged-release-specific claims were checked at exact
 source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, whose reviewed PR #177 head
 was `01fb3f08aeb69e44d1ce71dfd2111ecd63e23253` with the same tree.
+
+Candidate-only schema-063 claims were checked against migration 063 and the
+fee-runtime changes at observed PR #179 head
+`47005c63291d9e37567ae93b70f7dd6e2e273f59`, tree
+`1489239cd96ee7554ff8837991c1a17945f718b9`. They remain source claims until
+the authoritative merge, release record, deployment, migration, and journey
+evidence are recorded.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.

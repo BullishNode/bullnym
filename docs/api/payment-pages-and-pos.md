@@ -133,22 +133,38 @@ are served from `/og/fallback-*.jpg` whenever a generated file is unavailable.
 HTML responses send `X-Robots-Tag: noindex` while `/robots.txt` still permits
 preview crawlers to fetch public Pages.
 
-Checkout accepts exactly one amount representation:
+Checkout accepts exactly one amount representation and an optional private
+`note`:
 
 ```json
-{ "amount_sat": 10000 }
+{ "amount_sat": 10000, "note": "Table 4" }
 ```
 
 or:
 
 ```json
-{ "fiat_amount_minor": 2500, "fiat_currency": "USD" }
+{
+  "fiat_amount_minor": 2500,
+  "fiat_currency": "USD",
+  "note": "Thank you"
+}
 ```
 
+The optional note is trimmed; whitespace-only input is absent and a nonempty
+note is limited to 280 Unicode characters. Schema `063_checkout_private_memo` stores it
+as the invoice's private `memo`, exposed only by the owning merchant's signed
+invoice list. Public status and rendered invoice routes never return it.
+Checkout-supplied `recipient_label`, `public_description`, and `invoice_number`
+are outside this request contract and must not be accepted or persisted. The
+schema constraint rejects any checkout row that carries those wallet-only
+fields even though it permits `memo`.
+
 Fiat minor units follow the precision endpoint (`2500` is USD 25.00, while
-CRC has zero decimal places). Fiat is converted and locked to sats at creation;
-the response/payment state records the rate. Sat-fixed avoids exchange-rate
-risk and is preferable when the merchant's obligation is denominated in BTC.
+CRC has zero decimal places). Fiat checkout creation stores the exact
+minor-unit face value and currency without converting it or calling a provider.
+An explicit payer-demand quote later creates the five-minute conversion and
+rail instruction. Sat-fixed avoids exchange-rate risk and is preferable when
+the merchant's obligation is denominated in BTC.
 
 Response:
 
@@ -169,6 +185,9 @@ Response:
 Checkout invoices have a fixed outer lifetime of 30 days. The example
 `expires_at_unix` is illustrative; clients must use the returned value. Every
 payload and typed amount is adopted or withdrawn as one instruction.
+For fiat-fixed checkout, the creation response does not contain a payment
+instruction; request one with `POST /api/v1/invoices/:id/quote` for the selected
+rail.
 `lightning_amount_sat` is the exact BOLT11 principal and includes the
 provider-side reverse-swap costs needed for the merchant to net the checkout
 face value; a payer wallet can add its own Lightning routing fee.

@@ -45,9 +45,17 @@ swap admission all opened after their normal startup checks. This is a point-
 in-time result, not a promise that every method will always remain available:
 `/ready` does not report every rail, and a rail closes if its own safety
 foundation degrades. Use only the methods the current page offers. The
-schema-062 no-funds smoke and bounded live-money journey outcomes remain
-pending. This release changes the server-hosted PWA; it does not include a
-mobile-wallet release.
+schema-062 no-funds smoke later failed when a valid private Page checkout note
+reached an obsolete database constraint; the funds gate stayed closed and no
+funds moved. The bounded live-money journey was therefore not started.
+
+PR #179 proposes schema `063_checkout_private_memo` and a fee-refresh handoff
+fix. At the observed candidate head
+`47005c63291d9e37567ae93b70f7dd6e2e273f59`, tree
+`1489239cd96ee7554ff8837991c1a17945f718b9`, this is source behavior only. This
+manual does not claim that candidate is merged, deployed, migrated, or
+journey-certified. This release line changes the server-hosted PWA; it does not
+include a mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -123,6 +131,12 @@ unavailable.
 PoS stores receipt history in the local browser. Clearing browser data can
 erase that local list, but it does not change the server's invoice or payment
 records.
+
+Page and PoS checkout may include an optional note. Under the schema-063
+contract it is trimmed, stored as the invoice's private memo, and returned only
+through the merchant's signed invoice history. It is not shown on public status
+or invoice pages. Recipient label, public description, and invoice number are
+wallet-origin invoice fields; checkout cannot supply them as public metadata.
 
 In the merged release, PoS shows this warning before it reveals a Bitcoin
 instruction or asks the provider to create one:
@@ -439,5 +453,7 @@ The later public probes, artifact digests, and read-only certification prove
 deployment identity and public readiness. Exact deployed startup evidence also
 proved the current recovery generation and observed all four private rails
 open on that restart. The Operator Manual records that evidence and its
-limits. The schema-062 no-funds smoke and bounded live-money journeys remain
-separate pending certification work.
+limits. The schema-062 no-funds smoke failure and its zero-funds boundary are
+recorded there. Candidate schema-063 behavior was checked at observed PR #179
+head `47005c63291d9e37567ae93b70f7dd6e2e273f59`; the schema-063 no-funds rerun
+and bounded live-money journey remain separate outstanding certification work.

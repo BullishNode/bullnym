@@ -142,6 +142,7 @@ Each `invoices` item contains:
 | `fiat_amount_minor` | Original fiat minor-unit amount, or `null` |
 | `fiat_currency` | Original ISO currency code, or `null` |
 | `public_description` | Payer-visible description, or `null` |
+| `memo` | Private merchant note, or `null`; checkout `note` is exposed here but never on public status/render routes |
 | `recipient_name` | Recipient display label, or `null` |
 | `invoice_number` | Merchant invoice reference, or `null` |
 | `accept_btc` | Whether direct/on-chain Bitcoin was enabled |

@@ -66,6 +66,12 @@ amount/rate metadata. Each output is valued from its own first-observation
 time, so Bullnym never claims that a payment proves which refreshed QR was
 used. The stable address remains watched for late payments and reorgs.
 
+Checkout may carry an optional private note. Schema
+`063_checkout_private_memo` stores it as a private invoice memo visible only in
+the merchant's signed invoice history; it is not rendered to the payer or
+returned by public status. Recipient label, public description, and invoice
+number remain wallet-origin fields and cannot be attached by public checkout.
+
 ## Flow
 
 1. Payer opens `GET /:nym`.
