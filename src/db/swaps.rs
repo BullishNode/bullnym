@@ -269,6 +269,7 @@ async fn insert_swap_in_tx(
             "boltz_reverse",
             Some("boltz"),
             Some(swap.boltz_swap_id),
+            None,
         )
         .await?;
     }

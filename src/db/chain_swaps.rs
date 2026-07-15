@@ -991,6 +991,50 @@ pub async fn latest_payer_exposable_chain_swap_for_invoice<'e, E: sqlx::PgExecut
     .await
 }
 
+/// Exact quote-scoped counterpart to the legacy invoice amount lookup. The
+/// immutable offer identity, canonical provider id, swap attribution, pending
+/// state, and delivered recovery manifest must all agree before exposure.
+pub async fn payer_exposable_chain_swap_for_quote_offer<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+    quote_version_id: Uuid,
+    quote_offer_id: Uuid,
+    provider_offer_id: &str,
+) -> Result<Option<ChainSwapRecord>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, ChainSwapRecord>(&format!(
+        "SELECT {CHAIN_SWAP_RECORD_COLUMNS} FROM chain_swap_records \
+         WHERE invoice_id = $1 \
+           AND invoice_quote_version_id = $2 \
+           AND invoice_quote_offer_id = $3 \
+           AND boltz_swap_id = $4 \
+           AND status = 'pending' \
+           AND EXISTS ( \
+                 SELECT 1 FROM invoice_quote_offers offer \
+                  WHERE offer.id = chain_swap_records.invoice_quote_offer_id \
+                    AND offer.quote_version_id = chain_swap_records.invoice_quote_version_id \
+                    AND offer.invoice_id = chain_swap_records.invoice_id \
+                    AND offer.rail = 'bitcoin' \
+                    AND offer.offer_kind = 'boltz_chain' \
+                    AND offer.provider = 'boltz' \
+                    AND offer.provider_offer_id = chain_swap_records.boltz_swap_id \
+           ) \
+           AND EXISTS ( \
+                 SELECT 1 FROM chain_swap_manifest_deliveries delivery \
+                  WHERE delivery.chain_swap_id = chain_swap_records.id \
+                    AND delivery.delivery_state = 'delivered' \
+           )"
+    ))
+    .bind(invoice_id)
+    .bind(quote_version_id)
+    .bind(quote_offer_id)
+    .bind(provider_offer_id)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Whether one complete issue-#80 chain-swap creation record lacks any
 /// migration-052 manifest-ledger obligation.
 ///

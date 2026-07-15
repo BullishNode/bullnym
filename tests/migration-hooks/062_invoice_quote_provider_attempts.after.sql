@@ -76,6 +76,17 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'migration 062 fiat amount authority contract is absent';
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM invoice_quote_versions
+         WHERE invoice_id = '62000000-0000-0000-0000-000000000001'
+           AND fiat_face_amount_minor = 1000
+           AND fiat_target_amount_minor = 1000
+           AND merchant_amount_sat = 10000
+    ) OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 9999) <> 999
+       OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 10000) <> 1000
+    THEN
+        RAISE EXCEPTION 'migration 062 remaining-face/credit policy is incorrect';
+    END IF;
     IF (SELECT count(*) FROM invoice_quote_provider_attempts) <> 1 THEN
         RAISE EXCEPTION 'migration 062 did not retain one exact provider intent';
     END IF;
@@ -95,6 +106,14 @@ BEGIN
        OR has_table_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'DELETE')
        OR has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'created_at', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'invoice_id', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'fiat_target_amount_minor', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_offers', 'direct_address', 'INSERT')
+       OR NOT has_table_privilege('bullnym_app', 'invoice_quote_active_fiat_projection', 'SELECT')
+       OR NOT has_function_privilege(
+           'bullnym_app',
+           'invoice_quote_credit_for_sats(integer,bigint,bigint,bigint)',
+           'EXECUTE'
+       )
     THEN
         RAISE EXCEPTION 'migration 062 runtime ACL/owner boundary is unsafe';
     END IF;

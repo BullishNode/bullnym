@@ -199,7 +199,6 @@ const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
 /// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
 /// audit-greppable.
-const SAT_PER_BTC: i64 = 100_000_000;
 
 /// Per-field length caps for wallet-origin invoice fields.
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
@@ -762,6 +761,7 @@ async fn create_anonymous_for_kind(
         public_slug: public_slug.as_deref(),
         npub_owner: &owner.npub,
         origin: "checkout",
+        checkout_surface_kind: Some(kind),
         fiat_amount_minor: fiat.as_ref().map(|(amt, _)| *amt),
         fiat_currency: fiat.as_ref().map(|(_, cur)| cur.as_str()),
         amount_sat,
@@ -1533,6 +1533,7 @@ pub struct FiatQuoteView {
     pub quote_version_id: Uuid,
     pub version_number: i32,
     pub fiat_face_amount_minor: i32,
+    pub fiat_target_amount_minor: i32,
     pub fiat_currency: String,
     pub rate_minor_per_btc: i64,
     pub rate_source: String,
@@ -1550,6 +1551,7 @@ impl From<&db::InvoiceQuoteVersion> for FiatQuoteView {
             quote_version_id: quote.id,
             version_number: quote.version_number,
             fiat_face_amount_minor: quote.fiat_face_amount_minor,
+            fiat_target_amount_minor: quote.fiat_target_amount_minor,
             fiat_currency: quote.fiat_currency.clone(),
             rate_minor_per_btc: quote.rate_minor_per_btc,
             rate_source: quote.rate_source.clone(),
@@ -1647,12 +1649,14 @@ fn payer_quote_rail_availability(invoice: &db::Invoice) -> Option<PayerQuoteRail
         return None;
     }
     let payable = invoice_payment_rails_are_payable(invoice);
+    let checkout_descriptor_surface = invoice.origin == "checkout" && invoice.nym_owner.is_some();
     Some(PayerQuoteRailAvailability {
         lightning: payable && invoice.accept_ln,
-        liquid: payable && invoice.accept_liquid && invoice.liquid_address.is_some(),
-        bitcoin: payable
-            && ((invoice.accept_btc && invoice.bitcoin_address.is_some())
-                || (invoice.nym_owner.is_some() && invoice.liquid_address.is_some())),
+        liquid: payable && invoice.accept_liquid && checkout_descriptor_surface,
+        // Fiat wallet-origin direct Bitcoin cannot be unambiguously attributed
+        // until the signed request supplies a quote-address derivation pool.
+        // Checkout Bitcoin is provider-backed and settles to Liquid.
+        bitcoin: payable && checkout_descriptor_surface && invoice.liquid_address.is_some(),
     })
 }
 
@@ -1710,9 +1714,6 @@ async fn resolve_current_fiat_quote(
     if let Some(quote) = db::current_invoice_quote(&state.db, invoice.id).await? {
         return Ok(quote);
     }
-    let fiat_minor = invoice
-        .fiat_amount_minor
-        .ok_or_else(|| AppError::DbError("fiat-fixed invoice is missing its face amount".into()))?;
     let currency = invoice
         .fiat_currency
         .as_deref()
@@ -1728,20 +1729,8 @@ async fn resolve_current_fiat_quote(
         ));
     }
 
-    let merchant_amount_sat = i64::try_from(
-        i128::from(fiat_minor)
-            .checked_mul(i128::from(SAT_PER_BTC))
-            .and_then(|value| value.checked_div(i128::from(rate.minor_per_btc)))
-            .ok_or_else(|| AppError::InvalidAmount("fiat quote conversion overflow".into()))?,
-    )
-    .map_err(|_| AppError::InvalidAmount("fiat quote amount exceeds storage range".into()))?;
     let min_sat = (state.config.limits.min_sendable_msat / 1_000) as i64;
     let max_sat = (state.config.limits.max_sendable_msat / 1_000) as i64;
-    if merchant_amount_sat < min_sat || merchant_amount_sat > max_sat {
-        return Err(AppError::InvalidAmount(format!(
-            "quoted amount {merchant_amount_sat} sat is outside {min_sat}..={max_sat}"
-        )));
-    }
 
     let candidate = db::NewInvoiceQuoteVersion {
         rate_minor_per_btc: rate.minor_per_btc,
@@ -1752,7 +1741,8 @@ async fn resolve_current_fiat_quote(
             .map_err(|_| AppError::DbError("rate fetch time exceeds storage range".into()))?,
         rate_fresh_until_unix: i64::try_from(rate.expires_at_unix)
             .map_err(|_| AppError::DbError("rate expiry exceeds storage range".into()))?,
-        merchant_amount_sat,
+        minimum_merchant_amount_sat: min_sat,
+        maximum_merchant_amount_sat: max_sat,
     };
     Ok(
         db::create_or_reuse_current_invoice_quote(&state.db, invoice.id, &candidate)
@@ -1778,8 +1768,13 @@ async fn record_direct_quote_offer(
     quote: &db::InvoiceQuoteVersion,
     rail: PayerQuoteRail,
 ) -> Result<db::InvoiceQuoteOffer, AppError> {
+    if rail != PayerQuoteRail::Liquid {
+        return Err(AppError::InvalidAmount(
+            "wallet-origin fiat direct rails require a quote-address derivation contract".into(),
+        ));
+    }
     let key = quote_offer_request_key(quote.id, rail, "direct");
-    Ok(db::record_or_reuse_invoice_quote_offer(
+    Ok(db::record_or_reuse_checkout_liquid_quote_offer(
         &state.db,
         &db::NewInvoiceQuoteOffer {
             invoice_id: invoice.id,
@@ -1790,8 +1785,20 @@ async fn record_direct_quote_offer(
             provider: None,
             provider_offer_id: None,
             provider_attempt_id: None,
+            direct_address: None,
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: None,
             payer_amount_sat: quote.merchant_amount_sat,
             expires_at_unix: quote.expires_at_unix,
+        },
+        |ct_descriptor, index| {
+            let address = descriptor::derive_address(ct_descriptor, index)
+                .map_err(|error| sqlx::Error::Protocol(format!("derive quote address: {error}")))?;
+            let blinding_key_hex = descriptor::derive_blinding_key_hex(ct_descriptor, &address)
+                .map_err(|error| {
+                    sqlx::Error::Protocol(format!("derive quote blinding key: {error}"))
+                })?;
+            Ok((address, blinding_key_hex))
         },
     )
     .await?
@@ -2075,22 +2082,11 @@ async fn versioned_instruction_for_rail(
                     "invoice does not accept Liquid".into(),
                 ));
             }
-            let address = invoice.liquid_address.clone().ok_or_else(|| {
-                AppError::DbError("Liquid-enabled invoice is missing its address".into())
-            })?;
             let offer = record_direct_quote_offer(state, invoice, quote, rail).await?;
+            let address = offer.direct_address.clone().ok_or_else(|| {
+                AppError::DbError("direct Liquid quote is missing its unique destination".into())
+            })?;
             Ok(VersionedPayerInstruction::LiquidDirect {
-                quote_offer_id: offer.id,
-                address,
-                payer_amount_sat: offer.payer_amount_sat,
-            })
-        }
-        PayerQuoteRail::Bitcoin if invoice.accept_btc => {
-            let address = invoice.bitcoin_address.clone().ok_or_else(|| {
-                AppError::DbError("Bitcoin-enabled invoice is missing its address".into())
-            })?;
-            let offer = record_direct_quote_offer(state, invoice, quote, rail).await?;
-            Ok(VersionedPayerInstruction::BitcoinDirect {
                 quote_offer_id: offer.id,
                 address,
                 payer_amount_sat: offer.payer_amount_sat,
@@ -2296,6 +2292,9 @@ async fn ensure_versioned_lightning_offer(
             provider: Some("boltz"),
             provider_offer_id: Some(&prepared.swap_id),
             provider_attempt_id: Some(provider_attempt.id),
+            direct_address: None,
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: None,
             payer_amount_sat: prepared.payer_amount_sat,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -2604,6 +2603,9 @@ async fn ensure_versioned_bitcoin_chain_offer(
             provider: Some("boltz"),
             provider_offer_id: Some(&provider_result.swap_id),
             provider_attempt_id: Some(provider_attempt.id),
+            direct_address: None,
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: None,
             payer_amount_sat,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -3729,6 +3731,7 @@ async fn create_invoice_inner(
         public_slug: None,
         npub_owner: &req.npub,
         origin: "wallet",
+        checkout_surface_kind: None,
         fiat_amount_minor: fiat.as_ref().map(|(amt, _)| *amt),
         fiat_currency: fiat.as_ref().map(|(_, cur)| cur.as_str()),
         amount_sat,

@@ -138,6 +138,7 @@ enum LiquidRecordOutcome {
 #[derive(Clone, Copy)]
 struct LiquidInvoiceObservationTarget<'a> {
     invoice_id: uuid::Uuid,
+    quote_attribution: Option<db::InvoiceQuoteAttribution>,
     address: &'a str,
     script: &'a elements::Script,
     blinding_key_hex: &'a str,
@@ -1039,7 +1040,7 @@ async fn poll_invoice_addresses(
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
-                    invoice_id = %invoice.id,
+                    invoice_id = %invoice.invoice_id,
                     "chain_watcher: invoice liquid_address parse failed: {e}"
                 );
                 let cursor = invoice.scan_cursor();
@@ -1047,7 +1048,7 @@ async fn poll_invoice_addresses(
                     tracing::warn!(
                         event = "liquid_watcher_lane_progress_write_failed",
                         lane = tier.label(),
-                        invoice_id = %invoice.id,
+                        invoice_id = %invoice.invoice_id,
                         isolated = true,
                         "chain_watcher: malformed invoice offset was not persisted: {e}"
                     );
@@ -1059,11 +1060,30 @@ async fn poll_invoice_addresses(
             }
         };
         let script = parsed.script_pubkey();
+        let quote_attribution = match (
+            invoice.invoice_quote_version_id,
+            invoice.invoice_quote_offer_id,
+        ) {
+            (None, None) => None,
+            (Some(quote_version_id), Some(quote_offer_id)) => Some(db::InvoiceQuoteAttribution {
+                quote_version_id,
+                quote_offer_id,
+            }),
+            _ => {
+                tracing::error!(
+                    invoice_id = %invoice.invoice_id,
+                    scan_target_id = %invoice.id,
+                    "chain_watcher: direct quote destination has partial attribution"
+                );
+                return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
+            }
+        };
 
         match record_liquid_events_for_script(
             ctx,
             LiquidInvoiceObservationTarget {
-                invoice_id: invoice.id,
+                invoice_id: invoice.invoice_id,
+                quote_attribution,
                 address: &invoice.liquid_address,
                 script: &script,
                 blinding_key_hex: &invoice.liquid_blinding_key_hex,
@@ -1080,7 +1100,7 @@ async fn poll_invoice_addresses(
                     tracing::warn!(
                         event = "liquid_watcher_lane_progress_write_failed",
                         lane = tier.label(),
-                        invoice_id = %invoice.id,
+                        invoice_id = %invoice.invoice_id,
                         "chain_watcher: completed invoice offset was not persisted: {e}"
                     );
                     return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
@@ -1192,6 +1212,7 @@ async fn record_liquid_events_for_script(
 ) -> Result<LiquidRecordOutcome, AppError> {
     let LiquidInvoiceObservationTarget {
         invoice_id,
+        quote_attribution,
         address,
         script,
         blinding_key_hex,
@@ -1220,7 +1241,7 @@ async fn record_liquid_events_for_script(
         ));
     }
 
-    let known = list_liquid_direct_watch_evidence(ctx.pool, invoice_id).await?;
+    let known = list_liquid_direct_watch_evidence(ctx.pool, invoice_id, address).await?;
     if liquid_known_observation_count_is_hard_bound(known.len()) {
         tracing::warn!(
             event = "liquid_watcher_known_observation_bound_reached",
@@ -1425,18 +1446,31 @@ async fn record_liquid_events_for_script(
         .map(|output| output.as_direct_observation(address))
         .collect::<Vec<_>>();
     let observation_count = observations.len();
-    let apply_outcome = db::apply_direct_observation_batch(
-        ctx.pool,
-        db::DirectObservationBatch {
-            invoice_id,
-            source: db::DirectPaymentSource::Liquid,
-            authority: &snapshot.authority,
-            generation,
-            observations: &observations,
-        },
-        tolerances,
-    )
-    .await?;
+    let batch = db::DirectObservationBatch {
+        invoice_id,
+        source: db::DirectPaymentSource::Liquid,
+        authority: &snapshot.authority,
+        generation,
+        observations: &observations,
+    };
+    let apply_outcome = if let Some(attribution) = quote_attribution {
+        let quote_attributions = observations
+            .iter()
+            .map(|observation| db::DirectObservationQuoteAttribution {
+                event_key: observation.event_key,
+                attribution,
+            })
+            .collect::<Vec<_>>();
+        db::apply_direct_observation_batch_with_quote_attributions(
+            ctx.pool,
+            batch,
+            &quote_attributions,
+            tolerances,
+        )
+        .await?
+    } else {
+        db::apply_direct_observation_batch(ctx.pool, batch, tolerances).await?
+    };
 
     let recorded = match apply_outcome {
         db::ApplyDirectObservationOutcome::Applied { changed: true } => observation_count,
@@ -1722,6 +1756,7 @@ fn reconcile_liquid_replacements(
 async fn list_liquid_direct_watch_evidence(
     pool: &PgPool,
     invoice_id: uuid::Uuid,
+    address: &str,
 ) -> Result<Vec<LiquidKnownObservation>, AppError> {
     sqlx::query_as(
         "SELECT event_key, txid, vout, address, amount_sat, asset_id, \
@@ -1730,11 +1765,13 @@ async fn list_liquid_direct_watch_evidence(
          FROM invoice_payment_observations \
          WHERE invoice_id = $1 \
            AND source = 'liquid_direct' \
+           AND address = $2 \
            AND last_seen_state <> 'superseded' \
          ORDER BY event_key \
-         LIMIT $2",
+         LIMIT $3",
     )
     .bind(invoice_id)
+    .bind(address)
     .bind((MAX_LIQUID_KNOWN_OBSERVATIONS + 1) as i64)
     .fetch_all(pool)
     .await

@@ -430,6 +430,8 @@ struct AccountingProjection {
 #[derive(Debug, sqlx::FromRow)]
 struct LockedInvoice {
     amount_sat: i64,
+    pricing_mode: String,
+    fiat_amount_minor: Option<i32>,
     accept_btc: bool,
     accept_liquid: bool,
     accept_ln: bool,
@@ -740,10 +742,20 @@ fn public_settlement_status(direct: &str, swap: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn reduce_projection(
     invoice: &LockedInvoice,
     events: &[ProjectionEvent],
     tolerances: InvoiceAccountingTolerances,
+) -> ReducedProjection {
+    reduce_projection_with_fiat(invoice, events, tolerances, None)
+}
+
+fn reduce_projection_with_fiat(
+    invoice: &LockedInvoice,
+    events: &[ProjectionEvent],
+    tolerances: InvoiceAccountingTolerances,
+    fiat_projection: Option<super::FiatInvoiceCreditProjection>,
 ) -> ReducedProjection {
     let tolerance_sat = super::invoice_payment_tolerance_sat(
         invoice.amount_sat,
@@ -779,23 +791,31 @@ fn reduce_projection(
             .is_some_and(|prior| prior > 0 && accounting.received_sat >= prior);
     let direct_settlement_status =
         direct_settlement_status_for(events, &invoice.direct_settlement_status);
-    let presentation_status = presentation_status_for(
-        invoice.amount_sat,
-        events,
-        tolerance_sat,
-        &invoice.status,
-        preserve_prior_settlement,
-    );
-    let projected_status = if accounting.received_sat == 0 {
-        if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
-            "in_progress"
-        } else if invoice.status == "underpaid" {
-            "underpaid"
-        } else {
-            "unpaid"
-        }
+    let (presentation_status, projected_status) = if let Some(fiat) = fiat_projection {
+        (
+            super::fiat_invoice_presentation_status(fiat),
+            super::fiat_invoice_status(&invoice.status, fiat, invoice.expired),
+        )
     } else {
-        accounting.status
+        let presentation_status = presentation_status_for(
+            invoice.amount_sat,
+            events,
+            tolerance_sat,
+            &invoice.status,
+            preserve_prior_settlement,
+        );
+        let projected_status = if accounting.received_sat == 0 {
+            if presentation_status != "unpaid" || direct_settlement_status == "resolution_pending" {
+                "in_progress"
+            } else if invoice.status == "underpaid" {
+                "underpaid"
+            } else {
+                "unpaid"
+            }
+        } else {
+            accounting.status
+        };
+        (presentation_status, projected_status)
     };
     // Closing an invoice suppresses all future payment instructions but cannot
     // hide or discard later chain evidence. Preserve the lifecycle marker and
@@ -940,7 +960,8 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
         .execute(&mut *tx)
         .await?;
     let invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+        "SELECT amount_sat, pricing_mode, fiat_amount_minor, \
+                accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
@@ -952,6 +973,16 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
     .ok_or_else(|| sqlx::Error::RowNotFound)?;
 
     for entry in quote_attributions {
+        let direct_address = batch
+            .observations
+            .iter()
+            .find(|observation| observation.event_key == entry.event_key)
+            .map(|observation| observation.address)
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "quote attribution does not belong to this direct batch".into(),
+                )
+            })?;
         validate_invoice_quote_attribution(
             &mut *tx,
             batch.invoice_id,
@@ -960,6 +991,7 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
             "direct",
             None,
             None,
+            Some(direct_address),
         )
         .await?;
     }
@@ -1063,7 +1095,16 @@ async fn apply_direct_observation_batch_with_optional_quote_attributions(
     }
 
     let projection_events = load_projection_events_locked(&mut tx, batch.invoice_id).await?;
-    let projection = reduce_projection(&invoice, &projection_events, tolerances);
+    let fiat_projection = if invoice.pricing_mode == "fiat_fixed" {
+        if invoice.fiat_amount_minor.is_none() {
+            return protocol_error("fiat-fixed invoice lacks immutable face amount");
+        }
+        Some(super::invoice_fiat_credit_projection(&mut *tx, batch.invoice_id).await?)
+    } else {
+        None
+    };
+    let projection =
+        reduce_projection_with_fiat(&invoice, &projection_events, tolerances, fiat_projection);
     let active_rails: Vec<String> = projection_events
         .iter()
         .filter(|event| {
@@ -1586,7 +1627,9 @@ async fn ensure_direct_event_locked(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      CASE WHEN $9 = 'active' THEN NOW() ELSE NULL END, \
                      CASE WHEN $9 = 'active' THEN NULL ELSE NOW() END, $12, $13, $14, \
-                     CASE WHEN $13::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
+                     CASE WHEN $13::UUID IS NULL THEN NULL ELSE ( \
+                         SELECT first_seen_at FROM invoice_payment_observations WHERE id = $11 \
+                     ) END) \
              RETURNING id",
         )
         .bind(invoice_id)
@@ -1815,7 +1858,8 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
         .execute(&mut **tx)
         .await?;
     let mut invoice = sqlx::query_as::<_, LockedInvoice>(
-        "SELECT amount_sat, accept_btc, accept_liquid, accept_ln, \
+        "SELECT amount_sat, pricing_mode, fiat_amount_minor, \
+                accept_btc, accept_liquid, accept_ln, \
                 status, presentation_status, \
                 direct_settlement_status, swap_settlement_status, settlement_status, \
                 paid_via, paid_amount_sat, expires_at <= NOW() AS expired \
@@ -1829,7 +1873,13 @@ pub(crate) async fn reproject_after_merchant_settlement_locked(
     invoice.swap_settlement_status = swap_settlement_status.to_owned();
 
     let projection_events = load_projection_events_locked(tx, invoice_id).await?;
-    let projection = reduce_projection(&invoice, &projection_events, tolerances);
+    let fiat_projection = if invoice.pricing_mode == "fiat_fixed" {
+        Some(super::invoice_fiat_credit_projection(&mut **tx, invoice_id).await?)
+    } else {
+        None
+    };
+    let projection =
+        reduce_projection_with_fiat(&invoice, &projection_events, tolerances, fiat_projection);
     let active_rails: Vec<String> = projection_events
         .iter()
         .filter(|event| {
@@ -1928,6 +1978,8 @@ mod tests {
     fn invoice() -> LockedInvoice {
         LockedInvoice {
             amount_sat: 100_000,
+            pricing_mode: "sat_fixed".into(),
+            fiat_amount_minor: None,
             accept_btc: true,
             accept_liquid: true,
             accept_ln: true,

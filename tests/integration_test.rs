@@ -11671,6 +11671,7 @@ async fn insert_test_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -11707,6 +11708,7 @@ async fn insert_fiat_quote_test_invoice(
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
             amount_sat: 0,
@@ -12106,6 +12108,7 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
             public_slug: None,
             npub_owner: &npub_owner,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
             amount_sat: 0,
@@ -12138,7 +12141,8 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         rate_observed_at_unix: now - 1,
         rate_fetched_at_unix: now,
         rate_fresh_until_unix: now + 300,
-        merchant_amount_sat: 10_000,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: 1_000_000,
     };
 
     let mut tasks = Vec::new();
@@ -12192,6 +12196,11 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         provider: None,
         provider_offer_id: None,
         provider_attempt_id: None,
+        direct_address: Some("lq1qphase7quoteofferone000000000000000000000000000000000000000"),
+        direct_liquid_blinding_key_hex: Some(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        direct_address_index: Some(1),
         payer_amount_sat: quote.merchant_amount_sat,
         expires_at_unix: quote.expires_at_unix,
     };
@@ -12269,7 +12278,8 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         rate_observed_at_unix: now - 1,
         rate_fetched_at_unix: now,
         rate_fresh_until_unix: now + 300,
-        merchant_amount_sat: 10_000,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: 1_000_000,
     };
     let second = pay_service::db::create_or_reuse_current_invoice_quote(
         &admin,
@@ -12292,6 +12302,11 @@ async fn invoice_quote_versions_serialize_reuse_and_preserve_expired_attribution
         provider: None,
         provider_offer_id: None,
         provider_attempt_id: None,
+        direct_address: Some("lq1qphase7quoteoffertwo000000000000000000000000000000000000000"),
+        direct_liquid_blinding_key_hex: Some(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        ),
+        direct_address_index: Some(2),
         payer_amount_sat: second.quote.merchant_amount_sat,
         expires_at_unix: second.quote.expires_at_unix,
     };
@@ -12429,10 +12444,11 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: Some(1_000),
             fiat_currency: Some("USD"),
-            amount_sat: 10_000,
-            rate_minor_per_btc: Some(10_000_000),
+            amount_sat: 0,
+            rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
             recipient_label: None,
@@ -12459,7 +12475,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             rate_observed_at_unix: now - 1,
             rate_fetched_at_unix: now,
             rate_fresh_until_unix: now + 300,
-            merchant_amount_sat: 10_000,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
         },
     )
     .await
@@ -12467,6 +12484,86 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .quote;
     let reverse_provider_id = "PHASE7_ATTRIBUTION_REVERSE";
     let chain_provider_id = "PHASE7_ATTRIBUTION_CHAIN";
+    let reverse_request_key = "a".repeat(64);
+    let chain_request_key = "b".repeat(64);
+    let attempt_root = "7070707070707070";
+    let attempt_reverse_public = format!("02{}", "61".repeat(32));
+    let attempt_reverse_preimage = "62".repeat(32);
+    let attempt_chain_claim_public = format!("02{}", "63".repeat(32));
+    let attempt_chain_preimage = "64".repeat(32);
+    let attempt_chain_refund_public = format!("03{}", "65".repeat(32));
+    let attempt_reverse_allocation = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_901,
+            purpose: pay_service::db::SwapKeyPurpose::ReverseClaim,
+            public_key_hex: &attempt_reverse_public,
+            preimage_hash_hex: Some(&attempt_reverse_preimage),
+        },
+    )
+    .await
+    .unwrap();
+    let attempt_chain_claim_allocation = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_902,
+            purpose: pay_service::db::SwapKeyPurpose::ChainClaim,
+            public_key_hex: &attempt_chain_claim_public,
+            preimage_hash_hex: Some(&attempt_chain_preimage),
+        },
+    )
+    .await
+    .unwrap();
+    let attempt_chain_refund_allocation = pay_service::db::reserve_swap_key_allocation(
+        &pool,
+        &pay_service::db::NewSwapKeyAllocation {
+            root_fingerprint: attempt_root,
+            key_epoch: 1,
+            derivation_scheme_version: pay_service::db::DERIVATION_SCHEME_VERSION,
+            child_index: 61_903,
+            purpose: pay_service::db::SwapKeyPurpose::ChainRefund,
+            public_key_hex: &attempt_chain_refund_public,
+            preimage_hash_hex: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (reverse_attempt, _) = pay_service::db::record_or_reuse_invoice_quote_provider_attempt(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteProviderAttempt {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "lightning",
+            request_key: &reverse_request_key,
+            operation: "fixed_checkout_reverse",
+            merchant_amount_sat: quote.merchant_amount_sat,
+            claim_key_allocation_id: attempt_reverse_allocation,
+            refund_key_allocation_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (chain_attempt, _) = pay_service::db::record_or_reuse_invoice_quote_provider_attempt(
+        &pool,
+        &pay_service::db::NewInvoiceQuoteProviderAttempt {
+            invoice_id: invoice.id,
+            quote_version_id: quote.id,
+            rail: "bitcoin",
+            request_key: &chain_request_key,
+            operation: "chain_create",
+            merchant_amount_sat: quote.merchant_amount_sat,
+            claim_key_allocation_id: attempt_chain_claim_allocation,
+            refund_key_allocation_id: Some(attempt_chain_refund_allocation),
+        },
+    )
+    .await
+    .unwrap();
     let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
         &pool,
         &pay_service::db::NewInvoiceQuoteOffer {
@@ -12474,9 +12571,13 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             quote_version_id: quote.id,
             rail: "lightning",
             offer_kind: "boltz_reverse",
-            request_key: &"a".repeat(64),
+            request_key: &reverse_request_key,
             provider: Some("boltz"),
             provider_offer_id: Some(reverse_provider_id),
+            provider_attempt_id: Some(reverse_attempt.id),
+            direct_address: None,
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: None,
             payer_amount_sat: 10_500,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -12491,9 +12592,13 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             quote_version_id: quote.id,
             rail: "bitcoin",
             offer_kind: "boltz_chain",
-            request_key: &"b".repeat(64),
+            request_key: &chain_request_key,
             provider: Some("boltz"),
             provider_offer_id: Some(chain_provider_id),
+            provider_attempt_id: Some(chain_attempt.id),
+            direct_address: None,
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: None,
             payer_amount_sat: 10_600,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -12501,6 +12606,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap()
     .offer;
+    let direct_quote_address =
+        "bc1qphase7directquoteoffer00000000000000000000000000000000000";
     let direct_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
         &pool,
         &pay_service::db::NewInvoiceQuoteOffer {
@@ -12511,6 +12618,10 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             request_key: &"c".repeat(64),
             provider: None,
             provider_offer_id: None,
+            provider_attempt_id: None,
+            direct_address: Some(direct_quote_address),
+            direct_liquid_blinding_key_hex: None,
+            direct_address_index: Some(3),
             payer_amount_sat: 10_000,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -12772,6 +12883,23 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap();
 
+    // The provider obligation owns first-observation authority. Transition it
+    // after quote expiry so the accounting writer recovers an exact durable
+    // late-observation timestamp rather than guessing from handler time.
+    sqlx::query("UPDATE swap_records SET status = 'lockup_confirmed' WHERE boltz_swap_id = $1")
+        .bind(reverse_provider_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_records SET status = 'server_lock_confirmed' \
+         WHERE boltz_swap_id = $1",
+    )
+    .bind(chain_provider_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let reverse_event_key = format!("lightning_boltz_reverse:{reverse_provider_id}");
     let reverse_txid = "7e".repeat(32);
     let reverse_evidence = pay_service::db::InvoicePaymentEvidence {
@@ -12900,7 +13028,7 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         event_key: &direct_event_key,
         txid: &direct_txid,
         vout: 0,
-        address: bitcoin_address,
+        address: direct_quote_address,
         amount_sat: 100,
         asset_id: None,
         confirmations: 3,
@@ -13410,6 +13538,7 @@ async fn insert_test_btc_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -15955,6 +16084,7 @@ async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private()
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -16248,6 +16378,7 @@ async fn invoice_insert_rejects_reused_liquid_address() {
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -17100,6 +17231,7 @@ async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -17168,6 +17300,7 @@ async fn issue14_m5_direct_watcher_enforces_the_invoice_wide_tolerance() {
             public_slug: None,
             npub_owner: &npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -18296,6 +18429,7 @@ async fn stale_wallet_partial_stays_payable() {
             public_slug: None,
             npub_owner: &npub,
             origin: "wallet",
+            checkout_surface_kind: None,
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: 1_000,
@@ -29745,6 +29879,7 @@ async fn issue84_chain_invoice(
             public_slug: None,
             npub_owner: npub,
             origin: "checkout",
+            checkout_surface_kind: Some(pay_service::db::KIND_PAYMENT_PAGE),
             fiat_amount_minor: None,
             fiat_currency: None,
             amount_sat: i64::try_from(ISSUE84_CHAIN_AMOUNT_SAT).unwrap(),

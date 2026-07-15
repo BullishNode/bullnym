@@ -3,9 +3,11 @@
 -- amount/rate shape rather than backfilling it. Remove the disposable hook
 -- fixture after its 061 assertions so this upgrade test exercises the clean
 -- cutover contract without pretending to migrate monetary evidence.
-TRUNCATE TABLE invoice_quote_versions CASCADE;
-DELETE FROM invoices
- WHERE id = '61000000-0000-0000-0000-000000000001';
+-- The production rollout is an authorized clean cutover. The upgrade harness
+-- accumulated representative legacy invoice fixtures for earlier migration
+-- assertions; discard that synthetic ledger here instead of backfilling a
+-- quote surface or monetary valuation that never existed.
+TRUNCATE TABLE invoices CASCADE;
 
 DO $$
 BEGIN

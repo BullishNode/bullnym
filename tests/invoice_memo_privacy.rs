@@ -31,7 +31,6 @@ fn signed_list_item_exposes_memo() {
         accept_btc: false,
         accept_ln: true,
         accept_liquid: false,
-        quote_rail_availability: None,
         bitcoin_address: None,
         liquid_address: None,
         created_at_unix: 0,
@@ -90,6 +89,7 @@ fn public_status_response_hides_memo() {
         accept_btc: false,
         accept_ln: true,
         accept_liquid: false,
+        quote_rail_availability: None,
     };
     let json = serde_json::to_value(&status).unwrap();
     let obj = json.as_object().unwrap();
