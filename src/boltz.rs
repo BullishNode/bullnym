@@ -1978,17 +1978,23 @@ mod tests {
         pair_response: Value,
         creation_response: Value,
         calls: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<Value>>>,
     }
 
     struct ReverseCreationFixture {
         base_url: String,
         calls: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<Value>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl ReverseCreationFixture {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.requests.lock().unwrap().clone()
         }
 
         async fn shutdown(self) {
@@ -2006,22 +2012,30 @@ mod tests {
 
     async fn reverse_creation_handler(
         State(state): State<ReverseCreationFixtureState>,
-        Json(_request): Json<Value>,
+        Json(request): Json<Value>,
     ) -> Json<Value> {
         state
             .calls
             .lock()
             .unwrap()
             .push("POST /swap/reverse".into());
+        state.requests.lock().unwrap().push(request);
         Json(state.creation_response)
     }
 
     async fn spawn_reverse_creation_fixture(
         response: &CreateReverseResponse,
     ) -> ReverseCreationFixture {
+        spawn_reverse_creation_value_fixture(serde_json::to_value(response).unwrap()).await
+    }
+
+    async fn spawn_reverse_creation_value_fixture(
+        creation_response: Value,
+    ) -> ReverseCreationFixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let state = ReverseCreationFixtureState {
             pair_response: json!({
                 "BTC": {
@@ -2036,8 +2050,9 @@ mod tests {
                     }
                 }
             }),
-            creation_response: serde_json::to_value(response).unwrap(),
+            creation_response,
             calls: calls.clone(),
+            requests: requests.clone(),
         };
         let app = Router::new()
             .route(
@@ -2051,6 +2066,7 @@ mod tests {
         ReverseCreationFixture {
             base_url: format!("http://{address}"),
             calls,
+            requests,
             task,
         }
     }
@@ -2236,6 +2252,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_checkout_http_normalizes_only_an_omitted_onchain_amount() {
+        let expected = reverse_creation_response(ReverseCreationMutation::Valid);
+        let mut live_response = serde_json::to_value(&expected).unwrap();
+        live_response
+            .as_object_mut()
+            .unwrap()
+            .remove("onchainAmount");
+        let mut live_keys: Vec<_> = live_response
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        live_keys.sort_unstable();
+        assert_eq!(
+            live_keys,
+            vec![
+                "blindingKey",
+                "id",
+                "invoice",
+                "lockupAddress",
+                "refundPublicKey",
+                "swapTree",
+                "timeoutBlockHeight",
+            ],
+            "fixture must match the live top-level response shape"
+        );
+
+        let fixture = spawn_reverse_creation_value_fixture(live_response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+        let result = service
+            .create_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                1_000,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.payer_amount_sat, 1_050);
+        assert_eq!(result.onchain_amount_sat, 1_020);
+        assert_eq!(result.claim_fee_budget_sat, 20);
+        assert_eq!(result.swap.swap_id, expected.id);
+        assert_eq!(result.swap.boltz_response.onchain_amount, 1_020);
+        assert_eq!(
+            result.swap.boltz_response.lockup_address,
+            expected.lockup_address
+        );
+        assert_eq!(
+            fixture.calls(),
+            vec![
+                "GET /swap/reverse".to_string(),
+                "POST /swap/reverse".to_string(),
+            ]
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].get("invoiceAmount").is_none());
+        assert_eq!(requests[0]["onchainAmount"], 1_020);
+        assert_eq!(requests[0]["pairHash"], "11".repeat(32));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fixed_checkout_http_rejects_a_present_onchain_amount_mismatch() {
+        let mut response =
+            serde_json::to_value(reverse_creation_response(ReverseCreationMutation::Valid))
+                .unwrap();
+        response["onchainAmount"] = Value::from(1_019_u64);
+        let fixture = spawn_reverse_creation_value_fixture(response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+
+        let error = match service
+            .create_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                1_000,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("present onchainAmount mismatch was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("onchainAmount did not match immutable request authority"),
+            "unexpected mismatch error: {error}"
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["onchainAmount"], 1_020);
+        assert_eq!(requests[0]["pairHash"], "11".repeat(32));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_reverse_http_still_rejects_an_omitted_onchain_amount() {
+        let mut response =
+            serde_json::to_value(reverse_creation_response(ReverseCreationMutation::Valid))
+                .unwrap();
+        response.as_object_mut().unwrap().remove("onchainAmount");
+        let fixture = spawn_reverse_creation_value_fixture(response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+
+        let error = match service
+            .create_reverse_swap(service.derive_swap_key(42).unwrap(), 1_050, None, None)
+            .await
+        {
+            Ok(_) => panic!("ordinary reverse path accepted omitted onchainAmount"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("onchainAmount"), "{error}");
+        assert_eq!(fixture.calls(), vec!["POST /swap/reverse".to_string()]);
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["invoiceAmount"], 1_050);
+        assert!(requests[0].get("onchainAmount").is_none());
+        assert!(requests[0].get("pairHash").is_none());
+        fixture.shutdown().await;
     }
 
     fn dynamic_chain_creation_response(
