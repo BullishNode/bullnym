@@ -11890,9 +11890,13 @@ async fn payer_quote_refuses_a_partial_window_before_rate_or_provider_work() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let invoice = insert_fiat_quote_test_invoice(&pool, "shortlifetime", true).await;
+    // Pin the database clock to an integral second. Without this, flooring the
+    // stored TIMESTAMPTZ can occasionally turn a nominal 299-second remainder
+    // into the exact 300-second boundary that legitimately fits one window.
     sqlx::query(
         "UPDATE invoices \
-            SET expires_at = clock_timestamp() + INTERVAL '299 seconds' \
+            SET expires_at = date_trunc('second', clock_timestamp()) \
+                           + INTERVAL '299 seconds' \
           WHERE id = $1",
     )
     .bind(invoice.id)
