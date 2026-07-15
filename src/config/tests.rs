@@ -350,7 +350,10 @@ fn permanent_nym_cap_is_not_operator_configurable() {
 
 #[test]
 fn checked_in_config_uses_only_current_keys() {
-    let parsed: Config = toml::from_str(include_str!("../../config.toml")).unwrap();
+    let mut parsed: Config = toml::from_str(include_str!("../../config.toml")).unwrap();
+    // `Config::load` supplies this skipped secret from the required
+    // environment variable before running the same validation.
+    parsed.boltz_webhook_url_secret = "checked-in-config-test-secret".to_string();
 
     assert_eq!(parsed.rate_limit.api_rate_limit, 30);
     assert_eq!(parsed.rate_limit.api_rate_window_secs, 60);
@@ -811,13 +814,18 @@ fn liquid_claim_validation_includes_boltz_and_shared_electrum_settings() {
 }
 
 #[test]
-fn production_requires_webhook_secret() {
+fn every_runtime_mode_requires_webhook_secret() {
     let mut cfg = production_base_config();
     cfg.boltz_webhook_url_secret.clear();
 
-    let err = cfg.validate_for_runtime("production", false).unwrap_err();
-
-    assert!(err.to_string().contains("BOLTZ_WEBHOOK_URL_SECRET"));
+    for runtime_mode in ["development", "unknown", "production"] {
+        let err = cfg.validate_for_runtime(runtime_mode, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "BOLTZ_WEBHOOK_URL_SECRET must be non-empty",
+            "runtime mode {runtime_mode}"
+        );
+    }
 }
 
 #[test]
@@ -890,11 +898,10 @@ fn production_rejects_ipv6_loopback_domain() {
 }
 
 #[test]
-fn non_production_allows_dev_webhook_and_public_listen() {
+fn non_production_allows_local_domain_and_public_listen() {
     let mut cfg = production_base_config();
     cfg.domain = "localhost:8080".to_string();
     cfg.listen = "0.0.0.0:8080".to_string();
-    cfg.boltz_webhook_url_secret.clear();
 
     cfg.validate_for_runtime("development", false).unwrap();
 }

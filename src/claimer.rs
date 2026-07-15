@@ -469,43 +469,6 @@ pub async fn webhook_with_secret(
     ))
 }
 
-/// Compatibility webhook entrypoint: `/webhook/boltz`.
-/// See docs/compatibility-ledger.md for removal policy.
-///
-/// **First-time secret rollout (operational note).** The webhook URL is
-/// captured Boltz-side at swap-creation time. Setting the secret on a
-/// running deployment that previously created swaps without one will
-/// reject all in-flight swaps' webhook deliveries (Boltz retries 5×60s
-/// then abandons). Mitigation: deploy this code with the secret unset
-/// first, drain in-flight swaps (~24h max via reconciler / on-chain
-/// timeouts), then flip the secret on.
-pub async fn webhook_unauthenticated(
-    State(state): State<AppState>,
-    peer_opt: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    body: String,
-) -> Result<Response, AppError> {
-    if !state.config.boltz_webhook_url_secret.is_empty() {
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        let caller_ip = ip_whitelist::resolve_caller_ip(
-            peer_opt.map(|ConnectInfo(addr)| addr.ip()),
-            xff,
-            state.config.rate_limit.trust_forwarded_for,
-        );
-        tracing::warn!(
-            "boltz webhook: hit on unauthenticated path while secret is configured (caller={:?})",
-            caller_ip,
-        );
-        return Ok((StatusCode::NOT_FOUND, "").into_response());
-    }
-    tracing::warn!(
-        "boltz webhook: BOLTZ_WEBHOOK_URL_SECRET unset — accepting unauthenticated payload (DEV ONLY)"
-    );
-    Ok(webhook_dispatch_response(
-        dispatch_webhook(state, peer_opt, headers, body).await,
-    ))
-}
-
 /// Shared post-auth webhook handler.
 ///
 /// Returns `Ok("ok")` (200) for every payload we successfully decode and
