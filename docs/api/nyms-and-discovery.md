@@ -226,7 +226,9 @@ clients needing identity separation should use a dedicated auth key.
 
 ## `GET /api/reservations/:nym`
 
-Query: `npub`, `ts`, and legacy `sig`. Returns
+Query: `npub`, `timestamp`, and `signature`. Sign the `reservation-list`
+action with the route nym in the nym slot and zero payload fields, as defined
+in [Authentication](authentication.md). Returns
 `{ "reservations": [{ "outpoint", "addr_index", "fulfilled" }],
 "next_addr_idx": 42 }`. This is an owner diagnostics API, not a
 payment-status API. GC can delete an unfulfilled reservation after its TTL even

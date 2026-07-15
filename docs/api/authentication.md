@@ -44,13 +44,11 @@ unlinked invoice operations it is the empty string.
 | list recoverable swaps | `invoice-recovery-list` | none — zero payload fields, and the nym slot is the empty string |
 | register recovery address | `recovery-address-set` | `1`, then the canonical Bitcoin-mainnet `btc_address`; the nym slot is the empty string and the signature must be lowercase hex |
 | look up recovery address | `recovery-address-get` | none — zero payload fields, and the nym slot is the empty string |
+| list LUD-22 reservations | `reservation-list` | none — zero payload fields, with the route nym in the nym slot |
 
 Invoice optionals always occupy their fixed signing position as `""`. Amounts
 and timestamps use decimal strings. Surface social fields similarly occupy
 fixed empty-string positions; only the terminal alias is omitted when absent.
-
-Reservation inspection is the sole legacy signing exception. Sign the
-SHA-256 digest of UTF-8 `reservations:<nym>:<ts>` and send it as `sig`.
 
 ## Retry implications
 

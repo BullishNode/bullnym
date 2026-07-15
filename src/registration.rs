@@ -461,10 +461,11 @@ pub async fn lookup_by_npub(
 // --- Reservation sync ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReservationsAuthParams {
-    pub ts: u64,
-    pub sig: String,
     pub npub: String,
+    pub timestamp: u64,
+    pub signature: String,
 }
 
 #[derive(Serialize)]
@@ -482,20 +483,22 @@ pub struct ReservationsResponse {
 
 /// GET /api/reservations/:nym
 ///
-/// Auth via Schnorr signature over `sha256("reservations:" || nym || ":" || ts)`,
-/// where ts is a unix timestamp within ±RESERVATIONS_TS_WINDOW_SECS of server
-/// clock. The signing key must match the `npub` on record for this nym.
+/// Auth uses the `bullpay-la-v2` `reservation-list` action with the route nym
+/// in the nym slot and zero payload fields. The signing key must match the
+/// `npub` on record for this nym.
 pub async fn list_reservations(
     State(state): State<AppState>,
     Path(nym): Path<String>,
     Query(params): Query<ReservationsAuthParams>,
 ) -> Result<Json<ReservationsResponse>, AppError> {
-    // Clock skew check.
-    auth::check_ts_freshness(params.ts)?;
-
-    // Verify sig over "reservations:{nym}:{ts}".
-    let message = format!("reservations:{}:{}", nym, params.ts);
-    auth::verify_signature(&params.npub, message.as_bytes(), &params.sig)?;
+    auth::verify_la_v2(
+        "reservation-list",
+        &params.npub,
+        &nym,
+        &[],
+        params.timestamp,
+        &params.signature,
+    )?;
 
     // Bind to the nym owner on record.
     let user = db::get_active_user_by_nym(&state.db, &nym)
