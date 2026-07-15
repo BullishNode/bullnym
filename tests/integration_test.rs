@@ -13665,6 +13665,9 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     let chain_provider_id = "PHASE7_ATTRIBUTION_CHAIN";
     let reverse_request_key = "a".repeat(64);
     let chain_request_key = "b".repeat(64);
+    let request_authority_json = r#"{"kind":"phase7-attribution"}"#;
+    let request_authority_sha256 =
+        "01015ae3501c3a082ead6b0f4da92f978cde23ffd20848d30b86141ac75dc5ff";
     let attempt_root = "7070707070707070";
     let attempt_reverse_public = format!("02{}", "61".repeat(32));
     let attempt_reverse_preimage = "62".repeat(32);
@@ -13722,6 +13725,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             request_key: &reverse_request_key,
             operation: "fixed_checkout_reverse",
             merchant_amount_sat: quote.merchant_amount_sat,
+            request_authority_json,
+            request_authority_sha256,
             claim_key_allocation_id: attempt_reverse_allocation,
             refund_key_allocation_id: None,
         },
@@ -13737,14 +13742,33 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             request_key: &chain_request_key,
             operation: "chain_create",
             merchant_amount_sat: quote.merchant_amount_sat,
+            request_authority_json,
+            request_authority_sha256,
             claim_key_allocation_id: attempt_chain_claim_allocation,
             refund_key_allocation_id: Some(attempt_chain_refund_allocation),
         },
     )
     .await
     .unwrap();
-    let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
+    assert!(pay_service::db::record_invoice_quote_provider_dispatch(
         &pool,
+        reverse_attempt.id,
+        request_authority_sha256,
+    )
+    .await
+    .unwrap());
+    assert!(pay_service::db::record_invoice_quote_provider_dispatch(
+        &pool,
+        chain_attempt.id,
+        request_authority_sha256,
+    )
+    .await
+    .unwrap());
+
+    // Provider offers, obligations, and completion evidence share one commit.
+    let mut provider_tx = pool.begin().await.unwrap();
+    let reverse_offer = pay_service::db::record_or_reuse_invoice_quote_offer_in_tx(
+        &mut provider_tx,
         &pay_service::db::NewInvoiceQuoteOffer {
             invoice_id: invoice.id,
             quote_version_id: quote.id,
@@ -13761,8 +13785,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap()
     .offer;
-    let chain_offer = pay_service::db::record_or_reuse_invoice_quote_offer(
-        &pool,
+    let chain_offer = pay_service::db::record_or_reuse_invoice_quote_offer_in_tx(
+        &mut provider_tx,
         &pay_service::db::NewInvoiceQuoteOffer {
             invoice_id: invoice.id,
             quote_version_id: quote.id,
@@ -13828,8 +13852,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         claim_public_key_hex: &reverse_public_key,
         preimage_hash_hex: &reverse_preimage_hash,
     };
-    let wrong_rail = pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    let wrong_rail = pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &reverse_swap,
         &reverse_lineage,
         chain_attribution,
@@ -13851,8 +13875,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         key_index: Some(61_001),
         root_fingerprint: Some(reverse_root),
     };
-    let wrong_provider = pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    let wrong_provider = pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &wrong_provider_swap,
         &reverse_lineage,
         reverse_attribution,
@@ -13860,25 +13884,23 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     .await
     .unwrap_err();
     assert!(matches!(wrong_provider, sqlx::Error::Protocol(_)));
-    pay_service::db::record_swap_with_lineage_and_quote_attribution(
-        &pool,
+    pay_service::db::record_swap_in_tx_with_lineage_and_quote_attribution(
+        &mut provider_tx,
         &reverse_swap,
         &reverse_lineage,
         reverse_attribution,
     )
     .await
     .unwrap();
-    let stored_reverse = pay_service::db::get_swap_by_boltz_id(&pool, reverse_provider_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (
-            stored_reverse.invoice_quote_version_id,
-            stored_reverse.invoice_quote_offer_id,
-        ),
-        (Some(quote.id), Some(reverse_offer.id))
-    );
+    pay_service::db::record_invoice_quote_provider_completion(
+        &mut *provider_tx,
+        reverse_attempt.id,
+        reverse_offer.id,
+        reverse_provider_id,
+        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    )
+    .await
+    .unwrap();
 
     let recovery_commitment_id =
         insert_test_recovery_commitment(&pool, &npub, RECOVERY_COMMITMENT_P2WPKH, 1, 0x77).await;
@@ -13949,9 +13971,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         creation_terms,
         recovery_address_commitment_id: Some(recovery_commitment_id),
     };
-    let chain_wrong_rail =
-        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
-            &pool,
+    let chain_wrong_rail = pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx(
+            &mut provider_tx,
             &chain_swap,
             &chain_lineage,
             &creation_evidence,
@@ -13960,9 +13981,8 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
         .await
         .unwrap_err();
     assert!(matches!(chain_wrong_rail, sqlx::Error::Protocol(_)));
-    let stored_chain =
-        pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution(
-            &pool,
+    let stored_chain = pay_service::db::record_chain_swap_with_lineage_creation_evidence_and_quote_attribution_in_tx(
+            &mut provider_tx,
             &chain_swap,
             &chain_lineage,
             &creation_evidence,
@@ -13976,6 +13996,34 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             stored_chain.invoice_quote_offer_id,
         ),
         (Some(quote.id), Some(chain_offer.id))
+    );
+    let chain_response_sha256 = stored_chain
+        .creation_terms
+        .as_ref()
+        .unwrap()
+        .creation_response_sha256
+        .clone();
+    pay_service::db::record_invoice_quote_provider_completion(
+        &mut *provider_tx,
+        chain_attempt.id,
+        chain_offer.id,
+        chain_provider_id,
+        &chain_response_sha256,
+    )
+    .await
+    .unwrap();
+    provider_tx.commit().await.unwrap();
+
+    let stored_reverse = pay_service::db::get_swap_by_boltz_id(&pool, reverse_provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            stored_reverse.invoice_quote_version_id,
+            stored_reverse.invoice_quote_offer_id,
+        ),
+        (Some(quote.id), Some(reverse_offer.id))
     );
 
     // Make all issued instructions genuinely expired without waiting five
