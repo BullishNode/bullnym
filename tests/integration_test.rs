@@ -15951,16 +15951,15 @@ async fn offline_after_liquid_instruction_keeps_observation_live_without_reopeni
 
     // The authenticated supervision surface remains owner-readable while the
     // public payment-instruction surface stays closed.
-    let reservations_timestamp = auth_timestamp();
-    let reservations_message = format!("reservations:{nym}:{reservations_timestamp}");
-    let reservations_signature = sign_with_keypair(&keypair, reservations_message.as_bytes());
-    let (reservations_status, reservations_body) = get_path(
-        &app,
-        &format!(
-            "/api/reservations/{nym}?ts={reservations_timestamp}&sig={reservations_signature}&npub={npub}"
-        ),
-    )
-    .await;
+    let reservations_uri = reservation_list_uri(
+        &keypair,
+        "reservation-list",
+        &npub,
+        nym,
+        nym,
+        auth_timestamp(),
+    );
+    let (reservations_status, reservations_body) = get_path(&app, &reservations_uri).await;
     assert_eq!(reservations_status, StatusCode::OK, "{reservations_body}");
     assert_eq!(
         reservations_body["reservations"].as_array().unwrap().len(),
