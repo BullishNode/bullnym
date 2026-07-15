@@ -65,56 +65,156 @@ ALTER TABLE invoices
         OR (origin = 'wallet' AND checkout_surface_kind IS NULL)
     );
 
+-- `in_progress` now also represents real money whose fiat valuation is
+-- deliberately unresolved (for example first observed after its quote
+-- expired). Preserve the rail/amount evidence without mislabeling it paid.
+ALTER TABLE invoices
+    DROP CONSTRAINT invoices_paid_via_or_closed_chk,
+    ADD CONSTRAINT invoices_paid_via_or_closed_chk CHECK (
+        (
+            status = 'unpaid'
+            AND paid_via IS NULL
+            AND paid_amount_sat IS NULL
+        )
+        OR (
+            status = 'in_progress'
+            AND ((paid_via IS NULL) = (paid_amount_sat IS NULL))
+        )
+        OR (
+            status IN ('partially_paid', 'paid', 'underpaid', 'overpaid')
+            AND paid_via IS NOT NULL
+            AND paid_amount_sat IS NOT NULL
+        )
+        OR (
+            status IN ('cancelled', 'expired')
+            AND ((paid_via IS NULL) = (paid_amount_sat IS NULL))
+        )
+    );
+
 -- Each version prices one immutable slice of the still-outstanding fiat face.
 -- The original face remains separately snapshotted for audit and UI context.
 -- This column is intentionally added without a default: a database containing
 -- pre-cutover quote rows must be reset/refused rather than assigned invented
 -- remaining-fiat evidence.
 ALTER TABLE invoice_quote_versions
+    ADD COLUMN quote_purpose TEXT NOT NULL DEFAULT 'payer_instruction',
+    ADD COLUMN late_instruction_quote_version_id UUID,
+    ADD COLUMN late_observation_at TIMESTAMPTZ,
     ADD COLUMN fiat_target_amount_minor INTEGER NOT NULL,
+    ADD CONSTRAINT invoice_quote_versions_purpose_check CHECK (
+        (
+            quote_purpose = 'payer_instruction'
+            AND late_instruction_quote_version_id IS NULL
+            AND late_observation_at IS NULL
+        ) OR (
+            quote_purpose = 'late_valuation'
+            AND late_observation_at IS NOT NULL
+        )
+    ),
+    ADD CONSTRAINT invoice_quote_versions_late_instruction_fkey FOREIGN KEY (
+        late_instruction_quote_version_id,
+        invoice_id
+    ) REFERENCES invoice_quote_versions(id, invoice_id)
+      ON UPDATE RESTRICT ON DELETE RESTRICT,
     ADD CONSTRAINT invoice_quote_versions_fiat_target_check CHECK (
         fiat_target_amount_minor > 0
         AND fiat_target_amount_minor <= fiat_face_amount_minor
     );
+ALTER TABLE invoice_quote_versions ALTER COLUMN quote_purpose DROP DEFAULT;
+CREATE UNIQUE INDEX invoice_quote_versions_late_valuation_snapshot_key
+    ON invoice_quote_versions (
+        invoice_id,
+        rate_minor_per_btc,
+        rate_source,
+        rate_observed_at,
+        rate_fetched_at,
+        rate_fresh_until
+    ) WHERE quote_purpose = 'late_valuation';
 
--- Direct fiat instructions use a unique destination per quote. Reusing the
--- invoice settlement address would make an expired-A/active-B partial output
--- impossible to attribute to its own rate window. Provider offers keep these
--- fields NULL because their canonical swap rows own their destinations.
+-- Direct Liquid instructions are the invoice's stable address and therefore
+-- have no quote-offer row. Quote offers are reserved for provider obligations,
+-- whose durable identity is independently observable and attributable.
 ALTER TABLE invoice_quote_offers
-    ADD COLUMN direct_address TEXT,
-    ADD COLUMN direct_liquid_blinding_key_hex TEXT,
-    ADD COLUMN direct_address_index INTEGER,
-    ADD CONSTRAINT invoice_quote_offers_direct_destination_shape_check CHECK (
+    DROP CONSTRAINT invoice_quote_offers_rail_kind_check,
+    DROP CONSTRAINT invoice_quote_offers_provider_shape_check,
+    ADD CONSTRAINT invoice_quote_offers_rail_kind_check CHECK (
+        (rail = 'bitcoin' AND offer_kind = 'boltz_chain')
+        OR (rail = 'lightning' AND offer_kind = 'boltz_reverse')
+    ),
+    ADD CONSTRAINT invoice_quote_offers_provider_shape_check CHECK (
+        offer_kind IN ('boltz_reverse', 'boltz_chain')
+        AND provider = 'boltz'
+        AND provider_offer_id IS NOT NULL
+        AND provider_offer_id = btrim(provider_offer_id)
+        AND octet_length(provider_offer_id) BETWEEN 1 AND 255
+    );
+
+-- Keep instruction attribution separate from valuation authority. An event
+-- first observed while quote A is live is valued by A. An event first observed
+-- at or after A's expiry may only be valued by a distinct quote B which was
+-- already durable, live, and backed by a fresh upstream snapshot at that exact
+-- observation boundary. Copy the rate evidence onto the event so no later
+-- quote mutation, lookup rule, or market movement can reprice committed money.
+ALTER TABLE invoice_payment_events
+    ADD COLUMN fiat_valuation_quote_version_id UUID,
+    ADD COLUMN fiat_rate_minor_per_btc BIGINT,
+    ADD COLUMN fiat_rate_source TEXT,
+    ADD COLUMN fiat_rate_observed_at TIMESTAMPTZ,
+    ADD COLUMN fiat_rate_fetched_at TIMESTAMPTZ,
+    ADD COLUMN fiat_rate_fresh_until TIMESTAMPTZ,
+    DROP CONSTRAINT invoice_payment_events_quote_attribution_shape_check,
+    ADD CONSTRAINT invoice_payment_events_quote_attribution_shape_check CHECK (
         (
-            offer_kind = 'direct'
-            AND direct_address IS NOT NULL
-            AND octet_length(direct_address) BETWEEN 8 AND 256
-            AND direct_address = btrim(direct_address)
-            AND direct_address_index IS NOT NULL
-            AND direct_address_index >= 0
-            AND (
-                (
-                    rail = 'liquid'
-                    AND direct_liquid_blinding_key_hex ~ '^[0-9a-f]{64}$'
-                )
-                OR (
-                    rail = 'bitcoin'
-                    AND direct_liquid_blinding_key_hex IS NULL
+            (
+                invoice_quote_version_id IS NULL
+                AND invoice_quote_offer_id IS NULL
+                AND (
+                    quote_first_observed_at IS NULL
+                    OR source IN ('bitcoin_direct', 'liquid_direct')
                 )
             )
+            OR (
+                invoice_quote_version_id IS NOT NULL
+                AND invoice_quote_offer_id IS NOT NULL
+                AND quote_first_observed_at IS NOT NULL
+            )
         )
-        OR
-        (
-            offer_kind IN ('boltz_reverse', 'boltz_chain')
-            AND direct_address IS NULL
-            AND direct_liquid_blinding_key_hex IS NULL
-            AND direct_address_index IS NULL
+        AND (
+            (
+                fiat_credited_minor IS NULL
+                AND fiat_credit_policy IS NULL
+                AND fiat_valued_at IS NULL
+                AND fiat_valuation_quote_version_id IS NULL
+                AND fiat_rate_minor_per_btc IS NULL
+                AND fiat_rate_source IS NULL
+                AND fiat_rate_observed_at IS NULL
+                AND fiat_rate_fetched_at IS NULL
+                AND fiat_rate_fresh_until IS NULL
+            ) OR (
+                quote_first_observed_at IS NOT NULL
+                AND fiat_credited_minor IS NOT NULL
+                AND fiat_credited_minor >= 0
+                AND fiat_credit_policy IS NOT NULL
+                AND fiat_credit_policy ~ '^[a-z][a-z0-9_]{0,62}_v[1-9][0-9]*$'
+                AND fiat_valued_at IS NOT NULL
+                AND fiat_valuation_quote_version_id IS NOT NULL
+                AND fiat_rate_minor_per_btc > 0
+                AND fiat_rate_source IS NOT NULL
+                AND fiat_rate_source = btrim(fiat_rate_source)
+                AND fiat_rate_source ~ '^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$'
+                AND fiat_rate_observed_at IS NOT NULL
+                AND fiat_rate_fetched_at IS NOT NULL
+                AND fiat_rate_fresh_until IS NOT NULL
+                AND fiat_rate_observed_at < fiat_rate_fresh_until
+                AND fiat_rate_fetched_at < fiat_rate_fresh_until
+            )
         )
-    );
-CREATE UNIQUE INDEX invoice_quote_offers_direct_destination_key
-    ON invoice_quote_offers (rail, direct_address)
-    WHERE direct_address IS NOT NULL;
+    ),
+    ADD CONSTRAINT invoice_payment_events_fiat_valuation_quote_fkey FOREIGN KEY (
+        fiat_valuation_quote_version_id,
+        invoice_id
+    ) REFERENCES invoice_quote_versions(id, invoice_id)
+      ON UPDATE RESTRICT ON DELETE RESTRICT;
 
 CREATE FUNCTION invoice_quote_credit_for_sats(
     fiat_target_minor INTEGER,
@@ -156,7 +256,6 @@ SELECT
     COALESCE(SUM(e.amount_sat) FILTER (
         WHERE e.accounting_state = 'active'
           AND e.fiat_credited_minor IS NOT NULL
-          AND e.quote_first_observed_at < q.expires_at
     ), 0)::BIGINT AS active_eligible_sat,
     invoice_quote_credit_for_sats(
         q.fiat_target_amount_minor,
@@ -165,13 +264,11 @@ SELECT
         COALESCE(SUM(e.amount_sat) FILTER (
             WHERE e.accounting_state = 'active'
               AND e.fiat_credited_minor IS NOT NULL
-              AND e.quote_first_observed_at < q.expires_at
         ), 0)::BIGINT
     ) AS active_fiat_credited_minor,
     COALESCE(SUM(e.fiat_credited_minor) FILTER (
         WHERE e.accounting_state = 'active'
           AND e.fiat_credited_minor IS NOT NULL
-          AND e.quote_first_observed_at < q.expires_at
     ), 0)::BIGINT AS committed_active_event_credit_minor,
     invoice_quote_credit_for_sats(
         q.fiat_target_amount_minor,
@@ -180,16 +277,14 @@ SELECT
         COALESCE(SUM(e.amount_sat) FILTER (
             WHERE e.accounting_state = 'active'
               AND e.fiat_credited_minor IS NOT NULL
-              AND e.quote_first_observed_at < q.expires_at
         ), 0)::BIGINT
     ) - COALESCE(SUM(e.fiat_credited_minor) FILTER (
         WHERE e.accounting_state = 'active'
           AND e.fiat_credited_minor IS NOT NULL
-          AND e.quote_first_observed_at < q.expires_at
     ), 0)::BIGINT AS accounting_adjustment_minor
 FROM invoice_quote_versions q
 LEFT JOIN invoice_payment_events e
-  ON e.invoice_quote_version_id = q.id
+  ON e.fiat_valuation_quote_version_id = q.id
  AND e.invoice_id = q.invoice_id
 GROUP BY q.id;
 
@@ -231,30 +326,93 @@ BEGIN
             USING ERRCODE = '23514',
                   CONSTRAINT = 'invoice_quote_versions_fiat_source_check';
     END IF;
-    IF invoice_row.status NOT IN ('unpaid', 'partially_paid', 'in_progress')
+    IF NEW.quote_purpose = 'payer_instruction' AND (
+       invoice_row.status NOT IN ('unpaid', 'partially_paid', 'in_progress')
        OR invoice_row.presentation_status NOT IN ('unpaid', 'partial')
-       OR invoice_row.expires_at <= write_now THEN
+       OR invoice_row.expires_at < write_now + INTERVAL '5 minutes') THEN
         RAISE EXCEPTION 'invoice is not eligible for a new fiat quote version'
             USING ERRCODE = '55000';
     END IF;
-    IF EXISTS (
+    IF NEW.quote_purpose = 'late_valuation' THEN
+        IF NEW.rate_observed_at > NEW.late_observation_at
+           OR NEW.rate_fetched_at > NEW.late_observation_at
+           OR NEW.late_observation_at >= NEW.rate_fresh_until
+           OR (
+               NEW.late_instruction_quote_version_id IS NOT NULL
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM invoice_quote_versions instruction
+                        WHERE instruction.id = NEW.late_instruction_quote_version_id
+                          AND instruction.invoice_id = NEW.invoice_id
+                          AND instruction.quote_purpose = 'payer_instruction'
+                          AND NEW.late_observation_at >= instruction.expires_at
+                   )
+                   OR NOT (
+                       EXISTS (
+                           SELECT 1 FROM swap_records provider_observation
+                            WHERE provider_observation.invoice_id = NEW.invoice_id
+                              AND provider_observation.invoice_quote_version_id =
+                                  NEW.late_instruction_quote_version_id
+                              AND provider_observation.quote_payment_first_observed_at =
+                                  NEW.late_observation_at
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM chain_swap_records provider_observation
+                            WHERE provider_observation.invoice_id = NEW.invoice_id
+                              AND provider_observation.invoice_quote_version_id =
+                                  NEW.late_instruction_quote_version_id
+                              AND provider_observation.quote_payment_first_observed_at =
+                                  NEW.late_observation_at
+                       )
+                   )
+               )
+           )
+           OR (
+               NEW.late_instruction_quote_version_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM invoice_payment_observations direct_observation
+                     JOIN invoices direct_invoice
+                       ON direct_invoice.id = direct_observation.invoice_id
+                    WHERE direct_observation.invoice_id = NEW.invoice_id
+                      AND direct_observation.first_seen_at = NEW.late_observation_at
+                      AND (
+                          (direct_observation.rail = 'liquid'
+                           AND direct_observation.address = direct_invoice.liquid_address)
+                          OR (direct_observation.rail = 'bitcoin'
+                              AND direct_observation.address = direct_invoice.bitcoin_address)
+                      )
+               )
+           ) THEN
+            RAISE EXCEPTION 'valuation-only quote lacks exact late-observation authority'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'invoice_quote_versions_late_observation_check';
+        END IF;
+    END IF;
+    IF NEW.quote_purpose = 'payer_instruction' AND EXISTS (
         SELECT 1 FROM invoice_payment_events e
          WHERE e.invoice_id = NEW.invoice_id
            AND (
-               e.invoice_quote_version_id IS NULL
-               OR e.invoice_quote_offer_id IS NULL
-               OR e.quote_first_observed_at IS NULL
+               e.quote_first_observed_at IS NULL
                OR e.fiat_credited_minor IS NULL
                OR e.fiat_credit_policy IS NULL
                OR e.fiat_valued_at IS NULL
+               OR (
+                   e.source NOT IN ('bitcoin_direct', 'liquid_direct')
+                   AND (
+                       e.invoice_quote_version_id IS NULL
+                       OR e.invoice_quote_offer_id IS NULL
+                   )
+               )
            )
     ) THEN
         RAISE EXCEPTION 'invoice has payment evidence awaiting fiat valuation policy'
             USING ERRCODE = '55000';
     END IF;
-    IF EXISTS (
+    IF NEW.quote_purpose = 'payer_instruction' AND EXISTS (
         SELECT 1 FROM invoice_quote_versions q
          WHERE q.invoice_id = NEW.invoice_id
+           AND q.quote_purpose = 'payer_instruction'
            AND q.expires_at > write_now
     ) THEN
         RAISE EXCEPTION 'an unexpired quote version already exists for this invoice'
@@ -267,6 +425,13 @@ BEGIN
       FROM invoice_quote_active_fiat_projection p
      WHERE p.invoice_id = NEW.invoice_id;
     remaining_fiat := invoice_row.fiat_amount_minor::BIGINT - active_fiat_credit;
+    IF remaining_fiat <= 0 AND NEW.quote_purpose = 'late_valuation' THEN
+        -- A late output can arrive after earlier evidence already satisfied
+        -- the face. Give its valuation bucket one full-face saturation range:
+        -- the copied rate remains exact and the aggregate projection becomes
+        -- visibly overpaid without rewriting any prior credit.
+        remaining_fiat := invoice_row.fiat_amount_minor::BIGINT;
+    END IF;
     IF remaining_fiat <= 0 OR remaining_fiat > invoice_row.fiat_amount_minor THEN
         RAISE EXCEPTION 'invoice has no valid remaining fiat target'
             USING ERRCODE = '55000';
@@ -310,7 +475,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(
         hashtext('invoice-lightning:' || NEW.invoice_id::TEXT)
     );
-    SELECT merchant_amount_sat, expires_at
+    SELECT merchant_amount_sat, expires_at, quote_purpose
       INTO quote_row
       FROM invoice_quote_versions
      WHERE id = NEW.quote_version_id AND invoice_id = NEW.invoice_id
@@ -320,6 +485,11 @@ BEGIN
             USING ERRCODE = '23503',
                   CONSTRAINT = 'invoice_quote_offers_quote_invoice_fkey';
     END IF;
+    IF quote_row.quote_purpose <> 'payer_instruction' THEN
+        RAISE EXCEPTION 'valuation-only quote versions cannot create payer offers'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'invoice_quote_offers_payer_quote_only_check';
+    END IF;
     SELECT status, presentation_status, expires_at
       INTO invoice_row
       FROM invoices
@@ -328,6 +498,7 @@ BEGIN
     IF invoice_row.status NOT IN ('unpaid', 'partially_paid', 'in_progress')
        OR invoice_row.presentation_status NOT IN ('unpaid', 'partial')
        OR invoice_row.expires_at <= write_now
+       OR NEW.expires_at > invoice_row.expires_at
        OR quote_row.expires_at <= write_now THEN
         RAISE EXCEPTION 'invoice quote is not eligible for a new payer offer'
             USING ERRCODE = '55000';
@@ -349,23 +520,7 @@ BEGIN
             USING ERRCODE = '23514',
                   CONSTRAINT = 'invoice_quote_offers_quote_window_check';
     END IF;
-    IF NEW.offer_kind = 'direct'
-       AND NEW.payer_amount_sat <> quote_row.merchant_amount_sat THEN
-        RAISE EXCEPTION 'direct payer amount must equal the merchant sat target'
-            USING ERRCODE = '23514',
-                  CONSTRAINT = 'invoice_quote_offers_direct_amount_check';
-    END IF;
-    IF NEW.offer_kind = 'direct'
-       AND EXISTS (
-           SELECT 1 FROM invoice_payment_addresses a
-            WHERE a.rail = NEW.rail AND a.address = NEW.direct_address
-       ) THEN
-        RAISE EXCEPTION 'direct quote destination is already bound to an invoice address'
-            USING ERRCODE = '23505',
-                  CONSTRAINT = 'invoice_quote_offers_direct_destination_key';
-    END IF;
-    IF NEW.offer_kind IN ('boltz_reverse', 'boltz_chain')
-       AND NEW.payer_amount_sat <= quote_row.merchant_amount_sat THEN
+    IF NEW.payer_amount_sat <= quote_row.merchant_amount_sat THEN
         RAISE EXCEPTION 'provider payer amount must gross up the merchant sat target'
             USING ERRCODE = '23514',
                   CONSTRAINT = 'invoice_quote_offers_provider_amount_check';
@@ -429,74 +584,211 @@ ALTER TABLE invoice_payment_events
     DROP CONSTRAINT invoice_payment_events_fiat_valuation_deferred_check,
     ADD CONSTRAINT invoice_payment_events_fiat_valuation_policy_check CHECK (
         fiat_credit_policy IS NULL
-        OR fiat_credit_policy = 'quote_cumulative_saturation_v1'
+        OR fiat_credit_policy IN (
+            'quote_cumulative_saturation_v1',
+            'late_observation_rate_v1'
+        )
     );
 
 CREATE OR REPLACE FUNCTION guard_invoice_payment_quote_attribution() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     quote_row RECORD;
+    valuation_quote_row RECORD;
+    valuation_policy TEXT;
     prior_eligible_sat BIGINT;
     prior_credit BIGINT;
     next_credit BIGINT;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.invoice_quote_version_id IS NULL THEN
-            IF num_nonnulls(
-                NEW.invoice_quote_offer_id,
-                NEW.quote_first_observed_at,
-                NEW.fiat_credited_minor,
-                NEW.fiat_credit_policy,
-                NEW.fiat_valued_at
-            ) <> 0 THEN
-                RAISE EXCEPTION 'unattributed payment cannot carry fiat valuation'
+            IF NEW.invoice_quote_offer_id IS NOT NULL THEN
+                RAISE EXCEPTION 'payment quote and offer lineage must be complete'
                     USING ERRCODE = '23514';
             END IF;
-            RETURN NEW;
+            IF NEW.source NOT IN ('bitcoin_direct', 'liquid_direct')
+               OR NEW.quote_first_observed_at IS NULL THEN
+                IF num_nonnulls(
+                    NEW.quote_first_observed_at,
+                    NEW.fiat_credited_minor,
+                    NEW.fiat_credit_policy,
+                    NEW.fiat_valued_at,
+                    NEW.fiat_valuation_quote_version_id,
+                    NEW.fiat_rate_minor_per_btc,
+                    NEW.fiat_rate_source,
+                    NEW.fiat_rate_observed_at,
+                    NEW.fiat_rate_fetched_at,
+                    NEW.fiat_rate_fresh_until
+                ) <> 0 THEN
+                    RAISE EXCEPTION 'unattributed payment cannot carry fiat valuation'
+                        USING ERRCODE = '23514';
+                END IF;
+                RETURN NEW;
+            END IF;
+
+            PERFORM pg_advisory_xact_lock(
+                hashtext('invoice-lightning:' || NEW.invoice_id::TEXT)
+            );
+            IF NEW.quote_first_observed_at > clock_timestamp() + INTERVAL '30 seconds'
+               OR NOT EXISTS (
+                   SELECT 1
+                     FROM invoice_payment_observations direct_observation
+                     JOIN invoices direct_invoice
+                       ON direct_invoice.id = direct_observation.invoice_id
+                    WHERE direct_observation.id = NEW.observation_id
+                      AND direct_observation.invoice_id = NEW.invoice_id
+                      AND direct_observation.source = NEW.source
+                      AND direct_observation.first_seen_at = NEW.quote_first_observed_at
+                      AND direct_invoice.pricing_mode = 'fiat_fixed'
+                      AND (
+                          (direct_observation.rail = 'liquid'
+                           AND direct_observation.address = direct_invoice.liquid_address)
+                          OR (direct_observation.rail = 'bitcoin'
+                              AND direct_observation.address = direct_invoice.bitcoin_address)
+                      )
+               ) THEN
+                RAISE EXCEPTION 'direct fiat valuation lacks its exact durable observation'
+                    USING ERRCODE = '23514',
+                          CONSTRAINT = 'invoice_payment_events_quote_observation_check';
+            END IF;
+
+            NEW.fiat_credited_minor := NULL;
+            NEW.fiat_credit_policy := NULL;
+            NEW.fiat_valued_at := NULL;
+            NEW.fiat_valuation_quote_version_id := NULL;
+            NEW.fiat_rate_minor_per_btc := NULL;
+            NEW.fiat_rate_source := NULL;
+            NEW.fiat_rate_observed_at := NULL;
+            NEW.fiat_rate_fetched_at := NULL;
+            NEW.fiat_rate_fresh_until := NULL;
+
+            -- A direct output proves only its destination and observation
+            -- time. It never proves which refreshed QR was scanned. Select a
+            -- rate window without fabricating instruction/offer lineage.
+            SELECT id, quote_purpose, created_at, expires_at,
+                   fiat_target_amount_minor, merchant_amount_sat,
+                   rate_minor_per_btc, rate_source, rate_observed_at,
+                   rate_fetched_at, rate_fresh_until
+              INTO valuation_quote_row
+              FROM invoice_quote_versions
+             WHERE invoice_id = NEW.invoice_id
+               AND quote_purpose = 'payer_instruction'
+               AND created_at <= NEW.quote_first_observed_at
+               AND NEW.quote_first_observed_at < expires_at
+             ORDER BY created_at DESC, version_number DESC
+             LIMIT 1;
+            IF NOT FOUND THEN
+                SELECT id, quote_purpose, created_at, expires_at,
+                       fiat_target_amount_minor, merchant_amount_sat,
+                       rate_minor_per_btc, rate_source, rate_observed_at,
+                       rate_fetched_at, rate_fresh_until
+                  INTO valuation_quote_row
+                  FROM invoice_quote_versions
+                 WHERE invoice_id = NEW.invoice_id
+                   AND quote_purpose = 'late_valuation'
+                   AND rate_observed_at <= NEW.quote_first_observed_at
+                   AND rate_fetched_at <= NEW.quote_first_observed_at
+                   AND NEW.quote_first_observed_at < rate_fresh_until
+                 ORDER BY created_at DESC, version_number DESC
+                 LIMIT 1;
+                IF NOT FOUND THEN
+                    RETURN NEW;
+                END IF;
+            END IF;
+            valuation_policy := CASE valuation_quote_row.quote_purpose
+                WHEN 'payer_instruction' THEN 'quote_cumulative_saturation_v1'
+                ELSE 'late_observation_rate_v1'
+            END;
+        ELSE
+            PERFORM pg_advisory_xact_lock(
+                hashtext('invoice-lightning:' || NEW.invoice_id::TEXT)
+            );
+            SELECT id, quote_purpose, created_at, expires_at,
+                   fiat_target_amount_minor, merchant_amount_sat,
+                   rate_minor_per_btc, rate_source, rate_observed_at,
+                   rate_fetched_at, rate_fresh_until
+              INTO quote_row
+              FROM invoice_quote_versions
+             WHERE id = NEW.invoice_quote_version_id
+               AND invoice_id = NEW.invoice_id;
+            IF NOT FOUND
+               OR NEW.quote_first_observed_at < quote_row.created_at
+               OR NEW.quote_first_observed_at > clock_timestamp() + INTERVAL '30 seconds' THEN
+                RAISE EXCEPTION 'payment quote observation predates, postdates, or mismatches its quote'
+                    USING ERRCODE = '23514',
+                          CONSTRAINT = 'invoice_payment_events_quote_observation_check';
+            END IF;
+            NEW.fiat_credited_minor := NULL;
+            NEW.fiat_credit_policy := NULL;
+            NEW.fiat_valued_at := NULL;
+            NEW.fiat_valuation_quote_version_id := NULL;
+            NEW.fiat_rate_minor_per_btc := NULL;
+            NEW.fiat_rate_source := NULL;
+            NEW.fiat_rate_observed_at := NULL;
+            NEW.fiat_rate_fetched_at := NULL;
+            NEW.fiat_rate_fresh_until := NULL;
+            IF NEW.quote_first_observed_at < quote_row.expires_at THEN
+                valuation_quote_row := quote_row;
+                valuation_policy := 'quote_cumulative_saturation_v1';
+            ELSE
+                -- Equality belongs to the late side of the boundary. Never
+                -- reuse the expired instruction's rate.
+                SELECT id, quote_purpose, created_at, expires_at,
+                       fiat_target_amount_minor, merchant_amount_sat,
+                       rate_minor_per_btc, rate_source, rate_observed_at,
+                       rate_fetched_at, rate_fresh_until
+                  INTO valuation_quote_row
+                  FROM invoice_quote_versions
+                 WHERE invoice_id = NEW.invoice_id
+                   AND id <> NEW.invoice_quote_version_id
+                   AND rate_observed_at <= NEW.quote_first_observed_at
+                   AND rate_fetched_at <= NEW.quote_first_observed_at
+                   AND NEW.quote_first_observed_at < rate_fresh_until
+                   AND (
+                       (
+                           quote_purpose = 'payer_instruction'
+                           AND created_at <= NEW.quote_first_observed_at
+                           AND NEW.quote_first_observed_at < expires_at
+                       )
+                       OR quote_purpose = 'late_valuation'
+                   )
+                 ORDER BY (quote_purpose = 'payer_instruction') DESC,
+                          created_at DESC, version_number DESC
+                 LIMIT 1;
+                IF NOT FOUND THEN
+                    RETURN NEW;
+                END IF;
+                valuation_policy := 'late_observation_rate_v1';
+            END IF;
         END IF;
-        PERFORM pg_advisory_xact_lock(
-            hashtext('invoice-lightning:' || NEW.invoice_id::TEXT)
+
+        SELECT COALESCE(SUM(e.amount_sat), 0)::BIGINT
+          INTO prior_eligible_sat
+          FROM invoice_payment_events e
+         WHERE e.fiat_valuation_quote_version_id = valuation_quote_row.id
+           AND e.invoice_id = NEW.invoice_id
+           AND e.accounting_sequence < NEW.accounting_sequence;
+        prior_credit := invoice_quote_credit_for_sats(
+            valuation_quote_row.fiat_target_amount_minor,
+            valuation_quote_row.merchant_amount_sat,
+            valuation_quote_row.rate_minor_per_btc,
+            prior_eligible_sat
         );
-        SELECT created_at, expires_at, fiat_target_amount_minor,
-               merchant_amount_sat, rate_minor_per_btc
-          INTO quote_row
-          FROM invoice_quote_versions
-         WHERE id = NEW.invoice_quote_version_id
-           AND invoice_id = NEW.invoice_id;
-        IF NOT FOUND
-           OR NEW.quote_first_observed_at < quote_row.created_at
-           OR NEW.quote_first_observed_at > clock_timestamp() + INTERVAL '30 seconds' THEN
-            RAISE EXCEPTION 'payment quote observation predates, postdates, or mismatches its quote'
-                USING ERRCODE = '23514',
-                      CONSTRAINT = 'invoice_payment_events_quote_observation_check';
-        END IF;
-        NEW.fiat_credited_minor := NULL;
-        NEW.fiat_credit_policy := NULL;
-        NEW.fiat_valued_at := NULL;
-        IF NEW.quote_first_observed_at < quote_row.expires_at THEN
-            SELECT COALESCE(SUM(e.amount_sat), 0)::BIGINT
-              INTO prior_eligible_sat
-              FROM invoice_payment_events e
-             WHERE e.invoice_quote_version_id = NEW.invoice_quote_version_id
-               AND e.invoice_id = NEW.invoice_id
-               AND e.quote_first_observed_at < quote_row.expires_at
-               AND e.accounting_sequence < NEW.accounting_sequence;
-            prior_credit := invoice_quote_credit_for_sats(
-                quote_row.fiat_target_amount_minor,
-                quote_row.merchant_amount_sat,
-                quote_row.rate_minor_per_btc,
-                prior_eligible_sat
-            );
-            next_credit := invoice_quote_credit_for_sats(
-                quote_row.fiat_target_amount_minor,
-                quote_row.merchant_amount_sat,
-                quote_row.rate_minor_per_btc,
-                prior_eligible_sat + NEW.amount_sat
-            );
-            NEW.fiat_credited_minor := next_credit - prior_credit;
-            NEW.fiat_credit_policy := 'quote_cumulative_saturation_v1';
-            NEW.fiat_valued_at := clock_timestamp();
-        END IF;
+        next_credit := invoice_quote_credit_for_sats(
+            valuation_quote_row.fiat_target_amount_minor,
+            valuation_quote_row.merchant_amount_sat,
+            valuation_quote_row.rate_minor_per_btc,
+            prior_eligible_sat + NEW.amount_sat
+        );
+        NEW.fiat_credited_minor := next_credit - prior_credit;
+        NEW.fiat_credit_policy := valuation_policy;
+        NEW.fiat_valued_at := clock_timestamp();
+        NEW.fiat_valuation_quote_version_id := valuation_quote_row.id;
+        NEW.fiat_rate_minor_per_btc := valuation_quote_row.rate_minor_per_btc;
+        NEW.fiat_rate_source := valuation_quote_row.rate_source;
+        NEW.fiat_rate_observed_at := valuation_quote_row.rate_observed_at;
+        NEW.fiat_rate_fetched_at := valuation_quote_row.rate_fetched_at;
+        NEW.fiat_rate_fresh_until := valuation_quote_row.rate_fresh_until;
         RETURN NEW;
     END IF;
 
@@ -515,11 +807,23 @@ BEGIN
     IF ROW(
         OLD.fiat_credited_minor,
         OLD.fiat_credit_policy,
-        OLD.fiat_valued_at
+        OLD.fiat_valued_at,
+        OLD.fiat_valuation_quote_version_id,
+        OLD.fiat_rate_minor_per_btc,
+        OLD.fiat_rate_source,
+        OLD.fiat_rate_observed_at,
+        OLD.fiat_rate_fetched_at,
+        OLD.fiat_rate_fresh_until
     ) IS DISTINCT FROM ROW(
         NEW.fiat_credited_minor,
         NEW.fiat_credit_policy,
-        NEW.fiat_valued_at
+        NEW.fiat_valued_at,
+        NEW.fiat_valuation_quote_version_id,
+        NEW.fiat_rate_minor_per_btc,
+        NEW.fiat_rate_source,
+        NEW.fiat_rate_observed_at,
+        NEW.fiat_rate_fetched_at,
+        NEW.fiat_rate_fresh_until
     ) THEN
         RAISE EXCEPTION 'committed fiat valuation is immutable'
             USING ERRCODE = '55000';
@@ -569,9 +873,8 @@ CREATE TABLE invoice_quote_provider_attempts (
 ALTER TABLE invoice_quote_offers
     ADD COLUMN provider_attempt_id UUID,
     ADD CONSTRAINT invoice_quote_offers_provider_attempt_shape_check CHECK (
-        (offer_kind = 'direct' AND provider_attempt_id IS NULL)
-        OR
-        (offer_kind IN ('boltz_reverse', 'boltz_chain') AND provider_attempt_id IS NOT NULL)
+        offer_kind IN ('boltz_reverse', 'boltz_chain')
+        AND provider_attempt_id IS NOT NULL
     ),
     ADD CONSTRAINT invoice_quote_offers_provider_attempt_fkey FOREIGN KEY (
         provider_attempt_id, quote_version_id, invoice_id, rail, request_key
@@ -582,12 +885,7 @@ ALTER TABLE invoice_quote_offers
 CREATE FUNCTION enforce_invoice_quote_offer_attempt_binding() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF NEW.offer_kind = 'direct' AND NEW.provider_attempt_id IS NOT NULL THEN
-        RAISE EXCEPTION 'direct quote offer cannot reference a provider attempt'
-            USING ERRCODE = '23514';
-    END IF;
-    IF NEW.offer_kind IN ('boltz_reverse', 'boltz_chain')
-       AND NEW.provider_attempt_id IS NULL THEN
+    IF NEW.provider_attempt_id IS NULL THEN
         RAISE EXCEPTION 'provider quote offer requires its durable pre-network attempt'
             USING ERRCODE = '23514';
     END IF;
@@ -666,11 +964,7 @@ BEGIN
         runtime_role_name
     );
     EXECUTE format(
-        'GRANT INSERT (fiat_target_amount_minor) ON TABLE invoice_quote_versions TO %I',
-        runtime_role_name
-    );
-    EXECUTE format(
-        'GRANT INSERT (direct_address, direct_liquid_blinding_key_hex, direct_address_index) ON TABLE invoice_quote_offers TO %I',
+        'GRANT INSERT (quote_purpose, late_instruction_quote_version_id, late_observation_at, fiat_target_amount_minor) ON TABLE invoice_quote_versions TO %I',
         runtime_role_name
     );
     REVOKE ALL ON TABLE invoice_quote_provider_attempts FROM PUBLIC;

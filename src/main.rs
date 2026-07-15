@@ -708,6 +708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _reverse_reconciler_task = reconciler::spawn(
             pool.clone(),
             state.boltz.clone(),
+            state.pricer.clone(),
             Arc::new(config.reconciler.clone()),
             cancel.clone(),
             state
@@ -793,6 +794,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(backend) = state.utxo_backend.clone() {
             let pool = state.db.clone();
             let rl = rate_limiter.clone();
+            let pricer = state.pricer.clone();
             let cancel_watcher = cancel.clone();
             let watcher_cfg = chain_watcher::ChainWatcherConfig::from_rate_limit_config(
                 &config.rate_limit,
@@ -808,6 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pool,
                     backend,
                     rl,
+                    pricer,
                     cancel_watcher,
                     watcher_cfg,
                     accounting_tolerances,

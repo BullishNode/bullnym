@@ -236,6 +236,7 @@ fn report_epoch_outcome<const N: usize>(
 pub fn spawn(
     pool: PgPool,
     boltz: Arc<crate::boltz::BoltzService>,
+    pricer: Arc<crate::pricer::PricerClient>,
     config: Arc<ReconcilerConfig>,
     cancel: CancellationToken,
     mut reporter: WorkerReporter,
@@ -263,6 +264,7 @@ pub fn spawn(
                     match run_one_tick(
                         &pool,
                         boltz.as_ref(),
+                        pricer.as_ref(),
                         &config,
                         &cancel,
                         &reporter,
@@ -1817,6 +1819,7 @@ async fn run_one_chain_tick(
 async fn run_one_tick(
     pool: &PgPool,
     boltz: &crate::boltz::BoltzService,
+    pricer: &crate::pricer::PricerClient,
     config: &ReconcilerConfig,
     cancel: &CancellationToken,
     reporter: &WorkerReporter,
@@ -1883,7 +1886,7 @@ async fn run_one_tick(
         };
 
         let action = decide_action(swap, &remote.status);
-        if let Err(e) = apply_action(pool, swap, action).await {
+        if let Err(e) = apply_action(pool, pricer, swap, action).await {
             health.systemic_failure = true;
             tracing::error!(
                 "reconciler: apply failed for swap {}: {e}",
@@ -1990,11 +1993,34 @@ pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> Reconc
 
 async fn apply_action(
     pool: &PgPool,
+    pricer: &crate::pricer::PricerClient,
     swap: &ReconcilerSwap,
     action: ReconcilerAction,
 ) -> Result<(), sqlx::Error> {
     use ReconcilerAction::*;
-    match action {
+    let rate = match (swap.invoice_id, swap.invoice_quote_version_id) {
+        (Some(invoice_id), Some(quote_version_id)) => {
+            match db::invoice_quote_currency(pool, invoice_id, quote_version_id).await? {
+                Some(currency) => match pricer.get_rate(&currency).await {
+                    Ok(rate) => Some(rate),
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "invoice_reconciler_observation_rate_unavailable",
+                            swap_id = %swap.boltz_swap_id,
+                            currency,
+                            error = %error,
+                            "reverse provider evidence will persist without an invented fiat valuation"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let candidate = rate.as_ref().and_then(invoice::quote_candidate_from_rate);
+    let action_result: Result<(), sqlx::Error> = match action {
         Noop => Ok(()),
         AdvanceToLockupMempool => {
             tracing::info!(
@@ -2004,7 +2030,14 @@ async fn apply_action(
                 to = "lockup_mempool",
                 "reconciler advancing status (webhook missed)"
             );
-            db::update_swap_status(pool, swap.id, SwapStatus::LockupMempool, None).await?;
+            db::update_swap_status_with_late_valuation_candidate(
+                pool,
+                swap.id,
+                SwapStatus::LockupMempool,
+                None,
+                candidate.as_ref(),
+            )
+            .await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
             // Mempool sighting advances the checkout invoice to
             // `in_progress`. The matching webhook arm uses the same helper.
@@ -2024,7 +2057,14 @@ async fn apply_action(
                 to = "lockup_confirmed",
                 "reconciler advancing status (webhook missed)"
             );
-            db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+            db::update_swap_status_with_late_valuation_candidate(
+                pool,
+                swap.id,
+                SwapStatus::LockupConfirmed,
+                None,
+                candidate.as_ref(),
+            )
+            .await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
             // Confirmed lockup is still settlement-pending. The claimer
             // records accounting only after our claim succeeds.
@@ -2045,7 +2085,14 @@ async fn apply_action(
             // `lockup_confirmed` first so the sweep actually picks it up, the
             // same way the mempool/confirmed arms do.
             if swap.status == "pending" {
-                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+                db::update_swap_status_with_late_valuation_candidate(
+                    pool,
+                    swap.id,
+                    SwapStatus::LockupConfirmed,
+                    None,
+                    candidate.as_ref(),
+                )
+                .await?;
             }
             tracing::debug!(
                 event = "reconciler_schedule_claim",
@@ -2060,7 +2107,14 @@ async fn apply_action(
             // reached `swap.expired` while still locally `pending` is excluded
             // by the sweep, so the script-path retry would never run.
             if swap.status == "pending" {
-                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+                db::update_swap_status_with_late_valuation_candidate(
+                    pool,
+                    swap.id,
+                    SwapStatus::LockupConfirmed,
+                    None,
+                    candidate.as_ref(),
+                )
+                .await?;
             }
             tracing::warn!(
                 event = "reconciler_swap_expired",
@@ -2099,7 +2153,14 @@ async fn apply_action(
             // every other live status is already claimable and terminal rows
             // were rejected by `decide_action` above.
             if swap.status == "pending" {
-                db::update_swap_status(pool, swap.id, SwapStatus::LockupConfirmed, None).await?;
+                db::update_swap_status_with_late_valuation_candidate(
+                    pool,
+                    swap.id,
+                    SwapStatus::LockupConfirmed,
+                    None,
+                    candidate.as_ref(),
+                )
+                .await?;
             }
             let scheduled = db::schedule_immediate_claim(pool, swap.id).await?;
             if scheduled == 1 {
@@ -2121,7 +2182,11 @@ async fn apply_action(
             }
             Ok(())
         }
-    }
+    };
+    action_result?;
+    let observation = db::reverse_swap_quote_observation(pool, swap.id).await?;
+    invoice::capture_late_quote_valuation_snapshot(pool, pricer, observation).await;
+    Ok(())
 }
 
 #[cfg(test)]

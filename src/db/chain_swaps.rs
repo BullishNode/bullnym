@@ -7,8 +7,10 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
-    record_or_reuse_invoice_quote_offer_in_tx, ClaimFailureOutcome, InvoiceQuoteAttribution,
-    InvoiceQuoteOffer, LiquidClaimFeeAuthority, LiquidClaimFeeAuthorityRow, NewInvoiceQuoteOffer,
+    capture_late_observation_candidate_locked, record_or_reuse_invoice_quote_offer_in_tx,
+    ClaimFailureOutcome, InvoiceQuoteAttribution, InvoiceQuoteOffer, LiquidClaimFeeAuthority,
+    LiquidClaimFeeAuthorityRow, NewInvoiceQuoteOffer, NewInvoiceQuoteVersion,
+    PersistedInvoiceQuoteObservation,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,6 +1140,17 @@ pub async fn apply_chain_swap_provider_status(
     id: Uuid,
     input: ChainSwapProviderStatusInput,
 ) -> Result<Option<ChainSwapProviderTransition>, sqlx::Error> {
+    apply_chain_swap_provider_status_with_late_valuation_candidate(pool, id, input, None).await
+}
+
+/// Provider reducer variant which atomically binds a pre-fetched covering rate
+/// to the exact first-observation timestamp stamped by the status transition.
+pub async fn apply_chain_swap_provider_status_with_late_valuation_candidate(
+    pool: &PgPool,
+    id: Uuid,
+    input: ChainSwapProviderStatusInput,
+    candidate: Option<&NewInvoiceQuoteVersion<'_>>,
+) -> Result<Option<ChainSwapProviderTransition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let Some(current) = get_chain_swap_by_id_for_update(&mut *tx, id).await? else {
         tx.commit().await?;
@@ -1169,6 +1182,33 @@ pub async fn apply_chain_swap_provider_status(
             return Err(sqlx::Error::Protocol(format!(
                 "locked chain swap disappeared during provider transition: {id}"
             )));
+        }
+    }
+
+    if let Some(candidate) = candidate {
+        let observation: Option<PersistedInvoiceQuoteObservation> = sqlx::query_as(
+            "SELECT invoice_id, \
+                    invoice_quote_version_id AS instruction_quote_version_id, \
+                    (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT \
+                        AS first_observed_at_unix_micros \
+               FROM chain_swap_records \
+              WHERE id = $1 AND invoice_quote_version_id IS NOT NULL \
+                AND quote_payment_first_observed_at IS NOT NULL \
+              FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(observation) = observation {
+            let captured =
+                capture_late_observation_candidate_locked(&mut tx, observation, candidate).await?;
+            if !captured {
+                tracing::warn!(
+                    event = "invoice_chain_observation_rate_not_covering",
+                    chain_swap_id = %id,
+                    "provider status committed without fiat valuation because the pre-fetched rate did not cover exact first observation"
+                );
+            }
         }
     }
 

@@ -750,6 +750,41 @@ fn fiat_display_uses_zero_decimal_crc() {
     assert_eq!(format_fiat_major(12_345, "USD"), "123.45 USD");
 }
 
+#[test]
+fn signed_invoice_create_accepts_only_the_canonical_recipient_name_wire_key() {
+    let canonical = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_name": "Alice",
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    let parsed: CreateSignedRequest = serde_json::from_value(canonical).unwrap();
+    assert_eq!(parsed.recipient_label.as_deref(), Some("Alice"));
+
+    let legacy = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_label": "Alice",
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    let error = serde_json::from_value::<CreateSignedRequest>(legacy).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unknown field `recipient_label`"));
+
+    let extra = serde_json::json!({
+        "npub": "11".repeat(32),
+        "amount_sat": 1_000,
+        "recipient_name": "Alice",
+        "unexpected": true,
+        "timestamp": 1,
+        "signature": "22".repeat(64)
+    });
+    assert!(serde_json::from_value::<CreateSignedRequest>(extra).is_err());
+}
+
 fn invoice_fixture() -> db::Invoice {
     db::Invoice {
         id: Uuid::nil(),

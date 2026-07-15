@@ -561,9 +561,27 @@ async fn dispatch_webhook(
             } else {
                 SwapStatus::LockupConfirmed
             };
-            db::update_swap_status(&state.db, swap.id, new_status, None)
-                .await
-                .map_err(|e| AppError::DbError(e.to_string()))?;
+            let rate = match swap.invoice_id {
+                Some(invoice_id) => {
+                    invoice::prefetch_provider_observation_rate(
+                        &state,
+                        invoice_id,
+                        swap.invoice_quote_version_id,
+                    )
+                    .await
+                }
+                None => None,
+            };
+            let candidate = rate.as_ref().and_then(invoice::quote_candidate_from_rate);
+            db::update_swap_status_with_late_valuation_candidate(
+                &state.db,
+                swap.id,
+                new_status,
+                None,
+                candidate.as_ref(),
+            )
+            .await
+            .map_err(|e| AppError::DbError(e.to_string()))?;
 
             // Lockup sightings are only payment evidence. They may show
             // the public page as "payment detected", but accounting is
@@ -585,9 +603,27 @@ async fn dispatch_webhook(
             // immediately re-drive the claim/outspend recovery path instead
             // of waiting for the next provider reconciliation cycle.
             if swap.status == "pending" {
-                db::update_swap_status(&state.db, swap.id, SwapStatus::LockupConfirmed, None)
-                    .await
-                    .map_err(|e| AppError::DbError(e.to_string()))?;
+                let rate = match swap.invoice_id {
+                    Some(invoice_id) => {
+                        invoice::prefetch_provider_observation_rate(
+                            &state,
+                            invoice_id,
+                            swap.invoice_quote_version_id,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                let candidate = rate.as_ref().and_then(invoice::quote_candidate_from_rate);
+                db::update_swap_status_with_late_valuation_candidate(
+                    &state.db,
+                    swap.id,
+                    SwapStatus::LockupConfirmed,
+                    None,
+                    candidate.as_ref(),
+                )
+                .await
+                .map_err(|e| AppError::DbError(e.to_string()))?;
             }
             let scheduled = db::schedule_immediate_claim(&state.db, swap.id)
                 .await
@@ -2031,15 +2067,37 @@ pub async fn handle_chain_swap_webhook_with_provider_evidence(
         );
         return Ok(());
     };
-    let transition = db::apply_chain_swap_provider_status(&state.db, swap.id, input)
+    let rate = if matches!(
+        input,
+        db::ChainSwapProviderStatusInput::UserLockMempool
+            | db::ChainSwapProviderStatusInput::UserLockConfirmed
+            | db::ChainSwapProviderStatusInput::ServerLockMempool
+            | db::ChainSwapProviderStatusInput::ServerLockConfirmed
+    ) {
+        invoice::prefetch_provider_observation_rate(
+            state,
+            swap.invoice_id,
+            swap.invoice_quote_version_id,
+        )
         .await
-        .map_err(|e| AppError::DbError(e.to_string()))?
-        .ok_or_else(|| {
-            AppError::DbError(format!(
-                "chain swap disappeared while applying provider status: {}",
-                swap.id
-            ))
-        })?;
+    } else {
+        None
+    };
+    let candidate = rate.as_ref().and_then(invoice::quote_candidate_from_rate);
+    let transition = db::apply_chain_swap_provider_status_with_late_valuation_candidate(
+        &state.db,
+        swap.id,
+        input,
+        candidate.as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::DbError(e.to_string()))?
+    .ok_or_else(|| {
+        AppError::DbError(format!(
+            "chain swap disappeared while applying provider status: {}",
+            swap.id
+        ))
+    })?;
     let status = transition.current_status;
 
     if status.is_terminal() {

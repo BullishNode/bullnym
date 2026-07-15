@@ -153,6 +153,31 @@ pub fn project_fiat_quote_credit_minor(
     )
 }
 
+/// Derive the immutable merchant-side satoshi target for a fiat quote using
+/// the same checked floor conversion validated by Policy C.
+pub fn merchant_amount_sat_for_quote(
+    fiat_target_minor: i64,
+    rate_minor_per_btc: i64,
+) -> Result<i64, FiatQuoteCreditError> {
+    if fiat_target_minor <= 0 {
+        return Err(FiatQuoteCreditError::NonPositiveFiatTarget);
+    }
+    if rate_minor_per_btc <= 0 {
+        return Err(FiatQuoteCreditError::NonPositiveRate);
+    }
+    let fiat_scaled = i128::from(fiat_target_minor)
+        .checked_mul(SATOSHIS_PER_BTC)
+        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
+    let expected = fiat_scaled
+        .checked_div(i128::from(rate_minor_per_btc))
+        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
+    let expected = i64::try_from(expected).map_err(|_| FiatQuoteCreditError::ArithmeticOverflow)?;
+    if expected <= 0 {
+        return Err(FiatQuoteCreditError::NonPositiveMerchantAmount);
+    }
+    Ok(expected)
+}
+
 fn validate_quote_terms(
     fiat_target_minor: i64,
     rate_minor_per_btc: i64,
@@ -168,16 +193,7 @@ fn validate_quote_terms(
         return Err(FiatQuoteCreditError::NonPositiveMerchantAmount);
     }
 
-    let fiat_scaled = i128::from(fiat_target_minor)
-        .checked_mul(SATOSHIS_PER_BTC)
-        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
-    let expected = fiat_scaled
-        .checked_div(i128::from(rate_minor_per_btc))
-        .ok_or(FiatQuoteCreditError::ArithmeticOverflow)?;
-    let expected = i64::try_from(expected).map_err(|_| FiatQuoteCreditError::ArithmeticOverflow)?;
-    if expected <= 0 {
-        return Err(FiatQuoteCreditError::NonPositiveMerchantAmount);
-    }
+    let expected = merchant_amount_sat_for_quote(fiat_target_minor, rate_minor_per_btc)?;
     if merchant_amount_sat != expected {
         return Err(FiatQuoteCreditError::MerchantAmountMismatch {
             expected,
@@ -247,6 +263,15 @@ mod tests {
         assert_eq!(first, (MERCHANT_SAT, TARGET));
         assert_eq!(reordered, first);
         assert_eq!(unsplit, first);
+    }
+
+    #[test]
+    fn merchant_target_uses_the_policy_floor_conversion() {
+        assert_eq!(merchant_amount_sat_for_quote(1_000, 30_000_000), Ok(3_333));
+        assert_eq!(
+            merchant_amount_sat_for_quote(1, i64::MAX),
+            Err(FiatQuoteCreditError::NonPositiveMerchantAmount)
+        );
     }
 
     #[test]

@@ -1494,7 +1494,7 @@ async fn invoice_quote_foundation_invariants_present(
             AND to_regclass('public.invoice_quote_offers') IS NOT NULL \
             AND to_regclass('public.invoice_quote_provider_attempts') IS NOT NULL \
             AND to_regclass('public.invoice_quote_active_fiat_projection') IS NOT NULL \
-            AND to_regclass('public.invoice_quote_offers_direct_destination_key') IS NOT NULL \
+            AND to_regclass('public.invoice_quote_versions_late_valuation_snapshot_key') IS NOT NULL \
             AND to_regprocedure('public.invoice_quote_credit_for_sats(integer,bigint,bigint,bigint)') IS NOT NULL \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
@@ -1503,23 +1503,27 @@ async fn invoice_quote_foundation_invariants_present(
                     ('invoice_quote_versions', 'invoice_quote_versions_pkey', 'p'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_invoice_number_key', 'u'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_window_check', 'c'), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_purpose_check', 'c'), \
+                    ('invoice_quote_versions', 'invoice_quote_versions_late_instruction_fkey', 'f'), \
                     ('invoice_quote_versions', 'invoice_quote_versions_fiat_target_check', 'c'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_pkey', 'p'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_request_key', 'u'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_quote_invoice_fkey', 'f'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_rail_kind_check', 'c'), \
+                    ('invoice_quote_offers', 'invoice_quote_offers_provider_shape_check', 'c'), \
                     ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_pkey', 'p'), \
                     ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_identity_key', 'u'), \
                     ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_quote_invoice_fkey', 'f'), \
                     ('invoice_quote_provider_attempts', 'invoice_quote_provider_attempts_shape_check', 'c'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_provider_attempt_shape_check', 'c'), \
                     ('invoice_quote_offers', 'invoice_quote_offers_provider_attempt_fkey', 'f'), \
-                    ('invoice_quote_offers', 'invoice_quote_offers_direct_destination_shape_check', 'c'), \
                     ('swap_records', 'swap_records_invoice_quote_shape_check', 'c'), \
                     ('swap_records', 'swap_records_invoice_quote_offer_fkey', 'f'), \
                     ('chain_swap_records', 'chain_swap_records_invoice_quote_shape_check', 'c'), \
                     ('chain_swap_records', 'chain_swap_records_invoice_quote_offer_fkey', 'f'), \
                     ('invoice_payment_events', 'invoice_payment_events_quote_attribution_shape_check', 'c'), \
                     ('invoice_payment_events', 'invoice_payment_events_fiat_valuation_policy_check', 'c'), \
+                    ('invoice_payment_events', 'invoice_payment_events_fiat_valuation_quote_fkey', 'f'), \
                     ('invoice_payment_events', 'invoice_payment_events_quote_offer_fkey', 'f') \
                 ) required(table_name, constraint_name, constraint_type) \
                  WHERE NOT EXISTS ( \
@@ -1581,10 +1585,10 @@ async fn invoice_quote_foundation_invariants_present(
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
                     ('invoices', 'checkout_surface_kind'), \
+                    ('invoice_quote_versions', 'quote_purpose'), \
+                    ('invoice_quote_versions', 'late_instruction_quote_version_id'), \
+                    ('invoice_quote_versions', 'late_observation_at'), \
                     ('invoice_quote_versions', 'fiat_target_amount_minor'), \
-                    ('invoice_quote_offers', 'direct_address'), \
-                    ('invoice_quote_offers', 'direct_liquid_blinding_key_hex'), \
-                    ('invoice_quote_offers', 'direct_address_index'), \
                     ('invoice_quote_offers', 'provider_attempt_id'), \
                     ('swap_records', 'invoice_quote_version_id'), \
                     ('swap_records', 'invoice_quote_offer_id'), \
@@ -1597,7 +1601,13 @@ async fn invoice_quote_foundation_invariants_present(
                     ('invoice_payment_events', 'quote_first_observed_at'), \
                     ('invoice_payment_events', 'fiat_credited_minor'), \
                     ('invoice_payment_events', 'fiat_credit_policy'), \
-                    ('invoice_payment_events', 'fiat_valued_at') \
+                    ('invoice_payment_events', 'fiat_valued_at'), \
+                    ('invoice_payment_events', 'fiat_valuation_quote_version_id'), \
+                    ('invoice_payment_events', 'fiat_rate_minor_per_btc'), \
+                    ('invoice_payment_events', 'fiat_rate_source'), \
+                    ('invoice_payment_events', 'fiat_rate_observed_at'), \
+                    ('invoice_payment_events', 'fiat_rate_fetched_at'), \
+                    ('invoice_payment_events', 'fiat_rate_fresh_until') \
                 ) required(table_name, column_name) \
                  WHERE NOT EXISTS ( \
                     SELECT 1 FROM information_schema.columns \
@@ -1625,6 +1635,9 @@ async fn invoice_quote_foundation_invariants_present(
             AND NOT has_table_privilege(current_user, 'public.invoice_quote_versions', 'TRUNCATE') \
             AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'invoice_id', 'INSERT') \
             AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'fiat_target_amount_minor', 'INSERT') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'quote_purpose', 'INSERT') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'late_instruction_quote_version_id', 'INSERT') \
+            AND has_column_privilege(current_user, 'public.invoice_quote_versions', 'late_observation_at', 'INSERT') \
             AND NOT has_column_privilege(current_user, 'public.invoice_quote_versions', 'version_number', 'INSERT') \
             AND NOT has_column_privilege(current_user, 'public.invoice_quote_versions', 'created_at', 'INSERT') \
             AND has_table_privilege(current_user, 'public.invoice_quote_offers', 'SELECT') \
@@ -1633,9 +1646,6 @@ async fn invoice_quote_foundation_invariants_present(
             AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'request_key', 'INSERT') \
             AND NOT has_column_privilege(current_user, 'public.invoice_quote_offers', 'created_at', 'INSERT') \
             AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'provider_attempt_id', 'INSERT') \
-            AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'direct_address', 'INSERT') \
-            AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'direct_liquid_blinding_key_hex', 'INSERT') \
-            AND has_column_privilege(current_user, 'public.invoice_quote_offers', 'direct_address_index', 'INSERT') \
             AND has_table_privilege(current_user, 'public.invoice_quote_active_fiat_projection', 'SELECT') \
             AND has_function_privilege(current_user, 'public.invoice_quote_credit_for_sats(integer,bigint,bigint,bigint)', 'EXECUTE') \
             AND has_table_privilege(current_user, 'public.invoice_quote_provider_attempts', 'SELECT') \

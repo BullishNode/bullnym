@@ -197,6 +197,8 @@ const LIST_LIMIT_MAX: i64 = 100;
 /// this cap prevents abandoned checkout invoices from refreshing forever.
 const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = INVOICE_LIFETIME_SECS;
 
+const FIAT_QUOTE_WINDOW_SECS: i64 = 5 * 60;
+
 /// 1 BTC = 100_000_000 sat. Centralized so the conversion arithmetic is
 /// audit-greppable.
 
@@ -441,6 +443,159 @@ pub async fn flip_invoice_on_bitcoin_boltz_settlement(
     }
 }
 
+pub(crate) async fn prefetch_provider_observation_rate(
+    state: &crate::AppState,
+    invoice_id: Uuid,
+    quote_version_id: Option<Uuid>,
+) -> Option<pricer::RateView> {
+    let quote_version_id = quote_version_id?;
+    let currency = match db::invoice_quote_currency(&state.db, invoice_id, quote_version_id).await {
+        Ok(Some(currency)) => currency,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(
+                event = "invoice_provider_observation_currency_failed",
+                invoice_id = %invoice_id,
+                quote_version_id = %quote_version_id,
+                error = %error,
+                "failed to load quote currency before provider observation"
+            );
+            return None;
+        }
+    };
+    match state.pricer.get_rate(&currency).await {
+        Ok(rate) => Some(rate),
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_provider_observation_rate_unavailable",
+                invoice_id = %invoice_id,
+                quote_version_id = %quote_version_id,
+                currency,
+                error = %error,
+                "provider status will persist without an invented fiat valuation"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn quote_candidate_from_rate(
+    rate: &pricer::RateView,
+) -> Option<db::NewInvoiceQuoteVersion<'_>> {
+    Some(db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: rate.minor_per_btc,
+        rate_source: &rate.source,
+        rate_observed_at_unix: i64::try_from(rate.observed_at_unix).ok()?,
+        rate_fetched_at_unix: i64::try_from(rate.fetched_at_unix).ok()?,
+        rate_fresh_until_unix: i64::try_from(rate.expires_at_unix).ok()?,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: i64::MAX,
+    })
+}
+
+pub(crate) async fn capture_late_quote_valuation_snapshot(
+    pool: &sqlx::PgPool,
+    pricer: &pricer::PricerClient,
+    observation: Option<db::PersistedInvoiceQuoteObservation>,
+) -> bool {
+    let Some(observation) = observation else {
+        return true;
+    };
+    let currency = match db::late_observation_valuation_status(
+        pool,
+        observation.invoice_id,
+        observation.instruction_quote_version_id,
+        observation.first_observed_at_unix_micros,
+    )
+    .await
+    {
+        Ok(db::LateObservationValuationStatus::OnTime)
+        | Ok(db::LateObservationValuationStatus::Ready(_)) => return true,
+        Ok(db::LateObservationValuationStatus::NeedsRate { fiat_currency }) => fiat_currency,
+        Err(error) => {
+            tracing::error!(
+                event = "invoice_late_valuation_context_failed",
+                invoice_id = %observation.invoice_id,
+                error = %error,
+                "failed to inspect durable provider first-observation evidence"
+            );
+            return false;
+        }
+    };
+    let rate = match pricer.get_rate(&currency).await {
+        Ok(rate) => rate,
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_late_valuation_rate_unavailable",
+                invoice_id = %observation.invoice_id,
+                currency,
+                error = %error,
+                "provider payment observation remains durably unvalued"
+            );
+            return false;
+        }
+    };
+    let timestamp = |value: u64, field: &'static str| match i64::try_from(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::error!(
+                event = "invoice_late_valuation_rate_timestamp_invalid",
+                invoice_id = %observation.invoice_id,
+                field,
+                "pricer timestamp exceeds durable storage range"
+            );
+            None
+        }
+    };
+    let Some(rate_observed_at_unix) = timestamp(rate.observed_at_unix, "observed_at") else {
+        return false;
+    };
+    let Some(rate_fetched_at_unix) = timestamp(rate.fetched_at_unix, "fetched_at") else {
+        return false;
+    };
+    let Some(rate_fresh_until_unix) = timestamp(rate.expires_at_unix, "fresh_until") else {
+        return false;
+    };
+    let candidate = db::NewInvoiceQuoteVersion {
+        rate_minor_per_btc: rate.minor_per_btc,
+        rate_source: &rate.source,
+        rate_observed_at_unix,
+        rate_fetched_at_unix,
+        rate_fresh_until_unix,
+        minimum_merchant_amount_sat: 1,
+        maximum_merchant_amount_sat: i64::MAX,
+    };
+    match db::create_or_reuse_late_observation_valuation_quote(
+        pool,
+        observation.invoice_id,
+        observation.instruction_quote_version_id,
+        observation.first_observed_at_unix_micros,
+        &candidate,
+    )
+    .await
+    {
+        Ok(resolution) => {
+            tracing::info!(
+                event = "invoice_late_valuation_snapshot_ready",
+                invoice_id = %observation.invoice_id,
+                valuation_quote_version_id = %resolution.quote.id,
+                created = resolution.created,
+                "durable fresh rate now covers provider payment first observation"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "invoice_late_valuation_snapshot_failed",
+                invoice_id = %observation.invoice_id,
+                error = %error,
+                "provider payment observation remains durably unvalued"
+            );
+            false
+        }
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -528,7 +683,7 @@ pub async fn robots_txt() -> Response {
 /// `amount_sat` (sat-denominated) OR `(fiat_amount_minor, fiat_currency)`
 /// (fiat-denominated). Server rejects payloads that supply both or
 /// neither.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct CreateAnonymousRequest {
     pub amount_sat: Option<i64>,
     pub fiat_amount_minor: Option<i32>,
@@ -1571,12 +1726,6 @@ impl From<&db::InvoiceQuoteVersion> for FiatQuoteView {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VersionedPayerInstruction {
     LiquidDirect {
-        quote_offer_id: Uuid,
-        address: String,
-        payer_amount_sat: i64,
-    },
-    BitcoinDirect {
-        quote_offer_id: Uuid,
         address: String,
         payer_amount_sat: i64,
     },
@@ -1652,10 +1801,12 @@ fn payer_quote_rail_availability(invoice: &db::Invoice) -> Option<PayerQuoteRail
     let checkout_descriptor_surface = invoice.origin == "checkout" && invoice.nym_owner.is_some();
     Some(PayerQuoteRailAvailability {
         lightning: payable && invoice.accept_ln,
-        liquid: payable && invoice.accept_liquid && checkout_descriptor_surface,
-        // Fiat wallet-origin direct Bitcoin cannot be unambiguously attributed
-        // until the signed request supplies a quote-address derivation pool.
-        // Checkout Bitcoin is provider-backed and settles to Liquid.
+        liquid: payable
+            && invoice.accept_liquid
+            && invoice.liquid_address.is_some()
+            && invoice.liquid_blinding_key_hex.is_some(),
+        // Checkout Bitcoin is provider-backed and settles to Liquid. Direct
+        // wallet Bitcoin remains unavailable in this quote contract.
         bitcoin: payable && checkout_descriptor_surface && invoice.liquid_address.is_some(),
     })
 }
@@ -1714,6 +1865,11 @@ async fn resolve_current_fiat_quote(
     if let Some(quote) = db::current_invoice_quote(&state.db, invoice.id).await? {
         return Ok(quote);
     }
+    if invoice.expires_at_unix < unix_now().saturating_add(FIAT_QUOTE_WINDOW_SECS) {
+        return Err(AppError::ServiceUnavailable(
+            "invoice lifetime cannot contain a complete five-minute quote".into(),
+        ));
+    }
     let currency = invoice
         .fiat_currency
         .as_deref()
@@ -1760,49 +1916,6 @@ fn quote_offer_request_key(quote_id: Uuid, rail: PayerQuoteRail, kind: &str) -> 
     hash.update([0]);
     hash.update(kind.as_bytes());
     hex::encode(hash.finalize())
-}
-
-async fn record_direct_quote_offer(
-    state: &AppState,
-    invoice: &db::Invoice,
-    quote: &db::InvoiceQuoteVersion,
-    rail: PayerQuoteRail,
-) -> Result<db::InvoiceQuoteOffer, AppError> {
-    if rail != PayerQuoteRail::Liquid {
-        return Err(AppError::InvalidAmount(
-            "wallet-origin fiat direct rails require a quote-address derivation contract".into(),
-        ));
-    }
-    let key = quote_offer_request_key(quote.id, rail, "direct");
-    Ok(db::record_or_reuse_checkout_liquid_quote_offer(
-        &state.db,
-        &db::NewInvoiceQuoteOffer {
-            invoice_id: invoice.id,
-            quote_version_id: quote.id,
-            rail: rail.as_str(),
-            offer_kind: "direct",
-            request_key: &key,
-            provider: None,
-            provider_offer_id: None,
-            provider_attempt_id: None,
-            direct_address: None,
-            direct_liquid_blinding_key_hex: None,
-            direct_address_index: None,
-            payer_amount_sat: quote.merchant_amount_sat,
-            expires_at_unix: quote.expires_at_unix,
-        },
-        |ct_descriptor, index| {
-            let address = descriptor::derive_address(ct_descriptor, index)
-                .map_err(|error| sqlx::Error::Protocol(format!("derive quote address: {error}")))?;
-            let blinding_key_hex = descriptor::derive_blinding_key_hex(ct_descriptor, &address)
-                .map_err(|error| {
-                    sqlx::Error::Protocol(format!("derive quote blinding key: {error}"))
-                })?;
-            Ok((address, blinding_key_hex))
-        },
-    )
-    .await?
-    .offer)
 }
 
 pub async fn fetch_lightning_offer(
@@ -2082,14 +2195,14 @@ async fn versioned_instruction_for_rail(
                     "invoice does not accept Liquid".into(),
                 ));
             }
-            let offer = record_direct_quote_offer(state, invoice, quote, rail).await?;
-            let address = offer.direct_address.clone().ok_or_else(|| {
-                AppError::DbError("direct Liquid quote is missing its unique destination".into())
+            let address = invoice.liquid_address.clone().ok_or_else(|| {
+                AppError::DbError(
+                    "direct Liquid quote is missing its stable invoice address".into(),
+                )
             })?;
             Ok(VersionedPayerInstruction::LiquidDirect {
-                quote_offer_id: offer.id,
                 address,
-                payer_amount_sat: offer.payer_amount_sat,
+                payer_amount_sat: quote.merchant_amount_sat,
             })
         }
         PayerQuoteRail::Lightning => {
@@ -2292,9 +2405,6 @@ async fn ensure_versioned_lightning_offer(
             provider: Some("boltz"),
             provider_offer_id: Some(&prepared.swap_id),
             provider_attempt_id: Some(provider_attempt.id),
-            direct_address: None,
-            direct_liquid_blinding_key_hex: None,
-            direct_address_index: None,
             payer_amount_sat: prepared.payer_amount_sat,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -2603,9 +2713,6 @@ async fn ensure_versioned_bitcoin_chain_offer(
             provider: Some("boltz"),
             provider_offer_id: Some(&provider_result.swap_id),
             provider_attempt_id: Some(provider_attempt.id),
-            direct_address: None,
-            direct_liquid_blinding_key_hex: None,
-            direct_address_index: None,
             payer_amount_sat,
             expires_at_unix: quote.expires_at_unix,
         },
@@ -3468,7 +3575,8 @@ fn recovery_list_payload_fields() -> [&'static str; 0] {
 // POST /api/v1/invoices        (unlinked)
 // =====================================================================
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSignedRequest {
     pub npub: String,
     pub amount_sat: Option<i64>,
@@ -3478,7 +3586,7 @@ pub struct CreateSignedRequest {
     /// `recipient_name` on the wire; mapped to the `recipient_label`
     /// column in storage (no DB rename — defer to a v2 schema migration
     /// if ever needed).
-    #[serde(rename = "recipient_name", alias = "recipient_label")]
+    #[serde(rename = "recipient_name")]
     pub recipient_label: Option<String>,
     pub invoice_number: Option<String>,
     #[serde(default)]

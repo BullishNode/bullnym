@@ -119,6 +119,7 @@ struct ChainWatcherPollCtx<'a> {
     pool: &'a PgPool,
     backend: &'a (dyn UtxoBackend + Send + Sync),
     rate_limiter: &'a RateLimiter,
+    pricer: Option<&'a crate::pricer::PricerClient>,
     cancel: &'a CancellationToken,
 }
 
@@ -138,10 +139,10 @@ enum LiquidRecordOutcome {
 #[derive(Clone, Copy)]
 struct LiquidInvoiceObservationTarget<'a> {
     invoice_id: uuid::Uuid,
-    quote_attribution: Option<db::InvoiceQuoteAttribution>,
     address: &'a str,
     script: &'a elements::Script,
     blinding_key_hex: &'a str,
+    fiat_currency: Option<&'a str>,
     finality_confirmations: u32,
 }
 
@@ -618,6 +619,7 @@ pub async fn run(
     pool: PgPool,
     backend: Arc<dyn UtxoBackend + Send + Sync>,
     rate_limiter: Arc<RateLimiter>,
+    pricer: Arc<crate::pricer::PricerClient>,
     cancel: CancellationToken,
     cfg: ChainWatcherConfig,
     tolerances: db::InvoiceAccountingTolerances,
@@ -641,6 +643,7 @@ pub async fn run(
                 pool: &pool,
                 backend: backend.as_ref(),
                 rate_limiter: rate_limiter.as_ref(),
+                pricer: Some(pricer.as_ref()),
                 cancel: &cancel,
             },
             &cfg,
@@ -684,6 +687,7 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Recent, &reporter, &mut active_epoch, false,
@@ -712,6 +716,7 @@ pub async fn run(
                             pool: &pool,
                             backend: backend.as_ref(),
                             rate_limiter: rate_limiter.as_ref(),
+                            pricer: Some(pricer.as_ref()),
                             cancel: &cancel,
                         },
                         &cfg,
@@ -726,6 +731,7 @@ pub async fn run(
                             pool: &pool,
                             backend: backend.as_ref(),
                             rate_limiter: rate_limiter.as_ref(),
+                            pricer: Some(pricer.as_ref()),
                             cancel: &cancel,
                         },
                         &cfg,
@@ -749,6 +755,7 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
+                        pricer: Some(pricer.as_ref()),
                         cancel: &cancel,
                     },
                     &cfg, tolerances, WatchTier::Historical, &reporter, &mut idle_epoch, false,
@@ -1060,33 +1067,14 @@ async fn poll_invoice_addresses(
             }
         };
         let script = parsed.script_pubkey();
-        let quote_attribution = match (
-            invoice.invoice_quote_version_id,
-            invoice.invoice_quote_offer_id,
-        ) {
-            (None, None) => None,
-            (Some(quote_version_id), Some(quote_offer_id)) => Some(db::InvoiceQuoteAttribution {
-                quote_version_id,
-                quote_offer_id,
-            }),
-            _ => {
-                tracing::error!(
-                    invoice_id = %invoice.invoice_id,
-                    scan_target_id = %invoice.id,
-                    "chain_watcher: direct quote destination has partial attribution"
-                );
-                return WatcherTurn::defer_to_cadence(CycleOutcome::Failed);
-            }
-        };
-
         match record_liquid_events_for_script(
             ctx,
             LiquidInvoiceObservationTarget {
                 invoice_id: invoice.invoice_id,
-                quote_attribution,
                 address: &invoice.liquid_address,
                 script: &script,
                 blinding_key_hex: &invoice.liquid_blinding_key_hex,
+                fiat_currency: invoice.fiat_currency.as_deref(),
                 finality_confirmations: config.finality_confirmations,
             },
             config.tolerances,
@@ -1212,10 +1200,10 @@ async fn record_liquid_events_for_script(
 ) -> Result<LiquidRecordOutcome, AppError> {
     let LiquidInvoiceObservationTarget {
         invoice_id,
-        quote_attribution,
         address,
         script,
         blinding_key_hex,
+        fiat_currency,
         finality_confirmations: liquid_finality_confirmations,
     } = target;
     if liquid_finality_confirmations == 0 {
@@ -1453,18 +1441,42 @@ async fn record_liquid_events_for_script(
         generation,
         observations: &observations,
     };
-    let apply_outcome = if let Some(attribution) = quote_attribution {
-        let quote_attributions = observations
-            .iter()
-            .map(|observation| db::DirectObservationQuoteAttribution {
-                event_key: observation.event_key,
-                attribution,
-            })
-            .collect::<Vec<_>>();
-        db::apply_direct_observation_batch_with_quote_attributions(
+    let rate = match (ctx.pricer, fiat_currency) {
+        (Some(pricer), Some(currency)) => match pricer.get_rate(currency).await {
+            Ok(rate) => Some(rate),
+            Err(error) => {
+                tracing::warn!(
+                    event = "invoice_late_direct_pricer_unavailable",
+                    invoice_id = %invoice_id,
+                    currency,
+                    error = %error,
+                    "direct payment observation will remain unvalued unless a durable covering quote already exists"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
+    let apply_outcome = if let Some(rate) = rate.as_ref() {
+        let rate_candidate = db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: rate.minor_per_btc,
+            rate_source: &rate.source,
+            rate_observed_at_unix: i64::try_from(rate.observed_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer observation timestamp exceeds storage".into())
+            })?,
+            rate_fetched_at_unix: i64::try_from(rate.fetched_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer fetch timestamp exceeds storage".into())
+            })?,
+            rate_fresh_until_unix: i64::try_from(rate.expires_at_unix).map_err(|_| {
+                AppError::InvalidAmount("pricer freshness timestamp exceeds storage".into())
+            })?,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: i64::MAX,
+        };
+        db::apply_direct_observation_batch_with_rate_candidate(
             ctx.pool,
             batch,
-            &quote_attributions,
+            &rate_candidate,
             tolerances,
         )
         .await?
@@ -3162,6 +3174,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3224,6 +3237,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3265,6 +3279,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3326,6 +3341,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3367,6 +3383,7 @@ mod tests {
             pool: &pool,
             backend: &backend,
             rate_limiter: &rate_limiter,
+            pricer: None,
             cancel: &cancel,
         };
         let mut epoch = db::WatcherNymScanEpoch::default();
@@ -3414,6 +3431,7 @@ mod tests {
                 pool: &pool,
                 backend: &backend,
                 rate_limiter: &rate_limiter,
+                pricer: None,
                 cancel: &cancel,
             },
             &ChainWatcherConfig::default(),

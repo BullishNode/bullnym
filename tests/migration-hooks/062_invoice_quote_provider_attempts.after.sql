@@ -21,11 +21,12 @@ INSERT INTO invoices (
 BEGIN;
 SET LOCAL ROLE bullnym_app;
 INSERT INTO invoice_quote_versions (
-    invoice_id, rate_minor_per_btc, rate_source,
+    invoice_id, quote_purpose, rate_minor_per_btc, rate_source,
     rate_observed_at, rate_fetched_at, rate_fresh_until,
     merchant_amount_sat
 ) VALUES (
     '62000000-0000-0000-0000-000000000001',
+    'payer_instruction',
     10000000, 'bullbitcoin-pricer:indexPrice',
     clock_timestamp() - INTERVAL '1 second',
     clock_timestamp(),
@@ -35,9 +36,10 @@ INSERT INTO invoice_quote_versions (
 COMMIT;
 
 INSERT INTO swap_key_allocations (
-    root_fingerprint, key_epoch, derivation_scheme_version, child_index,
+    id, root_fingerprint, key_epoch, derivation_scheme_version, child_index,
     purpose, public_key_hex, preimage_hash_hex
 ) VALUES (
+    '62000000-0000-0000-0000-000000000002',
     '6262626262626262', 1, 1, 62001, 'reverse_claim',
     '02' || repeat('62', 32), repeat('63', 32)
 );
@@ -49,11 +51,11 @@ INSERT INTO invoice_quote_provider_attempts (
     merchant_amount_sat, claim_key_allocation_id, refund_key_allocation_id
 )
 SELECT q.invoice_id, q.id, 'lightning', repeat('a', 64), 'boltz',
-       'fixed_checkout_reverse', q.merchant_amount_sat, a.id, NULL
+       'fixed_checkout_reverse', q.merchant_amount_sat,
+       '62000000-0000-0000-0000-000000000002'::UUID, NULL
   FROM invoice_quote_versions q
-  CROSS JOIN swap_key_allocations a
  WHERE q.invoice_id = '62000000-0000-0000-0000-000000000001'
-   AND a.child_index = 62001;
+;
 COMMIT;
 
 DO $$
@@ -81,6 +83,7 @@ BEGIN
          WHERE invoice_id = '62000000-0000-0000-0000-000000000001'
            AND fiat_face_amount_minor = 1000
            AND fiat_target_amount_minor = 1000
+           AND quote_purpose = 'payer_instruction'
            AND merchant_amount_sat = 10000
     ) OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 9999) <> 999
        OR invoice_quote_credit_for_sats(1000, 10000, 10000000, 10000) <> 1000
@@ -107,7 +110,9 @@ BEGIN
        OR has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'created_at', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_provider_attempts', 'invoice_id', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'fiat_target_amount_minor', 'INSERT')
-       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_offers', 'direct_address', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'quote_purpose', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'late_instruction_quote_version_id', 'INSERT')
+       OR NOT has_column_privilege('bullnym_app', 'invoice_quote_versions', 'late_observation_at', 'INSERT')
        OR NOT has_table_privilege('bullnym_app', 'invoice_quote_active_fiat_projection', 'SELECT')
        OR NOT has_function_privilege(
            'bullnym_app',

@@ -52,12 +52,19 @@ Lightning Address descriptor or cursor.
 Rendering `GET /:nym` does not allocate a Liquid address. Allocation happens
 when the payer creates a checkout invoice with `POST /:nym/invoice`.
 
-Each checkout invoice gets one Liquid settlement address. All Payment Page
-rails settle to that address:
+Each checkout invoice gets one Liquid settlement address. All rails use that
+address as follows:
 
 - Lightning reverse swaps claim LBTC to it.
 - Direct Liquid pays it.
 - Bitcoin chain swaps claim LBTC to it.
+
+Fiat checkout defers payer instructions until an explicit five-minute quote is
+requested. Lightning and Bitcoin provider offers still settle to the invoice
+address, and every direct-Liquid quote returns that same address with refreshed
+amount/rate metadata. Each output is valued from its own first-observation
+time, so Bullnym never claims that a payment proves which refreshed QR was
+used. The stable address remains watched for late payments and reorgs.
 
 ## Flow
 
@@ -77,7 +84,7 @@ The public payment page for a linked checkout remains `GET /:nym/i/:id`.
 | Rail | Payer sees | Recipient settlement |
 |---|---|---|
 | Lightning | BOLT11 offer | LBTC claimed from Boltz reverse swap to the checkout Liquid address. |
-| Liquid | Liquid address | Direct LBTC to the checkout Liquid address. |
+| Liquid | Stable checkout Liquid address plus the current quoted amount | Direct LBTC to the checkout Liquid address. |
 | Bitcoin | Boltz BTC lockup address | LBTC claimed from the chain swap to the checkout Liquid address. |
 
 Payment Page Bitcoin is a BTC-to-LBTC Boltz chain swap. It is not direct
