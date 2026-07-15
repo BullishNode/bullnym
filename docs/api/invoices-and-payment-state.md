@@ -142,6 +142,7 @@ Each `invoices` item contains:
 | `fiat_amount_minor` | Original fiat minor-unit amount, or `null` |
 | `fiat_currency` | Original ISO currency code, or `null` |
 | `public_description` | Payer-visible description, or `null` |
+| `memo` | Private merchant note, or `null`; checkout `note` is exposed here but never on public status/render routes |
 | `recipient_name` | Recipient display label, or `null` |
 | `invoice_number` | Merchant invoice reference, or `null` |
 | `accept_btc` | Whether direct/on-chain Bitcoin was enabled |
@@ -215,6 +216,15 @@ are. Treat invoice URLs as shareable secrets.
   "accept_liquid": true
 }
 ```
+
+For a fiat-fixed invoice that has not received its first explicit payer-demand
+quote, `rate_minor_per_btc` is `null` and `rate_locks_until_unix` is exactly
+`0`. Zero means that no invoice-level rate lock exists; it is not an expired
+quote timestamp. The selected-rail quote response owns the actual immutable
+rate and its five-minute expiry. A sat-fixed invoice also has a null rate, but
+retains `rate_locks_until_unix == expires_at_unix` as its never-refresh
+sentinel. Clients must distinguish these cases by `pricing_mode`, not by the
+nullable rate alone.
 
 `lightning_pr`/`lightning_amount_sat`,
 `liquid_address`/`liquid_amount_sat`, `bitcoin_address`, and the

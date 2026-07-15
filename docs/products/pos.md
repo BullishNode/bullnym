@@ -33,6 +33,12 @@ Payment Page receive paths.
 The server database is the accounting source of truth. POS history is local
 browser state and can be cleared or lost without mutating invoices.
 
+An optional checkout note is private merchant history. Under schema
+`063_checkout_private_memo` it is stored as the invoice memo and returned only
+by the merchant's signed invoice list, never on public status or payment pages.
+Checkout cannot set the wallet-only recipient label, public description, or
+invoice number fields.
+
 ## Local Controls
 
 The POS PWA includes local settings for currency, receipt paper size, Bolt
