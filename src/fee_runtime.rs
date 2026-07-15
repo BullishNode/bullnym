@@ -724,6 +724,7 @@ impl FeeRuntime {
             {
                 Ok(current)
             }
+            FeeObservationSource::LiveBitcoin => self.bitcoin_last_known_good_at(now_unix),
             FeeObservationSource::BitcoinLastKnownGood
                 if self.bitcoin_lkg_authorized.load(Ordering::Acquire) =>
             {
@@ -748,12 +749,53 @@ impl FeeRuntime {
             {
                 Ok(current)
             }
+            FeeObservationSource::LiveLiquid => self.liquid_last_known_good_at(now_unix),
             FeeObservationSource::LiquidLastKnownGood
                 if self.liquid_lkg_authorized.load(Ordering::Acquire) =>
             {
                 Ok(current)
             }
             _ => Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid)),
+        }
+    }
+
+    fn bitcoin_last_known_good_at(
+        &self,
+        now_unix: u64,
+    ) -> Result<CurrentBitcoinFee, FeeRuntimeUnavailable> {
+        if !self.bitcoin_lkg_authorized.load(Ordering::Acquire) {
+            return Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Bitcoin));
+        }
+        let current = self
+            .snapshot
+            .read_bitcoin_last_known_good(&self.bitcoin_policy, now_unix)
+            .map_err(|_| FeeRuntimeUnavailable::Bitcoin)?;
+        if self.bitcoin_authority_is_consistent(&current)
+            && current.decision().source() == FeeObservationSource::BitcoinLastKnownGood
+        {
+            Ok(current)
+        } else {
+            Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Bitcoin))
+        }
+    }
+
+    fn liquid_last_known_good_at(
+        &self,
+        now_unix: u64,
+    ) -> Result<CurrentLiquidFee, FeeRuntimeUnavailable> {
+        if !self.liquid_lkg_authorized.load(Ordering::Acquire) {
+            return Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid));
+        }
+        let current = self
+            .snapshot
+            .read_liquid_last_known_good(&self.liquid_policy, now_unix)
+            .map_err(|_| FeeRuntimeUnavailable::Liquid)?;
+        if self.liquid_authority_is_consistent(&current)
+            && current.decision().source() == FeeObservationSource::LiquidLastKnownGood
+        {
+            Ok(current)
+        } else {
+            Err(FeeRuntimeUnavailable::NotDurable(FeeRail::Liquid))
         }
     }
 
@@ -1244,6 +1286,132 @@ mod tests {
 
         runtime.snapshot.clear_liquid().unwrap();
         assert!(!runtime.readiness_at(now).ready());
+    }
+
+    #[test]
+    fn in_flight_live_generations_retain_only_fresh_authorized_durable_lkg() {
+        let runtime = runtime();
+        let prior_observed_at = 10_000;
+        let pending_observed_at = 10_030;
+
+        runtime
+            .snapshot
+            .update_bitcoin(LiveBitcoin::new(
+                SatPerVbyte::try_from(2.0).unwrap(),
+                prior_observed_at,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        let bitcoin_durable_generation = runtime
+            .snapshot
+            .restore_bitcoin_last_known_good(crate::fee_policy::BitcoinLastKnownGood::new(
+                SatPerVbyte::try_from(2.0).unwrap(),
+                prior_observed_at,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .bitcoin_persisted_generation
+            .store(bitcoin_durable_generation.as_u64(), Ordering::Release);
+        runtime
+            .bitcoin_lkg_authorized
+            .store(true, Ordering::Release);
+
+        runtime
+            .snapshot
+            .update_liquid(LiveLiquid::new(
+                SatPerVbyte::try_from(0.2).unwrap(),
+                prior_observed_at,
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        let liquid_durable_generation = runtime
+            .snapshot
+            .restore_liquid_last_known_good(LiquidLastKnownGood::new(
+                SatPerVbyte::try_from(0.2).unwrap(),
+                prior_observed_at,
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .liquid_persisted_generation
+            .store(liquid_durable_generation.as_u64(), Ordering::Release);
+        runtime.liquid_lkg_authorized.store(true, Ordering::Release);
+        assert!(runtime.readiness_at(prior_observed_at).ready());
+
+        let pending_bitcoin_generation = runtime
+            .snapshot
+            .update_bitcoin(LiveBitcoin::new(
+                SatPerVbyte::try_from(7.0).unwrap(),
+                pending_observed_at,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        let pending_liquid_generation = runtime
+            .snapshot
+            .update_liquid(LiveLiquid::new(
+                SatPerVbyte::try_from(0.7).unwrap(),
+                pending_observed_at,
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        assert_ne!(
+            pending_bitcoin_generation.as_u64(),
+            runtime.bitcoin_persisted_generation.load(Ordering::Acquire)
+        );
+        assert_ne!(
+            pending_liquid_generation.as_u64(),
+            runtime.liquid_persisted_generation.load(Ordering::Acquire)
+        );
+
+        // The new live values are not durable yet. Admission remains open on
+        // the exact prior durable decisions; the shared decision boundary
+        // cannot expose either unpublished replacement.
+        assert!(runtime.readiness_at(pending_observed_at).ready());
+        let bitcoin = runtime.bitcoin_current_at(pending_observed_at).unwrap();
+        let liquid = runtime.liquid_current_at(pending_observed_at).unwrap();
+        assert_eq!(
+            bitcoin.decision().rate(),
+            SatPerVbyte::try_from(2.0).unwrap()
+        );
+        assert_eq!(
+            bitcoin.decision().source(),
+            FeeObservationSource::BitcoinLastKnownGood
+        );
+        assert_eq!(
+            liquid.decision().rate(),
+            SatPerVbyte::try_from(0.2).unwrap()
+        );
+        assert_eq!(
+            liquid.decision().source(),
+            FeeObservationSource::LiquidLastKnownGood
+        );
+
+        // A fresh but still-unpublished replacement cannot keep admission open
+        // after the durable fallback itself expires.
+        let stale_at = prior_observed_at
+            + runtime
+                .bitcoin_policy
+                .last_known_good_max_age_secs()
+                .max(runtime.liquid_policy.last_known_good_max_age_secs())
+            + 1;
+        runtime
+            .snapshot
+            .update_bitcoin(LiveBitcoin::new(
+                SatPerVbyte::try_from(8.0).unwrap(),
+                stale_at,
+                FeeProvenance::new(DEFAULT_BITCOIN_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .snapshot
+            .update_liquid(LiveLiquid::new(
+                SatPerVbyte::try_from(0.8).unwrap(),
+                stale_at,
+                FeeProvenance::new(DEFAULT_LIQUID_PROVENANCE).unwrap(),
+            ))
+            .unwrap();
+        assert!(!runtime.readiness_at(stale_at).ready());
     }
 
     #[test]
