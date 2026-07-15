@@ -206,12 +206,14 @@ is copied from the persisted, validated user lock and can likewise exceed
 URI, Bolt Card, and manual `Send` instructions. A missing or invalid typed
 amount withdraws the payload rather than falling back to the merchant amount.
 
-`payment_tolerance_sat` is a conservative display value: the minimum configured
-tolerance among all enabled rails, capped at one percent of the invoice amount
-with a one-sat floor. With the shipped BTC/Liquid/Lightning tolerances and all
-three rails enabled, it is therefore `1`. Payment accounting applies the
-configured tolerance for the rail of the credited event; do not independently
-recompute invoice status from this display field.
+`payment_tolerance_sat` is the authoritative invoice-wide shortfall threshold:
+the minimum configured tolerance among all enabled rails, capped at one percent
+of the invoice amount with a one-sat floor for that cap. With the shipped
+BTC/Liquid/Lightning tolerances and all three rails enabled, it is therefore
+`1`. Confirmed accounting and provisional presentation enforce this exact
+threshold regardless of which rail supplies an event or the order in which
+mixed-rail events arrive. Clients must not independently recompute invoice
+status.
 
 Invoice `status` values:
 
@@ -220,7 +222,7 @@ Invoice `status` values:
 | `unpaid` | No credited value. Offers may still be payable before expiry. |
 | `in_progress` | Payment detected or swap underway; continue polling and do not request duplicate payment. |
 | `partially_paid` | Credited amount is below the terminal threshold. Show remaining amount. Checkout partials terminalize after a configured grace period. |
-| `paid` | Within configured rail-specific tolerance. Fulfilled. |
+| `paid` | Within the advertised invoice-wide tolerance. Fulfilled. |
 | `underpaid` | Terminal payment remained below required tolerance. Requires merchant policy/manual resolution. |
 | `overpaid` | More than requested was credited. Fulfilled, with possible merchant refund policy. |
 | `expired` | Payment window ended. Do not pay cached offers. |

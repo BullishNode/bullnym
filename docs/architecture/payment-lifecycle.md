@@ -277,12 +277,16 @@ Initial defaults:
 - Bitcoin Boltz chain: 300 sats unless a tighter Boltz-delivered amount can be
   proven
 
-Tiny underpayments within tolerance become `paid`. Overpayments remain
-`overpaid` for auditability.
+For each invoice, select the strictest configured tolerance among every enabled
+rail and cap it at one percent of the invoice amount. That one advertised
+invoice-wide threshold drives both confirmed accounting and provisional
+presentation, independent of the credited event's rail or mixed-rail arrival
+order. Tiny underpayments within that threshold become `paid`; overpayments
+remain `overpaid` for auditability.
 
-If mixed rails are used, apply the tolerance of the event that crosses the
-threshold. If implementation starts with a simpler invoice-level tolerance, it
-must be documented and tested.
+Confirmation and finality policy remains rail-specific. Direct Bitcoin and
+Liquid both activate accounting at one confirmation, then reach settlement at
+their separately configured nonzero finality depths.
 
 ## Boltz Reverse Swaps
 
