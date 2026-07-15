@@ -41,6 +41,13 @@
    and webhook reachability without moving funds.
 10. Monitor error and recovery events through at least one reconciler cycle.
 
+Before promotion and again against the installed release, run the
+[read-only deployment certification preflight](deployment-certification.md)
+with the operator-recorded exact commit, artifact digest, PWA digest, and
+schema marker. It reuses the release-record verifier and probes public
+health/readiness/version without replacing this runbook's running-process
+digest, worker-log, migration, or admission checks.
+
 Rollback the binary only when its migrations and signed API behavior remain
 compatible. Never roll back the database blindly. A rollback does not undo an
 on-chain transaction; reconcile in-flight swaps before and after the change.

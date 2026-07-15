@@ -29,6 +29,7 @@ jobs:
         run: |
           scripts/test-release-provenance.sh
           scripts/test-release-record.sh
+          scripts/test-certify-deployment.py
           scripts/test-direct-lifecycle-rollback.sh
           scripts/test-renegotiation-rollback.sh
 
