@@ -18,7 +18,7 @@ This revision deliberately separates three kinds of evidence:
 Exact revisions used for this manual:
 
 - last verified deployed Bullnym: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, clean build, schema `062_invoice_quote_provider_attempts`;
-- source authority inspected: `fe36a8d1701416222a30670000978075b0b58196`, tree `1489239cd96ee7554ff8837991c1a17945f718b9`, schema `063_checkout_private_memo`.
+- source authority inspected: `f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree `8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`, schema `063_checkout_private_memo`.
 
 The healthy public probes returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -38,11 +38,13 @@ refresh, and PoS Bitcoin warning. Exact release provenance and schema readiness
 established that release contract; individual rail availability remains
 subject to its normal admission and dependency gates.
 
-Source main advanced during that outage to
-`fe36a8d1701416222a30670000978075b0b58196`. It adds schema 063 for the private
-checkout memo and fixes durable fee authority during refresh to unblock fiat
-checkout and stable fee admission. This hotfix is **main only** until a healthy
-public `/version` and `/ready` prove the matching deployed commit and schema.
+Source main advanced during that outage through
+`f91cc7d1438079e8eca8c018ed3d64487f4264cf`. It adds schema 063 for the private
+checkout memo, fixes durable fee authority during refresh to unblock fiat
+checkout and stable fee admission, and makes anonymous checkout reject unknown
+wire fields while counting its private note limit in user-perceived
+characters. These hotfixes are **main only** until a healthy public `/version`
+and `/ready` prove the matching deployed commit and schema.
 
 Main also contains a current-only automatic-recovery hardening merged in
 `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now

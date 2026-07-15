@@ -22,10 +22,11 @@ connection-refused through the 10:06 UTC check. The behaviors below describe
 the last verified deployed release, but the service itself was not available
 at the end of this evidence window.
 
-Source main advanced during the outage to
-`fe36a8d1701416222a30670000978075b0b58196`, schema 063, with fixes intended to
-unblock fiat checkout and stable fee admission. That hotfix is not deployment
-verified while `/version` and `/ready` are unreachable.
+Source main advanced during the outage through
+`f91cc7d1438079e8eca8c018ed3d64487f4264cf`, schema 063, with fixes intended to
+unblock fiat checkout, stable fee admission, and strict anonymous checkout
+input. Those hotfixes are not deployment verified while `/version` and
+`/ready` are unreachable.
 
 | Behavior | Status at the time of writing |
 |---|---|
@@ -388,7 +389,7 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Current behavior was checked against the deployed probe above, Bullnym source
-and tests through `fe36a8d1701416222a30670000978075b0b58196`, the product/API/
+and tests through `f91cc7d1438079e8eca8c018ed3d64487f4264cf`, the product/API/
 architecture documents in this repository, and these read-only authority
 records:
 
