@@ -162,10 +162,12 @@ pub struct RecoveryShadowLineageClassificationsV1 {
 impl RecoveryShadowLineageClassificationsV1 {
     fn has_unsafe_differences(self) -> bool {
         // Reverse swaps and committed-before-provider orphan reservations can
-        // legitimately advance the shared allocator after the latest chain
-        // manifest. The exact provider/local high-water comparison below is
-        // the authoritative safety check for that reported local-ahead case.
-        self.local_behind != 0 || self.local_missing != 0 || self.manifest_missing != 0
+        // legitimately create an allocator lineage with no chain manifest at
+        // all. Exact manifest/local record coverage proves such a
+        // `manifest_missing` lineage is allocator-only. The active-root
+        // provider/local high-water comparison below remains the authoritative
+        // safety check: provider-ahead still fails closed.
+        self.local_behind != 0 || self.local_missing != 0
     }
 }
 
@@ -208,6 +210,8 @@ pub struct RecoveryShadowLocalReportV1 {
     pub manifest_only_record_count: usize,
     pub local_only_record_count: usize,
     pub local_lineage_count: usize,
+    /// Allocation high-water for the active provider root only. Allocations
+    /// retained under an older root cannot mask provider-ahead evidence.
     pub local_max_child_index: Option<i64>,
     pub lineage_classifications: RecoveryShadowLineageClassificationsV1,
     pub coverage: RecoveryShadowCoverageV1,
@@ -430,7 +434,15 @@ where
         )
         .map_err(|_| RecoveryShadowAuditErrorV1::ChainInventoryAuditFailed)?;
 
-        let report = build_report(&boltz_restore, &boltz_audit, &local_audit, chain_inventory);
+        let active_root_local_max_child_index =
+            active_root_local_high_water(&local_snapshot, &active_root_fingerprint);
+        let report = build_report(
+            &boltz_restore,
+            &boltz_audit,
+            &local_audit,
+            chain_inventory,
+            active_root_local_max_child_index,
+        );
         Ok((report, manifests))
     }
 }
@@ -610,6 +622,7 @@ fn build_report(
     boltz_audit: &SwapManifestBoltzAuditV1,
     local_audit: &LocalChainSwapRecoveryAuditV1,
     chain_inventory: RecoveryShadowChainInventoryReportV1,
+    active_root_local_max_child_index: Option<i64>,
 ) -> RecoveryShadowReportV1 {
     let chain_record_count = boltz_restore
         .records
@@ -656,18 +669,15 @@ fn build_report(
         .iter()
         .map(|high_water| high_water.child_index)
         .max();
-    let local_max_child_index = local_audit
-        .lineage_high_waters
-        .iter()
-        .filter_map(|comparison| comparison.local_child_index)
-        .max();
     let local_lineage_count = local_audit
         .lineage_high_waters
         .iter()
         .filter(|comparison| comparison.local_child_index.is_some())
         .count();
-    let provider_local_high_water_relation =
-        compare_provider_local_high_water(boltz_restore.max_child_index, local_max_child_index);
+    let provider_local_high_water_relation = compare_provider_local_high_water(
+        boltz_restore.max_child_index,
+        active_root_local_max_child_index,
+    );
 
     let classification = if boltz_coverage == RecoveryShadowCoverageV1::Exact
         && local_coverage == RecoveryShadowCoverageV1::Exact
@@ -698,13 +708,26 @@ fn build_report(
             manifest_only_record_count: local_audit.manifest_only_chain_swap_ids.len(),
             local_only_record_count: local_audit.local_only_chain_swap_ids.len(),
             local_lineage_count,
-            local_max_child_index,
+            local_max_child_index: active_root_local_max_child_index,
             lineage_classifications,
             coverage: local_coverage,
         },
         chain_inventory,
         classification,
     }
+}
+
+fn active_root_local_high_water(
+    local: &LocalChainSwapRecoverySnapshotV1,
+    active_root_fingerprint: &str,
+) -> Option<i64> {
+    local
+        .summary
+        .lineage_high_waters
+        .iter()
+        .filter(|lineage| lineage.root_fingerprint == active_root_fingerprint)
+        .map(|lineage| lineage.child_index)
+        .max()
 }
 
 fn compare_provider_local_high_water(
@@ -1131,6 +1154,65 @@ mod tests {
             }
         );
         assert_trace(&calls, &["witness", "local", "boltz"]);
+    }
+
+    #[tokio::test]
+    async fn empty_chain_sources_use_the_active_root_allocator_high_water_fail_safely() {
+        let mut reverse = provider_record(
+            "ReverseAllocatorHistoryMustNotEscape",
+            BoltzRestoreKind::Reverse,
+        );
+        reverse.keys[0].child_index = 101;
+        let provider = provider_set(vec![reverse]);
+
+        for (local_child_index, expected_relation, expected_classification) in [
+            (
+                101,
+                RecoveryShadowProviderLocalHighWaterRelationV1::Equal,
+                RecoveryShadowClassificationV1::Consistent,
+            ),
+            (
+                100,
+                RecoveryShadowProviderLocalHighWaterRelationV1::ProviderAhead,
+                RecoveryShadowClassificationV1::DifferencesClassified,
+            ),
+        ] {
+            let calls = trace();
+            let local = LocalChainSwapRecoverySnapshotV1 {
+                records: Vec::new(),
+                summary: LocalChainSwapRecoverySnapshotSummaryV1 {
+                    record_count: 0,
+                    chain_inventory_record_count: 0,
+                    chain_inventory: Vec::new(),
+                    active_root_fingerprint: ROOT_SENTINEL.into(),
+                    active_root_legacy_high_water: None,
+                    lineage_high_waters: vec![LocalRecoveryLineageHighWaterV1 {
+                        root_fingerprint: ROOT_SENTINEL.into(),
+                        key_epoch: 1,
+                        derivation_scheme_version: 1,
+                        child_index: local_child_index,
+                    }],
+                },
+            };
+            let report = RecoveryShadowAuditCoordinatorV1::new(
+                fake_witness(&calls, Ok(Vec::new())),
+                fake_local(&calls, Ok(local)),
+                fake_boltz(&calls, Ok(provider.clone())),
+            )
+            .run_once()
+            .await
+            .unwrap();
+
+            assert_eq!(report.manifest_count, 0);
+            assert_eq!(report.boltz.chain_record_count, 0);
+            assert_eq!(report.boltz.reverse_record_count, 1);
+            assert_eq!(report.local.local_record_count, 0);
+            assert_eq!(report.chain_inventory.local_chain_record_count, 0);
+            assert_eq!(report.local.lineage_classifications.manifest_missing, 1);
+            assert_eq!(report.provider_local_high_water_relation, expected_relation);
+            assert_eq!(report.classification, expected_classification);
+            assert_trace(&calls, &["witness", "local", "boltz"]);
+        }
     }
 
     #[tokio::test]
@@ -1561,6 +1643,7 @@ mod tests {
             &boltz_audit,
             &local_audit,
             empty_chain_inventory_report(),
+            Some(14),
         );
 
         assert_eq!(report.manifest_count, 2);
@@ -1615,12 +1698,19 @@ mod tests {
     }
 
     #[test]
-    fn only_local_ahead_is_not_an_unsafe_lineage_difference() {
-        assert!(!RecoveryShadowLineageClassificationsV1 {
-            local_ahead: 1,
-            ..RecoveryShadowLineageClassificationsV1::default()
+    fn allocator_only_and_local_ahead_lineages_defer_to_the_global_high_water_gate() {
+        for classifications in [
+            RecoveryShadowLineageClassificationsV1 {
+                local_ahead: 1,
+                ..RecoveryShadowLineageClassificationsV1::default()
+            },
+            RecoveryShadowLineageClassificationsV1 {
+                manifest_missing: 1,
+                ..RecoveryShadowLineageClassificationsV1::default()
+            },
+        ] {
+            assert!(!classifications.has_unsafe_differences());
         }
-        .has_unsafe_differences());
 
         for classifications in [
             RecoveryShadowLineageClassificationsV1 {
@@ -1631,17 +1721,146 @@ mod tests {
                 local_missing: 1,
                 ..RecoveryShadowLineageClassificationsV1::default()
             },
-            RecoveryShadowLineageClassificationsV1 {
-                manifest_missing: 1,
-                ..RecoveryShadowLineageClassificationsV1::default()
-            },
         ] {
             assert!(classifications.has_unsafe_differences());
         }
     }
 
     #[test]
-    fn local_ahead_is_consistent_when_provider_is_equal_or_behind_local() {
+    fn empty_chain_authorities_accept_allocator_only_reverse_history_when_not_provider_ahead() {
+        let provider = provider_set(vec![provider_record(
+            "ReverseHistoryMustNotEscape",
+            BoltzRestoreKind::Reverse,
+        )]);
+        let manifest_set = SwapManifestSetAuditV1 {
+            manifest_count: 0,
+            last_manifest_sequence: None,
+            last_manifest_id: None,
+            lineage_high_waters: Vec::new(),
+        };
+        let boltz_audit = SwapManifestBoltzAuditV1 {
+            manifest_set: manifest_set.clone(),
+            provider_only_chain_swap_ids: Vec::new(),
+            provider_only_chain_record_count: 0,
+            provider_max_child_index: Some(30),
+        };
+
+        for (local_child_index, expected_relation) in [
+            (30, RecoveryShadowProviderLocalHighWaterRelationV1::Equal),
+            (
+                31,
+                RecoveryShadowProviderLocalHighWaterRelationV1::LocalAhead,
+            ),
+        ] {
+            let local_audit = LocalChainSwapRecoveryAuditV1 {
+                manifest_set: manifest_set.clone(),
+                local_record_count: 0,
+                exact_match_count: 0,
+                manifest_only_chain_swap_ids: Vec::new(),
+                local_only_chain_swap_ids: Vec::new(),
+                lineage_high_waters: vec![LocalRecoveryLineageComparisonV1 {
+                    root_fingerprint: ROOT_SENTINEL.into(),
+                    key_epoch: 1,
+                    derivation_scheme_version: 1,
+                    signed_manifest_child_index: None,
+                    local_child_index: Some(local_child_index),
+                    relation: LocalRecoveryHighWaterRelationV1::ManifestMissing,
+                }],
+            };
+            let report = build_report(
+                &provider,
+                &boltz_audit,
+                &local_audit,
+                empty_chain_inventory_report(),
+                Some(local_child_index),
+            );
+
+            assert_eq!(report.manifest_count, 0);
+            assert_eq!(report.boltz.chain_record_count, 0);
+            assert_eq!(report.local.local_record_count, 0);
+            assert_eq!(report.chain_inventory.local_chain_record_count, 0);
+            assert_eq!(report.local.lineage_classifications.manifest_missing, 1);
+            assert_eq!(report.provider_local_high_water_relation, expected_relation);
+            assert_eq!(
+                report.classification,
+                RecoveryShadowClassificationV1::Consistent
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_root_high_water_cannot_mask_active_root_provider_ahead() {
+        const RETIRED_ROOT: &str = "ffeeddccbbaa9988";
+        let mut local = empty_local_snapshot();
+        local.summary.lineage_high_waters = vec![
+            LocalRecoveryLineageHighWaterV1 {
+                root_fingerprint: ROOT_SENTINEL.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                child_index: 29,
+            },
+            LocalRecoveryLineageHighWaterV1 {
+                root_fingerprint: RETIRED_ROOT.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                child_index: 1_000,
+            },
+        ];
+        let active_high_water = active_root_local_high_water(&local, ROOT_SENTINEL);
+        assert_eq!(active_high_water, Some(29));
+
+        let provider = provider_set(vec![provider_record(
+            "ProviderAheadMustNotEscape",
+            BoltzRestoreKind::Reverse,
+        )]);
+        let mut local_audit = empty_local_audit();
+        local_audit.lineage_high_waters = vec![
+            LocalRecoveryLineageComparisonV1 {
+                root_fingerprint: ROOT_SENTINEL.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                signed_manifest_child_index: None,
+                local_child_index: Some(29),
+                relation: LocalRecoveryHighWaterRelationV1::ManifestMissing,
+            },
+            LocalRecoveryLineageComparisonV1 {
+                root_fingerprint: RETIRED_ROOT.into(),
+                key_epoch: 1,
+                derivation_scheme_version: 1,
+                signed_manifest_child_index: None,
+                local_child_index: Some(1_000),
+                relation: LocalRecoveryHighWaterRelationV1::ManifestMissing,
+            },
+        ];
+        let boltz_audit = SwapManifestBoltzAuditV1 {
+            manifest_set: local_audit.manifest_set.clone(),
+            provider_only_chain_swap_ids: Vec::new(),
+            provider_only_chain_record_count: 0,
+            provider_max_child_index: Some(30),
+        };
+        let report = build_report(
+            &provider,
+            &boltz_audit,
+            &local_audit,
+            empty_chain_inventory_report(),
+            active_high_water,
+        );
+
+        assert_eq!(
+            report.provider_local_high_water_relation,
+            RecoveryShadowProviderLocalHighWaterRelationV1::ProviderAhead
+        );
+        assert_eq!(
+            report.classification,
+            RecoveryShadowClassificationV1::DifferencesClassified
+        );
+        let debug = format!("{report:?}");
+        assert!(!debug.contains(RETIRED_ROOT));
+        assert!(!debug.contains("ProviderAheadMustNotEscape"));
+    }
+
+    #[test]
+    fn nonempty_matching_sources_are_consistent_when_provider_is_not_ahead() {
         let manifest_set = SwapManifestSetAuditV1 {
             manifest_count: 1,
             last_manifest_sequence: Some(1),
@@ -1691,7 +1910,14 @@ mod tests {
                 &provider,
                 &boltz_audit,
                 &local_audit,
-                empty_chain_inventory_report(),
+                RecoveryShadowChainInventoryReportV1 {
+                    local_chain_record_count: 1,
+                    current_v1_record_count: 1,
+                    complete_legacy_record_count: 0,
+                    exact_provider_local_id_count: 1,
+                    legacy_provider_key_count: 0,
+                },
+                Some(local_child_index),
             );
 
             assert_eq!(report.local.lineage_classifications.local_ahead, 1);
@@ -1747,6 +1973,7 @@ mod tests {
             &boltz_audit,
             &local_audit,
             empty_chain_inventory_report(),
+            Some(29),
         );
 
         assert_eq!(report.boltz.coverage, RecoveryShadowCoverageV1::Exact);
