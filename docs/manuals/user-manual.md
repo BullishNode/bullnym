@@ -49,13 +49,14 @@ schema-062 no-funds smoke later failed when a valid private Page checkout note
 reached an obsolete database constraint; the funds gate stayed closed and no
 funds moved. The bounded live-money journey was therefore not started.
 
-PR #179 proposes schema `063_checkout_private_memo` and a fee-refresh handoff
-fix. At the observed candidate head
-`47005c63291d9e37567ae93b70f7dd6e2e273f59`, tree
-`1489239cd96ee7554ff8837991c1a17945f718b9`, this is source behavior only. This
-manual does not claim that candidate is merged, deployed, migrated, or
-journey-certified. This release line changes the server-hosted PWA; it does not
-include a mobile-wallet release.
+PRs #179 and #180 merge schema `063_checkout_private_memo`, the fee-refresh
+handoff fix, strict anonymous checkout input, and Unicode-character note
+validation. Final exact main is
+`f91cc7d1438079e8eca8c018ed3d64487f4264cf`, tree
+`8b5edaf6bcc93655ac37ae1f4e8fe56d6fd9accc`, with terminal-green exact-main
+CI and a verified hosted release artifact. This is source/release behavior
+only; this manual does not call it deployed or certified. This release line
+changes the server-hosted PWA; it does not include a mobile-wallet release.
 
 ## Nyms, aliases, and permanent ownership
 
@@ -454,6 +455,7 @@ deployment identity and public readiness. Exact deployed startup evidence also
 proved the current recovery generation and observed all four private rails
 open on that restart. The Operator Manual records that evidence and its
 limits. The schema-062 no-funds smoke failure and its zero-funds boundary are
-recorded there. Candidate schema-063 behavior was checked at observed PR #179
-head `47005c63291d9e37567ae93b70f7dd6e2e273f59`; the schema-063 no-funds rerun
-and bounded live-money journey remain separate outstanding certification work.
+recorded there. Merged schema-063 source/release behavior was checked at final
+exact main `f91cc7d1438079e8eca8c018ed3d64487f4264cf`; the schema-063 no-funds
+rerun and bounded live-money journey remain separate outstanding certification
+work.
