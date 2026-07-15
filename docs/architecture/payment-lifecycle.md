@@ -373,14 +373,16 @@ Public checkout behavior:
 - single-flight chain swap creation per session and remaining amount
 - do not create a new chain swap after session expiry
 
-Rows created before schema 051 have no creation packet and retain an explicit
-legacy claim fallback. Every post-051 insert must contain the complete packet;
-the database rejects partial packets and freezes both the evidence packet and
-its bound payer instruction, amounts, provider response, ownership, and key
-material. The canonical response digest is rechecked before Liquid claim or
-Bitcoin recovery signing. Emergency Bitcoin commitment remains nullable until
-its signed registration issue is deployed; those rows are therefore not yet
-fully recovery-v3 compliant.
+Automatic recovery has no pre-contract execution mode. Every schedulable chain
+swap must contain the complete immutable creation packet plus an exact current
+recovery-address commitment ID/address pair. The database rejects partial
+packets and freezes both the evidence packet and its bound payer instruction,
+amounts, provider response, ownership, key material, and recovery destination.
+A missing or disputed contract is an integrity/readiness hold and causes no
+provider or chain call. The canonical response digest is rechecked before
+Liquid claim or Bitcoin recovery signing, and every persisted Bitcoin recovery
+attempt must carry complete construction-time fee authority; restart replay
+uses only those exact validated bytes.
 
 Product copy must make settlement clear:
 

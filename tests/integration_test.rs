@@ -38,7 +38,8 @@ use pay_service::boltz_transport::{
 use pay_service::chain_fault_harness::{
     ScriptedBitcoinBroadcastOutcome as FakeBroadcastResult,
     ScriptedBitcoinRecoveryBackend as FakeBitcoinChain,
-    ScriptedBitcoinRecoveryBroadcaster as FakeRecoveryBroadcaster,
+    ScriptedBitcoinRecoveryBroadcaster as FakeRecoveryBroadcaster, ScriptedLiquidBackend,
+    ScriptedLiquidBackendStep,
 };
 use pay_service::chain_swap_creation_permit::{
     ChainSwapCreationPermit, ChainSwapCreationPermitError,
@@ -19093,9 +19094,10 @@ async fn cooperative_signing_late_response_is_exact_or_integrity_held_without_ov
     assert_eq!(provider_fault_operation.request_attempt_count(), 1);
     assert!(provider_fault_operation.provider_response().is_none());
 
-    // Exercise the exact live advance loop with a nonterminal request whose
-    // RefundDue parent already carries Liquid claim bytes. The preflight must
-    // atomically quarantine the operation before provider or Bitcoin work.
+    // A manually injected pre-contract parent is outside the automatic lane
+    // regardless of its later conflict shape. The live advance loop must stop
+    // before provider/Bitcoin work and must not reinterpret or mutate its
+    // historical cooperative record.
     let mut conflict_seed = admin.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
         .execute(&mut *conflict_seed)
@@ -19123,21 +19125,27 @@ async fn cooperative_signing_late_response_is_exact_or_integrity_held_without_ov
             &pay_service::chain_recovery::NoRecoveryFaults,
         )
         .await;
-    assert!(matches!(parent_conflict, Err(AppError::ClaimError(_))));
+    assert!(matches!(
+        parent_conflict,
+        Err(AppError::ClaimError(message))
+            if message.contains("current immutable recovery-address contract")
+    ));
     assert_eq!(parent_conflict_calls.load(Ordering::SeqCst), 0);
-    let held_parent_conflict =
+    let unchanged_parent_conflict =
         pay_service::db::get_chain_swap_cooperative_signing(&runtime, requested_fault_row.id)
             .await
             .unwrap()
             .unwrap();
     assert_eq!(
-        held_parent_conflict.state(),
-        CooperativeSigningState::IntegrityHold
+        unchanged_parent_conflict.state(),
+        CooperativeSigningState::Requested
     );
-    assert_eq!(held_parent_conflict.version(), 3);
-    assert_eq!(held_parent_conflict.request_attempt_count(), 1);
-    assert!(held_parent_conflict.provider_response().is_none());
-    assert!(held_parent_conflict.integrity_reason_sha256().is_some());
+    assert_eq!(unchanged_parent_conflict.version(), 2);
+    assert_eq!(unchanged_parent_conflict.request_attempt_count(), 1);
+    assert!(unchanged_parent_conflict.provider_response().is_none());
+    assert!(unchanged_parent_conflict
+        .integrity_reason_sha256()
+        .is_none());
     let persisted_parent: (String, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT status, claim_txid, claim_tx_hex FROM chain_swap_records WHERE id = $1",
     )
@@ -21443,6 +21451,41 @@ fn midrange_bitcoin_fee_decision() -> pay_service::fee_policy::BitcoinFeeDecisio
     bitcoin_fee_decision(2.0)
 }
 
+fn bitcoin_fee_record_with_cap(
+    decision: &pay_service::fee_policy::BitcoinFeeDecision,
+    cap: f64,
+) -> pay_service::fee_decision_record::FeeDecisionRecord {
+    use pay_service::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
+    use pay_service::fee_policy::{BitcoinFeePolicy, FeeFreshness, SatPerVbyte};
+
+    let evaluated_at_unix = match decision.freshness() {
+        FeeFreshness::Fresh { age_secs, .. } => {
+            decision.observed_at_unix().checked_add(age_secs).unwrap()
+        }
+        freshness => panic!("test fee decision is not construction-fresh: {freshness:?}"),
+    };
+    let policy = BitcoinFeePolicy::new(
+        SatPerVbyte::try_from(1.0).unwrap(),
+        SatPerVbyte::try_from(cap).unwrap(),
+        120,
+        900,
+    )
+    .unwrap();
+    FeeDecisionRecord::from_bitcoin(
+        FeeConstructionPurpose::BitcoinRecovery,
+        decision,
+        &policy,
+        evaluated_at_unix,
+    )
+    .unwrap()
+}
+
+fn bitcoin_fee_record(
+    decision: &pay_service::fee_policy::BitcoinFeeDecision,
+) -> pay_service::fee_decision_record::FeeDecisionRecord {
+    bitcoin_fee_record_with_cap(decision, 500.0)
+}
+
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 struct PersistedRecoveryFeeDecision {
     fee_decision_purpose: String,
@@ -21536,6 +21579,17 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FakeRecoveryBuilder
             .push(fee_decision.rate().as_f64());
         self.construct_for_fee_decision(fee_decision)
     }
+
+    async fn construct_automatic(
+        &self,
+        swap: &pay_service::db::ChainSwapRecord,
+        destination_address: &str,
+        fee_decision: pay_service::builder_fee::BitcoinBuilderFeeDecision,
+        _path: pay_service::chain_swap_runtime_evidence::AutomaticFallbackConstructionPath,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        self.construct(swap, destination_address, fee_decision)
+            .await
+    }
 }
 
 struct FeeSensitiveRecoveryBuilder {
@@ -21579,6 +21633,17 @@ impl pay_service::chain_recovery::BitcoinRecoveryBuilder for FeeSensitiveRecover
             .await
             .push(hex::encode(bitcoin::consensus::serialize(&transaction)));
         Ok(BtcLikeTransaction::Bitcoin(transaction))
+    }
+
+    async fn construct_automatic(
+        &self,
+        swap: &pay_service::db::ChainSwapRecord,
+        destination_address: &str,
+        fee_decision: pay_service::builder_fee::BitcoinBuilderFeeDecision,
+        _path: pay_service::chain_swap_runtime_evidence::AutomaticFallbackConstructionPath,
+    ) -> Result<BtcLikeTransaction, AppError> {
+        self.construct(swap, destination_address, fee_decision)
+            .await
     }
 }
 
@@ -21641,7 +21706,7 @@ impl pay_service::chain_recovery::RecoveryFaultInjector for DelayedRecoveryFault
 struct RecoveryJournalHarness {
     swap: pay_service::db::ChainSwapRecord,
     builder: Arc<FakeRecoveryBuilder>,
-    fee_decision: pay_service::fee_policy::BitcoinFeeDecision,
+    fee_record: pay_service::fee_decision_record::FeeDecisionRecord,
     chain: Arc<FakeBitcoinChain>,
     broadcaster: Arc<FakeRecoveryBroadcaster>,
     source_txid: String,
@@ -21720,6 +21785,7 @@ async fn seed_recovery_journal_harness(
     };
     let source_txid = source_tx.compute_txid().to_string();
     let fee_decision = midrange_bitcoin_fee_decision();
+    let fee_record = bitcoin_fee_record(&fee_decision);
     let recovery_template = bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -21790,13 +21856,196 @@ async fn seed_recovery_journal_harness(
     RecoveryJournalHarness {
         swap,
         builder,
-        fee_decision,
+        fee_record,
         chain,
         broadcaster,
         source_txid,
         expected_txid,
         expected_raw_hex,
     }
+}
+
+#[tokio::test]
+async fn current_only_automatic_recovery_missing_contract_refuses_without_network_on_restart() {
+    use pay_service::chain_fallback::AutomaticFallbackScheduleOutcome;
+    use pay_service::chain_recovery::NoRecoveryFaults;
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (_, _, _, seeded) = seed_merchant_invoice_swap(
+        &pool,
+        "currentonlymissingcontract",
+        "current-only-missing-contract",
+        JOURNAL_LOCKUP_ADDRESS,
+        100_000,
+        99_000,
+    )
+    .await;
+    pay_service::db::mark_chain_swap_refund_due(&pool, seeded.id)
+        .await
+        .unwrap();
+
+    let liquid = Arc::new(ScriptedLiquidBackend::new(std::iter::empty::<
+        ScriptedLiquidBackendStep,
+    >()));
+    let mut state = test_state(pool.clone());
+    state.utxo_backend = Some(liquid.clone());
+    let provider_calls = AtomicUsize::new(0);
+    let before: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT status, refund_address, refund_txid, \
+                (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(seeded.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    for _restart in 0..2 {
+        assert_eq!(
+            pay_service::chain_fallback::schedule_automatic_fallback(&state, seeded.id)
+                .await
+                .unwrap(),
+            AutomaticFallbackScheduleOutcome::IntegrityHold
+        );
+        let result = pay_service::chain_recovery::exercise_cooperative_signing_advance_for_test(
+            &state,
+            seeded.id,
+            None,
+            &provider_calls,
+            &NoRecoveryFaults,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError::ClaimError(message))
+                if message.contains("current immutable recovery-address contract")
+        ));
+    }
+
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    assert!(liquid.calls().is_empty());
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, seeded.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pay_service::db::get_chain_swap_cooperative_signing(&pool, seeded.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT status, refund_address, refund_txid, \
+                (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(seeded.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before, "refusal and restart must be read-only");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn current_only_automatic_recovery_missing_fee_authority_refuses_without_network_on_restart()
+{
+    use pay_service::chain_recovery::{
+        execute_journaled_recovery_with_optional_fee_services,
+        execute_journaled_recovery_with_services, NoRecoveryFaults, RecoveryFaultPoint,
+    };
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let harness =
+        seed_recovery_journal_harness(&pool, "curfeeauth", [FakeBroadcastResult::Accept]).await;
+    let stop_after_journal =
+        OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
+    assert!(execute_journaled_recovery_with_services(
+        &pool,
+        harness.swap.id,
+        harness.builder.as_ref(),
+        &harness.fee_record,
+        harness.chain.as_ref(),
+        harness.broadcaster.as_ref(),
+        &stop_after_journal,
+    )
+    .await
+    .is_err());
+    assert!(stop_after_journal.fired.load(Ordering::SeqCst));
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert!(harness.broadcaster.calls().is_empty());
+
+    let attempt = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .expect("the kill boundary follows the immutable journal commit");
+    assert_eq!(attempt.raw_tx_hex, harness.expected_raw_hex);
+    let chain_calls_before_restart = harness.chain.calls();
+    let durable_before = recovery_replay_snapshot(&pool, harness.swap.id).await;
+
+    let mut corrupt = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corrupt)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts SET \
+             fee_decision_purpose = NULL, fee_decision_rail = NULL, \
+             fee_decision_target = NULL, fee_decision_source = NULL, \
+             fee_decision_rate_sat_vb = NULL, fee_decision_quoted_at_unix = NULL, \
+             fee_decision_evaluated_at_unix = NULL, \
+             fee_decision_freshness_age_secs = NULL, \
+             fee_decision_freshness_max_age_secs = NULL, \
+             fee_decision_provenance = NULL, \
+             fee_decision_policy_floor_sat_vb = NULL, \
+             fee_decision_policy_cap_sat_vb = NULL, \
+             fee_decision_policy_version = NULL \
+         WHERE id = $1",
+    )
+    .bind(attempt.id)
+    .execute(&mut *corrupt)
+    .await
+    .unwrap();
+    corrupt.commit().await.unwrap();
+
+    for _restart in 0..2 {
+        let result = execute_journaled_recovery_with_optional_fee_services(
+            &pool,
+            harness.swap.id,
+            harness.builder.as_ref(),
+            None,
+            harness.chain.as_ref(),
+            harness.broadcaster.as_ref(),
+            &NoRecoveryFaults,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError::ClaimError(message))
+                if message.contains("missing current persisted fee authority")
+        ));
+    }
+
+    assert_eq!(harness.builder.calls.load(Ordering::SeqCst), 1);
+    assert!(harness.broadcaster.calls().is_empty());
+    assert_eq!(harness.chain.calls(), chain_calls_before_restart);
+    assert_eq!(
+        recovery_replay_snapshot(&pool, harness.swap.id).await,
+        durable_before,
+        "invalid replay authority must not mutate the parent or journal"
+    );
+    let reloaded = pay_service::db::get_bitcoin_recovery_attempt(&pool, harness.swap.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.raw_tx_hex, harness.expected_raw_hex);
+
+    cleanup_db(&pool).await;
 }
 
 async fn seed_liquid_merchant_settlement_attempt(pool: &PgPool, suffix: &str) -> (Uuid, String) {
@@ -23026,7 +23275,7 @@ async fn closed_admission_still_completes_existing_chain_recovery() {
         &state.db,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23068,7 +23317,7 @@ async fn automatic_fallback_worklist_redrives_refunding_journal_after_restart() 
             &pool,
             harness.swap.id,
             harness.builder.as_ref(),
-            &harness.fee_decision,
+            &harness.fee_record,
             harness.chain.as_ref(),
             harness.broadcaster.as_ref(),
             &fault,
@@ -23103,7 +23352,7 @@ async fn automatic_fallback_worklist_redrives_refunding_journal_after_restart() 
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23144,7 +23393,7 @@ async fn exact_recovery_replay_preserves_stale_settlement_eligibility_and_eviden
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23270,7 +23519,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
             &pool,
             harness.swap.id,
             harness.builder.as_ref(),
-            &harness.fee_decision,
+            &harness.fee_record,
             harness.chain.as_ref(),
             harness.broadcaster.as_ref(),
             &fault,
@@ -23312,7 +23561,7 @@ async fn recovery_journal_resumes_safely_at_every_irreversible_boundary() {
                 &pool,
                 harness.swap.id,
                 harness.builder.as_ref(),
-                &harness.fee_decision,
+                &harness.fee_record,
                 harness.chain.as_ref(),
                 harness.broadcaster.as_ref(),
                 &NoRecoveryFaults,
@@ -23418,13 +23667,14 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
     // journal exists. A later eligible attempt is therefore allowed to use a
     // changed decision and construct different bytes.
     let minimum_decision = bitcoin_fee_decision(1.0);
+    let minimum_record = bitcoin_fee_record(&minimum_decision);
     let before_journal =
         OneShotRecoveryFault::at(RecoveryFaultPoint::AfterConstructionBeforeJournal);
     assert!(execute_journaled_recovery_with_services(
         &pool,
         harness.swap.id,
         &builder,
-        &minimum_decision,
+        &minimum_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &before_journal,
@@ -23443,13 +23693,14 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
     let after_commit =
         OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
     let maximum_decision = bitcoin_fee_decision(500.0);
+    let maximum_record = bitcoin_fee_record(&maximum_decision);
     let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match execute_journaled_recovery_with_services(
             &pool,
             harness.swap.id,
             &builder,
-            &maximum_decision,
+            &maximum_record,
             harness.chain.as_ref(),
             harness.broadcaster.as_ref(),
             &after_commit,
@@ -23509,16 +23760,17 @@ async fn changed_fee_applies_before_journal_and_no_quote_replays_persisted_bytes
     // Estimator movement after the journal commit cannot authorize new bytes
     // or rewrite the decision evidence bound to the committed transaction.
     // This decision is valid under its originating policy but outside the
-    // compatibility seam's default 500 sat/vB cap. Existing-byte replay must
-    // ignore it rather than rebuilding current construction authority.
+    // committed attempt's 500 sat/vB cap. Existing-byte replay must ignore it
+    // rather than rebuilding current construction authority.
     let moved_estimator_decision = bitcoin_fee_decision_with_cap(750.0, 1_000.0);
+    let moved_estimator_record = bitcoin_fee_record_with_cap(&moved_estimator_decision, 1_000.0);
     let replay_fault =
         OneShotRecoveryFault::at(RecoveryFaultPoint::AfterJournalCommitBeforeBroadcast);
     let replay_result = execute_journaled_recovery_with_services(
         &pool,
         harness.swap.id,
         &builder,
-        &moved_estimator_decision,
+        &moved_estimator_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &replay_fault,
@@ -23587,14 +23839,22 @@ async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
         1_000,
         FeeProvenance::new("expiring-integration-test").unwrap(),
     );
-    let expiring_decision = BitcoinFeePolicy::new(
+    let expiring_policy = BitcoinFeePolicy::new(
         SatPerVbyte::try_from(1.0).unwrap(),
         SatPerVbyte::try_from(500.0).unwrap(),
         3,
         900,
     )
-    .unwrap()
-    .decide_typed(Some(&observation), None, 1_000)
+    .unwrap();
+    let expiring_decision = expiring_policy
+        .decide_typed(Some(&observation), None, 1_000)
+        .unwrap();
+    let expiring_record = pay_service::fee_decision_record::FeeDecisionRecord::from_bitcoin(
+        pay_service::fee_decision_record::FeeConstructionPurpose::BitcoinRecovery,
+        &expiring_decision,
+        &expiring_policy,
+        1_000,
+    )
     .unwrap();
     let delayed_commit = DelayedRecoveryFault::at(
         RecoveryFaultPoint::AfterJournalWriteBeforeCommit,
@@ -23605,7 +23865,7 @@ async fn fee_authority_expiring_after_journal_write_rolls_back_before_commit() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &expiring_decision,
+        &expiring_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &delayed_commit,
@@ -23685,7 +23945,7 @@ async fn unjournaled_recovery_without_a_quote_stays_retryable_and_constructs_no_
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23716,7 +23976,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23731,7 +23991,7 @@ async fn recovery_journal_reconciles_accepted_response_loss_without_rebroadcast(
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23761,7 +24021,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23778,7 +24038,7 @@ async fn recovery_journal_retries_identical_bytes_after_rejection() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23806,7 +24066,7 @@ async fn recovery_ambiguity_result_rejects_a_stale_broadcast_start_token() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23879,7 +24139,7 @@ async fn recovery_journal_preserves_systemic_broadcast_failure_scope() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23908,7 +24168,7 @@ async fn recovery_journal_rejects_a_phantom_success_txid() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23956,7 +24216,7 @@ async fn recovery_journal_rejects_destination_drift_before_commit_or_broadcast()
         &pool,
         harness.swap.id,
         &bad_builder,
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -23993,7 +24253,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &fault,
@@ -24013,7 +24273,7 @@ async fn recovery_journal_unknown_outspend_enters_integrity_hold() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -24043,7 +24303,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -24052,7 +24312,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -24068,7 +24328,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -24099,7 +24359,7 @@ async fn concurrent_recovery_workers_share_one_immutable_intent() {
 }
 
 #[tokio::test]
-async fn legacy_refunding_without_journal_is_never_reconstructed() {
+async fn refunding_without_journal_is_never_reconstructed() {
     use pay_service::chain_recovery::{execute_journaled_recovery_with_services, NoRecoveryFaults};
 
     let pool = test_pool().await;
@@ -24114,7 +24374,7 @@ async fn legacy_refunding_without_journal_is_never_reconstructed() {
         &pool,
         harness.swap.id,
         harness.builder.as_ref(),
-        &harness.fee_decision,
+        &harness.fee_record,
         harness.chain.as_ref(),
         harness.broadcaster.as_ref(),
         &NoRecoveryFaults,
@@ -26649,10 +26909,14 @@ impl AtomicManifestPersistenceFixture {
             insert_test_invoice(pool, nym, &npub, &format!("lq1atomic{nym}"), 3_600).await;
         let boltz_swap_id = format!("AtomicManifest{child_index}");
         let claim_scalar = u8::try_from((child_index / 100).rem_euclid(100) + 1).unwrap();
-        let preimage = boltz_client::util::secrets::Preimage::from_str(
-            &format!("{claim_scalar:02x}").repeat(32),
-        )
-        .unwrap();
+        let preimage_hex = format!("{claim_scalar:02x}").repeat(32);
+        let preimage = boltz_client::util::secrets::Preimage::from_str(&preimage_hex).unwrap();
+        let mut claim_secret = [0_u8; 32];
+        claim_secret[31] = claim_scalar;
+        let claim_key_hex = hex::encode(claim_secret);
+        let mut refund_secret = [0_u8; 32];
+        refund_secret[31] = claim_scalar + 100;
+        let refund_key_hex = hex::encode(refund_secret);
         let claim_public_key = atomic_manifest_public_key(claim_scalar);
         let refund_public_key = atomic_manifest_public_key(claim_scalar + 100);
         let provider = atomic_manifest_provider_fixture(
@@ -26739,9 +27003,9 @@ impl AtomicManifestPersistenceFixture {
             lockup_address,
             lockup_bip21,
             canonical_provider_response,
-            preimage_hex: "aa".repeat(32),
-            claim_key_hex: "bb".repeat(32),
-            refund_key_hex: "cc".repeat(32),
+            preimage_hex,
+            claim_key_hex,
+            refund_key_hex,
             root_fingerprint,
             claim_child_index: child_index,
             refund_child_index,
@@ -26907,6 +27171,222 @@ impl AtomicManifestPersistenceFixture {
         .await
         .unwrap()
     }
+}
+
+#[derive(Clone)]
+struct CurrentRecoveryBitcoinState {
+    lockup_address: String,
+    source_txid: String,
+    source_raw_hex: String,
+    source_height: u32,
+    source_block_hash: String,
+    tip_height: u32,
+    tip_hash: String,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+struct CurrentRecoveryBitcoinServer {
+    base_url: String,
+    source_txid: String,
+    calls: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CurrentRecoveryBitcoinServer {
+    async fn spawn(lockup_address: &str, amount_sat: u64) -> Self {
+        let lockup_script = bitcoin::Address::from_str(lockup_address)
+            .unwrap()
+            .require_network(bitcoin::Network::Bitcoin)
+            .unwrap()
+            .script_pubkey();
+        let source = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(amount_sat),
+                script_pubkey: lockup_script,
+            }],
+        };
+        let source_txid = source.compute_txid().to_string();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = CurrentRecoveryBitcoinState {
+            lockup_address: lockup_address.to_owned(),
+            source_txid: source_txid.clone(),
+            source_raw_hex: hex::encode(bitcoin::consensus::serialize(&source)),
+            source_height: 958_033,
+            source_block_hash: "22".repeat(32),
+            tip_height: 958_034,
+            tip_hash: "11".repeat(32),
+            calls: calls.clone(),
+        };
+        let app = Router::new()
+            .fallback(any(current_recovery_bitcoin_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            source_txid,
+            calls,
+            task,
+        }
+    }
+}
+
+impl Drop for CurrentRecoveryBitcoinServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn current_recovery_bitcoin_handler(
+    State(state): State<CurrentRecoveryBitcoinState>,
+    uri: axum::http::Uri,
+) -> Response {
+    let path = uri.path().to_owned();
+    state.calls.lock().await.push(path.clone());
+    let status = json!({
+        "confirmed": true,
+        "block_height": state.source_height,
+        "block_hash": state.source_block_hash,
+    });
+    let (response_status, body) = if path == "/blocks/tip/height" {
+        (StatusCode::OK, state.tip_height.to_string())
+    } else if path == format!("/block-height/{}", state.tip_height) {
+        (StatusCode::OK, state.tip_hash.clone())
+    } else if path == format!("/block-height/{}", state.source_height) {
+        (StatusCode::OK, state.source_block_hash.clone())
+    } else if path == format!("/address/{}/txs", state.lockup_address) {
+        (
+            StatusCode::OK,
+            json!([{"txid": state.source_txid, "status": status}]).to_string(),
+        )
+    } else if path == format!("/tx/{}/status", state.source_txid) {
+        (StatusCode::OK, status.to_string())
+    } else if path == format!("/tx/{}/hex", state.source_txid) {
+        (StatusCode::OK, state.source_raw_hex.clone())
+    } else if path == format!("/tx/{}/outspend/0", state.source_txid) {
+        (StatusCode::OK, json!({"spent": false}).to_string())
+    } else {
+        (StatusCode::NOT_FOUND, "not found".into())
+    };
+    Response::builder()
+        .status(response_status)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn current_only_automatic_recovery_schedules_current_contract_idempotently() {
+    use pay_service::chain_fallback::AutomaticFallbackScheduleOutcome;
+    use pay_service::utxo::{LiquidHistorySnapshot, LiquidHistorySnapshotOutcome};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fixture = AtomicManifestPersistenceFixture::seed(&pool, "curautosuccess", 40_001).await;
+    let store = coordinator_manifest_store(InstrumentedManifestObjectStore::new());
+    let persisted = fixture
+        .persist(&pool, &store, Uuid::new_v4(), None)
+        .await
+        .unwrap();
+    let bitcoin = CurrentRecoveryBitcoinServer::spawn(
+        &fixture.lockup_address,
+        u64::try_from(persisted.user_lock_amount_sat).unwrap(),
+    )
+    .await;
+    let liquid_snapshot = LiquidHistorySnapshot {
+        authority: "current-only-liquid-agreement".into(),
+        tip_height: 3_972_216,
+        tip_hash: "33".repeat(32),
+        entries: Vec::new(),
+        anchored_block_hashes: std::collections::BTreeMap::new(),
+    };
+    let liquid = Arc::new(ScriptedLiquidBackend::new([
+        ScriptedLiquidBackendStep::AutomaticFallbackLiquidHistorySnapshot(Box::new(Ok(
+            LiquidHistorySnapshotOutcome::Complete(liquid_snapshot.clone()),
+        ))),
+        ScriptedLiquidBackendStep::AutomaticFallbackLiquidHistorySnapshot(Box::new(Ok(
+            LiquidHistorySnapshotOutcome::Complete(liquid_snapshot),
+        ))),
+    ]));
+    let mut state = test_state(pool.clone());
+    state.bitcoin_lockup_witness_adapter = Some(Arc::new(
+        pay_service::chain_lockup_witness_adapter::BitcoinLockupWitnessAdapterV1::try_new(
+            vec![bitcoin.base_url.clone()],
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    ));
+    state.utxo_backend = Some(liquid.clone());
+
+    let first_schedule =
+        pay_service::chain_fallback::schedule_automatic_fallback(&state, persisted.id)
+            .await
+            .unwrap();
+    let first_bitcoin_calls = bitcoin.calls.lock().await.clone();
+    assert_eq!(
+        first_schedule,
+        AutomaticFallbackScheduleOutcome::Scheduled,
+        "Bitcoin calls: {first_bitcoin_calls:?}; Liquid calls: {:?}",
+        liquid.calls()
+    );
+    let scheduled: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT status, refund_address, refund_txid, \
+                (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(persisted.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(scheduled.0, "refund_due");
+    assert_eq!(
+        scheduled.1.as_deref(),
+        Some(ATOMIC_MANIFEST_EMERGENCY_ADDRESS)
+    );
+    assert!(scheduled.2.is_none());
+
+    assert_eq!(
+        pay_service::chain_fallback::schedule_automatic_fallback(&state, persisted.id)
+            .await
+            .unwrap(),
+        AutomaticFallbackScheduleOutcome::AlreadyDue
+    );
+    let restarted: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT status, refund_address, refund_txid, \
+                (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT \
+           FROM chain_swap_records WHERE id = $1",
+    )
+    .bind(persisted.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        restarted, scheduled,
+        "restart must preserve the queue marker"
+    );
+    assert_eq!(liquid.remaining_steps(), 0);
+    assert_eq!(liquid.calls().len(), 2);
+    assert!(!bitcoin.calls.lock().await.is_empty());
+    assert_eq!(bitcoin.source_txid.len(), 64);
+    assert!(
+        pay_service::db::get_bitcoin_recovery_attempt(&pool, persisted.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "scheduling must not fabricate transaction bytes or fee authority"
+    );
+
+    cleanup_db(&pool).await;
 }
 
 struct PausingChainSwapPersistenceFault {

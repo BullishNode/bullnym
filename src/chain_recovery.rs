@@ -53,7 +53,7 @@ use crate::db::{
 };
 use crate::error::AppError;
 use crate::fee_decision_record::{FeeConstructionPurpose, FeeDecisionRecord};
-use crate::fee_policy::{BitcoinFeeDecision, BitcoinFeePolicy, FeeFreshness};
+use crate::fee_policy::BitcoinFeeDecision;
 use crate::fee_runtime::FeeRuntime;
 use crate::swap_manifest_runtime::CooperativeSigningNonceEnvelopeV1;
 use crate::AppState;
@@ -111,19 +111,15 @@ pub trait BitcoinRecoveryBuilder: Send + Sync {
     ) -> Result<BtcLikeTransaction, AppError>;
 
     /// Automatic execution must choose the spend path from fresh under-lock
-    /// evidence. Test builders retain the compatibility default; the live
-    /// builder overrides it so a pre-timeout failure can never fall through to
-    /// the unilateral script path.
+    /// evidence. Every implementation names this boundary explicitly so a
+    /// pre-timeout failure can never inherit an unreviewed unilateral default.
     async fn construct_automatic(
         &self,
         swap: &ChainSwapRecord,
         destination_address: &str,
         fee_decision: BitcoinBuilderFeeDecision,
-        _path: AutomaticFallbackConstructionPath,
-    ) -> Result<BtcLikeTransaction, AppError> {
-        self.construct(swap, destination_address, fee_decision)
-            .await
-    }
+        path: AutomaticFallbackConstructionPath,
+    ) -> Result<BtcLikeTransaction, AppError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1483,6 +1479,20 @@ pub async fn exercise_cooperative_signing_advance_for_test(
     advance_cooperative_signing_operation(state, chain_swap_id, &provider, faults).await
 }
 
+fn require_current_automatic_recovery_contract(swap: &ChainSwapRecord) -> Result<(), AppError> {
+    let current_shape = swap.creation_terms.as_ref().is_some_and(|terms| {
+        terms.recovery_address_commitment_id.is_some()
+            && terms.merchant_emergency_btc_address.is_some()
+    });
+    if current_shape {
+        Ok(())
+    } else {
+        Err(AppError::ClaimError(
+            "automatic recovery row lacks the current immutable recovery-address contract".into(),
+        ))
+    }
+}
+
 async fn cooperative_requested_intent_is_stale(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     chain_swap_id: Uuid,
@@ -1767,6 +1777,7 @@ async fn advance_cooperative_signing_operation(
             .map_err(|_| AppError::DbError("cooperative signing parent read failed".into()))?
             .ok_or_else(|| AppError::ClaimError("cooperative signing parent is missing".into()))?;
         let status = swap.parsed_status().map_err(AppError::DbError)?;
+        require_current_automatic_recovery_contract(&swap)?;
         if db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
             .await
             .map_err(|_| AppError::DbError("cooperative signing attempt read failed".into()))?
@@ -1795,7 +1806,7 @@ async fn advance_cooperative_signing_operation(
         }
         if status != ChainSwapStatus::RefundDue {
             if status == ChainSwapStatus::Refunding {
-                // Preserve the core executor's legacy-ambiguity refusal when
+                // Preserve the core executor's unjournaled-intent refusal when
                 // no cooperative intent remains capable of local signing.
                 tx.commit()
                     .await
@@ -1812,8 +1823,51 @@ async fn advance_cooperative_signing_operation(
             ));
         }
 
+        if let Some(operation) = operation.as_ref() {
+            match operation.state() {
+                db::CooperativeSigningState::Prepared => {
+                    persist_cooperative_integrity_hold_in_transaction(
+                        &mut tx,
+                        chain_swap_id,
+                        operation.version(),
+                        b"bullnym/cooperative-signing/prepared-state-unsupported/v1",
+                    )
+                    .await?;
+                    tx.commit().await.map_err(|_| {
+                        AppError::DbError(
+                            "prepared cooperative integrity hold commit failed".into(),
+                        )
+                    })?;
+                    return Err(AppError::ClaimError(
+                        "prepared cooperative signing intent is not a current executable state"
+                            .into(),
+                    ));
+                }
+                db::CooperativeSigningState::Completed => {
+                    return Err(AppError::ClaimError(
+                        "completed cooperative signing has no immutable recovery attempt".into(),
+                    ));
+                }
+                db::CooperativeSigningState::IntegrityHold => {
+                    return Err(AppError::ClaimError(
+                        "cooperative signing operation is on integrity hold".into(),
+                    ));
+                }
+                db::CooperativeSigningState::Requested
+                | db::CooperativeSigningState::Ambiguous
+                | db::CooperativeSigningState::ResponseReceived
+                | db::CooperativeSigningState::Superseded => {}
+            }
+        }
+
         let authority =
             collect_automatic_fallback_evidence_under_lock(state, &mut tx, &swap, None).await?;
+        if authority.committed_destination().is_none() {
+            return Err(AppError::ClaimError(
+                "automatic recovery row fails the current immutable recovery-address contract"
+                    .into(),
+            ));
+        }
         if !authority.dependencies_available() {
             return Err(AppError::ElectrumError(
                 "cooperative signing evidence dependencies are unavailable".into(),
@@ -1885,34 +1939,11 @@ async fn advance_cooperative_signing_operation(
         };
 
         match operation.state() {
-            db::CooperativeSigningState::Prepared => match path {
-                Some(AutomaticFallbackConstructionPath::Cooperative) => {
-                    validate_cooperative_operation_authority(&operation, &authority, &swap, true)?;
-                    return Err(AppError::RecoveryNotAvailable(
-                        "legacy prepared cooperative intent cannot authorize a provider call"
-                            .into(),
-                    ));
-                }
-                Some(AutomaticFallbackConstructionPath::Unilateral) => {
-                    validate_cooperative_operation_authority(&operation, &authority, &swap, false)?;
-                    db::supersede_chain_swap_cooperative_signing_at_unilateral_timeout_in_transaction(
-                        &mut tx,
-                        chain_swap_id,
-                        operation.version(),
-                    )
-                    .await
-                    .map_err(cooperative_store_error)?;
-                    tx.commit().await.map_err(|_| {
-                        AppError::DbError("cooperative signing supersede commit failed".into())
-                    })?;
-                    return Ok(());
-                }
-                None => {
-                    return Err(AppError::RecoveryNotAvailable(
-                        "prepared cooperative signing intent lacks current authority".into(),
-                    ));
-                }
-            },
+            db::CooperativeSigningState::Prepared => {
+                return Err(AppError::ClaimError(
+                    "prepared cooperative signing intent escaped its integrity hold".into(),
+                ));
+            }
             db::CooperativeSigningState::Requested => {
                 if path == Some(AutomaticFallbackConstructionPath::Unilateral) {
                     validate_cooperative_operation_authority(&operation, &authority, &swap, false)?;
@@ -2096,10 +2127,6 @@ pub(crate) async fn execute_journaled_recovery_automatically(
     state: &AppState,
     chain_swap_id: Uuid,
 ) -> Result<String, AppError> {
-    let evidence = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
-        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
-    })?;
-    let endpoints = evidence.endpoints().to_vec();
     let cooperative_provider = LiveCooperativeSigningProvider {
         api_url: state.config.boltz.api_url.clone(),
     };
@@ -2110,6 +2137,11 @@ pub(crate) async fn execute_journaled_recovery_automatically(
         &NoRecoveryFaults,
     )
     .await?;
+
+    let evidence = state.bitcoin_recovery_backend.as_deref().ok_or_else(|| {
+        AppError::ElectrumError("Bitcoin recovery evidence client is unavailable".into())
+    })?;
+    let endpoints = evidence.endpoints().to_vec();
 
     // The cooperative state machine either committed the exact final attempt
     // or positively yielded to the timeout-safe unilateral builder. The core
@@ -2131,16 +2163,16 @@ pub(crate) async fn execute_journaled_recovery_automatically(
     .await
 }
 
-/// Testable write-ahead executor.  This is public only to let the external DB
-/// integration target supply deterministic boundary fakes. `fee_decision`
+/// Testable write-ahead executor. This is public only to let the external DB
+/// integration target supply deterministic boundary fakes. `fee_record`
 /// applies only when no journaled attempt exists; retries always reuse the
-/// committed bytes and their immutable actual-fee evidence.
+/// committed bytes and their immutable construction authority.
 #[doc(hidden)]
 pub async fn execute_journaled_recovery_with_services(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
-    fee_decision: &BitcoinFeeDecision,
+    fee_record: &FeeDecisionRecord,
     evidence: &dyn BitcoinRecoveryEvidence,
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
@@ -2149,7 +2181,7 @@ pub async fn execute_journaled_recovery_with_services(
         pool,
         chain_swap_id,
         builder,
-        Some(fee_decision),
+        Some(fee_record),
         evidence,
         broadcaster,
         faults,
@@ -2157,19 +2189,19 @@ pub async fn execute_journaled_recovery_with_services(
     .await
 }
 
-/// Optional-fee integration seam used to prove that committed bytes can be
-/// resumed without a fresh quote while new construction remains pending.
+/// Optional-authority integration seam used to prove that committed bytes can
+/// be resumed without fresh construction authority.
 #[doc(hidden)]
 pub async fn execute_journaled_recovery_with_optional_fee_services(
     pool: &sqlx::PgPool,
     chain_swap_id: Uuid,
     builder: &dyn BitcoinRecoveryBuilder,
-    fee_decision: Option<&BitcoinFeeDecision>,
+    fee_record: Option<&FeeDecisionRecord>,
     evidence: &dyn BitcoinRecoveryEvidence,
     broadcaster: &dyn BitcoinRecoveryBroadcaster,
     faults: &dyn RecoveryFaultInjector,
 ) -> Result<String, AppError> {
-    let construction_fee = RecoveryConstructionFee::compatibility(fee_decision);
+    let construction_fee = RecoveryConstructionFee::persisted(fee_record);
     execute_journaled_recovery_with_builder_fee(
         pool,
         chain_swap_id,
@@ -2186,30 +2218,21 @@ pub async fn execute_journaled_recovery_with_optional_fee_services(
 }
 
 struct RecoveryConstructionFee<'a> {
-    builder_decision: Option<BitcoinBuilderFeeDecision>,
     record: Option<&'a FeeDecisionRecord>,
-    compatibility_record: Option<Result<FeeDecisionRecord, AppError>>,
     runtime: Option<&'a FeeRuntime>,
 }
 
 impl<'a> RecoveryConstructionFee<'a> {
-    fn compatibility(decision: Option<&BitcoinFeeDecision>) -> Self {
+    const fn persisted(record: Option<&'a FeeDecisionRecord>) -> Self {
         Self {
-            builder_decision: decision.map(BitcoinBuilderFeeDecision::from),
-            record: None,
-            // Capture the monotonic authority before any pool/lock wait, but
-            // defer an unusable-record error until the core proves that no
-            // committed bytes exist to replay.
-            compatibility_record: decision.map(bitcoin_fee_record_for_compatibility_seam),
+            record,
             runtime: None,
         }
     }
 
     const fn runtime(runtime: &'a FeeRuntime) -> Self {
         Self {
-            builder_decision: None,
             record: None,
-            compatibility_record: None,
             runtime: Some(runtime),
         }
     }
@@ -2565,6 +2588,14 @@ async fn prepare_or_reload_attempt(
     let existing = db::get_bitcoin_recovery_attempt_for_update(&mut tx, chain_swap_id)
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
+    if matches!(mode, RecoveryExecutionMode::Automatic(_)) {
+        require_current_automatic_recovery_contract(&swap)?;
+    }
+    if let Some(attempt) = existing.as_ref() {
+        // Refuse an incomplete authority packet before automatic mode contacts
+        // either chain. Exact-byte replay is current-contract replay only.
+        validate_reloaded_attempt(attempt)?;
+    }
     let (automatic_authority, automatic_construction_path) = match mode {
         RecoveryExecutionMode::InjectedHarness => (None, None),
         RecoveryExecutionMode::Automatic(state) => {
@@ -2575,6 +2606,12 @@ async fn prepare_or_reload_attempt(
                 existing.as_ref(),
             )
             .await?;
+            if collected.committed_destination().is_none() {
+                return Err(AppError::ClaimError(
+                    "automatic recovery row fails the current immutable recovery-address contract"
+                        .into(),
+                ));
+            }
             if !collected.dependencies_available() {
                 return Err(AppError::ElectrumError(
                     "automatic fallback evidence dependencies are unavailable".into(),
@@ -2603,9 +2640,6 @@ async fn prepare_or_reload_attempt(
     };
 
     if let Some(attempt) = existing {
-        // Validate the immutable bytes and their construction-time authority
-        // before repairing any parent lifecycle state.
-        validate_reloaded_attempt(&attempt)?;
         if let Some(authority) = automatic_authority.as_ref() {
             let path = classify_automatic_attempt_path(&attempt, &swap)?;
             let decision = classify_authoritative_automatic_attempt(
@@ -2665,12 +2699,12 @@ async fn prepare_or_reload_attempt(
 
     if status == ChainSwapStatus::Refunding {
         tracing::error!(
-            event = "chain_swap_legacy_recovery_ambiguity",
+            event = "chain_swap_unjournaled_recovery_integrity",
             chain_swap_id = %chain_swap_id,
-            "legacy `refunding` row has no write-ahead transaction; refusing to reconstruct"
+            "`refunding` row has no write-ahead transaction; refusing to reconstruct"
         );
         return Err(AppError::ClaimError(
-            "legacy in-flight recovery has no committed transaction bytes; integrity review required"
+            "in-flight recovery has no committed transaction bytes; integrity review required"
                 .into(),
         ));
     }
@@ -2695,9 +2729,6 @@ async fn prepare_or_reload_attempt(
             AppError::ClaimError("chain swap recovery has no committed destination".into())
         })?,
     };
-    // Compatibility authority was captured before the pool/lock wait, but its
-    // result is deliberately inspected only after the existing-journal branch:
-    // replay never consults new-construction authority.
     let runtime_fee = construction_fee
         .runtime
         .map(|runtime| {
@@ -2708,21 +2739,13 @@ async fn prepare_or_reload_attempt(
                 })
         })
         .transpose()?;
-    let compatibility_record = construction_fee.compatibility_record.transpose()?;
-    let fee_decision = runtime_fee
-        .as_ref()
-        .map(|(decision, _)| BitcoinBuilderFeeDecision::from(decision))
-        .or(construction_fee.builder_decision)
-        .ok_or_else(|| {
-            AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
-        })?;
     let fee_record = construction_fee
         .record
         .or_else(|| runtime_fee.as_ref().map(|(_, record)| record))
-        .or(compatibility_record.as_ref())
         .ok_or_else(|| {
             AppError::RecoveryNotAvailable(BITCOIN_FEE_DECISION_PENDING_REASON.into())
         })?;
+    let fee_decision = BitcoinBuilderFeeDecision::from(fee_record);
     if !fee_record.authorizes_construction_now() {
         return Err(AppError::RecoveryNotAvailable(
             BITCOIN_FEE_DECISION_PENDING_REASON.into(),
@@ -2803,9 +2826,9 @@ async fn prepare_or_reload_attempt(
 }
 
 /// Reconcile a restarted attempt before incrementing its durable broadcast
-/// counter. This replaces the legacy first-success backend read with a fresh,
-/// coherent primary packet and lets an already-observed transaction complete
-/// without recording a broadcast call that never happened.
+/// counter. A fresh coherent primary packet lets an already-observed
+/// transaction complete without recording a broadcast call that never
+/// happened.
 async fn preflight_automatic_attempt_under_lock(
     state: &AppState,
     chain_swap_id: Uuid,
@@ -3664,30 +3687,6 @@ impl PreparedAttempt {
     }
 }
 
-fn bitcoin_fee_record_for_compatibility_seam(
-    decision: &BitcoinFeeDecision,
-) -> Result<FeeDecisionRecord, AppError> {
-    let evaluated_at_unix =
-        match decision.freshness() {
-            FeeFreshness::Fresh { age_secs, .. } => decision
-                .observed_at_unix()
-                .checked_add(age_secs)
-                .ok_or_else(|| AppError::ClaimError("fee decision clock overflow".into()))?,
-            _ => {
-                return Err(AppError::RecoveryNotAvailable(
-                    BITCOIN_FEE_DECISION_PENDING_REASON.into(),
-                ))
-            }
-        };
-    FeeDecisionRecord::from_bitcoin(
-        FeeConstructionPurpose::BitcoinRecovery,
-        decision,
-        &BitcoinFeePolicy::default(),
-        evaluated_at_unix,
-    )
-    .map_err(|error| AppError::ClaimError(format!("invalid Bitcoin fee decision record: {error}")))
-}
-
 fn validate_reloaded_attempt(attempt: &ChainSwapTxAttempt) -> Result<(), AppError> {
     let raw = hex::decode(&attempt.raw_tx_hex)
         .map_err(|e| AppError::ClaimError(format!("decode journaled recovery hex: {e}")))?;
@@ -3785,6 +3784,11 @@ fn validate_reloaded_fee_intent(
     if stored_fee_rate_sat_vb.to_bits() != derived_fee_rate_sat_vb.to_bits() {
         return Err(AppError::ClaimError(
             "journaled recovery bytes do not match the committed fee rate".into(),
+        ));
+    }
+    if fee_authority.is_legacy() {
+        return Err(AppError::ClaimError(
+            "journaled Bitcoin recovery is missing current persisted fee authority".into(),
         ));
     }
     let final_vbytes = u64::try_from(final_vsize)
@@ -4435,16 +4439,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_replay_still_binds_raw_fee_amount_and_exact_rate() {
+    fn replay_without_current_fee_authority_is_refused_after_raw_fee_validation() {
         let (tx, sources, fee_amount_sat, fee_rate_sat_vb) = replay_fee_fixture();
-        validate_reloaded_fee_intent(
+        let error = validate_reloaded_fee_intent(
             &sources,
             &tx,
             fee_amount_sat,
             fee_rate_sat_vb,
             &BitcoinRecoveryFeeAuthority::Legacy,
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::AppError::ClaimError(message)
+                if message.contains("missing current persisted fee authority")
+        ));
 
         assert!(validate_reloaded_fee_intent(
             &sources,
