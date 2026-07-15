@@ -40,6 +40,7 @@ pub struct LnurlPayMetadata {
 // --- Callback params ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallbackParams {
     pub amount: u64,
     pub comment: Option<String>,
@@ -56,12 +57,6 @@ pub struct CallbackParams {
     pub value: Option<u64>,
     pub value_bf: Option<String>,
     pub asset_bf: Option<String>,
-    /// Approach A (legacy) fields. Accepted-but-ignored for forward/backward
-    /// compat: a client still sending a `blinding_key`/`asset` must not 422.
-    #[allow(dead_code)]
-    pub blinding_key: Option<String>,
-    #[allow(dead_code)]
-    pub asset: Option<String>,
 }
 
 struct ProofFields {

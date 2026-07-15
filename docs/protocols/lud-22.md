@@ -51,8 +51,9 @@ A public client requesting `L-BTC` also supplies every Approach B proof field:
 
 `value_bf` and `asset_bf` use Elements display order, exactly as
 `TxOutSecrets::to_string()` emits them. They are not raw internal byte-order
-hex. Legacy `blinding_key` and `asset` query fields are accepted but ignored;
-they do not replace any required Approach B field.
+hex. The callback accepts only the fields documented here. Retired Approach A
+fields such as `blinding_key` and `asset`, and all other unknown fields, are
+rejected instead of being silently ignored.
 
 Configured IP-whitelisted callers bypass proof and rate-limit gates. Public
 wallet integrations must never rely on that operator-only exception.

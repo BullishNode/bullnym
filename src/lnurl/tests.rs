@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn callback_contract_rejects_retired_approach_a_fields() {
+    for retired in ["blinding_key", "asset"] {
+        let mut request = serde_json::json!({ "amount": 100_000 });
+        request[retired] = serde_json::Value::String("00".repeat(32));
+
+        let error = match serde_json::from_value::<CallbackParams>(request) {
+            Ok(_) => panic!("retired LUD-22 fields must not be silently accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains(retired));
+    }
+}
+
+#[test]
+fn callback_contract_accepts_only_current_approach_b_fields() {
+    let request = serde_json::json!({
+        "amount": 100_000,
+        "payment_method": "L-BTC",
+        "outpoint": format!("{}:0", "00".repeat(32)),
+        "pubkey": format!("02{}", "11".repeat(32)),
+        "sig": "3000",
+        "value": 1_000,
+        "value_bf": "22".repeat(32),
+        "asset_bf": "33".repeat(32),
+    });
+
+    serde_json::from_value::<CallbackParams>(request)
+        .expect("the current LUD-22 callback shape must remain accepted");
+}
+
+#[test]
 fn metadata_is_valid_json() {
     let meta = build_metadata("francis", "bullpay.ca");
     let parsed: serde_json::Value = serde_json::from_str(&meta).unwrap();
