@@ -16,9 +16,10 @@ use boltz_client::error::Error as BoltzClientError;
 use boltz_client::swaps::boltz::{
     BoltzApiClientV2, CreateChainRequest, CreateChainResponse, CreateReverseRequest,
     CreateReverseResponse, GetChainPairsResponse, GetReversePairsResponse, GetSwapResponse,
-    HeightResponse, SwapRestoreResponse,
+    HeightResponse, SwapRestoreResponse, SwapTree,
 };
 use boltz_client::util::secrets::SwapMasterKey;
+use boltz_client::PublicKey;
 use sha2::{Digest, Sha256};
 
 use crate::boltz::{ChainSwapQuoteProviderError, ChainSwapQuoteProviderErrorKind};
@@ -82,6 +83,64 @@ pub struct HttpBoltzTransport {
     base_url: String,
     quote_client: reqwest::Client,
     restore_fetcher: Option<crate::boltz_restore_fetch::BoltzRestoreFetcher>,
+}
+
+/// Fixed-checkout-only compatibility envelope for Boltz create responses.
+///
+/// Boltz may omit `onchainAmount` after accepting the exact value in the
+/// request. Serde's typed struct decoder rejects duplicate known fields; the
+/// custom field decoder also distinguishes an absent field from an explicit
+/// `null`. The ordinary reverse transport continues to use the pinned SDK
+/// response type without this compatibility rule.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FixedCheckoutReverseResponseWire {
+    id: String,
+    #[serde(default)]
+    invoice: Option<String>,
+    swap_tree: SwapTree,
+    lockup_address: String,
+    refund_public_key: PublicKey,
+    timeout_block_height: u32,
+    #[serde(default, deserialize_with = "deserialize_present_onchain_amount")]
+    onchain_amount: Option<u64>,
+    #[serde(default)]
+    blinding_key: Option<String>,
+}
+
+fn deserialize_present_onchain_amount<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <u64 as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+impl FixedCheckoutReverseResponseWire {
+    fn normalize_from_request(
+        self,
+        requested_onchain_amount_sat: u64,
+    ) -> Result<CreateReverseResponse, BoltzClientError> {
+        let onchain_amount = match self.onchain_amount {
+            None => requested_onchain_amount_sat,
+            Some(actual) if actual == requested_onchain_amount_sat => actual,
+            Some(_) => {
+                return Err(BoltzClientError::Protocol(
+                    "fixed-checkout reverse response onchainAmount did not match immutable request authority"
+                        .into(),
+                ));
+            }
+        };
+        Ok(CreateReverseResponse {
+            id: self.id,
+            invoice: self.invoice,
+            swap_tree: self.swap_tree,
+            lockup_address: self.lockup_address,
+            refund_public_key: self.refund_public_key,
+            timeout_block_height: self.timeout_block_height,
+            onchain_amount,
+            blinding_key: self.blinding_key,
+        })
+    }
 }
 
 impl HttpBoltzTransport {
@@ -198,8 +257,10 @@ impl BoltzTransport for HttpBoltzTransport {
             ));
         }
         let mut deserializer = serde_json::Deserializer::from_slice(&body);
-        serde_path_to_error::deserialize::<_, CreateReverseResponse>(&mut deserializer).map_err(
-            |error| {
+        let response = serde_path_to_error::deserialize::<_, FixedCheckoutReverseResponseWire>(
+            &mut deserializer,
+        )
+        .map_err(|error| {
                 let inner = error.inner();
                 let serde_error = match inner.classify() {
                     serde_json::error::Category::Io => "io",
@@ -215,8 +276,8 @@ impl BoltzTransport for HttpBoltzTransport {
                     inner.column(),
                     safe_keys.join(","),
                 ))
-            },
-        )
+            })?;
+        response.normalize_from_request(onchain_amount_sat)
     }
 
     async fn create_chain(
@@ -722,7 +783,13 @@ impl ScriptedBoltzWebhookPlan {
 
 #[cfg(test)]
 mod response_diagnostic_tests {
-    use super::{safe_reverse_response_keys, safe_serde_path};
+    use super::{safe_reverse_response_keys, safe_serde_path, FixedCheckoutReverseResponseWire};
+
+    fn fixed_checkout_wire_error(body: &[u8]) -> serde_path_to_error::Error<serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_slice(body);
+        serde_path_to_error::deserialize::<_, FixedCheckoutReverseResponseWire>(&mut deserializer)
+            .expect_err("fixture must fail typed fixed-checkout decoding")
+    }
 
     #[test]
     fn response_diagnostics_never_copy_provider_values_or_unknown_key_names() {
@@ -738,5 +805,28 @@ mod response_diagnostic_tests {
         assert_eq!(safe_serde_path("swapTree.claimLeaf"), "swapTree.claimLeaf");
         assert_eq!(safe_serde_path("field\nsecret"), "<redacted>");
         assert_eq!(safe_serde_path(&"a".repeat(129)), "<redacted>");
+    }
+
+    #[test]
+    fn fixed_checkout_typed_boundary_rejects_duplicate_known_fields() {
+        let error = fixed_checkout_wire_error(br#"{"onchainAmount":1020,"onchainAmount":1020}"#);
+        assert!(
+            error
+                .inner()
+                .to_string()
+                .contains("duplicate field `onchainAmount`"),
+            "unexpected duplicate-field error: {error}"
+        );
+        assert_eq!(error.path().to_string(), ".");
+    }
+
+    #[test]
+    fn fixed_checkout_typed_boundary_does_not_treat_null_as_omission() {
+        let error = fixed_checkout_wire_error(br#"{"onchainAmount":null}"#);
+        assert!(
+            error.inner().to_string().contains("expected u64"),
+            "unexpected explicit-null error: {error}"
+        );
+        assert_eq!(error.path().to_string(), "onchainAmount");
     }
 }
