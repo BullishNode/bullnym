@@ -357,7 +357,8 @@ scripts/check-migration-058-boundary.sh \
 # Complete the stopped-writer cutover and then the private-comment schema.
 for later_migration in \
   migrations/059_remove_surface_alias.sql \
-  migrations/060_lnurl_private_comment_intents.sql; do
+  migrations/060_lnurl_private_comment_intents.sql \
+  migrations/061_invoice_quote_versions.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \
@@ -427,4 +428,4 @@ if scripts/check-migration-053-boundary.sh \
   exit 1
 fi
 
-echo "migration-053/060 test: runtime-role refusals and privileged bootstrap passed"
+echo "migration-053/061 test: runtime-role refusals and privileged bootstrap passed"
