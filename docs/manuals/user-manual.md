@@ -23,7 +23,7 @@ lifetimes and fiat quotes:
 | Behavior | Status at the time of writing |
 |---|---|
 | Permanent nym ownership, independent Lightning Address/Page/PoS availability, private Lightning payer comments, automatic recovery supervision | Deployed |
-| 30-day invoice outer lifetime, quote database foundation, and stricter automatic-recovery safety checks | Merged in source `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`, not deployed |
+| 30-day invoice outer lifetime, quote database foundation, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Merged in source `746444166a41f2a42faa8bc0615c423150ac3c6f`, not deployed |
 | Five-minute payer-demand fiat quotes, observation-time fiat credit, atomic browser refresh, and PoS Bitcoin warning | Locked behavior with unmerged implementation branches; not deployed |
 
 Production still uses a maximum seven-day invoice lifetime and converts a fiat
@@ -388,7 +388,7 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Current behavior was checked against the deployed probe above, Bullnym source
-and tests at `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`, the product/API/
+and tests at `746444166a41f2a42faa8bc0615c423150ac3c6f`, the product/API/
 architecture documents in this repository, and these read-only authority
 records:
 

@@ -18,7 +18,7 @@ This revision deliberately separates three kinds of evidence:
 Exact revisions used for this manual:
 
 - deployed Bullnym: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
-- source authority inspected: `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`, tree `070e5fa660615aa66736084955abeb05106f7fce`, schema 061;
+- source authority inspected: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`, schema 061;
 - unmerged quote/valuation runtime: `f6275b6b97064fd7572e3d04e0450d0b9e21d244`;
 - unmerged cumulative fiat-credit policy: `5d4670178029c35c08b34c7e9f802922a7c57095`;
 - unmerged atomic quote PWA: `d6be7bc60f17d530b6f69f6b572cbb8a25ce9128`;
@@ -45,6 +45,14 @@ provider or chain calls and enters an integrity/readiness hold. Every persisted
 Bitcoin recovery attempt must also retain complete construction-time fee
 authority; incomplete authority cannot construct or replay transaction bytes.
 This hardening is **main only**, not present on the deployed SHA above.
+
+Main now also enforces the current-only public identity surface merged in
+`746444166a41f2a42faa8bc0615c423150ac3c6f`. It preserves permanent ownership
+and offline supervision while removing pre-launch compatibility paths,
+including the tokenless LNURL callback, legacy Payment Page media fields, and
+legacy payout/surface modes. Migrations 058 and 059 now require a proven empty
+database at this cutover rather than inferring ownership from historical rows.
+These changes are **main only** and are not present on the deployed SHA.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the release record. A newer deployment can change the labels above.
@@ -190,6 +198,14 @@ Migrations 050, 051, 053, 057, 059, and 060 have explicit stopped-writer or
 roll-forward constraints documented in `docs/operations/deployment.md`.
 Schema 061 adds the quote foundation but does not activate runtime quote
 refresh. Never infer product capability from table existence alone.
+
+At source `746444166a41f2a42faa8bc0615c423150ac3c6f`, migrations 058 and 059
+are current-only empty-state guards: they require all user, surface, invoice,
+swap, allocation, and returned-address history to be empty before creating the
+permanent-name registry and removing pre-launch fields. The deployed schema-060
+marker does not prove that production ran these newer migration contents. Do
+not apply rewritten migrations to an existing database; use only the approved
+fresh-database cutover and exact release migration sequence.
 
 The locked program permits a fresh-database cutover because the product has no
 users, but that is an exceptional release decision, not routine maintenance.
