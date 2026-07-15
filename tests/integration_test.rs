@@ -29427,7 +29427,6 @@ async fn issue84_offline_page_owner_keeps_exactly_one_chain_offer_and_lnurl_stay
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,

@@ -215,10 +215,9 @@ if scripts/check-migration-053-boundary.sh \
 fi
 
 # Advance the same empty disposable database through the 058 stopped-writer
-# preflight first.  Migration 059 consumes and removes these review objects, so
-# its final registry boundary cannot stand in for this exact intermediate gate.
-# The non-empty candidate/resolution/drift rehearsal belongs to test-db's
-# upgrade lane; this lane verifies the empty bootstrap and runtime-role ACLs.
+# preflight first. Migration 058 deliberately creates no compatibility or
+# review objects; its exact intermediate boundary is an empty database with the
+# pre-cutover surface columns still present.
 for later_migration in \
   migrations/054_fee_policy_authority.sql \
   migrations/055_merchant_settlement_lifecycle.sql \
@@ -233,6 +232,18 @@ for later_migration in \
     <"$later_migration" >/dev/null
 done
 
+# The historical bootstrap migrations granted application access to the old
+# role name. Model the production role handoff so the operator probe itself is
+# exercised as the supplied current runtime role.
+admin_sql success "
+  GRANT SELECT ON users, donation_pages, invoices, swap_records,
+    chain_swap_records, outpoint_addresses, swap_key_allocations,
+    swap_key_legacy_high_water, recovery_address_commitments,
+    rate_limit_events, nym_access_events, processed_webhook_events,
+    watcher_lane_progress, fee_last_known_good_observations
+  TO bullnym_app;
+"
+
 migration_058_probe="$(
   scripts/check-migration-058-boundary.sh \
     "$ENV_FILE" bullnym_app success
@@ -243,114 +254,44 @@ migration_058_probe="$(
 }
 
 admin_sql success "
-  SET ROLE migration_owner;
-  ALTER TABLE public_name_migration_choices
-    DISABLE TRIGGER public_name_migration_choices_guard;
+  INSERT INTO users (nym, npub, ct_descriptor)
+  VALUES ('precutover', repeat('1', 64), 'descriptor');
 "
 if scripts/check-migration-058-boundary.sh \
     "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
-  echo "migration-058 test: probe accepted a disabled snapshot guard" >&2
+  echo "migration-058 test: probe accepted nonempty source state" >&2
   exit 1
 fi
-admin_sql success "
-  SET ROLE migration_owner;
-  ALTER TABLE public_name_migration_choices
-    ENABLE TRIGGER public_name_migration_choices_guard;
-"
-scripts/check-migration-058-boundary.sh \
-  "$ENV_FILE" bullnym_app success >/dev/null
-
-admin_sql success "
-  SET ROLE migration_owner;
-  CREATE OR REPLACE FUNCTION guard_public_name_migration_choice()
-  RETURNS TRIGGER
-  LANGUAGE plpgsql
-  AS \$guard\$
-  BEGIN
-      IF TG_OP = 'DELETE' THEN
-          RETURN OLD;
-      END IF;
-      RETURN NEW;
-  END
-  \$guard\$;
-"
-if scripts/check-migration-058-boundary.sh \
-    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
-  echo "migration-058 test: probe accepted a no-op snapshot guard body" >&2
+if docker exec --interactive "$CONTAINER" \
+    psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --username "$PG_USER" --dbname success \
+      --command 'SET ROLE migration_owner' \
+      --set runtime_role=bullnym_app --file=- \
+    <migrations/059_remove_surface_alias.sql >/dev/null 2>&1; then
+  echo "migration-059 test: nonempty cutover unexpectedly succeeded" >&2
   exit 1
 fi
-admin_sql success "
-  SET ROLE migration_owner;
-  CREATE OR REPLACE FUNCTION guard_public_name_migration_choice()
-  RETURNS TRIGGER
-  LANGUAGE plpgsql
-  AS \$guard\$
-  BEGIN
-      IF TG_OP = 'DELETE' THEN
-          RAISE EXCEPTION 'public-name migration candidate snapshot is immutable'
-              USING ERRCODE = '23000',
-                    CONSTRAINT = 'public_name_migration_snapshot_immutable';
-      END IF;
-      IF NEW.owner_npub IS DISTINCT FROM OLD.owner_npub
-         OR NEW.candidate_nyms IS DISTINCT FROM OLD.candidate_nyms
-         OR NEW.active_nym IS DISTINCT FROM OLD.active_nym
-         OR NEW.candidate_aliases IS DISTINCT FROM OLD.candidate_aliases THEN
-          RAISE EXCEPTION 'public-name migration candidate snapshot is immutable'
-              USING ERRCODE = '23000',
-                    CONSTRAINT = 'public_name_migration_snapshot_immutable';
-      END IF;
-      RETURN NEW;
-  END
-  \$guard\$;
-"
-scripts/check-migration-058-boundary.sh \
-  "$ENV_FILE" bullnym_app success >/dev/null
-
-admin_sql success "
-  SET ROLE migration_owner;
-  GRANT SELECT (owner_npub)
-    ON public_name_migration_choices TO bullnym_app;
-"
-if scripts/check-migration-058-boundary.sh \
-    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
-  echo "migration-058 test: probe accepted a choices column ACL escape" >&2
+nonempty_refusal_intact="$(
+  docker exec "$CONTAINER" \
+    psql --no-psqlrc --set ON_ERROR_STOP=1 \
+      --username "$PG_USER" --dbname success \
+      --tuples-only --no-align --command "
+        SELECT (
+          to_regclass('public.public_names') IS NULL
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'donation_pages'
+               AND column_name = 'alias'
+          )
+        )::INT
+      "
+)"
+[[ "$nonempty_refusal_intact" == "1" ]] || {
+  echo "migration-059 test: nonempty refusal mutated the pre-cutover schema" >&2
   exit 1
-fi
-admin_sql success "
-  SET ROLE migration_owner;
-  REVOKE SELECT (owner_npub)
-    ON public_name_migration_choices FROM bullnym_app;
-  GRANT SELECT (owner_npub)
-    ON public_name_migration_merchant_communications TO bullnym_app;
-"
-if scripts/check-migration-058-boundary.sh \
-    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
-  echo "migration-058 test: probe accepted a review-view column ACL escape" >&2
-  exit 1
-fi
-admin_sql success "
-  SET ROLE migration_owner;
-  REVOKE SELECT (owner_npub)
-    ON public_name_migration_merchant_communications FROM bullnym_app;
-"
-scripts/check-migration-058-boundary.sh \
-  "$ENV_FILE" bullnym_app success >/dev/null
-
-admin_sql success "
-  SET ROLE migration_owner;
-  GRANT INSERT, UPDATE
-    ON public_name_migration_merchant_communications TO bullnym_app;
-"
-if scripts/check-migration-058-boundary.sh \
-    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
-  echo "migration-058 test: probe accepted review-view write privileges" >&2
-  exit 1
-fi
-admin_sql success "
-  SET ROLE migration_owner;
-  REVOKE INSERT, UPDATE
-    ON public_name_migration_merchant_communications FROM bullnym_app;
-"
+}
+admin_sql success "DELETE FROM users WHERE nym = 'precutover';"
 scripts/check-migration-058-boundary.sh \
   "$ENV_FILE" bullnym_app success >/dev/null
 
@@ -400,6 +341,42 @@ scripts/check-migration-059-boundary.sh \
 
 admin_sql success "
   SET ROLE migration_owner;
+  GRANT UPDATE ON public_names TO bullnym_app;
+"
+if scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-059 test: probe accepted runtime UPDATE authority" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  REVOKE UPDATE ON public_names FROM bullnym_app;
+  GRANT INSERT (id) ON public_names TO bullnym_app;
+"
+if scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-059 test: probe accepted runtime id insertion" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  REVOKE INSERT (id) ON public_names FROM bullnym_app;
+  GRANT EXECUTE ON FUNCTION reject_public_name_mutation() TO bullnym_app;
+"
+if scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-059 test: probe accepted trigger-function execution authority" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  REVOKE EXECUTE ON FUNCTION reject_public_name_mutation() FROM bullnym_app;
+"
+scripts/check-migration-059-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
+admin_sql success "
+  SET ROLE migration_owner;
   ALTER TABLE donation_pages ADD COLUMN alias TEXT;
 "
 if scripts/check-migration-059-boundary.sh \
@@ -410,6 +387,22 @@ fi
 admin_sql success "
   SET ROLE migration_owner;
   ALTER TABLE donation_pages DROP COLUMN alias;
+"
+scripts/check-migration-059-boundary.sh \
+  "$ENV_FILE" bullnym_app success >/dev/null
+
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE donation_pages ADD COLUMN pos_mode BOOLEAN;
+"
+if scripts/check-migration-059-boundary.sh \
+    "$ENV_FILE" bullnym_app success >/dev/null 2>&1; then
+  echo "migration-059 test: probe accepted restored pos_mode authority" >&2
+  exit 1
+fi
+admin_sql success "
+  SET ROLE migration_owner;
+  ALTER TABLE donation_pages DROP COLUMN pos_mode;
 "
 scripts/check-migration-059-boundary.sh \
   "$ENV_FILE" bullnym_app success >/dev/null
