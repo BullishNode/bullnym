@@ -1729,6 +1729,11 @@ pub enum VersionedPayerInstruction {
         address: String,
         payer_amount_sat: i64,
     },
+    BitcoinDirect {
+        address: String,
+        bip21: String,
+        payer_amount_sat: i64,
+    },
     LightningBoltzReverse {
         quote_offer_id: Uuid,
         pr: String,
@@ -1799,15 +1804,20 @@ fn payer_quote_rail_availability(invoice: &db::Invoice) -> Option<PayerQuoteRail
     }
     let payable = invoice_payment_rails_are_payable(invoice);
     let checkout_descriptor_surface = invoice.origin == "checkout" && invoice.nym_owner.is_some();
+    let wallet_direct_bitcoin =
+        invoice.origin == "wallet" && invoice.accept_btc && invoice.bitcoin_address.is_some();
     Some(PayerQuoteRailAvailability {
         lightning: payable && invoice.accept_ln,
         liquid: payable
             && invoice.accept_liquid
             && invoice.liquid_address.is_some()
             && invoice.liquid_blinding_key_hex.is_some(),
-        // Checkout Bitcoin is provider-backed and settles to Liquid. Direct
-        // wallet Bitcoin remains unavailable in this quote contract.
-        bitcoin: payable && checkout_descriptor_surface && invoice.liquid_address.is_some(),
+        // Checkout/POS Bitcoin remains provider-backed and settles to Liquid.
+        // Wallet-origin Bitcoin pays the stable invoice address directly; its
+        // version-bound quote changes only the amount and BIP21 envelope.
+        bitcoin: payable
+            && (wallet_direct_bitcoin
+                || (checkout_descriptor_surface && invoice.liquid_address.is_some())),
     })
 }
 
@@ -2219,6 +2229,26 @@ async fn versioned_instruction_for_rail(
             })
         }
         PayerQuoteRail::Bitcoin => {
+            if invoice.origin == "wallet" {
+                if !invoice.accept_btc {
+                    return Err(AppError::InvalidAmount(
+                        "invoice does not accept Bitcoin".into(),
+                    ));
+                }
+                let address = invoice.bitcoin_address.clone().ok_or_else(|| {
+                    AppError::DbError(
+                        "direct Bitcoin quote is missing its stable invoice address".into(),
+                    )
+                })?;
+                let amount_sat = u64::try_from(quote.merchant_amount_sat).map_err(|_| {
+                    AppError::DbError("direct Bitcoin quote amount is invalid".into())
+                })?;
+                return Ok(VersionedPayerInstruction::BitcoinDirect {
+                    bip21: build_direct_bitcoin_bip21(&address, amount_sat),
+                    address,
+                    payer_amount_sat: quote.merchant_amount_sat,
+                });
+            }
             let (offer_id, offer) =
                 ensure_versioned_bitcoin_chain_offer(state, invoice, quote).await?;
             let bip21 = offer.lockup_bip21.ok_or_else(|| {
@@ -2956,6 +2986,12 @@ fn build_bitcoin_chain_bip21(address: &str, amount_sat: u64, message: &str) -> S
     format!(
         "bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}&label=Send%20to%20L-BTC%20address&message={message}"
     )
+}
+
+fn build_direct_bitcoin_bip21(address: &str, amount_sat: u64) -> String {
+    let whole_btc = amount_sat / 100_000_000;
+    let fractional_sat = amount_sat % 100_000_000;
+    format!("bitcoin:{address}?amount={whole_btc}.{fractional_sat:08}")
 }
 
 fn percent_encode_query_value(value: &str) -> String {

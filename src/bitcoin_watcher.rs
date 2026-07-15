@@ -345,6 +345,9 @@ pub struct BitcoinWatcher {
     tolerances: db::InvoiceAccountingTolerances,
     http: reqwest::Client,
     pool: PgPool,
+    /// Optional in hermetic evidence-only tests; production always supplies
+    /// the same validated pricer used by direct Liquid observation.
+    pricer: Option<Arc<crate::pricer::PricerClient>>,
     bucket: Arc<AsyncMutex<TokenBucket>>,
     rbf_capabilities: Arc<AsyncMutex<BTreeMap<String, bool>>>,
 }
@@ -366,9 +369,17 @@ impl BitcoinWatcher {
             tolerances,
             http,
             pool,
+            pricer: None,
             bucket,
             rbf_capabilities: Arc::new(AsyncMutex::new(BTreeMap::new())),
         })
+    }
+
+    /// Attach the production fiat-rate source used to value exact direct-chain
+    /// first-observation boundaries.
+    pub fn with_pricer(mut self, pricer: Arc<crate::pricer::PricerClient>) -> Self {
+        self.pricer = Some(pricer);
+        self
     }
 
     /// Top-level loop. Returns when `cancel` fires.
@@ -909,18 +920,83 @@ impl BitcoinWatcher {
                 .iter()
                 .map(BtcDirectObservation::as_reducer_observation)
                 .collect();
-            let applied = db::apply_direct_observation_batch(
-                &self.pool,
-                db::DirectObservationBatch {
-                    invoice_id: inv.id,
-                    source: db::DirectPaymentSource::Bitcoin,
-                    authority: ep,
-                    generation,
-                    observations: &reducer_observations,
-                },
-                self.tolerances,
-            )
-            .await;
+            let batch = db::DirectObservationBatch {
+                invoice_id: inv.id,
+                source: db::DirectPaymentSource::Bitcoin,
+                authority: ep,
+                generation,
+                observations: &reducer_observations,
+            };
+            let rate = if reducer_observations.is_empty() {
+                None
+            } else {
+                match (self.pricer.as_deref(), inv.fiat_currency.as_deref()) {
+                    (Some(pricer), Some(currency)) => match pricer.get_rate(currency).await {
+                        Ok(rate) => Some(rate),
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "invoice_late_direct_pricer_unavailable",
+                                invoice_id = %inv.id,
+                                currency,
+                                error = %error,
+                                "direct Bitcoin observation will remain unvalued unless a durable covering quote already exists"
+                            );
+                            None
+                        }
+                    },
+                    _ => None,
+                }
+            };
+            let applied = if let Some(rate) = rate.as_ref() {
+                let candidate = db::NewInvoiceQuoteVersion {
+                    rate_minor_per_btc: rate.minor_per_btc,
+                    rate_source: &rate.source,
+                    rate_observed_at_unix: match i64::try_from(rate.observed_at_unix) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            tracing::error!(
+                                event = "bitcoin_watcher_pricer_timestamp_invalid",
+                                invoice_id = %inv.id,
+                                "pricer observation timestamp exceeds storage"
+                            );
+                            return InvoiceCheckOutcome::Failed;
+                        }
+                    },
+                    rate_fetched_at_unix: match i64::try_from(rate.fetched_at_unix) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            tracing::error!(
+                                event = "bitcoin_watcher_pricer_timestamp_invalid",
+                                invoice_id = %inv.id,
+                                "pricer fetch timestamp exceeds storage"
+                            );
+                            return InvoiceCheckOutcome::Failed;
+                        }
+                    },
+                    rate_fresh_until_unix: match i64::try_from(rate.expires_at_unix) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            tracing::error!(
+                                event = "bitcoin_watcher_pricer_timestamp_invalid",
+                                invoice_id = %inv.id,
+                                "pricer freshness timestamp exceeds storage"
+                            );
+                            return InvoiceCheckOutcome::Failed;
+                        }
+                    },
+                    minimum_merchant_amount_sat: 1,
+                    maximum_merchant_amount_sat: i64::MAX,
+                };
+                db::apply_direct_observation_batch_with_rate_candidate(
+                    &self.pool,
+                    batch,
+                    &candidate,
+                    self.tolerances,
+                )
+                .await
+            } else {
+                db::apply_direct_observation_batch(&self.pool, batch, self.tolerances).await
+            };
             return match applied {
                 Ok(db::ApplyDirectObservationOutcome::Applied { changed }) => {
                     tracing::info!(
@@ -2282,6 +2358,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: address.to_string(),
             amount_sat: 50_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2398,6 +2475,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: address.to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2488,6 +2566,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2566,6 +2645,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2635,6 +2715,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2710,6 +2791,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 4_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2768,6 +2850,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
         assert_eq!(MAX_KNOWN_DIRECT_TXIDS, 64);
@@ -2871,6 +2954,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
 
@@ -2975,6 +3059,7 @@ mod tests {
             id: Uuid::new_v4(),
             bitcoin_address: "bc1qtarget".to_string(),
             amount_sat: 6_000,
+            fiat_currency: None,
             created_at_cursor: "2026-07-12 12:00:00+00".to_string(),
         };
         let old = watch_evidence(&old_txid, 0, 6_000);

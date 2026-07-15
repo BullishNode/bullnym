@@ -119,7 +119,8 @@ const BITCOIN_WATCHER_PRIORITY_PREDICATE: &str = "( \
            )";
 
 const BITCOIN_WATCHER_PAGE_SQL_TEMPLATE: &str = "SELECT \
-            id, bitcoin_address, amount_sat, created_at::TEXT AS created_at_cursor \
+            id, bitcoin_address, amount_sat, fiat_currency, \
+            created_at::TEXT AS created_at_cursor \
      FROM invoices \
      WHERE {eligible} \
        AND {lane_predicate} \
@@ -167,6 +168,9 @@ pub struct BitcoinWatcherInvoicePageRow {
     pub id: Uuid,
     pub bitcoin_address: String,
     pub amount_sat: i64,
+    /// Present only for fiat-fixed invoices. The watcher uses this exact
+    /// invoice snapshot to request a candidate covering first observation.
+    pub fiat_currency: Option<String>,
     pub created_at_cursor: String,
 }
 

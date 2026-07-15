@@ -486,6 +486,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.pricer.max_freshness_secs,
         config.pricer.request_timeout_ms,
     );
+    let initialized_bitcoin_watcher =
+        initialized_bitcoin_watcher.map(|watcher| watcher.with_pricer(pricer_client.clone()));
     let pwa_shells = Arc::new(donation_render::PwaShells::load(&config.pwa.dist_dir));
 
     let listen_addr = config.listen.clone();

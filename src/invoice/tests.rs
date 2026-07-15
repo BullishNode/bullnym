@@ -207,6 +207,49 @@ fn chain_bip21_formats_whole_bitcoin_without_rounding() {
 }
 
 #[test]
+fn direct_bitcoin_bip21_keeps_the_exact_merchant_output() {
+    assert_eq!(
+        build_direct_bitcoin_bip21("bc1qstable", 10_001),
+        "bitcoin:bc1qstable?amount=0.00010001"
+    );
+    assert_eq!(
+        build_direct_bitcoin_bip21("bc1qstable", 100_000_001),
+        "bitcoin:bc1qstable?amount=1.00000001"
+    );
+}
+
+#[test]
+fn fiat_wallet_bitcoin_is_direct_while_checkout_bitcoin_remains_provider_backed() {
+    let mut wallet = invoice_fixture();
+    wallet.pricing_mode = "fiat_fixed".to_string();
+    wallet.fiat_amount_minor = Some(1_000);
+    wallet.fiat_currency = Some("USD".to_string());
+    wallet.amount_sat = 0;
+    wallet.accept_ln = false;
+    wallet.accept_btc = true;
+    wallet.bitcoin_address = Some("bc1qstable".to_string());
+    assert_eq!(
+        payer_quote_rail_availability(&wallet).map(|rails| rails.bitcoin),
+        Some(true)
+    );
+
+    let mut checkout = invoice_fixture();
+    checkout.pricing_mode = "fiat_fixed".to_string();
+    checkout.fiat_amount_minor = Some(1_000);
+    checkout.fiat_currency = Some("USD".to_string());
+    checkout.amount_sat = 0;
+    checkout.accept_ln = false;
+    checkout.origin = "checkout".to_string();
+    checkout.accept_btc = false;
+    checkout.bitcoin_address = None;
+    checkout.liquid_address = Some("lq1merchant".to_string());
+    assert_eq!(
+        payer_quote_rail_availability(&checkout).map(|rails| rails.bitcoin),
+        Some(true)
+    );
+}
+
+#[test]
 fn public_chain_amount_requires_a_positive_non_decreasing_gross_up() {
     assert_eq!(
         validated_payer_chain_amount_sat(10_431, 10_000),
