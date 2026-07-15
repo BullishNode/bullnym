@@ -18,11 +18,7 @@ This revision deliberately separates three kinds of evidence:
 Exact revisions used for this manual:
 
 - deployed Bullnym: `512fb32b9fec31702b1260314427df4420f8e27c`, clean build, schema `060_lnurl_private_comment_intents`;
-- source authority inspected: `746444166a41f2a42faa8bc0615c423150ac3c6f`, tree `78b04ae8f21e254d662ee13ba4147adab17fc556`, schema 061;
-- unmerged quote/valuation runtime: `f6275b6b97064fd7572e3d04e0450d0b9e21d244`;
-- unmerged cumulative fiat-credit policy: `5d4670178029c35c08b34c7e9f802922a7c57095`;
-- unmerged atomic quote PWA: `d6be7bc60f17d530b6f69f6b572cbb8a25ce9128`;
-- unmerged PoS Bitcoin acknowledgement: `e546058d4e021ac6d7347264165d53142a018904`.
+- source authority inspected: `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, tree `93f9f06f10d58520547a8d4d9ac85064c822fa07`, schema `062_invoice_quote_provider_attempts`.
 
 The public probe returned `200` for `/health`, `/ready`, `/version`,
 `/api/v1/supported-currencies`, and `/api/v1/rate?currency=USD`.
@@ -32,10 +28,12 @@ commit above, `build_dirty: false`, production mode, and
 
 The deployed SHA still has a seven-day invoice cap, converts fiat once when an
 invoice is created, has no versioned quote schema, and has no PoS Bitcoin risk
-dialog. Main has the immutable quote schema foundation and 30-day outer
-lifetime, but those changes are not deployed. The full five-minute payer-demand
-quote flow, observation-time valuation, atomic PWA refresh, and PoS warning are
-therefore **capability-blocked**, not production failures.
+dialog. Main has the immutable quote schema, 30-day outer lifetime, full
+five-minute payer-demand quote flow, observation-time valuation, durable
+provider attribution/recovery, atomic PWA refresh, and PoS warning. Those
+changes merged in `e17c465939ccf766ebf77b7d9bd7dbfb776c395d` but are not
+deployed. They are therefore **main only** and production
+**capability-blocked**, not production failures.
 
 Main also contains a current-only automatic-recovery hardening merged in
 `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now
@@ -194,10 +192,21 @@ Deployment principles:
    startup, non-money public surfaces, and logs before promotion.
 8. Observe at least one reconciler cycle after promotion.
 
+Current main adds `scripts/certify-deployment.py`, a read-only fail-closed
+preflight that binds the exact clean commit, artifact SHA-256, PWA content
+SHA-256, schema marker, release record, executable, and serving origin. It
+performs only bounded `/version`, `/health`, and `/ready` requests and does not
+build, deploy, migrate, restart, contact providers, create payment instructions,
+or move funds. Supply all expected identities from the approved release record;
+never infer them from the candidate being checked.
+
 Migrations 050, 051, 053, 057, 059, and 060 have explicit stopped-writer or
 roll-forward constraints documented in `docs/operations/deployment.md`.
-Schema 061 adds the quote foundation but does not activate runtime quote
-refresh. Never infer product capability from table existence alone.
+Schema 061 adds the quote foundation but does not by itself activate runtime
+quote refresh. Current main adds schema 062 and the matching quote runtime,
+provider-attempt journal, PWA, and PoS behavior. Never infer product capability
+from table existence alone, and never claim it is deployed until the public
+release provenance and certification record match that complete release.
 
 At source `746444166a41f2a42faa8bc0615c423150ac3c6f`, migrations 058 and 059
 are current-only empty-state guards: they require all user, surface, invoice,
@@ -483,6 +492,7 @@ scripts/test-db.sh
 scripts/check-docs.sh
 scripts/test-release-provenance.sh
 scripts/test-release-record.sh
+scripts/test-certify-deployment.py
 scripts/release-preflight.sh
 (cd pwa && npm ci && npm test && npm run build && npm run check:dist)
 ```
@@ -560,7 +570,7 @@ start another transfer merely because the command timed out.
 
 The operational claims above were checked against `README.md`, `SECURITY.md`,
 `config.toml`, `src/config.rs`, `src/main.rs`, `src/readiness.rs`, migration
-files 045–061, server and DB integration tests, the architecture/API/product
+files 045–062, server and DB integration tests, the architecture/API/product
 documents under `docs/`, the `bullnym-tests` README and recycler source, and the
 three read-only authority records:
 

@@ -23,15 +23,15 @@ lifetimes and fiat quotes:
 | Behavior | Status at the time of writing |
 |---|---|
 | Permanent nym ownership, independent Lightning Address/Page/PoS availability, private Lightning payer comments, automatic recovery supervision | Deployed |
-| 30-day invoice outer lifetime, quote database foundation, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Merged in source `746444166a41f2a42faa8bc0615c423150ac3c6f`, not deployed |
-| Five-minute payer-demand fiat quotes, observation-time fiat credit, atomic browser refresh, and PoS Bitcoin warning | Locked behavior with unmerged implementation branches; not deployed |
+| 30-day invoice outer lifetime, stricter automatic-recovery checks, and removal of pre-launch identity compatibility paths | Merged in source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, not deployed |
+| Five-minute payer-demand fiat quotes, observation-time fiat credit, durable provider attribution, atomic browser refresh, and PoS Bitcoin warning | Merged in source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, not deployed |
 
 Production still uses a maximum seven-day invoice lifetime and converts a fiat
 price once when an invoice is created. Do not expect a five-minute quote
 countdown or 30-day deadline until `/version` and release notes confirm that the
 complete quote release is deployed.
 
-Sections marked **Locked next behavior** explain the approved contract without
+Sections marked **Main-only behavior** explain the merged source contract without
 pretending it is live.
 
 ## Nyms, aliases, and permanent ownership
@@ -109,7 +109,7 @@ PoS stores receipt history in the local browser. Clearing browser data can
 erase that local list, but it does not change the server's invoice or payment
 records.
 
-**Locked next behavior:** Before PoS reveals a Bitcoin instruction, it will show
+**Main-only behavior:** Before PoS reveals a Bitcoin instruction, it will show
 this warning:
 
 > For in-person payments, Lightning network is recommended. Bitcoin on-chain
@@ -155,7 +155,7 @@ deployed server, that fiat amount is converted once at invoice creation and the
 resulting sat amount stays fixed for the invoice's seven-day life. This is the
 older behavior and creates exchange-rate exposure.
 
-**Locked next behavior:** The merchant's fiat minor-unit amount and currency
+**Main-only behavior:** The merchant's fiat minor-unit amount and currency
 will remain the face value for a 30-day invoice. A payer-facing conversion will
 last five minutes. Reloads inside that window will reuse the same quote. After
 expiry, an explicit payer-demand refresh will replace the amount, cost
@@ -170,7 +170,7 @@ until the quote runtime and browser changes are deployed together.
 One checkout invoice uses one concrete Liquid settlement destination. The
 address is not resolved again from mutable profile data during settlement.
 
-**Locked next behavior:** The same Liquid address will remain stable for the
+**Main-only behavior:** The same Liquid address will remain stable for the
 entire 30-day invoice across partial payments and every five-minute quote
 refresh. Only the amount, valuation, QR, and copy payload change. The deployed
 server has no quote refresh, so the across-refresh guarantee cannot yet be
@@ -214,7 +214,7 @@ If more arrives, the overpayment remains recorded. Bullnym does not
 automatically refund an overpayment. The merchant should compare the invoice,
 actual received value, rail, and settlement status before deciding what to do.
 
-**Locked next behavior for fiat:** Each payment event receives fiat credit from
+**Main-only behavior for fiat:** Each payment event receives fiat credit from
 its own authoritative rate evidence. Sats first durably observed before a quote
 expires keep that quote's rate, but only for the sats actually observed. An
 underpayment does not lock the old rate for the unpaid balance.
@@ -388,7 +388,7 @@ choosing two conflicting irreversible outcomes.
 ## Evidence sources
 
 Current behavior was checked against the deployed probe above, Bullnym source
-and tests at `746444166a41f2a42faa8bc0615c423150ac3c6f`, the product/API/
+and tests at `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, the product/API/
 architecture documents in this repository, and these read-only authority
 records:
 
@@ -396,6 +396,6 @@ records:
 - `/home/francis/bull-bitcoin-workspace/bullnym-rationale-review-record.md`;
 - `/home/francis/bull-bitcoin-workspace/server-pwa-locked-plan-gap-audit-20260715.md`.
 
-The full unmerged quote/PWA/PoS branch revisions are listed in the Operator
-Manual. Their presence is implementation evidence only, not proof that the
-feature is safe, merged, or available.
+The complete quote/PWA/PoS implementation is present on source main. That is
+implementation evidence only, not proof that the feature is deployed or
+available on the public service.
