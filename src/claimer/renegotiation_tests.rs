@@ -588,6 +588,8 @@ fn chain_swap_with_pair_limits(
     db::ChainSwapRecord {
         id: Uuid::from_u128(0x83),
         invoice_id: Uuid::from_u128(0x84),
+        invoice_quote_version_id: None,
+        invoice_quote_offer_id: None,
         nym: Some("renegotiation-tests".into()),
         boltz_swap_id: "issue38-swap".into(),
         from_chain: "BTC".into(),

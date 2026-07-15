@@ -23,6 +23,8 @@ fn settlement_record(
     db::ChainSwapRecord {
         id: Uuid::from_u128(10),
         invoice_id: Uuid::from_u128(20),
+        invoice_quote_version_id: None,
+        invoice_quote_offer_id: None,
         nym: Some("alice".to_owned()),
         boltz_swap_id: "runtime-settlement".to_owned(),
         from_chain: "BTC".to_owned(),

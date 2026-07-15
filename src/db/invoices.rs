@@ -235,6 +235,64 @@ pub struct InvoiceQuoteOfferResolution {
     pub created: bool,
 }
 
+/// Immutable identity of the exact quote and payer instruction that produced
+/// a swap or payment event. The pair is optional at persistence boundaries so
+/// rows created before migration 061 remain valid, but new quote-aware callers
+/// must always supply both IDs together through this value object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvoiceQuoteAttribution {
+    pub quote_version_id: Uuid,
+    pub quote_offer_id: Uuid,
+}
+
+/// Validate quote attribution against the complete immutable payer-offer
+/// identity. There is deliberately no expiry predicate: a copied instruction
+/// remains an observable obligation after its five-minute quote window closes.
+///
+/// Keeping this check on the same transaction as the owning insert prevents a
+/// wrong-invoice, wrong-rail, or crossed provider identity from relying only
+/// on the coarser composite foreign key in migration 061.
+pub(crate) async fn validate_invoice_quote_attribution<'e, E>(
+    executor: E,
+    invoice_id: Uuid,
+    attribution: InvoiceQuoteAttribution,
+    expected_rail: &str,
+    expected_offer_kind: &str,
+    expected_provider: Option<&str>,
+    expected_provider_offer_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM invoice_quote_offers \
+              WHERE id = $1 \
+                AND quote_version_id = $2 \
+                AND invoice_id = $3 \
+                AND rail = $4 \
+                AND offer_kind = $5 \
+                AND provider IS NOT DISTINCT FROM $6::TEXT \
+                AND provider_offer_id IS NOT DISTINCT FROM $7::TEXT \
+         )",
+    )
+    .bind(attribution.quote_offer_id)
+    .bind(attribution.quote_version_id)
+    .bind(invoice_id)
+    .bind(expected_rail)
+    .bind(expected_offer_kind)
+    .bind(expected_provider)
+    .bind(expected_provider_offer_id)
+    .fetch_one(executor)
+    .await?;
+    if !valid {
+        return Err(sqlx::Error::Protocol(format!(
+            "invoice quote attribution does not match invoice/rail/offer identity: invoice={invoice_id}, rail={expected_rail}, offer_kind={expected_offer_kind}"
+        )));
+    }
+    Ok(())
+}
+
 /// Exact server-owned value used by `presentation_status` and payable top-up
 /// instructions. Active/legacy accounting events contribute, as do verified
 /// provisional direct observations. Superseded or unverified evidence never
@@ -1378,6 +1436,116 @@ pub async fn record_invoice_payment(
     evidence: InvoicePaymentEvidence<'_>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<u64, sqlx::Error> {
+    record_invoice_payment_with_optional_quote_attribution(pool, id, evidence, None, tolerances)
+        .await
+}
+
+/// Quote-aware payment writer for direct and provider-backed evidence. The
+/// exact offer identity is immutable on first insert; an idempotent retry must
+/// present the same attribution. Provider settlements also recover attribution
+/// from their persisted swap row so crash-repair callers cannot drop lineage.
+pub async fn record_invoice_payment_with_quote_attribution(
+    pool: &PgPool,
+    id: Uuid,
+    evidence: InvoicePaymentEvidence<'_>,
+    attribution: InvoiceQuoteAttribution,
+    tolerances: InvoiceAccountingTolerances,
+) -> Result<u64, sqlx::Error> {
+    record_invoice_payment_with_optional_quote_attribution(
+        pool,
+        id,
+        evidence,
+        Some(attribution),
+        tolerances,
+    )
+    .await
+}
+
+async fn persisted_provider_quote_attribution(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    evidence: &InvoicePaymentEvidence<'_>,
+) -> Result<Option<InvoiceQuoteAttribution>, sqlx::Error> {
+    let Some(boltz_swap_id) = evidence.boltz_swap_id else {
+        return Ok(None);
+    };
+    let row: Option<(Option<Uuid>, Option<Uuid>, Option<Uuid>)> = match evidence.source {
+        "lightning_boltz_reverse" => {
+            sqlx::query_as(
+                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id \
+               FROM swap_records WHERE boltz_swap_id = $1",
+            )
+            .bind(boltz_swap_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        }
+        "bitcoin_boltz_chain" => {
+            sqlx::query_as(
+                "SELECT invoice_id, invoice_quote_version_id, invoice_quote_offer_id \
+               FROM chain_swap_records WHERE boltz_swap_id = $1",
+            )
+            .bind(boltz_swap_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        }
+        _ => None,
+    };
+    let Some((persisted_invoice_id, quote_version_id, quote_offer_id)) = row else {
+        // Compatibility writers historically accepted settlement evidence
+        // before a swap-row lookup was required. Keep that NULL path explicit.
+        return Ok(None);
+    };
+    if persisted_invoice_id != Some(invoice_id) {
+        return Err(sqlx::Error::Protocol(
+            "provider settlement swap belongs to a different invoice".into(),
+        ));
+    }
+    match (quote_version_id, quote_offer_id) {
+        (None, None) => Ok(None),
+        (Some(quote_version_id), Some(quote_offer_id)) => Ok(Some(InvoiceQuoteAttribution {
+            quote_version_id,
+            quote_offer_id,
+        })),
+        _ => Err(sqlx::Error::Protocol(
+            "provider settlement swap has partial quote attribution".into(),
+        )),
+    }
+}
+
+fn payment_offer_identity<'a>(
+    evidence: &'a InvoicePaymentEvidence<'a>,
+) -> (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'a str>,
+) {
+    match evidence.source {
+        "bitcoin_direct" => ("bitcoin", "direct", None, None),
+        "liquid_direct" => ("liquid", "direct", None, None),
+        "lightning_boltz_reverse" => (
+            "lightning",
+            "boltz_reverse",
+            Some("boltz"),
+            evidence.boltz_swap_id,
+        ),
+        "bitcoin_boltz_chain" => (
+            "bitcoin",
+            "boltz_chain",
+            Some("boltz"),
+            evidence.boltz_swap_id,
+        ),
+        _ => unreachable!("InvoicePaymentEvidence::validate rejects unknown source"),
+    }
+}
+
+async fn record_invoice_payment_with_optional_quote_attribution(
+    pool: &PgPool,
+    id: Uuid,
+    evidence: InvoicePaymentEvidence<'_>,
+    requested_attribution: Option<InvoiceQuoteAttribution>,
+    tolerances: InvoiceAccountingTolerances,
+) -> Result<u64, sqlx::Error> {
     evidence.validate()?;
 
     let mut tx = pool.begin().await?;
@@ -1388,6 +1556,36 @@ pub async fn record_invoice_payment(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
+
+    let persisted_attribution =
+        persisted_provider_quote_attribution(&mut tx, id, &evidence).await?;
+    let attribution = match (requested_attribution, persisted_attribution) {
+        (Some(requested), Some(persisted)) if requested != persisted => {
+            return Err(sqlx::Error::Protocol(
+                "payment quote attribution conflicts with its persisted provider swap".into(),
+            ));
+        }
+        (Some(requested), _) => Some(requested),
+        (None, persisted) => persisted,
+    };
+    if let Some(attribution) = attribution {
+        let (rail, offer_kind, provider, provider_offer_id) = payment_offer_identity(&evidence);
+        if evidence.rail != rail {
+            return Err(sqlx::Error::Protocol(
+                "payment evidence rail does not match its quote offer identity".into(),
+            ));
+        }
+        validate_invoice_quote_attribution(
+            &mut *tx,
+            id,
+            attribution,
+            rail,
+            offer_kind,
+            provider,
+            provider_offer_id,
+        )
+        .await?;
+    }
 
     let is_direct_liquid_payment = evidence.source == "liquid_direct";
     let is_boltz_settlement = matches!(
@@ -1423,8 +1621,10 @@ pub async fn record_invoice_payment(
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO invoice_payment_events \
             (invoice_id, rail, source, event_key, amount_sat, txid, vout, \
-             boltz_swap_id, address, accounting_state, verification_state) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             boltz_swap_id, address, accounting_state, verification_state, \
+             invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                 CASE WHEN $12::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
          ON CONFLICT (event_key) DO NOTHING \
          RETURNING id",
     )
@@ -1439,6 +1639,8 @@ pub async fn record_invoice_payment(
     .bind(evidence.address)
     .bind(accounting_state)
     .bind(verification_state)
+    .bind(attribution.map(|attribution| attribution.quote_version_id))
+    .bind(attribution.map(|attribution| attribution.quote_offer_id))
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -1446,14 +1648,36 @@ pub async fn record_invoice_payment(
     let recorded_event_id = if let Some((event_id,)) = inserted {
         event_id
     } else {
-        sqlx::query_scalar::<_, Uuid>(
+        let existing = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM invoice_payment_events \
-             WHERE invoice_id = $1 AND event_key = $2",
+             WHERE invoice_id = $1 AND event_key = $2 \
+               AND rail = $3 AND source = $4 AND amount_sat = $5 \
+               AND txid IS NOT DISTINCT FROM $6::TEXT \
+               AND vout IS NOT DISTINCT FROM $7::INTEGER \
+               AND boltz_swap_id IS NOT DISTINCT FROM $8::TEXT \
+               AND address IS NOT DISTINCT FROM $9::TEXT \
+               AND invoice_quote_version_id IS NOT DISTINCT FROM $10::UUID \
+               AND invoice_quote_offer_id IS NOT DISTINCT FROM $11::UUID",
         )
         .bind(id)
         .bind(evidence.event_key)
-        .fetch_one(&mut *tx)
-        .await?
+        .bind(evidence.rail)
+        .bind(evidence.source)
+        .bind(evidence.amount_sat)
+        .bind(evidence.txid)
+        .bind(evidence.vout)
+        .bind(evidence.boltz_swap_id)
+        .bind(evidence.address)
+        .bind(attribution.map(|attribution| attribution.quote_version_id))
+        .bind(attribution.map(|attribution| attribution.quote_offer_id))
+        .fetch_optional(&mut *tx)
+        .await?;
+        existing.ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "invoice payment event key was replayed with different evidence or quote attribution"
+                    .into(),
+            )
+        })?
     };
 
     // A Boltz claim transaction can also appear at the invoice's direct

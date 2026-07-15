@@ -717,6 +717,8 @@ mod tests {
             record: ChainSwapRecord {
                 id: chain_swap_id,
                 invoice_id,
+                invoice_quote_version_id: None,
+                invoice_quote_offer_id: None,
                 nym: Some("restore-nym".into()),
                 boltz_swap_id: provider.id,
                 from_chain: "BTC".into(),

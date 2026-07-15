@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::InvoiceAccountingTolerances;
+use super::{
+    validate_invoice_quote_attribution, InvoiceAccountingTolerances, InvoiceQuoteAttribution,
+};
 
 /// Maximum number of direct observations the atomic reducer accepts in one
 /// generation. Watchers may use tighter rail-specific bounds, but never a
@@ -336,6 +338,16 @@ pub struct DirectObservationBatch<'a> {
     pub observations: &'a [DirectOutputObservation<'a>],
 }
 
+/// Event-specific quote lineage supplied alongside one watcher batch. A batch
+/// may contain copied instructions from several expired versions, so the
+/// attribution belongs to the immutable event key rather than to the batch as
+/// a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectObservationQuoteAttribution<'a> {
+    pub event_key: &'a str,
+    pub attribution: InvoiceQuoteAttribution,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyDirectObservationOutcome {
     Applied { changed: bool },
@@ -469,6 +481,8 @@ struct StoredEvent {
     observation_id: Option<Uuid>,
     superseded_by_event_id: Option<Uuid>,
     deactivation_reason: Option<String>,
+    invoice_quote_version_id: Option<Uuid>,
+    invoice_quote_offer_id: Option<Uuid>,
 }
 
 #[derive(Debug)]
@@ -869,6 +883,35 @@ pub async fn apply_direct_observation_batch(
     batch: DirectObservationBatch<'_>,
     tolerances: InvoiceAccountingTolerances,
 ) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
+    apply_direct_observation_batch_with_optional_quote_attributions(pool, batch, &[], tolerances)
+        .await
+}
+
+/// Quote-aware direct watcher writer. Every supplied mapping is validated
+/// against the same invoice, direct rail, and immutable offer identity before
+/// any observation/event row is changed. Missing mappings preserve the legacy
+/// NULL path; an existing attributed event is never rewritten or detached.
+pub async fn apply_direct_observation_batch_with_quote_attributions(
+    pool: &PgPool,
+    batch: DirectObservationBatch<'_>,
+    quote_attributions: &[DirectObservationQuoteAttribution<'_>],
+    tolerances: InvoiceAccountingTolerances,
+) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
+    apply_direct_observation_batch_with_optional_quote_attributions(
+        pool,
+        batch,
+        quote_attributions,
+        tolerances,
+    )
+    .await
+}
+
+async fn apply_direct_observation_batch_with_optional_quote_attributions(
+    pool: &PgPool,
+    batch: DirectObservationBatch<'_>,
+    quote_attributions: &[DirectObservationQuoteAttribution<'_>],
+    tolerances: InvoiceAccountingTolerances,
+) -> Result<ApplyDirectObservationOutcome, sqlx::Error> {
     if batch.generation <= 0 {
         return protocol_error("direct observation generation must be positive");
     }
@@ -876,6 +919,19 @@ pub async fn apply_direct_observation_batch(
         return protocol_error("direct observation authority is invalid");
     }
     validate_observation_batch(batch.source, batch.observations)?;
+    let mut attributed_event_keys = HashSet::new();
+    for entry in quote_attributions {
+        if !attributed_event_keys.insert(entry.event_key) {
+            return protocol_error("direct event has duplicate quote attribution");
+        }
+        if !batch
+            .observations
+            .iter()
+            .any(|observation| observation.event_key == entry.event_key)
+        {
+            return protocol_error("quote attribution does not belong to this direct batch");
+        }
+    }
 
     let mut tx = pool.begin().await?;
     let offer_lock_key = super::invoice_lightning_lock_key(batch.invoice_id);
@@ -894,6 +950,19 @@ pub async fn apply_direct_observation_batch(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| sqlx::Error::RowNotFound)?;
+
+    for entry in quote_attributions {
+        validate_invoice_quote_attribution(
+            &mut *tx,
+            batch.invoice_id,
+            entry.attribution,
+            batch.source.rail(),
+            "direct",
+            None,
+            None,
+        )
+        .await?;
+    }
 
     let head: Option<(i64, i64)> = sqlx::query_as(
         "SELECT issued_generation, applied_generation \
@@ -958,6 +1027,10 @@ pub async fn apply_direct_observation_batch(
             batch.source,
             observation_mutation.id,
             observation,
+            quote_attributions
+                .iter()
+                .find(|entry| entry.event_key == observation.event_key)
+                .map(|entry| entry.attribution),
         )
         .await?;
         changed |= event_mutation.changed;
@@ -1436,6 +1509,7 @@ async fn ensure_direct_event_locked(
     source: DirectPaymentSource,
     observation_id: Uuid,
     observation: &DirectOutputObservation<'_>,
+    attribution: Option<InvoiceQuoteAttribution>,
 ) -> Result<EventMutation, sqlx::Error> {
     let stored = load_event_for_update(tx, observation.event_key).await?;
     let should_activate = observation
@@ -1457,7 +1531,14 @@ async fn ensure_direct_event_locked(
             .or(Some("not_confirmed"))
     };
     if let Some(stored) = stored {
-        validate_stored_event(&stored, invoice_id, source, observation_id, observation)?;
+        validate_stored_event(
+            &stored,
+            invoice_id,
+            source,
+            observation_id,
+            observation,
+            attribution,
+        )?;
         if stored.accounting_state == "superseded" || stored.superseded_by_event_id.is_some() {
             return protocol_error("a superseded direct event is terminal");
         }
@@ -1500,10 +1581,12 @@ async fn ensure_direct_event_locked(
             "INSERT INTO invoice_payment_events \
                  (invoice_id, rail, source, event_key, amount_sat, txid, vout, address, \
                   accounting_state, verification_state, observation_id, \
-                  last_activated_at, deactivated_at, deactivation_reason) \
+                  last_activated_at, deactivated_at, deactivation_reason, \
+                  invoice_quote_version_id, invoice_quote_offer_id, quote_first_observed_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      CASE WHEN $9 = 'active' THEN NOW() ELSE NULL END, \
-                     CASE WHEN $9 = 'active' THEN NULL ELSE NOW() END, $12) \
+                     CASE WHEN $9 = 'active' THEN NULL ELSE NOW() END, $12, $13, $14, \
+                     CASE WHEN $13::UUID IS NULL THEN NULL ELSE clock_timestamp() END) \
              RETURNING id",
         )
         .bind(invoice_id)
@@ -1518,6 +1601,8 @@ async fn ensure_direct_event_locked(
         .bind(observation.verification.event_state())
         .bind(observation_id)
         .bind(desired_reason)
+        .bind(attribution.map(|attribution| attribution.quote_version_id))
+        .bind(attribution.map(|attribution| attribution.quote_offer_id))
         .fetch_one(&mut **tx)
         .await?;
         Ok(EventMutation {
@@ -1536,7 +1621,8 @@ async fn load_event_for_update(
     sqlx::query_as::<_, StoredEvent>(
         "SELECT id, invoice_id, rail, source, event_key, txid, vout, address, \
                 amount_sat, accounting_state, verification_state, observation_id, \
-                superseded_by_event_id, deactivation_reason \
+                superseded_by_event_id, deactivation_reason, \
+                invoice_quote_version_id, invoice_quote_offer_id \
          FROM invoice_payment_events WHERE event_key = $1 FOR UPDATE",
     )
     .bind(event_key)
@@ -1550,6 +1636,7 @@ fn validate_stored_event(
     source: DirectPaymentSource,
     observation_id: Uuid,
     observation: &DirectOutputObservation<'_>,
+    attribution: Option<InvoiceQuoteAttribution>,
 ) -> Result<(), sqlx::Error> {
     if stored.invoice_id != invoice_id
         || stored.rail != source.rail()
@@ -1560,6 +1647,10 @@ fn validate_stored_event(
         || stored.address.as_deref() != Some(observation.address)
         || stored.amount_sat != observation.amount_sat
         || stored.observation_id.is_some_and(|id| id != observation_id)
+        || attribution.is_some_and(|attribution| {
+            stored.invoice_quote_version_id != Some(attribution.quote_version_id)
+                || stored.invoice_quote_offer_id != Some(attribution.quote_offer_id)
+        })
     {
         return protocol_error("direct accounting event immutable evidence mismatch");
     }
