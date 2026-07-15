@@ -21,6 +21,7 @@
   import QrCard from '$lib/components/QrCard.svelte'
   import BullSpinner from '$lib/components/BullSpinner.svelte'
   import Button from '$lib/components/Button.svelte'
+  import BitcoinRiskAcknowledgement from '$lib/components/BitcoinRiskAcknowledgement.svelte'
   import {
     ApiError,
     fetchLightningOffer,
@@ -54,6 +55,16 @@
   import { availableRails } from '$lib/rails'
   import { liquidUri, bitcoinPayload } from '$lib/payloads'
   import { watchLiquidAddress } from '$lib/liquid-ws'
+  import {
+    beginBitcoinRiskAcknowledgementScope,
+    mayRequestBitcoinQuote,
+    mayUseBitcoinPaymentInstruction,
+    preferredInitialFiatQuoteRail,
+    preferredRailAfterBitcoinDecline,
+    rememberBitcoinRiskAcknowledgement,
+    requiresPosBitcoinAcknowledgement,
+    type SessionStorageLike,
+  } from '$lib/pos-bitcoin-risk'
   import {
     PayerQuoteCoordinator,
     assertLightningQuoteAuthorityCurrent,
@@ -235,8 +246,41 @@
   })
 
   const activeTabStore = untrack(() => localStore<Rail>(`bullnym:${nym}:rail`, 'lightning'))
+  const bitcoinRiskStorage = untrack<SessionStorageLike | undefined>(() => {
+    if (typeof window === 'undefined') return undefined
+    try {
+      return window.sessionStorage
+    } catch {
+      return undefined
+    }
+  })
+  const acknowledgedAtMount = untrack(() =>
+    beginBitcoinRiskAcknowledgementScope(
+      config.mode,
+      invoice.invoice_id,
+      bitcoinRiskStorage,
+    ),
+  )
+  const storedBitcoinRequested = untrack(
+    () =>
+      invoice.pricing_mode === 'sat_fixed' &&
+      config.mode === 'pos' &&
+      !acknowledgedAtMount &&
+      activeTabStore.value === 'bitcoin',
+  )
   let activeTab = $state<Rail>(
-    untrack(() => (invoice.pricing_mode === 'fiat_fixed' ? 'lightning' : activeTabStore.value)),
+    untrack(() =>
+      invoice.pricing_mode === 'fiat_fixed' || storedBitcoinRequested
+        ? 'lightning'
+        : activeTabStore.value,
+    ),
+  )
+  let bitcoinAcknowledged = $state(acknowledgedAtMount)
+  let bitcoinRiskOpen = $state(false)
+  let pendingStoredBitcoin = $state(storedBitcoinRequested)
+  let fiatInitialRequested = false
+  const bitcoinInstructionAllowed = $derived(
+    mayUseBitcoinPaymentInstruction(config.mode, bitcoinAcknowledged),
   )
   const activeQuoteRail = $derived<PayerQuoteRail>(activeTab === 'boltcard' ? 'lightning' : activeTab)
   const activeFiatPresentation = $derived(
@@ -271,10 +315,63 @@
     rail: PayerQuoteRail,
     trigger: QuoteRefreshTrigger,
   ): Promise<unknown> | undefined {
-    if (stopped || !isFiatFixed || !showsRails(view) || !quoteRailAvailable(rail)) return
+    if (
+      stopped ||
+      !isFiatFixed ||
+      !showsRails(view) ||
+      !quoteRailAvailable(rail) ||
+      (rail === 'bitcoin' && !mayRequestBitcoinQuote(config.mode, bitcoinAcknowledged))
+    ) return
     return trigger === 'tab'
       ? quoteCoordinator.ensure(rail, trigger)
       : quoteCoordinator.refresh(rail, trigger)
+  }
+
+  function activateTab(tab: Rail) {
+    // Keep this guard below every public selection path as a second line of
+    // defence. Internal callers cannot reveal Bitcoin by assigning the rail.
+    if (tab === 'bitcoin' && !bitcoinInstructionAllowed) {
+      bitcoinRiskOpen = true
+      return
+    }
+    if (activeTab === 'boltcard' && tab !== 'boltcard') {
+      stopCardScan()
+      cardState = 'idle'
+      cardError = null
+    }
+    activeTab = tab
+    activeTabStore.value = tab
+    if (tab === 'boltcard') startCardScan()
+  }
+
+  function requestBitcoinTab() {
+    if (requiresPosBitcoinAcknowledgement(config.mode, bitcoinAcknowledged)) {
+      bitcoinRiskOpen = true
+      return
+    }
+    activateTab('bitcoin')
+    if (isFiatFixed) void requestFiatQuote('bitcoin', 'tab')
+  }
+
+  function acknowledgeBitcoinRisk() {
+    rememberBitcoinRiskAcknowledgement(
+      config.mode,
+      invoice.invoice_id,
+      bitcoinRiskStorage,
+    )
+    bitcoinAcknowledged = true
+    bitcoinRiskOpen = false
+    activateTab('bitcoin')
+    if (isFiatFixed) {
+      fiatInitialRequested = true
+      void requestFiatQuote('bitcoin', 'tab')
+    }
+  }
+
+  function leaveBitcoinRisk() {
+    bitcoinRiskOpen = false
+    const safeTab = preferredRailAfterBitcoinDecline(tabs)
+    if (safeTab) activateTab(safeTab)
   }
 
   // Never show a selectable tab with a blank QR (today's bug — tabs used to
@@ -285,44 +382,48 @@
   $effect(() => {
     if (tabs.length === 0) return
     if (tabs.includes(activeTab)) return
-    const next = tabs[0]!
-    if (activeTab === 'boltcard' && next !== 'boltcard') stopCardScan()
-    activeTab = next
-    activeTabStore.value = next
-    if (next === 'boltcard') startCardScan()
+    const next = tabs.find((tab) => tab !== 'bitcoin' || bitcoinInstructionAllowed)
+    if (!next) return
+    activateTab(next)
+  })
+
+  // A Bitcoin preference belongs to the prior invoice, not the new PoS
+  // session. Re-open the warning only after authoritative status says that
+  // Bitcoin is available; no payload or quote request occurs underneath it.
+  $effect(() => {
+    if (!pendingStoredBitcoin || !showsRails(view) || !tabs.includes('bitcoin')) return
+    pendingStoredBitcoin = false
+    requestBitcoinTab()
+  })
+
+  $effect(() => {
+    if (!showsRails(view) || !tabs.includes('bitcoin')) bitcoinRiskOpen = false
   })
 
   function selectTab(tab: Rail) {
-    if (activeTab === 'boltcard' && tab !== 'boltcard') {
-      stopCardScan()
-      cardState = 'idle'
-      cardError = null
+    if (tab === 'bitcoin') {
+      requestBitcoinTab()
+      return
     }
-    activeTab = tab
-    activeTabStore.value = tab
-    if (tab === 'boltcard') startCardScan()
+    activateTab(tab)
     if (isFiatFixed) void requestFiatQuote(tab === 'boltcard' ? 'lightning' : tab, 'tab')
   }
 
   // The first trustworthy fiat status starts exactly one default Lightning
   // POST. Other rails remain lazy and are requested only when selected.
-  let fiatInitialRequested = false
   $effect(() => {
     const status = latest
     if (!status || !isFiatFixed || !showsRails(view) || fiatInitialRequested) return
     const availability = status.quote_rail_availability
     if (!availability) return
-    const initialRail: PayerQuoteRail | null = availability.lightning
-      ? 'lightning'
-      : availability.liquid
-        ? 'liquid'
-        : availability.bitcoin
-          ? 'bitcoin'
-          : null
+    const initialRail = preferredInitialFiatQuoteRail(
+      config.mode,
+      bitcoinAcknowledged,
+      availability,
+    )
     if (!initialRail) return
     fiatInitialRequested = true
-    activeTab = initialRail
-    activeTabStore.value = initialRail
+    activateTab(initialRail)
     void requestFiatQuote(initialRail, 'initial')
   })
 
@@ -710,7 +811,10 @@
   // with the new remaining amount.
   // ---------------------------------------------------------------------
   const qrValue = $derived.by(() => {
-    if (isFiatFixed) return activeFiatPresentation?.qrValue ?? ''
+    if (isFiatFixed) {
+      if (activeTab === 'bitcoin' && !bitcoinInstructionAllowed) return ''
+      return activeFiatPresentation?.qrValue ?? ''
+    }
     if (activeTab === 'lightning') return currentLightningPr ?? ''
     if (activeTab === 'liquid') {
       return currentLiquidAddress && currentLiquidAmountSat !== null
@@ -718,6 +822,7 @@
         : ''
     }
     if (activeTab === 'bitcoin') {
+      if (!bitcoinInstructionAllowed) return ''
       if (remainingAmountSat === null) return ''
       const bip21 = currentBitcoinChainAddress ? currentBitcoinChainBip21 : null
       const amountSat = currentBitcoinChainAddress ? currentBitcoinChainAmountSat : remainingAmountSat
@@ -770,7 +875,11 @@
   )
 </script>
 
-<div class="mx-auto flex w-full max-w-md flex-col items-center gap-5">
+<div
+  class="mx-auto flex w-full max-w-md flex-col items-center gap-5"
+  inert={bitcoinRiskOpen}
+  aria-hidden={bitcoinRiskOpen ? 'true' : undefined}
+>
   <div class="flex w-full flex-col items-center gap-1">
     <p class="font-display text-7xl tabular-nums tracking-display leading-none">{mainAmount}</p>
     <div class="flex items-center gap-1.5">
@@ -818,7 +927,7 @@
       {/each}
     </div>
 
-    {#if isFiatFixed && activeFiatPresentation}
+    {#if isFiatFixed && activeFiatPresentation && (activeTab !== 'bitcoin' || bitcoinInstructionAllowed)}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(activeFiatPresentation.payerAmountSat)} sats
@@ -848,7 +957,7 @@
           Your wallet may add its own Liquid network fee.
         </p>
       </div>
-    {:else if !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinChainAddress && currentBitcoinChainAmountSat !== null && bitcoinChainSwapCostSat !== null}
+    {:else if bitcoinInstructionAllowed && !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinChainAddress && currentBitcoinChainAmountSat !== null && bitcoinChainSwapCostSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(currentBitcoinChainAmountSat)} sats
@@ -857,7 +966,7 @@
           Includes {new Intl.NumberFormat().format(bitcoinChainSwapCostSat)} sats in swap costs; your wallet may add its own Bitcoin network fee.
         </p>
       </div>
-    {:else if !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinDirectAddress && remainingAmountSat !== null}
+    {:else if bitcoinInstructionAllowed && !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinDirectAddress && remainingAmountSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(remainingAmountSat)} sats
@@ -938,3 +1047,9 @@
     </div>
   {/if}
 </div>
+
+<BitcoinRiskAcknowledgement
+  open={bitcoinRiskOpen}
+  onAcknowledge={acknowledgeBitcoinRisk}
+  onBack={leaveBitcoinRisk}
+/>
