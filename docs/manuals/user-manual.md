@@ -21,8 +21,8 @@ The complete server/PWA behavior described below is current deployed source
 `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
 `203abc2352b7d06819e383b56c91b99f113633eb`, with expected schema
 `063_checkout_private_memo`. Its exact artifact and active release record are
-installed, but this manual does not yet claim that it is journey-certified. It
-includes:
+installed, and its final no-funds, bounded live-Liquid/recycler, authority
+cleanup, restart, and audit evidence is recorded below. It includes:
 
 - a fixed 30-day outer invoice lifetime and five-minute payer-demand quotes;
 - one stable Liquid destination per invoice and first-observation fiat
@@ -81,8 +81,8 @@ path and fills it from the immutable request amount; a present mismatch, null,
 duplicate, or otherwise malformed value still fails closed, and ordinary
 reverse-swap responses remain strict.
 
-The final PR #185 deployment identity and bounded journey evidence are
-complete; certification cleanup remains deliberately incomplete:
+The final PR #185 deployment identity, bounded journey evidence, and
+certification cleanup are complete:
 
 - deployed binary/artifact SHA-256:
   `eb49032953177b4ff49c99f5e76743dd0d0b53bc4697b7b5d625516e91ffb325`;
@@ -105,7 +105,19 @@ complete; certification cleanup remains deliberately incomplete:
   An earlier 250-sat-cap check refused before payment preparation and before
   any broadcast, so it was a preflight refusal, not a failed payment;
 - certification-authority cleanup and final audit:
-  `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
+  TEST material is quarantined at
+  `/opt/bullnym-tests-private/quarantine/schema063-c026691-final-20260715T221110Z`
+  with manifest SHA-256
+  `02bed4aab278d96039ee9e9f5fdf578a432f6c3f918446f5436aa3e336024a04`;
+  the active TEST config and token are absent, with no simulator or Cargo
+  process. APP certification is disabled with empty allowlist, token, and
+  scopes in configuration SHA-256
+  `d53df2677eb29029c99af747a0799aa715766440b1642706a91a97bd1b87ba12`,
+  installed as `root:bullnym` mode `0640`. The final restart reported
+  consistent recovery and open rails; generic audit SHA-256
+  `22265a8eda8c2701c85a9649ccca828d4520e8be0e079ee94ef75b98305dfe0c`
+  and strict final audit SHA-256
+  `52a90ebd8db034cae50280953ad902f98ebc94b5e4e7800b25075b8a888e94f3`.
 
 A rail can still close whenever its own safety foundation degrades, so use only
 methods the current page offers. The work described here is server/PWA source;
@@ -516,8 +528,7 @@ and public-readiness observation through installed PR #185. Exact hotfix
 startup evidence reported a consistent recovery pass; the Operator Manual
 records that evidence and its limits. The schema-062 and earlier schema-063
 no-funds failures and their closed funds boundaries are recorded there. PR
-#185's exact artifact, active release record, passing no-funds journey, and
-bounded live-Liquid/recycler journey are recorded above. Certification
-cleanup/audit remains the conspicuous `PENDING_FINAL_*` field in the
-release-status section and may not be inferred from deployment identity or the
-passing journeys.
+#185's exact artifact, active release record, passing no-funds journey,
+bounded live-Liquid/recycler journey, certification cleanup, restart, and
+final audits are recorded above. These results are separate evidence and may
+not be inferred from deployment identity alone.

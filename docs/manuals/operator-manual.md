@@ -14,9 +14,9 @@ certification evidence:
 |---|---|
 | **Historical deployed baseline** | Verified by a read-only probe of `https://pay2.bull-wallet.com` at 2026-07-15 04:23–04:26 UTC, before the schema-062 cutover. |
 | **Deployment-certified schema-062 release** | The exact merged artifact, PWA, release record, running process, fresh schema, read-only deployment certification, startup recovery evidence, and observed private rail admission agree. |
-| **Verified installed schema-063 release** | Through PR #185, migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This proves deployment identity and readiness at the observed times, not the unfinished payment journeys. |
+| **Verified installed schema-063 release** | Through PR #185, migration 063, the exact verified release, running process, source, PWA, public version, startup recovery, and repeated fee refreshes agree. This label proves deployment identity and readiness at the observed times; journey and cleanup evidence is recorded separately below. |
 | **Current deployed source** | PR #185 exact main contains the final runtime fixes described below. Its exact artifact and active release record are verified, but deployment identity is not journey certification. |
-| **Journey-certified production release** | Use this label only after the schema-063 no-funds smoke and bounded live-Liquid/recycler journey pass, and certification authority is removed with a clean final audit. Those results remain explicit placeholders below. |
+| **Journey-certified production release** | The schema-063 no-funds smoke and bounded live-Liquid/recycler journey passed, certification authority was removed, and the clean final audits and restart are recorded below. |
 
 Exact revisions used for this manual:
 
@@ -175,8 +175,8 @@ persisted request amount or pair hash.
 PR #185 is merged at exact main
 `c026691cdede46cff56c9a34fade0fd4339bd5b7`, tree
 `203abc2352b7d06819e383b56c91b99f113633eb`. Its exact artifact is installed
-and running with the active release record below; this manual does not yet
-claim that it is journey-certified.
+and running with the active release record below; its final journey and cleanup
+certification evidence is also recorded below.
 
 Its verified deployment digests are:
 
@@ -185,8 +185,7 @@ Its verified deployment digests are:
 - final active PR #185 release-record SHA-256:
   `4eaa7bb7221bad2c75e190f0cc4285519e19c4b1b6ea13c28bbb0bfcfc0ae131`.
 
-The final journey evidence and deliberately unresolved cleanup field in this
-revision are:
+The final journey and cleanup evidence in this revision is:
 
 - final no-funds schema-063 result: run
   `nofunds-c026691-20260715T213857Z` passed 12/12 with zero sats spent and
@@ -206,7 +205,22 @@ revision are:
   before any broadcast, so it was a preflight refusal rather than a failed
   payment;
 - certification-authority removal and final APP/TEST/DB audit:
-  `PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`.
+  TEST material was quarantined at
+  `/opt/bullnym-tests-private/quarantine/schema063-c026691-final-20260715T221110Z`
+  with manifest SHA-256
+  `02bed4aab278d96039ee9e9f5fdf578a432f6c3f918446f5436aa3e336024a04`.
+  The active TEST config and token are absent, and no simulator or Cargo
+  process remains. APP certification is disabled with empty allowlist, token,
+  and scopes; configuration SHA-256
+  `d53df2677eb29029c99af747a0799aa715766440b1642706a91a97bd1b87ba12`
+  is installed as `root:bullnym` mode `0640`. The final restart reported
+  consistent recovery and open rails. Generic audit SHA-256 is
+  `22265a8eda8c2701c85a9649ccca828d4520e8be0e079ee94ef75b98305dfe0c`;
+  strict final audit SHA-256 is
+  `52a90ebd8db034cae50280953ad902f98ebc94b5e4e7800b25075b8a888e94f3`.
+  Never restore the quarantined TEST config: rotate to new TEST-only
+  descriptor and blinding material backed by a recycler-reclaimable wallet
+  before reusing TEST.
 
 Deployment provenance is bound to the private cutover records by SHA-256:
 
@@ -949,10 +963,25 @@ wallet delta of exactly 517 sats; its report SHA-256 is
 and its log SHA-256 is
 `b866387eb6de4f9ca1f78af47f5dd52c853431aa0bb3a24904c918a8a46315aa`.
 The earlier 250-sat cap refusal occurred before payment preparation and before
-any broadcast, so it was not a failed payment. Certification cleanup remains
-`PENDING_FINAL_CERTIFICATION_CLEANUP_AUDIT`. Neither the disabled timer, merge
-status, deployment identity, offline precheck, nor the earlier schema-062
-certification substitutes for these recorded results.
+any broadcast, so it was not a failed payment. Cleanup quarantined TEST
+material at
+`/opt/bullnym-tests-private/quarantine/schema063-c026691-final-20260715T221110Z`
+with manifest SHA-256
+`02bed4aab278d96039ee9e9f5fdf578a432f6c3f918446f5436aa3e336024a04`.
+The active TEST config and token are absent, with no simulator or Cargo
+process. APP certification is disabled with empty allowlist, token, and scopes
+in `root:bullnym` mode-`0640` configuration SHA-256
+`d53df2677eb29029c99af747a0799aa715766440b1642706a91a97bd1b87ba12`.
+The final restart recovered consistently and opened all rails. Generic audit
+SHA-256 is
+`22265a8eda8c2701c85a9649ccca828d4520e8be0e079ee94ef75b98305dfe0c`;
+strict final audit SHA-256 is
+`52a90ebd8db034cae50280953ad902f98ebc94b5e4e7800b25075b8a888e94f3`.
+Never restore the quarantined config; rotate to new TEST-only descriptor and
+blinding material backed by a recycler-reclaimable wallet before TEST reuse.
+Neither the disabled timer, merge status, deployment identity, offline
+precheck, nor the earlier schema-062 certification substitutes for these
+recorded results.
 
 Current harness commands include:
 
@@ -1034,8 +1063,8 @@ fixed-checkout-only Boltz compatibility boundary at current exact main
 stopped-writer migration, exact artifact installs, public version, startup
 recovery, configuration preservation, and repeated fee cycles are observed
 deployment evidence. PR #185's final artifact, release record, no-funds
-journey, and live-Liquid/recycler journey are recorded explicitly above;
-certification cleanup/audit remains the sole explicit placeholder.
+journey, live-Liquid/recycler journey, certification cleanup, restart, and
+final audits are recorded explicitly above.
 
 Historical RFCs and older manuals are evidence only when current source and the
 locked records still agree with them.
