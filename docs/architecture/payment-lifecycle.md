@@ -22,8 +22,8 @@ settlement state.
 | Product | Payment methods | Settlement destination | Notes |
 |---|---|---|---|
 | Lightning Address | Lightning via Boltz reverse swap; Liquid via LUD-22 | Derived from the online Lightning Address CT descriptor | Mostly unchanged. No invoice partial/under/over semantics. |
-| Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the Payment Page CT descriptor when present, otherwise the permanent nym's CT descriptor for legacy pages | Payer enters amount at `/:nym`. |
-| POS | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived from the POS CT descriptor | Cashier enters amount at `/:nym/pos`. POS has no Lightning Address fallback. |
+| Payment Page | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived only from the Payment Page CT descriptor | Payer enters amount at `/:nym`. |
+| POS | Lightning via Boltz reverse swap; Liquid direct; Bitcoin via Boltz chain swap | Derived only from the POS CT descriptor | Cashier enters amount at `/:nym/pos`. |
 | Invoices | Lightning via Boltz reverse swap; Liquid direct; Bitcoin direct | Merchant supplied Liquid/BTC addresses | Merchant receivable. No BTC-to-LBTC Boltz chain swap in v1 invoices. |
 
 ## Identity Model
@@ -42,8 +42,8 @@ An online Lightning Address has one CT descriptor in `users.ct_descriptor`
 (mobile path 75). Public checkout surfaces have independent Get Paid CT
 descriptors in `donation_pages.ct_descriptor`: Payment Page uses mobile path
 102 and POS uses mobile path 103. Each `(nym, kind)` row has its own
-`donation_pages.next_addr_idx` cursor. Legacy Payment Pages without a page
-descriptor fall back to the nym descriptor; POS does not.
+`donation_pages.next_addr_idx` cursor. Both surfaces require their own
+descriptor; neither falls back to the Lightning Address wallet or cursor.
 
 Permanent name and Lightning Address availability invariants:
 

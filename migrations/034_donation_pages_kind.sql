@@ -2,7 +2,7 @@
 -- with its own descriptor and address cursor.
 --
 -- Until now donation_pages was 1:1 with nym (nym as PRIMARY KEY), and POS was
--- a pos_mode BOOLEAN toggle on that single row sharing one ct_descriptor. The
+-- a single row sharing one ct_descriptor. The
 -- Get Paid model needs a Payment Page (BIP85 idx 102) AND a POS (idx 103) to
 -- coexist under one identity with segregated funds. We relax the key to
 -- (nym, kind) so each surface is its own row.

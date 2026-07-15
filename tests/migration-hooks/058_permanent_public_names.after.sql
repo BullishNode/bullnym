@@ -141,16 +141,16 @@ BEGIN
         RAISE EXCEPTION 'migration 058 omitted invoice-alias merchant communication';
     END IF;
 
-    -- A2 belongs to 059; the preflight itself is non-mutating.
+    -- The preflight never changes independent surface payout state.
     IF NOT EXISTS (
         SELECT 1
         FROM donation_pages
-        WHERE nym = 'fallback-page-owner'
+        WHERE nym = 'independent-page-owner'
           AND kind = 'payment_page'
-          AND ct_descriptor IS NULL
+          AND ct_descriptor = 'surface-page-descriptor'
           AND next_addr_idx = 3
     ) THEN
-        RAISE EXCEPTION 'migration 058 changed fallback descriptor state';
+        RAISE EXCEPTION 'migration 058 changed surface payout state';
     END IF;
 END
 $$;

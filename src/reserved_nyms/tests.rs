@@ -42,12 +42,12 @@ fn is_reserved_alias_covers_both_lists() {
     assert!(is_reserved_alias("a"));
     assert!(is_reserved_alias("register"));
     // ...plus the alias-specific reservations.
-    assert!(is_reserved_alias("0"));
-    assert!(is_reserved_alias("1"));
     assert!(is_reserved_alias("bull"));
     assert!(is_reserved_alias("bullbitcoin"));
     assert!(is_reserved_alias("bull-bitcoin"));
     // Ordinary merchant slugs are still allowed.
     assert!(!is_reserved_alias("alices-shop"));
     assert!(!is_reserved_alias("my-shop"));
+    assert!(!is_reserved_alias("0"));
+    assert!(!is_reserved_alias("1"));
 }

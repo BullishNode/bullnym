@@ -2097,11 +2097,19 @@ if [[ "$require_migration_059" == "1" ]]; then
     clean_psql --no-psqlrc --no-password --set ON_ERROR_STOP=1 \
       --quiet --tuples-only --no-align <<'SQL'
 SELECT (
-    NOT EXISTS (
+    EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'donation_pages'
+           AND column_name = 'ct_descriptor'
+           AND is_nullable = 'NO'
+    )
+    AND NOT EXISTS (
         SELECT 1
           FROM pg_attribute
          WHERE attrelid = to_regclass('public.donation_pages')
-           AND attname = 'alias'
+           AND attname IN ('alias', 'pos_mode')
            AND attnum > 0
            AND NOT attisdropped
     )
@@ -2110,7 +2118,7 @@ SELECT (
 SQL
   )"
   [[ "$migration_059_ready" == "1" ]] || {
-    echo "migration-059 boundary: mutable per-surface alias authority remains" >&2
+    echo "migration-059 boundary: obsolete surface authority or nullable descriptor remains" >&2
     exit 1
   }
 fi

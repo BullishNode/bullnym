@@ -148,8 +148,8 @@ impl PwaShells {
         }
     }
 
-    async fn shell_for(&self, pos_mode: bool) -> Option<String> {
-        let path = if pos_mode {
+    async fn shell_for(&self, is_pos: bool) -> Option<String> {
+        let path = if is_pos {
             self.pos.as_ref()
         } else {
             self.donation.as_ref()
@@ -210,7 +210,7 @@ const PWA_SHELL_HEADER: &str = "x-bullnym-pwa-shell";
 
 /// Add a few defensive response headers that apply to all donation-page
 /// HTML responses.
-fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
+fn apply_security_headers(resp: &mut Response, is_pos: bool) {
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -242,7 +242,7 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     //   changes for live POS pages.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(if pos_mode { POS_CSP } else { DONATION_CSP }),
+        HeaderValue::from_static(if is_pos { POS_CSP } else { DONATION_CSP }),
     );
     // Short browser freshness plus shared-cache stale serving absorbs crawler
     // bursts while keeping Page edits visible quickly.
@@ -252,8 +252,8 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     );
 }
 
-fn mark_pwa_shell_response(resp: &mut Response, pos_mode: bool) {
-    let value = if pos_mode { "pos" } else { "donation" };
+fn mark_pwa_shell_response(resp: &mut Response, is_pos: bool) {
+    let value = if is_pos { "pos" } else { "donation" };
     resp.headers_mut()
         .insert(PWA_SHELL_HEADER, HeaderValue::from_static(value));
 }
@@ -684,8 +684,7 @@ async fn manifest_alias_for_kind(
 /// - `PublicBase::Alias` → served at `/a/<slug>`; the nym is scrubbed from the
 ///   embedded config and manifest.
 ///
-/// The POS shell is selected when the row is the POS surface OR carries the
-/// legacy `pos_mode` toggle.
+/// The selected surface kind alone determines which shell is served.
 async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase<'_>) -> Response {
     let domain = &state.config.domain;
 
@@ -701,8 +700,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage, base: PublicBase
         PublicBase::Alias { slug, base_path } => (base_path.to_string(), slug.to_string(), None),
     };
     let public_url = format!("https://{domain}{base_path}");
-    // POS shell for either the dedicated POS row or a legacy pos_mode page.
-    let is_pos = page.kind == db::KIND_POS || page.pos_mode;
+    let is_pos = page.kind == db::KIND_POS;
     let manifest_href = format!("{base_path}/manifest.webmanifest");
 
     let og_url = if !is_pos {

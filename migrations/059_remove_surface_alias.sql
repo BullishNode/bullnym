@@ -4,9 +4,9 @@
 --
 -- Apply only after migration 058 has been reviewed and every ambiguous owner
 -- has an explicit canonical choice.  This stopped-writer transaction rechecks
--- nym, alias, and active-nym drift; snapshots every real legacy Payment Page
--- descriptor/cursor dependency; reserves every historical name; and removes
--- the mutable per-surface alias authority.
+-- nym, alias, and active-nym drift; rejects any descriptor-less surface;
+-- reserves every historical name; and removes the mutable per-surface alias
+-- authority.
 
 BEGIN;
 
@@ -168,9 +168,8 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
-    -- A NULL Page descriptor is a real legacy fallback only when the nym has
-    -- no POS row.  POS descriptors and Page+POS splits cannot be inferred;
-    -- fail closed for operator repair instead of changing a payout wallet.
+    -- The current contract has no descriptor-less surface. Never infer or
+    -- copy a payout wallet from another product during this name cutover.
     SELECT jsonb_agg(to_jsonb(conflicts))
       INTO invalid_surface_descriptors
       FROM (
@@ -181,26 +180,11 @@ BEGIN
               donation_pages.archived_at IS NOT NULL AS archived
           FROM donation_pages
           WHERE donation_pages.ct_descriptor IS NULL
-            AND (
-                donation_pages.kind = 'pos'
-                OR EXISTS (
-                    SELECT 1
-                    FROM donation_pages AS sibling
-                    WHERE sibling.nym = donation_pages.nym
-                      AND sibling.kind = 'pos'
-                )
-                OR NOT EXISTS (
-                    SELECT 1
-                    FROM users
-                    WHERE users.nym = donation_pages.nym
-                      AND length(btrim(users.ct_descriptor)) > 0
-                )
-            )
           ORDER BY donation_pages.nym, donation_pages.kind
       ) AS conflicts;
     IF invalid_surface_descriptors IS NOT NULL THEN
         RAISE EXCEPTION
-            'migration 059 aborted; surface descriptors require explicit operator repair: %',
+            'migration 059 aborted; descriptor-less surfaces violate the current contract: %',
             invalid_surface_descriptors
             USING ERRCODE = '23514';
     END IF;
@@ -230,35 +214,10 @@ BEGIN
 END
 $$;
 
--- A2: eliminate every genuine Page->Lightning-Address descriptor dependency.
--- The maximum cursor is essential: the Page cursor was unused on the fallback
--- path and may lag addresses already distributed from users.next_addr_idx.
-UPDATE donation_pages AS page
-   SET ct_descriptor = users.ct_descriptor,
-       next_addr_idx = GREATEST(page.next_addr_idx, users.next_addr_idx),
-       updated_at = clock_timestamp()
-  FROM users
- WHERE page.nym = users.nym
-   AND page.kind = 'payment_page'
-   AND page.ct_descriptor IS NULL
-   AND NOT EXISTS (
-       SELECT 1
-       FROM donation_pages AS pos
-       WHERE pos.nym = page.nym
-         AND pos.kind = 'pos'
-   );
-
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM donation_pages WHERE ct_descriptor IS NULL
-    ) THEN
-        RAISE EXCEPTION
-            'migration 059 left a surface dependent on another product descriptor'
-            USING ERRCODE = '23514';
-    END IF;
-END
-$$;
+-- Every current Page/POS surface owns its payout descriptor. Runtime checkout
+-- never falls back to the Lightning Address descriptor or cursor.
+ALTER TABLE donation_pages
+    ALTER COLUMN ct_descriptor SET NOT NULL;
 
 CREATE TABLE public_names (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),

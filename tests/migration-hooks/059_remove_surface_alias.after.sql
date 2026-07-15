@@ -1,5 +1,5 @@
--- Lock the historical backfill, typed collision, canonical/tombstone, A2
--- descriptor, runtime-claim, and least-privilege contracts.
+-- Lock the historical backfill, typed collision, canonical/tombstone,
+-- independent descriptor, runtime-claim, and least-privilege contracts.
 DO $$
 DECLARE
     actual_columns TEXT[];
@@ -95,23 +95,31 @@ BEGIN
         RAISE EXCEPTION 'migration 059 did not preserve typed collision';
     END IF;
 
-    -- A2 copied the exact descriptor and retained the high watermark.  The
-    -- owner cursor remains unchanged; every surface now owns a descriptor.
+    -- The name cutover leaves each product's descriptor/cursor untouched and
+    -- enforces the current non-null surface descriptor contract.
     IF NOT EXISTS (
         SELECT 1
         FROM donation_pages
-        WHERE nym = 'fallback-page-owner'
+        WHERE nym = 'independent-page-owner'
           AND kind = 'payment_page'
-          AND ct_descriptor = 'fallback-user-descriptor'
-          AND next_addr_idx = 118
+          AND ct_descriptor = 'surface-page-descriptor'
+          AND next_addr_idx = 3
     ) OR NOT EXISTS (
         SELECT 1 FROM users
-        WHERE nym = 'fallback-page-owner'
+        WHERE nym = 'independent-page-owner'
+          AND ct_descriptor = 'lightning-address-descriptor'
           AND next_addr_idx = 118
     ) OR EXISTS (
         SELECT 1 FROM donation_pages WHERE ct_descriptor IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'donation_pages'
+          AND column_name = 'ct_descriptor'
+          AND is_nullable = 'NO'
     ) THEN
-        RAISE EXCEPTION 'migration 059 descriptor/cursor backfill changed';
+        RAISE EXCEPTION 'migration 059 surface descriptor/cursor contract changed';
     END IF;
 
     -- Existing product state and old invoice owner identity are untouched.

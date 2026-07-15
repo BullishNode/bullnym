@@ -2092,6 +2092,7 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
                   AND column_name = 'ct_descriptor' \
+                  AND is_nullable = 'NO' \
             ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.columns \
@@ -2218,7 +2219,7 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 SELECT 1 FROM information_schema.columns \
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
-                  AND column_name IN ('avatar_sha256', 'og_sha256') \
+                  AND column_name IN ('avatar_sha256', 'og_sha256', 'pos_mode') \
             ) \
             AND EXISTS ( \
                 SELECT 1 FROM information_schema.tables \

@@ -188,7 +188,7 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
     let page = db::DonationPage {
         nym: "manifestnym".to_string(),
         kind: db::KIND_PAYMENT_PAGE.to_string(),
-        ct_descriptor: None,
+        ct_descriptor: String::new(),
         next_addr_idx: 0,
         header: "   ".to_string(),
         description: "Description".to_string(),
@@ -199,7 +199,6 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         is_archived: false,
     };
@@ -223,7 +222,7 @@ fn web_manifest_uses_header_for_name() {
     let page = db::DonationPage {
         nym: "alice".to_string(),
         kind: db::KIND_PAYMENT_PAGE.to_string(),
-        ct_descriptor: None,
+        ct_descriptor: String::new(),
         next_addr_idx: 0,
         header: "Alice Coffee Counter".to_string(),
         description: "Description".to_string(),
@@ -234,7 +233,6 @@ fn web_manifest_uses_header_for_name() {
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: true,
         enabled: true,
         is_archived: false,
     };
@@ -521,7 +519,7 @@ fn web_manifest_fallback_uses_provided_name_not_nym() {
     let page = db::DonationPage {
         nym: "secretnym".to_string(),
         kind: db::KIND_PAYMENT_PAGE.to_string(),
-        ct_descriptor: None,
+        ct_descriptor: String::new(),
         next_addr_idx: 0,
         header: "   ".to_string(),
         description: "d".to_string(),
@@ -532,7 +530,6 @@ fn web_manifest_fallback_uses_provided_name_not_nym() {
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         is_archived: false,
     };

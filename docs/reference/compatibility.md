@@ -24,7 +24,7 @@ policy inline.
   one optional permanent npub-level slug shared by Payment Page and POS,
   served at `/a/<alias>` and `/a/<alias>/pos`.
 - Compatibility behavior: `alias` is the sole optional trailing signed field,
-  appended after the required `pos_mode`, `ct_descriptor`, and `kind`. A client
+  appended after the required `ct_descriptor` and `kind`. A client
   that omits it signs the current fixed field list. Omitted/null preserves the
   claim; `""` is signed but rejected
   as `DonationPageInvalid`; a first valid value claims permanently; the same

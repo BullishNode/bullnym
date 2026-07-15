@@ -741,7 +741,6 @@ struct DonationSaveSignFields<'a> {
     twitter: &'a str,
     instagram: &'a str,
     enabled: bool,
-    pos_mode: bool,
     ct_descriptor: &'a str,
     kind: &'a str,
     alias: Option<&'a str>,
@@ -754,7 +753,6 @@ fn sign_donation_page_save_with_keypair(
     save: DonationSaveSignFields<'_>,
 ) -> (String, u64) {
     let enabled_str = if save.enabled { "1" } else { "0" };
-    let pos_mode_str = if save.pos_mode { "1" } else { "0" };
     let mut fields = vec![
         save.header,
         save.description,
@@ -763,7 +761,6 @@ fn sign_donation_page_save_with_keypair(
         save.twitter,
         save.instagram,
         enabled_str,
-        pos_mode_str,
         save.ct_descriptor,
         save.kind,
     ];
@@ -775,6 +772,21 @@ fn sign_donation_page_save_with_keypair(
 
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
+
+fn test_descriptor_with_blinding_key(byte: u8) -> String {
+    let body = TEST_DESCRIPTOR
+        .split_once('#')
+        .expect("test descriptor checksum")
+        .0
+        .replacen(
+            "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023",
+            &hex::encode([byte; 32]),
+            1,
+        );
+    let checksum = elements_miniscript::descriptor::checksum::desc_checksum(&body)
+        .expect("test descriptor checksum generation");
+    format!("{body}#{checksum}")
+}
 const TEST_LNURL_COMMENT_INTENT_TOKEN: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -1234,7 +1246,6 @@ async fn seed_chain_offer_checkout_surface(pool: &PgPool, nym: &str) {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3769,7 +3780,7 @@ async fn watcher_lane_progress_resumes_independently_and_repeats_after_crash_gap
 // --- Registration tests ---
 
 #[tokio::test]
-async fn payment_page_schema_keeps_generated_cards_without_legacy_media_hashes() {
+async fn payment_page_schema_enforces_current_surface_contract() {
     let pool = test_pool().await;
 
     let legacy_column_count: i64 = sqlx::query_scalar(
@@ -3777,12 +3788,24 @@ async fn payment_page_schema_keeps_generated_cards_without_legacy_media_hashes()
            FROM information_schema.columns \
           WHERE table_schema = current_schema() \
             AND table_name = 'donation_pages' \
-            AND column_name IN ('avatar_sha256', 'og_sha256')",
+            AND column_name IN ('avatar_sha256', 'og_sha256', 'pos_mode')",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(legacy_column_count, 0);
+
+    let descriptor_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable \
+           FROM information_schema.columns \
+          WHERE table_schema = current_schema() \
+            AND table_name = 'donation_pages' \
+            AND column_name = 'ct_descriptor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(descriptor_nullable, "NO");
 
     let generated_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name \
@@ -3812,7 +3835,7 @@ async fn payment_page_schema_keeps_generated_cards_without_legacy_media_hashes()
 }
 
 #[tokio::test]
-async fn donation_page_upsert_round_trips_pos_mode() {
+async fn donation_page_upsert_round_trips_independent_kinds() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     create_test_user(&pool, "posround").await;
@@ -3823,13 +3846,12 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             nym: "posround",
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             ct_descriptor: TEST_DESCRIPTOR,
-            header: "POS Store",
-            description: "Counter checkout",
+            header: "Donation Store",
+            description: "Tip jar",
             display_currency: "USD",
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: true,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3837,7 +3859,7 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     )
     .await
     .unwrap();
-    assert!(row.pos_mode);
+    assert_eq!(row.kind, pay_service::db::KIND_PAYMENT_PAGE);
 
     let fetched = pay_service::db::get_donation_page_by_nym(
         &pool,
@@ -3847,13 +3869,13 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     .await
     .unwrap()
     .unwrap();
-    assert!(fetched.pos_mode);
+    assert_eq!(fetched.kind, pay_service::db::KIND_PAYMENT_PAGE);
 
     let row = pay_service::db::upsert_donation_page(
         &pool,
         &pay_service::db::UpsertDonationPage {
             nym: "posround",
-            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            kind: pay_service::db::KIND_POS,
             ct_descriptor: TEST_DESCRIPTOR,
             header: "Donation Store",
             description: "Tip jar",
@@ -3861,7 +3883,6 @@ async fn donation_page_upsert_round_trips_pos_mode() {
             website: Some("https://example.com"),
             twitter: Some("posround"),
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3869,7 +3890,13 @@ async fn donation_page_upsert_round_trips_pos_mode() {
     )
     .await
     .unwrap();
-    assert!(!row.pos_mode);
+    assert_eq!(row.kind, pay_service::db::KIND_POS);
+    let surface_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM donation_pages WHERE nym = 'posround'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(surface_count, 2);
 
     cleanup_db(&pool).await;
 }
@@ -3892,7 +3919,6 @@ async fn og_reconciler_schedules_a_bounded_retry_after_publish_failure() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3969,7 +3995,6 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -3990,7 +4015,6 @@ async fn og_reconciler_backfills_legacy_rows_and_repairs_missing_current_files()
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4102,7 +4126,6 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4119,7 +4142,6 @@ async fn payment_page_save_commits_when_og_storage_is_unwritable() {
             "header": "Persist despite preview failure",
             "description": "Payments must not depend on social image storage.",
             "display_currency": "USD",
-            "pos_mode": false,
             "enabled": true,
             "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
@@ -4164,7 +4186,6 @@ async fn og_key_attaches_only_to_the_matching_persisted_page_content() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: Some(pay_service::og_image::TEMPLATE_VERSION),
             alias: None,
@@ -4260,7 +4281,6 @@ async fn manifest_falls_back_to_nym_and_sets_pwa_metadata() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -4345,7 +4365,6 @@ async fn donation_page_save_requires_current_signed_fields() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4362,7 +4381,6 @@ async fn donation_page_save_requires_current_signed_fields() {
             "description": "Current clients sign every required field",
             "display_currency": "USD",
             "enabled": true,
-            "kind": pay_service::db::KIND_PAYMENT_PAGE,
             "timestamp": timestamp,
             "signature": signature,
         }),
@@ -4403,7 +4421,6 @@ async fn donation_page_archive_requires_signed_kind() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -4459,7 +4476,7 @@ async fn donation_page_archive_requires_signed_kind() {
 }
 
 #[tokio::test]
-async fn donation_page_save_new_payload_round_trips_pos_mode() {
+async fn donation_page_save_rejects_legacy_pos_mode_field() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -4474,14 +4491,13 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
         &npub,
         nym,
         DonationSaveSignFields {
-            header: "New POS",
-            description: "New clients sign pos_mode",
+            header: "Current Page",
+            description: "Current clients sign kind only",
             display_currency: "USD",
             website: "https://example.com",
             twitter: "posnew",
             instagram: "pos.new",
             enabled: true,
-            pos_mode: true,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4494,8 +4510,8 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
             "nym": nym,
             "npub": npub,
             "ct_descriptor": TEST_DESCRIPTOR,
-            "header": "New POS",
-            "description": "New clients sign pos_mode",
+            "header": "Current Page",
+            "description": "Current clients sign kind only",
             "display_currency": "USD",
             "website": "https://example.com",
             "twitter": "posnew",
@@ -4508,16 +4524,15 @@ async fn donation_page_save_new_payload_round_trips_pos_mode() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["pos_mode"], true);
-
-    let row =
-        pay_service::db::get_donation_page_by_nym(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
-            .await
-            .unwrap()
-            .unwrap();
-    assert!(row.pos_mode);
-    assert_eq!(row.website.as_deref(), Some("https://example.com"));
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(pay_service::db::get_donation_page_by_nym(
+        &pool,
+        nym,
+        pay_service::db::KIND_PAYMENT_PAGE
+    )
+    .await
+    .unwrap()
+    .is_none());
 
     cleanup_db(&pool).await;
 }
@@ -4546,7 +4561,6 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -4558,7 +4572,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice Page", "description": "Tip jar", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "payment_page",
+            "enabled": true, "kind": "payment_page",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -4579,7 +4593,6 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: "pos",
             alias: None,
@@ -4591,7 +4604,7 @@ async fn pos_and_payment_page_surfaces_coexist_under_one_nym() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Alice POS", "description": "Counter", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "pos",
+            "enabled": true, "kind": "pos",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -4645,7 +4658,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(alias),
@@ -4657,7 +4669,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared Page", "description": "Permanent alias Page",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4681,7 +4693,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_POS,
             alias: Some(alias),
@@ -4693,7 +4704,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Shared POS", "description": "Permanent alias POS",
-            "display_currency": "CRC", "pos_mode": false, "enabled": true,
+            "display_currency": "CRC", "enabled": true,
             "kind": "pos", "alias": alias,
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4729,7 +4740,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some("different-shop"),
@@ -4741,7 +4751,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Not Commit", "description": "Rejected rename",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": "different-shop",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4769,7 +4779,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: Some(""),
@@ -4781,7 +4790,7 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Must Still Not Commit", "description": "Empty is not a clear",
-            "display_currency": "USD", "pos_mode": false, "enabled": true,
+            "display_currency": "USD", "enabled": true,
             "kind": "payment_page", "alias": "",
             "timestamp": timestamp, "signature": signature,
         }),
@@ -4810,7 +4819,6 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some(alias),
@@ -4855,8 +4863,35 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
     assert_eq!(status, StatusCode::OK, "{pos_manifest:?}");
     assert_eq!(pos_manifest["start_url"], "/a/shared-shop/pos");
 
+    let page_descriptor = test_descriptor_with_blinding_key(0x11);
+    let pos_descriptor = test_descriptor_with_blinding_key(0x22);
+    sqlx::query("UPDATE users SET next_addr_idx = 3 WHERE npub = $1")
+        .bind(&npub)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 7 \
+          WHERE nym = $1 AND kind = 'payment_page'",
+    )
+    .bind(nym)
+    .bind(&page_descriptor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE donation_pages SET ct_descriptor = $2, next_addr_idx = 13 \
+          WHERE nym = $1 AND kind = 'pos'",
+    )
+    .bind(nym)
+    .bind(&pos_descriptor)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // Lightning Address availability is independent: taking it offline does
-    // not remove the alias or either surface route.
+    // not remove the alias or either surface route. Checkout must allocate
+    // only from the selected surface descriptor/cursor.
     sqlx::query("UPDATE users SET is_active = FALSE WHERE npub = $1")
         .bind(&npub)
         .execute(&pool)
@@ -4870,19 +4905,41 @@ async fn permanent_alias_is_shared_insert_only_and_independent_of_surface_availa
         get_text_path(&app, "/a/shared-shop/pos").await.0,
         StatusCode::OK
     );
-    let (status, offline_checkout) = post_json(
+    let (status, offline_page_checkout) = post_json(
+        &app,
+        "/a/shared-shop/invoice",
+        json!({ "amount_sat": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{offline_page_checkout:?}");
+    assert_eq!(
+        offline_page_checkout["liquid_address"],
+        pay_service::descriptor::derive_address(&page_descriptor, 7).unwrap()
+    );
+    let (status, offline_pos_checkout) = post_json(
         &app,
         "/a/shared-shop/pos/invoice",
         json!({ "amount_sat": 1_000 }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{offline_checkout:?}");
-    assert!(
-        offline_checkout["liquid_address"]
-            .as_str()
-            .is_some_and(|address| !address.is_empty()),
-        "offline Lightning Address must not disable POS checkout"
+    assert_eq!(status, StatusCode::OK, "{offline_pos_checkout:?}");
+    assert_eq!(
+        offline_pos_checkout["liquid_address"],
+        pay_service::descriptor::derive_address(&pos_descriptor, 13).unwrap()
     );
+    let cursors: (i32, i32, i32) = sqlx::query_as(
+        "SELECT users.next_addr_idx, \
+                (SELECT next_addr_idx FROM donation_pages \
+                  WHERE nym = $1 AND kind = 'payment_page'), \
+                (SELECT next_addr_idx FROM donation_pages \
+                  WHERE nym = $1 AND kind = 'pos') \
+           FROM users WHERE nym = $1",
+    )
+    .bind(nym)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cursors, (3, 8, 14));
 
     // Archiving only Page preserves the permanent claim and live POS route.
     pay_service::db::archive_donation_page(&pool, nym, pay_service::db::KIND_PAYMENT_PAGE)
@@ -4924,7 +4981,6 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("page-choice"),
@@ -4939,7 +4995,6 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         generated_og_template_version: None,
         alias: Some("pos-choice"),
@@ -5016,7 +5071,6 @@ async fn pos_save_without_descriptor_is_rejected() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: "pos",
             alias: None,
@@ -5028,7 +5082,7 @@ async fn pos_save_without_descriptor_is_rejected() {
         json!({
             "nym": nym, "npub": npub,
             "header": "No Desc POS", "description": "Missing wallet", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "kind": "pos",
+            "enabled": true, "kind": "pos",
             "timestamp": ts, "signature": sig,
         }),
     )
@@ -5068,7 +5122,6 @@ async fn donation_page_save_without_kind_is_rejected() {
             twitter: "",
             instagram: "",
             enabled: true,
-            pos_mode: false,
             ct_descriptor: TEST_DESCRIPTOR,
             kind: pay_service::db::KIND_PAYMENT_PAGE,
             alias: None,
@@ -5080,7 +5133,7 @@ async fn donation_page_save_without_kind_is_rejected() {
         json!({
             "nym": nym, "npub": npub, "ct_descriptor": TEST_DESCRIPTOR,
             "header": "Current", "description": "Kind is required", "display_currency": "USD",
-            "pos_mode": false, "enabled": true, "timestamp": ts, "signature": sig,
+            "enabled": true, "timestamp": ts, "signature": sig,
         }),
     )
     .await;
@@ -5127,7 +5180,6 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -5182,12 +5234,9 @@ async fn pos_allocation_uses_pos_cursor_not_lightning_address_cursor() {
 }
 
 #[tokio::test]
-async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
-    // A misconfigured POS row (enabled, no descriptor) must make POS checkout
-    // hard-fail rather than fall back to the Lightning Address cursor (KR-1).
+async fn surface_schema_rejects_missing_descriptor() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
-    let app = test_app(test_state(pool.clone()));
     let nym = "posnofb";
     let (npub, _, _) = sign_registration(nym, TEST_DESCRIPTOR);
     pay_service::db::create_user(&pool, nym, &npub, TEST_DESCRIPTOR)
@@ -5199,23 +5248,22 @@ async fn pos_invoice_hard_fails_without_pos_descriptor_no_la_fallback() {
         .await
         .unwrap();
 
-    // Save would reject a descriptor-less POS row; insert it directly to
-    // exercise the checkout branch's hard-fail.
-    sqlx::query(
+    let error = sqlx::query(
         "INSERT INTO donation_pages \
-            (nym, kind, ct_descriptor, header, description, display_currency, pos_mode, enabled) \
-         VALUES ($1, 'pos', NULL, 'Broken POS', 'No wallet', 'USD', FALSE, TRUE)",
+            (nym, kind, ct_descriptor, header, description, display_currency, enabled) \
+         VALUES ($1, 'pos', NULL, 'Broken POS', 'No wallet', 'USD', TRUE)",
     )
     .bind(nym)
     .execute(&pool)
     .await
-    .unwrap();
-
-    let (status, body) =
-        post_json(&app, "/posnofb/pos/invoice", json!({ "amount_sat": 1000 })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ERROR");
-    assert_eq!(body["code"], "DonationPageNotFound");
+    .expect_err("ct_descriptor is a current required surface invariant");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("23502")
+    );
 
     // The Lightning Address cursor was never advanced — no leak.
     let la_idx: i32 = sqlx::query_scalar("SELECT next_addr_idx FROM users WHERE nym = $1")
@@ -9044,7 +9092,6 @@ async fn healthy_direct_liquid_checkout_omits_closed_swap_rails() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -9133,7 +9180,6 @@ async fn certification_invoice_scope_does_not_bypass_closed_admission() {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,
@@ -21212,7 +21258,6 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
                 website: None,
                 twitter: None,
                 instagram: None,
-                pos_mode: false,
                 enabled: true,
                 generated_og_template_version: None,
                 alias: None,
@@ -31178,7 +31223,6 @@ async fn seed_invoice_route_page(pool: &PgPool, nym: &str) -> uuid::Uuid {
             website: None,
             twitter: None,
             instagram: None,
-            pos_mode: false,
             enabled: true,
             generated_og_template_version: None,
             alias: None,

@@ -60,6 +60,7 @@ static ALIAS_REGEX: LazyLock<Regex> =
 // --- Request / response wire types ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SaveDonationPageRequest {
     pub nym: String,
     pub npub: String,
@@ -73,7 +74,6 @@ pub struct SaveDonationPageRequest {
     pub twitter: Option<String>,
     #[serde(default)]
     pub instagram: Option<String>,
-    pub pos_mode: bool,
     pub enabled: bool,
     /// Surface discriminator: `payment_page` or `pos`.
     pub kind: String,
@@ -107,7 +107,6 @@ pub struct DonationPageView {
     pub twitter: Option<String>,
     pub instagram: Option<String>,
     pub kind: String,
-    pub pos_mode: bool,
     pub enabled: bool,
     pub is_archived: bool,
     /// Permanent owner-level alias shared by Page and POS, if claimed.
@@ -138,7 +137,6 @@ impl DonationPageView {
             twitter: row.twitter,
             instagram: row.instagram,
             kind: row.kind,
-            pos_mode: row.pos_mode,
             enabled: row.enabled,
             is_archived: row.is_archived,
             alias: row.alias,
@@ -246,8 +244,8 @@ fn validate_description_for_kind(
 /// The order MUST stay in lockstep with the mobile
 /// (`donation_page_constants.dart::buildSavePayloadFields`).
 /// Optional social fields that are absent become empty strings (NOT skipped)
-/// so their NUL-separated positions remain stable. `pos_mode`,
-/// `ct_descriptor`, and `kind` are required signed fields. `alias` is the sole
+/// so their NUL-separated positions remain stable. `ct_descriptor` and `kind`
+/// are required signed fields. `alias` is the sole
 /// optional trailing field and MUST stay last.
 // The positional list is the signed wire contract; grouping it into a struct
 // would obscure the byte-exact field order this helper exists to test.
@@ -260,7 +258,6 @@ fn save_payload_fields<'a>(
     twitter: &'a str,
     instagram: &'a str,
     enabled_str: &'a str,
-    pos_mode_str: &'a str,
     ct_descriptor: &'a str,
     kind: &'a str,
     alias: Option<&'a str>,
@@ -273,7 +270,6 @@ fn save_payload_fields<'a>(
         twitter,
         instagram,
         enabled_str,
-        pos_mode_str,
         ct_descriptor,
         kind,
     ];
@@ -364,7 +360,6 @@ pub async fn save(
     let twitter = req.twitter.as_deref().unwrap_or("");
     let instagram = req.instagram.as_deref().unwrap_or("");
     let enabled_str = if req.enabled { "1" } else { "0" };
-    let pos_mode_str = if req.pos_mode { "1" } else { "0" };
     let fields = save_payload_fields(
         &req.header,
         &req.description,
@@ -373,7 +368,6 @@ pub async fn save(
         twitter,
         instagram,
         enabled_str,
-        pos_mode_str,
         &req.ct_descriptor,
         &req.kind,
         req.alias.as_deref(),
@@ -389,21 +383,6 @@ pub async fn save(
 
     // Verify the npub owns the nym AND is active.
     assert_nym_owner(&state, &req.nym, &req.npub).await?;
-
-    // Conflict rule: a nym must not end up with two POS surfaces. Reject
-    // enabling pos_mode on the Payment Page row when a separate POS row
-    // already exists (Q5). New clients use `kind` and stop sending pos_mode.
-    if kind == db::KIND_PAYMENT_PAGE
-        && req.pos_mode
-        && db::get_donation_page_by_nym(&state.db, &req.nym, db::KIND_POS)
-            .await?
-            .is_some()
-    {
-        return Err(AppError::DonationPageInvalid(
-            "cannot enable pos_mode on the payment page while a separate POS surface exists"
-                .to_string(),
-        ));
-    }
 
     // Persist the merchant's Page mutation before doing any rendering work.
     // Changed content clears the old generated key in the upsert, so public
@@ -421,7 +400,6 @@ pub async fn save(
             website: req.website.as_deref().filter(|s| !s.is_empty()),
             twitter: req.twitter.as_deref().filter(|s| !s.is_empty()),
             instagram: req.instagram.as_deref().filter(|s| !s.is_empty()),
-            pos_mode: req.pos_mode,
             enabled: req.enabled,
             generated_og_template_version: (kind == db::KIND_PAYMENT_PAGE)
                 .then_some(og_image::TEMPLATE_VERSION),

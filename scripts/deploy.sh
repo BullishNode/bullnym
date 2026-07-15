@@ -467,10 +467,10 @@ then prove the exact migration-058 boundary. If it is absent, apply migration
 its exact candidate snapshot and merchant-communication view, explicitly
 resolve every ambiguous canonical choice, and capture the review evidence.
 Only then apply migration 059 with the same owner and runtime-role binding. It
-revalidates both candidate sets, snapshots fallback Page descriptors/cursors,
-preserves canonical names and tombstones, and only then removes the old alias
-column. Never apply 059 directly from schema 057 or bypass an unresolved,
-drift, snapshot, or review refusal.
+revalidates both candidate sets, rejects descriptor-less surfaces, preserves
+canonical names and tombstones, and only then removes the old alias column.
+Never apply 059 directly from schema 057 or bypass an unresolved, drift,
+descriptor, snapshot, or review refusal.
 EOF
     exit 1
   fi

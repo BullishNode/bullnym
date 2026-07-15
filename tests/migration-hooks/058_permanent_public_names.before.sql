@@ -110,16 +110,15 @@ VALUES
         'archived-owner-pos-descriptor', NULL
     );
 
--- A2: this Page really uses the LA fallback (no POS sibling).  Its own cursor
--- is stale; 059 must copy the descriptor and retain the higher user cursor.
+-- Surface and Lightning Address payout state are independent before cutover.
 INSERT INTO users (nym, npub, ct_descriptor, next_addr_idx, is_active)
-VALUES ('fallback-page-owner', repeat('2', 64), 'fallback-user-descriptor', 118, TRUE);
+VALUES ('independent-page-owner', repeat('2', 64), 'lightning-address-descriptor', 118, TRUE);
 
 INSERT INTO donation_pages (
     nym, kind, header, description, display_currency, enabled,
     ct_descriptor, next_addr_idx
 )
 VALUES (
-    'fallback-page-owner', 'payment_page', 'Fallback Page',
-    'Cursor migration fixture', 'USD', TRUE, NULL, 3
+    'independent-page-owner', 'payment_page', 'Independent Page',
+    'Independent payout fixture', 'USD', TRUE, 'surface-page-descriptor', 3
 );

@@ -32,7 +32,7 @@ or linked/unlinked invoice scopes.
 | `register` | `npub` | `nym`, Lightning Address `ct_descriptor`, optional `verification_npub`. |
 | `update` | `npub` | Replacement Lightning Address `ct_descriptor`. |
 | `delete` | `npub` | Take the current Lightning Address offline without changing nym ownership. |
-| `donation-page-save` | `npub` | Surface fields, display currency, links, required `pos_mode`, required `ct_descriptor`, and required `kind`; optional terminal alias. |
+| `donation-page-save` | `npub` | Surface fields, display currency, links, required `ct_descriptor`, and required `kind`; optional terminal alias. |
 | `donation-page-archive` | `npub` | Required surface `kind`. |
 | `invoice-create` | `npub` | Amount, accepted rails, recipient-supplied addresses, metadata, expiry. |
 | `invoice-cancel` | `npub` | Invoice id. |

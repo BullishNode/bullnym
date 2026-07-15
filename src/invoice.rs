@@ -745,39 +745,9 @@ async fn create_anonymous_for_kind(
         .await?
         {
             Some((address, index, descriptor)) => (address, index, descriptor),
-            // Legacy Payment Page rows created before the descriptor split have
-            // no page descriptor; fall back to the nym's Lightning Address
-            // descriptor/cursor so those pages keep settling.
-            //
-            // Defense-in-depth (KR-1): only for a nym with NO POS surface. A
-            // nym that also runs POS lives in the descriptor-split world, so a
-            // Payment Page checkout with a missing page descriptor is a
-            // misconfiguration, not a legacy row — refuse rather than silently
-            // settle it to the shared Lightning Address cursor and risk mixing
-            // the POS and LA rails.
-            None if kind == db::KIND_PAYMENT_PAGE => {
-                if db::get_donation_page_by_nym(&state.db, &nym, db::KIND_POS)
-                    .await?
-                    .is_some()
-                {
-                    return Err(AppError::DonationPageNotFound(nym.clone()));
-                }
-                let (address, index) = db::allocate_next_liquid_for_permanent_nym(
-                    &state.db,
-                    &nym,
-                    |ct_descriptor, idx| {
-                        descriptor::derive_address(ct_descriptor, idx)
-                            .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
-                    },
-                )
-                .await?
-                .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
-                (address, index, owner.ct_descriptor.clone())
-            }
-            // The POS surface must carry its own descriptor (enforced at save).
-            // If allocation failed the row is misconfigured; hard-fail rather
-            // than fall back to the Lightning Address cursor — POS receipts
-            // must never settle to the LA wallet (KR-1).
+            // Every Page/POS surface owns its descriptor and cursor. Missing or
+            // unavailable surface allocation is never redirected through the
+            // owner's independently configured Lightning Address wallet.
             None => return Err(AppError::DonationPageNotFound(nym.clone())),
         };
     let liquid_blinding_key_hex =

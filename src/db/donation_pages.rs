@@ -20,7 +20,7 @@ pub struct DonationPage {
     pub nym: String,
     /// Surface kind: `payment_page` or `pos`. A nym may own one row of each.
     pub kind: String,
-    pub ct_descriptor: Option<String>,
+    pub ct_descriptor: String,
     pub next_addr_idx: i32,
     pub header: String,
     pub description: String,
@@ -34,7 +34,6 @@ pub struct DonationPage {
     pub website: Option<String>,
     pub twitter: Option<String>,
     pub instagram: Option<String>,
-    pub pos_mode: bool,
     pub enabled: bool,
     /// Derived from `archived_at IS NOT NULL`. The full timestamp lives in
     /// the column for audit but isn't read into Rust (would require the
@@ -54,7 +53,6 @@ pub struct UpsertDonationPage<'a> {
     pub website: Option<&'a str>,
     pub twitter: Option<&'a str>,
     pub instagram: Option<&'a str>,
-    pub pos_mode: bool,
     pub enabled: bool,
     /// The target renderer version for this content. A missing key with a
     /// present version selects the branded fallback while post-commit
@@ -134,10 +132,10 @@ pub async fn upsert_donation_page(
     sqlx::query(
         "INSERT INTO donation_pages \
             (nym, kind, ct_descriptor, header, description, display_currency, \
-             website, twitter, instagram, pos_mode, enabled, \
+             website, twitter, instagram, enabled, \
              generated_og_key, generated_og_template_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                 NULL, $12) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                 NULL, $11) \
          ON CONFLICT (nym, kind) DO UPDATE SET \
              ct_descriptor = EXCLUDED.ct_descriptor, \
              header = EXCLUDED.header, \
@@ -146,7 +144,6 @@ pub async fn upsert_donation_page(
              website = EXCLUDED.website, \
              twitter = EXCLUDED.twitter, \
              instagram = EXCLUDED.instagram, \
-             pos_mode = EXCLUDED.pos_mode, \
              enabled = EXCLUDED.enabled, \
              generated_og_key = CASE \
                  WHEN donation_pages.header = EXCLUDED.header \
@@ -171,7 +168,6 @@ pub async fn upsert_donation_page(
     .bind(page.website)
     .bind(page.twitter)
     .bind(page.instagram)
-    .bind(page.pos_mode)
     .bind(page.enabled)
     .bind(page.generated_og_template_version)
     .execute(&mut *tx)
@@ -263,7 +259,7 @@ where
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \
-                donation_pages.instagram, donation_pages.pos_mode, donation_pages.enabled, \
+                donation_pages.instagram, donation_pages.enabled, \
                 (donation_pages.archived_at IS NOT NULL) AS is_archived \
            FROM donation_pages \
            JOIN users ON users.nym = donation_pages.nym \
@@ -298,7 +294,7 @@ pub async fn get_donation_page_by_alias(
                 donation_pages.generated_og_key, donation_pages.generated_og_template_version, \
                 alias_name.name AS alias, donation_pages.ct_descriptor, donation_pages.next_addr_idx, \
                 donation_pages.display_currency, donation_pages.website, donation_pages.twitter, \
-                donation_pages.instagram, donation_pages.pos_mode, donation_pages.enabled, \
+                donation_pages.instagram, donation_pages.enabled, \
                 (donation_pages.archived_at IS NOT NULL) AS is_archived \
            FROM public_names alias_name \
            JOIN public_names nym_name \
@@ -346,8 +342,7 @@ where
          WHERE nym = $1 \
            AND kind = $2 \
            AND enabled = TRUE \
-           AND archived_at IS NULL \
-           AND ct_descriptor IS NOT NULL",
+           AND archived_at IS NULL",
     )
     .bind(nym)
     .bind(kind)

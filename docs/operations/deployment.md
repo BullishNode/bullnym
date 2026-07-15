@@ -26,8 +26,8 @@
    the runtime `bullnym_app` role must never apply it.
    Migrations 058 and 059 are one stopped-writer permanent-name cutover: 058
    snapshots historical nym/alias candidates for explicit canonical choices;
-   059 rejects drift, backfills canonical claims and tombstones, snapshots
-   legacy Page descriptors/cursors, and removes the mutable alias column.
+   059 rejects drift and descriptor-less surfaces, backfills canonical claims
+   and tombstones, and removes the mutable alias column.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -131,12 +131,11 @@ pre-cutover backup while writers remain stopped.
 Apply 059 with `--set runtime_role=bullnym_app`. It recomputes both candidate
 sets and the active nym; any drift or unresolved row aborts transactionally.
 It preserves every historical surface/invoice name as a canonical claim or
-non-payable typed tombstone, preserves typed legacy nym/alias collisions, verifies historical
-invoice owner tuples, and copies each real legacy Payment Page fallback's
-descriptor plus `GREATEST(page.next_addr_idx, users.next_addr_idx)` before
-removing `donation_pages.alias`. A missing POS descriptor or a Page missing its
-descriptor while a POS sibling exists requires explicit repair and fails
-closed; do not infer a payout wallet.
+non-payable typed tombstone, preserves typed legacy nym/alias collisions, and
+verifies historical invoice owner tuples before removing
+`donation_pages.alias`. Any descriptor-less Page/POS row requires explicit
+repair and fails closed; the cutover never infers a payout wallet from the
+Lightning Address or another surface.
 
 Before starting Bullnym, verify the result through the protected runtime
 connection:

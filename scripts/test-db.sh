@@ -242,7 +242,7 @@ assert_migration_058_refusal_case() {
     docker exec "$CONTAINER" \
       psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --username "$PG_USER" --dbname "$scratch" \
-        --command "SELECT COALESCE(to_regclass('public.public_name_migration_choices')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'fallback-page-owner' AND kind = 'payment_page')"
+        --command "SELECT COALESCE(to_regclass('public.public_name_migration_choices')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'independent-page-owner' AND kind = 'payment_page')"
   )"
   [[ "$rollback_state" == ":true:3" ]] \
     || die "migration 058 $suffix leaked preflight state after rollback ($rollback_state)"
@@ -293,7 +293,7 @@ assert_migration_059_refusal_case() {
     docker exec "$CONTAINER" \
       psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --username "$PG_USER" --dbname "$scratch" \
-        --command "SELECT COALESCE(to_regclass('public.public_names')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'fallback-page-owner' AND kind = 'payment_page')"
+        --command "SELECT COALESCE(to_regclass('public.public_names')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'independent-page-owner' AND kind = 'payment_page')"
   )"
   [[ "$rollback_state" == ":true:3" ]] \
     || die "migration 059 $suffix leaked cutover state after rollback ($rollback_state)"
@@ -319,6 +319,11 @@ assert_migration_059_refuses_drift_and_unresolved() {
     "$database" "$migration" "unresolved" \
     "UPDATE public_name_migration_choices SET resolved = FALSE WHERE owner_npub = repeat('d', 64);" \
     "resolve every canonical choice first"
+
+  assert_migration_059_refusal_case \
+    "$database" "$migration" "descriptorless_surface" \
+    "UPDATE donation_pages SET ct_descriptor = NULL WHERE nym = 'independent-page-owner' AND kind = 'payment_page';" \
+    "descriptor-less surfaces violate the current contract"
 }
 
 apply_migrations() {

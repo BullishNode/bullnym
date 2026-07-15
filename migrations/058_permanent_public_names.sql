@@ -335,7 +335,6 @@ DECLARE
     runtime_role_name TEXT := current_setting('bullnym.migration_runtime_role');
     unresolved JSONB;
     cross_type_collisions JSONB;
-    fallback_pages JSONB;
     merchant_communications JSONB;
 BEGIN
     REVOKE ALL ON TABLE public_name_migration_choices FROM PUBLIC;
@@ -392,33 +391,6 @@ BEGIN
         RAISE NOTICE
             'migration 059 will grandfather typed alias/nym collisions: %',
             cross_type_collisions;
-    END IF;
-
-    SELECT jsonb_agg(to_jsonb(fallbacks))
-      INTO fallback_pages
-      FROM (
-          SELECT
-              users.npub AS owner_npub,
-              donation_pages.nym,
-              donation_pages.next_addr_idx AS surface_cursor,
-              users.next_addr_idx AS user_cursor,
-              donation_pages.archived_at IS NOT NULL AS surface_archived
-          FROM donation_pages
-          JOIN users ON users.nym = donation_pages.nym
-          WHERE donation_pages.kind = 'payment_page'
-            AND donation_pages.ct_descriptor IS NULL
-            AND NOT EXISTS (
-                SELECT 1
-                FROM donation_pages AS pos
-                WHERE pos.nym = donation_pages.nym
-                  AND pos.kind = 'pos'
-            )
-          ORDER BY users.npub, donation_pages.nym
-      ) AS fallbacks;
-    IF fallback_pages IS NOT NULL THEN
-        RAISE NOTICE
-            'migration 059 will snapshot legacy Page descriptors/cursors: %',
-            fallback_pages;
     END IF;
 
     SELECT jsonb_agg(to_jsonb(communications))

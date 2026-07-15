@@ -67,9 +67,8 @@ backfills every historical name into `public_names`: selected names are
 canonical and every other historical name is an owner-bound non-payable
 tombstone. Typed historical nym/alias collisions are preserved while every new
 claim still uses one shared namespace. Before removing the older mutable
-`donation_pages.alias` column, it snapshots each real legacy Payment Page
-descriptor dependency and advances its surface cursor to the greater of its
-old surface and user cursors.
+`donation_pages.alias` column, it rejects any descriptor-less Page/POS row;
+the name cutover never infers or copies a payout wallet from another product.
 
 Database constraints and triggers enforce:
 
