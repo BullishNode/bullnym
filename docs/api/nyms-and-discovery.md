@@ -25,9 +25,9 @@ extension and use Lightning.
 ## `GET /lnurlp/callback/:nym/:comment_intent`
 
 Use the complete opaque callback URL returned by metadata. The final path
-component gives an exact retry the same private intent identity. The legacy
-`/lnurlp/callback/:nym` route remains available for no-comment payments, but
-fails closed if a `comment` is supplied.
+component gives an exact retry the same private intent identity and is required
+even when the request has no comment. Bullnym does not expose a tokenless
+callback route.
 
 Common query fields:
 

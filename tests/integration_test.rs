@@ -401,7 +401,6 @@ fn test_app(state: AppState) -> Router {
             "/lnurlp/callback/:nym/:comment_intent",
             get(lnurl::callback_with_comment_intent),
         )
-        .route("/lnurlp/callback/:nym", get(lnurl::callback))
         .route("/donation-page", put(donation_page::save))
         .route("/donation-page/:nym", get(donation_page::get))
         .route(
@@ -776,6 +775,12 @@ fn sign_donation_page_save_with_keypair(
 
 // Valid CT descriptor (lwk 0.14, h-notation)
 const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
+const TEST_LNURL_COMMENT_INTENT_TOKEN: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn test_lnurl_callback_path(nym: &str) -> String {
+    format!("/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}")
+}
 
 async fn cleanup_db(pool: &PgPool) {
     // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
@@ -8242,16 +8247,54 @@ async fn callback_rejects_invalid_amounts() {
     .await;
 
     // Below minimum (default 100k msat = 100 sats)
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=1000").await;
+    let (_, body) = get_path(
+        &app,
+        &format!("{}?amount=1000", test_lnurl_callback_path("amtuser")),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     // Not divisible by 1000
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=100500").await;
+    let (_, body) = get_path(
+        &app,
+        &format!("{}?amount=100500", test_lnurl_callback_path("amtuser")),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
 
     // Above maximum
-    let (_, body) = get_path(&app, "/lnurlp/callback/amtuser?amount=99000000000000").await;
+    let (_, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=99000000000000",
+            test_lnurl_callback_path("amtuser")
+        ),
+    )
+    .await;
     assert_eq!(body["status"], "ERROR");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn callback_requires_current_intent_token_route() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    create_test_user(&pool, "badintenttoken").await;
+    let app = test_app(test_state(pool.clone()));
+
+    let (retired_status, retired_body) =
+        get_path(&app, "/lnurlp/callback/badintenttoken?amount=100000").await;
+    assert_eq!(retired_status, StatusCode::NOT_FOUND, "{retired_body:?}");
+    assert_eq!(retired_body, Value::Null);
+
+    let (status, body) = get_path(
+        &app,
+        "/lnurlp/callback/badintenttoken/not-canonical?amount=100000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["code"], "InvalidComment");
 
     cleanup_db(&pool).await;
 }
@@ -8299,15 +8342,6 @@ async fn lnurl_comment_callback_persists_binds_and_replays_one_private_lightning
     assert_eq!(over_limit_status, StatusCode::OK, "{over_limit_body}");
     assert_eq!(over_limit_body["code"], "InvalidComment");
     assert!(!over_limit_body.to_string().contains(&over_limit));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-
-    let (legacy_status, legacy_body) = get_path(
-        &app,
-        &format!("/lnurlp/callback/{nym}?amount=100000&comment=private"),
-    )
-    .await;
-    assert_eq!(legacy_status, StatusCode::OK, "{legacy_body}");
-    assert_eq!(legacy_body["code"], "InvalidComment");
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
     let (liquid_status, liquid_body) = get_path(
@@ -8509,7 +8543,14 @@ async fn m11_fresh_provider_range_is_cached_and_callback_revalidates_before_muta
         .provider_limits()
         .record_successful_refresh(Some(test_reverse_pair(500, 1_500)), Instant::now());
     let before = m11_creation_mutation_snapshot(&pool).await;
-    let (status, body) = get_path(&app, "/lnurlp/callback/m11freshlimits?amount=250000").await;
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=250000",
+            test_lnurl_callback_path("m11freshlimits")
+        ),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -8718,7 +8759,14 @@ async fn closed_reverse_admission_precedes_key_and_provider_mutation() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let (status, body) = get_path(&app, "/lnurlp/callback/admissionclosed?amount=100000").await;
+    let (status, body) = get_path(
+        &app,
+        &format!(
+            "{}?amount=100000",
+            test_lnurl_callback_path("admissionclosed")
+        ),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["status"], "ERROR");
@@ -8910,7 +8958,10 @@ async fn whitelisted_liquid_admission_failure_does_not_fallback_to_lightning() {
 
     let (status, body) = get_path_from(
         &app,
-        "/lnurlp/callback/liquidclosed?amount=100000&payment_method=L-BTC",
+        &format!(
+            "{}?amount=100000&payment_method=L-BTC",
+            test_lnurl_callback_path("liquidclosed")
+        ),
         "127.0.0.1:42000".parse().unwrap(),
     )
     .await;
@@ -10171,7 +10222,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (cached_pubkey, cached_sig) = sign_proof(&cached_key, &cached_outpoint);
     let proof_blinder = "01".repeat(32);
     let cached_replay_path = format!(
-        "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+        "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={cached_pubkey}&sig={cached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
     );
     let (status, body) = get_path_from(&app, &cached_replay_path, caller).await;
 
@@ -10253,7 +10304,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={mismatched_pubkey}&sig={mismatched_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={cached_outpoint}&pubkey={mismatched_pubkey}&sig={mismatched_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
@@ -10292,7 +10343,7 @@ async fn closed_admission_reuses_cached_liquid_proof_but_rejects_uncached_withou
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={uncached_outpoint}&pubkey={uncached_pubkey}&sig={uncached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={uncached_outpoint}&pubkey={uncached_pubkey}&sig={uncached_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
@@ -10394,7 +10445,7 @@ async fn failed_lightning_fallback_returns_original_liquid_throttle_without_retr
     let (status, body) = get_path(
         &app,
         &format!(
-            "/lnurlp/callback/{nym}?amount=100000&payment_method=L-BTC&outpoint={proof_outpoint}&pubkey={proof_pubkey}&sig={proof_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
+            "/lnurlp/callback/{nym}/{TEST_LNURL_COMMENT_INTENT_TOKEN}?amount=100000&payment_method=L-BTC&outpoint={proof_outpoint}&pubkey={proof_pubkey}&sig={proof_sig}&value=1000&value_bf={proof_blinder}&asset_bf={proof_blinder}"
         ),
     )
     .await;
