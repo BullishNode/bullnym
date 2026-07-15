@@ -306,9 +306,11 @@ conflicting evidence waits or enters review; it must not trigger an eager
 Bitcoin transaction.
 
 Newer source code, not yet deployed, tightens this rule: automatic recovery
-must have the complete current recovery contract and recorded fee evidence
-before it may contact the provider or either chain. Missing or disputed
-authority stays on hold rather than using an older compatibility path.
+must have the complete current recovery contract before it may contact the
+provider or either chain. Every recorded Bitcoin recovery transaction must
+also retain the fee evidence that authorized its construction. A missing or
+disputed contract, or incomplete transaction authority, stays on hold rather
+than using an older compatibility path.
 
 On wallet restore, verify that the committed address belongs to the restored
 default Bitcoin wallet and restore its local label. Do not register a new

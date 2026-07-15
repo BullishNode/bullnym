@@ -39,11 +39,12 @@ therefore **capability-blocked**, not production failures.
 
 Main also contains a current-only automatic-recovery hardening merged in
 `9c7c595906c9b0341bbd7735a6d3785890c3bbbe`. Automatic Bitcoin recovery now
-requires the complete immutable creation packet, the exact current
-recovery-address commitment, and complete construction-time fee authority.
-Missing or disputed authority stops before provider or chain calls and enters
-an integrity/readiness hold. This hardening is **main only**, not present on the
-deployed SHA above.
+requires the complete immutable creation packet and the exact current
+recovery-address commitment. A missing or disputed contract stops before
+provider or chain calls and enters an integrity/readiness hold. Every persisted
+Bitcoin recovery attempt must also retain complete construction-time fee
+authority; incomplete authority cannot construct or replay transaction bytes.
+This hardening is **main only**, not present on the deployed SHA above.
 
 Before relying on this manual, repeat the provenance probes and compare the
 result to the release record. A newer deployment can change the labels above.
