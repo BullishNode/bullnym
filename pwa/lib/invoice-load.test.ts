@@ -27,7 +27,7 @@ afterEach(() => {
 const fiatStatus = {
   status: 'unpaid',
   presentation_status: 'unpaid',
-  pricing_mode: 'fiat',
+  pricing_mode: 'fiat_fixed',
   settlement_status: 'none',
   amount_sat: 10_800,
   fiat_amount_minor: 850000,
@@ -51,6 +51,7 @@ const fiatStatus = {
   accept_btc: true,
   accept_ln: true,
   accept_liquid: true,
+  quote_rail_availability: { lightning: true, liquid: true, bitcoin: true },
 }
 
 const currenciesBody = { currencies: [{ code: 'CRC', precision: 0 }, { code: 'USD', precision: 2 }] }
@@ -69,7 +70,11 @@ describe('reconstructInvoice — fiat status', () => {
     expect(res.data.currency).toBe('CRC')
     expect(res.data.amountLabel).toBe(formatFiat(850000, 'CRC', 0))
     expect(res.data.invoice.invoice_id).toBe('abc')
-    expect(res.data.invoice.lightning_pr).toBe('lnbc1...')
+    expect(res.data.invoice).toEqual({
+      pricing_mode: 'fiat_fixed',
+      invoice_id: 'abc',
+      expires_at_unix: fiatStatus.expires_at_unix,
+    })
   })
 
   it('falls back to precision 2 when the currencies call fails', async () => {
@@ -86,7 +91,15 @@ describe('reconstructInvoice — fiat status', () => {
 
 describe('reconstructInvoice — sat status (no fiat amount)', () => {
   it('builds a sat amount label when fiat_amount_minor is null', async () => {
-    const satStatus = { ...fiatStatus, fiat_amount_minor: null, fiat_currency: null, amount_sat: 21_000, remaining_amount_sat: 21_000 }
+    const satStatus = {
+      ...fiatStatus,
+      pricing_mode: 'sat_fixed',
+      fiat_amount_minor: null,
+      fiat_currency: null,
+      amount_sat: 21_000,
+      remaining_amount_sat: 21_000,
+      quote_rail_availability: null,
+    }
     mockSequence([
       { status: 200, body: satStatus },
       { status: 200, body: currenciesBody },

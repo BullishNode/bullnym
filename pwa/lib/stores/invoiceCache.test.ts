@@ -8,6 +8,7 @@ import { formatFiat } from '$lib/money'
 
 function makeInvoice(id: string): CreateInvoiceResponse {
   return {
+    pricing_mode: 'sat_fixed',
     invoice_id: id,
     lightning_pr: 'lnbc1...',
     lightning_amount_sat: 1_050,
@@ -27,7 +28,10 @@ describe('cacheInvoice / getCachedInvoice', () => {
     const hit = getCachedInvoice('cache-hit-1')
     expect(hit?.note).toBe('table 5')
     expect(hit?.fiatAmountMinor).toBe(1500)
-    expect(hit?.invoice.lightning_pr).toBe('lnbc1...')
+    expect(hit?.invoice.pricing_mode).toBe('sat_fixed')
+    if (hit?.invoice.pricing_mode === 'sat_fixed') {
+      expect(hit.invoice.lightning_pr).toBe('lnbc1...')
+    }
   })
 
   it('an unknown id misses', () => {

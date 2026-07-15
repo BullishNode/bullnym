@@ -21,7 +21,15 @@
   import QrCard from '$lib/components/QrCard.svelte'
   import BullSpinner from '$lib/components/BullSpinner.svelte'
   import Button from '$lib/components/Button.svelte'
-  import { ApiError, getInvoiceStatus, fetchLightningOffer, type CreateInvoiceResponse, type InvoiceStatus } from '$lib/api/client'
+  import {
+    ApiError,
+    fetchLightningOffer,
+    fetchPayerQuote,
+    getInvoiceStatus,
+    type CreateInvoiceResponse,
+    type InvoiceStatus,
+    type PayerQuoteRail,
+  } from '$lib/api/client'
   import { localStore } from '$lib/stores/local.svelte'
   import { config } from '$lib/config'
   import { settings } from '$lib/stores/settings.svelte'
@@ -46,6 +54,15 @@
   import { availableRails } from '$lib/rails'
   import { liquidUri, bitcoinPayload } from '$lib/payloads'
   import { watchLiquidAddress } from '$lib/liquid-ws'
+  import {
+    PayerQuoteCoordinator,
+    activeQuoteSnapshot,
+    emptyPayerQuoteState,
+    formatQuoteCountdown,
+    quoteAccessibilityState,
+    quoteRailPresentation,
+    type QuoteRefreshTrigger,
+  } from '$lib/payer-quote'
 
   // Only repeated explicit not-found responses terminalize this view. Future
   // wire values are valid-but-unknown states and stay visible/polling.
@@ -86,42 +103,84 @@
   let latest = $state<InvoiceStatus | null>(null)
   let currentLightningAmountSat = $state<number | null>(
     untrack(() =>
-      Number.isSafeInteger(invoice.lightning_amount_sat) && (invoice.lightning_amount_sat ?? 0) > 0
+      invoice.pricing_mode === 'sat_fixed' &&
+      Number.isSafeInteger(invoice.lightning_amount_sat) &&
+      (invoice.lightning_amount_sat ?? 0) > 0
         ? invoice.lightning_amount_sat
         : null,
     ),
   )
   let currentLightningPr = $state<string | null>(
-    untrack(() => (currentLightningAmountSat !== null ? (invoice.lightning_pr || null) : null)),
+    untrack(() =>
+      invoice.pricing_mode === 'sat_fixed' && currentLightningAmountSat !== null
+        ? (invoice.lightning_pr || null)
+        : null,
+    ),
   )
   let currentLiquidAmountSat = $state<number | null>(
     untrack(() =>
-      Number.isSafeInteger(invoice.liquid_amount_sat) && (invoice.liquid_amount_sat ?? 0) > 0
+      invoice.pricing_mode === 'sat_fixed' &&
+      Number.isSafeInteger(invoice.liquid_amount_sat) &&
+      (invoice.liquid_amount_sat ?? 0) > 0
         ? invoice.liquid_amount_sat
         : null,
     ),
   )
   let currentLiquidAddress = $state<string | null>(
-    untrack(() => (currentLiquidAmountSat !== null ? (invoice.liquid_address || null) : null)),
+    untrack(() =>
+      invoice.pricing_mode === 'sat_fixed' && currentLiquidAmountSat !== null
+        ? (invoice.liquid_address || null)
+        : null,
+    ),
   )
   let currentBitcoinDirectAddress = $state<string | null>(null)
   let currentBitcoinChainAmountSat = $state<number | null>(
     untrack(() =>
-      Number.isSafeInteger(invoice.bitcoin_chain_amount_sat) && (invoice.bitcoin_chain_amount_sat ?? 0) > 0
+      invoice.pricing_mode === 'sat_fixed' &&
+      Number.isSafeInteger(invoice.bitcoin_chain_amount_sat) &&
+      (invoice.bitcoin_chain_amount_sat ?? 0) > 0
         ? invoice.bitcoin_chain_amount_sat
         : null,
     ),
   )
   let currentBitcoinChainAddress = $state<string | null>(
-    untrack(() => (currentBitcoinChainAmountSat !== null ? invoice.bitcoin_chain_address : null)),
+    untrack(() =>
+      invoice.pricing_mode === 'sat_fixed' && currentBitcoinChainAmountSat !== null
+        ? invoice.bitcoin_chain_address
+        : null,
+    ),
   )
   let currentBitcoinChainBip21 = $state<string | null>(
-    untrack(() => (currentBitcoinChainAddress ? invoice.bitcoin_chain_bip21 : null)),
+    untrack(() =>
+      invoice.pricing_mode === 'sat_fixed' && currentBitcoinChainAddress
+        ? invoice.bitcoin_chain_bip21
+        : null,
+    ),
   )
   const currentBitcoinAddress = $derived(currentBitcoinChainAddress ?? currentBitcoinDirectAddress)
 
+  let quoteState = $state(emptyPayerQuoteState())
+  let quoteNowMs = $state(untrack(() => Date.now()))
+  const quoteCoordinator = untrack(
+    () =>
+      new PayerQuoteCoordinator(
+        invoice.invoice_id,
+        (rail, trigger) =>
+          fetchPayerQuote(
+            invoice.invoice_id,
+            rail === 'lightning' && trigger === 'initial' ? undefined : rail,
+          ),
+        () => Date.now(),
+        (next) => (quoteState = next),
+      ),
+  )
+
   const view = $derived<PayView>(latest ? derivePayView(latest) : payViewBeforeFirstStatus())
   const support = $derived(payViewSupport(view))
+  const isFiatFixed = $derived(
+    latest?.pricing_mode === 'fiat_fixed' ||
+      (!latest && invoice.pricing_mode === 'fiat_fixed'),
+  )
   // Amount for payloads/Bolt Card. Deliberately NOT `?? invoice.amount_sat`
   // — remaining_amount_sat is always present on InvoiceStatus once polled;
   // null here means "haven't polled yet", not "unknown remaining amount".
@@ -131,7 +190,7 @@
 
   // Rail-tab gating (review item 1). `showsRails(view)` is the outer authority;
   // these flags decide which payloads are selectable after status is known.
-  const rails = $derived(
+  const satRails = $derived(
     availableRails({
       acceptLn: latest?.accept_ln,
       lightningPr: currentLightningPr,
@@ -154,15 +213,66 @@
     config.mode === 'pos' && typeof window !== 'undefined' && 'NDEFReader' in window && settings.boltCardEnabled,
   )
 
-  const tabs = $derived<Rail[]>([
-    ...(rails.lightning ? (['lightning'] as const) : []),
-    ...(rails.liquid ? (['liquid'] as const) : []),
-    ...(rails.bitcoin ? (['bitcoin'] as const) : []),
-    ...(hasBoltCard ? (['boltcard'] as const) : []),
-  ])
+  const tabs = $derived.by<Rail[]>(() => {
+    if (isFiatFixed) {
+      const availability = latest?.quote_rail_availability
+      if (!availability) return []
+      return [
+        ...(availability.lightning ? (['lightning'] as const) : []),
+        ...(availability.liquid ? (['liquid'] as const) : []),
+        ...(availability.bitcoin ? (['bitcoin'] as const) : []),
+        ...(hasBoltCard && availability.lightning ? (['boltcard'] as const) : []),
+      ]
+    }
+    return [
+      ...(satRails.lightning ? (['lightning'] as const) : []),
+      ...(satRails.liquid ? (['liquid'] as const) : []),
+      ...(satRails.bitcoin ? (['bitcoin'] as const) : []),
+      ...(hasBoltCard ? (['boltcard'] as const) : []),
+    ]
+  })
 
   const activeTabStore = untrack(() => localStore<Rail>(`bullnym:${nym}:rail`, 'lightning'))
-  let activeTab = $state<Rail>(untrack(() => activeTabStore.value))
+  let activeTab = $state<Rail>(
+    untrack(() => (invoice.pricing_mode === 'fiat_fixed' ? 'lightning' : activeTabStore.value)),
+  )
+  const activeQuoteRail = $derived<PayerQuoteRail>(activeTab === 'boltcard' ? 'lightning' : activeTab)
+  const activeFiatPresentation = $derived(
+    quoteRailPresentation(
+      quoteState,
+      activeQuoteRail,
+      quoteNowMs,
+      config.liquid_btc_asset_id,
+    ),
+  )
+  const activeQuoteAccessibility = $derived(
+    quoteAccessibilityState(quoteState, activeQuoteRail, quoteNowMs),
+  )
+  const fiatLightningPresentation = $derived(
+    quoteRailPresentation(
+      quoteState,
+      'lightning',
+      quoteNowMs,
+      config.liquid_btc_asset_id,
+    ),
+  )
+  const fiatQuoteCountdown = $derived(formatQuoteCountdown(quoteState, quoteNowMs))
+  const displayedRemainingAmountSat = $derived(
+    isFiatFixed ? (activeFiatPresentation?.merchantAmountSat ?? null) : remainingAmountSat,
+  )
+
+  function quoteRailAvailable(rail: PayerQuoteRail): boolean {
+    return latest?.quote_rail_availability?.[rail] === true
+  }
+
+  function requestFiatQuote(
+    rail: PayerQuoteRail,
+    trigger: QuoteRefreshTrigger,
+  ): Promise<unknown> | undefined {
+    if (stopped || !isFiatFixed || !showsRails(view) || !quoteRailAvailable(rail)) return
+    if (trigger === 'tab' && activeQuoteSnapshot(quoteState, rail, Date.now())) return
+    return quoteCoordinator.refresh(rail, trigger)
+  }
 
   // Never show a selectable tab with a blank QR (today's bug — tabs used to
   // derive once from the create response, which is frozen at invoice
@@ -188,7 +298,30 @@
     activeTab = tab
     activeTabStore.value = tab
     if (tab === 'boltcard') startCardScan()
+    if (isFiatFixed) void requestFiatQuote(tab === 'boltcard' ? 'lightning' : tab, 'tab')
   }
+
+  // The first trustworthy fiat status starts exactly one default Lightning
+  // POST. Other rails remain lazy and are requested only when selected.
+  let fiatInitialRequested = false
+  $effect(() => {
+    const status = latest
+    if (!status || !isFiatFixed || !showsRails(view) || fiatInitialRequested) return
+    const availability = status.quote_rail_availability
+    if (!availability) return
+    const initialRail: PayerQuoteRail | null = availability.lightning
+      ? 'lightning'
+      : availability.liquid
+        ? 'liquid'
+        : availability.bitcoin
+          ? 'bitcoin'
+          : null
+    if (!initialRail) return
+    fiatInitialRequested = true
+    activeTab = initialRail
+    activeTabStore.value = initialRail
+    void requestFiatQuote(initialRail, 'initial')
+  })
 
   // ---------------------------------------------------------------------
   // Lightning offer refresh (review item 6), mirroring
@@ -201,6 +334,7 @@
   let lnFailedAt = $state<number | null>(null)
 
   async function maybeRefreshLightning(): Promise<void> {
+    if (isFiatFixed) return
     const decision = shouldRefreshLightning({
       accept: latest?.accept_ln ?? true,
       pr: currentLightningPr,
@@ -239,8 +373,24 @@
   // amount isn't known yet, Tap Card must not start a scan (don't throw on
   // a null amount like the pre-rewrite version did) — show a waiting state
   // instead.
+  const boltCardLightningPr = $derived(
+    isFiatFixed && fiatLightningPresentation
+      ? fiatLightningPresentation.qrValue
+      : currentLightningPr,
+  )
+  const boltCardAmountSat = $derived(
+    isFiatFixed && fiatLightningPresentation
+      ? fiatLightningPresentation.payerAmountSat
+      : currentLightningAmountSat,
+  )
+  const boltCardRefreshing = $derived(
+    isFiatFixed ? quoteState.pending.lightning : lnRefreshing,
+  )
   const boltCardReady = $derived(
-    showsRails(view) && !!currentLightningPr && !lnRefreshing && currentLightningAmountSat !== null,
+    showsRails(view) &&
+      !!boltCardLightningPr &&
+      !boltCardRefreshing &&
+      boltCardAmountSat !== null,
   )
 
   function stopCardScan() {
@@ -262,8 +412,8 @@
       .then(async (lnurl) => {
         if (controller.signal.aborted) return
         cardState = 'requesting'
-        const pr = currentLightningPr
-        const amt = currentLightningAmountSat
+        const pr = boltCardLightningPr
+        const amt = boltCardAmountSat
         if (!pr || amt === null) throw new Error('Lightning offer not ready — try again in a moment')
         await payViaBoltCard(lnurl, pr, amt)
         if (controller.signal.aborted) return
@@ -355,28 +505,38 @@
       if (stopped) return
       notFoundStreak = 0
 
-      // Adopt a fresh Lightning offer, or clear a stale one so it gets
-      // re-requested (review item 6 / finding #2 — a partial payment
-      // invalidates the full-amount BOLT11 and the server returns
-      // lightning_pr=null until POST /lightning issues a new one).
-      const nextPr = nextLightningPr(currentLightningPr, status)
-      const nextLightningAmountSat = Number.isSafeInteger(status.lightning_amount_sat) && (status.lightning_amount_sat ?? 0) > 0
-        ? status.lightning_amount_sat
-        : null
-      currentLightningPr = nextPr && nextLightningAmountSat !== null ? nextPr : null
-      currentLightningAmountSat = currentLightningPr ? nextLightningAmountSat : null
-      const nextLiquidAmountSat = Number.isSafeInteger(status.liquid_amount_sat) && (status.liquid_amount_sat ?? 0) > 0
-        ? status.liquid_amount_sat
-        : null
-      currentLiquidAddress = status.liquid_address && nextLiquidAmountSat !== null
-        ? status.liquid_address
-        : null
-      currentLiquidAmountSat = currentLiquidAddress ? nextLiquidAmountSat : null
-      const bitcoin = bitcoinPaymentPayloadFromStatus(status)
-      currentBitcoinDirectAddress = bitcoin.directAddress
-      currentBitcoinChainAddress = bitcoin.chainAddress
-      currentBitcoinChainBip21 = bitcoin.chainBip21
-      currentBitcoinChainAmountSat = bitcoin.chainAmountSat
+      if (status.pricing_mode === 'sat_fixed') {
+        // Sat-fixed retains the legacy independent instruction flow.
+        const nextPr = nextLightningPr(currentLightningPr, status)
+        const nextLightningAmountSat = Number.isSafeInteger(status.lightning_amount_sat) && (status.lightning_amount_sat ?? 0) > 0
+          ? status.lightning_amount_sat
+          : null
+        currentLightningPr = nextPr && nextLightningAmountSat !== null ? nextPr : null
+        currentLightningAmountSat = currentLightningPr ? nextLightningAmountSat : null
+        const nextLiquidAmountSat = Number.isSafeInteger(status.liquid_amount_sat) && (status.liquid_amount_sat ?? 0) > 0
+          ? status.liquid_amount_sat
+          : null
+        currentLiquidAddress = status.liquid_address && nextLiquidAmountSat !== null
+          ? status.liquid_address
+          : null
+        currentLiquidAmountSat = currentLiquidAddress ? nextLiquidAmountSat : null
+        const bitcoin = bitcoinPaymentPayloadFromStatus(status)
+        currentBitcoinDirectAddress = bitcoin.directAddress
+        currentBitcoinChainAddress = bitcoin.chainAddress
+        currentBitcoinChainBip21 = bitcoin.chainBip21
+        currentBitcoinChainAmountSat = bitcoin.chainAmountSat
+      } else {
+        // Fiat GETs are projection-only. Never reconstruct an instruction
+        // from their nullable legacy fields; only the quote POST may fill it.
+        currentLightningPr = null
+        currentLightningAmountSat = null
+        currentLiquidAddress = null
+        currentLiquidAmountSat = null
+        currentBitcoinDirectAddress = null
+        currentBitcoinChainAddress = null
+        currentBitcoinChainBip21 = null
+        currentBitcoinChainAmountSat = null
+      }
       // Publish the new view only after every payload has been replaced, so a
       // payable render cannot observe the prior snapshot for one frame.
       latest = status
@@ -421,6 +581,9 @@
       // explicit action can't hammer POST /lightning past the 15s failure
       // cooldown (finding #4).
       await poll()
+      if (isFiatFixed) {
+        await requestFiatQuote(activeQuoteRail, 'manual')
+      }
     } finally {
       refreshing = false
     }
@@ -434,13 +597,13 @@
   $effect(() => {
     untrack(() => {
       ensurePollInterval()
-      // Countdown is DISPLAY ONLY. Expiry is server-authoritative — the poller
-      // terminalizes on status==='expired'; we never stop locally on the clock
-      // (a fast device clock or an in-progress/settling payment near expiry
-      // must not be shown as Expired while the server still resolves it —
-      // finding #3, matching invoice_payment.html's countdown-text-only behavior).
+      // The outer invoice countdown remains display-only and server-authoritative.
+      // The five-minute quote clock is different: it locally suppresses stale
+      // copy/QR state, while the server remains authoritative for payment state.
       tickHandle = setInterval(() => {
-        remainingMs = expiresAtUnix * 1000 - Date.now()
+        const now = Date.now()
+        remainingMs = expiresAtUnix * 1000 - now
+        quoteNowMs = now
       }, 1000)
       void poll()
       // This is intentionally a no-op for the conservative pre-status view.
@@ -449,6 +612,22 @@
       void maybeRefreshLightning()
     })
     return () => stopPolling()
+  })
+
+  // Wake at the exact immutable quote boundary instead of waiting for the
+  // display tick. Retire every rail first, then request only the selected one;
+  // the coordinator coalesces this with manual/tab/reload races.
+  $effect(() => {
+    const quote = quoteState.quote
+    if (!isFiatFixed || !quote || stopped) return
+    const delay = Math.max(0, quote.expires_at_unix * 1000 - Date.now()) + 1
+    const handle = setTimeout(() => {
+      quoteNowMs = Date.now()
+      if (quoteCoordinator.expire(quoteNowMs)) {
+        void requestFiatQuote(activeQuoteRail, 'timer')
+      }
+    }, delay)
+    return () => clearTimeout(handle)
   })
 
   // ---------------------------------------------------------------------
@@ -460,10 +639,22 @@
   // goes false), on a Liquid-address change, and on unmount. Failures degrade
   // silently to the 3s poller (see lib/liquid-ws.ts).
   // ---------------------------------------------------------------------
-  const liquidWatchable = $derived(showsRails(view) && (latest?.accept_liquid ?? true) && !!currentLiquidAddress)
+  const fiatLiquidAddress = $derived.by(() => {
+    const snapshot = quoteState.rails.liquid
+    return snapshot?.instruction.kind === 'liquid_direct' &&
+      quoteNowMs < snapshot.quote.expires_at_unix * 1_000
+      ? snapshot.instruction.address
+      : null
+  })
+  const liquidWatchAddress = $derived(isFiatFixed ? fiatLiquidAddress : currentLiquidAddress)
+  const liquidWatchable = $derived(
+    showsRails(view) &&
+      (latest?.quote_rail_availability?.liquid ?? latest?.accept_liquid ?? true) &&
+      !!liquidWatchAddress,
+  )
   $effect(() => {
-    if (!liquidWatchable || !currentLiquidAddress) return
-    const watcher = watchLiquidAddress(currentLiquidAddress, () => void poll())
+    if (!liquidWatchable || !liquidWatchAddress) return
+    const watcher = watchLiquidAddress(liquidWatchAddress, () => void poll())
     return () => watcher.close()
   })
 
@@ -474,6 +665,7 @@
   // with the new remaining amount.
   // ---------------------------------------------------------------------
   const qrValue = $derived.by(() => {
+    if (isFiatFixed) return activeFiatPresentation?.qrValue ?? ''
     if (activeTab === 'lightning') return currentLightningPr ?? ''
     if (activeTab === 'liquid') {
       return currentLiquidAddress && currentLiquidAmountSat !== null
@@ -507,13 +699,24 @@
     return Number.isSafeInteger(cost) && cost >= 0 ? cost : null
   })
 
-  const qrPlaceholder = $derived(activeTab === 'lightning' ? 'Loading Lightning offer…' : 'Preparing payment code…')
+  const qrPlaceholder = $derived.by(() => {
+    if (isFiatFixed) {
+      if (activeQuoteAccessibility.busy) return `Refreshing ${railLabels[activeTab]} quote…`
+      if (quoteState.errors[activeQuoteRail]) {
+        return `${railLabels[activeTab]} is temporarily unavailable. Choose another rail or retry.`
+      }
+      return `Preparing ${railLabels[activeTab]} quote…`
+    }
+    return activeTab === 'lightning' ? 'Loading Lightning offer…' : 'Preparing payment code…'
+  })
 
   // After a partial payment the original amount is misleading, so the primary
   // display switches to the remaining amount due (finding #5 / review item 5,
   // mirroring invoice_payment.html:597-600's "{remaining} sat remaining").
   const mainAmount = $derived(
-    (view.kind === 'partially_paid' || view.kind === 'partially_paid_pending') && remainingAmountSat !== null
+    !isFiatFixed &&
+      (view.kind === 'partially_paid' || view.kind === 'partially_paid_pending') &&
+      remainingAmountSat !== null
       ? `${new Intl.NumberFormat().format(remainingAmountSat)} sat`
       : amountLabel,
   )
@@ -528,14 +731,15 @@
     <div class="flex items-center gap-1.5">
       <p class={`inline-flex items-center gap-1.5 text-xs font-semibold ${payViewTone(view)}`}>
         <span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-        {payViewLabel(view, remainingAmountSat)}
+        {payViewLabel(view, displayedRemainingAmountSat)}
       </p>
       <button
         type="button"
         class="grid h-5 w-5 place-items-center rounded-full text-[#776b5a] transition hover:bg-[#eadfce] disabled:opacity-40 dark:text-[#b9aa91] dark:hover:bg-[#2c2922]"
         onclick={refreshNow}
         disabled={refreshing}
-        aria-label="Refresh status"
+        aria-label={isFiatFixed ? 'Refresh status and selected payment quote' : 'Refresh status'}
+        aria-busy={refreshing}
       >
         <RefreshCw size={12} class={refreshing ? 'animate-spin' : ''} />
       </button>
@@ -546,10 +750,17 @@
   </div>
 
   {#if showsRails(view)}
-    <div class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]">
+    <div
+      class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]"
+      role="tablist"
+      aria-label="Payment rail"
+    >
       {#each tabs as tab (tab)}
         <button
           type="button"
+          role="tab"
+          aria-selected={activeTab === tab}
+          aria-controls="payment-rail-panel"
           class={`min-h-9 rounded-md px-4 font-semibold transition ${
             activeTab === tab
               ? 'bg-[#fffaf0] text-[#1f513a] shadow-sm dark:bg-[#161512] dark:text-[#8bc8a4]'
@@ -562,7 +773,19 @@
       {/each}
     </div>
 
-    {#if activeTab === 'lightning' && currentLightningAmountSat !== null && lightningSwapCostSat !== null}
+    {#if isFiatFixed && activeFiatPresentation}
+      <div class="flex flex-col items-center gap-1 text-center">
+        <p class="font-display text-4xl tabular-nums tracking-display leading-none">
+          Send {new Intl.NumberFormat().format(activeFiatPresentation.payerAmountSat)} sats
+        </p>
+        <p class="max-w-sm text-xs text-[#776b5a] dark:text-[#b9aa91]">
+          {#if activeFiatPresentation.swapCostSat > 0}
+            Includes {new Intl.NumberFormat().format(activeFiatPresentation.swapCostSat)} sats in swap costs;
+          {/if}
+          your wallet may add its own {railLabels[activeTab]} network or routing fee.
+        </p>
+      </div>
+    {:else if !isFiatFixed && activeTab === 'lightning' && currentLightningAmountSat !== null && lightningSwapCostSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(currentLightningAmountSat)} sats
@@ -571,7 +794,7 @@
           Includes {new Intl.NumberFormat().format(lightningSwapCostSat)} sats in swap costs; your wallet may add its own Lightning routing fee.
         </p>
       </div>
-    {:else if activeTab === 'liquid' && currentLiquidAmountSat !== null}
+    {:else if !isFiatFixed && activeTab === 'liquid' && currentLiquidAmountSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(currentLiquidAmountSat)} sats
@@ -580,7 +803,7 @@
           Your wallet may add its own Liquid network fee.
         </p>
       </div>
-    {:else if activeTab === 'bitcoin' && currentBitcoinChainAddress && currentBitcoinChainAmountSat !== null && bitcoinChainSwapCostSat !== null}
+    {:else if !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinChainAddress && currentBitcoinChainAmountSat !== null && bitcoinChainSwapCostSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(currentBitcoinChainAmountSat)} sats
@@ -589,7 +812,7 @@
           Includes {new Intl.NumberFormat().format(bitcoinChainSwapCostSat)} sats in swap costs; your wallet may add its own Bitcoin network fee.
         </p>
       </div>
-    {:else if activeTab === 'bitcoin' && currentBitcoinDirectAddress && remainingAmountSat !== null}
+    {:else if !isFiatFixed && activeTab === 'bitcoin' && currentBitcoinDirectAddress && remainingAmountSat !== null}
       <div class="flex flex-col items-center gap-1 text-center">
         <p class="font-display text-4xl tabular-nums tracking-display leading-none">
           Send {new Intl.NumberFormat().format(remainingAmountSat)} sats
@@ -600,6 +823,13 @@
       </div>
     {/if}
 
+    <div
+      id="payment-rail-panel"
+      role="tabpanel"
+      class="contents"
+      aria-live="polite"
+      aria-busy={isFiatFixed && activeQuoteAccessibility.busy}
+    >
     {#if activeTab === 'boltcard'}
       <div class="flex w-full flex-col items-center gap-3 py-6">
         {#if cardState === 'idle' || cardState === 'scanning'}
@@ -619,16 +849,27 @@
         {/if}
       </div>
     {:else if qrValue}
-      <QrCard value={qrValue} label={`${railLabels[activeTab]} payment code`} />
+      {#key isFiatFixed ? `${activeFiatPresentation?.quoteVersionId}:${activeTab}` : `${activeTab}:${qrValue}`}
+        <QrCard value={qrValue} label={`${railLabels[activeTab]} payment code`} />
+      {/key}
     {:else}
       <div
-        class="mx-auto grid w-full max-w-sm place-items-center rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-8 text-center text-sm text-[#776b5a] shadow-sm dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
+        class="mx-auto grid w-full max-w-sm place-items-center gap-3 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-8 text-center text-sm text-[#776b5a] shadow-sm dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
+        role="status"
       >
-        {qrPlaceholder}
+        <span>{qrPlaceholder}</span>
+        {#if isFiatFixed && quoteState.errors[activeQuoteRail] && !activeQuoteAccessibility.busy}
+          <Button variant="secondary" onclick={() => requestFiatQuote(activeQuoteRail, 'manual')}>
+            Retry {railLabels[activeTab]}
+          </Button>
+        {/if}
       </div>
     {/if}
+    </div>
 
-    <p class="text-center text-xs text-[#776b5a] tabular-nums dark:text-[#b9aa91]">Expires in {countdown}</p>
+    <p class="text-center text-xs text-[#776b5a] tabular-nums dark:text-[#b9aa91]">
+      {isFiatFixed ? 'Quote' : 'Invoice'} expires in {isFiatFixed ? fiatQuoteCountdown : countdown}
+    </p>
   {:else}
     <div class="flex flex-col items-center gap-3 py-10 text-center">
       <div
@@ -645,7 +886,7 @@
           {amountLabel}
         </p>
       {/if}
-      <p class={`text-lg font-semibold ${payViewTone(view)}`}>{payViewLabel(view, remainingAmountSat)}</p>
+      <p class={`text-lg font-semibold ${payViewTone(view)}`}>{payViewLabel(view, displayedRemainingAmountSat)}</p>
       <p class="text-sm text-[#776b5a] dark:text-[#b9aa91]">
         {support ?? 'Settlement status is being checked'}
       </p>

@@ -24,7 +24,14 @@ export interface CreateInvoiceRequest {
 }
 
 /** Response of POST /<nym>/invoice (invoice.rs CreateInvoiceResponse). */
-export interface CreateInvoiceResponse {
+export interface FiatFixedCreateInvoiceResponse {
+  pricing_mode: 'fiat_fixed'
+  invoice_id: string
+  expires_at_unix: number
+}
+
+export interface SatFixedCreateInvoiceResponse {
+  pricing_mode: 'sat_fixed'
   invoice_id: string
   lightning_pr: string
   /** Exact BOLT11 principal paired with lightning_pr. */
@@ -38,6 +45,8 @@ export interface CreateInvoiceResponse {
   bitcoin_chain_amount_sat: number | null
   expires_at_unix: number
 }
+
+export type CreateInvoiceResponse = FiatFixedCreateInvoiceResponse | SatFixedCreateInvoiceResponse
 
 /** Response of GET /api/v1/invoices/:id/status (InvoiceStatusResponse). */
 export type PresentationStatus = 'unpaid' | 'partial' | 'payment_received' | 'overpaid' | string
@@ -93,6 +102,61 @@ export interface InvoiceStatus {
   accept_btc: boolean
   accept_ln: boolean
   accept_liquid: boolean
+  /** Pure GET projection. Required for fiat-fixed invoices and null for
+   * sat-fixed invoices; it never creates a quote or provider obligation. */
+  quote_rail_availability: PayerQuoteRailAvailability | null
+}
+
+export type PayerQuoteRail = 'lightning' | 'liquid' | 'bitcoin'
+
+export interface PayerQuoteRailAvailability {
+  lightning: boolean
+  liquid: boolean
+  bitcoin: boolean
+}
+
+export interface FiatQuoteView {
+  quote_version_id: string
+  version_number: number
+  fiat_face_amount_minor: number
+  fiat_target_amount_minor: number
+  fiat_currency: string
+  rate_minor_per_btc: number
+  rate_source: string
+  rate_observed_at_unix: number
+  rate_fetched_at_unix: number
+  rate_fresh_until_unix: number
+  merchant_amount_sat: number
+  created_at_unix: number
+  expires_at_unix: number
+}
+
+export type VersionedPayerInstruction =
+  | {
+      kind: 'lightning_boltz_reverse'
+      quote_offer_id: string
+      pr: string
+      payer_amount_sat: number
+    }
+  | {
+      kind: 'liquid_direct'
+      address: string
+      payer_amount_sat: number
+    }
+  | {
+      kind: 'bitcoin_boltz_chain'
+      quote_offer_id: string
+      address: string
+      bip21: string
+      payer_amount_sat: number
+    }
+
+export interface PayerDemandQuoteResponse {
+  pricing_mode: 'fiat_fixed'
+  invoice_id: string
+  selected_rail: PayerQuoteRail
+  quote: FiatQuoteView
+  instruction: VersionedPayerInstruction
 }
 
 export interface CurrencyView {
@@ -182,6 +246,21 @@ export function getInvoiceStatus(id: string): Promise<InvoiceStatus> {
 
 export function getSupportedCurrencies(): Promise<SupportedCurrenciesResponse> {
   return request('/api/v1/supported-currencies')
+}
+
+/**
+ * The sole fiat payer-instruction mutation. Omitting `rail` deliberately uses
+ * the server's Lightning default; all GET endpoints remain projection-only.
+ */
+export function fetchPayerQuote(
+  id: string,
+  rail?: PayerQuoteRail,
+): Promise<PayerDemandQuoteResponse> {
+  return request(`/api/v1/invoices/${id}/quote`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rail ? { rail } : {}),
+  })
 }
 
 /**

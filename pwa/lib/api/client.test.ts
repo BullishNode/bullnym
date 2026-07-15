@@ -5,7 +5,7 @@
 // fix, request() only checked res.ok, so every such envelope silently
 // parsed as a success (e.g. createInvoice returning invoice_id: undefined).
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { ApiError, createInvoice, getInvoiceStatus } from './client'
+import { ApiError, createInvoice, fetchPayerQuote, getInvoiceStatus } from './client'
 
 function mockFetchOnce(status: number, body: unknown): void {
   vi.stubGlobal(
@@ -71,6 +71,7 @@ describe('request() error-envelope detection', () => {
 
   it('still resolves normally for a real (non-envelope) 200 response', async () => {
     mockFetchOnce(200, {
+      pricing_mode: 'sat_fixed',
       invoice_id: 'real-id',
       lightning_pr: 'lnbc1...',
       lightning_amount_sat: 1_050,
@@ -92,6 +93,7 @@ describe('request() error-envelope detection', () => {
 
   it('POSTs to <invoice_base>/invoice, so an alias base stays nym-free', async () => {
     mockFetchOnce(200, {
+      pricing_mode: 'sat_fixed',
       invoice_id: 'id',
       lightning_pr: '',
       lightning_amount_sat: null,
@@ -106,6 +108,60 @@ describe('request() error-envelope detection', () => {
     expect(fetch).toHaveBeenCalledWith(
       '/a/alices-shop/invoice',
       expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('uses one explicit POST for payer quotes and preserves the Lightning default body', async () => {
+    const quote = {
+      pricing_mode: 'fiat_fixed',
+      invoice_id: 'invoice-id',
+      selected_rail: 'lightning',
+      quote: {
+        quote_version_id: 'quote-id',
+        version_number: 1,
+        fiat_face_amount_minor: 1_000,
+        fiat_target_amount_minor: 1_000,
+        fiat_currency: 'USD',
+        rate_minor_per_btc: 10_000_000,
+        rate_source: 'test',
+        rate_observed_at_unix: 1,
+        rate_fetched_at_unix: 2,
+        rate_fresh_until_unix: 90,
+        merchant_amount_sat: 10_000,
+        created_at_unix: 10,
+        expires_at_unix: 310,
+      },
+      instruction: {
+        kind: 'lightning_boltz_reverse',
+        quote_offer_id: 'offer-id',
+        pr: 'lnbc1...',
+        payer_amount_sat: 10_100,
+      },
+    }
+    mockFetchOnce(200, quote)
+    await expect(fetchPayerQuote('invoice-id')).resolves.toEqual(quote)
+    expect(fetch).toHaveBeenCalledWith('/api/v1/invoices/invoice-id/quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+
+    mockFetchOnce(200, { ...quote, selected_rail: 'liquid' })
+    await fetchPayerQuote('invoice-id', 'liquid')
+    expect(fetch).toHaveBeenCalledWith('/api/v1/invoices/invoice-id/quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"rail":"liquid"}',
+    })
+  })
+
+  it('keeps status reads as a projection-only GET', async () => {
+    mockFetchOnce(200, { status: 'unpaid', pricing_mode: 'fiat_fixed' })
+    await getInvoiceStatus('projection-only')
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/invoices/projection-only/status',
+      undefined,
     )
   })
 })
