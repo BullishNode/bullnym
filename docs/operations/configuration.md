@@ -32,14 +32,24 @@ request's merchant-specific committed recovery destination. Invalid
 rail-specific client configuration closes only that rail; it does not make
 generic `/ready` fail or stop existing-obligation workers.
 
+The fee runtime validates ordered configured sources for both rails. Bitcoin
+source bases are joined only to `/v1/fees/precise`, including
+`https://mempool.space/api/v1/fees/precise`; it never falls back to
+`/fees/recommended`. At process startup it restores only validated same-rail
+persisted evidence, refreshes Bitcoin and Liquid, and persists each accepted
+live decision before that decision may contribute to `fee_policy_ready`.
+Background per-rail refreshes and a process-local freshness check continue to
+update that admission fact. A valid recent persisted same-rail decision may
+remain authoritative, but a missing, stale, rejected, or not-durably-accepted
+decision for either rail sets `fee_policy_ready` false and closes reverse and
+chain offer creation until current durable fee evidence is available again.
+
 The recovery-commitment schema, private registration endpoint, and
-merchant-specific chain binding are present. Reverse and chain offer creation
-nevertheless remain closed because issue #64 has not yet supplied the
-persisted live fee-policy decision; `fee_policy_ready` therefore stays false.
-Chain creation also fails closed for an individual merchant until that active
-identity has registered a current recovery commitment. Do not work around
-either boundary with certification, an IP whitelist, or a temporary runtime
-override.
+merchant-specific chain binding are present. Chain creation still fails closed
+for an individual merchant until that active identity has registered a current
+recovery commitment and the request is bound to it. Do not work around either
+the fee or recovery boundary with certification, an IP whitelist, or a
+temporary runtime override.
 
 Do not enable broad IP or certification bypasses for ordinary internet traffic.
 After every configuration change, call `/ready` and exercise a non-monetary

@@ -105,9 +105,19 @@ dependency reason codes appear only in transition logs. This prevents callers
 from learning internal backend, key-lineage, worker, fee-policy, or recovery
 state.
 
-Reverse-swap and chain-swap admission intentionally remain closed until issue
-#64 supplies the live persisted fee decision. Chain-swap admission also remains
-closed until issue #84 binds the merchant-specific committed recovery
+At startup, each process restores only validated same-rail persisted fee
+evidence, refreshes the configured live sources, and durably accepts current
+Bitcoin and Liquid decisions before setting `fee_policy_ready`. Configured
+Bitcoin source bases are queried only at `/v1/fees/precise`; there is no
+`/fees/recommended` fallback. Accepted live decisions contribute to readiness
+only after persistence succeeds or a newer authoritative durable row wins the
+ordering race. Background per-rail refreshes and the process-local freshness
+loop keep the admission fact current. If either rail has no current durable
+decision, `fee_policy_ready` becomes false and reverse- and chain-swap creation
+fail closed until current durable evidence is available again.
+
+Chain-swap admission additionally remains closed for an individual merchant
+until the request is bound to that merchant's current committed recovery
 destination before an offer is created. Direct rails can remain available
 independently when their own prerequisites are healthy.
 
