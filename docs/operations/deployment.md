@@ -24,10 +24,10 @@
    the complete creation packet written by a 051-aware chain-swap caller.
    Migration 053 is a stopped-writer, privileged-owner, roll-forward boundary;
    the runtime `bullnym_app` role must never apply it.
-   Migrations 058 and 059 are one stopped-writer permanent-name cutover: 058
-   snapshots historical nym/alias candidates for explicit canonical choices;
-   059 rejects drift and descriptor-less surfaces, backfills canonical claims
-   and tombstones, and removes the mutable alias column.
+   Migrations 058 and 059 are one stopped-writer, empty-state permanent-name
+   cutover: 058 refuses any existing production state; 059 repeats that proof,
+   creates the current registry, requires surface descriptors, and removes the
+   pre-launch mutable alias/mode columns.
 6. Deploy one version consistently across all instances. Mixed binaries can
    disagree about signed payloads or state transitions.
 7. Start the service and require `/health`, `/ready`, and `/version` to pass.
@@ -79,63 +79,30 @@ readable before reopening chain-swap admission.
 
 ## Migrations 058-059 permanent-name cutover
 
-Apply 058 and 059 together before starting a binary whose expected schema
-marker is `059_remove_surface_alias`. Stop every Bullnym writer and validate a
-fresh backup first. Migration 058 preserves live tables and creates the
-immutable `public_name_migration_choices` snapshot. Alias candidates are the
-union of current/archived surface aliases and exactly owner-verified historical
-`invoices.public_slug` values. It automatically resolves single candidates
-and, per A3, a multi-nym owner whose one active row must be canonical. A
-fully-offline multi-nym owner or any multi-alias owner stays unresolved for an
-explicit operator decision. Never delete, truncate, clear, rewrite, or hide
-historical rows to make a choice disappear.
+Apply 058 and 059 only as part of the documented fresh production database
+reset. Bullnym has no production users at this boundary; these migrations do
+not preserve, select, or backfill pre-launch identity or payment state.
 
-Use the distinct privileged schema-owner connection described below. Apply 058
-with `--set runtime_role=bullnym_app`, then inspect all choices:
+1. Close admission and stop every Bullnym writer and worker.
+2. Take and validate a final pre-reset backup for audit and rollback to the
+   pre-cutover release only.
+3. Reset the production database while preserving the reviewed database owner,
+   runtime role, and connection-secret topology.
+4. Apply the complete migration sequence as the privileged schema owner. Supply
+   `--set runtime_role=bullnym_app` to each role-aware migration.
+5. Start only a binary whose schema expectation includes migration 059 or
+   later.
 
-```sql
-SELECT owner_npub, candidate_nyms, active_nym, canonical_nym,
-       candidate_aliases, canonical_alias, resolved
-FROM public_name_migration_choices
-ORDER BY owner_npub;
-```
+Migration 058 takes exclusive locks and requires all identity, surface, invoice,
+swap, allocation, and returned-address source tables to be empty. It creates no
+persistent object. Migration 059 repeats the same proof, refuses any obsolete
+migration artifact, creates the five-column current-only `public_names`
+registry, requires a non-null descriptor for each Page/POS row, and removes the
+pre-launch `donation_pages.alias` and `pos_mode` fields.
 
-For each unresolved owner, choose only values present in its candidate arrays.
-An owner with alias history must retain exactly one canonical alias; `NULL` is
-not a valid final choice. A typical fully-offline resolution is:
-
-```sql
-UPDATE public_name_migration_choices
-SET canonical_nym = '<reviewed candidate>',
-    canonical_alias = '<reviewed candidate alias>', -- omit when aliases = {}
-    resolved = TRUE
-WHERE owner_npub = '<reviewed owner>';
-```
-
-The table CHECKs reject incomplete choices, an active noncanonical nym, and
-candidate-array edits. Capture the A10 merchant communication rows before
-cutover, including changes caused by aliases found on archived surfaces:
-
-```sql
-SELECT *
-FROM public_name_migration_merchant_communications
-ORDER BY owner_npub, surface_nym, surface_kind;
-```
-
-The report cannot recover aliases that were hard-cleared before the snapshot
-and left no surviving database/backup record; document that those strings are
-re-claimable before deployment. Audit backups and deployment records for any
-exceptional hard-deleted name, record the resolution, and take the final
-pre-cutover backup while writers remain stopped.
-
-Apply 059 with `--set runtime_role=bullnym_app`. It recomputes both candidate
-sets and the active nym; any drift or unresolved row aborts transactionally.
-It preserves every historical surface/invoice name as a canonical claim or
-non-payable typed tombstone, preserves typed legacy nym/alias collisions, and
-verifies historical invoice owner tuples before removing
-`donation_pages.alias`. Any descriptor-less Page/POS row requires explicit
-repair and fails closed; the cutover never infers a payout wallet from the
-Lightning Address or another surface.
+A nonempty source table is not an operator-choice workflow. It means the reset
+was incomplete: stop, diagnose the reset, and begin again from the validated
+empty database. Do not delete individual rows to force the guard.
 
 Before starting Bullnym, verify the result through the protected runtime
 connection:
@@ -146,14 +113,15 @@ sudo /opt/bullnym/bullnym/scripts/check-migration-059-boundary.sh \
 ```
 
 The probe must print successful boundaries for 053, 055, 056, 057, 058, and
-059. It
-proves the typed canonical/tombstone registry, runtime ACL/trigger contract,
-canonical active-nym rule, surface descriptor independence, and absence of the
-obsolete alias column/index. Before applying later migrations, a 059 binary's
-`/ready` reports `059_remove_surface_alias`. Before 059, an unresolved
-preflight may be left in place while writers are unfrozen and the deployment
-is regrouped. After 059, automatic binary rollback is forbidden; repair or roll
-forward with a compatible binary or restore the validated pre-059 backup.
+059. It proves the current shared namespace, one nym plus optional alias per
+owner, alias-to-nym requirement, immutable claims, runtime ACL/function
+boundary, exact user ownership, surface descriptor independence, and removal
+of obsolete surface fields. Before applying later migrations, a 059 binary's
+`/ready` reports `059_remove_surface_alias`.
+
+After 059, automatic binary rollback is forbidden. Repair or roll forward with
+a compatible binary, or restore the full validated pre-reset database and its
+matching pre-059 binary while every writer remains stopped.
 
 ## Migration 060 private LNURL comments
 
@@ -176,15 +144,6 @@ location-local error-log sink; LUD-12 places the private comment in the GET
 query string and nginx error records can include the request line. The
 application trace span records neither the URI query nor the callback's opaque
 intent token.
-
-`bullnym.allow_public_name_delete=on` is a schema-owner-only emergency escape
-hatch for a validated database restore/repair. The runtime role has no table
-`DELETE` privilege and cannot execute the guard function, so no product path
-can use it. If an exceptional repair requires deletion, stop all writers, take
-a backup, record the exact row identities and reason, use `SET LOCAL` inside one
-reviewed transaction, re-run the 059 boundary probe, and retain the audit
-record. Never use the hatch for rename, release, canonical selection, account
-closure, or to force a migration precondition.
 
 ## Migration 061 versioned fiat quote foundation
 

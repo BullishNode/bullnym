@@ -3,7 +3,7 @@ use serde::Serialize;
 
 pub const EXPECTED_SCHEMA_MARKER: &str = env!("BULLNYM_SCHEMA_MARKER");
 pub const PUBLIC_NAME_POLICY: &str = "permanent_names_v1";
-/// One authentication identity permanently owns exactly one canonical nym.
+/// One authentication identity permanently owns exactly one nym.
 /// This is a product and database invariant, not an operator-tunable limit.
 pub const PERMANENT_NYM_CAP: i64 = 1;
 

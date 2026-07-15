@@ -91,7 +91,6 @@ pub async fn upsert_donation_page(
              ON public_names.name = users.nym \
             AND public_names.owner_npub = users.npub \
             AND public_names.kind = 'nym' \
-            AND public_names.canonical \
           WHERE users.nym = $1",
     )
     .bind(page.nym)
@@ -110,7 +109,7 @@ pub async fn upsert_donation_page(
             if super::public_name_constraint_is(&error, "public_names_owner_kind_lifetime_key") =>
         {
             tx.rollback().await?;
-            return match super::canonical_alias_by_npub(pool, &owner_npub).await? {
+            return match super::permanent_alias_by_npub(pool, &owner_npub).await? {
                 Some(alias) => Err(UpsertDonationPageError::AliasAlreadyAssigned { alias }),
                 None => Err(UpsertDonationPageError::Database(error)),
             };
@@ -264,14 +263,12 @@ where
            FROM donation_pages \
            JOIN users ON users.nym = donation_pages.nym \
       LEFT JOIN public_names alias_name \
-             ON alias_name.owner_npub = users.npub \
+            ON alias_name.owner_npub = users.npub \
             AND alias_name.kind = 'alias' \
-            AND alias_name.canonical \
            JOIN public_names nym_name \
              ON nym_name.name = users.nym \
             AND nym_name.owner_npub = users.npub \
             AND nym_name.kind = 'nym' \
-            AND nym_name.canonical \
           WHERE donation_pages.nym = $1 AND donation_pages.kind = $2",
     )
     .bind(nym)
@@ -300,15 +297,13 @@ pub async fn get_donation_page_by_alias(
            JOIN public_names nym_name \
              ON nym_name.owner_npub = alias_name.owner_npub \
             AND nym_name.kind = 'nym' \
-            AND nym_name.canonical \
            JOIN users \
              ON users.npub = nym_name.owner_npub \
             AND users.nym = nym_name.name \
            JOIN donation_pages \
              ON donation_pages.nym = users.nym AND donation_pages.kind = $2 \
           WHERE alias_name.name = $1 \
-            AND alias_name.kind = 'alias' \
-            AND alias_name.canonical",
+            AND alias_name.kind = 'alias'",
     )
     .bind(alias)
     .bind(kind)

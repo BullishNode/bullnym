@@ -405,11 +405,11 @@ pub struct LookupParams {
 
 #[derive(Serialize)]
 pub struct LookupResponse {
-    /// The owner's canonical permanent nym, independent of Lightning Address
+    /// The owner's permanent nym, independent of Lightning Address
     /// availability.
     pub nym: String,
     pub lightning_address_online: bool,
-    /// The one canonical permanent owner alias, when it has been claimed.
+    /// The one permanent owner alias, when it has been claimed.
     pub alias: Option<String>,
     pub public_name_policy: &'static str,
     pub quota: QuotaView,
@@ -450,9 +450,9 @@ pub async fn lookup_by_npub(
         .await?
         .ok_or_else(|| AppError::NymNotFound("no registration for this key".to_string()))?;
     Ok(Json(LookupResponse {
-        nym: status.canonical_nym,
+        nym: status.nym,
         lightning_address_online: status.lightning_address_online,
-        alias: status.canonical_alias,
+        alias: status.alias,
         public_name_policy: PUBLIC_NAME_POLICY,
         quota: QuotaView::new(status.used),
     }))

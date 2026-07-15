@@ -63,7 +63,6 @@ pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>,
            ON public_names.name = users.nym \
           AND public_names.owner_npub = users.npub \
           AND public_names.kind = 'nym' \
-          AND public_names.canonical \
          WHERE users.npub = $1 AND users.is_active = TRUE",
     )
     .bind(npub)
@@ -83,7 +82,6 @@ pub async fn get_user_by_npub_any(pool: &PgPool, npub: &str) -> Result<Option<Us
            ON public_names.name = users.nym \
           AND public_names.owner_npub = users.npub \
           AND public_names.kind = 'nym' \
-          AND public_names.canonical \
          WHERE users.npub = $1",
     )
     .bind(npub)
@@ -103,7 +101,6 @@ pub async fn get_inactive_user_by_npub(
            ON public_names.name = users.nym \
           AND public_names.owner_npub = users.npub \
           AND public_names.kind = 'nym' \
-          AND public_names.canonical \
          WHERE users.npub = $1 AND users.is_active = FALSE",
     )
     .bind(npub)
@@ -127,12 +124,11 @@ pub async fn mark_user_used<'e, E: sqlx::PgExecutor<'e>>(
     Ok(())
 }
 
-/// Canonical permanent nym claims for this npub. Historical tombstones remain
-/// reserved, but only the canonical claim consumes the ownership quota.
+/// Permanent nym claims for this npub. The database permits exactly one.
 pub async fn count_permanent_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM public_names \
-         WHERE owner_npub = $1 AND kind = 'nym' AND canonical",
+         WHERE owner_npub = $1 AND kind = 'nym'",
     )
     .bind(npub)
     .fetch_one(pool)
@@ -142,53 +138,49 @@ pub async fn count_permanent_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i
 /// Permanent ownership plus the independent Lightning Address availability
 /// projected by `GET /register/lookup` in one database snapshot.
 pub struct RegistrationLookupStatus {
-    pub canonical_nym: String,
+    pub nym: String,
     pub lightning_address_online: bool,
-    pub canonical_alias: Option<String>,
+    pub alias: Option<String>,
     pub used: i64,
 }
 
 type RegistrationLookupRow = (String, bool, Option<String>, i64);
 
-/// Resolve only the canonical permanent nym and alias for this owner. An
-/// offline canonical nym remains the returned identity; historical tombstones
-/// never become the current lookup identity.
+/// Resolve the permanent nym and optional alias for this owner. An offline nym
+/// remains the returned identity.
 pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
 ) -> Result<Option<RegistrationLookupStatus>, sqlx::Error> {
     let row: Option<RegistrationLookupRow> = sqlx::query_as(
         "SELECT \
-                canonical_nym.name, \
+                permanent_nym.name, \
                 users.is_active, \
-                canonical_alias.name, \
+                permanent_alias.name, \
                 (SELECT COUNT(*) FROM public_names counted_nym \
-                  WHERE counted_nym.owner_npub = canonical_nym.owner_npub \
-                    AND counted_nym.kind = 'nym' \
-                    AND counted_nym.canonical) \
-           FROM public_names canonical_nym \
+                  WHERE counted_nym.owner_npub = permanent_nym.owner_npub \
+                    AND counted_nym.kind = 'nym') \
+           FROM public_names permanent_nym \
            JOIN users \
-             ON users.npub = canonical_nym.owner_npub \
-            AND users.nym = canonical_nym.name \
-      LEFT JOIN public_names canonical_alias \
-             ON canonical_alias.owner_npub = canonical_nym.owner_npub \
-            AND canonical_alias.kind = 'alias' \
-            AND canonical_alias.canonical \
-          WHERE canonical_nym.owner_npub = $1 \
-            AND canonical_nym.kind = 'nym' \
-            AND canonical_nym.canonical",
+             ON users.npub = permanent_nym.owner_npub \
+            AND users.nym = permanent_nym.name \
+      LEFT JOIN public_names permanent_alias \
+             ON permanent_alias.owner_npub = permanent_nym.owner_npub \
+            AND permanent_alias.kind = 'alias' \
+          WHERE permanent_nym.owner_npub = $1 \
+            AND permanent_nym.kind = 'nym'",
     )
     .bind(npub)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(
-        |(canonical_nym, online, canonical_alias, used)| RegistrationLookupStatus {
-            canonical_nym,
+    Ok(
+        row.map(|(nym, online, alias, used)| RegistrationLookupStatus {
+            nym,
             lightning_address_online: online,
-            canonical_alias,
+            alias,
             used,
-        },
-    ))
+        }),
+    )
 }
 
 /// Outcome of one permanent-nym registration transaction.
@@ -245,7 +237,7 @@ pub async fn register_user_atomic(
 
     let permanent_nym: Option<String> = sqlx::query_scalar(
         "SELECT name FROM public_names \
-         WHERE owner_npub = $1 AND kind = 'nym' AND canonical",
+         WHERE owner_npub = $1 AND kind = 'nym'",
     )
     .bind(npub)
     .fetch_optional(&mut *tx)

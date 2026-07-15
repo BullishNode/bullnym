@@ -1,9 +1,10 @@
--- Lock the historical backfill, typed collision, canonical/tombstone,
--- independent descriptor, runtime-claim, and least-privilege contracts.
+-- Lock the current-only schema, constraints, trigger behavior, and empty-state
+-- cutover. There is no historical selection/backfill representation.
 DO $$
 DECLARE
     actual_columns TEXT[];
-    refusal_constraint TEXT;
+    mutation_error TEXT;
+    claimed_timestamp TIMESTAMPTZ;
 BEGIN
     SELECT array_agg(
                format('%s:%s:%s', column_name, data_type, is_nullable)
@@ -18,177 +19,129 @@ BEGIN
         'name:text:NO',
         'owner_npub:text:NO',
         'kind:text:NO',
-        'canonical:boolean:NO',
-        'claimed_at:timestamp with time zone:NO',
-        'grandfathered:boolean:NO'
+        'claimed_at:timestamp with time zone:NO'
     ]::TEXT[] THEN
         RAISE EXCEPTION 'migration 059 column contract changed: %', actual_columns;
     END IF;
 
-    IF to_regclass('public.public_name_migration_choices') IS NOT NULL
+    IF EXISTS (SELECT 1 FROM users)
+       OR EXISTS (SELECT 1 FROM donation_pages)
+       OR EXISTS (SELECT 1 FROM invoices)
+       OR to_regclass('public.public_name_migration_choices') IS NOT NULL
        OR to_regclass('public.public_name_migration_merchant_communications') IS NOT NULL
        OR EXISTS (
            SELECT 1
-           FROM information_schema.columns
-           WHERE table_schema = 'public'
-             AND table_name = 'donation_pages'
-             AND column_name = 'alias'
+             FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'donation_pages'
+              AND column_name IN ('alias', 'pos_mode')
        )
-       OR to_regclass('public.donation_pages_alias_uidx') IS NOT NULL THEN
-        RAISE EXCEPTION 'migration 059 retained temporary/mutable alias authority';
-    END IF;
-
-    IF (SELECT COUNT(*) FROM public_names WHERE kind = 'nym')
-       <> (SELECT COUNT(*) FROM users) THEN
-        RAISE EXCEPTION 'migration 059 lost historical nym reservations';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'active-canonical'
-          AND owner_npub = repeat('b', 64)
-          AND kind = 'nym' AND canonical AND grandfathered
-    ) OR NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'inactive-tombstone'
-          AND owner_npub = repeat('b', 64)
-          AND kind = 'nym' AND NOT canonical AND grandfathered
-    ) OR NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'operator-choice-one'
-          AND owner_npub = repeat('d', 64)
-          AND kind = 'nym' AND canonical AND grandfathered
-    ) OR NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'operator-choice-two'
-          AND owner_npub = repeat('d', 64)
-          AND kind = 'nym' AND NOT canonical AND grandfathered
-    ) THEN
-        RAISE EXCEPTION 'migration 059 canonical/tombstone nym backfill changed';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'shop-page' AND owner_npub = repeat('e', 64)
-          AND kind = 'alias' AND canonical AND grandfathered
-    ) OR NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'shop-pos' AND owner_npub = repeat('e', 64)
-          AND kind = 'alias' AND NOT canonical AND grandfathered
-    ) THEN
-        RAISE EXCEPTION 'migration 059 canonical/tombstone alias backfill changed';
-    END IF;
-
-    -- Same string, two typed historical reservations, different owners.
-    IF (SELECT COUNT(*) FROM public_names
-        WHERE name = 'og-migration-fixture') <> 2
+       OR to_regclass('public.donation_pages_alias_uidx') IS NOT NULL
        OR NOT EXISTS (
-           SELECT 1 FROM public_names
-           WHERE name = 'og-migration-fixture' AND kind = 'nym'
-             AND owner_npub = repeat('a', 64)
-       )
-       OR NOT EXISTS (
-           SELECT 1 FROM public_names
-           WHERE name = 'og-migration-fixture' AND kind = 'alias'
-             AND owner_npub = repeat('f', 64)
+           SELECT 1
+             FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'donation_pages'
+              AND column_name = 'ct_descriptor'
+              AND is_nullable = 'NO'
        ) THEN
-        RAISE EXCEPTION 'migration 059 did not preserve typed collision';
+        RAISE EXCEPTION 'migration 059 retained obsolete or nullable surface state';
     END IF;
 
-    -- The name cutover leaves each product's descriptor/cursor untouched and
-    -- enforces the current non-null surface descriptor contract.
     IF NOT EXISTS (
-        SELECT 1
-        FROM donation_pages
-        WHERE nym = 'independent-page-owner'
-          AND kind = 'payment_page'
-          AND ct_descriptor = 'surface-page-descriptor'
-          AND next_addr_idx = 3
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'public.public_names'::REGCLASS
+           AND conname = 'public_names_shared_namespace_key'
+           AND contype = 'u'
+           AND convalidated
     ) OR NOT EXISTS (
-        SELECT 1 FROM users
-        WHERE nym = 'independent-page-owner'
-          AND ct_descriptor = 'lightning-address-descriptor'
-          AND next_addr_idx = 118
-    ) OR EXISTS (
-        SELECT 1 FROM donation_pages WHERE ct_descriptor IS NULL
-    ) OR NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'donation_pages'
-          AND column_name = 'ct_descriptor'
-          AND is_nullable = 'NO'
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'public.public_names'::REGCLASS
+           AND conname = 'public_names_owner_kind_lifetime_key'
+           AND contype = 'u'
+           AND convalidated
     ) THEN
-        RAISE EXCEPTION 'migration 059 surface descriptor/cursor contract changed';
+        RAISE EXCEPTION 'migration 059 permanent-name uniqueness changed';
     END IF;
 
-    -- Existing product state and old invoice owner identity are untouched.
-    IF NOT EXISTS (
-        SELECT 1 FROM donation_pages
-        WHERE nym = 'archived-alias-owner'
-          AND kind = 'payment_page'
-          AND archived_at IS NOT NULL
-          AND NOT enabled
-    ) OR NOT EXISTS (
-        SELECT 1 FROM invoices
-        WHERE id = '46000000-0000-0000-0000-000000000001'
-          AND nym_owner = 'og-migration-fixture'
-          AND npub_owner = repeat('a', 64)
-          AND public_slug = 'invoice-only-alias'
-    ) OR NOT EXISTS (
-        SELECT 1 FROM public_names
-        WHERE name = 'invoice-only-alias'
-          AND owner_npub = repeat('a', 64)
-          AND kind = 'alias'
-          AND canonical
-          AND grandfathered
-    ) THEN
-        RAISE EXCEPTION 'migration 059 changed product or invoice ownership state';
+    INSERT INTO public_names (name, owner_npub, kind, claimed_at)
+    VALUES (
+        'current-owner', repeat('a', 64), 'nym',
+        '2000-01-01 00:00:00+00'::TIMESTAMPTZ
+    )
+    RETURNING claimed_at INTO claimed_timestamp;
+    IF claimed_timestamp = '2000-01-01 00:00:00+00'::TIMESTAMPTZ
+       OR claimed_timestamp < statement_timestamp() - INTERVAL '1 minute'
+       OR claimed_timestamp > statement_timestamp() + INTERVAL '1 minute' THEN
+        RAISE EXCEPTION 'migration 059 did not own the claim timestamp';
     END IF;
+    INSERT INTO public_names (name, owner_npub, kind)
+    VALUES ('current-shop', repeat('a', 64), 'alias');
 
-    -- Tombstones can never become active product identity.
-    BEGIN
-        UPDATE users SET is_active = TRUE WHERE nym = 'inactive-tombstone';
-        RAISE EXCEPTION 'migration 059 allowed tombstone activation';
-    EXCEPTION WHEN check_violation THEN
-        GET STACKED DIAGNOSTICS refusal_constraint = CONSTRAINT_NAME;
-        IF refusal_constraint <> 'users_active_nym_must_be_canonical' THEN
-            RAISE;
-        END IF;
-    END;
-
-    -- Historical typed collision blocks every new claim of the string.
     BEGIN
         INSERT INTO public_names (name, owner_npub, kind)
-        VALUES ('og-migration-fixture', repeat('3', 64), 'nym');
-        RAISE EXCEPTION 'migration 059 admitted a reserved historical name';
+        VALUES ('second-nym', repeat('a', 64), 'nym');
+        RAISE EXCEPTION 'migration 059 allowed a second owner nym';
     EXCEPTION WHEN unique_violation THEN
-        GET STACKED DIAGNOSTICS refusal_constraint = CONSTRAINT_NAME;
-        IF refusal_constraint <> 'public_names_shared_namespace_key' THEN
+        GET STACKED DIAGNOSTICS mutation_error = CONSTRAINT_NAME;
+        IF mutation_error <> 'public_names_owner_kind_lifetime_key' THEN
             RAISE;
         END IF;
     END;
 
-    -- Any historical claim of a kind exhausts that owner's lifetime slot.
     BEGIN
         INSERT INTO public_names (name, owner_npub, kind)
-        VALUES ('another-nym', repeat('b', 64), 'nym');
-        RAISE EXCEPTION 'migration 059 admitted a second owner nym';
+        VALUES ('current-shop', repeat('b', 64), 'nym');
+        RAISE EXCEPTION 'migration 059 allowed a shared-namespace collision';
     EXCEPTION WHEN unique_violation THEN
-        GET STACKED DIAGNOSTICS refusal_constraint = CONSTRAINT_NAME;
-        IF refusal_constraint <> 'public_names_owner_kind_lifetime_key' THEN
+        GET STACKED DIAGNOSTICS mutation_error = CONSTRAINT_NAME;
+        IF mutation_error <> 'public_names_shared_namespace_key' THEN
             RAISE;
         END IF;
     END;
+
+    BEGIN
+        INSERT INTO public_names (name, owner_npub, kind)
+        VALUES ('orphan-shop', repeat('c', 64), 'alias');
+        RAISE EXCEPTION 'migration 059 allowed an alias without a nym';
+    EXCEPTION WHEN foreign_key_violation THEN
+        GET STACKED DIAGNOSTICS mutation_error = CONSTRAINT_NAME;
+        IF mutation_error <> 'public_names_alias_requires_nym' THEN
+            RAISE;
+        END IF;
+    END;
+
+    BEGIN
+        UPDATE public_names SET name = 'renamed' WHERE name = 'current-owner';
+        RAISE EXCEPTION 'migration 059 allowed a name mutation';
+    EXCEPTION WHEN integrity_constraint_violation THEN
+        GET STACKED DIAGNOSTICS mutation_error = CONSTRAINT_NAME;
+        IF mutation_error <> 'public_names_reject_update' THEN
+            RAISE;
+        END IF;
+    END;
+
+    BEGIN
+        DELETE FROM public_names WHERE name = 'current-shop';
+        RAISE EXCEPTION 'migration 059 allowed a name deletion';
+    EXCEPTION WHEN integrity_constraint_violation THEN
+        GET STACKED DIAGNOSTICS mutation_error = CONSTRAINT_NAME;
+        IF mutation_error <> 'public_names_reject_delete' THEN
+            RAISE;
+        END IF;
+    END;
+
+    TRUNCATE public_names;
 END
 $$;
 
--- Runtime can create only normal canonical claims through the three claim
--- columns.  Database-owned metadata is not forgeable.
+-- Runtime can insert only the three claim inputs; identity and timestamp stay
+-- database-owned. The transaction is rolled back so the post-hook state stays
+-- empty for later migration fixtures.
 BEGIN;
 SET LOCAL ROLE bullnym_app;
 INSERT INTO public_names (name, owner_npub, kind)
-VALUES ('runtime-probe', repeat('3', 64), 'nym');
+VALUES ('runtime-probe', repeat('d', 64), 'nym');
 ROLLBACK;
 
 DO $$
@@ -207,16 +160,17 @@ BEGIN
        OR pg_has_role(runtime_role_oid, relation_owner_oid, 'USAGE')
        OR pg_has_role(runtime_role_oid, relation_owner_oid, 'SET')
        OR NOT has_table_privilege('bullnym_app', 'public.public_names', 'SELECT')
+       OR has_table_privilege('bullnym_app', 'public.public_names', 'INSERT')
        OR has_table_privilege('bullnym_app', 'public.public_names', 'UPDATE')
        OR has_table_privilege('bullnym_app', 'public.public_names', 'DELETE')
        OR has_table_privilege('bullnym_app', 'public.public_names', 'TRUNCATE')
+       OR has_table_privilege('bullnym_app', 'public.public_names', 'REFERENCES')
+       OR has_table_privilege('bullnym_app', 'public.public_names', 'TRIGGER')
        OR NOT has_column_privilege('bullnym_app', 'public.public_names', 'name', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'public.public_names', 'owner_npub', 'INSERT')
        OR NOT has_column_privilege('bullnym_app', 'public.public_names', 'kind', 'INSERT')
        OR has_column_privilege('bullnym_app', 'public.public_names', 'id', 'INSERT')
-       OR has_column_privilege('bullnym_app', 'public.public_names', 'canonical', 'INSERT')
-       OR has_column_privilege('bullnym_app', 'public.public_names', 'claimed_at', 'INSERT')
-       OR has_column_privilege('bullnym_app', 'public.public_names', 'grandfathered', 'INSERT') THEN
+       OR has_column_privilege('bullnym_app', 'public.public_names', 'claimed_at', 'INSERT') THEN
         RAISE EXCEPTION 'migration 059 retained unsafe runtime owner/ACL';
     END IF;
 

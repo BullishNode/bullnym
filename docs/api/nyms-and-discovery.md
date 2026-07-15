@@ -215,9 +215,9 @@ Public and rate-limited. A successful response is:
 }
 ```
 
-`nym` is always the canonical permanent nym. `lightning_address_online`
+`nym` is always the permanent nym. `lightning_address_online`
 reports only Lightning Address availability; it does not describe nym or alias
-ownership. `alias` is the canonical permanent owner alias, or `null` when none
+ownership. `alias` is the permanent owner alias, or `null` when none
 has ever been claimed. Clients must require
 `public_name_policy == "permanent_names_v1"` before enabling permanent-name or
 alias UX. `quota` is the authoritative permanent-nym ownership quota. Because

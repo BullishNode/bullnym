@@ -23,7 +23,7 @@ pub async fn apply_alias_claim(
 
     if let Some(existing) = sqlx::query_scalar::<_, String>(
         "SELECT name FROM public_names \
-         WHERE owner_npub = $1 AND kind = 'alias' AND canonical",
+         WHERE owner_npub = $1 AND kind = 'alias'",
     )
     .bind(owner_npub)
     .fetch_optional(&mut **tx)
@@ -56,24 +56,24 @@ pub async fn apply_alias_claim(
     Ok(AliasClaimOutcome::Claimed)
 }
 
-/// Return the owner's canonical permanent alias after a transaction-level
+/// Return the owner's permanent alias after a transaction-level
 /// uniqueness race. Callers use this only after rolling back the failed
 /// transaction so the winning claim is visible and can be returned as typed
 /// conflict detail.
-pub async fn canonical_alias_by_npub(
+pub async fn permanent_alias_by_npub(
     pool: &sqlx::PgPool,
     owner_npub: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT name FROM public_names \
-         WHERE owner_npub = $1 AND kind = 'alias' AND canonical",
+         WHERE owner_npub = $1 AND kind = 'alias'",
     )
     .bind(owner_npub)
     .fetch_optional(pool)
     .await
 }
 
-/// Authorize a historical invoice path without consulting Page/POS
+/// Authorize an invoice alias path without consulting Page/POS
 /// availability. Alias ownership is permanent even if either surface is
 /// archived or the Lightning Address is offline.
 pub async fn alias_owns_nym(

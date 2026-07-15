@@ -826,9 +826,7 @@ SELECT COALESCE((
                    'name:text:NO',
                    'owner_npub:text:NO',
                    'kind:text:NO',
-                   'canonical:boolean:NO',
-                   'claimed_at:timestamp with time zone:NO',
-                   'grandfathered:boolean:NO'
+                   'claimed_at:timestamp with time zone:NO'
                ]::TEXT[]
           FROM information_schema.columns
          WHERE table_schema = 'public'
@@ -840,9 +838,10 @@ SELECT COALESCE((
               ('public_names_pkey', 'p'),
               ('public_names_kind_check', 'c'),
               ('public_names_claimed_at_check', 'c'),
-              ('public_names_new_name_shape_check', 'c'),
-              ('public_names_new_owner_shape_check', 'c'),
-              ('public_names_name_kind_key', 'u')
+              ('public_names_name_shape_check', 'c'),
+              ('public_names_owner_shape_check', 'c'),
+              ('public_names_shared_namespace_key', 'u'),
+              ('public_names_owner_kind_lifetime_key', 'u')
           ) required(constraint_name, constraint_type)
          WHERE NOT EXISTS (
              SELECT 1
@@ -855,32 +854,8 @@ SELECT COALESCE((
                 AND constraint_info.convalidated
          )
     )
-    AND EXISTS (
-        SELECT 1
-          FROM pg_index index_info
-          JOIN pg_class index_relation ON index_relation.oid = index_info.indexrelid
-         WHERE index_info.indrelid = to_regclass('public.public_names')
-           AND index_relation.relname =
-               'public_names_one_canonical_kind_per_owner_idx'
-           AND index_info.indisunique
-           AND index_info.indisvalid
-           AND index_info.indisready
-           AND index_info.indnkeyatts = 2
-           AND index_info.indnatts = 2
-           AND ARRAY(
-               SELECT attribute.attname::TEXT
-                 FROM unnest(index_info.indkey) WITH ORDINALITY
-                      AS key_column(attnum, position)
-                 JOIN pg_attribute attribute
-                   ON attribute.attrelid = index_info.indrelid
-                  AND attribute.attnum = key_column.attnum
-                ORDER BY key_column.position
-           ) = ARRAY['owner_npub', 'kind']::TEXT[]
-           AND pg_get_expr(index_info.indpred, index_info.indrelid) = 'canonical'
-    )
-    -- Historical duplicate owners remain representable.  Only one active LA
-    -- row is permitted, and the active row must be the canonical tombstone-safe
-    -- identity selected during preflight.
+    -- Lightning Address availability remains independent from permanent-name
+    -- ownership, but there can still be at most one active row per owner.
     AND EXISTS (
         SELECT 1
           FROM pg_index index_info
@@ -906,38 +881,13 @@ SELECT COALESCE((
     )
     AND NOT EXISTS (
         SELECT 1
-          FROM public_names
-         WHERE NOT canonical AND NOT grandfathered
-    )
-    AND NOT EXISTS (
-        SELECT owner_npub, kind
-          FROM public_names
-         GROUP BY owner_npub, kind
-        HAVING COUNT(*) FILTER (WHERE canonical) <> 1
-    )
-    AND NOT EXISTS (
-        SELECT 1
           FROM public_names AS aliases
          WHERE aliases.kind = 'alias'
            AND NOT EXISTS (
                SELECT 1
-                 FROM public_names AS nyms
+                FROM public_names AS nyms
                 WHERE nyms.owner_npub = aliases.owner_npub
                   AND nyms.kind = 'nym'
-                  AND nyms.canonical
-           )
-    )
-    AND NOT EXISTS (
-        SELECT 1
-          FROM users
-         WHERE users.is_active
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM public_names
-                WHERE public_names.name = users.nym
-                  AND public_names.owner_npub = users.npub
-                  AND public_names.kind = 'nym'
-                  AND public_names.canonical
            )
     )
     AND NOT EXISTS (
@@ -954,11 +904,19 @@ SELECT COALESCE((
     AND NOT EXISTS (
         SELECT 1 FROM donation_pages WHERE ct_descriptor IS NULL
     )
+    AND EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'donation_pages'
+           AND column_name = 'ct_descriptor'
+           AND is_nullable = 'NO'
+    )
     AND NOT EXISTS (
         SELECT 1
           FROM pg_attribute
          WHERE attrelid = to_regclass('public.donation_pages')
-           AND attname = 'alias'
+           AND attname IN ('alias', 'pos_mode')
            AND attnum > 0
            AND NOT attisdropped
     )
@@ -1029,13 +987,7 @@ SELECT COALESCE((
         current_user, 'public.public_names', 'id', 'INSERT'
     )
     AND NOT has_column_privilege(
-        current_user, 'public.public_names', 'canonical', 'INSERT'
-    )
-    AND NOT has_column_privilege(
         current_user, 'public.public_names', 'claimed_at', 'INSERT'
-    )
-    AND NOT has_column_privilege(
-        current_user, 'public.public_names', 'grandfathered', 'INSERT'
     )
     AND NOT EXISTS (
         SELECT 1
@@ -1046,6 +998,21 @@ SELECT COALESCE((
           )) acl
          WHERE namespace.nspname = 'public'
            AND relation.relname = 'public_names'
+           AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM pg_attribute attribute
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+              attribute.attacl,
+              acldefault('c', (
+                  SELECT relowner FROM pg_class
+                   WHERE oid = attribute.attrelid
+              ))
+          )) acl
+         WHERE attribute.attrelid = to_regclass('public.public_names')
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
            AND acl.grantee = 0
     )
     AND NOT EXISTS (

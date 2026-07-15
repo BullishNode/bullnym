@@ -214,116 +214,39 @@ run_sql_file() {
     < "$file" >/dev/null
 }
 
-assert_migration_058_refusal_case() {
+assert_empty_name_cutover_refusal() {
   local database="$1"
   local migration="$2"
-  local suffix="$3"
-  local mutation="$4"
-  local expected="$5"
-  local scratch="${database}_migration_058_${suffix}"
+  local number="$3"
+  local scratch="${database}_migration_${number}_nonempty"
   local refusal_output rollback_state
 
   docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$scratch"
   docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$scratch"
   docker exec "$CONTAINER" psql --no-psqlrc --set ON_ERROR_STOP=1 \
-    --username "$PG_USER" --dbname "$scratch" --command "$mutation" >/dev/null
+    --username "$PG_USER" --dbname "$scratch" \
+    --command "INSERT INTO users (nym, npub, ct_descriptor, is_active) VALUES ('nonempty-cutover', repeat('d', 64), 'nonempty-descriptor', FALSE);" >/dev/null
 
   if refusal_output="$(
     docker exec --interactive "$CONTAINER" \
       psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" --dbname "$scratch" \
         --set "runtime_role=$RUNTIME_ROLE" < "$migration" 2>&1
   )"; then
-    die "migration 058 unexpectedly accepted $suffix"
+    die "migration $number unexpectedly accepted nonempty ownership state"
   fi
-  [[ "$refusal_output" == *"$expected"* ]] \
-    || die "migration 058 $suffix returned the wrong failure: $refusal_output"
+  [[ "$refusal_output" == *"requires the documented empty production reset"* ]] \
+    || die "migration $number returned the wrong empty-state failure: $refusal_output"
 
   rollback_state="$(
     docker exec "$CONTAINER" \
       psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --username "$PG_USER" --dbname "$scratch" \
-        --command "SELECT COALESCE(to_regclass('public.public_name_migration_choices')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'independent-page-owner' AND kind = 'payment_page')"
+        --command "SELECT COALESCE(to_regclass('public.public_names')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT COUNT(*) FROM users)::TEXT"
   )"
-  [[ "$rollback_state" == ":true:3" ]] \
-    || die "migration 058 $suffix leaked preflight state after rollback ($rollback_state)"
+  [[ "$rollback_state" == ":true:1" ]] \
+    || die "migration $number leaked cutover state after refusal ($rollback_state)"
   docker exec "$CONTAINER" dropdb --username "$PG_USER" "$scratch"
-  echo "test-db: migration 058 refused $suffix transactionally"
-}
-
-assert_migration_058_refuses_ambiguous_history() {
-  local database="$1"
-  local migration="$2"
-
-  assert_migration_058_refusal_case \
-    "$database" "$migration" "invalid_invoice_owner" \
-    "UPDATE invoices SET npub_owner = repeat('9', 64) WHERE id = '46000000-0000-0000-0000-000000000001';" \
-    "cannot attribute historical invoice aliases"
-
-  assert_migration_058_refusal_case \
-    "$database" "$migration" "ambiguous_alias_owner" \
-    "UPDATE invoices SET public_slug = 'shop-page' WHERE id = '46000000-0000-0000-0000-000000000001';" \
-    "aliases attributed to multiple owners"
-}
-
-assert_migration_059_refusal_case() {
-  local database="$1"
-  local migration="$2"
-  local suffix="$3"
-  local mutation="$4"
-  local expected="$5"
-  local scratch="${database}_migration_059_${suffix}"
-  local refusal_output rollback_state
-
-  docker exec "$CONTAINER" dropdb --if-exists --username "$PG_USER" "$scratch"
-  docker exec "$CONTAINER" createdb --username "$PG_USER" --template "$database" "$scratch"
-  docker exec "$CONTAINER" psql --no-psqlrc --set ON_ERROR_STOP=1 \
-    --username "$PG_USER" --dbname "$scratch" --command "$mutation" >/dev/null
-
-  if refusal_output="$(
-    docker exec --interactive "$CONTAINER" \
-      psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$PG_USER" --dbname "$scratch" \
-        --set "runtime_role=$RUNTIME_ROLE" < "$migration" 2>&1
-  )"; then
-    die "migration 059 unexpectedly accepted $suffix"
-  fi
-  [[ "$refusal_output" == *"$expected"* ]] \
-    || die "migration 059 $suffix returned the wrong failure: $refusal_output"
-
-  rollback_state="$(
-    docker exec "$CONTAINER" \
-      psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
-        --username "$PG_USER" --dbname "$scratch" \
-        --command "SELECT COALESCE(to_regclass('public.public_names')::TEXT, '') || ':' || EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'donation_pages' AND column_name = 'alias')::TEXT || ':' || (SELECT next_addr_idx::TEXT FROM donation_pages WHERE nym = 'independent-page-owner' AND kind = 'payment_page')"
-  )"
-  [[ "$rollback_state" == ":true:3" ]] \
-    || die "migration 059 $suffix leaked cutover state after rollback ($rollback_state)"
-  docker exec "$CONTAINER" dropdb --username "$PG_USER" "$scratch"
-  echo "test-db: migration 059 refused $suffix transactionally"
-}
-
-assert_migration_059_refuses_drift_and_unresolved() {
-  local database="$1"
-  local migration="$2"
-
-  assert_migration_059_refusal_case \
-    "$database" "$migration" "nym_drift" \
-    "INSERT INTO users (nym, npub, ct_descriptor, is_active) VALUES ('post-preflight-nym', repeat('d', 64), 'drift-descriptor', FALSE);" \
-    "public-name candidates changed after preflight"
-
-  assert_migration_059_refusal_case \
-    "$database" "$migration" "alias_drift" \
-    "UPDATE donation_pages SET alias = 'shop-pos-drift' WHERE nym = 'multi-alias-owner' AND kind = 'pos';" \
-    "public-name candidates changed after preflight"
-
-  assert_migration_059_refusal_case \
-    "$database" "$migration" "unresolved" \
-    "UPDATE public_name_migration_choices SET resolved = FALSE WHERE owner_npub = repeat('d', 64);" \
-    "resolve every canonical choice first"
-
-  assert_migration_059_refusal_case \
-    "$database" "$migration" "descriptorless_surface" \
-    "UPDATE donation_pages SET ct_descriptor = NULL WHERE nym = 'independent-page-owner' AND kind = 'payment_page';" \
-    "descriptor-less surfaces violate the current contract"
+  echo "test-db: migration $number refused nonempty ownership state transactionally"
 }
 
 apply_migrations() {
@@ -342,10 +265,10 @@ apply_migrations() {
       run_sql_file "$database" "$before"
     fi
     if [[ "$with_hooks" == "true" && "$base" == "058_permanent_public_names" ]]; then
-      assert_migration_058_refuses_ambiguous_history "$database" "$migration"
+      assert_empty_name_cutover_refusal "$database" "$migration" "058"
     fi
     if [[ "$with_hooks" == "true" && "$base" == "059_remove_surface_alias" ]]; then
-      assert_migration_059_refuses_drift_and_unresolved "$database" "$migration"
+      assert_empty_name_cutover_refusal "$database" "$migration" "059"
     fi
     if [[ "$base" == "053_recovery_address_commitments" \
        || "$base" == "054_fee_policy_authority" \

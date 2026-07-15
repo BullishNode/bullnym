@@ -36,7 +36,7 @@ Options and implications:
 | `instagram` | ASCII letters/digits/dot/underscore, 1-50 bytes, or empty/null/omitted. | Full-PUT field: empty, null, or omission clears the stored handle. Send the handle, not a URL. |
 | `enabled` | Required boolean; signed as `1` or `0`. | False retains configuration but public payment use is disabled. It is not archival deletion. |
 | `ct_descriptor` | Required non-empty valid descriptor; always signed and replaces the stored surface descriptor. | Replacing a surface descriptor does not reset `next_addr_idx`; the new wallet must scan from the existing cursor and old returned addresses remain payable to the old wallet. |
-| `alias` omitted/null | Preserve the permanent owner-level claim; no trailing signed field. | Maintains old-client compatibility without creating a synthetic alias. |
+| `alias` omitted/null | Preserve the permanent owner-level claim; no trailing signed field. | Does not create a synthetic alias. |
 | `alias: ""` | Append the empty terminal signed field, then reject with `DonationPageInvalid`. | Empty is never a clear/release operation. |
 | non-empty `alias` | Append it as the terminal field; first claim wins permanently and exact same-owner retries are idempotent. | Globally shared nym/alias namespace. A different value from the same owner returns `AliasAlreadyAssigned` with `details.alias` set to the owner's permanent alias; a name owned by anyone else returns `NameTaken` without ownership details. |
 

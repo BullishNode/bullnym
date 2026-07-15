@@ -1620,8 +1620,8 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
 
-    // Migration 058 is incomplete if immutable ownership can be released,
-    // even when the registry columns and uniqueness constraints remain.
+    // The permanent-name registry is incomplete if immutable ownership can be
+    // released, even when its columns and uniqueness constraints remain.
     sqlx::query("ALTER TABLE public_names DISABLE TRIGGER public_names_reject_mutation")
         .execute(&admin)
         .await
@@ -3788,7 +3788,7 @@ async fn payment_page_schema_enforces_current_surface_contract() {
            FROM information_schema.columns \
           WHERE table_schema = current_schema() \
             AND table_name = 'donation_pages' \
-            AND column_name IN ('avatar_sha256', 'og_sha256', 'pos_mode')",
+            AND column_name IN ('avatar_sha256', 'og_sha256', 'alias', 'pos_mode')",
     )
     .fetch_one(&pool)
     .await
@@ -5023,10 +5023,10 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
     .fetch_one(&pool)
     .await
     .unwrap();
-    let canonical_alias: String = sqlx::query_scalar(
+    let permanent_alias: String = sqlx::query_scalar(
         "SELECT name FROM public_names WHERE kind = 'alias' AND owner_npub = ( \
              SELECT npub FROM users WHERE nym = 'aliasrace' \
-         ) AND canonical",
+         )",
     )
     .fetch_one(&pool)
     .await
@@ -5037,7 +5037,7 @@ async fn permanent_alias_concurrent_page_and_pos_claims_have_one_atomic_winner()
             .await
             .unwrap();
     assert_eq!(claims, 1);
-    assert_eq!(owned_alias, canonical_alias);
+    assert_eq!(owned_alias, permanent_alias);
     assert_eq!(
         surfaces, 1,
         "losing alias claim must not mutate its surface"
@@ -21403,7 +21403,7 @@ async fn permanent_nym_contract_online_retry_delete_and_reactivation_are_stable(
 }
 
 #[tokio::test]
-async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availability() {
+async fn permanent_name_lookup_reports_permanent_policy_alias_and_la_availability() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
     let app = test_app(test_state(pool.clone()));
@@ -21476,7 +21476,7 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
     pay_service::db::deactivate_user(&pool, &npub)
         .await
         .unwrap()
-        .expect("active canonical nym");
+        .expect("active permanent nym");
 
     let (offline_status, offline_with_alias) = get_path(&app, &lookup_uri).await;
     assert_eq!(offline_status, StatusCode::OK);
@@ -21579,113 +21579,6 @@ async fn permanent_nym_contract_shared_namespace_and_cross_owner_race() {
             .await
             .unwrap();
     assert_eq!((shared_claims, shared_users), (1, 1));
-
-    cleanup_db(&pool).await;
-}
-
-#[tokio::test]
-async fn grandfathered_tombstones_verify_history_but_never_drive_live_routes() {
-    let pool = test_pool().await;
-    cleanup_db(&pool).await;
-
-    let (npub, _, _) = sign_registration("canonical-owner", TEST_DESCRIPTOR);
-    pay_service::db::create_user(&pool, "canonical-owner", &npub, TEST_DESCRIPTOR)
-        .await
-        .unwrap();
-
-    // Model the exact rows migration 059 is allowed to create before its
-    // runtime insert trigger exists. Test-only replication role is local to
-    // this transaction and leaves every declarative constraint enabled.
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL session_replication_role = replica")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO public_names \
-             (name, owner_npub, kind, canonical, grandfathered) \
-         VALUES \
-             ('historical-tombstone', $1, 'nym', FALSE, TRUE), \
-             ('historical-alias', $1, 'alias', FALSE, TRUE)",
-    )
-    .bind(&npub)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO users (nym, npub, ct_descriptor, is_active) \
-         VALUES ('historical-tombstone', $1, 'historical-descriptor', FALSE)",
-    )
-    .bind(&npub)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO donation_pages \
-             (nym, kind, ct_descriptor, header, description, \
-              display_currency, enabled) \
-         VALUES \
-             ('historical-tombstone', 'payment_page', \
-              'historical-descriptor', 'Historical', 'Tombstone surface', \
-              'USD', TRUE)",
-    )
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-
-    let owner = pay_service::db::get_user_by_npub_any(&pool, &npub)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(owner.nym, "canonical-owner");
-    assert_eq!(
-        pay_service::db::count_permanent_nyms_by_npub(&pool, &npub)
-            .await
-            .unwrap(),
-        1,
-        "compatibility quota counts the one canonical product identity"
-    );
-
-    assert!(
-        pay_service::db::get_donation_page_by_nym(
-            &pool,
-            "historical-tombstone",
-            pay_service::db::KIND_PAYMENT_PAGE,
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "a tombstone nym must never select a payable surface"
-    );
-    assert!(
-        pay_service::db::get_donation_page_by_alias(
-            &pool,
-            "historical-alias",
-            pay_service::db::KIND_PAYMENT_PAGE,
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "a tombstone alias must never select a payable surface"
-    );
-    assert!(
-        pay_service::db::alias_owns_nym(&pool, "historical-alias", "historical-tombstone",)
-            .await
-            .unwrap(),
-        "typed tombstones remain authoritative for old invoice verification"
-    );
-
-    let activation =
-        sqlx::query("UPDATE users SET is_active = TRUE WHERE nym = 'historical-tombstone'")
-            .execute(&pool)
-            .await
-            .expect_err("a tombstone must not become an active Lightning Address");
-    assert!(matches!(
-        activation,
-        sqlx::Error::Database(ref error)
-            if error.constraint() == Some("users_active_nym_must_be_canonical")
-    ));
 
     cleanup_db(&pool).await;
 }
