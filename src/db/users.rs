@@ -126,8 +126,8 @@ pub async fn mark_user_used<'e, E: sqlx::PgExecutor<'e>>(
 }
 
 /// Canonical permanent nym claims for this npub. Historical tombstones remain
-/// reserved, but do not consume the compatibility API's current-name count.
-pub async fn count_lifetime_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i64, sqlx::Error> {
+/// reserved, but only the canonical claim consumes the ownership quota.
+pub async fn count_permanent_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM public_names \
          WHERE owner_npub = $1 AND kind = 'nym' AND canonical",
@@ -137,34 +137,20 @@ pub async fn count_lifetime_nyms_by_npub(pool: &PgPool, npub: &str) -> Result<i6
     .await
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PreviousNym {
-    pub nym: String,
-    pub created_at: String,
-}
-
 /// Permanent ownership plus the independent Lightning Address availability
 /// projected by `GET /register/lookup` in one database snapshot.
 pub struct RegistrationLookupStatus {
     pub canonical_nym: String,
     pub lightning_address_online: bool,
     pub canonical_alias: Option<String>,
-    pub previous_nyms: Vec<PreviousNym>,
     pub used: i64,
 }
 
-type RegistrationLookupRow = (
-    String,
-    bool,
-    Option<String>,
-    sqlx::types::Json<Vec<PreviousNym>>,
-    i64,
-);
+type RegistrationLookupRow = (String, bool, Option<String>, i64);
 
 /// Resolve only the canonical permanent nym and alias for this owner. An
-/// offline canonical nym remains the returned identity and is additionally
-/// retained in `previous_nyms` for compatibility; historical tombstones never
-/// become the current lookup identity.
+/// offline canonical nym remains the returned identity; historical tombstones
+/// never become the current lookup identity.
 pub async fn lookup_status_by_npub(
     pool: &PgPool,
     npub: &str,
@@ -174,10 +160,6 @@ pub async fn lookup_status_by_npub(
                 canonical_nym.name, \
                 users.is_active, \
                 canonical_alias.name, \
-                CASE WHEN users.is_active THEN '[]'::JSON \
-                     ELSE json_build_array(json_build_object( \
-                              'nym', canonical_nym.name, \
-                              'created_at', canonical_nym.claimed_at)) END, \
                 (SELECT COUNT(*) FROM public_names counted_nym \
                   WHERE counted_nym.owner_npub = canonical_nym.owner_npub \
                     AND counted_nym.kind = 'nym' \
@@ -198,11 +180,10 @@ pub async fn lookup_status_by_npub(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(canonical_nym, online, canonical_alias, previous_nyms, used)| RegistrationLookupStatus {
+        |(canonical_nym, online, canonical_alias, used)| RegistrationLookupStatus {
             canonical_nym,
             lightning_address_online: online,
             canonical_alias,
-            previous_nyms: previous_nyms.0,
             used,
         },
     ))

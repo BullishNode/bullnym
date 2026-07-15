@@ -20819,16 +20819,40 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
     let app = test_app(test_state(pool.clone()));
     let npub = create_test_user(&pool, "lookup-contract").await;
     let lookup_uri = format!("/register/lookup?npub={npub}");
+    let assert_lookup_shape = |body: &Value| {
+        let object = body.as_object().expect("registration lookup object");
+        assert_eq!(
+            object.len(),
+            5,
+            "unexpected registration lookup fields: {body}"
+        );
+        for field in [
+            "nym",
+            "lightning_address_online",
+            "alias",
+            "public_name_policy",
+            "quota",
+        ] {
+            assert!(object.contains_key(field), "missing {field}: {body}");
+        }
+        for removed in [
+            "active",
+            "previous_nyms",
+            "lifetime_nyms_used",
+            "lifetime_nyms_cap",
+        ] {
+            assert!(
+                !object.contains_key(removed),
+                "legacy {removed} leaked: {body}"
+            );
+        }
+    };
 
     let (online_status, online_without_alias) = get_path(&app, &lookup_uri).await;
     assert_eq!(online_status, StatusCode::OK);
+    assert_lookup_shape(&online_without_alias);
     assert_eq!(online_without_alias["nym"], "lookup-contract");
-    assert_eq!(online_without_alias["active"], true);
     assert_eq!(online_without_alias["lightning_address_online"], true);
-    assert_eq!(
-        online_without_alias["active"],
-        online_without_alias["lightning_address_online"]
-    );
     assert_eq!(online_without_alias["alias"], Value::Null);
     assert_eq!(
         online_without_alias["public_name_policy"],
@@ -20838,9 +20862,6 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
         online_without_alias["quota"],
         json!({"used": 1, "cap": 1, "remaining": 0})
     );
-    assert_eq!(online_without_alias["previous_nyms"], json!([]));
-    assert_eq!(online_without_alias["lifetime_nyms_used"], 1);
-    assert_eq!(online_without_alias["lifetime_nyms_cap"], 1);
 
     sqlx::query(
         "INSERT INTO public_names (name, owner_npub, kind) \
@@ -20853,9 +20874,9 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
 
     let (aliased_status, online_with_alias) = get_path(&app, &lookup_uri).await;
     assert_eq!(aliased_status, StatusCode::OK);
+    assert_lookup_shape(&online_with_alias);
     assert_eq!(online_with_alias["nym"], "lookup-contract");
     assert_eq!(online_with_alias["alias"], "lookup-shop");
-    assert_eq!(online_with_alias["active"], true);
     assert_eq!(online_with_alias["lightning_address_online"], true);
     assert_eq!(
         online_with_alias["public_name_policy"],
@@ -20869,28 +20890,13 @@ async fn permanent_name_lookup_reports_canonical_policy_alias_and_la_availabilit
 
     let (offline_status, offline_with_alias) = get_path(&app, &lookup_uri).await;
     assert_eq!(offline_status, StatusCode::OK);
+    assert_lookup_shape(&offline_with_alias);
     assert_eq!(offline_with_alias["nym"], "lookup-contract");
     assert_eq!(offline_with_alias["alias"], "lookup-shop");
-    assert_eq!(offline_with_alias["active"], false);
     assert_eq!(offline_with_alias["lightning_address_online"], false);
-    assert_eq!(
-        offline_with_alias["active"],
-        offline_with_alias["lightning_address_online"]
-    );
     assert_eq!(
         offline_with_alias["public_name_policy"],
         "permanent_names_v1"
-    );
-    assert_eq!(
-        offline_with_alias["previous_nyms"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        offline_with_alias["previous_nyms"][0]["nym"],
-        "lookup-contract"
     );
     assert_eq!(
         offline_with_alias["quota"],
@@ -21044,7 +21050,7 @@ async fn grandfathered_tombstones_verify_history_but_never_drive_live_routes() {
         .unwrap();
     assert_eq!(owner.nym, "canonical-owner");
     assert_eq!(
-        pay_service::db::count_lifetime_nyms_by_npub(&pool, &npub)
+        pay_service::db::count_permanent_nyms_by_npub(&pool, &npub)
             .await
             .unwrap(),
         1,
