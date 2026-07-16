@@ -198,23 +198,37 @@ impl RateLimiter {
     // --- Opaque wallet-backup gates ---
 
     pub async fn check_wallet_backup_fetch_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
-        let bucket = format!("wallet_backup:fetch:{}", source_key(ip));
+        let bucket = wallet_backup_source_bucket("fetch", &source_key(ip));
         self.inmem_sliding_check(
             &bucket,
             self.cfg.wallet_backup_fetch_per_source_per_hour,
             3600,
             AppError::RateLimitedSender,
+        )?;
+        self.atomic_sliding_window_check(
+            &bucket,
+            self.cfg.wallet_backup_fetch_per_source_per_hour,
+            3600,
+            AppError::RateLimitedSender,
         )
+        .await
     }
 
     pub async fn check_wallet_backup_mutation_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
-        let bucket = format!("wallet_backup:mutation:{}", source_key(ip));
+        let bucket = wallet_backup_source_bucket("mutation", &source_key(ip));
         self.inmem_sliding_check(
             &bucket,
             self.cfg.wallet_backup_mutation_per_source_per_hour,
             3600,
             AppError::RateLimitedSender,
+        )?;
+        self.atomic_sliding_window_check(
+            &bucket,
+            self.cfg.wallet_backup_mutation_per_source_per_hour,
+            3600,
+            AppError::RateLimitedSender,
         )
+        .await
     }
 
     pub async fn check_wallet_backup_mutation_per_key(
@@ -237,7 +251,7 @@ impl RateLimiter {
         ip: IpAddr,
         npub_hex: &str,
     ) -> Result<(), AppError> {
-        let bucket = format!("wallet_backup:distinct:{}", source_key(ip));
+        let bucket = wallet_backup_source_bucket("distinct", &source_key(ip));
         let digest = Sha256::digest(npub_hex.as_bytes());
         let pseudonym = hex::encode(&digest[..16]);
         self.distinct_nyms_check(
@@ -576,6 +590,11 @@ impl RateLimiter {
         }
         Ok(())
     }
+}
+
+fn wallet_backup_source_bucket(axis: &str, source: &str) -> String {
+    let digest = Sha256::digest(source.as_bytes());
+    format!("wallet_backup:{axis}-source:{}", hex::encode(&digest[..16]))
 }
 
 // --- In-memory sliding-window limiter ---

@@ -56,7 +56,7 @@ $$;
 CREATE TABLE wallet_backup_blobs (
     stream              TEXT        NOT NULL,
     author_pubkey       BYTEA       NOT NULL,
-    generation          BIGINT      NOT NULL CHECK (generation > 0),
+    generation          BIGINT      NOT NULL,
     etag                 BYTEA       NOT NULL,
     ciphertext          BYTEA,
     ciphertext_sha256   BYTEA,
@@ -65,6 +65,8 @@ CREATE TABLE wallet_backup_blobs (
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at           TIMESTAMPTZ,
     PRIMARY KEY (stream, author_pubkey),
+    CONSTRAINT wallet_backup_blobs_generation_positive_chk
+        CHECK (generation > 0),
     CONSTRAINT wallet_backup_blobs_stream_chk
         CHECK (stream IN ('keychain_manifest', 'wallet_metadata')),
     CONSTRAINT wallet_backup_blobs_author_pubkey_len_chk
@@ -101,6 +103,7 @@ DO $$
 DECLARE
     runtime_role_name TEXT := current_setting('bullnym.migration_runtime_role');
 BEGIN
+    REVOKE ALL ON TABLE wallet_backup_blobs FROM PUBLIC;
     EXECUTE format('REVOKE ALL ON TABLE wallet_backup_blobs FROM %I', runtime_role_name);
     EXECUTE format(
         'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE wallet_backup_blobs TO %I',

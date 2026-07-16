@@ -4,8 +4,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, post, put};
@@ -73,12 +72,55 @@ pub struct StoreRequest {
     stream: BackupStream,
     npub: String,
     generation: u64,
-    expected_etag: Option<String>,
+    expected_etag: RequiredNullableString,
     ciphertext: String,
     ciphertext_sha256: String,
     ciphertext_bytes: u64,
     timestamp: u64,
     signature: String,
+}
+
+struct RequiredNullableString(Option<String>);
+
+impl<'de> Deserialize<'de> for RequiredNullableString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NullableStringVisitor;
+
+        impl serde::de::Visitor<'_> for NullableStringVisitor {
+            type Value = RequiredNullableString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RequiredNullableString(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(RequiredNullableString(None))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(RequiredNullableString(Some(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(RequiredNullableString(Some(value)))
+            }
+        }
+
+        deserializer.deserialize_any(NullableStringVisitor)
+    }
+}
+
+impl RequiredNullableString {
+    fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -219,8 +261,11 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, WalletBackupError> {
-    match request {
+async fn json_request<T>(request: Request, state: &AppState) -> Result<T, WalletBackupError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match Json::<T>::from_request(request, state).await {
         Ok(Json(request)) => Ok(request),
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             Err(WalletBackupError::BlobTooLarge)
@@ -411,7 +456,7 @@ pub async fn fetch(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    request: Result<Json<FetchRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<FetchResponse>, WalletBackupError> {
     let started = Instant::now();
     let _ = source_gate(
@@ -421,7 +466,7 @@ pub async fn fetch(
         false,
     )
     .await?;
-    let request = json_request(request)?;
+    let request: FetchRequest = json_request(request, &state).await?;
     validate_version(request.version)?;
     let author = decode_canonical_hex::<32>(
         &request.npub,
@@ -488,7 +533,7 @@ pub async fn store(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    request: Result<Json<StoreRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<MutationResponse>, WalletBackupError> {
     let started = Instant::now();
     let (source, whitelisted) = source_gate(
@@ -498,7 +543,7 @@ pub async fn store(
         true,
     )
     .await?;
-    let request = json_request(request)?;
+    let request: StoreRequest = json_request(request, &state).await?;
     validate_version(request.version)?;
     let generation = validate_generation(request.generation)?;
     let author = decode_canonical_hex::<32>(
@@ -603,7 +648,7 @@ pub async fn delete_backup(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    request: Result<Json<DeleteRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<MutationResponse>, WalletBackupError> {
     let started = Instant::now();
     let (source, whitelisted) = source_gate(
@@ -613,7 +658,7 @@ pub async fn delete_backup(
         true,
     )
     .await?;
-    let request = json_request(request)?;
+    let request: DeleteRequest = json_request(request, &state).await?;
     validate_version(request.version)?;
     let generation = validate_generation(request.generation)?;
     let author = decode_canonical_hex::<32>(

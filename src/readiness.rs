@@ -1317,19 +1317,42 @@ async fn wallet_backup_storage_invariants_present(
     sqlx::query_scalar::<_, bool>(
         "SELECT \
             to_regclass('public.wallet_backup_blobs') IS NOT NULL \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('stream', 'text'::REGTYPE, 1, TRUE, FALSE), \
+                    ('author_pubkey', 'bytea'::REGTYPE, 2, TRUE, FALSE), \
+                    ('generation', 'int8'::REGTYPE, 3, TRUE, FALSE), \
+                    ('etag', 'bytea'::REGTYPE, 4, TRUE, FALSE), \
+                    ('ciphertext', 'bytea'::REGTYPE, 5, FALSE, FALSE), \
+                    ('ciphertext_sha256', 'bytea'::REGTYPE, 6, FALSE, FALSE), \
+                    ('ciphertext_bytes', 'int4'::REGTYPE, 7, FALSE, FALSE), \
+                    ('created_at', 'timestamptz'::REGTYPE, 8, TRUE, TRUE), \
+                    ('updated_at', 'timestamptz'::REGTYPE, 9, TRUE, TRUE), \
+                    ('deleted_at', 'timestamptz'::REGTYPE, 10, FALSE, FALSE) \
+                ) required(column_name, type_oid, ordinal, not_null, has_default) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_attribute attribute_info \
+                     WHERE attribute_info.attrelid = \
+                               to_regclass('public.wallet_backup_blobs') \
+                       AND attribute_info.attname = required.column_name \
+                       AND attribute_info.atttypid = required.type_oid \
+                       AND attribute_info.attnum = required.ordinal \
+                       AND attribute_info.attnotnull = required.not_null \
+                       AND attribute_info.atthasdef = required.has_default \
+                       AND NOT attribute_info.attisdropped \
+                 ) \
+            ) \
             AND ( \
-                SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_schema = 'public' \
-                   AND table_name = 'wallet_backup_blobs' \
-                   AND column_name IN ( \
-                       'stream', 'author_pubkey', 'generation', 'etag', \
-                       'ciphertext', 'ciphertext_sha256', 'ciphertext_bytes', \
-                       'created_at', 'updated_at', 'deleted_at' \
-                   ) \
+                SELECT COUNT(*) FROM pg_attribute attribute_info \
+                 WHERE attribute_info.attrelid = \
+                           to_regclass('public.wallet_backup_blobs') \
+                   AND attribute_info.attnum > 0 \
+                   AND NOT attribute_info.attisdropped \
             ) = 10 \
             AND NOT EXISTS ( \
                 SELECT 1 FROM (VALUES \
                     ('wallet_backup_blobs_pkey', 'p'), \
+                    ('wallet_backup_blobs_generation_positive_chk', 'c'), \
                     ('wallet_backup_blobs_stream_chk', 'c'), \
                     ('wallet_backup_blobs_author_pubkey_len_chk', 'c'), \
                     ('wallet_backup_blobs_etag_len_chk', 'c'), \
@@ -1353,6 +1376,15 @@ async fn wallet_backup_storage_invariants_present(
                  WHERE schemaname = 'public' \
                    AND tablename = 'wallet_backup_blobs' \
                    AND indexname = 'wallet_backup_blobs_tombstone_cleanup_idx' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM pg_class relation \
+                  CROSS JOIN LATERAL aclexplode(COALESCE( \
+                      relation.relacl, acldefault('r', relation.relowner) \
+                  )) acl \
+                 WHERE relation.oid = to_regclass('public.wallet_backup_blobs') \
+                   AND acl.grantee = 0 \
             ) \
             AND pg_get_userbyid( \
                 (SELECT relowner FROM pg_class \

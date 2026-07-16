@@ -234,6 +234,11 @@ pub async fn delete_wallet_backup(
         return Ok(WalletBackupMutationOutcome::ExactRetry);
     }
 
+    if current.is_tombstone() {
+        transaction.rollback().await?;
+        return Ok(WalletBackupMutationOutcome::HeadConflict);
+    }
+
     if current.generation.checked_add(1) != Some(generation) || current.etag() != expected_etag {
         transaction.rollback().await?;
         return Ok(WalletBackupMutationOutcome::HeadConflict);

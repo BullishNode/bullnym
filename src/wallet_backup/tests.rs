@@ -79,6 +79,25 @@ fn request_shapes_reject_unknown_fields() {
 }
 
 #[test]
+fn store_requires_explicit_nullable_expected_etag() {
+    let mut request = serde_json::json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "generation": 1,
+        "expected_etag": null,
+        "ciphertext": "AA==",
+        "ciphertext_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "ciphertext_bytes": 1,
+        "timestamp": 1_700_000_000u64,
+        "signature": "00".repeat(64)
+    });
+    assert!(serde_json::from_value::<StoreRequest>(request.clone()).is_ok());
+    request.as_object_mut().unwrap().remove("expected_etag");
+    assert!(serde_json::from_value::<StoreRequest>(request).is_err());
+}
+
+#[test]
 fn exact_decoded_limit_is_two_mebibytes() {
     assert_eq!(MAX_CIPHERTEXT_BYTES, 2_097_152);
     assert!(BASE64_STANDARD

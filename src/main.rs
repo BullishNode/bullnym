@@ -708,6 +708,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // Signed backup gates and other HTTP controls persist cross-process rate
+    // events even in web-only mode, so their retention loop cannot depend on
+    // payment workers being enabled.
+    {
+        let rate_limit_gc_pool = pool.clone();
+        let rate_limit_gc_cancel = cancel.clone();
+        let rate_limit_gc_config = gc::GcConfig::default();
+        let tick_secs = rate_limit_gc_config.tick_secs;
+        let retention_secs = rate_limit_gc_config.retention_secs;
+        tokio::spawn(async move {
+            gc::run_rate_limit_gc(
+                rate_limit_gc_pool,
+                rate_limit_gc_cancel,
+                tick_secs,
+                retention_secs,
+            )
+            .await;
+        });
+        tracing::info!(tick_secs, retention_secs, "rate-limit GC started");
+    }
     // Tombstones outlive the five-minute signed-request window, then become
     // disposable. Every HTTP process may run this bounded SKIP LOCKED sweep;
     // concurrent processes divide work without blocking request transactions.
@@ -841,8 +861,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tracing::info!("slow recovery started (shares reconciler config)");
 
-        // Periodic GC of rate-limit tables. Without this, sliding-window
-        // queries get progressively slower as inactive rows accumulate.
+        // Payment-state cleanup remains worker-owned because it changes
+        // invoice and reservation lifecycle state.
         {
             let pool = pool.clone();
             let gc_cfg = gc::GcConfig {
@@ -856,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 gc::run(pool, cancel_gc, gc_cfg).await;
             });
-            tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
+            tracing::info!("operational payment-state GC started");
         }
 
         if let Some(backend) = state.utxo_backend.clone() {
