@@ -1129,6 +1129,23 @@ pub struct RateLimitConfig {
     /// without blocking a legitimate burst. 0 disables the check.
     #[serde(default = "default_invoice_create_per_npub_per_hour")]
     pub invoice_create_per_npub_per_hour: u32,
+
+    // --- Opaque wallet backups ---
+    /// Signed fetch attempts per source per hour. 0 disables.
+    #[serde(default = "default_wallet_backup_fetch_per_source_per_hour")]
+    pub wallet_backup_fetch_per_source_per_hour: u32,
+    /// Store and delete attempts combined per source per hour. 0 disables.
+    #[serde(default = "default_wallet_backup_mutation_per_source_per_hour")]
+    pub wallet_backup_mutation_per_source_per_hour: u32,
+    /// Store and delete attempts per authenticated stream key per hour. 0 disables.
+    #[serde(default = "default_wallet_backup_mutation_per_key_per_hour")]
+    pub wallet_backup_mutation_per_key_per_hour: u32,
+    /// Distinct stream keys mutated by one source per day. 0 disables.
+    #[serde(default = "default_wallet_backup_distinct_keys_per_source_per_day")]
+    pub wallet_backup_distinct_keys_per_source_per_day: u32,
+    /// Total live decoded ciphertext bytes. 0 disables the capacity ceiling.
+    #[serde(default = "default_wallet_backup_global_stored_bytes")]
+    pub wallet_backup_global_stored_bytes: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -1178,6 +1195,15 @@ impl Default for RateLimitConfig {
             invoice_status_per_source_per_min: default_invoice_status_per_source_per_min(),
             invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
             invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
+            wallet_backup_fetch_per_source_per_hour:
+                default_wallet_backup_fetch_per_source_per_hour(),
+            wallet_backup_mutation_per_source_per_hour:
+                default_wallet_backup_mutation_per_source_per_hour(),
+            wallet_backup_mutation_per_key_per_hour:
+                default_wallet_backup_mutation_per_key_per_hour(),
+            wallet_backup_distinct_keys_per_source_per_day:
+                default_wallet_backup_distinct_keys_per_source_per_day(),
+            wallet_backup_global_stored_bytes: default_wallet_backup_global_stored_bytes(),
         }
     }
 }
@@ -1356,6 +1382,21 @@ fn default_invoice_create_per_source_per_min() -> u32 {
 /// stolen mobile credential without throttling legitimate use.
 fn default_invoice_create_per_npub_per_hour() -> u32 {
     100
+}
+fn default_wallet_backup_fetch_per_source_per_hour() -> u32 {
+    120
+}
+fn default_wallet_backup_mutation_per_source_per_hour() -> u32 {
+    30
+}
+fn default_wallet_backup_mutation_per_key_per_hour() -> u32 {
+    20
+}
+fn default_wallet_backup_distinct_keys_per_source_per_day() -> u32 {
+    10
+}
+fn default_wallet_backup_global_stored_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
 }
 
 // --- Electrum / tx cache config ---

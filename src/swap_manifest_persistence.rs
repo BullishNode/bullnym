@@ -572,11 +572,7 @@ pub async fn repair_oldest_manifestless_chain_swap(
             // Migration 053 persists the exact ID/address pair. Refuse to
             // invent either half only when historical or corrupted evidence
             // is genuinely asymmetric and cannot be reconstructed exactly.
-            return Err(rollback_repair_or_replace(
-                tx,
-                error,
-            )
-            .await);
+            return Err(rollback_repair_or_replace(tx, error).await);
         }
     };
     let merchant_policy = MerchantPolicyReferencesV1::new(
@@ -703,8 +699,8 @@ async fn rollback_repair_or_replace(
 mod manifestless_repair_error_tests {
     use std::error::Error as _;
 
-    use super::ManifestlessChainSwapRepairError as Error;
     use super::exact_emergency_policy_reference;
+    use super::ManifestlessChainSwapRepairError as Error;
 
     #[test]
     fn emergency_policy_reconstruction_preserves_exact_pair_and_legacy_absence() {

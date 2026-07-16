@@ -22,6 +22,7 @@ mod reservations;
 mod swap_lineage;
 mod swaps;
 mod users;
+mod wallet_backups;
 mod watcher;
 
 pub use bitcoin_recovery_fee_authority::*;
@@ -48,6 +49,7 @@ pub use reservations::*;
 pub use swap_lineage::*;
 pub use swaps::*;
 pub use users::*;
+pub use wallet_backups::*;
 pub use watcher::*;
 
 /// Shared advisory-lock namespace for exact invoice presentation value versus

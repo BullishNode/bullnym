@@ -472,6 +472,7 @@ fn test_app(state: AppState) -> Router {
         .route("/api/v1/invoices/:id/status", get(invoice::status))
         .route("/certification/preflight", get(certification::preflight))
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
+        .merge(pay_service::wallet_backup::router())
         .with_state(state)
 }
 
@@ -799,6 +800,10 @@ fn test_lnurl_callback_path(nym: &str) -> String {
 }
 
 async fn cleanup_db(pool: &PgPool) {
+    sqlx::query("TRUNCATE wallet_backup_blobs")
+        .execute(pool)
+        .await
+        .ok();
     // Quote/offer ledgers are immutable and hold RESTRICT links from swaps and
     // events. The disposable database owner truncates the entire attribution
     // family solely for per-test isolation.
@@ -1674,7 +1679,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "063_checkout_private_memo"
+        "064_wallet_backup_blobs"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -1887,7 +1892,7 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["expected_schema_marker"], "063_checkout_private_memo");
+    assert_eq!(body["expected_schema_marker"], "064_wallet_backup_blobs");
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -1901,6 +1906,37 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     assert_eq!(restored_body["ready"], true);
 
     cleanup_db(&admin).await;
+}
+
+#[tokio::test]
+async fn wallet_backup_readiness_requires_runtime_crud_without_table_authority() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(runtime.clone()));
+    let (initial_status, initial_body) = get_path(&app, "/ready").await;
+    assert_eq!(initial_status, StatusCode::OK, "{initial_body:?}");
+    runtime.close().await;
+
+    sqlx::query("REVOKE DELETE ON TABLE wallet_backup_blobs FROM bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(runtime.clone()));
+    let (missing_status, missing_body) = get_path(&app, "/ready").await;
+    assert_eq!(missing_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_body["schema"]["ok"], false);
+    runtime.close().await;
+
+    sqlx::query("GRANT DELETE ON TABLE wallet_backup_blobs TO bullnym_app")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let runtime = readiness_runtime_role_test_pool(&admin).await;
+    let app = test_app(test_state(runtime));
+    let (restored_status, restored_body) = get_path(&app, "/ready").await;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_body:?}");
 }
 
 #[tokio::test]
@@ -33712,5 +33748,318 @@ async fn invoice_chain_offer_delivery_failure_withholds_offer_and_retains_provid
 
     boltz.shutdown().await;
     store.shutdown().await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit() {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+    use pay_service::wallet_backup::{build_signing_message, compute_etag, BackupStream};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+    let secp = Secp256k1::new();
+    let secret = SecretKey::from_slice(&[91; 32]).unwrap();
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let npub = keypair.x_only_public_key().0.to_string();
+    let stream = BackupStream::WalletMetadata;
+    let ciphertext = b"opaque-encrypted-wallet-metadata";
+    let ciphertext_hash = hex::encode(Sha256::digest(ciphertext));
+    let timestamp = auth_timestamp();
+    let store_message = build_signing_message(
+        "backup-store",
+        stream,
+        &npub,
+        1,
+        None,
+        Some(&ciphertext_hash),
+        ciphertext.len() as u64,
+        timestamp,
+    );
+    let store_body = json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": npub,
+        "generation": 1,
+        "expected_etag": null,
+        "ciphertext": BASE64_STANDARD.encode(ciphertext),
+        "ciphertext_sha256": ciphertext_hash,
+        "ciphertext_bytes": ciphertext.len(),
+        "timestamp": timestamp,
+        "signature": sign_with_keypair(&keypair, &store_message),
+    });
+
+    let (store_status, store_response) =
+        put_json(&app, "/api/v1/wallet-backups", store_body.clone()).await;
+    assert_eq!(store_status, StatusCode::OK, "{store_response}");
+    let first_etag = store_response["etag"].as_str().unwrap().to_string();
+    assert_eq!(
+        first_etag,
+        hex::encode(compute_etag(stream, &npub, 1, Some(&ciphertext_hash)))
+    );
+
+    let (retry_status, retry_response) =
+        put_json(&app, "/api/v1/wallet-backups", store_body.clone()).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_response}");
+    assert_eq!(retry_response["etag"], first_etag);
+
+    let fetch_timestamp = auth_timestamp();
+    let fetch_message = build_signing_message(
+        "backup-fetch",
+        stream,
+        &npub,
+        0,
+        None,
+        None,
+        0,
+        fetch_timestamp,
+    );
+    let fetch_body = json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": npub,
+        "timestamp": fetch_timestamp,
+        "signature": sign_with_keypair(&keypair, &fetch_message),
+    });
+    let (fetch_status, fetch_response) =
+        post_json(&app, "/api/v1/wallet-backups/fetch", fetch_body.clone()).await;
+    assert_eq!(fetch_status, StatusCode::OK, "{fetch_response}");
+    assert_eq!(fetch_response["found"], true);
+    assert_eq!(fetch_response["generation"], 1);
+    assert_eq!(
+        fetch_response["ciphertext"],
+        BASE64_STANDARD.encode(ciphertext)
+    );
+
+    let replacement = b"new-opaque-encrypted-wallet-metadata";
+    let replacement_hash = hex::encode(Sha256::digest(replacement));
+    let replacement_timestamp = auth_timestamp();
+    let replacement_message = build_signing_message(
+        "backup-store",
+        stream,
+        &npub,
+        2,
+        Some(&first_etag),
+        Some(&replacement_hash),
+        replacement.len() as u64,
+        replacement_timestamp,
+    );
+    let replacement_body = json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": npub,
+        "generation": 2,
+        "expected_etag": first_etag,
+        "ciphertext": BASE64_STANDARD.encode(replacement),
+        "ciphertext_sha256": replacement_hash,
+        "ciphertext_bytes": replacement.len(),
+        "timestamp": replacement_timestamp,
+        "signature": sign_with_keypair(&keypair, &replacement_message),
+    });
+    let (replacement_status, replacement_response) =
+        put_json(&app, "/api/v1/wallet-backups", replacement_body).await;
+    assert_eq!(replacement_status, StatusCode::OK, "{replacement_response}");
+    let replacement_etag = replacement_response["etag"].as_str().unwrap().to_string();
+
+    let (stale_status, stale_response) = put_json(&app, "/api/v1/wallet-backups", store_body).await;
+    assert_eq!(stale_status, StatusCode::CONFLICT, "{stale_response}");
+    assert_eq!(stale_response["code"], "BackupHeadConflict");
+
+    let delete_timestamp = auth_timestamp();
+    let delete_message = build_signing_message(
+        "backup-delete",
+        stream,
+        &npub,
+        3,
+        Some(&replacement_etag),
+        None,
+        0,
+        delete_timestamp,
+    );
+    let delete_body = json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": npub,
+        "generation": 3,
+        "expected_etag": replacement_etag,
+        "timestamp": delete_timestamp,
+        "signature": sign_with_keypair(&keypair, &delete_message),
+    });
+    let (delete_status, delete_response) =
+        delete_json_path(&app, "/api/v1/wallet-backups", delete_body.clone()).await;
+    assert_eq!(delete_status, StatusCode::OK, "{delete_response}");
+    let (delete_retry_status, delete_retry_response) =
+        delete_json_path(&app, "/api/v1/wallet-backups", delete_body).await;
+    assert_eq!(
+        delete_retry_status,
+        StatusCode::OK,
+        "{delete_retry_response}"
+    );
+
+    let (tombstone_status, tombstone_response) =
+        post_json(&app, "/api/v1/wallet-backups/fetch", fetch_body).await;
+    assert_eq!(tombstone_status, StatusCode::OK, "{tombstone_response}");
+    assert_eq!(tombstone_response["found"], false);
+    assert_eq!(tombstone_response["generation"], 3);
+    assert!(tombstone_response["etag"].is_string());
+
+    let oversized = vec![0u8; pay_service::wallet_backup::MAX_CIPHERTEXT_BYTES + 1];
+    let oversized_body = json!({
+        "version": 1,
+        "stream": "wallet_metadata",
+        "npub": npub,
+        "generation": 4,
+        "expected_etag": tombstone_response["etag"],
+        "ciphertext": BASE64_STANDARD.encode(&oversized),
+        "ciphertext_sha256": hex::encode(Sha256::digest(&oversized)),
+        "ciphertext_bytes": oversized.len(),
+        "timestamp": auth_timestamp(),
+        "signature": "00".repeat(64),
+    });
+    let (oversized_status, oversized_response) =
+        put_json(&app, "/api/v1/wallet-backups", oversized_body).await;
+    assert_eq!(oversized_status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(oversized_response["code"], "BackupBlobTooLarge");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn wallet_backup_persistence_serializes_first_writers_and_rejects_stale_delete() {
+    use pay_service::db::WalletBackupMutationOutcome;
+    use pay_service::wallet_backup::{compute_etag, BackupStream};
+
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let stream = BackupStream::WalletMetadata;
+    let stream_name = stream.as_str();
+    let author = [0x71u8; 32];
+    let npub = hex::encode(author);
+    let first = b"first-ciphertext";
+    let second = b"second-ciphertext";
+    let first_hash = Sha256::digest(first);
+    let second_hash = Sha256::digest(second);
+    let first_hash_hex = hex::encode(first_hash);
+    let second_hash_hex = hex::encode(second_hash);
+    let first_etag = compute_etag(stream, &npub, 1, Some(&first_hash_hex));
+    let second_etag = compute_etag(stream, &npub, 1, Some(&second_hash_hex));
+
+    let first_write = pay_service::db::store_wallet_backup(
+        &pool,
+        stream_name,
+        &author,
+        1,
+        None,
+        &first_etag,
+        first,
+        &first_hash,
+        0,
+    );
+    let second_write = pay_service::db::store_wallet_backup(
+        &pool,
+        stream_name,
+        &author,
+        1,
+        None,
+        &second_etag,
+        second,
+        &second_hash,
+        0,
+    );
+    let (first_outcome, second_outcome) = tokio::join!(first_write, second_write);
+    let outcomes = [first_outcome.unwrap(), second_outcome.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|&&outcome| outcome == WalletBackupMutationOutcome::Applied)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|&&outcome| outcome == WalletBackupMutationOutcome::HeadConflict)
+            .count(),
+        1
+    );
+
+    let head = pay_service::db::fetch_wallet_backup_head(&pool, stream_name, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_etag: [u8; 32] = head.etag().try_into().unwrap();
+    let replacement = b"replacement-ciphertext";
+    let replacement_hash = Sha256::digest(replacement);
+    let replacement_hash_hex = hex::encode(replacement_hash);
+    let replacement_etag = compute_etag(stream, &npub, 2, Some(&replacement_hash_hex));
+    assert_eq!(
+        pay_service::db::store_wallet_backup(
+            &pool,
+            stream_name,
+            &author,
+            2,
+            Some(&old_etag),
+            &replacement_etag,
+            replacement,
+            &replacement_hash,
+            0,
+        )
+        .await
+        .unwrap(),
+        WalletBackupMutationOutcome::Applied
+    );
+
+    let stale_tombstone_etag = compute_etag(stream, &npub, 2, None);
+    assert_eq!(
+        pay_service::db::delete_wallet_backup(
+            &pool,
+            stream_name,
+            &author,
+            2,
+            &old_etag,
+            &stale_tombstone_etag,
+        )
+        .await
+        .unwrap(),
+        WalletBackupMutationOutcome::HeadConflict
+    );
+    let current = pay_service::db::fetch_wallet_backup_head(&pool, stream_name, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.generation, 2);
+    assert!(!current.is_tombstone());
+
+    cleanup_db(&pool).await;
+    let capacity_author = [0x72u8; 32];
+    let capacity_npub = hex::encode(capacity_author);
+    let capacity_hash = Sha256::digest(b"sixsix");
+    let capacity_hash_hex = hex::encode(capacity_hash);
+    let capacity_etag = compute_etag(stream, &capacity_npub, 1, Some(&capacity_hash_hex));
+    assert_eq!(
+        pay_service::db::store_wallet_backup(
+            &pool,
+            stream_name,
+            &capacity_author,
+            1,
+            None,
+            &capacity_etag,
+            b"sixsix",
+            &capacity_hash,
+            5,
+        )
+        .await
+        .unwrap(),
+        WalletBackupMutationOutcome::GlobalCapacityExceeded
+    );
+    assert!(
+        pay_service::db::fetch_wallet_backup_head(&pool, stream_name, &capacity_author)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     cleanup_db(&pool).await;
 }

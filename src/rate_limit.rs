@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -192,6 +193,61 @@ impl RateLimiter {
             self.cfg.api_rate_window_secs,
             AppError::RateLimitedSender,
         )
+    }
+
+    // --- Opaque wallet-backup gates ---
+
+    pub async fn check_wallet_backup_fetch_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("wallet_backup:fetch:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.wallet_backup_fetch_per_source_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    pub async fn check_wallet_backup_mutation_per_ip(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("wallet_backup:mutation:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.wallet_backup_mutation_per_source_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    pub async fn check_wallet_backup_mutation_per_key(
+        &self,
+        npub_hex: &str,
+    ) -> Result<(), AppError> {
+        let digest = Sha256::digest(npub_hex.as_bytes());
+        let bucket = format!("wallet_backup:key:{}", hex::encode(&digest[..8]));
+        self.atomic_sliding_window_check(
+            &bucket,
+            self.cfg.wallet_backup_mutation_per_key_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+        .await
+    }
+
+    pub async fn check_wallet_backup_distinct_keys_per_ip(
+        &self,
+        ip: IpAddr,
+        npub_hex: &str,
+    ) -> Result<(), AppError> {
+        let bucket = format!("wallet_backup:distinct:{}", source_key(ip));
+        let digest = Sha256::digest(npub_hex.as_bytes());
+        let pseudonym = hex::encode(&digest[..16]);
+        self.distinct_nyms_check(
+            &bucket,
+            &pseudonym,
+            self.cfg.wallet_backup_distinct_keys_per_source_per_day,
+            86_400,
+            AppError::RateLimitedNetwork,
+        )
+        .await
     }
 
     /// Dedicated public-pricing source gate. Keeping this bucket separate

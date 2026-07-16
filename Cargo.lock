@@ -2807,6 +2807,7 @@ dependencies = [
  "askama_axum",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bitcoin",
  "boltz-client",
  "chacha20poly1305",
