@@ -17,6 +17,7 @@ Review these policy groups before deployment:
 - Bitcoin and Liquid direct-payment finality thresholds and upstream APIs;
 - accounting tolerances and checkout expiry/grace periods;
 - rate limits, trusted proxies, IP whitelist, and certification scopes;
+- wallet-backup fetch/mutation/distinct-key limits and global stored-byte ceiling;
 - feature gates, especially merchant chain-swap recovery;
 - PWA asset paths and public base URL.
 
@@ -54,6 +55,16 @@ temporary runtime override.
 Do not enable broad IP or certification bypasses for ordinary internet traffic.
 After every configuration change, call `/ready` and exercise a non-monetary
 preflight before allowing payment traffic.
+
+Opaque wallet backups have independent controls under `[rate_limit]`:
+`wallet_backup_fetch_per_source_per_hour` (default `120`),
+`wallet_backup_mutation_per_source_per_hour` (`30`),
+`wallet_backup_mutation_per_key_per_hour` (`20`),
+`wallet_backup_distinct_keys_per_source_per_day` (`10`), and
+`wallet_backup_global_stored_bytes` (`10737418240`, 10 GiB). Zero disables the
+corresponding gate. Increasing the global ceiling changes operational capacity,
+not the fixed 2 MiB per-object mobile contract. Database backups protect this
+convenience data operationally; Bullnym does not expose object history.
 
 Direct Bitcoin and Liquid accounting begins at exactly one confirmation. The
 `bitcoin_watcher.confirmations_required` setting (default `3`) and
