@@ -106,6 +106,13 @@ fn exact_decoded_limit_is_two_mebibytes() {
 }
 
 #[test]
+fn tombstones_outlive_the_full_signed_request_replay_horizon() {
+    let replay_horizon_secs = auth::LA_AUTH_TS_WINDOW_SECS * 2;
+    let retention_secs = u64::try_from(TOMBSTONE_RETENTION_SECS).unwrap();
+    assert!(retention_secs >= replay_horizon_secs + auth::LA_AUTH_TS_WINDOW_SECS);
+}
+
+#[test]
 fn router_combines_store_and_delete_methods() {
     let _router = router();
 }

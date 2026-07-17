@@ -27,7 +27,10 @@ pub const BACKUP_ETAG_DOMAIN: &[u8] = b"bullbitcoin-wallet-backup-etag-v1";
 pub const MAX_CIPHERTEXT_BYTES: usize = 2 * 1024 * 1024;
 pub const STORE_BODY_LIMIT_BYTES: usize = 3 * 1024 * 1024;
 const SMALL_BODY_LIMIT_BYTES: usize = 8 * 1024;
-pub const TOMBSTONE_RETENTION_SECS: i32 = 600;
+// A captured request can be signed five minutes in the future and remain
+// acceptable for another five minutes. Keep a further five-minute margin for
+// whole-second timestamp truncation and small app/database clock skew.
+pub const TOMBSTONE_RETENTION_SECS: i32 = 15 * 60;
 
 const FETCH_ACTION: &str = "backup-fetch";
 const STORE_ACTION: &str = "backup-store";

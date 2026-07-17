@@ -129,9 +129,10 @@ resulting `etag`.
 ```
 
 Delete cannot remove a newer write. It erases ciphertext and writes a
-ten-minute tombstone head. Repeating the exact delete succeeds. The tombstone
-outlives the authentication window so a captured initial-store request cannot
-recreate a deleted object after its head disappears.
+fifteen-minute tombstone head. Repeating the exact delete succeeds. The
+tombstone exceeds the complete future-dated authentication replay horizon, with
+an additional clock/granularity margin, so a captured initial-store request
+cannot recreate a deleted object after its head disappears.
 
 ## Errors and Privacy
 

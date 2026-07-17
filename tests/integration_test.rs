@@ -34489,11 +34489,12 @@ async fn wallet_backup_persistence_serializes_first_writers_and_rejects_stale_de
 
     sqlx::query(
         "UPDATE wallet_backup_blobs \
-         SET deleted_at = now() - INTERVAL '601 seconds' \
+         SET deleted_at = now() - make_interval(secs => $3) \
          WHERE stream = $1 AND author_pubkey = $2",
     )
     .bind(stream_name)
     .bind(author)
+    .bind(pay_service::wallet_backup::TOMBSTONE_RETENTION_SECS + 1)
     .execute(&pool)
     .await
     .unwrap();
