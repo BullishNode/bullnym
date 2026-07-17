@@ -52,6 +52,14 @@ Rollback the binary only when its migrations and signed API behavior remain
 compatible. Never roll back the database blindly. A rollback does not undo an
 on-chain transaction; reconcile in-flight swaps before and after the change.
 
+Migration 064 advances the exact runtime schema marker even though its new
+wallet-backup table is additive. A schema-063 binary therefore cannot become
+ready against a schema-064 database. Automatic binary/PWA rollback across this
+boundary is refused. To return to the pre-064 release, stop every writer and
+restore the validated schema-063 database backup together with its matching
+binary, PWA, and release record. Otherwise repair or roll forward with a
+schema-064-aware binary.
+
 Migration 047 has an explicit binary boundary. A same-schema rollback remains
 allowed. An initial rollback from a 047 binary to a 046 binary is also allowed
 while `invoice_direct_payment_transitions` is absent or empty. Once any direct
@@ -129,6 +137,34 @@ of obsolete surface fields. Before applying later migrations, a 059 binary's
 After 059, automatic binary rollback is forbidden. Repair or roll forward with
 a compatible binary, or restore the full validated pre-reset database and its
 matching pre-059 binary while every writer remains stopped.
+
+## Migration 064 opaque wallet backups
+
+Apply `064_wallet_backup_blobs.sql` as the privileged schema owner with
+`--set runtime_role=bullnym_app`. The migration creates only the opaque
+current-object table, its tombstone cleanup index, constraints, comments, and
+runtime CRUD grants. It does not transform existing payment or identity rows.
+
+Treat the schema marker as a stopped-writer deployment boundary:
+
+1. Stop every Bullnym writer and confirm the runtime role has no surviving
+   database session.
+2. Take a schema-063 PostgreSQL backup and prove it is readable with
+   `pg_restore --list` or an isolated restore. Preserve the matching binary,
+   PWA, release record, and configuration with it.
+3. Apply migration 064 as the distinct privileged owner. Never apply it as
+   `bullnym_app`.
+4. Start only the reviewed schema-064 binary and require `/ready`, `/version`,
+   the installed artifact digest, and the release record to agree before
+   enabling mobile backup traffic.
+5. Verify the runtime role has only `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
+   on `wallet_backup_blobs`; it must not own the table or hold `TRUNCATE`,
+   `REFERENCES`, `TRIGGER`, or PUBLIC-derived privileges.
+
+Rollback is a paired restore, not a table drop: stop the schema-064 writer,
+restore the validated schema-063 database, then restore its matching old
+binary/PWA/release record. Do not start the old binary against schema 064 and
+do not delete the backup table merely to force the old readiness marker.
 
 ## Migration 060 private LNURL comments
 

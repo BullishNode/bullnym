@@ -67,6 +67,22 @@ expect_refused \
   054_fee_policy_authority \
   056_future_settlement_schema \
   0
+expect_allowed \
+  064_wallet_backup_blobs \
+  064_wallet_backup_blobs \
+  0
+expect_allowed \
+  064_wallet_backup_blobs \
+  065_future_wallet_backup_aware_schema \
+  0
+expect_refused \
+  063_checkout_private_memo \
+  064_wallet_backup_blobs \
+  0
+expect_refused \
+  063_checkout_private_memo \
+  065_future_wallet_backup_aware_schema \
+  0
 expect_refused \
   malformed-previous-marker \
   050_swap_key_lineage \
