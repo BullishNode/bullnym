@@ -160,6 +160,12 @@ Treat the schema marker as a stopped-writer deployment boundary:
 5. Verify the runtime role has only `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
    on `wallet_backup_blobs`; it must not own the table or hold `TRUNCATE`,
    `REFERENCES`, `TRIGGER`, or PUBLIC-derived privileges.
+6. Apply the exact wallet-backup locations from `nginx.conf.example`, inspect
+   the effective configuration with `nginx -T`, run `nginx -t`, and reload.
+   Verify that the store route has a 3 MiB proxy ceiling, the fetch route has
+   an 8 KiB ceiling, and access logging is disabled for both. Exercise an
+   authenticated 2 MiB store through the public proxy before launch; a direct
+   loopback test does not prove the proxy contract.
 
 Rollback is a paired restore, not a table drop: stop the schema-064 writer,
 restore the validated schema-063 database, then restore its matching old
