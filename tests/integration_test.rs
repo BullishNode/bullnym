@@ -34050,9 +34050,36 @@ async fn wallet_backup_http_round_trip_enforces_cas_retry_delete_and_size_limit(
         "signature": sign_with_keypair(&keypair, &store_message),
     });
 
+    let mut unauthenticated_invalid_ciphertext = store_body.clone();
+    unauthenticated_invalid_ciphertext["ciphertext"] = Value::String("not-base64".to_string());
+    unauthenticated_invalid_ciphertext["signature"] = Value::String("00".repeat(64));
+    let (unauthenticated_status, unauthenticated_response) = put_json(
+        &app,
+        "/api/v1/wallet-backups",
+        unauthenticated_invalid_ciphertext,
+    )
+    .await;
+    assert_eq!(
+        unauthenticated_status,
+        StatusCode::UNAUTHORIZED,
+        "{unauthenticated_response}"
+    );
+    assert_eq!(unauthenticated_response["code"], "BackupAuthError");
+
+    let bad_hash = "00".repeat(32);
+    let bad_hash_message = build_signing_message(
+        "backup-store",
+        stream,
+        &npub,
+        1,
+        None,
+        Some(&bad_hash),
+        ciphertext.len() as u64,
+        timestamp,
+    );
     let mut bad_hash_body = store_body.clone();
-    bad_hash_body["ciphertext_sha256"] = Value::String("00".repeat(32));
-    bad_hash_body["signature"] = Value::String("00".repeat(64));
+    bad_hash_body["ciphertext_sha256"] = Value::String(bad_hash);
+    bad_hash_body["signature"] = Value::String(sign_with_keypair(&keypair, &bad_hash_message));
     let (bad_hash_status, bad_hash_response) =
         put_json(&app, "/api/v1/wallet-backups", bad_hash_body).await;
     assert_eq!(

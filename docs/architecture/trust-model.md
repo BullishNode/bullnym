@@ -20,6 +20,12 @@ and submit transactions to the intended destination.
 | Bullnym | Database, swap-specific keys, worker policy, provider/API credentials | Durable coordination and transaction execution |
 | Swap provider | Its side of Boltz swaps and cooperative signing | Swap execution and provider state |
 
+Wallet-backup clients additionally rely on Bullnym only for best-effort opaque
+blob availability. Separate seed-derived signing and encryption keys identify
+each backup stream. Bullnym observes the source IP, pseudonymous stream key,
+timing, and ciphertext size, but it does not receive the seed, encryption key,
+or plaintext metadata.
+
 Compromise of the swap provider is outside Bullnym's chosen threat model. Its
 responses are nevertheless not sufficient proof of chain state; operators and
 workers should correlate them with independent chain evidence.
@@ -29,6 +35,8 @@ workers should correlate them with independent chain evidence.
 - the merchant's offline wallet balance;
 - funds already delivered to merchant-controlled Bitcoin or Liquid outputs;
 - payer funds that were never sent to an instruction issued by Bullnym.
+- correctly client-encrypted wallet-backup plaintext or the wallet seed from
+  which its independent encryption key is derived.
 
 ## What a malicious or compromised Bullnym could do
 
@@ -39,6 +47,8 @@ workers should correlate them with independent chain evidence.
 - suppress, delay, or mishandle claims and refunds;
 - misuse swap-specific private keys or destroy recovery artifacts;
 - allocate addresses incorrectly, causing reuse or missed wallet discovery.
+- delete, withhold, replay, or selectively make opaque wallet-backup objects
+  unavailable, and correlate stream keys with source/timing/size observations.
 
 For direct payments, the payer's wallet displays the destination but cannot
 know whether it belongs to the merchant. For swap payments, the payer sees a
@@ -63,6 +73,9 @@ model.
   payloads. Public invoice URLs remain bearer-readable by design.
 - Operators preserve artifacts and reconcile database, provider, and chain
   evidence before changing state.
+- Opaque backup writes use signed, stream-separated compare-and-swap heads;
+  short tombstones outlive the signed-request replay window, and responses are
+  marked private/no-store. Clients authenticate and decrypt before applying.
 
 ## Residual risks
 
@@ -81,3 +94,9 @@ No design can promise zero loss under simultaneous server compromise,
 destruction of all durable state, invalid merchant configuration, or failures
 outside the defined threat model. Backups, key protection, monitoring, and
 tested recovery procedures remain part of the security boundary.
+
+Opaque wallet backups are a convenience service, not a fund-recovery
+guarantee. A malicious or unavailable Bullnym can deny or roll back whatever
+blob it serves, so clients must enforce authenticated generations, protective
+conflict/version behavior, and non-blocking seed recovery. Confidentiality also
+depends on correct client-side key separation and authenticated encryption.

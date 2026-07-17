@@ -58,3 +58,13 @@ released, reassigned, or claimed by another `npub`. Lightning Address online/
 offline availability is a separate property and never changes that ownership.
 The server also blocks names that would shadow explicit routes such as
 `/health`, `/api`, or `/register`.
+
+## Wallet backup identities
+
+Opaque wallet backups do not reuse the account-owner `npub` contract above.
+Each closed backup stream uses a separate seed-derived BIP-340 signing key and
+an independent client-side encryption key. Requests use the dedicated
+`bullbitcoin-wallet-backup-v1` signing domain, bind the action, stream, key,
+generation, expected head, ciphertext commitment, size, and timestamp, and do
+not establish nym ownership or authorize another product surface. See
+[Opaque Wallet Backups](../api/wallet-backups.md) for the byte-exact contract.

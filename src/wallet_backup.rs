@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, post, put};
 use axum::{Json, Router};
@@ -214,15 +214,17 @@ impl IntoResponse for WalletBackupError {
             status = status.as_u16(),
             "wallet backup request rejected"
         );
-        (
-            status,
-            Json(json!({
-                "status": "ERROR",
-                "code": code,
-                "reason": reason,
-            })),
+        private_no_store(
+            (
+                status,
+                Json(json!({
+                    "status": "ERROR",
+                    "code": code,
+                    "reason": reason,
+                })),
+            )
+                .into_response(),
         )
-            .into_response()
     }
 }
 
@@ -452,12 +454,23 @@ fn record_success(
     );
 }
 
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
 pub async fn fetch(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     request: Request,
-) -> Result<Json<FetchResponse>, WalletBackupError> {
+) -> Result<Response, WalletBackupError> {
     let started = Instant::now();
     let _ = source_gate(
         &state,
@@ -525,8 +538,22 @@ pub async fn fetch(
             updated_at: Some(head.updated_at_unix),
         },
     };
-    record_success(FETCH_ACTION, request.stream, started, 0, "fetched");
-    Ok(Json(response))
+    let ciphertext_bytes = response.ciphertext_bytes.unwrap_or(0) as usize;
+    let outcome = if response.found {
+        "live"
+    } else if response.generation > 0 {
+        "tombstone"
+    } else {
+        "absent"
+    };
+    record_success(
+        FETCH_ACTION,
+        request.stream,
+        started,
+        ciphertext_bytes,
+        outcome,
+    );
+    Ok(private_no_store(Json(response).into_response()))
 }
 
 pub async fn store(
@@ -534,7 +561,7 @@ pub async fn store(
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     request: Request,
-) -> Result<Json<MutationResponse>, WalletBackupError> {
+) -> Result<Response, WalletBackupError> {
     let started = Instant::now();
     let (source, whitelisted) = source_gate(
         &state,
@@ -559,6 +586,20 @@ pub async fn store(
         &request.ciphertext_sha256,
         "Wallet backup ciphertext hash is invalid.",
     )?;
+    if request.ciphertext_bytes > MAX_CIPHERTEXT_BYTES as u64 {
+        return Err(WalletBackupError::BlobTooLarge);
+    }
+    verify_request_signature(
+        STORE_ACTION,
+        request.stream,
+        &request.npub,
+        request.generation,
+        request.expected_etag.as_deref(),
+        Some(&request.ciphertext_sha256),
+        request.ciphertext_bytes,
+        request.timestamp,
+        &request.signature,
+    )?;
     let ciphertext = BASE64_STANDARD.decode(&request.ciphertext).map_err(|_| {
         WalletBackupError::InvalidRequest("Wallet backup ciphertext is not base64.")
     })?;
@@ -580,17 +621,6 @@ pub async fn store(
             "Wallet backup ciphertext hash does not match.",
         ));
     }
-    verify_request_signature(
-        STORE_ACTION,
-        request.stream,
-        &request.npub,
-        request.generation,
-        request.expected_etag.as_deref(),
-        Some(&request.ciphertext_sha256),
-        request.ciphertext_bytes,
-        request.timestamp,
-        &request.signature,
-    )?;
     if !whitelisted {
         state
             .rate_limiter
@@ -637,11 +667,14 @@ pub async fn store(
         ciphertext.len(),
         outcome_label,
     );
-    Ok(Json(MutationResponse {
-        version: BACKUP_PROTOCOL_VERSION,
-        generation: request.generation,
-        etag: hex::encode(etag),
-    }))
+    Ok(private_no_store(
+        Json(MutationResponse {
+            version: BACKUP_PROTOCOL_VERSION,
+            generation: request.generation,
+            etag: hex::encode(etag),
+        })
+        .into_response(),
+    ))
 }
 
 pub async fn delete_backup(
@@ -649,7 +682,7 @@ pub async fn delete_backup(
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     request: Request,
-) -> Result<Json<MutationResponse>, WalletBackupError> {
+) -> Result<Response, WalletBackupError> {
     let started = Instant::now();
     let (source, whitelisted) = source_gate(
         &state,
@@ -710,11 +743,14 @@ pub async fn delete_backup(
         }
     };
     record_success(DELETE_ACTION, request.stream, started, 0, outcome_label);
-    Ok(Json(MutationResponse {
-        version: BACKUP_PROTOCOL_VERSION,
-        generation: request.generation,
-        etag: hex::encode(tombstone_etag),
-    }))
+    Ok(private_no_store(
+        Json(MutationResponse {
+            version: BACKUP_PROTOCOL_VERSION,
+            generation: request.generation,
+            etag: hex::encode(tombstone_etag),
+        })
+        .into_response(),
+    ))
 }
 
 #[cfg(test)]

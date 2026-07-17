@@ -111,6 +111,23 @@ fn router_combines_store_and_delete_methods() {
 }
 
 #[test]
+fn success_and_error_responses_disable_caching() {
+    let success = private_no_store(Json(json!({"status": "ok"})).into_response());
+    assert_eq!(
+        success.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(success.headers().get(header::PRAGMA).unwrap(), "no-cache");
+
+    let error = WalletBackupError::Authentication.into_response();
+    assert_eq!(
+        error.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store, max-age=0"
+    );
+    assert_eq!(error.headers().get(header::PRAGMA).unwrap(), "no-cache");
+}
+
+#[test]
 fn shared_contract_fixture_matches_rust_codec_and_bip340() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../tests/fixtures/wallet-backup-v1.json")).unwrap();

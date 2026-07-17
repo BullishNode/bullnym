@@ -139,8 +139,8 @@ Backup errors always use the Bullnym JSON envelope and meaningful HTTP status:
 
 | HTTP | Code | Meaning |
 |---:|---|---|
-| `400` | `BackupInvalidRequest` | Shape, version, encoding, hash, or declared size is invalid. |
-| `401` | `BackupAuthError` | Key, timestamp, or signature did not authenticate. |
+| `400` | `BackupInvalidRequest` | Shape, version, canonical key/signature encoding, ciphertext encoding, hash, or declared size is invalid. |
+| `401` | `BackupAuthError` | A well-formed key/signature did not authenticate, or the timestamp is outside the allowed window. |
 | `409` | `BackupHeadConflict` | Generation or expected ETag is stale. |
 | `413` | `BackupBlobTooLarge` | Body or decoded ciphertext exceeds its limit. |
 | `429` | `RateLimited` | A source, key, or distinct-key gate rejected the attempt. |
@@ -151,3 +151,7 @@ observes source IP, stream, pseudonymous signing key, timing, and ciphertext
 size. It does not log request bodies, ciphertext, signatures, public keys, or
 ETags. Aggregate structured events include only action, stream, status,
 latency, size bucket, and outcome.
+
+All success and error responses set `Cache-Control: private, no-store,
+max-age=0` and `Pragma: no-cache` so authenticated backup payloads and heads
+are not retained by ordinary browser or intermediary caches.
