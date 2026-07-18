@@ -344,6 +344,21 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
 }
 
 #[test]
+fn template_qr_loading_failure_does_not_block_the_payment_state_machine() {
+    let html = payment_template_fixture("unpaid", "unpaid", "none", true)
+        .render()
+        .expect("template renders");
+
+    assert!(html.contains("const paymentQrRenderer = import('/pwa-assets/invoice-qr.js')"));
+    assert!(html.contains(".catch(() => null);"));
+    assert!(html.contains("const renderQr = await paymentQrRenderer;"));
+    assert!(html.contains("if (!renderQr) throw new Error('payment QR renderer unavailable');"));
+    assert!(!html.contains("import { paymentQrDataUrl } from"));
+    assert!(html.contains("fetchLightning();"));
+    assert!(html.contains("copyBtn.addEventListener('click'"));
+}
+
+#[test]
 fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
     let tpl = InvoicePaymentTpl {
         nym: "alice",

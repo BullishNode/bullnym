@@ -334,7 +334,14 @@
     </main>
 
     <script type="module">
-        import { paymentQrDataUrl } from '/pwa-assets/invoice-qr.js';
+        // Loading the QR renderer is best-effort. Payment details, copy actions,
+        // status polling, and rail selection must still work if this asset or
+        // one of its chunks is temporarily unavailable.
+        const paymentQrRenderer = import('/pwa-assets/invoice-qr.js')
+            .then((module) => typeof module.paymentQrDataUrl === 'function'
+                ? module.paymentQrDataUrl
+                : null)
+            .catch(() => null);
 
         // Single state machine driven by polling /api/v1/invoices/<id>/status
         // every 3s. The page re-renders on status changes, fetches the
@@ -552,7 +559,9 @@
                 payloadText.textContent = text;
                 qrWrap.innerHTML = '<div class="qr-placeholder">Rendering QR…</div>';
                 try {
-                    const dataUrl = await paymentQrDataUrl(text);
+                    const renderQr = await paymentQrRenderer;
+                    if (!renderQr) throw new Error('payment QR renderer unavailable');
+                    const dataUrl = await renderQr(text);
                     if (renderSequence !== qrRenderSequence) return;
                     const img = document.createElement('img');
                     img.src = dataUrl;
