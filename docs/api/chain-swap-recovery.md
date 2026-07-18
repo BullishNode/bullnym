@@ -152,8 +152,12 @@ invoice can carry more than one), `refund_due` first, oldest first:
 ```
 
 - `recovery_status` is `refund_due` (automatic recovery is pending),
-  `refunding` (an automatic attempt is in flight), or `refunded` (terminal;
-  `refund_txid` set). Treat unknown values as in-flight and take no action.
+  `refunding` (an automatic attempt is in flight), `refunded` (legacy
+  broadcast/refund compatibility state), `confirmed`, or `finalized`. The
+  server projects `confirmed`/`finalized` only after the parent recovery row is
+  `refunded` and the btc_recovery journal has stored that chain evidence; it
+  does not claim more finality than that evidence. Treat unknown values as
+  in-flight and take no action.
 - This endpoint is read-only. Clients must never infer a writable recovery
   action, submit a destination, or trigger a broadcast from these fields.
 - `refund_address`/`refund_txid` expose the immutable automatic destination and

@@ -23988,6 +23988,48 @@ async fn set_test_refund_destination(pool: &PgPool, id: Uuid, address: &str) {
     );
 }
 
+async fn insert_test_bitcoin_recovery_attempt(
+    pool: &PgPool,
+    chain_swap_id: Uuid,
+    txid: &str,
+    destination_address: &str,
+) {
+    sqlx::query(
+        "INSERT INTO chain_swap_tx_attempts (\
+             chain_swap_id, purpose, raw_tx_hex, txid, source_prevouts, \
+             destination_address, destination_script_hex, destination_vout, \
+             destination_amount_sat, fee_amount_sat, fee_rate_sat_vb, \
+             fee_decision_purpose, fee_decision_rail, fee_decision_target, \
+             fee_decision_source, fee_decision_rate_sat_vb, \
+             fee_decision_quoted_at_unix, fee_decision_evaluated_at_unix, \
+             fee_decision_freshness_age_secs, fee_decision_freshness_max_age_secs, \
+             fee_decision_provenance, fee_decision_policy_floor_sat_vb, \
+             fee_decision_policy_cap_sat_vb, fee_decision_policy_version\
+         ) VALUES (\
+             $1, 'btc_recovery', '020000000001', $2, $3, \
+             $4, '0014abcd', 0, \
+             900, 100, 1.5, \
+             'bitcoin_recovery', 'bitcoin', 'fastestFee', \
+             'bitcoin_live', 1.5, \
+             1700000100, 1700000105, \
+             5, 60, 'integration-test-bitcoin-live', \
+             1.0, 500.0, 'review25-v1'\
+         )",
+    )
+    .bind(chain_swap_id)
+    .bind(txid)
+    .bind(json!([{
+        "txid": "11".repeat(32),
+        "vout": 0,
+        "amount_sat": 1_000,
+        "script_pubkey_hex": "0014abcd"
+    }]))
+    .bind(destination_address)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 fn bitcoin_fee_decision(rate: f64) -> pay_service::fee_policy::BitcoinFeeDecision {
     bitcoin_fee_decision_with_cap(rate, 500.0)
 }
@@ -27126,7 +27168,9 @@ async fn recoverable_list_returns_committed_address_and_txid() {
     assert_eq!(body["items"][0]["refund_address"], committed);
     assert!(body["items"][0]["refund_txid"].is_null());
 
-    // refunded: terminal, txid present (the reinstall reconciliation payload).
+    // refunded: legacy terminal parent state, txid present (the reinstall
+    // reconciliation payload). With no btc_recovery journal attempt yet, the
+    // signed projection must preserve the legacy wire value.
     pay_service::db::mark_chain_swap_refunded(&pool, swap.id, &txid)
         .await
         .unwrap();
@@ -27139,6 +27183,61 @@ async fn recoverable_list_returns_committed_address_and_txid() {
     assert_eq!(body["items"][0]["recovery_status"], "refunded");
     assert_eq!(body["items"][0]["refund_address"], committed);
     assert_eq!(body["items"][0]["refund_txid"], txid);
+
+    insert_test_bitcoin_recovery_attempt(&pool, swap.id, &txid, committed).await;
+
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts \
+            SET status = 'confirmed', confirmed_at = NOW(), updated_at = NOW() \
+          WHERE chain_swap_id = $1 AND purpose = 'btc_recovery'",
+    )
+    .bind(swap.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "confirmed");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert_eq!(body["items"][0]["refund_txid"], txid);
+
+    sqlx::query(
+        "UPDATE chain_swap_tx_attempts \
+            SET status = 'finalized', finalized_at = NOW(), updated_at = NOW() \
+          WHERE chain_swap_id = $1 AND purpose = 'btc_recovery'",
+    )
+    .bind(swap.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "finalized");
+    assert_eq!(body["items"][0]["refund_address"], committed);
+    assert_eq!(body["items"][0]["refund_txid"], txid);
+
+    // If an inconsistent row somehow has terminal journal evidence before the
+    // parent reaches `refunded`, the public projection stays conservative.
+    sqlx::query("UPDATE chain_swap_records SET status = 'refunding' WHERE id = $1")
+        .bind(swap.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (sig, ts) = sign_invoice_recovery_list_with_keypair(&keypair, &npub);
+    let (_, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/recoverable?npub={npub}&timestamp={ts}&signature={sig}"),
+    )
+    .await;
+    assert_eq!(body["items"][0]["recovery_status"], "refunding");
 
     cleanup_db(&pool).await;
 }
