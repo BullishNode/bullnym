@@ -52,6 +52,7 @@ response, including HTTP 2xx responses.
 | `409` | A supplied Bitcoin/Liquid address is already assigned, a public name is permanently reserved, or this npub already owns another permanent nym/alias. Blind retry is wrong. |
 | `410` | Deprecated Liquid-offer endpoint. |
 | `413` | Axum request-body limit exceeded before the handler. |
+| `429` | Wallet-backup source or authenticated-key rate limit. |
 | `404`, `405` | Route not found or method not allowed; may be HTML/plain text rather than JSON. |
 | `415` | Missing or unsupported JSON `Content-Type`; framework response, not a Bullnym envelope. |
 | `422` | JSON syntax was valid but could not deserialize into the request type; framework response. |
@@ -74,6 +75,12 @@ Stable error `code` values include `NymNotFound`, `NymTaken`, `NymInvalid`,
 `ServiceUnavailable`, `PurgeBlocked`, `RecoveryAddressInvalid`,
 `RecoveryNotAvailable`, `ElectrumError`, `BoltzError`,
 `ClaimError`, and `InternalError`.
+
+The wallet-backup API deliberately uses strict HTTP statuses rather than the
+LNURL-compatible HTTP-200 error behavior. Its additional stable codes are
+`BackupInvalidRequest`, `BackupAuthError`, `BackupHeadConflict`,
+`BackupBlobTooLarge`, and `BackupCapacityExceeded`; see
+[Opaque wallet backups](wallet-backups.md).
 
 `details` is optional. Currently useful shapes include:
 

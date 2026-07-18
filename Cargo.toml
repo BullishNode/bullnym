@@ -31,6 +31,7 @@ zeroize = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 hex = "0.4"
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }

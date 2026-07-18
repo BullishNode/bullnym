@@ -1,4 +1,4 @@
-//! Background GC for the rate-limit tables.
+//! Background cleanup for rate-limit events and worker-owned payment state.
 //!
 //! `rate_limit_events` and `nym_access_events` accumulate one row per
 //! request/cache-miss and never self-clean. Without GC the windowed
@@ -6,13 +6,12 @@
 //! rows that are no longer in any active window.
 //!
 //! Strategy: every `tick_secs`, prune rows older than `retention_secs`.
-//! `retention_secs` is set to 2× the longest configured rate-limit window
-//! (so the limiter can never observe a "missing" row that should still
-//! count). With windows in the 60s..3600s range, 24h retention is plenty.
+//! `retention_secs` is set to 2x the longest configured rate-limit window
+//! so the limiter cannot lose an event that should still count.
 //!
-//! Pruning runs as a background `tokio::spawn` from `main.rs`, cancelled
-//! by the same `CancellationToken` as the chain watcher. Errors are
-//! logged and ignored — a transient DB hiccup shouldn't kill the GC loop.
+//! Rate-limit pruning runs in every HTTP process. Payment-state cleanup runs
+//! only with workers enabled. Both loops share the process cancellation token;
+//! transient database failures are logged without terminating either loop.
 
 use std::time::Duration;
 
@@ -42,8 +41,8 @@ pub struct GcConfig {
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            tick_secs: 600,         // 10 min
-            retention_secs: 86_400, // 24 h — well past the longest 1h window
+            tick_secs: 600,          // 10 min
+            retention_secs: 172_800, // 48 h, twice the backup distinct-key window
             checkout_partial_terminal_grace_secs: 900,
             payment_grace_secs: 3_600,        // 1 h
             outpoint_pending_ttl_secs: 3_600, // 1 h
@@ -59,12 +58,10 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::info!("rate-limit GC: shutdown requested");
+                tracing::info!("operational GC: shutdown requested");
                 return;
             }
             _ = tick.tick() => {
-                let removed_rl = prune_rate_limit_events(&pool, cfg.retention_secs).await;
-                let removed_na = prune_nym_access_events(&pool, cfg.retention_secs).await;
                 let removed_oa =
                     prune_outpoint_addresses(&pool, cfg.outpoint_pending_ttl_secs).await;
                 let removed_iv =
@@ -75,13 +72,39 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
                         cfg.checkout_partial_terminal_grace_secs,
                     ).await;
                 tracing::info!(
-                    "rate-limit GC: pruned rate_limit_events={} nym_access_events={} \
-                     outpoint_addresses_pending={} invoices_expired={} checkout_partials_underpaid={}",
-                    removed_rl,
-                    removed_na,
+                    "operational GC: pruned outpoint_addresses_pending={} \
+                     invoices_expired={} checkout_partials_underpaid={}",
                     removed_oa,
                     removed_iv,
                     terminalized_partials,
+                );
+            }
+        }
+    }
+}
+
+pub async fn run_rate_limit_gc(
+    pool: PgPool,
+    cancel: CancellationToken,
+    tick_secs: u64,
+    retention_secs: u64,
+) {
+    let mut tick = interval(Duration::from_secs(tick_secs));
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("rate-limit GC: shutdown requested");
+                return;
+            }
+            _ = tick.tick() => {
+                let removed_rate_limits = prune_rate_limit_events(&pool, retention_secs).await;
+                let removed_distinct = prune_nym_access_events(&pool, retention_secs).await;
+                tracing::info!(
+                    "rate-limit GC: pruned rate_limit_events={} nym_access_events={}",
+                    removed_rate_limits,
+                    removed_distinct,
                 );
             }
         }
@@ -131,7 +154,7 @@ async fn expire_invoices_past_deadline(pool: &PgPool, payment_grace_secs: u64) -
     match db::expire_invoices_past_deadline(pool, payment_grace_secs).await {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!("rate-limit GC: expire_invoices_past_deadline failed: {e}");
+            tracing::warn!("operational GC: expire_invoices_past_deadline failed: {e}");
             0
         }
     }
@@ -141,7 +164,7 @@ async fn terminalize_stale_checkout_partial_invoices(pool: &PgPool, grace_secs: 
     match db::terminalize_stale_checkout_partial_invoices(pool, grace_secs).await {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!("rate-limit GC: terminalize stale checkout partials failed: {e}");
+            tracing::warn!("operational GC: terminalize stale checkout partials failed: {e}");
             0
         }
     }
@@ -163,7 +186,7 @@ async fn prune_outpoint_addresses(pool: &PgPool, ttl_secs: u64) -> u64 {
     {
         Ok(r) => r.rows_affected(),
         Err(e) => {
-            tracing::warn!("rate-limit GC: outpoint_addresses prune failed: {e}");
+            tracing::warn!("operational GC: outpoint_addresses prune failed: {e}");
             0
         }
     }

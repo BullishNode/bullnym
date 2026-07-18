@@ -62,6 +62,15 @@ global_electrum_rate_per_sec = 200
 invoice_status_per_source_per_min = 1000
 trust_forwarded_for = false
 
+# Opaque encrypted wallet-backup service. Limits are deliberately independent
+# from payment and registration traffic. The global ceiling counts only live
+# decoded ciphertext; fetch and conditional delete remain available when full.
+wallet_backup_fetch_per_source_per_hour       = 120
+wallet_backup_mutation_per_source_per_hour    = 30
+wallet_backup_mutation_per_key_per_hour       = 20
+wallet_backup_distinct_keys_per_source_per_day = 10
+wallet_backup_global_stored_bytes             = 10737418240
+
 # --- Registration gates ---
 # These close R8 (registration flood). Aggressive on purpose; legitimate users
 # register once per identity so 5/min/IP is generous. Per-IP-distinct-npubs

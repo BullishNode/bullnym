@@ -15,6 +15,7 @@ external calls, webhooks, and signed write paths.
 | Checkout creation | Protect surface descriptor cursor allocation and eager offer creation. |
 | Invoice create/list/status | Protect signed dashboard and public polling surfaces. |
 | Webhook | Bound webhook-bombing from a single source. |
+| Opaque wallet backups | Bound fetches and mutations per source, mutations per authenticated stream key, distinct keys per source, object size, and global live ciphertext. |
 
 ## LUD-22 Descriptor Protection
 
@@ -35,6 +36,13 @@ does not allocate an address, but `POST /:nym/invoice` currently allocates the
 checkout settlement address immediately. Protecting that cursor depends on the
 anonymous invoice-create rate limit and certification preflight, not on a
 Liquid-specific proof-of-funds request.
+
+Wallet backup source gates run before JSON parsing and body allocation. The
+authenticated per-key and distinct-key gates run only after signature
+verification. Store signatures are verified before ciphertext decoding and
+hashing. The service additionally enforces a 3 MiB request-body ceiling, a
+2 MiB decoded-object ceiling, and a configured global live-byte ceiling;
+fetch and conditional delete remain available at capacity.
 
 ## IP Whitelist
 

@@ -27,7 +27,7 @@ use pay_service::{
     recovery_address_registration, registration, startup_provider_reconciliation,
     swap_manifest_runtime,
     utxo::{self, UtxoBackend},
-    version, AppState,
+    version, wallet_backup, AppState,
 };
 
 #[tokio::main]
@@ -708,6 +708,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // Signed backup gates and other HTTP controls persist cross-process rate
+    // events even in web-only mode, so their retention loop cannot depend on
+    // payment workers being enabled.
+    {
+        let rate_limit_gc_pool = pool.clone();
+        let rate_limit_gc_cancel = cancel.clone();
+        let rate_limit_gc_config = gc::GcConfig::default();
+        let tick_secs = rate_limit_gc_config.tick_secs;
+        let retention_secs = rate_limit_gc_config.retention_secs;
+        tokio::spawn(async move {
+            gc::run_rate_limit_gc(
+                rate_limit_gc_pool,
+                rate_limit_gc_cancel,
+                tick_secs,
+                retention_secs,
+            )
+            .await;
+        });
+        tracing::info!(tick_secs, retention_secs, "rate-limit GC started");
+    }
+    // Tombstones outlive the five-minute signed-request window, then become
+    // disposable. Every HTTP process may run this bounded SKIP LOCKED sweep;
+    // concurrent processes divide work without blocking request transactions.
+    {
+        let cleanup_pool = pool.clone();
+        let cleanup_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cleanup_cancel.cancelled() => return,
+                    _ = tick.tick() => {
+                        match db::cleanup_expired_wallet_backup_tombstones(
+                            &cleanup_pool,
+                            wallet_backup::TOMBSTONE_RETENTION_SECS,
+                            500,
+                        ).await {
+                            Ok(removed) if removed > 0 => tracing::info!(
+                                event = "wallet_backup_tombstones_cleaned",
+                                removed,
+                                "expired wallet backup tombstones removed"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::error!(
+                                event = "wallet_backup_tombstone_cleanup_failed",
+                                error_class = ?error.class(),
+                                "wallet backup tombstone cleanup failed"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
     if config.workers.enabled {
         tracing::info!("background workers enabled");
         if config.features.payment_pages {
@@ -806,8 +861,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tracing::info!("slow recovery started (shares reconciler config)");
 
-        // Periodic GC of rate-limit tables. Without this, sliding-window
-        // queries get progressively slower as inactive rows accumulate.
+        // Payment-state cleanup remains worker-owned because it changes
+        // invoice and reservation lifecycle state.
         {
             let pool = pool.clone();
             let gc_cfg = gc::GcConfig {
@@ -821,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 gc::run(pool, cancel_gc, gc_cfg).await;
             });
-            tracing::info!("rate-limit GC started (prune every 10 min, retention 24h)");
+            tracing::info!("operational payment-state GC started");
         }
 
         if let Some(backend) = state.utxo_backend.clone() {
@@ -1101,8 +1156,13 @@ fn build_router(state: AppState) -> Router {
         router.fallback(not_found)
     };
 
-    router
-        .layer(RequestBodyLimitLayer::new(64 * 1024))
+    let standard_router = router.layer(RequestBodyLimitLayer::new(64 * 1024));
+
+    standard_router
+        // Backup stores need a 3 MiB JSON envelope for a maximum 2 MiB
+        // decoded object. Keeping this as a separately layered router leaves
+        // the established 64 KiB ceiling intact for every other endpoint.
+        .merge(wallet_backup::router())
         // LNURL payer comments arrive in a GET query by protocol. Never put a
         // request URI (and therefore its query string) into tracing spans.
         // Path-only spans retain route diagnostics without copying private

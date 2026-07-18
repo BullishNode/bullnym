@@ -7,6 +7,7 @@ choices exposed by Bullnym and their consequences. The Rust route table, serde
 types, and contract tests remain the implementation authority:
 `src/main.rs`, `src/auth.rs`, `src/registration.rs`, `src/lnurl.rs`,
 `src/lnurl_comment_history.rs`, `src/donation_page.rs`, and `src/invoice.rs`.
+Opaque wallet-backup storage is defined by `src/wallet_backup.rs`.
 
 ## Contents
 
@@ -17,6 +18,7 @@ types, and contract tests remain the implementation authority:
 - [Invoices and payment state](invoices-and-payment-state.md)
 - [Private LNURL payer-comment history](private-lnurl-comments.md)
 - [Chain-swap recovery](chain-swap-recovery.md)
+- [Opaque wallet backups](wallet-backups.md)
 - [Utility and operations APIs](operations.md)
 - [Integration choices and production checklist](integration-guide.md)
 

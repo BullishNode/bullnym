@@ -1174,6 +1174,7 @@ async fn check_schema(pool: &sqlx::PgPool) -> ComponentStatus {
 /// checks cannot drift.
 pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
     if !schema_marker_present(pool).await?
+        || !wallet_backup_storage_invariants_present(pool).await?
         || !checkout_private_memo_contract_present(pool).await?
         || !swap_key_lineage_invariants_present(pool).await?
         || !merchant_settlement_fee_schema_present(pool).await?
@@ -1308,6 +1309,127 @@ pub async fn schema_and_journal_ready(pool: &sqlx::PgPool) -> Result<bool, sqlx:
         && watcher_lane_privileges_ready(watcher_lane_privileges)
         && swap_key_lineage_privileges_ready(swap_key_lineage_privileges)
         && chain_swap_record_privileges_ready(chain_swap_record_privileges))
+}
+
+async fn wallet_backup_storage_invariants_present(
+    pool: &sqlx::PgPool,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT \
+            to_regclass('public.wallet_backup_blobs') IS NOT NULL \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('stream', 'text'::REGTYPE, 1, TRUE, FALSE), \
+                    ('author_pubkey', 'bytea'::REGTYPE, 2, TRUE, FALSE), \
+                    ('generation', 'int8'::REGTYPE, 3, TRUE, FALSE), \
+                    ('etag', 'bytea'::REGTYPE, 4, TRUE, FALSE), \
+                    ('ciphertext', 'bytea'::REGTYPE, 5, FALSE, FALSE), \
+                    ('ciphertext_sha256', 'bytea'::REGTYPE, 6, FALSE, FALSE), \
+                    ('ciphertext_bytes', 'int4'::REGTYPE, 7, FALSE, FALSE), \
+                    ('created_at', 'timestamptz'::REGTYPE, 8, TRUE, TRUE), \
+                    ('updated_at', 'timestamptz'::REGTYPE, 9, TRUE, TRUE), \
+                    ('deleted_at', 'timestamptz'::REGTYPE, 10, FALSE, FALSE) \
+                ) required(column_name, type_oid, ordinal, not_null, has_default) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_attribute attribute_info \
+                     WHERE attribute_info.attrelid = \
+                               to_regclass('public.wallet_backup_blobs') \
+                       AND attribute_info.attname = required.column_name \
+                       AND attribute_info.atttypid = required.type_oid \
+                       AND attribute_info.attnum = required.ordinal \
+                       AND attribute_info.attnotnull = required.not_null \
+                       AND attribute_info.atthasdef = required.has_default \
+                       AND NOT attribute_info.attisdropped \
+                 ) \
+            ) \
+            AND ( \
+                SELECT COUNT(*) FROM pg_attribute attribute_info \
+                 WHERE attribute_info.attrelid = \
+                           to_regclass('public.wallet_backup_blobs') \
+                   AND attribute_info.attnum > 0 \
+                   AND NOT attribute_info.attisdropped \
+            ) = 10 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM (VALUES \
+                    ('wallet_backup_blobs_pkey', 'p'), \
+                    ('wallet_backup_blobs_generation_positive_chk', 'c'), \
+                    ('wallet_backup_blobs_stream_chk', 'c'), \
+                    ('wallet_backup_blobs_author_pubkey_len_chk', 'c'), \
+                    ('wallet_backup_blobs_etag_len_chk', 'c'), \
+                    ('wallet_backup_blobs_live_tombstone_chk', 'c'), \
+                    ('wallet_backup_blobs_payload_columns_chk', 'c'), \
+                    ('wallet_backup_blobs_hash_len_chk', 'c'), \
+                    ('wallet_backup_blobs_size_matches_chk', 'c'), \
+                    ('wallet_backup_blobs_size_limit_chk', 'c') \
+                ) required(constraint_name, constraint_type) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM pg_constraint constraint_info \
+                     WHERE constraint_info.conrelid = \
+                               to_regclass('public.wallet_backup_blobs') \
+                       AND constraint_info.conname = required.constraint_name \
+                       AND constraint_info.contype = required.constraint_type::\"char\" \
+                       AND constraint_info.convalidated \
+                 ) \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'public' \
+                   AND tablename = 'wallet_backup_blobs' \
+                   AND indexname = 'wallet_backup_blobs_tombstone_cleanup_idx' \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 \
+                  FROM pg_class relation \
+                  CROSS JOIN LATERAL aclexplode(COALESCE( \
+                      relation.relacl, acldefault('r', relation.relowner) \
+                  )) acl \
+                 WHERE relation.oid = to_regclass('public.wallet_backup_blobs') \
+                   AND acl.grantee = 0 \
+            ) \
+            AND pg_get_userbyid( \
+                (SELECT relowner FROM pg_class \
+                  WHERE oid = to_regclass('public.wallet_backup_blobs')) \
+            ) <> current_user \
+            AND NOT pg_has_role( \
+                current_user, \
+                pg_get_userbyid( \
+                    (SELECT relowner FROM pg_class \
+                      WHERE oid = to_regclass('public.wallet_backup_blobs')) \
+                ), \
+                'USAGE' \
+            ) \
+            AND NOT pg_has_role( \
+                current_user, \
+                pg_get_userbyid( \
+                    (SELECT relowner FROM pg_class \
+                      WHERE oid = to_regclass('public.wallet_backup_blobs')) \
+                ), \
+                'SET' \
+            ) \
+            AND has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'SELECT' \
+            ) \
+            AND has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'INSERT' \
+            ) \
+            AND has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'UPDATE' \
+            ) \
+            AND has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'DELETE' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'TRUNCATE' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'REFERENCES' \
+            ) \
+            AND NOT has_table_privilege( \
+                current_user, to_regclass('public.wallet_backup_blobs'), 'TRIGGER' \
+            )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn checkout_private_memo_contract_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {

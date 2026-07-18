@@ -4602,7 +4602,7 @@ pub struct RecoverableItem {
     pub invoice_id: Uuid,
     /// Owning nym, included as read-only identity context.
     pub nym: String,
-    /// "refund_due" | "refunding" | "refunded".
+    /// "refund_due" | "refunding" | "refunded" | "confirmed" | "finalized".
     pub recovery_status: String,
     pub user_lock_amount_sat: i64,
     /// Renegotiation-aware (COALESCE(renegotiated, original)).

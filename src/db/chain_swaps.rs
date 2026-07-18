@@ -1547,6 +1547,9 @@ pub struct RecoverableChainSwapRow {
     /// NULL row is legacy fixture data the API path skips). Included as
     /// read-only ownership context.
     pub nym: Option<String>,
+    /// Public recovery lifecycle projection. Parent `refunded` is legacy
+    /// compatibility unless the authoritative btc_recovery journal has stronger
+    /// chain evidence; inconsistent pre-refunded parents stay conservative.
     pub status: String,
     pub user_lock_amount_sat: i64,
     /// COALESCE(renegotiated, original) — the renegotiation-aware value.
@@ -1569,13 +1572,15 @@ pub struct RecoverableChainSwapRow {
 }
 
 /// All chain swaps owned by `npub_owner` currently in a recovery lifecycle
-/// state, oldest-first within status (`refund_due` before `refunding` before
-/// `refunded`). Scoped by `invoices.npub_owner`, so it answers "does this
-/// merchant have stranded funds?" in one query with no pagination — the
+/// state, oldest-first within parent status (`refund_due` before `refunding`
+/// before `refunded`). Scoped by `invoices.npub_owner`, so it answers "does
+/// this merchant have stranded funds?" in one query with no pagination — the
 /// populated size is stuck-swap incidents (expected 0). `limit` is applied as a
 /// hard cap (handler passes `RECOVERABLE_LIST_LIMIT + 1` to detect overflow).
 /// Driven by `chain_swap_records_status_idx` (migration 025) over a globally
-/// rare status set. Selects no key material.
+/// rare status set. The btc_recovery journal join is one-to-one because
+/// `chain_swap_tx_attempts` has `UNIQUE (chain_swap_id, purpose)`. Selects no
+/// key material.
 pub async fn list_recoverable_chain_swaps_for_npub(
     pool: &PgPool,
     npub_owner: &str,
@@ -1584,7 +1589,11 @@ pub async fn list_recoverable_chain_swaps_for_npub(
     sqlx::query_as::<_, RecoverableChainSwapRow>(
         "SELECT cs.invoice_id, \
                 cs.nym, \
-                cs.status, \
+                CASE WHEN cs.status = 'refunded' \
+                       AND attempt.status IN ('confirmed', 'finalized') \
+                     THEN attempt.status \
+                     ELSE cs.status \
+                END AS status, \
                 cs.user_lock_amount_sat, \
                 COALESCE(cs.renegotiated_server_lock_amount_sat, \
                          cs.server_lock_amount_sat) AS effective_server_lock_amount_sat, \
@@ -1604,6 +1613,9 @@ pub async fn list_recoverable_chain_swaps_for_npub(
                 EXTRACT(EPOCH FROM i.created_at)::BIGINT AS invoice_created_at_unix \
          FROM chain_swap_records cs \
          JOIN invoices i ON i.id = cs.invoice_id \
+         LEFT JOIN chain_swap_tx_attempts attempt \
+                ON attempt.chain_swap_id = cs.id \
+               AND attempt.purpose = 'btc_recovery' \
          WHERE i.npub_owner = $1 \
            AND cs.status IN ('refund_due', 'refunding', 'refunded') \
          ORDER BY CASE cs.status \
