@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -23,7 +23,7 @@ use pay_service::{
     admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
     chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
     donation_page, donation_render, fee_runtime, gc, invoice, ip_whitelist, lnurl,
-    lnurl_comment_history, nostr, og_image, pricer, qr, rate_limit, readiness, reconciler,
+    lnurl_comment_history, nostr, og_image, pricer, rate_limit, readiness, reconciler,
     recovery_address_registration, registration, startup_provider_reconciliation,
     swap_manifest_runtime,
     utxo::{self, UtxoBackend},
@@ -996,7 +996,6 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/robots.txt", get(invoice::robots_txt))
         .route("/sw.js", get(donation_render::service_worker))
-        .route("/qr.svg", get(qr::generate))
         .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
         .route("/health", get(health))
         .route("/ready", get(readiness::ready))
@@ -1163,22 +1162,19 @@ fn build_router(state: AppState) -> Router {
         // decoded object. Keeping this as a separately layered router leaves
         // the established 64 KiB ceiling intact for every other endpoint.
         .merge(wallet_backup::router())
-        // LNURL payer comments arrive in a GET query by protocol. Never put a
-        // request URI (and therefore its query string) into tracing spans.
-        // Path-only spans retain route diagnostics without copying private
-        // payer text into application logs.
+        // Keep private invoice and invoice-API responses out of shared/browser
+        // caches, search indexes, and outbound Referer headers. This applies to
+        // success and error responses at the route boundary.
+        .layer(middleware::from_fn(private_invoice_response_headers))
+        // LNURL payer comments and proofs arrive in GET queries by protocol.
+        // Record only Axum's static route template: never the raw URI, query,
+        // nym, invoice id, comment-intent token, or webhook secret.
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-                let path = request.uri().path();
-                let trace_path = if path.starts_with("/lnurlp/callback/") {
-                    "/lnurlp/callback/<redacted>"
-                } else {
-                    path
-                };
                 tracing::debug_span!(
                     "http_request",
                     method = %request.method(),
-                    path = trace_path
+                    route = request_route_template(request)
                 )
             }),
         )
@@ -1221,7 +1217,11 @@ async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
     if !resp.status().is_success() {
         return resp;
     }
-    let cache_control = if path.starts_with("/assets/") {
+    let cache_control = if path == "/invoice-qr.js" {
+        // This stable module name is imported by the server-rendered private
+        // invoice page. Always revalidate it; its dependencies are hashed.
+        "public, max-age=0, must-revalidate"
+    } else if path.starts_with("/assets/") {
         "public, max-age=31536000, immutable"
     } else {
         "public, max-age=3600"
@@ -1233,10 +1233,152 @@ async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
+fn request_route_template(request: &Request<Body>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("<unmatched>")
+}
+
+fn is_private_invoice_route(route: &str) -> bool {
+    route == "/api/v1/invoices"
+        || route.starts_with("/api/v1/invoices/")
+        || route == "/api/v1/:nym/invoices"
+        || route.starts_with("/api/v1/:nym/invoices/")
+        || matches!(
+            route,
+            "/:nym/invoice"
+                | "/:nym/pos/invoice"
+                | "/:nym/i/:id"
+                | "/a/:slug/invoice"
+                | "/a/:slug/pos/invoice"
+                | "/a/:slug/i/:id"
+                | "/a/:slug/pos/i/:id"
+                | "/invoice/:id"
+        )
+}
+
+fn apply_private_response_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "x-robots-tag",
+        HeaderValue::from_static("noindex, nofollow"),
+    );
+}
+
+async fn private_invoice_response_headers(req: Request<Body>, next: Next) -> Response {
+    let is_private = req
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|route| is_private_invoice_route(route.as_str()));
+    let mut response = next.run(req).await;
+    if is_private {
+        apply_private_response_headers(&mut response);
+    }
+    response
+}
+
 async fn health() -> &'static str {
     "ok"
 }
 
 async fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn unmatched_trace_route_never_falls_back_to_the_raw_uri() {
+        let request = Request::builder()
+            .uri("/private/invoice-id?comment=do-not-log")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(request_route_template(&request), "<unmatched>");
+    }
+
+    #[test]
+    fn private_invoice_route_set_excludes_public_pages() {
+        assert!(is_private_invoice_route("/api/v1/invoices/:id/status"));
+        assert!(is_private_invoice_route("/:nym/i/:id"));
+        assert!(is_private_invoice_route("/a/:slug/pos/invoice"));
+        assert!(is_private_invoice_route("/invoice/:id"));
+
+        assert!(!is_private_invoice_route("/:nym"));
+        assert!(!is_private_invoice_route("/a/:slug"));
+        assert!(!is_private_invoice_route("/.well-known/lnurlp/:nym"));
+    }
+
+    #[test]
+    fn private_response_headers_forbid_storage_and_referrers() {
+        let mut response = StatusCode::OK.into_response();
+
+        apply_private_response_headers(&mut response);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(response.headers()["x-robots-tag"], "noindex, nofollow");
+    }
+
+    #[tokio::test]
+    async fn private_header_middleware_uses_the_matched_route_template() {
+        let app = Router::new()
+            .route(
+                "/api/v1/invoices/:id/status",
+                get(|| async { StatusCode::OK }),
+            )
+            .route("/public/:id", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(private_invoice_response_headers));
+
+        let private_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/invoices/private-id/status?proof=do-not-cache")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            private_response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            private_response.headers()[header::REFERRER_POLICY],
+            "no-referrer"
+        );
+
+        let public_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/public/page-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!public_response
+            .headers()
+            .contains_key(header::CACHE_CONTROL));
+        assert!(!public_response
+            .headers()
+            .contains_key(header::REFERRER_POLICY));
+    }
 }

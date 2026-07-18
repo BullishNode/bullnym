@@ -10,7 +10,7 @@ const CACHE_VERSION = 'bullnym-shell-v1'
 // Bumped v1 -> v2 to purge invoice/private pages cached by older builds.
 // Only responses marked with x-bullnym-pwa-shell are cached now.
 const PAGES_CACHE_VERSION = 'bullnym-pages-v2'
-const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-nSFZ0M8f.css","/pwa-assets/assets/donation-19f65n6k.js","/pwa-assets/assets/pos-CDdG8kgO.js","/pwa-assets/assets/PayFlow-ahS5p4cs.js"]
+const PRECACHE_URLS = ["/pwa-assets/assets/PayFlow-nSFZ0M8f.css","/pwa-assets/assets/donation-BK6tYy9q.js","/pwa-assets/assets/pos-BPj4EAZi.js","/pwa-assets/assets/PayFlow-_rdcaObg.js","/pwa-assets/assets/browser-CjSdxGTc.js"]
 // Synthetic cache entry recording the PREVIOUS deploy's precache list. Never
 // requested by a page (not under /pwa-assets/), so no fetch handler serves it.
 const PREV_PRECACHE_SENTINEL = '/__bullnym/prev-precache'
@@ -122,6 +122,7 @@ self.addEventListener('fetch', (event) => {
   // Never cache: this file, the API, invoice creation, or the manifest.
   if (
     url.pathname === '/sw.js' ||
+    url.pathname === '/pwa-assets/invoice-qr.js' ||
     url.pathname.startsWith('/api/') ||
     url.pathname.endsWith('/invoice') ||
     url.pathname.endsWith('/manifest.webmanifest')

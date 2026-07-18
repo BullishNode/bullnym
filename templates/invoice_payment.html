@@ -13,7 +13,7 @@
     {# Page is private to whoever holds the URL — match the X-Robots-Tag
        header set by the response wrapper so crawlers respect either signal. #}
     <meta name="robots" content="noindex, nofollow">
-    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <meta name="referrer" content="no-referrer">
     <title>Invoice · {{ domain }}</title>
 
     {# CSP: same-origin only, plus liquid.network WSS for 0-conf push.
@@ -333,7 +333,9 @@
         </div>
     </main>
 
-    <script>
+    <script type="module">
+        import { paymentQrDataUrl } from '/pwa-assets/invoice-qr.js';
+
         // Single state machine driven by polling /api/v1/invoices/<id>/status
         // every 3s. The page re-renders on status changes, fetches the
         // appropriate payload (Lightning via the /lightning endpoint, BTC
@@ -436,6 +438,7 @@
             const targetAmountSat = {{ amount_sat }};
             let currentAmountSat = {{ remaining_amount_sat }};
             let currentExpiresAtUnix = 0;
+            let qrRenderSequence = 0;
 
             function btcUri(address, amountSat) {
                 const btc = (amountSat / SAT_PER_BTC).toFixed(8);
@@ -543,18 +546,27 @@
                 return `liquidnetwork:${address}?amount=${btc}&assetid={{ liquid_btc_asset_id }}`;
             }
 
-            function setQrPayload(text) {
+            async function setQrPayload(text) {
                 if (!payloadText || !qrWrap) return;
+                const renderSequence = ++qrRenderSequence;
                 payloadText.textContent = text;
-                qrWrap.innerHTML = '';
-                const img = document.createElement('img');
-                img.src = `/qr.svg?data=${encodeURIComponent(text)}`;
-                img.alt = 'payment QR';
-                qrWrap.appendChild(img);
+                qrWrap.innerHTML = '<div class="qr-placeholder">Rendering QR…</div>';
+                try {
+                    const dataUrl = await paymentQrDataUrl(text);
+                    if (renderSequence !== qrRenderSequence) return;
+                    const img = document.createElement('img');
+                    img.src = dataUrl;
+                    img.alt = 'payment QR';
+                    qrWrap.replaceChildren(img);
+                } catch (_) {
+                    if (renderSequence !== qrRenderSequence) return;
+                    qrWrap.innerHTML = '<div class="qr-placeholder">QR unavailable — copy the payment details below</div>';
+                }
             }
 
             function clearQr(message) {
                 if (!payloadText || !qrWrap) return;
+                qrRenderSequence += 1;
                 payloadText.textContent = '—';
                 qrWrap.innerHTML = `<div class="qr-placeholder">${message}</div>`;
             }

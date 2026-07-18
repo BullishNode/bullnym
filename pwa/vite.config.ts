@@ -74,9 +74,22 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     rollupOptions: {
+      // The invoice template imports a named export from the non-HTML entry.
+      // Vite's app default may otherwise rename or tree-shake that contract.
+      preserveEntrySignatures: 'strict',
       input: {
         donation: resolve(__dirname, 'apps/donation/index.html'),
         pos: resolve(__dirname, 'apps/pos/index.html'),
+        invoiceQr: resolve(__dirname, 'lib/invoiceQr.ts'),
+      },
+      output: {
+        // The server-rendered invoice template needs a stable module URL.
+        // Browser/SW caching is disabled for this entry; imported chunks keep
+        // Vite's normal content hashes and immutable caching.
+        entryFileNames: (chunk) =>
+          chunk.name === 'invoiceQr' ? 'invoice-qr.js' : 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
       },
     },
   },
