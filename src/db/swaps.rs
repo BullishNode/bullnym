@@ -503,8 +503,13 @@ pub async fn mark_swap_mrh_direct(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::
     Ok(result.rows_affected())
 }
 
-/// Provider-observation transition with an optional pre-fetched rate. The
-/// status trigger stamps exact first observation, and this same transaction
+/// Provider-observation transition with an optional pre-fetched rate. A
+/// reverse webhook is durably claimed before its handler mutates the swap. If
+/// that later transaction fails, a reconciler retry must recover the original
+/// receipt time rather than value the payment at the retry time. The update
+/// therefore seeds first observation from the earliest matching durable
+/// funding webhook when it is plausible for this swap; the status trigger
+/// stamps the current time when no such receipt exists. This same transaction
 /// persists a covering valuation-only quote before either fact commits.
 pub async fn update_swap_status_with_late_valuation_candidate(
     pool: &PgPool,
@@ -515,10 +520,27 @@ pub async fn update_swap_status_with_late_valuation_candidate(
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row: Option<(Option<Uuid>, Option<Uuid>, Option<i64>)> = sqlx::query_as(
-        "UPDATE swap_records \
-         SET status = $2, claim_txid = COALESCE($3, claim_txid), updated_at = NOW() \
-         WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded') \
+        "UPDATE swap_records AS swap \
+         SET status = $2, claim_txid = COALESCE($3, swap.claim_txid), \
+             quote_payment_first_observed_at = CASE \
+                 WHEN swap.quote_payment_first_observed_at IS NULL \
+                  AND swap.invoice_quote_version_id IS NOT NULL \
+                  AND $2 IN ('lockup_mempool', 'lockup_confirmed') \
+                 THEN ( \
+                     SELECT MIN(event.processed_at) \
+                       FROM processed_webhook_events AS event \
+                      WHERE event.event_id IN ( \
+                                swap.boltz_swap_id || ':transaction.mempool', \
+                                swap.boltz_swap_id || ':transaction.confirmed' \
+                            ) \
+                        AND event.processed_at >= swap.created_at \
+                        AND event.processed_at <= clock_timestamp() \
+                 ) \
+                 ELSE swap.quote_payment_first_observed_at \
+             END, \
+             updated_at = NOW() \
+         WHERE swap.id = $1 \
+           AND swap.status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded') \
          RETURNING invoice_id, invoice_quote_version_id, \
                    (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT",
     )

@@ -2,10 +2,11 @@ use sqlx::PgPool;
 
 // --- Webhook idempotency ---
 
-/// Try to record that a webhook event was processed. Returns `true` if
-/// this is the first time we've seen `event_id` (caller should do the
-/// work) or `false` if it was already processed (caller short-circuits
-/// to 200 OK without acting).
+/// Try to claim a webhook event for processing. The insert's durable timestamp
+/// records when Bullnym first accepted the delivery, before the handler's
+/// separate state transition. Returns `true` if this is the first time we've
+/// seen `event_id` (caller should do the work) or `false` if it was already
+/// claimed (caller short-circuits to 200 OK without acting).
 pub async fn try_record_webhook_event(pool: &PgPool, event_id: &str) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO processed_webhook_events (event_id) VALUES ($1) \
