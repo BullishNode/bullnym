@@ -554,6 +554,24 @@ async fn dispatch_webhook(
     }
 
     match data.status.as_str() {
+        "transaction.direct" => {
+            let retired = db::mark_swap_mrh_direct(&state.db, swap.id)
+                .await
+                .map_err(|error| AppError::DbError(error.to_string()))?;
+            if retired != 1 {
+                return Err(AppError::ClaimError(
+                    "transaction.direct did not match a pending Payment Page MRH authority".into(),
+                ));
+            }
+            // Do not flip or credit the invoice from provider testimony. The
+            // Liquid watcher independently verifies the transaction against
+            // invoices.liquid_address and owns direct-payment accounting.
+            tracing::info!(
+                event = "reverse_swap_mrh_direct",
+                swap_id = %data.id,
+                "retired reverse obligation; awaiting independent Liquid observation"
+            );
+        }
         "transaction.mempool" | "transaction.confirmed" => {
             let is_mempool = data.status == "transaction.mempool";
             let new_status = if is_mempool {
@@ -3226,7 +3244,7 @@ async fn claim_swap_inner(
              next_claim_attempt_at = NOW() + $2::interval, \
              updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
     )
     .bind(swap.id)
     .bind(db::CLAIM_IN_FLIGHT_LEASE)

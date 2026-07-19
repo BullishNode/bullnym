@@ -439,6 +439,22 @@ fn boltz_mempool_pending_advances() {
 }
 
 #[test]
+fn boltz_mrh_direct_retires_only_a_pending_reverse_obligation() {
+    let pending = fixture("pending");
+    assert_eq!(
+        decide_action(&pending, "transaction.direct"),
+        ReconcilerAction::MarkMrhDirect
+    );
+    for progressed in ["lockup_mempool", "lockup_confirmed", "claiming"] {
+        assert_eq!(
+            decide_action(&fixture(progressed), "transaction.direct"),
+            ReconcilerAction::Noop,
+            "MRH must not overwrite ordinary reverse progress: {progressed}"
+        );
+    }
+}
+
+#[test]
 fn boltz_confirmed_pending_advances() {
     let swap = fixture("pending");
     assert_eq!(
@@ -538,11 +554,18 @@ fn boltz_invoice_settled_when_we_did_not_claim_schedules_retry() {
 
 #[test]
 fn terminal_status_always_noop() {
-    for our in &["claimed", "expired", "claim_stuck", "lockup_refunded"] {
+    for our in &[
+        "claimed",
+        "expired",
+        "claim_stuck",
+        "mrh_direct",
+        "lockup_refunded",
+    ] {
         for boltz in &[
             "swap.created",
             "transaction.mempool",
             "transaction.confirmed",
+            "transaction.direct",
             "swap.expired",
             "invoice.settled",
             "invoice.expired",

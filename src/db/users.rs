@@ -505,7 +505,7 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     // blocks purge — a stuck claim is still a live obligation.
     let reverse_in_flight: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM swap_records \
-         WHERE nym = $1 AND status NOT IN ('claimed', 'expired')",
+         WHERE nym = $1 AND status NOT IN ('claimed', 'expired', 'mrh_direct')",
     )
     .bind(&user.nym)
     .fetch_one(&mut *tx)

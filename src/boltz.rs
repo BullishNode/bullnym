@@ -15,6 +15,7 @@ use boltz_client::swaps::boltz::{
     CreateReverseResponse, GetQuoteResponse, GetSwapResponse, HeightResponse, Leaf, RevSwapStates,
     Side, Webhook,
 };
+use boltz_client::swaps::magic_routing::{sign_address, verify_mrh_signature};
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::{BtcSwapScript, LBtcSwapScript, PublicKey};
 use lightning_invoice::Bolt11Invoice;
@@ -22,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::boltz_transport::{BoltzQuoteMethod, BoltzTransport, HttpBoltzTransport};
 use crate::error::AppError;
+
+const MAGIC_ROUTING_HINT_SHORT_CHANNEL_ID: u64 = 596_385_002_596_073_472;
 
 pub struct SwapResult {
     pub swap_id: String,
@@ -37,6 +40,7 @@ pub struct FixedCheckoutReverseSwapResult {
     pub payer_amount_sat: u64,
     pub onchain_amount_sat: u64,
     pub claim_fee_budget_sat: u64,
+    pub mrh_address: Option<String>,
 }
 
 /// Canonical, non-secret authority for one fixed-checkout reverse mutation.
@@ -390,6 +394,48 @@ fn validate_bolt11_description_authority(
         ));
     }
     Ok(())
+}
+
+fn validate_bolt11_mrh_authority(
+    invoice: &str,
+    expected_address: Option<&str>,
+    claim_public_key: &PublicKey,
+) -> Result<(), AppError> {
+    let parsed = Bolt11Invoice::from_str(invoice)
+        .map_err(|_| AppError::BoltzError("invalid BOLT11 invoice".into()))?;
+    let hints: Vec<_> = parsed
+        .private_routes()
+        .iter()
+        .flat_map(|route| route.0.iter())
+        .filter(|hint| hint.short_channel_id == MAGIC_ROUTING_HINT_SHORT_CHANNEL_ID)
+        .collect();
+    match expected_address {
+        Some(_) if hints.len() == 1 => {
+            if hints[0].src_node_id.to_string() != claim_public_key.to_string() {
+                return Err(AppError::BoltzError(
+                    "fixed checkout MRH claim key did not match request authority".into(),
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(AppError::BoltzError(
+                "fixed checkout invoice did not contain exactly one MRH".into(),
+            ));
+        }
+        None if !hints.is_empty() => {
+            return Err(AppError::BoltzError(
+                "fixed checkout invoice contained an unrequested MRH".into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn mrh_address_signature_matches(address: &str, signature: &str, keypair: &Keypair) -> bool {
+    let bip21 = format!("liquid:{address}?amount=0");
+    let public_key = PublicKey::new(keypair.public_key()).to_string();
+    verify_mrh_signature(&bip21, &public_key, signature).is_ok()
 }
 
 fn is_lower_hex_32(value: &str) -> bool {
@@ -1111,6 +1157,7 @@ impl BoltzService {
         merchant_amount_sat: u64,
         description: Option<&str>,
         description_hash: Option<&str>,
+        mrh_address: Option<&str>,
     ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
         if let crate::boltz_breaker::Gate::Reject = self.breaker.gate() {
             return Err(AppError::BoltzError(
@@ -1123,6 +1170,12 @@ impl BoltzService {
             .map_err(|error| AppError::BoltzError(error.to_string()))?;
         let DerivedSwapKey { keypair, preimage } = derived_key;
         let claim_public_key = PublicKey::new(keypair.public_key());
+        let address_signature = mrh_address
+            .map(|address| sign_address(address, &keypair).map(|signature| signature.to_string()))
+            .transpose()
+            .map_err(|error| {
+                AppError::BoltzError(format!("cannot sign magic routing hint address: {error}"))
+            })?;
         let request = CreateReverseRequest {
             from: "BTC".to_string(),
             to: "L-BTC".to_string(),
@@ -1132,19 +1185,27 @@ impl BoltzService {
             preimage_hash: Some(preimage.sha256),
             description: description.map(str::to_owned),
             description_hash: description_hash.map(str::to_owned),
-            address: None,
-            address_signature: None,
+            address: mrh_address.map(str::to_owned),
+            address_signature,
             referral_id: None,
             webhook: self.webhook_url.as_ref().map(|url| Webhook {
                 url: url.clone(),
                 hash_swap_id: None,
-                status: Some(vec![
-                    RevSwapStates::TransactionMempool,
-                    RevSwapStates::TransactionConfirmed,
-                    RevSwapStates::InvoiceSettled,
-                    RevSwapStates::SwapExpired,
-                    RevSwapStates::TransactionFailed,
-                ]),
+                // The pinned SDK predates `transaction.direct`. Omitting the
+                // filter asks Boltz to deliver every status, including MRH
+                // direct-payment sightings. Ordinary swaps retain the narrow
+                // subscription below.
+                status: if mrh_address.is_some() {
+                    None
+                } else {
+                    Some(vec![
+                        RevSwapStates::TransactionMempool,
+                        RevSwapStates::TransactionConfirmed,
+                        RevSwapStates::InvoiceSettled,
+                        RevSwapStates::SwapExpired,
+                        RevSwapStates::TransactionFailed,
+                    ])
+                },
             }),
             claim_covenant: None,
         };
@@ -1168,6 +1229,7 @@ impl BoltzService {
         derived_key: DerivedSwapKey,
         canonical_authority_json: &str,
         authority_sha256: &str,
+        expected_mrh_address: Option<&str>,
     ) -> Result<PreparedFixedCheckoutReverseCreate, AppError> {
         let authority: FixedCheckoutReverseRequestAuthorityV1 =
             decode_canonical_provider_authority(canonical_authority_json, authority_sha256)?;
@@ -1180,6 +1242,16 @@ impl BoltzService {
             || authority.request.preimage_hash != Some(preimage.sha256)
             || authority.request.invoice.is_some()
             || authority.request.invoice_amount.is_some()
+            || authority.request.address.as_deref() != expected_mrh_address
+            || authority.request.address.is_some() != authority.request.address_signature.is_some()
+            || authority
+                .request
+                .address
+                .as_deref()
+                .zip(authority.request.address_signature.as_deref())
+                .is_some_and(|(address, signature)| {
+                    !mrh_address_signature_matches(address, signature, &keypair)
+                })
             || authority.merchant_amount_sat == 0
             || authority.payer_amount_sat <= authority.merchant_amount_sat
             || authority.onchain_amount_sat < authority.merchant_amount_sat
@@ -1250,6 +1322,11 @@ impl BoltzService {
             authority.request.description.as_deref(),
             authority.request.description_hash.as_deref(),
         )?;
+        validate_bolt11_mrh_authority(
+            &invoice,
+            authority.request.address.as_deref(),
+            &claim_public_key,
+        )?;
         let payer_amount_sat = exact_bolt11_amount_sat(&invoice)?;
         if payer_amount_sat != authority.payer_amount_sat {
             return Err(AppError::BoltzError(format!(
@@ -1279,6 +1356,7 @@ impl BoltzService {
             payer_amount_sat,
             onchain_amount_sat: authority.onchain_amount_sat,
             claim_fee_budget_sat: authority.claim_fee_budget_sat,
+            mrh_address: authority.request.address,
         })
     }
 
@@ -1288,12 +1366,14 @@ impl BoltzService {
         merchant_amount_sat: u64,
         description: Option<&str>,
         description_hash: Option<&str>,
+        mrh_address: Option<&str>,
     ) -> Result<FixedCheckoutReverseSwapResult, AppError> {
         let prepared = self.prepare_fixed_checkout_reverse_swap(
             derived_key,
             merchant_amount_sat,
             description,
             description_hash,
+            mrh_address,
         )?;
         self.submit_fixed_checkout_reverse_swap(prepared).await
     }
@@ -1700,7 +1780,9 @@ mod tests {
     use boltz_client::network::Network;
     use boltz_client::swaps::boltz::{ChainSwapDetails, CreateReverseResponse, SwapTree, SwapType};
     use boltz_client::{ZKKeyPair, ZKSecp256k1};
-    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use lightning_invoice::{
+        Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees,
+    };
     use secp256k1::{Secp256k1, SecretKey};
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2112,15 +2194,39 @@ mod tests {
         payment_hash: bitcoin::hashes::sha256::Hash,
         amount_sat: u64,
     ) -> String {
+        reverse_creation_invoice_with_mrh(payment_hash, amount_sat, None)
+    }
+
+    fn reverse_creation_invoice_with_mrh(
+        payment_hash: bitcoin::hashes::sha256::Hash,
+        amount_sat: u64,
+        mrh_claim_public_key: Option<PublicKey>,
+    ) -> String {
         let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
-        InvoiceBuilder::new(Currency::Bitcoin)
+        let builder = InvoiceBuilder::new(Currency::Bitcoin)
             .amount_milli_satoshis(amount_sat * 1_000)
             .description("Bullnym reverse validation test".into())
             .payment_hash(payment_hash)
             .payment_secret(PaymentSecret([24; 32]))
             .duration_since_epoch(Duration::from_secs(1_700_000_000))
             .expiry_time(Duration::from_secs(3_600))
-            .min_final_cltv_expiry_delta(144)
+            .min_final_cltv_expiry_delta(144);
+        let builder = if let Some(public_key) = mrh_claim_public_key {
+            builder.private_route(RouteHint(vec![RouteHintHop {
+                src_node_id: public_key.inner,
+                short_channel_id: MAGIC_ROUTING_HINT_SHORT_CHANNEL_ID,
+                fees: RoutingFees {
+                    base_msat: 0,
+                    proportional_millionths: 0,
+                },
+                cltv_expiry_delta: 0,
+                htlc_minimum_msat: None,
+                htlc_maximum_msat: None,
+            }]))
+        } else {
+            builder
+        };
+        builder
             .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
             .unwrap()
             .to_string()
@@ -2257,7 +2363,7 @@ mod tests {
                 .await
                 .map(|swap| swap.invoice),
             ReverseCreationPath::FixedCheckout => service
-                .create_fixed_checkout_reverse_swap(derived_key, 1_000, None, None)
+                .create_fixed_checkout_reverse_swap(derived_key, 1_000, None, None, None)
                 .await
                 .map(|swap| swap.swap.invoice),
         };
@@ -2347,6 +2453,7 @@ mod tests {
                 1_000,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2376,6 +2483,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_checkout_mrh_binds_address_signature_invoice_and_restore() {
+        const MRH_ADDRESS: &str =
+            "lq1qqexamplepaymentpageaddress000000000000000000000000000000000000000000";
+        let master = SwapMasterKey::from_mnemonic(TEST_MNEMONIC, None, Network::Mainnet).unwrap();
+        let claim_keypair = master.derive_swapkey(42).unwrap();
+        let claim_public_key = PublicKey::new(claim_keypair.public_key());
+        let preimage = Preimage::from_swap_key(&claim_keypair);
+        let mut response = reverse_creation_response(ReverseCreationMutation::Valid);
+        response.invoice = Some(reverse_creation_invoice_with_mrh(
+            preimage.sha256,
+            1_050,
+            Some(claim_public_key),
+        ));
+        let fixture = spawn_reverse_creation_fixture(&response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+
+        let prepared = service
+            .prepare_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                1_000,
+                None,
+                None,
+                Some(MRH_ADDRESS),
+            )
+            .unwrap();
+        let (authority_json, authority_sha256) = prepared.canonical_authority().unwrap();
+        let authority: Value = serde_json::from_str(&authority_json).unwrap();
+        assert_eq!(authority["request"]["address"], MRH_ADDRESS);
+        assert!(authority["request"]["addressSignature"]
+            .as_str()
+            .is_some_and(|signature| signature.len() == 128));
+        assert!(service
+            .restore_prepared_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                &authority_json,
+                &authority_sha256,
+                Some(MRH_ADDRESS),
+            )
+            .is_ok());
+        assert!(service
+            .restore_prepared_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                &authority_json,
+                &authority_sha256,
+                Some("lq1wrongaddress"),
+            )
+            .is_err());
+
+        let result = service
+            .submit_fixed_checkout_reverse_swap(prepared)
+            .await
+            .unwrap();
+        assert_eq!(result.mrh_address.as_deref(), Some(MRH_ADDRESS));
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["address"], MRH_ADDRESS);
+        assert!(requests[0]["addressSignature"].as_str().is_some());
+        assert!(requests[0]["webhook"]
+            .get("status")
+            .is_none_or(Value::is_null));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fixed_checkout_mrh_rejects_an_invoice_without_the_requested_hint() {
+        let response = reverse_creation_response(ReverseCreationMutation::Valid);
+        let fixture = spawn_reverse_creation_fixture(&response).await;
+        let service = test_service_at(&fixture.base_url, TEST_MNEMONIC);
+        assert_eq!(
+            service.refresh_provider_limits().await,
+            crate::provider_limits_runtime::ProviderLimitRefreshOutcome::Updated
+        );
+        let prepared = service
+            .prepare_fixed_checkout_reverse_swap(
+                service.derive_swap_key(42).unwrap(),
+                1_000,
+                None,
+                None,
+                Some("lq1requestedpaymentpageaddress"),
+            )
+            .unwrap();
+        let error = match service.submit_fixed_checkout_reverse_swap(prepared).await {
+            Ok(_) => panic!("provider response omitted the requested MRH"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("exactly one MRH"),
+            "unexpected MRH validation error: {error}"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fixed_checkout_http_rejects_a_present_onchain_amount_mismatch() {
         let mut response =
             serde_json::to_value(reverse_creation_response(ReverseCreationMutation::Valid))
@@ -2392,6 +2596,7 @@ mod tests {
             .create_fixed_checkout_reverse_swap(
                 service.derive_swap_key(42).unwrap(),
                 1_000,
+                None,
                 None,
                 None,
             )

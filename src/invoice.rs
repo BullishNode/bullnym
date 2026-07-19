@@ -2125,7 +2125,13 @@ async fn ensure_reusable_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
-    let prepared = request_lightning_offer(state, derived_key, amount_sat as u64).await?;
+    let prepared = request_lightning_offer(
+        state,
+        derived_key,
+        amount_sat as u64,
+        payment_page_mrh_address(&current),
+    )
+    .await?;
 
     // The allocation above is already durable. Start a short transaction only
     // for provider-result persistence plus the final invoice revalidation.
@@ -2398,6 +2404,7 @@ async fn ensure_versioned_lightning_offer(
             derived_key,
             &attempt.request_authority_json,
             &attempt.request_authority_sha256,
+            payment_page_mrh_address(&current),
         )?;
         (
             attempt.clone(),
@@ -2434,8 +2441,12 @@ async fn ensure_versioned_lightning_offer(
         )
         .await
         .map_err(|error| AppError::DbError(format!("swap key reservation failed: {error}")))?;
-        let provider_create =
-            prepare_lightning_provider_create(state, derived_key, merchant_amount_sat)?;
+        let provider_create = prepare_lightning_provider_create(
+            state,
+            derived_key,
+            merchant_amount_sat,
+            payment_page_mrh_address(&current),
+        )?;
         let (request_authority_json, request_authority_sha256) =
             provider_create.canonical_authority()?;
         let (attempt, _) = db::record_or_reuse_invoice_quote_provider_attempt(
@@ -3277,6 +3288,7 @@ struct PreparedLightningOffer {
     claim_key_hex: String,
     boltz_response_json: String,
     provider_response_sha256: String,
+    mrh_address: Option<String>,
 }
 
 impl PreparedLightningOffer {
@@ -3298,9 +3310,11 @@ impl PreparedLightningOffer {
         db::NewSwapRecord {
             nym: swap_nym,
             boltz_swap_id: &self.swap_id,
-            // Claim destination is resolved from invoices.liquid_address at
-            // claim time and cached into swap_records.address.
-            address: None,
+            // Payment Page swaps persist their already-allocated claim
+            // destination because the same address is also the MRH direct
+            // payment authority. Other surfaces continue resolving it from
+            // the invoice at claim time.
+            address: self.mrh_address.as_deref(),
             address_index: None,
             amount_sat,
             invoice: &self.lightning_pr,
@@ -3318,8 +3332,9 @@ async fn request_lightning_offer(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
+    mrh_address: Option<&str>,
 ) -> Result<PreparedLightningOffer, AppError> {
-    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat)?;
+    let prepared = prepare_lightning_provider_create(state, derived_key, amount_sat, mrh_address)?;
     let result = state
         .boltz
         .submit_fixed_checkout_reverse_swap(prepared)
@@ -3331,13 +3346,23 @@ fn prepare_lightning_provider_create(
     state: &AppState,
     derived_key: crate::boltz::DerivedSwapKey,
     amount_sat: u64,
+    mrh_address: Option<&str>,
 ) -> Result<crate::boltz::PreparedFixedCheckoutReverseCreate, AppError> {
     state.boltz.prepare_fixed_checkout_reverse_swap(
         derived_key,
         amount_sat,
         Some(BOLTZ_INVOICE_DESCRIPTION),
         None,
+        mrh_address,
     )
+}
+
+fn payment_page_mrh_address(invoice: &db::Invoice) -> Option<&str> {
+    (invoice.origin == "checkout"
+        && invoice.accept_liquid
+        && invoice.checkout_surface_kind.as_deref() == Some(db::KIND_PAYMENT_PAGE))
+    .then_some(invoice.liquid_address.as_deref())
+    .flatten()
 }
 
 fn prepared_lightning_offer_from_result(
@@ -3358,6 +3383,7 @@ fn prepared_lightning_offer_from_result(
         claim_key_hex: hex::encode(swap.claim_keypair.secret_bytes()),
         boltz_response_json,
         provider_response_sha256,
+        mrh_address: result.mrh_address,
     })
 }
 
@@ -3396,7 +3422,13 @@ async fn create_lightning_offer(
     )
     .await
     .map_err(|e| AppError::DbError(format!("swap key reservation failed: {e}")))?;
-    let prepared = request_lightning_offer(state, derived_key, amount_sat).await?;
+    let prepared = request_lightning_offer(
+        state,
+        derived_key,
+        amount_sat,
+        payment_page_mrh_address(invoice),
+    )
+    .await?;
 
     db::record_swap_with_lineage(
         &state.db,
