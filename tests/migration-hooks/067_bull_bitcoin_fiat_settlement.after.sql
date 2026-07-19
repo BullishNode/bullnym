@@ -100,6 +100,7 @@ BEGIN
        SET provider_state = 'bound',
            bull_bitcoin_order_id = '33333333-3333-4333-8333-333333333333',
            funding_route = 'bull_bitcoin',
+           settlement_status = 'pending',
            instruction_kind = 'bitcoin',
            payer_instruction = 'bc1qmigrationfixture',
            updated_at = now()

@@ -1401,7 +1401,8 @@ async fn bull_bitcoin_fiat_foundation_invariants_present(
                     ('fiat_settlement_settings', 'fiat_settlement_settings_credential_owner_fkey'), \
                     ('invoice_fiat_settlement_policies', 'invoice_fiat_settlement_policies_credential_owner_fkey'), \
                     ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_provider_binding_chk'), \
-                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk') \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_route_state_chk'), \
+                    ('bull_bitcoin_settlements', 'bull_bitcoin_settlements_status_chk') \
                 ) required(table_name, constraint_name) \
                  WHERE NOT EXISTS ( \
                     SELECT 1 FROM pg_constraint constraint_info \

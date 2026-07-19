@@ -16,6 +16,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::BullBitcoinEncryptionKey;
 
+mod http;
+pub use http::HttpBullBitcoinApi;
+
 pub const CREDENTIAL_ENCRYPTION_FORMAT_VERSION: i16 = 1;
 pub const TERMS_VERSION: &str = "bull-bitcoin-fiat-settlement-v1";
 pub const TERMS_REFERENCE: &str = "https://www.bullbitcoin.com/terms-of-service";
@@ -170,6 +173,12 @@ impl BitcoinAmountSat {
         let fractional = format!("{remainder:08}");
         format!("{whole}.{}", fractional.trim_end_matches('0'))
     }
+
+    pub fn parse_json_decimal(value: &str) -> Result<Self, BullBitcoinError> {
+        let sat = parse_positive_decimal_to_units(value, 8, 2_100_000_000_000_000)
+            .map_err(|_| BullBitcoinError::InvalidBitcoinAmount)?;
+        Self::new(sat)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,59 +199,70 @@ impl FiatAmountMinor {
     /// Parse an upstream JSON decimal exactly into two-decimal minor units.
     /// Scientific notation is accepted; excess non-zero precision is not.
     pub fn parse_json_decimal(value: &str) -> Result<Self, BullBitcoinError> {
-        let (mantissa, exponent) = match value.find(['e', 'E']) {
-            Some(index) => {
-                let exponent = value[index + 1..]
-                    .parse::<i32>()
-                    .map_err(|_| BullBitcoinError::InvalidFiatAmount)?;
-                (&value[..index], exponent)
-            }
-            None => (value, 0),
-        };
-        if mantissa.starts_with('-') || mantissa.starts_with('+') || mantissa.is_empty() {
-            return Err(BullBitcoinError::InvalidFiatAmount);
-        }
-        let (whole, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-        if whole.is_empty()
-            || !whole.bytes().all(|byte| byte.is_ascii_digit())
-            || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(BullBitcoinError::InvalidFiatAmount);
-        }
-
-        let mut digits = String::with_capacity(whole.len() + fractional.len() + 4);
-        digits.push_str(whole);
-        digits.push_str(fractional);
-        let decimal_scale =
-            i32::try_from(fractional.len()).map_err(|_| BullBitcoinError::InvalidFiatAmount)?;
-        let minor_shift = exponent - decimal_scale + 2;
-        if minor_shift >= 0 {
-            digits.extend(std::iter::repeat_n(
-                '0',
-                usize::try_from(minor_shift).map_err(|_| BullBitcoinError::InvalidFiatAmount)?,
-            ));
-        } else {
-            let remove =
-                usize::try_from(-minor_shift).map_err(|_| BullBitcoinError::InvalidFiatAmount)?;
-            if remove > digits.len() {
-                if digits.bytes().any(|byte| byte != b'0') {
-                    return Err(BullBitcoinError::InvalidFiatAmount);
-                }
-                return Err(BullBitcoinError::InvalidFiatAmount);
-            }
-            let split = digits.len() - remove;
-            if digits[split..].bytes().any(|byte| byte != b'0') {
-                return Err(BullBitcoinError::InvalidFiatAmount);
-            }
-            digits.truncate(split);
-        }
-        let trimmed = digits.trim_start_matches('0');
-        let normalized = if trimmed.is_empty() { "0" } else { trimmed };
-        let minor = normalized
-            .parse::<i64>()
+        let minor = parse_positive_decimal_to_units(value, 2, i64::MAX)
             .map_err(|_| BullBitcoinError::InvalidFiatAmount)?;
         Self::new(minor)
     }
+}
+
+fn parse_positive_decimal_to_units(
+    value: &str,
+    target_scale: i32,
+    maximum: i64,
+) -> Result<i64, ()> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(());
+    }
+    let (mantissa, exponent) = match value.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = value[index + 1..].parse::<i32>().map_err(|_| ())?;
+            (&value[..index], exponent)
+        }
+        None => (value, 0),
+    };
+    if mantissa.starts_with('-') || mantissa.starts_with('+') || mantissa.is_empty() {
+        return Err(());
+    }
+    let (whole, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+
+    let mut digits = String::with_capacity(whole.len() + fractional.len() + 4);
+    digits.push_str(whole);
+    digits.push_str(fractional);
+    let decimal_scale = i32::try_from(fractional.len()).map_err(|_| ())?;
+    let unit_shift = exponent
+        .checked_sub(decimal_scale)
+        .and_then(|shift| shift.checked_add(target_scale))
+        .ok_or(())?;
+    if unit_shift >= 0 {
+        let zeroes = usize::try_from(unit_shift).map_err(|_| ())?;
+        if digits.len().checked_add(zeroes).ok_or(())? > 19 {
+            return Err(());
+        }
+        digits.extend(std::iter::repeat_n('0', zeroes));
+    } else {
+        let remove = usize::try_from(unit_shift.checked_neg().ok_or(())?).map_err(|_| ())?;
+        if remove > digits.len() {
+            return Err(());
+        }
+        let split = digits.len() - remove;
+        if digits[split..].bytes().any(|byte| byte != b'0') {
+            return Err(());
+        }
+        digits.truncate(split);
+    }
+    let trimmed = digits.trim_start_matches('0');
+    let normalized = if trimmed.is_empty() { "0" } else { trimmed };
+    let units = normalized.parse::<i64>().map_err(|_| ())?;
+    if units <= 0 || units > maximum {
+        return Err(());
+    }
+    Ok(units)
 }
 
 /// A scoped key that is validated before it can enter a signed message or DB

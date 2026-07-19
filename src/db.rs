@@ -1,4 +1,5 @@
 mod bitcoin_recovery_fee_authority;
+mod bull_bitcoin_settlements;
 mod chain_swap_attempts;
 mod chain_swap_cooperative_signing;
 mod chain_swap_renegotiations;
@@ -28,6 +29,7 @@ mod wallet_backups;
 mod watcher;
 
 pub use bitcoin_recovery_fee_authority::*;
+pub use bull_bitcoin_settlements::*;
 pub use chain_swap_attempts::*;
 pub use chain_swap_cooperative_signing::*;
 pub use chain_swap_renegotiations::*;

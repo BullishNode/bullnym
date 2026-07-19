@@ -188,6 +188,7 @@ CREATE TABLE bull_bitcoin_settlements (
     provider_state           TEXT        NOT NULL DEFAULT 'reserved',
     funding_route            TEXT,
     fallback_category        TEXT,
+    settlement_status        TEXT        NOT NULL DEFAULT 'none',
     requested_bitcoin_sat    BIGINT      NOT NULL,
     bull_bitcoin_order_id    UUID,
     order_status             TEXT,
@@ -274,6 +275,19 @@ CREATE TABLE bull_bitcoin_settlements (
         OR provider_state = 'bound'
         OR (provider_state = 'abandoned' AND funding_route = 'bitcoin_fallback')
     ),
+    CONSTRAINT bull_bitcoin_settlements_status_chk CHECK (
+        settlement_status IN (
+            'none', 'pending', 'settled', 'unavailable', 'integrity_error'
+        )
+        AND (
+            (settlement_status = 'none'
+                AND (provider_state <> 'bound'
+                    OR funding_route = 'bitcoin_fallback'))
+            OR (settlement_status <> 'none'
+                AND provider_state = 'bound'
+                AND funding_route = 'bull_bitcoin')
+        )
+    ),
     CONSTRAINT bull_bitcoin_settlements_observation_shape_chk CHECK (
         (provider_state <> 'bound'
             AND order_status IS NULL AND payin_status IS NULL
@@ -307,8 +321,14 @@ CREATE TABLE bull_bitcoin_settlements (
         reconcile_attempts >= 0
     ),
     CONSTRAINT bull_bitcoin_settlements_terminal_chk CHECK (
-        (provider_final AND terminal_at IS NOT NULL)
-        OR (NOT provider_final AND terminal_at IS NULL)
+        (provider_final
+            AND terminal_at IS NOT NULL
+            AND settlement_status = 'settled'
+            AND actual_received_sat IS NOT NULL
+            AND credited_fiat_minor IS NOT NULL)
+        OR (NOT provider_final
+            AND terminal_at IS NULL
+            AND settlement_status <> 'settled')
     ),
     CONSTRAINT bull_bitcoin_settlements_time_order_chk CHECK (
         updated_at >= created_at
@@ -384,6 +404,20 @@ BEGIN
         RAISE EXCEPTION 'Bull Bitcoin provider finality is monotonic'
             USING ERRCODE = '23514',
                   CONSTRAINT = 'bull_bitcoin_settlements_finality_monotonic';
+    END IF;
+
+    IF NOT (
+        NEW.settlement_status = OLD.settlement_status
+        OR (OLD.settlement_status = 'none'
+            AND NEW.settlement_status = 'pending')
+        OR (OLD.settlement_status = 'pending'
+            AND NEW.settlement_status IN (
+                'settled', 'unavailable', 'integrity_error'
+            ))
+    ) THEN
+        RAISE EXCEPTION 'invalid Bull Bitcoin settlement-status transition'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'bull_bitcoin_settlements_status_transition';
     END IF;
 
     IF OLD.terminal_at IS NOT NULL

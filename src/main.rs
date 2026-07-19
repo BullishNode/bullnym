@@ -20,9 +20,9 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    admission, bitcoin_watcher, boltz, boltz_restore_fetch, certification, chain_fallback,
-    chain_lockup_witness_adapter, chain_watcher, claimer, config, db, derivation_guard,
-    donation_page, donation_render, fee_runtime, fiat_settlement, gc,
+    admission, bitcoin_watcher, boltz, boltz_restore_fetch, bull_bitcoin_settlement, certification,
+    chain_fallback, chain_lockup_witness_adapter, chain_watcher, claimer, config, db,
+    derivation_guard, donation_page, donation_render, fee_runtime, fiat_settlement, gc,
     get_paid_transaction_history, invoice, ip_whitelist, lnurl, lnurl_comment_history, nostr,
     og_image, pricer, rate_limit, readiness, reconciler, recovery_address_registration,
     registration, startup_provider_reconciliation,
@@ -525,6 +525,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = config.listen.clone();
     let config = Arc::new(config);
+    let bull_bitcoin = Arc::new(
+        pay_service::bull_bitcoin::HttpBullBitcoinApi::new(&config.bull_bitcoin)
+            .map_err(|error| format!("invalid Bull Bitcoin API client configuration: {error}"))?,
+    );
     let boltz = Arc::new(boltz_service);
     let whitelist = Arc::new(whitelist);
     let certification_allowlist = Arc::new(certification_allowlist);
@@ -621,6 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         admission,
         boltz: boltz.clone(),
+        bull_bitcoin,
         ip_whitelist: whitelist.clone(),
         certification: certification_allowlist.clone(),
         rate_limiter: rate_limiter.clone(),
@@ -767,6 +772,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.workers.enabled {
         tracing::info!("background workers enabled");
+        {
+            // The rollout flag gates new fiat admission, not supervision of
+            // already-exposed Bull Bitcoin destinations. Keep this worker
+            // running whenever this process owns background work.
+            let settlement_state = state.clone();
+            let settlement_cancel = cancel.clone();
+            tokio::spawn(async move {
+                bull_bitcoin_settlement::run_reconciler(settlement_state, settlement_cancel).await;
+            });
+            tracing::info!(
+                interval_secs = config.bull_bitcoin.reconcile_interval_secs,
+                batch_size = config.bull_bitcoin.reconcile_batch_size,
+                "Bull Bitcoin settlement reconciler started"
+            );
+        }
         if config.features.payment_pages {
             og_image::spawn_reconciler(
                 pool.clone(),

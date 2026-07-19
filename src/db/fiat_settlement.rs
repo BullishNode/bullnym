@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::bull_bitcoin::{EncryptedCredential, FiatCurrency, Product, TERMS_VERSION};
 
-const OWNER_LOCK_NAMESPACE: i64 = 7_111_929_681_017_003_517;
+pub(super) const OWNER_LOCK_NAMESPACE: i64 = 7_111_929_681_017_003_517;
 
 #[derive(Debug)]
 pub enum FiatSettlementStoreError {
@@ -200,21 +200,18 @@ pub async fn request_bull_bitcoin_credential_deletion(
     .fetch_optional(&mut *transaction)
     .await?
     {
-        // No instruction was exposed from these states. A dispatched create
-        // is ambiguous and must never be retried; both states can release the
-        // key dependency by choosing the ordinary Bitcoin fallback.
+        // A reserved row has not crossed the dispatch boundary and can safely
+        // release its key dependency. `dispatch_started` may represent an API
+        // call currently in flight, so deletion must retain that generation;
+        // its caller or restart recovery will bind or abandon it exactly once.
         sqlx::query(
             "UPDATE bull_bitcoin_settlements \
                 SET provider_state = 'abandoned', \
                     funding_route = 'bitcoin_fallback', \
-                    fallback_category = CASE \
-                        WHEN provider_state = 'dispatch_started' \
-                            THEN 'ambiguous_create' \
-                        ELSE 'conversion_unavailable' \
-                    END, \
+                    fallback_category = 'conversion_unavailable', \
                     updated_at = now() \
               WHERE credential_id = $1 \
-                AND provider_state IN ('reserved', 'dispatch_started')",
+                AND provider_state = 'reserved'",
         )
         .bind(credential_id)
         .execute(&mut *transaction)
@@ -252,7 +249,7 @@ pub async fn select_fiat_settlement_configuration(
     Ok(configuration)
 }
 
-async fn lock_owner(
+pub(super) async fn lock_owner(
     transaction: &mut Transaction<'_, Postgres>,
     owner_npub: &str,
 ) -> Result<(), sqlx::Error> {
@@ -264,7 +261,7 @@ async fn lock_owner(
     Ok(())
 }
 
-async fn require_active_identity(
+pub(super) async fn require_active_identity(
     transaction: &mut Transaction<'_, Postgres>,
     owner_npub: &str,
 ) -> Result<(), FiatSettlementStoreError> {
