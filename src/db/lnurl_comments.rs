@@ -576,7 +576,7 @@ pub async fn mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
         0
     } else if matches!(
         status.as_str(),
-        "expired" | "claim_stuck" | "lockup_refunded"
+        "expired" | "claim_stuck" | "mrh_direct" | "lockup_refunded"
     ) {
         tx.commit().await?;
         return Ok(0);
@@ -585,7 +585,7 @@ pub async fn mark_reverse_swap_claimed_and_bind_lnurl_comment_evidence(
             "UPDATE swap_records \
                 SET status = 'claimed', claim_txid = $2, updated_at = NOW() \
               WHERE id = $1 \
-                AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+                AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
         )
         .bind(swap_id)
         .bind(claim_txid)

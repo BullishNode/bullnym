@@ -83,12 +83,15 @@ use boltz_client::swaps::boltz::{
     GetSwapResponse, HeightResponse, Leaf, PairMinerFees, ReverseFees, ReverseLimits, ReversePair,
     Side, SwapTree, SwapType,
 };
+use boltz_client::swaps::magic_routing::find_magic_routing_hint;
 use boltz_client::swaps::BtcLikeTransaction;
 use boltz_client::util::secrets::{Preimage, SwapMasterKey};
 use boltz_client::{
     BtcSwapScript, LBtcSwapScript, PublicKey as BoltzPublicKey, ZKKeyPair, ZKSecp256k1,
 };
-use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+use lightning_invoice::{
+    Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees,
+};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
@@ -506,15 +509,40 @@ fn fresh_bolt11_for_payment_hash(
     payment_hash: bitcoin::hashes::sha256::Hash,
     description: &str,
 ) -> String {
+    fresh_bolt11_for_payment_hash_with_mrh(amount_sat, payment_hash, description, None)
+}
+
+fn fresh_bolt11_for_payment_hash_with_mrh(
+    amount_sat: u64,
+    payment_hash: bitcoin::hashes::sha256::Hash,
+    description: &str,
+    mrh_claim_public_key: Option<BoltzPublicKey>,
+) -> String {
     let private_key = SecretKey::from_slice(&[45; 32]).unwrap();
-    InvoiceBuilder::new(Currency::Bitcoin)
+    let builder = InvoiceBuilder::new(Currency::Bitcoin)
         .amount_milli_satoshis(amount_sat.saturating_mul(1_000))
         .description(description.to_owned())
         .payment_hash(payment_hash)
         .payment_secret(PaymentSecret([27; 32]))
         .duration_since_epoch(Duration::from_secs(auth_timestamp()))
         .expiry_time(Duration::from_secs(3_600))
-        .min_final_cltv_expiry_delta(144)
+        .min_final_cltv_expiry_delta(144);
+    let builder = if let Some(public_key) = mrh_claim_public_key {
+        builder.private_route(RouteHint(vec![RouteHintHop {
+            src_node_id: public_key.inner,
+            short_channel_id: 596_385_002_596_073_472,
+            fees: RoutingFees {
+                base_msat: 0,
+                proportional_millionths: 0,
+            },
+            cltv_expiry_delta: 0,
+            htlc_minimum_msat: None,
+            htlc_maximum_msat: None,
+        }]))
+    } else {
+        builder
+    };
+    builder
         .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
         .unwrap()
         .to_string()
@@ -1523,8 +1551,15 @@ async fn successful_reverse_barrier_handler(
                 request.get("descriptionHash").is_none(),
                 "current fixed checkout request unexpectedly used a description hash"
             );
-            let invoice =
-                fresh_bolt11_for_payment_hash(*invoice_amount_sat, preimage.sha256, description);
+            let invoice = fresh_bolt11_for_payment_hash_with_mrh(
+                *invoice_amount_sat,
+                preimage.sha256,
+                description,
+                request
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .map(|_| claim_public_key),
+            );
             let response = protocol_valid_reverse_response(
                 swap_id,
                 invoice.clone(),
@@ -5952,6 +5987,101 @@ async fn issue30_webhook_rejects_malformed_payload_with_retryable_status() {
 }
 
 #[tokio::test]
+async fn mrh_direct_webhook_retires_only_the_bound_payment_page_swap() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "mrhdirect").await;
+    let invoice = insert_test_invoice(&pool, "mrhdirect", &npub, "lq1mrhdirect", 3_600).await;
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("mrhdirect"),
+            boltz_swap_id: "MRH_DIRECT_BOUND",
+            address: Some("lq1mrhdirect"),
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-mrh-direct",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+    let app = test_app(test_state(pool.clone()));
+
+    let (status, body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {"id": "MRH_DIRECT_BOUND", "status": "transaction.direct"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let swap = pay_service::db::get_swap_by_boltz_id(&pool, "MRH_DIRECT_BOUND")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(swap.status, "mrh_direct");
+    let projection: (String, String, i64) = sqlx::query_as(
+        "SELECT status, settlement_status, \
+                (SELECT COUNT(*) FROM invoice_payment_events WHERE invoice_id = $1) \
+           FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projection, ("unpaid".into(), "none".into(), 0));
+
+    record_pre_050_reverse_fixture(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            key_index: None,
+            root_fingerprint: None,
+            nym: Some("mrhdirect"),
+            boltz_swap_id: "MRH_DIRECT_WRONG_ADDRESS",
+            address: Some("lq1not-the-invoice-address"),
+            address_index: None,
+            amount_sat: 1_000,
+            invoice: "lnbc-mrh-direct-wrong-address",
+            preimage_hex: "cc".repeat(32).as_str(),
+            claim_key_hex: "dd".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+    let (rejected_status, rejected_body) = post_json(
+        &app,
+        TEST_BOLTZ_WEBHOOK_CURRENT_PATH,
+        json!({
+            "event": "swap.update",
+            "data": {"id": "MRH_DIRECT_WRONG_ADDRESS", "status": "transaction.direct"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{rejected_body}"
+    );
+    let rejected = pay_service::db::get_swap_by_boltz_id(&pool, "MRH_DIRECT_WRONG_ADDRESS")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.status, "pending");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn webhook_skips_terminal_swaps() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -10022,7 +10152,18 @@ async fn terminal_latest_lightning_swap_is_withdrawn_and_replaced_not_masked_by_
         .as_str()
         .expect("reverse request preimageHash")
         .to_string();
+    assert_eq!(requests[0]["address"], "lq1lazyofferterminal");
+    assert!(requests[0]["addressSignature"]
+        .as_str()
+        .is_some_and(|signature| signature.len() == 128));
+    assert!(requests[0]["webhook"]
+        .get("status")
+        .is_none_or(Value::is_null));
     drop(requests);
+    let mrh = find_magic_routing_hint(&replacement_bolt11)
+        .unwrap()
+        .expect("Payment Page BOLT11 omitted MRH");
+    assert_eq!(mrh.src_node_id.to_string(), requested_claim_public_key);
 
     let lineage: (
         i64,
@@ -11921,6 +12062,73 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
 }
 
 #[tokio::test]
+async fn runtime_role_can_value_an_observation_without_quote_update_privilege() {
+    let admin = test_pool().await;
+    cleanup_db(&admin).await;
+    let invoice = insert_fiat_quote_test_invoice(&admin, "runtimeacl", true).await;
+    let now = i64::try_from(auth_timestamp()).unwrap();
+    let quote = pay_service::db::create_or_reuse_current_invoice_quote(
+        &admin,
+        invoice.id,
+        &pay_service::db::NewInvoiceQuoteVersion {
+            rate_minor_per_btc: 10_000_000,
+            rate_source: "test:runtime-acl",
+            rate_observed_at_unix: now - 1,
+            rate_fetched_at_unix: now,
+            rate_fresh_until_unix: now + 300,
+            minimum_merchant_amount_sat: 1,
+            maximum_merchant_amount_sat: 1_000_000,
+        },
+    )
+    .await
+    .unwrap()
+    .quote;
+    let observed_at_micros: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE bullnym_app")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&require_test_db())
+        .await
+        .unwrap();
+    let privileges: (bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege(current_user, 'invoice_quote_versions', 'SELECT'), \
+                has_table_privilege(current_user, 'invoice_quote_versions', 'UPDATE')",
+    )
+    .fetch_one(&runtime)
+    .await
+    .unwrap();
+    assert_eq!(privileges, (true, false));
+
+    let valuation = pay_service::db::late_observation_valuation_status(
+        &runtime,
+        invoice.id,
+        quote.id,
+        observed_at_micros,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        valuation,
+        pay_service::db::LateObservationValuationStatus::OnTime
+    ));
+
+    runtime.close().await;
+    cleanup_db(&admin).await;
+}
+
+#[tokio::test]
 async fn unfunded_fiat_direct_bitcoin_empty_scan_respects_payment_grace_and_constraint() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -12286,6 +12494,125 @@ async fn fiat_checkout_private_note_survives_pricer_outage_and_first_quote_owns_
     let _ = healthy_pricer_task.await;
     provider_task.abort();
     let _ = provider_task.await;
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_payment_page_lightning_quote_requests_and_returns_bound_mrh() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let nym = "fiatpagemrh";
+    create_test_user(&pool, nym).await;
+    pay_service::db::upsert_donation_page(
+        &pool,
+        &pay_service::db::UpsertDonationPage {
+            nym,
+            kind: pay_service::db::KIND_PAYMENT_PAGE,
+            ct_descriptor: TEST_DESCRIPTOR,
+            header: "Fiat Payment Page MRH",
+            description: "Lightning can settle directly to the invoice address",
+            display_currency: "USD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: true,
+            generated_og_template_version: None,
+            alias: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let first_key_index = pay_service::db::swap_key_seq_next_value(&pool)
+        .await
+        .unwrap() as u64;
+    let provider =
+        spawn_successful_reverse_barrier_server("FIAT_PAYMENT_PAGE_MRH", 10_073, first_key_index)
+            .await;
+    let (pricer_url, pricer_calls, pricer_task) = spawn_pricer_server(10_000_000).await;
+    let mut config = test_config();
+    config.boltz.api_url = provider.base_url.clone();
+    let mut state = test_state_with_config(pool.clone(), config);
+    state.pricer = Arc::new(
+        PricerClient::new(PricerConfig {
+            url: pricer_url,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let app = test_app(state);
+
+    let (create_status, created) = post_json(
+        &app,
+        &format!("/{nym}/invoice"),
+        json!({ "fiat_amount_minor": 1_000, "fiat_currency": "USD" }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK, "{created}");
+    let invoice_id = Uuid::parse_str(created["invoice_id"].as_str().unwrap()).unwrap();
+    let invoice = pay_service::db::get_invoice_by_id(&pool, invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        invoice.checkout_surface_kind.as_deref(),
+        Some(pay_service::db::KIND_PAYMENT_PAGE)
+    );
+    let liquid_address = invoice
+        .liquid_address
+        .as_deref()
+        .expect("Payment Page invoice omitted its Liquid address")
+        .to_owned();
+
+    let quote_app = app.clone();
+    let quote_path = format!("/api/v1/invoices/{invoice_id}/quote");
+    let quote = tokio::spawn(async move {
+        post_json(&quote_app, &quote_path, json!({ "rail": "lightning" })).await
+    });
+    provider.wait_until_request_is_blocked().await;
+    provider.release_response().await;
+    let (quote_status, quote_body) = quote.await.unwrap();
+    assert_eq!(quote_status, StatusCode::OK, "{quote_body}");
+    assert_eq!(quote_body["selected_rail"], "lightning", "{quote_body}");
+    assert_eq!(
+        quote_body["instruction"]["kind"], "lightning_boltz_reverse",
+        "{quote_body}"
+    );
+
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["address"], liquid_address);
+    assert!(requests[0]["addressSignature"]
+        .as_str()
+        .is_some_and(|signature| signature.len() == 128));
+    assert!(requests[0]["webhook"]
+        .get("status")
+        .is_none_or(Value::is_null));
+    let requested_claim_public_key = requests[0]["claimPublicKey"]
+        .as_str()
+        .expect("reverse request claimPublicKey");
+    let returned_bolt11 = quote_body["instruction"]["pr"]
+        .as_str()
+        .expect("Lightning quote BOLT11");
+    let mrh = find_magic_routing_hint(returned_bolt11)
+        .unwrap()
+        .expect("fiat Payment Page BOLT11 omitted MRH");
+    assert_eq!(mrh.src_node_id.to_string(), requested_claim_public_key);
+    drop(requests);
+
+    let swap_address: Option<String> =
+        sqlx::query_scalar("SELECT address FROM swap_records WHERE invoice_id = $1")
+            .bind(invoice_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(swap_address.as_deref(), Some(liquid_address.as_str()));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pricer_calls.load(Ordering::SeqCst), 1);
+
+    pricer_task.abort();
+    let _ = pricer_task.await;
+    provider.shutdown().await;
     cleanup_db(&pool).await;
 }
 

@@ -28,6 +28,10 @@ pub enum SwapStatus {
     /// claim_attempts, clear claim_tx_hex, flip cooperative_refused,
     /// status back to lockup_confirmed).
     ClaimStuck,
+    /// The payer followed the Payment Page magic routing hint and paid the
+    /// invoice address directly. This retires only the unused Boltz reverse
+    /// obligation; the Liquid watcher remains the sole settlement authority.
+    MrhDirect,
     /// Boltz auto-refunded its lockup before we claimed. The user paid
     /// the LN invoice and got nothing back — fund-loss terminal state.
     /// Reconciler is the only path that writes this; emits a P0 alert.
@@ -38,7 +42,11 @@ impl SwapStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Claimed | Self::Expired | Self::ClaimStuck | Self::LockupRefunded
+            Self::Claimed
+                | Self::Expired
+                | Self::ClaimStuck
+                | Self::MrhDirect
+                | Self::LockupRefunded
         )
     }
 
@@ -61,6 +69,7 @@ impl fmt::Display for SwapStatus {
             Self::ClaimFailed => "claim_failed",
             Self::Expired => "expired",
             Self::ClaimStuck => "claim_stuck",
+            Self::MrhDirect => "mrh_direct",
             Self::LockupRefunded => "lockup_refunded",
         })
     }
@@ -78,6 +87,7 @@ impl FromStr for SwapStatus {
             "claim_failed" => Ok(Self::ClaimFailed),
             "expired" => Ok(Self::Expired),
             "claim_stuck" => Ok(Self::ClaimStuck),
+            "mrh_direct" => Ok(Self::MrhDirect),
             "lockup_refunded" => Ok(Self::LockupRefunded),
             other => Err(format!("unknown swap status: {other}")),
         }
@@ -447,7 +457,7 @@ pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
 
 /// Forward-only status update. Refuses to write through a row whose
 /// status is already in a terminal state (claimed, expired, claim_stuck,
-/// lockup_refunded). Closes the race where, e.g., a `transaction.failed`
+/// MRH-direct, lockup_refunded). Closes the race where, e.g., a `transaction.failed`
 /// webhook arrives during a successful claim and would otherwise
 /// overwrite `Claimed → Expired`.
 ///
@@ -467,6 +477,32 @@ pub async fn update_swap_status(
     update_swap_status_with_late_valuation_candidate(pool, id, status, claim_txid, None).await
 }
 
+/// Retire an unused reverse obligation after Boltz observes an MRH payment.
+///
+/// The provider event is never settlement evidence. This transition is
+/// permitted only for a still-pending Payment Page swap whose persisted MRH
+/// address exactly matches the invoice's independently watched Liquid address.
+/// The Liquid watcher records the actual payment separately after on-chain
+/// verification.
+pub async fn mark_swap_mrh_direct(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE swap_records swap \
+            SET status = 'mrh_direct', updated_at = clock_timestamp() \
+           FROM invoices invoice \
+          WHERE swap.id = $1 \
+            AND swap.status = 'pending' \
+            AND swap.invoice_id = invoice.id \
+            AND swap.address IS NOT NULL \
+            AND swap.address = invoice.liquid_address \
+            AND invoice.origin = 'checkout' \
+            AND invoice.checkout_surface_kind = 'payment_page'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Provider-observation transition with an optional pre-fetched rate. The
 /// status trigger stamps exact first observation, and this same transaction
 /// persists a covering valuation-only quote before either fact commits.
@@ -482,7 +518,7 @@ pub async fn update_swap_status_with_late_valuation_candidate(
         "UPDATE swap_records \
          SET status = $2, claim_txid = COALESCE($3, claim_txid), updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded') \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded') \
          RETURNING invoice_id, invoice_quote_version_id, \
                    (EXTRACT(EPOCH FROM quote_payment_first_observed_at) * 1000000)::BIGINT",
     )
@@ -533,7 +569,7 @@ pub async fn mark_cooperative_refused<'e, E: sqlx::PgExecutor<'e>>(
         "UPDATE swap_records \
          SET cooperative_refused = TRUE, updated_at = NOW() \
          WHERE id = $1 AND cooperative_refused = FALSE \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
     )
     .bind(id)
     .execute(executor)
@@ -575,7 +611,7 @@ pub enum ClaimFailureOutcome {
 /// terminal-state guard rejects further updates.
 ///
 /// Forward-only: never writes through a row already in a terminal state
-/// (claimed / expired / claim_stuck / lockup_refunded).
+/// (claimed / expired / claim_stuck / MRH-direct / lockup_refunded).
 pub async fn record_claim_failure(
     pool: &PgPool,
     id: Uuid,
@@ -602,7 +638,7 @@ pub async fn record_claim_failure(
                  END \
              ) * (0.8 + 0.4 * random()) \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded') \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded') \
          RETURNING claim_attempts",
     )
     .bind(id)
@@ -622,7 +658,7 @@ pub async fn record_claim_failure(
                 "UPDATE swap_records \
                  SET status = 'claim_stuck', updated_at = NOW() \
                  WHERE id = $1 \
-                   AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+                   AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
             )
             .bind(id)
             .execute(&mut *tx)
@@ -746,7 +782,7 @@ pub(crate) const REVERSE_RECONCILER_SCAN_SQL: &str = "WITH scan AS ( \
      SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
             nym, amount_sat, invoice_id, invoice_quote_version_id \
      FROM swap_records, scan \
-     WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
+     WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck', 'mrh_direct') \
        AND updated_at <= scan.epoch - ($1 || ' seconds')::interval \
        AND ($3::uuid IS NULL OR id > $3) \
      ORDER BY id ASC \
@@ -849,7 +885,7 @@ pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sq
              END, \
              updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
     )
     .bind(id)
     .bind(CLAIM_IN_FLIGHT_LEASE)
@@ -876,7 +912,7 @@ pub async fn schedule_script_path_retry(pool: &PgPool, id: Uuid) -> Result<u64, 
              END, \
              updated_at = NOW() \
          WHERE id = $1 \
-           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'mrh_direct', 'lockup_refunded')",
     )
     .bind(id)
     .bind(CLAIM_IN_FLIGHT_LEASE)

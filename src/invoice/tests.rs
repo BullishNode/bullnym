@@ -852,6 +852,7 @@ fn invoice_fixture() -> db::Invoice {
         public_slug: None,
         npub_owner: "npub".to_string(),
         origin: "wallet".to_string(),
+        checkout_surface_kind: None,
         fiat_amount_minor: None,
         fiat_currency: None,
         amount_sat: 10_000,
@@ -883,4 +884,23 @@ fn invoice_fixture() -> db::Invoice {
         paid_at_unix: None,
         cancelled_at_unix: None,
     }
+}
+
+#[test]
+fn mrh_is_scoped_to_payment_page_invoices_with_an_existing_liquid_address() {
+    let mut invoice = invoice_fixture();
+    invoice.origin = "checkout".into();
+    invoice.accept_liquid = true;
+    invoice.checkout_surface_kind = Some(db::KIND_PAYMENT_PAGE.into());
+    invoice.liquid_address = Some("lq1paymentpage".into());
+    assert_eq!(payment_page_mrh_address(&invoice), Some("lq1paymentpage"));
+
+    invoice.accept_liquid = false;
+    assert_eq!(payment_page_mrh_address(&invoice), None);
+    invoice.accept_liquid = true;
+    invoice.checkout_surface_kind = Some(db::KIND_POS.into());
+    assert_eq!(payment_page_mrh_address(&invoice), None);
+    invoice.origin = "wallet".into();
+    invoice.checkout_surface_kind = None;
+    assert_eq!(payment_page_mrh_address(&invoice), None);
 }

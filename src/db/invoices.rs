@@ -34,6 +34,7 @@ pub struct Invoice {
     /// Canonical recipient identity (hex x-only Schnorr pubkey). Always set.
     pub npub_owner: String,
     pub origin: String,
+    pub checkout_surface_kind: Option<String>,
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     pub amount_sat: i64,
@@ -73,7 +74,8 @@ pub struct Invoice {
 /// (mirrors the SwapRecord pattern). FromRow matches by alias name, so
 /// the order is cosmetic.
 const INVOICE_COLUMNS: &str =
-    "id, nym_owner, public_slug, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
+    "id, nym_owner, public_slug, npub_owner, origin, checkout_surface_kind, \
+     fiat_amount_minor, fiat_currency, amount_sat, \
      rate_minor_per_btc, memo, recipient_label, \
      bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      public_description, invoice_number, \
@@ -692,16 +694,19 @@ pub(crate) async fn late_observation_valuation_status_locked(
     instruction_quote_version_id: Uuid,
     first_observed_at_unix_micros: i64,
 ) -> Result<LateObservationValuationStatus, sqlx::Error> {
+    // Quote versions are append-only and this transaction already owns the
+    // invoice projection lock. A PostgreSQL row-locking clause here would add
+    // no serialization but would require the deliberately withheld table-wide
+    // UPDATE privilege from the runtime role.
     let instruction: Option<(String, bool, bool)> = sqlx::query_as(
         "SELECT fiat_currency, \
                 to_timestamp($3::NUMERIC / 1000000) >= created_at \
                     AND to_timestamp($3::NUMERIC / 1000000) \
                         <= clock_timestamp() + INTERVAL '30 seconds', \
                 to_timestamp($3::NUMERIC / 1000000) < expires_at \
-           FROM invoice_quote_versions \
+          FROM invoice_quote_versions \
           WHERE id = $1 AND invoice_id = $2 \
-            AND quote_purpose = 'payer_instruction' \
-          FOR SHARE",
+            AND quote_purpose = 'payer_instruction'",
     )
     .bind(instruction_quote_version_id)
     .bind(invoice_id)
@@ -738,7 +743,7 @@ pub(crate) async fn late_observation_valuation_status_locked(
             ) \
           ORDER BY (quote_purpose = 'payer_instruction') DESC, \
                    created_at DESC, version_number DESC \
-          LIMIT 1 FOR SHARE"
+          LIMIT 1"
     ))
     .bind(invoice_id)
     .bind(instruction_quote_version_id)

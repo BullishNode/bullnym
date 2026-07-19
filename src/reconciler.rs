@@ -1932,6 +1932,9 @@ pub enum ReconcilerAction {
     /// `transaction.failed`). Terminal `expired`. User is safe — they
     /// never paid the LN invoice or Boltz never funded the lockup.
     MarkExpired,
+    /// Boltz observed a Payment Page MRH transaction. Retire only the
+    /// reverse obligation; direct settlement remains watcher-authoritative.
+    MarkMrhDirect,
     /// Boltz says the lockup was refunded. Terminal `lockup_refunded`.
     /// FUND LOSS. P0 alert.
     MarkLockupRefunded,
@@ -1946,7 +1949,7 @@ pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> Reconc
 
     let our_terminal = matches!(
         swap.status.as_str(),
-        "claimed" | "expired" | "claim_stuck" | "lockup_refunded"
+        "claimed" | "expired" | "claim_stuck" | "mrh_direct" | "lockup_refunded"
     );
     if our_terminal {
         // Reconciler scan filters terminal rows out, but be defensive:
@@ -1964,6 +1967,11 @@ pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> Reconc
         ("transaction.confirmed", "pending") => AdvanceToLockupConfirmed,
         ("transaction.confirmed", "lockup_mempool") => AdvanceToLockupConfirmed,
         ("transaction.mempool" | "transaction.confirmed", _) => ScheduleImmediateClaim,
+
+        // A direct MRH sighting is safe to terminalize only before any
+        // ordinary reverse-lockup progress. The database transition also
+        // verifies the persisted Payment Page address binding.
+        ("transaction.direct", "pending") => MarkMrhDirect,
 
         // Wall-clock invoice timer expired but the on-chain HTLC is
         // still claimable until `timeoutBlockHeight`. Cooperative is
@@ -1999,6 +2007,21 @@ async fn apply_action(
     action: ReconcilerAction,
 ) -> Result<(), sqlx::Error> {
     use ReconcilerAction::*;
+    if action == MarkMrhDirect {
+        let retired = db::mark_swap_mrh_direct(pool, swap.id).await?;
+        if retired != 1 {
+            return Err(sqlx::Error::Protocol(
+                "transaction.direct did not match a pending Payment Page MRH authority".into(),
+            ));
+        }
+        tracing::info!(
+            event = "reverse_swap_mrh_direct",
+            source = "reconciler",
+            swap_id = %swap.boltz_swap_id,
+            "retired reverse obligation; awaiting independent Liquid observation"
+        );
+        return Ok(());
+    }
     let rate = match (swap.invoice_id, swap.invoice_quote_version_id) {
         (Some(invoice_id), Some(quote_version_id)) => {
             match db::invoice_quote_currency(pool, invoice_id, quote_version_id).await? {
@@ -2023,6 +2046,7 @@ async fn apply_action(
     let candidate = rate.as_ref().and_then(invoice::quote_candidate_from_rate);
     let action_result: Result<(), sqlx::Error> = match action {
         Noop => Ok(()),
+        MarkMrhDirect => unreachable!("handled before rate lookup"),
         AdvanceToLockupMempool => {
             tracing::info!(
                 event = "reconciler_advance",

@@ -9,6 +9,7 @@ const ALL_STATUSES: &[SwapStatus] = &[
     SwapStatus::ClaimFailed,
     SwapStatus::Expired,
     SwapStatus::ClaimStuck,
+    SwapStatus::MrhDirect,
     SwapStatus::LockupRefunded,
 ];
 
@@ -43,6 +44,7 @@ fn swap_status_terminal() {
     assert!(SwapStatus::Claimed.is_terminal());
     assert!(SwapStatus::Expired.is_terminal());
     assert!(SwapStatus::ClaimStuck.is_terminal());
+    assert!(SwapStatus::MrhDirect.is_terminal());
     assert!(SwapStatus::LockupRefunded.is_terminal());
     assert!(!SwapStatus::Pending.is_terminal());
     assert!(!SwapStatus::LockupMempool.is_terminal());
@@ -61,6 +63,7 @@ fn swap_status_claimable() {
     assert!(!SwapStatus::Claimed.is_claimable());
     assert!(!SwapStatus::Expired.is_claimable());
     assert!(!SwapStatus::ClaimStuck.is_claimable());
+    assert!(!SwapStatus::MrhDirect.is_claimable());
     assert!(!SwapStatus::LockupRefunded.is_claimable());
 }
 
