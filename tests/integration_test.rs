@@ -403,13 +403,23 @@ fn test_state_with_nip05(pool: PgPool) -> AppState {
 
 #[derive(Clone, Default)]
 struct ScriptedBullBitcoinApi {
+    validation_calls: Arc<Mutex<Vec<FiatCurrency>>>,
     create_calls: Arc<AtomicUsize>,
     read_calls: Arc<AtomicUsize>,
+    validation_results: Arc<Mutex<VecDeque<Result<(), BullBitcoinError>>>>,
     create_results: Arc<Mutex<VecDeque<Result<CreatedSellOrder, BullBitcoinError>>>>,
     read_results: Arc<Mutex<VecDeque<Result<OrderObservation, BullBitcoinError>>>>,
 }
 
 impl ScriptedBullBitcoinApi {
+    async fn push_validation(&self, result: Result<(), BullBitcoinError>) {
+        self.validation_results.lock().await.push_back(result);
+    }
+
+    async fn validation_currencies(&self) -> Vec<FiatCurrency> {
+        self.validation_calls.lock().await.clone()
+    }
+
     async fn push_create(&self, result: Result<CreatedSellOrder, BullBitcoinError>) {
         self.create_results.lock().await.push_back(result);
     }
@@ -429,6 +439,19 @@ impl ScriptedBullBitcoinApi {
 
 #[async_trait]
 impl BullBitcoinApi for ScriptedBullBitcoinApi {
+    async fn validate_sell_to_balance(
+        &self,
+        _key: &ScopedApiKey,
+        currency: FiatCurrency,
+    ) -> Result<(), BullBitcoinError> {
+        self.validation_calls.lock().await.push(currency);
+        self.validation_results
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
     async fn create_sell_to_balance(
         &self,
         _key: &ScopedApiKey,
@@ -480,7 +503,7 @@ async fn fiat_lifecycle_test_state(
         100,
         FiatCurrency::CAD,
         i64::try_from(auth_timestamp()).unwrap(),
-        Some(pay_service::db::NewEncryptedCredential {
+        pay_service::db::FiatSettlementCredential::New(pay_service::db::NewEncryptedCredential {
             id: credential_id,
             encrypted,
         }),
@@ -526,6 +549,68 @@ fn scripted_created_order(order_id: Uuid) -> CreatedSellOrder {
         },
         expires_at_unix: Some(2_000_000_000),
     }
+}
+
+fn fiat_activation_test_state(pool: PgPool, fake: ScriptedBullBitcoinApi) -> AppState {
+    let mut config = test_config();
+    config.features.bull_bitcoin_fiat_settlement = true;
+    config.bull_bitcoin_credential_encryption_key =
+        Some(pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap());
+    let mut state = test_state_with_config(pool, config);
+    state.bull_bitcoin = Arc::new(fake);
+    state
+}
+
+fn signed_fiat_set_body(
+    keypair: &Keypair,
+    npub: &str,
+    product: Product,
+    percentage: u8,
+    currency: Option<FiatCurrency>,
+    api_key: Option<&str>,
+    timestamp: u64,
+) -> Value {
+    let percentage_field = percentage.to_string();
+    let currency_field = currency.map(FiatCurrency::as_str).unwrap_or("");
+    let terms_field = if percentage == 0 {
+        ""
+    } else {
+        pay_service::bull_bitcoin::TERMS_VERSION
+    };
+    let key_field = api_key.unwrap_or("");
+    let signature = sign_la_action_with_timestamp(
+        keypair,
+        fiat_settlement::ACTION_SET,
+        npub,
+        "",
+        &[
+            "1",
+            product.as_str(),
+            &percentage_field,
+            currency_field,
+            terms_field,
+            key_field,
+        ],
+        timestamp,
+    );
+    let mut body = json!({
+        "version": 1,
+        "npub": npub,
+        "fiat_percentage": percentage,
+        "timestamp": timestamp,
+        "signature": signature,
+    });
+    let object = body.as_object_mut().unwrap();
+    if let Some(currency) = currency {
+        object.insert("fiat_currency".into(), json!(currency.as_str()));
+    }
+    if percentage > 0 {
+        object.insert("terms_version".into(), json!(terms_field));
+    }
+    if let Some(api_key) = api_key {
+        object.insert("api_key".into(), json!(api_key));
+    }
+    body
 }
 
 fn scripted_liquid_order(order_id: Uuid, amount_sat: i64) -> CreatedSellOrder {
@@ -588,7 +673,9 @@ async fn mixed_reverse_fixture(
         fiat_percentage,
         FiatCurrency::CAD,
         i64::try_from(auth_timestamp()).unwrap(),
-        None,
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
     )
     .await
     .unwrap();
@@ -2074,11 +2161,8 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
         .await
         .unwrap();
 
-    let mut config = test_config();
-    config.features.bull_bitcoin_fiat_settlement = true;
-    config.bull_bitcoin_credential_encryption_key =
-        Some(pay_service::config::BullBitcoinEncryptionKey::parse_hex(&"42".repeat(32)).unwrap());
-    let app = test_app(test_state_with_config(pool.clone(), config));
+    let fake = ScriptedBullBitcoinApi::default();
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
 
     let timestamp = auth_timestamp();
     let api_key = format!("bbak-{}", "ab".repeat(32));
@@ -2177,6 +2261,10 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
     .await;
     assert_eq!(pos_status, StatusCode::OK, "{pos_response:?}");
     assert_eq!(pos_response["settings"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fake.validation_currencies().await,
+        vec![FiatCurrency::CAD, FiatCurrency::CAD, FiatCurrency::EUR]
+    );
 
     let get_timestamp = auth_timestamp();
     let get_signature = sign_la_action_with_timestamp(
@@ -2234,6 +2322,263 @@ async fn fiat_settlement_signed_configuration_never_returns_or_stores_plaintext_
     .await
     .unwrap();
     assert_eq!(erased, (None, None, true));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_eligibility_denial_is_stable_and_persists_nothing() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) = sign_registration_with_keypair("fiat-kyc-denied", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-kyc-denied", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_validation(Err(BullBitcoinError::BenchmarkEligibilityDenied))
+        .await;
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "cd".repeat(32));
+    let body = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Invoice,
+        50,
+        Some(FiatCurrency::CAD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/invoice", body).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert_eq!(
+        response["reason"],
+        "To activate fiat conversion, your account needs to have the right KYC permissions. Please update your KYC to have unlimited trading."
+    );
+    assert!(!response.to_string().contains(&api_key));
+    assert_eq!(fake.validation_currencies().await, vec![FiatCurrency::CAD]);
+    let persisted = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (0, 0));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_failed_update_is_atomic_and_disable_skips_preflight() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-update-denied", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-update-denied", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "de".repeat(32));
+    let initial = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        40,
+        Some(FiatCurrency::CAD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", initial).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+
+    let before = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
+        "SELECT credential.id, credential.ciphertext, credential.nonce, \
+                setting.fiat_percentage, setting.fiat_currency, \
+                extract(epoch FROM setting.terms_accepted_at)::BIGINT \
+           FROM fiat_settlement_settings setting \
+           JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
+          WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    fake.push_validation(Err(BullBitcoinError::BenchmarkEligibilityDenied))
+        .await;
+    let update = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        75,
+        Some(FiatCurrency::EUR),
+        None,
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", update).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    let after = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i16, String, i64)>(
+        "SELECT credential.id, credential.ciphertext, credential.nonce, \
+                setting.fiat_percentage, setting.fiat_currency, \
+                extract(epoch FROM setting.terms_accepted_at)::BIGINT \
+           FROM fiat_settlement_settings setting \
+           JOIN bull_bitcoin_credentials credential ON credential.id = setting.credential_id \
+          WHERE setting.owner_npub = $1 AND setting.product = 'payment_page'",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        fake.validation_currencies().await,
+        vec![FiatCurrency::CAD, FiatCurrency::EUR]
+    );
+
+    let disable = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::PaymentPage,
+        0,
+        None,
+        None,
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/payment_page", disable).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert!(response["settings"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fake.validation_currencies().await,
+        vec![FiatCurrency::CAD, FiatCurrency::EUR]
+    );
+    let remaining = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials \
+               WHERE owner_npub = $1 AND admitted_for_new_orders), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, (1, 0));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_auth_and_transient_preflight_failures_are_not_kyc_errors() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let (npub, _, _, keypair) =
+        sign_registration_with_keypair("fiat-preflight-errors", TEST_DESCRIPTOR);
+    pay_service::db::create_user(&pool, "fiat-preflight-errors", &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    let fake = ScriptedBullBitcoinApi::default();
+    fake.push_validation(Err(BullBitcoinError::Authentication))
+        .await;
+    let app = test_app(fiat_activation_test_state(pool.clone(), fake.clone()));
+    let api_key = format!("bbak-{}", "ef".repeat(32));
+
+    let auth_failure = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Pos,
+        100,
+        Some(FiatCurrency::USD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", auth_failure).await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["code"], "InvalidAmount");
+    assert!(response["reason"].as_str().unwrap().contains("Reconnect"));
+    assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert!(!response.to_string().contains(&api_key));
+
+    fake.push_validation(Err(BullBitcoinError::Timeout)).await;
+    let transient_failure = signed_fiat_set_body(
+        &keypair,
+        &npub,
+        Product::Pos,
+        100,
+        Some(FiatCurrency::USD),
+        Some(&api_key),
+        auth_timestamp(),
+    );
+    let (status, response) = put_json(&app, "/api/v1/fiat-settlement/pos", transient_failure).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
+    assert_eq!(response["code"], "ServiceUnavailable");
+    assert_ne!(response["code"], "FIAT_CONVERSION_KYC_REQUIRED");
+    assert!(!response.to_string().contains(&api_key));
+    let persisted = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM bull_bitcoin_credentials WHERE owner_npub = $1), \
+             (SELECT COUNT(*) FROM fiat_settlement_settings WHERE owner_npub = $1)",
+    )
+    .bind(&npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (0, 0));
+    assert_eq!(
+        fake.validation_currencies().await,
+        vec![FiatCurrency::USD, FiatCurrency::USD]
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn fiat_settlement_stale_credential_id_cannot_commit_after_preflight() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let fake = ScriptedBullBitcoinApi::default();
+    let (_, owner_npub, credential_id, _) =
+        fiat_lifecycle_test_state(&pool, fake, "fiat-stale-credential").await;
+
+    let result = pay_service::db::upsert_fiat_settlement_setting(
+        &pool,
+        &owner_npub,
+        Product::Invoice,
+        50,
+        FiatCurrency::EUR,
+        i64::try_from(auth_timestamp()).unwrap(),
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: Uuid::new_v4(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(pay_service::db::FiatSettlementStoreError::CredentialChanged)
+    ));
+
+    let active_credential = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM bull_bitcoin_credentials \
+          WHERE owner_npub = $1 AND admitted_for_new_orders",
+    )
+    .bind(&owner_npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_credential, credential_id);
+    let invoice_settings = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM fiat_settlement_settings \
+          WHERE owner_npub = $1 AND product = 'invoice'",
+    )
+    .bind(&owner_npub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(invoice_settings, 0);
 
     cleanup_db(&pool).await;
 }
@@ -2482,7 +2827,9 @@ async fn bull_bitcoin_exact_payer_intent_replays_after_setting_change_or_deletio
         40,
         FiatCurrency::EUR,
         i64::try_from(auth_timestamp()).unwrap(),
-        None,
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
     )
     .await
     .unwrap();
@@ -3263,7 +3610,9 @@ async fn bull_bitcoin_invoice_reconciliation_is_idempotent_private_and_repairs_a
         100,
         FiatCurrency::CAD,
         i64::try_from(auth_timestamp()).unwrap(),
-        None,
+        pay_service::db::FiatSettlementCredential::Existing {
+            expected_id: credential_id,
+        },
     )
     .await
     .unwrap();

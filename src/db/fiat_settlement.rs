@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 use crate::bull_bitcoin::{EncryptedCredential, FiatCurrency, Product, TERMS_VERSION};
 
+use super::bull_bitcoin_settlements::StoredEncryptedCredential;
+
 pub(super) const OWNER_LOCK_NAMESPACE: i64 = 7_111_929_681_017_003_517;
 
 #[derive(Debug)]
@@ -10,6 +12,7 @@ pub enum FiatSettlementStoreError {
     SourceIdentityNotActive,
     CredentialRequired,
     CredentialDraining,
+    CredentialChanged,
     Sqlx(sqlx::Error),
 }
 
@@ -23,6 +26,12 @@ impl From<sqlx::Error> for FiatSettlementStoreError {
 pub struct NewEncryptedCredential {
     pub id: Uuid,
     pub encrypted: EncryptedCredential,
+}
+
+#[derive(Clone, Debug)]
+pub enum FiatSettlementCredential {
+    Existing { expected_id: Uuid },
+    New(NewEncryptedCredential),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
@@ -54,11 +63,29 @@ pub async fn upsert_fiat_settlement_setting(
     fiat_percentage: i16,
     fiat_currency: FiatCurrency,
     signed_at_unix: i64,
-    new_credential: Option<NewEncryptedCredential>,
+    credential: FiatSettlementCredential,
 ) -> Result<FiatSettlementConfiguration, FiatSettlementStoreError> {
     let mut transaction = pool.begin().await?;
     lock_owner(&mut transaction, owner_npub).await?;
     require_active_identity(&mut transaction, owner_npub).await?;
+
+    if let FiatSettlementCredential::Existing {
+        expected_id: expected_credential_id,
+    } = &credential
+    {
+        let active_credential_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id \
+               FROM bull_bitcoin_credentials \
+              WHERE owner_npub = $1 AND admitted_for_new_orders \
+              FOR UPDATE",
+        )
+        .bind(owner_npub)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if active_credential_id != Some(*expected_credential_id) {
+            return Err(FiatSettlementStoreError::CredentialChanged);
+        }
+    }
 
     // An exact retried signed mutation is already complete. Do not rotate the
     // credential a second time merely because the client did not receive the
@@ -97,8 +124,8 @@ pub async fn upsert_fiat_settlement_setting(
         .fetch_optional(&mut *transaction)
         .await?;
 
-        let credential_id = match new_credential {
-            Some(new_credential) => {
+        let credential_id = match credential {
+            FiatSettlementCredential::New(new_credential) => {
                 if let Some(old_id) = active_credential {
                     if credential_has_live_dependencies(&mut transaction, old_id).await? {
                         return Err(FiatSettlementStoreError::CredentialDraining);
@@ -129,7 +156,9 @@ pub async fn upsert_fiat_settlement_setting(
                 .await?;
                 new_credential.id
             }
-            None => active_credential.ok_or(FiatSettlementStoreError::CredentialRequired)?,
+            FiatSettlementCredential::Existing { .. } => {
+                active_credential.ok_or(FiatSettlementStoreError::CredentialRequired)?
+            }
         };
 
         sqlx::query(
@@ -159,6 +188,40 @@ pub async fn upsert_fiat_settlement_setting(
     let configuration = select_configuration_in_transaction(&mut transaction, owner_npub).await?;
     transaction.commit().await?;
     Ok(configuration)
+}
+
+pub async fn load_active_bull_bitcoin_credential(
+    pool: &PgPool,
+    owner_npub: &str,
+) -> Result<Option<StoredEncryptedCredential>, FiatSettlementStoreError> {
+    let row = sqlx::query_as::<_, (Uuid, String, Vec<u8>, Vec<u8>, i16)>(
+        "SELECT id, owner_npub, ciphertext, nonce, encryption_format \
+           FROM bull_bitcoin_credentials \
+          WHERE owner_npub = $1 \
+            AND admitted_for_new_orders \
+            AND ciphertext IS NOT NULL \
+            AND nonce IS NOT NULL",
+    )
+    .bind(owner_npub)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|(id, owner_npub, ciphertext, nonce, format_version)| {
+        let nonce: [u8; 24] = nonce.try_into().map_err(|_| {
+            sqlx::Error::Decode("Bull Bitcoin credential nonce has the wrong length".into())
+        })?;
+        Ok::<StoredEncryptedCredential, sqlx::Error>(StoredEncryptedCredential {
+            id,
+            owner_npub,
+            encrypted: EncryptedCredential {
+                ciphertext,
+                nonce,
+                format_version,
+            },
+        })
+    })
+    .transpose()
+    .map_err(FiatSettlementStoreError::from)
 }
 
 pub async fn delete_fiat_settlement_setting(

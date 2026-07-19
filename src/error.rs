@@ -67,6 +67,9 @@ pub enum AppError {
 
     // --- Amount validation (LNURL callback) ---
     InvalidAmount(String),
+    /// The authenticated Bull Bitcoin account cannot pass the server-owned
+    /// fiat-settlement eligibility benchmark at activation time.
+    FiatConversionKycRequired,
     /// LUD-12 comment validation or stable-retry failure. The inner value is
     /// always server-authored static text and must never contain payer input.
     InvalidComment(&'static str),
@@ -170,6 +173,7 @@ impl AppError {
             | Self::UtxoSpent
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
+            | Self::FiatConversionKycRequired
             | Self::InvalidComment(_)
             | Self::RecoveryAddressInvalid(_)
             | Self::RecoveryNotAvailable(_)
@@ -221,6 +225,7 @@ impl AppError {
             Self::PubkeyUtxoMismatch => "PubkeyUtxoMismatch",
 
             Self::InvalidAmount(_) => "InvalidAmount",
+            Self::FiatConversionKycRequired => "FIAT_CONVERSION_KYC_REQUIRED",
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
@@ -286,6 +291,9 @@ impl std::fmt::Display for AppError {
             Self::PubkeyUtxoMismatch => write!(f, "pubkey/utxo mismatch"),
 
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
+            Self::FiatConversionKycRequired => {
+                write!(f, "Bull Bitcoin fiat-conversion eligibility is required")
+            }
             Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
@@ -366,6 +374,7 @@ impl IntoResponse for AppError {
             AppError::PubkeyUtxoMismatch => "The proof-of-funds public key does not match the script of the referenced UTXO.".into(),
 
             AppError::InvalidAmount(reason) => reason.clone(),
+            AppError::FiatConversionKycRequired => "To activate fiat conversion, your account needs to have the right KYC permissions. Please update your KYC to have unlimited trading.".into(),
             AppError::InvalidComment(reason) => (*reason).to_string(),
             AppError::BitcoinAddressAlreadyUsed => {
                 "This Bitcoin address is already assigned to an invoice. Generate a fresh receive address and try again.".into()

@@ -1083,6 +1083,7 @@ fn fallback_for_create_error(error: BullBitcoinError) -> FallbackCategory {
         BullBitcoinError::Minimum => FallbackCategory::BelowMinimum,
         BullBitcoinError::Maximum
         | BullBitcoinError::Policy
+        | BullBitcoinError::BenchmarkEligibilityDenied
         | BullBitcoinError::Authentication
         | BullBitcoinError::NotFound
         | BullBitcoinError::InvalidApiKey
@@ -1433,5 +1434,9 @@ mod tests {
                 FallbackCategory::AmbiguousCreate
             );
         }
+        assert_eq!(
+            fallback_for_create_error(BullBitcoinError::BenchmarkEligibilityDenied),
+            FallbackCategory::ConversionUnavailable
+        );
     }
 }

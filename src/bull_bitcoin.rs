@@ -446,6 +446,12 @@ pub struct OrderObservation {
 
 #[async_trait]
 pub trait BullBitcoinApi: Send + Sync {
+    async fn validate_sell_to_balance(
+        &self,
+        key: &ScopedApiKey,
+        currency: FiatCurrency,
+    ) -> Result<(), BullBitcoinError>;
+
     async fn create_sell_to_balance(
         &self,
         key: &ScopedApiKey,
@@ -469,6 +475,7 @@ pub enum BullBitcoinError {
     InvalidFiatAmount,
     CredentialEncryption,
     Authentication,
+    BenchmarkEligibilityDenied,
     NotFound,
     Minimum,
     Maximum,
@@ -491,6 +498,9 @@ impl fmt::Display for BullBitcoinError {
             Self::InvalidFiatAmount => "invalid fiat amount",
             Self::CredentialEncryption => "Bull Bitcoin credential cryptography failed",
             Self::Authentication => "Bull Bitcoin credential is unavailable",
+            Self::BenchmarkEligibilityDenied => {
+                "Bull Bitcoin fiat-settlement eligibility benchmark was denied"
+            }
             Self::NotFound => "Bull Bitcoin order is unavailable",
             Self::Minimum => "amount is below the Bull Bitcoin minimum",
             Self::Maximum => "amount is above the Bull Bitcoin maximum",

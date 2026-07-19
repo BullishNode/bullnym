@@ -92,6 +92,27 @@ impl HttpBullBitcoinApi {
 
 #[async_trait]
 impl BullBitcoinApi for HttpBullBitcoinApi {
+    async fn validate_sell_to_balance(
+        &self,
+        key: &ScopedApiKey,
+        currency: FiatCurrency,
+    ) -> Result<(), BullBitcoinError> {
+        let body = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"bullnym\",\"method\":\"validateSellToBalance\",\"params\":{{\"fiatCurrency\":\"{}\"}}}}",
+            currency.as_str(),
+        );
+        let result = self.post_rpc(key, body, false).await?;
+        match result.as_object() {
+            Some(object)
+                if object.len() == 1
+                    && object.get("eligible").and_then(Value::as_bool) == Some(true) =>
+            {
+                Ok(())
+            }
+            _ => Err(BullBitcoinError::MalformedResponse),
+        }
+    }
+
     async fn create_sell_to_balance(
         &self,
         key: &ScopedApiKey,
@@ -165,6 +186,11 @@ fn classify_transport_error(error: reqwest::Error) -> BullBitcoinError {
 }
 
 fn classify_rpc_error(error: &Value, create_call: bool) -> BullBitcoinError {
+    if error.pointer("/data/apiError/code").and_then(Value::as_str)
+        == Some("SELL_TO_BALANCE_KYC_REQUIRED")
+    {
+        return BullBitcoinError::BenchmarkEligibilityDenied;
+    }
     if let Some(operator) = error
         .pointer("/data/reason/limit/conditionalOperator")
         .and_then(Value::as_str)
@@ -443,11 +469,13 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
+        let is_validation =
+            body.get("method").and_then(Value::as_str) == Some("validateSellToBalance");
         *capture.0.lock().await = Some((headers, body));
-        Json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "bullnym",
-            "result": {
+        let result = if is_validation {
+            serde_json::json!({"eligible": true})
+        } else {
+            serde_json::json!({
                 "orderId": "11111111-1111-4111-8111-111111111111",
                 "payinAmount": 0.001,
                 "payoutAmount": 50.25,
@@ -457,8 +485,28 @@ mod tests {
                 "payoutStatus": "Not started",
                 "bitcoinAddress": BTC_ADDRESS,
                 "confirmationDeadline": "2099-07-19T12:00:00Z"
-            }
+            })
+        };
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "bullnym",
+            "result": result
         }))
+    }
+
+    async fn client_for_app(
+        app: Router,
+        request_timeout_ms: u64,
+    ) -> (HttpBullBitcoinApi, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = BullBitcoinConfig {
+            api_url: format!("http://{address}/ak/api-orders"),
+            request_timeout_ms,
+            ..BullBitcoinConfig::default()
+        };
+        (HttpBullBitcoinApi::new(&config).unwrap(), task)
     }
 
     async fn test_client() -> (HttpBullBitcoinApi, Capture, tokio::task::JoinHandle<()>) {
@@ -508,6 +556,140 @@ mod tests {
         assert_eq!(body["params"]["usePayjoin"], true);
         assert!(body["params"].get("fiatAmount").is_none());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn eligibility_call_is_minimal_and_uses_the_scoped_key() {
+        let (client, capture, task) = test_client().await;
+        for currency in FiatCurrency::ALL {
+            client
+                .validate_sell_to_balance(&key(), currency)
+                .await
+                .unwrap();
+
+            let (headers, body) = capture.0.lock().await.take().unwrap();
+            assert_eq!(headers.get("x-api-key").unwrap(), key().expose());
+            assert_eq!(body["method"], "validateSellToBalance");
+            assert_eq!(
+                body["params"],
+                serde_json::json!({"fiatCurrency": currency.as_str()})
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn eligibility_denial_auth_and_upstream_failures_remain_distinct() {
+        async fn denied() -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "bullnym",
+                "error": {
+                    "code": -32602,
+                    "message": "eligibility denied",
+                    "data": {"apiError": {"code": "SELL_TO_BALANCE_KYC_REQUIRED"}}
+                }
+            }))
+        }
+        let (client, task) =
+            client_for_app(Router::new().route("/ak/api-orders", post(denied)), 1_000).await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
+                .await,
+            Err(BullBitcoinError::BenchmarkEligibilityDenied)
+        );
+        task.abort();
+
+        async fn unauthorized() -> StatusCode {
+            StatusCode::UNAUTHORIZED
+        }
+        let (client, task) = client_for_app(
+            Router::new().route("/ak/api-orders", post(unauthorized)),
+            1_000,
+        )
+        .await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
+                .await,
+            Err(BullBitcoinError::Authentication)
+        );
+        task.abort();
+
+        async fn unavailable() -> StatusCode {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        let (client, task) = client_for_app(
+            Router::new().route("/ak/api-orders", post(unavailable)),
+            1_000,
+        )
+        .await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::CAD)
+                .await,
+            Err(BullBitcoinError::Upstream)
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn eligibility_rejects_nonminimal_success_and_times_out_safely() {
+        async fn nonminimal() -> Json<Value> {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "bullnym",
+                "result": {"eligible": true, "kycTier": "must-not-be-consumed"}
+            }))
+        }
+        let (client, task) = client_for_app(
+            Router::new().route("/ak/api-orders", post(nonminimal)),
+            1_000,
+        )
+        .await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::USD)
+                .await,
+            Err(BullBitcoinError::MalformedResponse)
+        );
+        task.abort();
+
+        async fn slow() -> Json<Value> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "bullnym",
+                "result": {"eligible": true}
+            }))
+        }
+        let (client, task) =
+            client_for_app(Router::new().route("/ak/api-orders", post(slow)), 5).await;
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::USD)
+                .await,
+            Err(BullBitcoinError::Timeout)
+        );
+        task.abort();
+
+        let config = BullBitcoinConfig {
+            // No service can listen on TCP port zero; this deterministically
+            // exercises connection failure without racing another test for a
+            // recently released ephemeral port.
+            api_url: "http://127.0.0.1:0/ak/api-orders".into(),
+            connect_timeout_ms: 100,
+            request_timeout_ms: 100,
+            ..BullBitcoinConfig::default()
+        };
+        let client = HttpBullBitcoinApi::new(&config).unwrap();
+        assert_eq!(
+            client
+                .validate_sell_to_balance(&key(), FiatCurrency::USD)
+                .await,
+            Err(BullBitcoinError::Transport)
+        );
     }
 
     #[test]
@@ -567,6 +749,15 @@ mod tests {
         assert_eq!(
             classify_rpc_error(&minimum, true),
             BullBitcoinError::Minimum
+        );
+        assert_eq!(
+            classify_rpc_error(
+                &serde_json::json!({
+                    "data": {"apiError": {"code": "SELL_TO_BALANCE_KYC_REQUIRED"}}
+                }),
+                false
+            ),
+            BullBitcoinError::BenchmarkEligibilityDenied
         );
         assert_eq!(
             classify_rpc_error(&serde_json::json!({"message": "API key denied"}), false),

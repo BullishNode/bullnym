@@ -19,7 +19,10 @@ use crate::bull_bitcoin::{
     CredentialCipher, FiatCurrency, Product, ScopedApiKey, COMMON_DISCLOSURE, TERMS_REFERENCE,
     TERMS_VERSION,
 };
-use crate::db::{self, CredentialLifecycle, FiatSettlementStoreError, NewEncryptedCredential};
+use crate::db::{
+    self, CredentialLifecycle, FiatSettlementCredential, FiatSettlementStoreError,
+    NewEncryptedCredential,
+};
 use crate::error::AppError;
 use crate::registration;
 use crate::AppState;
@@ -226,19 +229,50 @@ pub async fn set(
         .currency
         .ok_or_else(|| AppError::InvalidAmount("A fiat currency is required.".into()))?;
 
+    let encryption_key = state
+        .config
+        .bull_bitcoin_credential_encryption_key
+        .clone()
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(
+                "fiat settlement credential encryption is unavailable".into(),
+            )
+        })?;
+    let (stored_key, expected_credential_id) = if verified.api_key.is_some() {
+        (None, None)
+    } else {
+        let credential = db::load_active_bull_bitcoin_credential(&state.db, verified.npub())
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| map_store_error(FiatSettlementStoreError::CredentialRequired))?;
+        if credential.owner_npub != verified.npub() {
+            return Err(AppError::DbError(
+                "Bull Bitcoin credential owner binding failed".into(),
+            ));
+        }
+        let credential_id = credential.id;
+        let scoped_key = CredentialCipher::new(encryption_key.clone())
+            .decrypt(credential.id, &credential.owner_npub, &credential.encrypted)
+            .map_err(|_| {
+                AppError::ServiceUnavailable("fiat settlement credential is unavailable".into())
+            })?;
+        (Some(scoped_key), Some(credential_id))
+    };
+    let validation_key = verified
+        .api_key
+        .as_ref()
+        .or(stored_key.as_ref())
+        .ok_or_else(|| map_store_error(FiatSettlementStoreError::CredentialRequired))?;
+    state
+        .bull_bitcoin
+        .validate_sell_to_balance(validation_key, currency)
+        .await
+        .map_err(map_preflight_error)?;
+
     let encrypted = match verified.api_key {
         Some(ref api_key) => {
-            let key = state
-                .config
-                .bull_bitcoin_credential_encryption_key
-                .clone()
-                .ok_or_else(|| {
-                    AppError::ServiceUnavailable(
-                        "fiat settlement credential encryption is unavailable".into(),
-                    )
-                })?;
             let id = Uuid::new_v4();
-            let encrypted = CredentialCipher::new(key)
+            let encrypted = CredentialCipher::new(encryption_key)
                 .encrypt(id, verified.npub(), api_key)
                 .map_err(|_| {
                     AppError::DbError("Bull Bitcoin credential encryption failed".into())
@@ -248,6 +282,13 @@ pub async fn set(
         None => None,
     };
 
+    let credential = match encrypted {
+        Some(credential) => FiatSettlementCredential::New(credential),
+        None => FiatSettlementCredential::Existing {
+            expected_id: expected_credential_id
+                .ok_or_else(|| map_store_error(FiatSettlementStoreError::CredentialRequired))?,
+        },
+    };
     let result = db::upsert_fiat_settlement_setting(
         &state.db,
         verified.npub(),
@@ -255,7 +296,7 @@ pub async fn set(
         i16::from(verified.percentage),
         currency,
         verified.signed_at_unix,
-        encrypted,
+        credential,
     )
     .await
     .map_err(map_store_error)?;
@@ -538,9 +579,44 @@ fn map_store_error(error: FiatSettlementStoreError) -> AppError {
         FiatSettlementStoreError::CredentialDraining => AppError::ServiceUnavailable(
             "the previous scoped credential still supervises a settlement".into(),
         ),
+        FiatSettlementStoreError::CredentialChanged => AppError::ServiceUnavailable(
+            "the scoped credential changed while eligibility was being checked; retry".into(),
+        ),
         FiatSettlementStoreError::Sqlx(_) => {
             AppError::DbError("fiat-settlement persistence failed".into())
         }
+    }
+}
+
+fn map_preflight_error(error: crate::bull_bitcoin::BullBitcoinError) -> AppError {
+    use crate::bull_bitcoin::BullBitcoinError;
+
+    match error {
+        BullBitcoinError::BenchmarkEligibilityDenied => AppError::FiatConversionKycRequired,
+        BullBitcoinError::Authentication | BullBitcoinError::InvalidApiKey => {
+            AppError::InvalidAmount(
+                "Reconnect your Bull Bitcoin account before activating fiat conversion.".into(),
+            )
+        }
+        BullBitcoinError::Timeout
+        | BullBitcoinError::Transport
+        | BullBitcoinError::Upstream
+        | BullBitcoinError::MalformedResponse
+        | BullBitcoinError::NotFound => {
+            AppError::ServiceUnavailable("Bull Bitcoin eligibility check is unavailable".into())
+        }
+        BullBitcoinError::InvalidOwner
+        | BullBitcoinError::InvalidProduct
+        | BullBitcoinError::InvalidCurrency
+        | BullBitcoinError::InvalidBitcoinAmount
+        | BullBitcoinError::InvalidFiatAmount
+        | BullBitcoinError::CredentialEncryption
+        | BullBitcoinError::Minimum
+        | BullBitcoinError::Maximum
+        | BullBitcoinError::Policy
+        | BullBitcoinError::Integrity => AppError::ServiceUnavailable(
+            "Bull Bitcoin eligibility check returned an unsupported result".into(),
+        ),
     }
 }
 
