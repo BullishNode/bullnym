@@ -15,9 +15,8 @@ callbacks.
   "amount_sat": 10000,
   "fiat_amount_minor": null,
   "fiat_currency": null,
-  "public_description": "Order 42",
-  "recipient_name": "Alice",
-  "invoice_number": "42",
+  "client_request_id": "5e5f6f6a-6caf-4f42-99b7-80f3212cd540",
+  "presentation_envelope": "<5500-character base64url>",
   "accept_btc": true,
   "accept_ln": true,
   "accept_liquid": true,
@@ -53,9 +52,8 @@ Additional create constraints:
 | `amount_sat` | Positive and within the server's configured LNURL min/max after converting those limits from msat. |
 | `fiat_amount_minor` | `1..=1,000,000,000`; the converted sat amount must also fit the configured min/max. |
 | `fiat_currency` | Case-normalized by the server and present in `/api/v1/supported-currencies`. |
-| `public_description` | At most 1,000 bytes. |
-| `recipient_name` | Required current wire key; at most 100 bytes. Unknown or legacy field names are rejected. |
-| `invoice_number` | At most 50 bytes. |
+| `client_request_id` | Random UUID v4 generated once before the first network attempt. Reuse it only for byte-identical retries. |
+| `presentation_envelope` | Exactly 4,125 private-invoice-v1 bytes encoded as 5,500 characters of canonical unpadded base64url. Bullnym validates only this opaque framing. |
 | `expires_at_unix` | Omit for 30 days, or set between 60 seconds and 30 days in the future at processing time. |
 | addresses | Valid canonical Bitcoin mainnet addresses or confidential Liquid mainnet addresses. The signature commits to the raw submitted strings before server canonicalization. |
 | `liquid_blinding_key_hex` | Required and checked against the address only when `accept_liquid` is true. |
@@ -95,9 +93,9 @@ Linking provides merchant branding/routing but reveals the nym. Unlinked
 invoices remain associated with the signing `npub` internally and in the signed
 list API.
 
-The response's `share_url` follows the creation route:
+The response's fragmentless `invoice_url` follows the creation route:
 
-| Create route | `share_url` |
+| Create route | `invoice_url` |
 |---|---|
 | `POST /api/v1/:nym/invoices` | `https://pay.example.com/:nym/i/:invoice_id` |
 | `POST /api/v1/invoices` | `https://pay.example.com/invoice/:invoice_id` |
@@ -107,9 +105,34 @@ Example unlinked response:
 ```json
 {
   "invoice_id": "00000000-0000-0000-0000-000000000000",
-  "share_url": "https://pay.example.com/invoice/00000000-0000-0000-0000-000000000000"
+  "invoice_url": "https://pay.example.com/invoice/00000000-0000-0000-0000-000000000000"
 }
 ```
+
+`invoice_url` is a construction value, not the merchant-facing share value.
+Mobile appends `#v1.<43-character-viewing-key>` locally and exposes only that
+complete private link through its Copy, Share, and QR actions. The view key is
+never sent to Bullnym. See [private invoice presentation v1](../protocols/private-invoice-v1.md).
+
+An authenticated retry with the same owner, `client_request_id`, and exact
+signed fields returns the original invoice and URL even if admission or the
+invoice lifecycle changed after commit. Reusing the identifier for any other
+signed payload returns HTTP 409 `InvoiceCreateConflict`.
+
+### Private presentation
+
+`GET /api/v1/invoices/:id/presentation` is public and returns only the stored
+opaque envelope:
+
+```json
+{ "presentation_envelope": "<5500-character base64url>" }
+```
+
+It returns `InvoiceNotFound` for checkout invoices and unknown IDs. The payer
+browser obtains the AES key only from the URL fragment, scrubs that fragment
+from the address bar after retaining it in tab-scoped `sessionStorage`, and
+decrypts locally. Missing, corrupted, or invalid private data produces a
+generic warning but does not remove the normal payment instructions.
 
 ## List
 
@@ -141,10 +164,7 @@ Each `invoices` item contains:
 | `remaining_amount_sat` | Amount still due in sats |
 | `fiat_amount_minor` | Original fiat minor-unit amount, or `null` |
 | `fiat_currency` | Original ISO currency code, or `null` |
-| `public_description` | Payer-visible description, or `null` |
 | `memo` | Private merchant note, or `null`; checkout `note` is exposed here but never on public status/render routes |
-| `recipient_name` | Recipient display label, or `null` |
-| `invoice_number` | Merchant invoice reference, or `null` |
 | `accept_btc` | Whether direct/on-chain Bitcoin was enabled |
 | `accept_ln` | Whether Lightning was enabled |
 | `accept_liquid` | Whether Liquid was enabled |
@@ -160,7 +180,8 @@ Each `invoices` item contains:
 at 100; sign the capped value if requesting more than 100. Supported status
 filters are listed below. `has_more` is not based on a look-ahead query: an
 exactly full final page still reports `true`. Continue until the API returns a
-short or empty page. Use this endpoint to reconcile a timed-out create request.
+short or empty page. Reconcile a timed-out create with the exact idempotent
+create retry; a list scan is no longer required for that purpose.
 The optional `status` filter remains accounting-based; provisional
 `payment_received` does not enter the `paid` filter before one confirmation.
 

@@ -105,6 +105,10 @@ expect_refusal \
   056_chain_swap_renegotiation_journal \
   058_permanent_public_names \
   'migration 057 is a roll-forward-only cooperative-signing-intent boundary'
+expect_refusal \
+  064_wallet_backup_blobs \
+  065_private_invoice_presentations \
+  'migration 065 replaces wallet-invoice plaintext with required encrypted presentations'
 rollback_writer_stopped=0
 cooperative_query_fails=1
 expect_allowed 056_chain_swap_renegotiation_journal 056_chain_swap_renegotiation_journal

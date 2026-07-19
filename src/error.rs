@@ -78,6 +78,10 @@ pub enum AppError {
     /// already assigned to an invoice. Address reuse makes chain payment
     /// attribution ambiguous, so it is rejected at create time.
     LiquidAddressAlreadyUsed,
+    /// A wallet reused a private-invoice client request identifier with a
+    /// different signed payload. Returning either invoice would make retry
+    /// resolution ambiguous, so the conflict is explicit and non-retryable.
+    InvoiceCreateConflict,
     /// This wallet already owns a different permanent alias. Alias ownership
     /// is insert-only, so the client must keep using the existing value.
     AliasAlreadyAssigned {
@@ -171,6 +175,7 @@ impl AppError {
             | Self::RecoveryNotAvailable(_)
             | Self::BitcoinAddressAlreadyUsed
             | Self::LiquidAddressAlreadyUsed
+            | Self::InvoiceCreateConflict
             | Self::AliasAlreadyAssigned { .. } => ErrorClass::Identity,
 
             Self::RateLimitedSender
@@ -219,6 +224,7 @@ impl AppError {
             Self::InvalidComment(_) => "InvalidComment",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
+            Self::InvoiceCreateConflict => "InvoiceCreateConflict",
             Self::AliasAlreadyAssigned { .. } => "AliasAlreadyAssigned",
 
             Self::RateLimitedSender => "RateLimitedSender",
@@ -283,6 +289,9 @@ impl std::fmt::Display for AppError {
             Self::InvalidComment(reason) => write!(f, "invalid comment: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
+            Self::InvoiceCreateConflict => {
+                write!(f, "invoice create identifier reused with different payload")
+            }
             Self::AliasAlreadyAssigned { alias } => {
                 write!(f, "permanent alias already assigned: {alias}")
             }
@@ -364,6 +373,9 @@ impl IntoResponse for AppError {
             AppError::LiquidAddressAlreadyUsed => {
                 "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
+            AppError::InvoiceCreateConflict => {
+                "This invoice creation identifier was already used for different invoice data.".into()
+            }
             AppError::AliasAlreadyAssigned { alias } => {
                 format!("This wallet permanently owns the link name {alias}.")
             }
@@ -425,6 +437,7 @@ impl IntoResponse for AppError {
             | AppError::NymAlreadyAssigned { .. }
             | AppError::BitcoinAddressAlreadyUsed
             | AppError::LiquidAddressAlreadyUsed
+            | AppError::InvoiceCreateConflict
             | AppError::AliasAlreadyAssigned { .. } => StatusCode::CONFLICT,
             AppError::ServiceUnavailable(_) | AppError::MoneyAdmissionUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE

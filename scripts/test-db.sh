@@ -26,7 +26,7 @@ BULLNYM_CARGO_SERIALIZED_LANE="${BULLNYM_CARGO_SERIALIZED_LANE:-}"
 DATA_VOLUME=""
 CLEANUP_FAILURE_PROBE=0
 CLEANUP_FAILURE_STATUS=86
-EXPECTED_MIGRATION_COUNT=64
+EXPECTED_MIGRATION_COUNT=65
 MIGRATION_FILES=()
 
 usage() {
@@ -117,8 +117,8 @@ done
 [[ "${MIGRATION_FILES[0]}" == "001_initial.sql" ]] \
   || die "unexpected migration-001 boundary: ${MIGRATION_FILES[0]}"
 [[ "${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}" == \
-    "064_wallet_backup_blobs.sql" ]] \
-  || die "unexpected migration-064 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
+    "065_private_invoice_presentations.sql" ]] \
+  || die "unexpected migration-065 boundary: ${MIGRATION_FILES[EXPECTED_MIGRATION_COUNT - 1]}"
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "docker daemon is unavailable"
@@ -281,7 +281,8 @@ apply_migrations() {
        || "$base" == "061_invoice_quote_versions" \
        || "$base" == "062_invoice_quote_provider_attempts" \
        || "$base" == "063_checkout_private_memo" \
-       || "$base" == "064_wallet_backup_blobs" ]]; then
+       || "$base" == "064_wallet_backup_blobs" \
+       || "$base" == "065_private_invoice_presentations" ]]; then
       run_sql_file "$database" "$migration" --set "runtime_role=$RUNTIME_ROLE"
     else
       run_sql_file "$database" "$migration"

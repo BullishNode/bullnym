@@ -212,6 +212,28 @@ event may still reference an expired quote/offer with its first-observed time
 while all fiat-credit fields remain NULL, preserving the evidence without
 guessing the accounting result.
 
+## Migration 065 private invoice presentations
+
+Apply `065_private_invoice_presentations.sql` as the privileged schema owner
+with `--set runtime_role=bullnym_app` while every Bullnym writer is stopped.
+This is a pre-production direct cutover: it refuses to run if any
+`origin = 'wallet'` invoice exists. Reset the test database or complete the
+documented empty production reset; do not delete selected rows merely to force
+the guard.
+
+The migration drops the three wallet plaintext presentation columns and adds a
+random client request UUID, a 32-byte create digest, and one fixed 4,125-byte
+encrypted envelope. Wallet rows require all three values; checkout rows require
+all three to be null and retain their separate private `memo`. Readiness checks
+the exact column/constraint/unique-key shape and refuses any index over the
+ciphertext column.
+
+Start only a matching schema-065 binary after this migration commits. A
+pre-065 binary cannot construct the required wallet row and still expects
+columns that no longer exist, so automatic binary rollback is forbidden. Roll
+forward, or restore the complete validated pre-065 database and matching
+binary while all writers remain stopped.
+
 ## Migration 053 privileged-owner boundary
 
 Migration 053 creates the private append-only recovery-address ledger and makes

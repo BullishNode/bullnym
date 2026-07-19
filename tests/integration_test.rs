@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, put};
 use axum::Router;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::stream::BoxStream;
 use http_body_util::BodyExt;
 use object_store::memory::InMemory;
@@ -457,6 +458,10 @@ fn test_app(state: AppState) -> Router {
             post(invoice::payer_demand_quote),
         )
         .route(
+            "/api/v1/invoices/:id/presentation",
+            get(invoice::private_presentation),
+        )
+        .route(
             "/api/v1/invoices/recoverable",
             get(invoice::list_recoverable_signed),
         )
@@ -651,8 +656,14 @@ fn sign_invoice_create_with_keypair(
     npub: &str,
     bitcoin_address: &str,
     expires_at_unix: i64,
-) -> (String, u64) {
+) -> (String, u64, Uuid, String) {
     sign_invoice_create_for_nym_with_keypair(keypair, npub, "", bitcoin_address, expires_at_unix)
+}
+
+fn private_invoice_presentation_envelope_fixture() -> String {
+    let mut envelope = vec![0_u8; 4_125];
+    envelope[0] = 1;
+    URL_SAFE_NO_PAD.encode(envelope)
 }
 
 fn sign_invoice_create_for_nym_with_keypair(
@@ -661,20 +672,20 @@ fn sign_invoice_create_for_nym_with_keypair(
     nym: &str,
     bitcoin_address: &str,
     expires_at_unix: i64,
-) -> (String, u64) {
+) -> (String, u64, Uuid, String) {
     let amount_sat = "1000";
     let fiat_amount_minor = "";
     let fiat_currency = "";
-    let public_description = "";
-    let recipient_name = "";
-    let invoice_number = "";
+    let client_request_id = Uuid::new_v4();
+    let client_request_id_text = client_request_id.to_string();
+    let presentation_envelope = private_invoice_presentation_envelope_fixture();
     let accept_btc = "true";
     let accept_ln = "false";
     let accept_liquid = "false";
     let liquid_address = "";
     let liquid_blinding_key_hex = "";
     let expires_at = expires_at_unix.to_string();
-    sign_la_action(
+    let (signature, timestamp) = sign_la_action(
         keypair,
         "invoice-create",
         npub,
@@ -683,9 +694,8 @@ fn sign_invoice_create_for_nym_with_keypair(
             amount_sat,
             fiat_amount_minor,
             fiat_currency,
-            public_description,
-            recipient_name,
-            invoice_number,
+            &client_request_id_text,
+            &presentation_envelope,
             accept_btc,
             accept_ln,
             accept_liquid,
@@ -694,6 +704,12 @@ fn sign_invoice_create_for_nym_with_keypair(
             liquid_blinding_key_hex,
             &expires_at,
         ],
+    );
+    (
+        signature,
+        timestamp,
+        client_request_id,
+        presentation_envelope,
     )
 }
 
@@ -701,20 +717,20 @@ fn sign_invoice_create_without_expiry_with_keypair(
     keypair: &Keypair,
     npub: &str,
     bitcoin_address: &str,
-) -> (String, u64) {
+) -> (String, u64, Uuid, String) {
     let amount_sat = "1000";
     let fiat_amount_minor = "";
     let fiat_currency = "";
-    let public_description = "";
-    let recipient_name = "";
-    let invoice_number = "";
+    let client_request_id = Uuid::new_v4();
+    let client_request_id_text = client_request_id.to_string();
+    let presentation_envelope = private_invoice_presentation_envelope_fixture();
     let accept_btc = "true";
     let accept_ln = "false";
     let accept_liquid = "false";
     let liquid_address = "";
     let liquid_blinding_key_hex = "";
     let expires_at = "";
-    sign_la_action(
+    let (signature, timestamp) = sign_la_action(
         keypair,
         "invoice-create",
         npub,
@@ -723,9 +739,8 @@ fn sign_invoice_create_without_expiry_with_keypair(
             amount_sat,
             fiat_amount_minor,
             fiat_currency,
-            public_description,
-            recipient_name,
-            invoice_number,
+            &client_request_id_text,
+            &presentation_envelope,
             accept_btc,
             accept_ln,
             accept_liquid,
@@ -734,6 +749,12 @@ fn sign_invoice_create_without_expiry_with_keypair(
             liquid_blinding_key_hex,
             expires_at,
         ],
+    );
+    (
+        signature,
+        timestamp,
+        client_request_id,
+        presentation_envelope,
     )
 }
 
@@ -1753,7 +1774,7 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(pre_migration_body["ready"], false);
     assert_eq!(
         pre_migration_body["expected_schema_marker"],
-        "064_wallet_backup_blobs"
+        "065_private_invoice_presentations"
     );
 
     let app = test_app(test_state(runtime.clone()));
@@ -1761,51 +1782,77 @@ async fn readiness_rejects_schema_before_latest_migration() {
     assert_eq!(current_status, StatusCode::OK, "body: {current_body}");
     assert_eq!(current_body["ready"], true);
 
-    // The schema marker includes the exact Page/POS private-note contract.
-    // Restoring migration 021's obsolete memo refusal must close readiness
-    // even though the constraint retains the same public name.
+    // The schema marker includes the exact fixed-envelope contract. Keeping
+    // the same public constraint name while dropping the version byte check
+    // must still close readiness.
     sqlx::query(
         "ALTER TABLE invoices \
-             DROP CONSTRAINT invoices_checkout_no_metadata_chk, \
-             ADD CONSTRAINT invoices_checkout_no_metadata_chk CHECK ( \
-                 origin = 'wallet' OR ( \
-                     memo IS NULL \
-                     AND recipient_label IS NULL \
-                     AND public_description IS NULL \
-                     AND invoice_number IS NULL \
-                 ) \
+             DROP CONSTRAINT invoices_private_presentation_shape_check, \
+             ADD CONSTRAINT invoices_private_presentation_shape_check CHECK ( \
+                 (origin = 'wallet' \
+                  AND client_request_id IS NOT NULL \
+                  AND octet_length(client_request_digest) = 32 \
+                  AND octet_length(presentation_envelope) = 4125) \
+                 OR \
+                 (origin = 'checkout' \
+                  AND client_request_id IS NULL \
+                  AND client_request_digest IS NULL \
+                  AND presentation_envelope IS NULL) \
              )",
     )
     .execute(&admin)
     .await
     .unwrap();
     let app = test_app(test_state(runtime.clone()));
-    let (obsolete_checkout_status, obsolete_checkout_body) = get_path(&app, "/ready").await;
-    assert_eq!(obsolete_checkout_status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(obsolete_checkout_body["ready"], false);
+    let (weakened_shape_status, weakened_shape_body) = get_path(&app, "/ready").await;
+    assert_eq!(weakened_shape_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(weakened_shape_body["ready"], false);
 
     sqlx::query(
         "ALTER TABLE invoices \
-             DROP CONSTRAINT invoices_checkout_no_metadata_chk, \
-             ADD CONSTRAINT invoices_checkout_no_metadata_chk CHECK ( \
-                 origin = 'wallet' OR ( \
-                     recipient_label IS NULL \
-                     AND public_description IS NULL \
-                     AND invoice_number IS NULL \
-                 ) \
+             DROP CONSTRAINT invoices_private_presentation_shape_check, \
+             ADD CONSTRAINT invoices_private_presentation_shape_check CHECK ( \
+                 (origin = 'wallet' \
+                  AND client_request_id IS NOT NULL \
+                  AND client_request_digest IS NOT NULL \
+                  AND octet_length(client_request_digest) = 32 \
+                  AND presentation_envelope IS NOT NULL \
+                  AND CASE \
+                      WHEN octet_length(presentation_envelope) = 4125 \
+                      THEN get_byte(presentation_envelope, 0) = 1 \
+                      ELSE FALSE \
+                  END) \
+                 OR \
+                 (origin = 'checkout' \
+                  AND client_request_id IS NULL \
+                  AND client_request_digest IS NULL \
+                  AND presentation_envelope IS NULL) \
              )",
     )
     .execute(&admin)
     .await
     .unwrap();
     let app = test_app(test_state(runtime.clone()));
-    let (restored_checkout_status, restored_checkout_body) = get_path(&app, "/ready").await;
+    let (restored_private_status, restored_private_body) = get_path(&app, "/ready").await;
     assert_eq!(
-        restored_checkout_status,
+        restored_private_status,
         StatusCode::OK,
-        "body: {restored_checkout_body}"
+        "body: {restored_private_body}"
     );
-    assert_eq!(restored_checkout_body["ready"], true);
+    assert_eq!(restored_private_body["ready"], true);
+
+    sqlx::query("ALTER TABLE invoices DISABLE TRIGGER invoices_reject_private_presentation_update")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let app = test_app(test_state(runtime.clone()));
+    let (mutable_private_status, mutable_private_body) = get_path(&app, "/ready").await;
+    assert_eq!(mutable_private_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mutable_private_body["ready"], false);
+    sqlx::query("ALTER TABLE invoices ENABLE TRIGGER invoices_reject_private_presentation_update")
+        .execute(&admin)
+        .await
+        .unwrap();
 
     sqlx::query(
         "ALTER TABLE invoice_quote_provider_attempts DISABLE TRIGGER \
@@ -1966,7 +2013,10 @@ async fn permanent_alias_readiness_rejects_restored_surface_alias_authority() {
     let (status, body) = get_path(&app, "/ready").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["expected_schema_marker"], "064_wallet_backup_blobs");
+    assert_eq!(
+        body["expected_schema_marker"],
+        "065_private_invoice_presentations"
+    );
 
     sqlx::query("ALTER TABLE donation_pages DROP COLUMN alias")
         .execute(&admin)
@@ -11973,9 +12023,6 @@ async fn insert_test_invoice(
             rate_minor_per_btc: None,
             rate_lock_secs: expires_in_secs,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln: false,
             accept_liquid: true,
@@ -11989,6 +12036,185 @@ async fn insert_test_invoice(
     .unwrap()
 }
 
+async fn insert_test_wallet_invoice(
+    pool: &PgPool,
+    invoice: &pay_service::db::NewInvoice<'_>,
+) -> Result<pay_service::db::Invoice, sqlx::Error> {
+    assert_eq!(invoice.origin, "wallet");
+    let client_request_id = Uuid::new_v4();
+    let request_digest: [u8; 32] = Sha256::digest(client_request_id.as_bytes()).into();
+    let mut presentation_envelope = vec![0_u8; 4_125];
+    presentation_envelope[0] = 1;
+    let private = pay_service::db::PrivateInvoiceCreate {
+        client_request_id,
+        request_digest: &request_digest,
+        presentation_envelope: &presentation_envelope,
+    };
+    match pay_service::db::insert_or_reuse_wallet_invoice(pool, invoice, &private).await? {
+        pay_service::db::WalletInvoiceCreateResolution::Created(invoice) => Ok(invoice),
+        pay_service::db::WalletInvoiceCreateResolution::Reused(_) => Err(sqlx::Error::Protocol(
+            "fresh test wallet request unexpectedly reused an invoice".to_string(),
+        )),
+        pay_service::db::WalletInvoiceCreateResolution::Conflict => Err(sqlx::Error::Protocol(
+            "fresh test wallet request unexpectedly conflicted".to_string(),
+        )),
+    }
+}
+
+fn private_invoice_test_candidate<'a>(
+    npub: &'a str,
+    bitcoin_address: &'a str,
+) -> pay_service::db::NewInvoice<'a> {
+    pay_service::db::NewInvoice {
+        nym_owner: None,
+        public_slug: None,
+        npub_owner: npub,
+        origin: "wallet",
+        checkout_surface_kind: None,
+        fiat_amount_minor: None,
+        fiat_currency: None,
+        amount_sat: 21_000,
+        rate_minor_per_btc: None,
+        rate_lock_secs: 3_600,
+        memo: None,
+        accept_btc: true,
+        accept_ln: false,
+        accept_liquid: false,
+        bitcoin_address: Some(bitcoin_address),
+        liquid_address: None,
+        liquid_blinding_key_hex: None,
+        expires_in_secs: 3_600,
+    }
+}
+
+#[tokio::test]
+async fn private_invoice_create_is_idempotent_and_exposes_only_the_opaque_envelope() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = "91".repeat(32);
+    let invoice = private_invoice_test_candidate(&npub, "bc1qprivateinvoiceidempotency");
+    let client_request_id = Uuid::new_v4();
+    let digest = [0x31_u8; 32];
+    let mut envelope = vec![0x42_u8; 4_125];
+    envelope[0] = 1;
+    let private = pay_service::db::PrivateInvoiceCreate {
+        client_request_id,
+        request_digest: &digest,
+        presentation_envelope: &envelope,
+    };
+
+    let created = match pay_service::db::insert_or_reuse_wallet_invoice(&pool, &invoice, &private)
+        .await
+        .unwrap()
+    {
+        pay_service::db::WalletInvoiceCreateResolution::Created(invoice) => invoice,
+        _ => panic!("first private invoice create was not created"),
+    };
+    let reused = match pay_service::db::insert_or_reuse_wallet_invoice(&pool, &invoice, &private)
+        .await
+        .unwrap()
+    {
+        pay_service::db::WalletInvoiceCreateResolution::Reused(invoice) => invoice,
+        _ => panic!("identical private invoice retry was not reused"),
+    };
+    assert_eq!(reused.id, created.id);
+
+    let conflicting_digest = [0x32_u8; 32];
+    let conflict = pay_service::db::PrivateInvoiceCreate {
+        client_request_id,
+        request_digest: &conflicting_digest,
+        presentation_envelope: &envelope,
+    };
+    assert!(matches!(
+        pay_service::db::insert_or_reuse_wallet_invoice(&pool, &invoice, &conflict)
+            .await
+            .unwrap(),
+        pay_service::db::WalletInvoiceCreateResolution::Conflict
+    ));
+
+    assert_eq!(
+        pay_service::db::get_private_invoice_presentation(&pool, created.id)
+            .await
+            .unwrap(),
+        Some(envelope.clone())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM invoices WHERE npub_owner = $1 AND client_request_id = $2",
+        )
+        .bind(&npub)
+        .bind(client_request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    let app = test_app(test_state(pool.clone()));
+    let (status, body) = get_path(
+        &app,
+        &format!("/api/v1/invoices/{}/presentation", created.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["presentation_envelope"],
+        URL_SAFE_NO_PAD.encode(&envelope)
+    );
+    assert_eq!(body.as_object().unwrap().len(), 1);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn concurrent_private_invoice_retries_commit_exactly_one_invoice() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = "92".repeat(32);
+    let invoice = private_invoice_test_candidate(&npub, "bc1qprivateinvoiceconcurrent");
+    let client_request_id = Uuid::new_v4();
+    let digest = [0x51_u8; 32];
+    let mut envelope = vec![0x61_u8; 4_125];
+    envelope[0] = 1;
+    let private = pay_service::db::PrivateInvoiceCreate {
+        client_request_id,
+        request_digest: &digest,
+        presentation_envelope: &envelope,
+    };
+
+    let (left, right) = tokio::join!(
+        pay_service::db::insert_or_reuse_wallet_invoice(&pool, &invoice, &private),
+        pay_service::db::insert_or_reuse_wallet_invoice(&pool, &invoice, &private),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    let (created_id, reused_id) = match (left, right) {
+        (
+            pay_service::db::WalletInvoiceCreateResolution::Created(created),
+            pay_service::db::WalletInvoiceCreateResolution::Reused(reused),
+        )
+        | (
+            pay_service::db::WalletInvoiceCreateResolution::Reused(reused),
+            pay_service::db::WalletInvoiceCreateResolution::Created(created),
+        ) => (created.id, reused.id),
+        _ => panic!("concurrent retries did not resolve as one create and one reuse"),
+    };
+    assert_eq!(created_id, reused_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM invoices WHERE npub_owner = $1 AND client_request_id = $2",
+        )
+        .bind(&npub)
+        .bind(client_request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    cleanup_db(&pool).await;
+}
+
 async fn insert_fiat_quote_test_invoice(
     pool: &PgPool,
     suffix: &str,
@@ -11996,7 +12222,7 @@ async fn insert_fiat_quote_test_invoice(
 ) -> pay_service::db::Invoice {
     let npub = "7".repeat(64);
     let blinding_key = "11".repeat(32);
-    pay_service::db::insert_invoice(
+    insert_test_wallet_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: None,
@@ -12010,9 +12236,6 @@ async fn insert_fiat_quote_test_invoice(
             rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln,
             accept_liquid: true,
@@ -12031,7 +12254,7 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
     bitcoin_address: &str,
 ) -> pay_service::db::Invoice {
     let npub = "8".repeat(64);
-    pay_service::db::insert_invoice(
+    insert_test_wallet_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: None,
@@ -12045,9 +12268,6 @@ async fn insert_fiat_direct_bitcoin_test_invoice(
             rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: true,
             accept_ln: false,
             accept_liquid: false,
@@ -12675,6 +12895,9 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
     let fiat_bitcoin_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     let expires_at_unix = auth_timestamp() as i64 + 3_600;
     let expires_at = expires_at_unix.to_string();
+    let fiat_client_request_id = Uuid::new_v4();
+    let fiat_client_request_id_text = fiat_client_request_id.to_string();
+    let fiat_presentation_envelope = private_invoice_presentation_envelope_fixture();
     let (fiat_signature, fiat_timestamp) = sign_la_action(
         &wallet_keypair,
         "invoice-create",
@@ -12684,9 +12907,8 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
             "",
             "1000",
             "USD",
-            "",
-            "",
-            "",
+            &fiat_client_request_id_text,
+            &fiat_presentation_envelope,
             "true",
             "false",
             "false",
@@ -12704,9 +12926,8 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
             "amount_sat": null,
             "fiat_amount_minor": 1_000,
             "fiat_currency": "USD",
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": fiat_client_request_id,
+            "presentation_envelope": fiat_presentation_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -12791,12 +13012,13 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
     }
 
     let sat_bitcoin_address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
-    let (sat_signature, sat_timestamp) = sign_invoice_create_with_keypair(
-        &wallet_keypair,
-        &wallet_npub,
-        sat_bitcoin_address,
-        expires_at_unix,
-    );
+    let (sat_signature, sat_timestamp, sat_client_request_id, sat_presentation_envelope) =
+        sign_invoice_create_with_keypair(
+            &wallet_keypair,
+            &wallet_npub,
+            sat_bitcoin_address,
+            expires_at_unix,
+        );
     let (sat_create_status, sat_create_body) = post_json(
         &app,
         "/api/v1/invoices",
@@ -12805,9 +13027,8 @@ async fn prequote_rate_lock_projection_is_zero_for_every_fiat_surface_and_preser
             "amount_sat": 1_000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": sat_client_request_id,
+            "presentation_envelope": sat_presentation_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -14598,7 +14819,7 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
     pay_service::db::create_user(&pool, "phase7attribution", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
-    let invoice = pay_service::db::insert_invoice(
+    let invoice = insert_test_wallet_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: None,
@@ -14612,9 +14833,6 @@ async fn phase7_quote_attribution_follows_swaps_and_provider_settlement_exactly(
             rate_minor_per_btc: None,
             rate_lock_secs: 300,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: true,
             accept_ln: true,
             accept_liquid: true,
@@ -15601,7 +15819,7 @@ async fn insert_test_btc_invoice(
     npub: &str,
     bitcoin_address: &str,
 ) -> Result<pay_service::db::Invoice, sqlx::Error> {
-    pay_service::db::insert_invoice(
+    insert_test_wallet_invoice(
         pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some(nym),
@@ -15615,9 +15833,6 @@ async fn insert_test_btc_invoice(
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: true,
             accept_ln: false,
             accept_liquid: false,
@@ -17275,6 +17490,65 @@ async fn invoice_insert_rejects_reused_bitcoin_address() {
 }
 
 #[tokio::test]
+async fn signed_private_invoice_retry_survives_expiry_and_admission_changes() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let state = test_state(pool.clone());
+    let app = test_app(state.clone());
+    let (npub, _, _, keypair) = sign_registration_with_keypair("invoiceretry", TEST_DESCRIPTOR);
+    let expires_at_unix = auth_timestamp() as i64 + 3_600;
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let (signature, timestamp, client_request_id, presentation_envelope) =
+        sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
+    let request = || {
+        json!({
+            "npub": npub.clone(),
+            "amount_sat": 1_000,
+            "fiat_amount_minor": null,
+            "fiat_currency": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope.clone(),
+            "accept_btc": true,
+            "accept_ln": false,
+            "accept_liquid": false,
+            "bitcoin_address": address,
+            "liquid_address": null,
+            "liquid_blinding_key_hex": null,
+            "expires_at_unix": expires_at_unix,
+            "timestamp": timestamp,
+            "signature": signature.clone(),
+        })
+    };
+
+    let (first_status, first_body) = post_json(&app, "/api/v1/invoices", request()).await;
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    let invoice_id = Uuid::parse_str(first_body["invoice_id"].as_str().unwrap()).unwrap();
+    assert_eq!(first_body.as_object().unwrap().len(), 2);
+    assert!(first_body.get("share_url").is_none());
+    assert!(!first_body["invoice_url"].as_str().unwrap().contains('#'));
+
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(invoice_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    state.admission.set_workers_enabled(false);
+
+    let (retry_status, retry_body) = post_json(&app, "/api/v1/invoices", request()).await;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+    assert_eq!(retry_body, first_body);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -17284,7 +17558,7 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
     let lower = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     let upper = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
 
-    let (sig_upper, ts_upper) =
+    let (sig_upper, ts_upper, upper_request_id, upper_envelope) =
         sign_invoice_create_with_keypair(&keypair, &npub, upper, expires_at_unix);
     let (status, body) = post_json(
         &app,
@@ -17294,9 +17568,8 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": upper_request_id,
+            "presentation_envelope": upper_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17320,7 +17593,7 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
             .unwrap();
     assert_eq!(stored, lower);
 
-    let (sig_lower, ts_lower) =
+    let (sig_lower, ts_lower, lower_request_id, lower_envelope) =
         sign_invoice_create_with_keypair(&keypair, &npub, lower, expires_at_unix);
     let (status, body) = post_json(
         &app,
@@ -17330,9 +17603,8 @@ async fn signed_invoice_create_canonicalizes_bitcoin_address_before_reuse_check(
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": lower_request_id,
+            "presentation_envelope": lower_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17362,7 +17634,7 @@ async fn disabled_workers_reject_direct_invoice_before_publication() {
     let (npub, _, _, keypair) = sign_registration_with_keypair("directclosed", TEST_DESCRIPTOR);
     let expires_at_unix = auth_timestamp() as i64 + 3_600;
     let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    let (signature, timestamp) =
+    let (signature, timestamp, client_request_id, presentation_envelope) =
         sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
 
     let (status, body) = post_json(
@@ -17373,9 +17645,8 @@ async fn disabled_workers_reject_direct_invoice_before_publication() {
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17415,6 +17686,9 @@ async fn disabled_workers_reject_signed_lightning_only_invoice_atomically() {
     let expires_at = expires_at_unix.to_string();
     let liquid_address =
         "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv";
+    let client_request_id = Uuid::new_v4();
+    let client_request_id_text = client_request_id.to_string();
+    let presentation_envelope = private_invoice_presentation_envelope_fixture();
     let (signature, timestamp) = sign_la_action(
         &keypair,
         "invoice-create",
@@ -17424,9 +17698,8 @@ async fn disabled_workers_reject_signed_lightning_only_invoice_atomically() {
             "1000",
             "",
             "",
-            "",
-            "",
-            "",
+            &client_request_id_text,
+            &presentation_envelope,
             "false",
             "true",
             "false",
@@ -17448,9 +17721,8 @@ async fn disabled_workers_reject_signed_lightning_only_invoice_atomically() {
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope,
             "accept_btc": false,
             "accept_ln": true,
             "accept_liquid": false,
@@ -17498,7 +17770,7 @@ async fn direct_invoice_http_gate_reopens_only_after_two_healthy_watcher_cycles(
     let (npub, _, _, keypair) = sign_registration_with_keypair("directreopen", TEST_DESCRIPTOR);
     let expires_at_unix = auth_timestamp() as i64 + 3_600;
     let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    let (signature, timestamp) =
+    let (signature, timestamp, client_request_id, presentation_envelope) =
         sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
     let request_body = || {
         json!({
@@ -17506,9 +17778,8 @@ async fn direct_invoice_http_gate_reopens_only_after_two_healthy_watcher_cycles(
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope.clone(),
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17570,7 +17841,8 @@ async fn signed_invoice_create_defaults_expiry_when_omitted() {
     let (npub, _, _, keypair) = sign_registration_with_keypair("invoicedefault", TEST_DESCRIPTOR);
     let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 
-    let (sig, ts) = sign_invoice_create_without_expiry_with_keypair(&keypair, &npub, address);
+    let (sig, ts, client_request_id, presentation_envelope) =
+        sign_invoice_create_without_expiry_with_keypair(&keypair, &npub, address);
     let before = auth_timestamp() as i64;
     let (status, body) = post_json(
         &app,
@@ -17580,9 +17852,8 @@ async fn signed_invoice_create_defaults_expiry_when_omitted() {
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope,
             "accept_btc": true,
             "bitcoin_address": address,
             "liquid_address": null,
@@ -17622,7 +17893,7 @@ async fn signed_invoice_create_rejects_expiry_beyond_thirty_days() {
     let (npub, _, _, keypair) = sign_registration_with_keypair("invoiceexpirycap", TEST_DESCRIPTOR);
     let address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
     let expires_at_unix = auth_timestamp() as i64 + 30 * 24 * 60 * 60 + 60;
-    let (signature, timestamp) =
+    let (signature, timestamp, client_request_id, presentation_envelope) =
         sign_invoice_create_with_keypair(&keypair, &npub, address, expires_at_unix);
 
     let (status, body) = post_json(
@@ -17633,9 +17904,8 @@ async fn signed_invoice_create_rejects_expiry_beyond_thirty_days() {
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17740,15 +18010,18 @@ async fn signed_linked_invoice_management_uses_permanent_owner_while_lnurl_is_of
 
     let expires_at_unix = auth_timestamp() as i64 + 3_600;
     let bitcoin_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    let request = |npub: &str, timestamp: u64, signature: &str| {
+    let request = |npub: &str,
+                   client_request_id: Uuid,
+                   presentation_envelope: &str,
+                   timestamp: u64,
+                   signature: &str| {
         json!({
             "npub": npub,
             "amount_sat": 1000,
             "fiat_amount_minor": null,
             "fiat_currency": null,
-            "public_description": null,
-            "recipient_name": null,
-            "invoice_number": null,
+            "client_request_id": client_request_id,
+            "presentation_envelope": presentation_envelope,
             "accept_btc": true,
             "accept_ln": false,
             "accept_liquid": false,
@@ -17763,17 +18036,24 @@ async fn signed_linked_invoice_management_uses_permanent_owner_while_lnurl_is_of
 
     // A valid signature from a different permanent owner cannot adopt the
     // offline merchant's linked management surface or create any row.
-    let (other_signature, other_timestamp) = sign_invoice_create_for_nym_with_keypair(
-        &other_keypair,
-        &other_npub,
-        nym,
-        bitcoin_address,
-        expires_at_unix,
-    );
+    let (other_signature, other_timestamp, other_client_request_id, other_presentation_envelope) =
+        sign_invoice_create_for_nym_with_keypair(
+            &other_keypair,
+            &other_npub,
+            nym,
+            bitcoin_address,
+            expires_at_unix,
+        );
     let (status, body) = post_json(
         &app,
         &format!("/api/v1/{nym}/invoices"),
-        request(&other_npub, other_timestamp, &other_signature),
+        request(
+            &other_npub,
+            other_client_request_id,
+            &other_presentation_envelope,
+            other_timestamp,
+            &other_signature,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
@@ -17787,17 +18067,24 @@ async fn signed_linked_invoice_management_uses_permanent_owner_while_lnurl_is_of
         "cross-owner create mutated invoices"
     );
 
-    let (signature, timestamp) = sign_invoice_create_for_nym_with_keypair(
-        &owner_keypair,
-        &owner_npub,
-        nym,
-        bitcoin_address,
-        expires_at_unix,
-    );
+    let (signature, timestamp, client_request_id, presentation_envelope) =
+        sign_invoice_create_for_nym_with_keypair(
+            &owner_keypair,
+            &owner_npub,
+            nym,
+            bitcoin_address,
+            expires_at_unix,
+        );
     let (status, body) = post_json(
         &app,
         &format!("/api/v1/{nym}/invoices"),
-        request(&owner_npub, timestamp, &signature),
+        request(
+            &owner_npub,
+            client_request_id,
+            &presentation_envelope,
+            timestamp,
+            &signature,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -18147,7 +18434,7 @@ async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private()
     pay_service::db::create_user(&pool, "lnonlyprivate", &npub, TEST_DESCRIPTOR)
         .await
         .unwrap();
-    let invoice = pay_service::db::insert_invoice(
+    let invoice = insert_test_wallet_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("lnonlyprivate"),
@@ -18161,9 +18448,6 @@ async fn payable_lightning_only_invoice_keeps_liquid_claim_destination_private()
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln: true,
             accept_liquid: false,
@@ -18441,7 +18725,7 @@ async fn invoice_insert_rejects_reused_liquid_address() {
 
     let _ = insert_test_invoice(&pool, "liqreuse", &npub, address, 3_600).await;
 
-    let err = pay_service::db::insert_invoice(
+    let err = insert_test_wallet_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("liqreuse"),
@@ -18455,9 +18739,6 @@ async fn invoice_insert_rejects_reused_liquid_address() {
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln: false,
             accept_liquid: true,
@@ -19308,9 +19589,6 @@ async fn issue14_m5_mixed_invoice_enforces_its_public_tolerance_for_bitcoin() {
             rate_minor_per_btc: None,
             rate_lock_secs: 60,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: true,
             accept_ln: true,
             accept_liquid: true,
@@ -19377,9 +19655,6 @@ async fn issue14_m5_direct_watcher_enforces_the_invoice_wide_tolerance() {
             rate_minor_per_btc: None,
             rate_lock_secs: 60,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: true,
             accept_ln: true,
             accept_liquid: true,
@@ -20492,7 +20767,7 @@ async fn stale_wallet_partial_stays_payable() {
     cleanup_db(&pool).await;
     let npub = create_test_user(&pool, "walletpartial").await;
     let blinding_key = "11".repeat(32);
-    let invoice = pay_service::db::insert_invoice(
+    let invoice = insert_test_wallet_invoice(
         &pool,
         &pay_service::db::NewInvoice {
             nym_owner: Some("walletpartial"),
@@ -20506,9 +20781,6 @@ async fn stale_wallet_partial_stays_payable() {
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln: false,
             accept_liquid: true,
@@ -32055,9 +32327,6 @@ async fn issue84_chain_invoice(
             rate_minor_per_btc: None,
             rate_lock_secs: 3_600,
             memo: None,
-            recipient_label: None,
-            public_description: None,
-            invoice_number: None,
             accept_btc: false,
             accept_ln: false,
             accept_liquid: true,

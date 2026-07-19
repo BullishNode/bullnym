@@ -162,6 +162,119 @@
             margin-top: 12px;
             text-align: center;
         }
+        .invoice-document {
+            margin-top: 16px;
+            padding: 28px 24px;
+            color: #27221b;
+            background: #f8f3e9;
+            border: 1px solid #d8cbb8;
+            border-radius: 6px;
+            box-shadow: 0 14px 42px rgba(0, 0, 0, 0.28);
+        }
+        .invoice-document-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 20px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid #d8cbb8;
+        }
+        .invoice-eyebrow {
+            margin: 0 0 4px;
+            color: #776b5a;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .invoice-document-title {
+            margin: 0;
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 34px;
+            font-weight: 500;
+            letter-spacing: -0.02em;
+        }
+        .invoice-number {
+            color: #51483c;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 12px;
+            text-align: right;
+            overflow-wrap: anywhere;
+        }
+        .invoice-date-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+            margin: 18px 0 0;
+        }
+        .invoice-date-overdue .invoice-detail:last-child .invoice-detail-value {
+            color: #9f332c;
+        }
+        .invoice-party,
+        .invoice-description-card {
+            margin-top: 22px;
+            padding-top: 18px;
+            border-top: 1px solid #ded3c3;
+        }
+        .invoice-section-title {
+            margin: 0 0 12px;
+            color: #776b5a;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .invoice-detail-list {
+            display: grid;
+            gap: 10px;
+            margin: 0;
+        }
+        .invoice-detail {
+            display: grid;
+            grid-template-columns: minmax(100px, 0.38fr) minmax(0, 1fr);
+            gap: 14px;
+        }
+        .invoice-detail-label {
+            color: #776b5a;
+            font-size: 11px;
+        }
+        .invoice-detail-value {
+            margin: 0;
+            color: #27221b;
+            font-size: 14px;
+            font-weight: 500;
+            overflow-wrap: anywhere;
+            white-space: pre-line;
+        }
+        .private-invoice-warning {
+            margin-top: 14px;
+            padding: 12px 14px;
+            color: #f8e7c7;
+            background: #3c2b18;
+            border: 1px solid #76552f;
+            border-radius: 8px;
+            font-size: 13px;
+        }
+        .private-invoice-link-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .private-invoice-link-actions button {
+            flex: 1;
+            min-height: 42px;
+            color: var(--fg);
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        [hidden] { display: none !important; }
+        @media (max-width: 420px) {
+            .invoice-document { padding: 22px 18px; }
+            .invoice-date-grid { grid-template-columns: 1fr; }
+            .invoice-detail { grid-template-columns: 1fr; gap: 2px; }
+        }
     </style>
 </head>
 <body>
@@ -175,21 +288,16 @@
             <h1>Pay <span class="nym">{{ nym }}</span></h1>
         {% endif %}
 
-        {# Wallet-origin invoice metadata. Each block renders only when
-           the source field is present — askama auto-escapes every
-           interpolation; do NOT add `|safe` to user-controlled content. #}
-        {% match invoice_number %}
-            {% when Some with (n) %}<div class="meta">Invoice {{ n }}</div>
-            {% when None %}
-        {% endmatch %}
-        {% match recipient_name %}
-            {% when Some with (r) %}<div class="meta">Recipient: {{ r }}</div>
-            {% when None %}
-        {% endmatch %}
-        {% match public_description %}
-            {% when Some with (d) %}<div class="meta">{{ d }}</div>
-            {% when None %}
-        {% endmatch %}
+        {% if private_presentation %}
+            <section id="private-invoice-presentation" class="invoice-document" hidden></section>
+            <div id="private-invoice-warning" class="private-invoice-warning" role="status" hidden>
+                Private invoice details could not be displayed. You can still pay using the instructions below.
+            </div>
+            <div id="private-invoice-link-actions" class="private-invoice-link-actions" hidden>
+                <button id="copy-private-invoice-link" type="button">Copy private link</button>
+                <button id="share-private-invoice-link" type="button">Share private link</button>
+            </div>
+        {% endif %}
 
         {# Accepted-rails badge. The QR/copy card below reveals only the
            currently selected rail, defaulting to Lightning when available. #}
@@ -334,6 +442,17 @@
     </main>
 
     <script type="module">
+        {% if private_presentation %}
+        // Private presentation failures are isolated from the payment state
+        // machine. The server-provided rails remain usable without a key.
+        import('/pwa-assets/private-invoice.js')
+            .then((module) => module.startPrivateInvoicePresentation("{{ invoice_id }}"))
+            .catch(() => {
+                const warning = document.getElementById('private-invoice-warning');
+                if (warning) warning.hidden = false;
+            });
+        {% endif %}
+
         // Loading the QR renderer is best-effort. Payment details, copy actions,
         // status polling, and rail selection must still work if this asset or
         // one of its chunks is temporarily unavailable.

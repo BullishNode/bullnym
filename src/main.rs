@@ -1110,17 +1110,18 @@ fn build_router(state: AppState) -> Router {
 
     if features.invoices {
         // Schnorr-signed recipient invoice endpoints, linked + unlinked.
-        // Body cap 8 KiB on signed POST to
-        // bound a misbehaving client; DELETE carries only npub+ts+sig.
+        // Body cap 16 KiB on signed POST to accommodate the fixed 5.5 KiB
+        // base64url private-presentation envelope while retaining a strict
+        // upper bound. DELETE carries only npub+ts+sig.
         // List uses GET + Query at the npub-keyed root.
         router = router
             .route(
                 "/api/v1/:nym/invoices",
-                post(invoice::create_signed_linked).layer(DefaultBodyLimit::max(8 * 1024)),
+                post(invoice::create_signed_linked).layer(DefaultBodyLimit::max(16 * 1024)),
             )
             .route(
                 "/api/v1/invoices",
-                post(invoice::create_signed_unlinked).layer(DefaultBodyLimit::max(8 * 1024)),
+                post(invoice::create_signed_unlinked).layer(DefaultBodyLimit::max(16 * 1024)),
             )
             .route(
                 "/api/v1/:nym/invoices/:id",
@@ -1129,6 +1130,10 @@ fn build_router(state: AppState) -> Router {
             .route(
                 "/api/v1/invoices/:id",
                 axum::routing::delete(invoice::cancel_unlinked).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/api/v1/invoices/:id/presentation",
+                get(invoice::private_presentation),
             )
             .route("/api/v1/invoices", get(invoice::list_signed))
             // Public unlinked render path. Privacy headers + indexing posture
@@ -1217,9 +1222,10 @@ async fn pwa_assets_headers(req: Request<Body>, next: Next) -> Response {
     if !resp.status().is_success() {
         return resp;
     }
-    let cache_control = if path == "/invoice-qr.js" {
-        // This stable module name is imported by the server-rendered private
-        // invoice page. Always revalidate it; its dependencies are hashed.
+    let cache_control = if matches!(path.as_str(), "/invoice-qr.js" | "/private-invoice.js") {
+        // These stable module names are imported by the server-rendered
+        // private invoice page. Always revalidate them; dependencies are
+        // content-hashed.
         "public, max-age=0, must-revalidate"
     } else if path.starts_with("/assets/") {
         "public, max-age=31536000, immutable"
@@ -1313,6 +1319,9 @@ mod tests {
     #[test]
     fn private_invoice_route_set_excludes_public_pages() {
         assert!(is_private_invoice_route("/api/v1/invoices/:id/status"));
+        assert!(is_private_invoice_route(
+            "/api/v1/invoices/:id/presentation"
+        ));
         assert!(is_private_invoice_route("/:nym/i/:id"));
         assert!(is_private_invoice_route("/a/:slug/pos/invoice"));
         assert!(is_private_invoice_route("/invoice/:id"));

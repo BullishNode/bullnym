@@ -37,7 +37,7 @@ unlinked invoice operations it is the empty string.
 | take Lightning Address offline/purge | `delete` or `purge` | none |
 | save surface | `donation-page-save` | `header`, `description`, `display_currency`, `website_or_empty`, `twitter_or_empty`, `instagram_or_empty`, `enabled`, required `ct_descriptor`, required `kind`; then `alias` only when its JSON value is non-null (`alias: ""` is non-null and is signed) |
 | archive surface | `donation-page-archive` | required `kind` |
-| create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, `public_description`, `recipient_name`, `invoice_number`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
+| create invoice | `invoice-create` | `amount_sat`, `fiat_amount_minor`, `fiat_currency`, canonical UUID `client_request_id`, canonical unpadded-base64url `presentation_envelope`, `accept_btc` (`true`/`false`), `accept_ln` (`true`/`false`), `accept_liquid` (`true`/`false`), `bitcoin_address`, `liquid_address`, `liquid_blinding_key_hex`, `expires_at_unix` |
 | cancel invoice | `invoice-cancel` | `invoice_id` |
 | list invoices | `invoice-list` | `page`, `pageSize`, `status_or_empty` |
 | list received LNURL comments | `lnurl-comment-history` | `page`, then `pageSize`; the nym slot is the empty string and `npub` must be canonical lowercase hex |

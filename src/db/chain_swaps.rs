@@ -1566,8 +1566,6 @@ pub struct RecoverableChainSwapRow {
     pub invoice_amount_sat: i64,
     pub invoice_fiat_amount_minor: Option<i32>,
     pub invoice_fiat_currency: Option<String>,
-    pub invoice_public_description: Option<String>,
-    pub invoice_number: Option<String>,
     pub invoice_created_at_unix: i64,
 }
 
@@ -1608,8 +1606,6 @@ pub async fn list_recoverable_chain_swaps_for_npub(
                 i.amount_sat AS invoice_amount_sat, \
                 i.fiat_amount_minor AS invoice_fiat_amount_minor, \
                 i.fiat_currency AS invoice_fiat_currency, \
-                i.public_description AS invoice_public_description, \
-                i.invoice_number, \
                 EXTRACT(EPOCH FROM i.created_at)::BIGINT AS invoice_created_at_unix \
          FROM chain_swap_records cs \
          JOIN invoices i ON i.id = cs.invoice_id \

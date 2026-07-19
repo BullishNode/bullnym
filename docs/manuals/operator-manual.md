@@ -95,15 +95,17 @@ availability defect rather than evidence that the fee sources were stale.
 PR #179 merged both remediations. Migration
 `063_checkout_private_memo` replaces the obsolete constraint so Page and PoS
 checkout can persist a private `memo`, while `recipient_label`,
-`public_description`, and `invoice_number` remain wallet-only. Its fee-runtime
-change keeps only the prior fresh, source-authorized, explicitly restored
-durable last-known-good decision eligible while a newer live generation awaits
-durable acceptance. The pending live value is neither construction authority
-nor a reason to close admission when that exact durable predecessor remains
-valid. Missing, stale, unauthorized, or inconsistent durable evidence still
-closes admission. PR #180 then made the anonymous checkout JSON contract
-strict and aligned the 280-character note boundary with PostgreSQL Unicode
-character semantics.
+`public_description`, and `invoice_number` remain wallet-only. That statement
+describes schema 063: migration 065 later removes all three plaintext columns
+and replaces the wallet-only presentation with a fixed-size opaque encrypted
+envelope. Its fee-runtime change keeps only the prior fresh, source-authorized,
+explicitly restored durable last-known-good decision eligible while a newer
+live generation awaits durable acceptance. The pending live value is neither
+construction authority nor a reason to close admission when that exact durable
+predecessor remains valid. Missing, stale, unauthorized, or inconsistent
+durable evidence still closes admission. PR #180 then made the anonymous
+checkout JSON contract strict and aligned the 280-character note boundary with
+PostgreSQL Unicode character semantics.
 
 At 2026-07-15 17:55 UTC, the stopped writer captured the final schema-062
 backup: 33 public tables, 66 public rows, dump SHA-256
@@ -449,7 +451,12 @@ Migration 063 is a fix-forward replacement of
 application writer is stopped. The exact resulting constraint permits checkout
 `memo` but still requires checkout `recipient_label`, `public_description`, and
 `invoice_number` to be null. Schema-063 readiness verifies the constraint body;
-merely retaining the old constraint name does not satisfy readiness.
+merely retaining the old constraint name does not satisfy readiness. Migration
+065 is a later direct cutover: it refuses any existing wallet-origin row, drops
+those three plaintext columns, and requires every new wallet-origin invoice to
+carry its immutable request identity, digest, and fixed-size encrypted
+presentation envelope. Schema-065 readiness verifies that replacement shape
+and the envelope immutability boundary.
 
 At installed source `e17c465939ccf766ebf77b7d9bd7dbfb776c395d`, migrations
 058 and 059 are current-only empty-state guards: they require all user, surface,

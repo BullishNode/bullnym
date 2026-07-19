@@ -21,9 +21,16 @@ Wallet-origin invoices are created by signed requests:
 - `POST /api/v1/:nym/invoices`
 - `POST /api/v1/invoices`
 
-The mobile client supplies accepted rails, amount, metadata, expiry, and
-concrete recipient addresses for Bitcoin and/or Liquid. The server validates
-the request, creates the invoice, and may create an initial Lightning offer.
+The mobile client supplies accepted rails, amount, expiry, concrete recipient
+addresses for Bitcoin and/or Liquid, and one fixed-size encrypted presentation.
+Bullnym validates only the opaque envelope framing; payer, payee, and invoice
+document fields are decrypted and rendered by the payer browser. The server
+creates the invoice and may create an initial Lightning offer.
+
+The server response contains a fragmentless `invoice_url`. Mobile appends its
+locally generated viewing key and exposes only the resulting private link
+through Copy, Share, and QR. There is no server or wallet-backup recovery path
+for that key. See [private invoice presentation v1](../protocols/private-invoice-v1.md).
 
 ## Lifetime and quote windows
 

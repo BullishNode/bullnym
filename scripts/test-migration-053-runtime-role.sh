@@ -302,7 +302,8 @@ for later_migration in \
   migrations/061_invoice_quote_versions.sql \
   migrations/062_invoice_quote_provider_attempts.sql \
   migrations/063_checkout_private_memo.sql \
-  migrations/064_wallet_backup_blobs.sql; do
+  migrations/064_wallet_backup_blobs.sql \
+  migrations/065_private_invoice_presentations.sql; do
   docker exec --interactive "$CONTAINER" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 \
       --username "$PG_USER" --dbname success \

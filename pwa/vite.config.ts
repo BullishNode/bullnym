@@ -81,13 +81,18 @@ export default defineConfig({
         donation: resolve(__dirname, 'apps/donation/index.html'),
         pos: resolve(__dirname, 'apps/pos/index.html'),
         invoiceQr: resolve(__dirname, 'lib/invoiceQr.ts'),
+        privateInvoice: resolve(__dirname, 'lib/privateInvoice.ts'),
       },
       output: {
         // The server-rendered invoice template needs a stable module URL.
         // Browser/SW caching is disabled for this entry; imported chunks keep
         // Vite's normal content hashes and immutable caching.
         entryFileNames: (chunk) =>
-          chunk.name === 'invoiceQr' ? 'invoice-qr.js' : 'assets/[name]-[hash].js',
+          chunk.name === 'invoiceQr'
+            ? 'invoice-qr.js'
+            : chunk.name === 'privateInvoice'
+              ? 'private-invoice.js'
+              : 'assets/[name]-[hash].js',
         chunkFileNames: 'assets/[name]-[hash].js',
         assetFileNames: 'assets/[name]-[hash][extname]',
       },
