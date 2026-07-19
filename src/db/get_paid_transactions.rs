@@ -3,7 +3,9 @@ use uuid::Uuid;
 
 pub const MAX_GET_PAID_TRANSACTION_PAGE_SIZE: u16 = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+// Deliberately omit `Debug`: `comment` is authenticated private metadata and
+// must not become printable through an incidental row/page debug log.
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct GetPaidTransaction {
     pub transaction_id: Uuid,
     pub source: String,

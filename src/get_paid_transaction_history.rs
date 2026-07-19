@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -127,6 +127,14 @@ pub async fn list_signed(
     response
         .headers_mut()
         .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow"),
+    );
     Ok(response)
 }
 

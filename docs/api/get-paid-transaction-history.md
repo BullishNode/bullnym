@@ -58,11 +58,27 @@ Boltz settlement event are also absent so one receipt cannot appear twice.
 Ordering is stable newest-first by immutable first-observation time, source
 rank, and UUID. The cursor is a strict versioned encoding of that tuple. Treat
 it as opaque, sign it exactly as received, and restart from an empty cursor on
-refresh. New payments may appear before the first page but cannot reshuffle
-continuation pages behind an existing cursor.
+refresh. A newly recorded payment normally appears before an existing cursor.
+Recovery can also persist older first-observation evidence after a page was
+read; that row can then appear on a continuation page. The cursor prevents
+already-returned rows from moving behind it, but it is not a database snapshot.
 
-Successful responses use `Cache-Control: private, no-store, max-age=0` and
-`Pragma: no-cache`. Comments must not be exposed through public invoice,
-LNURL, Page/POS, log, metric, or provider-description surfaces. The older
-`/api/v1/lnurl/comments` route remains available for compatibility, but new
-clients use this transaction resource.
+Each list item is the authenticated transaction detail currently exposed by
+this API. Invoice-backed items carry `invoice_id`; clients may use the existing
+invoice status surface for current payment state, but private comments remain
+available only here. Lightning Address items have no invoice and no separate
+public detail route. `transaction_id` is an opaque stable identity, not a
+public lookup token.
+
+Bullnym does not autonomously garbage-collect these payment-evidence rows.
+Soft-deactivating a Lightning Address preserves its history. An explicitly
+signed hard purge deletes that nym's terminal Lightning Address swap history;
+invoice-backed evidence remains subject to the invoice lifecycle and is not
+deleted by that nym purge.
+
+Successful responses use `Cache-Control: private, no-store, max-age=0`,
+`Pragma: no-cache`, `Referrer-Policy: no-referrer`, and
+`X-Robots-Tag: noindex, nofollow`. Comments must not be exposed through public
+invoice, LNURL, Page/POS, log, metric, or provider-description surfaces. The
+older `/api/v1/lnurl/comments` route remains available for compatibility, but
+new clients use this transaction resource.

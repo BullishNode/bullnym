@@ -12054,8 +12054,33 @@ async fn get_paid_history_unifies_payment_evidence_without_making_comments_the_r
         first_headers.get("cache-control").unwrap(),
         "private, no-store, max-age=0"
     );
+    assert_eq!(first_headers.get("pragma").unwrap(), "no-cache");
+    assert_eq!(first_headers.get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(
+        first_headers.get("x-robots-tag").unwrap(),
+        "noindex, nofollow"
+    );
     assert_eq!(first_page["transactions"].as_array().unwrap().len(), 3);
     let cursor = first_page["next_cursor"].as_str().unwrap();
+
+    // A payment first observed after page one belongs ahead of that page's
+    // cursor. It must not shift or duplicate the continuation behind it.
+    insert_swap(&admin, nym, "pending", 73).await;
+    let after_cursor_swap: (Uuid,) =
+        sqlx::query_as("SELECT id FROM swap_records WHERE boltz_swap_id = $1")
+            .bind("boltz-getpaidhistory-73")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    pay_service::db::update_swap_status(
+        &runtime,
+        after_cursor_swap.0,
+        pay_service::db::SwapStatus::Claimed,
+        Some(&"f".repeat(64)),
+    )
+    .await
+    .unwrap();
+
     let second_uri =
         get_paid_transaction_history_uri(&owner_keypair, &owner_npub, cursor, 3, timestamp);
     let (second_status, second_page) = get_path(&app, &second_uri).await;
@@ -12123,6 +12148,20 @@ async fn get_paid_history_unifies_payment_evidence_without_making_comments_the_r
     assert!(all_items.iter().any(|item| item["comment"] == comment_text));
     let wire = format!("{first_page} {second_page}");
     assert!(!wire.contains(abandoned_text));
+    assert!(!all_items
+        .iter()
+        .any(|item| item["transaction_id"] == after_cursor_swap.0.to_string()));
+
+    let refreshed_uri =
+        get_paid_transaction_history_uri(&owner_keypair, &owner_npub, "", 10, timestamp);
+    let (refreshed_status, refreshed_page) = get_path(&app, &refreshed_uri).await;
+    assert_eq!(refreshed_status, StatusCode::OK, "{refreshed_page:?}");
+    let refreshed_items = refreshed_page["transactions"].as_array().unwrap();
+    assert_eq!(refreshed_items.len(), 6);
+    assert_eq!(
+        refreshed_items[0]["transaction_id"],
+        after_cursor_swap.0.to_string()
+    );
 
     let forged_message = get_paid_transaction_history::build_get_paid_transaction_history_message(
         &owner_npub,
